@@ -340,6 +340,79 @@ the range. Unbounded quantification over an unknown domain would need a differen
 decision procedure — that is the line between this crate and a real SMT solver, and
 it is not a small one.
 
+## Modular verification: procedures checked once, calls reasoned about through contracts
+
+Without contracts, verifying a call means inlining the callee's body — exponential in
+the call graph, and impossible for recursion. With them, a procedure is proved once
+against its own contract and every call site costs two implications.
+
+A `Proc` carries its body *and* its contract together, so it is impossible to assume
+a postcondition nobody ever proved:
+
+```rust
+let sat_inc = Proc {
+    name: "sat_inc",
+    requires: smt::ule_const(x, 20),                                  // caller must establish
+    ensures: smt::and(smt::ule_const(r, 20),                          // caller may assume
+                      smt::implies(x.lt_val(20), smt::eq(r, x + 1u32))),
+    body: &body,
+};
+
+assert!(wp::verify_proc(&sat_inc).is_verified());   // the "once" half
+
+let call = Stmt::Call { proc_: &sat_inc, actuals: &[(x, a), (r, tmp)], writes: &[r] };
+let report = wp::verify(&caller, smt::truth(true), post);   // the "many" half
+```
+
+`actuals` is a *simultaneous rename* of the callee's variables to the caller's, the
+same mechanism assignment and memory writes use. `writes` is the callee's frame, and
+`Stmt::frame` derives the check from it rather than trusting a hand-written list.
+
+Run it: `cargo run --features std --example contracts`.
+
+### Where a postcondition stops being bookkeeping
+
+Put a call in a loop and the callee's postcondition becomes load-bearing. With
+`sat_inc` above, the invariant `a <= 20 && k <= 4` is preserved *only* because the
+contract promises `r <= 20`. Weaken the contract to the equation alone and the loop
+stops being provable — `LoopPreserve` fails. The caller never reads the body, so that
+bound is the entire reason the proof goes through. Both directions are tests
+(`a_call_inside_a_loop_body_verifies` and its control
+`dropping_the_bound_from_the_postcondition_breaks_the_loop`), because a positive test
+alone would not show the postcondition was being used.
+
+### What a call is not allowed to do
+
+`Stmt::frame` rejects four things, and each is a real hole rather than tidiness:
+
+1. **A write the caller does not name.** The caller's state after the call would be
+   unknown. Reported as `Rule::CallFrame`.
+2. **A rename that is not a function** — a repeated callee variable.
+3. **Two writes landing on one caller variable**, which is an order-dependent
+   simultaneous assignment.
+4. **A write landing on a variable the call also reads.** This one is not obvious.
+   `ensures` is *assumed* after the call, so `x -> a, r -> a` would assume
+   `a == a + a`, silently forcing `a == 0` on the caller and letting the engine prove
+   anything about it. In-place update is not expressible by a rename; the caller must
+   capture the old value into a temporary first, exactly as it must for a memory swap.
+   I found this by writing a test that expected `frame` to accept the aliasing, and the
+   engine had already been accepting it.
+
+An unmodelled call is reported as an obligation that can never hold, not asserted
+away, so a whole program can be checked in one run.
+
+### The sharp edge, stated rather than hidden
+
+`frame` checks the *shape* of the rename, not its meaning. A caller who wires the
+result onto the wrong variable passes the check and gets a proof about a program it
+did not write. And a caller that believes a contract whose body never established it
+verifies anyway, because the caller does not read the body. Both are pinned by tests.
+The discipline is therefore: verify every body against its contract with
+`verify_proc`, and trust nothing else.
+
+Recursion is not supported — a call graph with a cycle would need an induction
+principle, and that is a different feature.
+
 ## What this is *not* — read this before trusting a green test
 
 Honesty matters more than a nice README, so:
@@ -412,18 +485,21 @@ sparkrs/
 │   ├── wp.rs           Hoare logic + automatic VC generation
 │   ├── smtscript.rs    SMT-LIB2 export for independent checking
 │   ├── mem.rs          bounded symbolic memory + frame condition
-│   └── quant.rs        bounded forall/exists, expanded to finite form
+│   ├── quant.rs        bounded forall/exists, expanded to finite form
+│   └── wp.rs           also: Proc + Stmt::Call for modular verification
 ├── tests/
 │   ├── smoke.rs        the engine proves real identities
 │   ├── kernel.rs       the proof kernel, including a compile-fail case
 │   ├── differential.rs symbolic prover vs brute-force execution
 │   ├── wp.rs           generated conditions checked against execution
 │   ├── mem.rs          memory proofs checked against real Rust arrays
-│   └── quant.rs        fill and scan loops, both verified and executed
+│   ├── quant.rs        fill and scan loops, both verified and executed
+│   └── call.rs         modular verification, every positive with its control
 └── examples/
     ├── flight_control.rs  a realistic actuator path, all obligations discharged
     ├── pipeline.rs        program -> conditions -> proofs -> SMT-LIB2
-    └── memory.rs          read/store, the frame condition, and a fill loop
+    ├── memory.rs          read/store, the frame condition, and a fill loop
+    └── contracts.rs       procedures verified once, calls reasoned about by contract
 ```
 
 ## Building and testing

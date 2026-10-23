@@ -92,6 +92,33 @@ mind when editing:
    SMT-LIB exporter must render it as `((_ extract w-1 0) x)`. Adding a width-changing
    op without updating those three places will produce silently wrong widths.
 
+## A call is reasoned about through a contract, never through a body
+
+`Stmt::Call` assumes the callee's `ensures` and discharges an obligation to establish
+its `requires`. The body is never looked at, which is what makes verification modular
+and also what makes the frame check load-bearing:
+
+1. **`ensures` is an assumption, so it must imply the continuation** — `ensures => Q`,
+   not `ensures && Q`. Conjoining demands the callee's result satisfy the caller's
+   postcondition unaided, which makes every interesting call unprovable. I had this
+   wrong first; `a_call_is_reasoned_about_through_the_contract_alone` catches it.
+2. **`requires` is an obligation, so it is recorded like an assertion**: dominating
+   assignments rewrite it and `verify` wraps it with the precondition. That is why
+   `Rule::CallRequires` appears alongside `Rule::Assertion` in both substitution
+   sites in `collect` and in `verify`.
+3. **A write landing on a variable the call also reads is a soundness hole, not
+   tidiness.** With `x -> a, r -> a`, the assumed `ensures` becomes `a == a + a`,
+   which forces `a == 0` and lets the engine prove anything. `Stmt::frame` rejects it;
+   the caller must capture old values into a temporary, as for a memory swap.
+4. **An unmodelled call is reported (`Rule::CallFrame`), never asserted away.** A
+   verifier that aborts on bad input cannot be run on a program you do not yet trust.
+5. **`frame` checks shape, not meaning.** Renaming a write onto the wrong variable
+   passes. Do not try to "fix" this with a smarter check; the fix is `verify_proc` on
+   every body, and the limitation is documented where a user will meet it.
+
+Recursion is deliberately unsupported: a cyclic call graph needs an induction
+principle, which is a different feature rather than a missing branch.
+
 ## Architecture (read this before editing `smt.rs`)
 
 `src/smt.rs` is the heart: bit-vector terms are bit-blasted into a Reduced

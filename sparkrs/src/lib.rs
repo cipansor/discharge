@@ -93,7 +93,9 @@ pub mod prelude {
     pub use crate::vc::{ensures, invariant, requires, verify_body, verify_contract, Verified};
     pub use crate::mem::{declare as declare_memory, Mem};
     pub use crate::smtscript::Query;
-    pub use crate::wp::{verify as verify_program, Correctness, Rule, Stmt};
+    pub use crate::wp::{
+        verify as verify_program, verify_modular, verify_proc, Correctness, Proc, Rule, Stmt,
+    };
 
     // Macros live at the crate root; re-export them so `use prelude::*` is enough.
     pub use crate::{assert_proof, check, contract, proof, verify, verify_exhaustive, verify_implies};

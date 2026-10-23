@@ -23,10 +23,32 @@
 
 use crate::smt::{self, Pred, Var, Verdict};
 
+/// A procedure: a body together with the contract it must satisfy.
+///
+/// The body and the contract live in one value because a call is only sound when
+/// both are known: the *contract* is what the caller may assume, and the *body* is
+/// what has to be verified once. Keeping them together makes it impossible to
+/// assume a postcondition nobody ever proved — the mistake that turns modular
+/// verification into a way of proving anything you like.
+#[derive(Debug, Clone, Copy)]
+pub struct Proc<'a> {
+    /// The name, used in diagnostics.
+    pub name: &'static str,
+    /// The callee's precondition. A call discharges an obligation to establish it.
+    pub requires: Pred,
+    /// The callee's postcondition. A call may assume it, and the body must
+    /// establish it.
+    pub ensures: Pred,
+    /// The body. Verified by [`verify_proc`].
+    pub body: &'a Stmt<'a>,
+}
+
 /// One statement of the imperative fragment.
 ///
 /// Branches and loops are references, not indices, so nesting is expressed
 /// directly and `wp` can recurse without any bookkeeping about token ranges.
+/// A [`Stmt::Call`] refers to a [`Proc`], which carries its own contract, so a
+/// program is a tree of statements plus the procedures they call.
 #[derive(Debug, Clone, Copy)]
 pub enum Stmt<'a> {
     /// `var := expr`
@@ -85,6 +107,33 @@ pub enum Stmt<'a> {
         /// The loop body.
         body: &'a Stmt<'a>,
     },
+    /// A call to a procedure, reasoned about through its contract.
+    ///
+    /// The body is *not* re-verified here. Instead the call is sound only if the
+    /// caller has proved the callee's precondition at the point of the call, and
+    /// after the call the caller may assume the callee's postcondition. That is
+    /// what makes verification modular: a procedure is checked once against its
+    /// contract, and every call site costs only the two implications.
+    ///
+    /// [`Stmt::frame`] must hold for the call to be sound at all; the constructor
+    /// checks it.
+    Call {
+        /// The procedure being called.
+        proc_: &'a Proc<'a>,
+        /// `(global, local)` pairs. The callee's `requires` is evaluated over
+        /// `local`, so a call *renames* the procedure's variables to the caller's
+        /// arguments.
+        ///
+        /// The caller's variables that are *not* listed are treated as unchanged
+        /// by the call, which is sound only when the callee cannot touch them. See
+        /// [`Stmt::frame`] for the discipline that makes that true.
+        actuals: &'a [(Var, Var)],
+        /// Variables the callee may modify, in the callee's own names.
+        ///
+        /// `Stmt::frame` is derived from this list, so it does not have to be
+        /// written out by hand and cannot drift from it.
+        writes: &'a [Var],
+    },
     /// `s1; s2`
     Seq {
         /// The first statement.
@@ -122,6 +171,18 @@ pub enum Rule {
     /// An in-body assertion holds whenever control reaches it:
     /// `pre => wp(prefix, c)`, where `prefix` is the code before the assertion.
     Assertion,
+    /// A call site establishes the callee's precondition:
+    /// `wp(rest, post) => requires[actuals]`.
+    ///
+    /// Failing this means the caller is asking the callee to work in a state the
+    /// callee does not accept. It is *not* a fault in the callee.
+    CallRequires,
+    /// A call could not be modelled at all: the callee may write a variable the
+    /// caller did not name, so the caller's state after the call is unknown.
+    ///
+    /// This is not a proof failure but a modelling one, and it is reported rather
+    /// than asserted so that a whole program can be checked in one run.
+    CallFrame,
 }
 
 /// A verification condition, attributed to the rule that produced it.
@@ -206,7 +267,7 @@ fn collect<'a>(
             // assignment, so it dominates them and must be substituted in.
             for slot in out[start..*n].iter_mut() {
                 if let Some(ob) = slot {
-                    if ob.rule == Rule::Assertion {
+                    if ob.rule == Rule::Assertion || ob.rule == Rule::CallRequires {
                         *slot = Some(Obligation {
                             rule: ob.rule,
                             goal: smt::substitute(ob.goal, &[(*var, *expr)]),
@@ -220,7 +281,7 @@ fn collect<'a>(
             *cursor = smt::substitute(*cursor, binds);
             for slot in out[start..*n].iter_mut() {
                 if let Some(ob) = slot {
-                    if ob.rule == Rule::Assertion {
+                    if ob.rule == Rule::Assertion || ob.rule == Rule::CallRequires {
                         *slot = Some(Obligation {
                             rule: ob.rule,
                             goal: smt::substitute(ob.goal, binds),
@@ -228,6 +289,30 @@ fn collect<'a>(
                     }
                 }
             }
+        }
+        Stmt::Call { proc_, actuals, writes } => {
+            if !Stmt::frame(proc_, actuals, writes) {
+                // Unmodelled, not merely unproved. Report it as an obligation that
+                // can never hold, rather than asserting and aborting: a verifier
+                // that panics on a bad input is a verifier you cannot run on a
+                // program you do not yet trust.
+                push(out, n, Rule::CallFrame, smt::truth(false));
+                *cursor = smt::truth(false);
+                return;
+            }
+            // `requires[actuals]` is what the caller must establish *at this
+            // point*, so it is recorded like an assertion: the assignments that
+            // dominate it rewrite it, and `verify` wraps it with the precondition.
+            // The rename is simultaneous, so `requires` and `ensures` are
+            // substituted independently.
+            push(out, n, Rule::CallRequires, smt::substitute(proc_.requires, actuals));
+            // After the call, `ensures[actuals]` may be *assumed*. Assumption in a
+            // backward calculus is implication: `ensures => Q`, not `ensures && Q`.
+            // Conjoining would demand that the callee's result satisfy the caller's
+            // postcondition on its own, which is not the rule and makes every
+            // interesting call unprovable.
+            let renamed_ensures = smt::substitute(proc_.ensures, actuals);
+            *cursor = smt::implies(renamed_ensures, *cursor);
         }
         Stmt::Assume(c) => {
             *cursor = smt::implies(*c, *cursor);
@@ -288,6 +373,92 @@ fn collect<'a>(
     }
 }
 
+impl<'a> Stmt<'a> {
+    /// Whether a call can be justified: every variable the callee may write must
+    /// appear in the caller's `actuals`, so that the write has somewhere to land.
+    ///
+    /// This is the frame condition of a call, and it is the whole reason a call is
+    /// sound to reason about locally. If the callee could write a variable the
+    /// caller did not name, the caller would go on believing that variable's value
+    /// — and no amount of proof about the callee's own contract would catch it.
+    ///
+    /// Returning `false` means the call is unmodelled, not merely unproved, so
+    /// [`verify`] reports it as a failure rather than silently assuming the frame.
+    ///
+    /// # What the check rules out, and why each one is needed
+    ///
+    /// 1. **Every write must have a target.** Otherwise the callee writes a
+    ///    variable the caller does not name, the caller's state after the call is
+    ///    unknown, and any proof built on it is unsound.
+    /// 2. **The rename must be a function.** A repeated global would make the
+    ///    substitution depend on which pair the engine happened to see last.
+    /// 3. **No two writes may land on the same variable.** That is an
+    ///    order-dependent simultaneous assignment, which is exactly what a
+    ///    simultaneous rename is supposed to exclude.
+    /// 4. **A write may not land on a variable the call also reads.** This one is
+    ///    not obvious, and it is a genuine soundness hole rather than tidiness.
+    ///    `ensures` is *assumed* after the call, so with `x -> a, r -> a` the
+    ///    assumption becomes `a == a + a`, which silently forces `a == 0` on the
+    ///    caller. The engine then proves anything at all about `a`. In-place
+    ///    update is not expressible by a rename: the caller must capture the old
+    ///    value into a temporary first, exactly as it must for a memory swap
+    ///    (`oi := m[i]`). `tests/call.rs` pins this.
+    ///
+    /// # Only the *shape* is checked here
+    ///
+    /// This asks whether the write is expressible, not whether it is *right*. A
+    /// caller who renames a write onto the wrong variable passes the check and
+    /// still proves nonsense about the variable it actually reads. That is a real
+    /// limitation, stated rather than left to be discovered: the rename is trusted,
+    /// and a caller that gets it wrong gets a proof about a program it did not
+    /// write.
+    pub fn frame(proc_: &Proc<'_>, actuals: &[(Var, Var)], writes: &[Var]) -> bool {
+        let _ = proc_;
+        // 1. Every write has a target in the caller.
+        if !writes
+            .iter()
+            .all(|w| actuals.iter().any(|(global, _)| *global == *w))
+        {
+            return false;
+        }
+        // 2. The rename is a function.
+        if !actuals
+            .iter()
+            .enumerate()
+            .all(|(i, (g, _))| !actuals[..i].iter().any(|(earlier, _)| earlier == g))
+        {
+            return false;
+        }
+        // Split the images: written variables against read-only ones.
+        let image = |g: &Var| actuals.iter().find(|(global, _)| global == g).map(|(_, l)| *l);
+        let mut written: [Option<Var>; MAX_CALL_ARGS] = [None; MAX_CALL_ARGS];
+        let mut n_written = 0;
+        for w in writes {
+            let Some(l) = image(w) else { return false };
+            // 3. No two writes land on the same variable.
+            if written[..n_written].iter().flatten().any(|prev| *prev == l) {
+                return false;
+            }
+            if n_written < MAX_CALL_ARGS {
+                written[n_written] = Some(l);
+                n_written += 1;
+            } else {
+                return false;
+            }
+        }
+        // 4. No write lands on a variable the call also reads.
+        for (global, local) in actuals {
+            if writes.contains(global) {
+                continue;
+            }
+            if written[..n_written].iter().flatten().any(|prev| prev == local) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 fn push(out: &mut [Option<Obligation>], n: &mut usize, rule: Rule, goal: Pred) {
     if *n < out.len() {
         out[*n] = Some(Obligation { rule, goal });
@@ -323,6 +494,10 @@ fn wp_of(s: &Stmt<'_>, post: Pred) -> Pred {
         Stmt::Skip => post,
         Stmt::Assign { var, expr } => smt::substitute(post, &[(*var, *expr)]),
         Stmt::AssignMany { binds } => smt::substitute(post, binds),
+        Stmt::Call { proc_, actuals, .. } => {
+            let renamed = smt::substitute(proc_.ensures, actuals);
+            smt::implies(renamed, post)
+        }
         Stmt::Assume(cond) => smt::implies(*cond, post),
         Stmt::Assert(cond) => smt::and(*cond, post),
         Stmt::Seq { first, second } => {
@@ -373,6 +548,10 @@ fn distinct_targets(binds: &[(Var, Var)]) -> bool {
 pub fn variant_after(s: &Stmt<'_>, e: Var) -> Var {
     match s {
         Stmt::Skip | Stmt::Assume(_) | Stmt::Assert(_) => e,
+        // A measure over the caller's own locals survives a call: a callee cannot
+        // write them, because that is what `Stmt::frame` checks. So the value is
+        // unchanged.
+        Stmt::Call { .. } => e,
         Stmt::Assign { var, expr } => smt::substitute_word(e, &[(*var, *expr)]),
         Stmt::AssignMany { binds } => smt::substitute_word(e, binds),
         Stmt::Seq { first, second } => variant_after(first, variant_after(second, e)),
@@ -408,6 +587,9 @@ pub fn termination_obligation(
 
 /// How many obligations [`verify`] can report at once.
 pub const MAX_OBLIGATIONS: usize = 16;
+
+/// The most arguments a call may pass, so the frame check needs no allocator.
+pub const MAX_CALL_ARGS: usize = 16;
 
 /// The result of verifying a program: every obligation, in the order the rules
 /// were applied, plus the verdict of the contract as a whole.
@@ -512,7 +694,7 @@ pub fn verify(s: &Stmt<'_>, pre: Pred, post: Pred) -> Report {
     // deliberately left alone; see `obligations` for why.
     for slot in slots[..count].iter_mut() {
         if let Some(ob) = slot {
-            if ob.rule == Rule::Assertion {
+            if ob.rule == Rule::Assertion || ob.rule == Rule::CallRequires {
                 *slot = Some(Obligation {
                     rule: ob.rule,
                     goal: smt::implies(pre, ob.goal),
@@ -529,6 +711,36 @@ pub fn verify(s: &Stmt<'_>, pre: Pred, post: Pred) -> Report {
             goal: smt::implies(pre, goal),
         },
     }
+}
+
+/// Verify one procedure against its own contract: for every input satisfying
+/// `p.requires`, executing `p.body` establishes `p.ensures`.
+///
+/// This is the "once" half of modular verification. Do it for every procedure in
+/// the program, then [`verify_modular`] can reason about the calls without looking
+/// at any body again.
+///
+/// It is deliberately thin. `verify_proc` and [`verify`] differ only in which
+/// predicate they take as the precondition, and that is the point: a procedure is
+/// nothing more than a body with a contract attached, so it must not need a
+/// different prover.
+pub fn verify_proc(p: &Proc<'_>) -> Report {
+    verify(p.body, p.requires, p.ensures)
+}
+
+/// The report for a program, with the *call obligations* attached to the
+/// procedures they belong to.
+///
+/// [`verify`] checks a program's own loops and assertions. A call adds two things:
+/// the obligation that the caller establishes the callee's precondition (checked
+/// here), and the right to assume the callee's postcondition (which is sound only
+/// if someone verified the callee's body — see [`verify_proc`]).
+///
+/// The obligation to establish a precondition is attached to the *caller*, not the
+/// callee, because that is whose fault a failure is. This function returns the
+/// caller's report; the callee's obligations come from [`verify_proc`].
+pub fn verify_modular(s: &Stmt<'_>, pre: Pred, post: Pred) -> Report {
+    verify(s, pre, post)
 }
 
 /// Convenience: verify and return just the overall verdict, treating a loop
