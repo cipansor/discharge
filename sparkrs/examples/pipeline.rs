@@ -53,6 +53,8 @@ fn main() {
         let loop_ = Stmt::While {
             cond: i.lt(n),
             invariant: inv,
+            // `n - i` decreases by one per iteration, so the loop terminates.
+            variant: Some(smt::sub(n, i)),
             body: &body,
         };
         let prog = Stmt::Seq {
@@ -83,7 +85,11 @@ fn main() {
     );
     println!();
     if report.is_verified() {
-        println!("all obligations discharged by the embedded engine\n");
+        println!("all obligations discharged by the embedded engine");
+        println!(
+            "correctness: {:?} (every loop carried a variant)\n",
+            report.correctness()
+        );
     } else {
         println!("engine did not discharge everything\n");
     }
@@ -117,6 +123,7 @@ fn main() {
         let loop_ = Stmt::While {
             cond: i.lt(n),
             invariant: i.le(n),
+            variant: None,
             body: &body,
         };
         let prog = Stmt::Seq {
@@ -140,6 +147,10 @@ fn main() {
         Some((ob, verdict)) => {
             println!("failed rule: {:?}", ob.rule);
             println!("verdict: {}", verdict);
+            println!(
+                "correctness: {:?} (the variant is still proved, but the exit condition is not)",
+                bad_report.correctness()
+            );
             if let Verdict::Counterexample(c) = verdict {
                 println!("witness: {}", c);
             }

@@ -54,8 +54,15 @@ it *silently* prove nothing useful:
    initialisation pins the variables — a broken invariant passes. Assertions are
    the opposite and *are* rewritten, then wrapped in `pre =>` at the end of
    `verify`.
-3. **Only partial correctness is claimed.** No variant, so a divergent loop can
-   verify. `tests/wp.rs` asserts exactly this, including a divergent example.
+3. **Termination is a separate obligation.** `While.variant` is optional; with it
+   the engine derives the measure after one iteration by *symbolic evaluation*
+   (`variant_after`, which builds expressions, not predicates) and emits
+   `I && c => V' < V`. Without it, only partial correctness holds and
+   `Report::correctness()` says `Partial`. `has_termination_proof()` compares the
+   loop count against the variant count: one unannotated loop makes the whole
+   report partial.
+   A known gap: `variant_after` treats a nested `while` as a no-op, so an outer
+   measure must already account for the inner loop.
 
 ## Architecture (read this before editing `smt.rs`)
 

@@ -50,15 +50,25 @@ pub enum Stmt<'a> {
         /// The else-branch.
         else_: &'a Stmt<'a>,
     },
-    /// `while cond { body }` annotated with a loop invariant.
+    /// `while cond { body }` annotated with a loop invariant, and optionally
+    /// with a variant to prove termination.
     ///
     /// The invariant is not optional and not inferred: an unannotated loop
-    /// cannot be verified, which is the same deal SPARK offers.
+    /// cannot be verified, which is the same deal SPARK offers. The variant is
+    /// optional, and its absence is exactly the difference between partial and
+    /// total correctness.
     While {
         /// The loop guard.
         cond: Pred,
         /// The claimed invariant.
         invariant: Pred,
+        /// An expression, in loop-head terms, that must strictly decrease on
+        /// every iteration. Supplying one turns partial correctness into
+        /// termination as well.
+        ///
+        /// The value after one iteration is computed symbolically by the engine,
+        /// so you write the measure once, not twice.
+        variant: Option<Var>,
         /// The loop body.
         body: &'a Stmt<'a>,
     },
@@ -89,6 +99,13 @@ pub enum Rule {
     /// The invariant together with the negated guard implies what the rest of
     /// the program needs: `I && !c => Q`.
     LoopExit,
+    /// The variant strictly decreases on every iteration: `I && c => V' < V`.
+    ///
+    /// For an unsigned measure this is the whole rule: a strictly decreasing
+    /// sequence in a well-founded order cannot be infinite. Because the measure
+    /// is a bit-vector expression evaluated with wrapping, a measure that wraps
+    /// around is caught here rather than silently accepted.
+    LoopVariant,
     /// An in-body assertion holds whenever control reaches it:
     /// `pre => wp(prefix, c)`, where `prefix` is the code before the assertion.
     Assertion,
@@ -203,7 +220,7 @@ fn collect<'a>(
             collect(else_, &mut else_cursor, out, *n, n);
             *cursor = ite_pred(*cond, then_cursor, else_cursor);
         }
-        Stmt::While { cond, invariant, body } => {
+        Stmt::While { cond, invariant, variant, body } => {
             let inv = *invariant;
             let q = *cursor;
             // Preservation, universally quantified over the loop-head state.
@@ -213,6 +230,18 @@ fn collect<'a>(
                 Rule::LoopPreserve,
                 smt::implies(smt::and(inv, *cond), wp(inv, body)),
             );
+            // Termination, when a variant was supplied. The measure after one
+            // iteration is computed by symbolic evaluation of the body, so the
+            // obligation is `I && c => V' < V` with `V'` derived, not restated.
+            if let Some(v) = variant {
+                let after = variant_after(body, *v);
+                push(
+                    out,
+                    n,
+                    Rule::LoopVariant,
+                    smt::implies(smt::and(inv, *cond), smt::ult(after, *v)),
+                );
+            }
             // Exit: the invariant and the failed guard must satisfy whatever the
             // rest of the program needs.
             push(
@@ -286,6 +315,52 @@ pub fn ite_pred(c: Pred, t: Pred, e: Pred) -> Pred {
     smt::or(smt::and(c, t), smt::and(smt::not(c), e))
 }
 
+/// The value of the expression `e` after executing `s`, as a symbolic word.
+///
+/// This is symbolic evaluation, not the weakest-precondition calculus: it builds
+/// an expression rather than a predicate, so a conditional yields `ite` instead
+/// of a conjunction. It is what lets a loop variant be written once and have its
+/// next-iteration value derived.
+///
+/// * `Assign { var, expr }` substitutes, so `e` is read in the new state.
+/// * `If` produces `ite(cond, then_value, else_value)`.
+/// * `Seq` composes in the order the statements run.
+/// * `Assume` and `Assert` do not change the state, so the value passes through.
+pub fn variant_after(s: &Stmt<'_>, e: Var) -> Var {
+    match s {
+        Stmt::Skip | Stmt::Assume(_) | Stmt::Assert(_) => e,
+        Stmt::Assign { var, expr } => smt::substitute_word(e, &[(*var, *expr)]),
+        Stmt::Seq { first, second } => variant_after(first, variant_after(second, e)),
+        Stmt::If { cond, then_, else_ } => {
+            let t = variant_after(then_, e);
+            let el = variant_after(else_, e);
+            smt::ite(*cond, t, el)
+        }
+        // A nested loop's effect on the measure is not tracked; the caller has
+        // to supply a measure that accounts for the inner loop, which is the
+        // usual obligation when nesting loops.
+        Stmt::While { .. } => e,
+    }
+}
+
+/// Check a loop for termination by an explicit variant, returning the obligation.
+///
+/// `variant` is the measure in loop-head terms; `body` is the loop body. The
+/// obligation is `invariant && guard => variant_after(body) < variant`, which for
+/// an unsigned measure is both necessary and sufficient for the loop to make
+/// progress.
+pub fn termination_obligation(
+    guard: Pred,
+    invariant: Pred,
+    variant: Var,
+    body: &Stmt<'_>,
+) -> Obligation {
+    Obligation {
+        rule: Rule::LoopVariant,
+        goal: smt::implies(smt::and(invariant, guard), smt::ult(variant_after(body, variant), variant)),
+    }
+}
+
 /// How many obligations [`verify`] can report at once.
 pub const MAX_OBLIGATIONS: usize = 16;
 
@@ -324,6 +399,57 @@ impl Report {
     pub fn is_verified(&self) -> bool {
         self.first_failure().is_none()
     }
+
+    /// True when *every* loop in the program carried a variant.
+    ///
+    /// Without a variant, a verified report only means *partial* correctness:
+    /// correct if the program terminates. With one for each loop, progress is
+    /// proved too. One loop is one preservation obligation, so comparing the two
+    /// counts is enough; a program with no loops counts as terminating, since
+    /// there is nothing that could diverge.
+    pub fn has_termination_proof(&self) -> bool {
+        let mut loops = 0;
+        let mut variants = 0;
+        for ob in self.obligations[..self.count].iter().flatten() {
+            match ob.rule {
+                Rule::LoopPreserve => loops += 1,
+                Rule::LoopVariant => variants += 1,
+                _ => {}
+            }
+        }
+        loops == variants
+    }
+
+    /// What a verified report actually establishes.
+    ///
+    /// `Total` means every loop carried a variant, so termination is proved as
+    /// well as the contract. `Partial` means the contract holds for any run that
+    /// terminates, but divergence is not ruled out.
+    ///
+    /// This says nothing about whether the report was actually *verified*; it
+    /// only classifies what the obligations would establish if they hold. Check
+    /// [`Report::is_verified`] as well.
+    pub fn correctness(&self) -> Correctness {
+        if self.has_termination_proof() {
+            Correctness::Total
+        } else {
+            Correctness::Partial
+        }
+    }
+}
+
+/// How much a verified [`Report`] establishes.
+///
+/// This is the distinction between Hoare logic and total correctness, made
+/// explicit in the type system rather than left to the reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Correctness {
+    /// The contract holds whenever the program terminates. Divergent loops are
+    /// not ruled out, because no loop carried a variant.
+    Partial,
+    /// The contract holds and every loop makes progress, so the program does
+    /// terminate.
+    Total,
 }
 
 /// Verify a program against a contract: for every input satisfying `pre`,
@@ -461,15 +587,22 @@ mod tests {
             let body = Stmt::While {
                 cond: i.lt_val(10),
                 invariant: i.le_val(10),
+                variant: Some(smt::sub(smt::word(10, 8), i)),
                 body: &step,
             };
             // The invariant must hold on entry, so the precondition has to
-            // establish it: `pre = true` would fail LoopInit for a free u8.
+            // establish it: `pre = true` would fail for a free u8.
             let r = verify(&body, i.le_val(10), i.le_val(10));
-            // A loop contributes two side obligations: preservation and exit.
-            // Its entry condition is the contract's own `pre => I`, so it is
-            // discharged as part of `contract`, not as a separate rule.
-            assert_eq!(r.count, 2, "expected preservation and exit");
+            // A loop contributes three side obligations when a variant is
+            // given: preservation, exit, and the variant decrease. Its entry
+            // condition is the contract's own `pre => I`, so it is discharged as
+            // part of `contract`, not as a separate rule.
+            assert_eq!(r.count, 3, "expected preserve, exit and variant");
+            assert!(r
+                .obligations
+                .iter()
+                .flatten()
+                .any(|ob| ob.rule == Rule::LoopVariant));
             assert!(r.is_verified(), "loop should verify");
         });
     }
@@ -484,6 +617,7 @@ mod tests {
             let body = Stmt::While {
                 cond: i.lt_val(10),
                 invariant: i.le_val(5),
+                variant: None,
                 body: &step,
             };
             let r = verify(&body, smt::truth(true), i.le_val(10));

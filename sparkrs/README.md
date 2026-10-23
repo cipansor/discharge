@@ -79,7 +79,7 @@ obligation. That is what `examples/flight_control.rs` demonstrates.
 | `proof` | Curry–Howard kernel (`Truth`, `And`, `Imp`, `Equals`) + composable `Certificate` |
 | `contract` | Runtime `Pre`/`Post`/`Assert` over concrete values, structured errors |
 | `vc` | `requires`/`ensures`/`invariant`, `verify_body`, `Verified<T>` |
-| `wp` | Hoare logic: weakest preconditions, automatic VC generation, loop rules |
+| `wp` | Hoare logic: weakest preconditions, automatic VC generation, loop rules, termination by variant |
 | `smtscript` | SMT-LIB2 export, so an external solver can check the same formula |
 | `exhaustive` | Complete proofs by enumeration over `u8`/`u16` |
 | `primitives` | Total integer ops and a refinement-typed `Bounded<MIN, MAX>` |
@@ -142,10 +142,56 @@ implementation quietly proves the wrong thing:
    initialisation pins the variables, which turns a broken invariant green.
    Assertions are the opposite: they are checked where control reaches them, so
    the dominating assignments *do* apply.
-3. **Only partial correctness is claimed.** Hoare logic says "correct if it
-   exits". There is no variant, so a divergent loop can still be verified — and
-   `tests/wp.rs` contains a test that proves a divergent loop and demonstrates the
-   divergence by execution, so the boundary is documented rather than hidden.
+3. **Termination is proved separately, by a variant.** Hoare logic alone says
+   "correct if it exits". Give the loop a `variant` and its progress is proved
+   too, which upgrades the result from partial to total correctness.
+
+### Termination: give the loop a variant
+
+A `variant` is an expression in loop-head terms that must strictly decrease each
+iteration. For an unsigned measure, `I && c => V' < V` is the whole rule: a
+strictly decreasing sequence in a well-founded order cannot be infinite.
+
+```rust
+let loop_ = Stmt::While {
+    cond: i.lt_val(10),
+    invariant: i.le_val(10),
+    variant: Some(smt::sub(smt::word(10, 8), i)),   // 10 - i decreases by one
+    body: &step,
+};
+```
+
+The value *after* one iteration is computed by symbolic evaluation of the body, so
+you write the measure once, not twice. Through an `if` it becomes
+`ite(cond, then_value, else_value)`; through a sequence it composes in execution
+order. That is what makes a conditional body work without extra annotation:
+
+```rust
+// while i < 10 { if i < 5 { i := i + 2 } else { i := i + 1 } }
+// V' is derived as ite(i < 5, 10 - (i + 2), 10 - (i + 1))
+```
+
+Because the measure is a bit-vector expression evaluated with wrapping, a measure
+that wraps around is caught rather than silently accepted. Take the divergent loop
+from `tests/wp.rs`, `while i != 0 { i := i + 2 }`: claim `variant: i` and the
+obligation is refuted, because from `i == 253` the next value is `255`, which is
+larger. The variant rule is what turns "this loop does not terminate" from a
+comment into a failed proof obligation.
+
+`Report::correctness()` tells you which claim you actually got:
+
+```rust
+assert_eq!(report.correctness(), Correctness::Total);    // every loop has a variant
+assert_eq!(report.correctness(), Correctness::Partial);  // some loop does not
+```
+
+`Total` requires *every* loop to carry a variant. One unannotated loop makes the
+whole report `Partial`, which is why the classification compares the number of
+loops against the number of variants rather than checking that a variant exists
+somewhere.
+
+A report can be `Total` and still `!is_verified()`: the two questions — does it
+terminate, and does it meet its contract — are answered independently.
 
 ### When the engine says `Unknown`, hand the formula to a solver
 
@@ -180,9 +226,14 @@ Honesty matters more than a nice README, so:
 1. **It does not model memory, pointers, aliasing, or concurrency.** The logic is
    bit-vectors and booleans. You cannot state "this pointer is valid" or "these
    two threads do not race" in it. That is a different tool.
-1b. **Hoare logic gives partial correctness only.** `wp` does not prove
-   termination; there is no variant. A divergent loop can verify.
-1c. **`with_fresh` must not be nested.** The inner call wipes the term arena and
+1b. **Termination needs a variant.** Without one, `wp` proves partial correctness
+   only: a divergent loop can verify. There is no inference of variants — you
+   supply the measure, the engine checks it decreases.
+1c. **A nested loop's effect on an outer variant is not tracked.** `variant_after`
+   treats an inner `while` as a no-op, so an outer measure must already account
+   for the inner loop. This is the usual obligation when nesting loops, but it is
+   a real gap rather than a solved problem.
+1d. **`with_fresh` must not be nested.** The inner call wipes the term arena and
    invalidates every `Var` the outer scope holds. One `with_fresh` per proof.
 2. **The BDD engine hits a wall, and says so.** Boolean *equality of two wide
    multipliers* is the classic blow-up: `(a*b)*c == a*(b*c)` at 12 bits returns

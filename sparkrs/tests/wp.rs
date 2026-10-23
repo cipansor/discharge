@@ -103,6 +103,8 @@ fn an_accumulator_loop_verifies_with_attributed_rules() {
         let loop_ = Stmt::While {
             cond: i.lt_val(10),
             invariant: i.le_val(10),
+            // `10 - i` decreases by one each iteration, so the loop terminates.
+            variant: Some(smt::sub(smt::word(10, 8), i)),
             body: &step,
         };
         let prog = Stmt::Seq { first: &init, second: &loop_ };
@@ -143,6 +145,7 @@ fn a_broken_invariant_is_caught_by_the_preservation_rule() {
         let loop_ = Stmt::While {
             cond: i.lt_val(10),
             invariant: i.le_val(10),
+            variant: None,
             body: &step,
         };
         let prog = Stmt::Seq { first: &init, second: &loop_ };
@@ -174,6 +177,10 @@ fn hoare_logic_does_not_prove_termination() {
         let loop_ = Stmt::While {
             cond: smt::not(smt::eq(i, smt::word(0, 8))),
             invariant: smt::truth(true),
+            // No variant: this loop genuinely does not terminate, so there is
+            // nothing to supply. See the termination tests below for the case
+            // where a variant is given and the proof fails.
+            variant: None,
             body: &step,
         };
         let prog = Stmt::Seq { first: &init, second: &loop_ };
@@ -282,5 +289,256 @@ fn the_exported_query_negates_the_goal() {
             "{}",
             text
         );
+    });
+}
+
+#[test]
+fn a_variant_proves_the_loop_terminates() {
+    smt::with_fresh(|| {
+        // i := 0; while i < 10 { i := i + 1 }, variant `10 - i`.
+        //
+        // `10 - i` is a natural number that drops by one each iteration, so the
+        // loop cannot run forever. Supplying it upgrades the result from partial
+        // to total correctness.
+        let i = var(8);
+        let init = Stmt::Assign { var: i, expr: smt::word(0, 8) };
+        let step = Stmt::Assign { var: i, expr: i + 1u32 };
+        let loop_ = Stmt::While {
+            cond: i.lt_val(10),
+            invariant: i.le_val(10),
+            variant: Some(smt::sub(smt::word(10, 8), i)),
+            body: &step,
+        };
+        let prog = Stmt::Seq { first: &init, second: &loop_ };
+
+        let report = verify_program(&prog, smt::truth(true), i.le_val(10));
+        assert!(report.is_verified(), "{:?}", report.first_failure());
+
+        // The variant obligation is present and is the one that carries the
+        // termination argument.
+        let variant_obs: Vec<_> = report
+            .obligations
+            .iter()
+            .flatten()
+            .filter(|ob| ob.rule == Rule::LoopVariant)
+            .collect();
+        assert_eq!(variant_obs.len(), 1, "expected exactly one variant rule");
+        assert_eq!(variant_obs[0].discharge(), Verdict::Valid);
+    });
+}
+
+#[test]
+fn a_variant_that_does_not_decrease_is_refuted() {
+    smt::with_fresh(|| {
+        // i := 0; while i < 10 { i := i } with variant `10 - i`.
+        //
+        // The body makes no progress, so the measure never decreases. The loop
+        // hangs, and the variant obligation is what reports it.
+        let i = var(8);
+        let init = Stmt::Assign { var: i, expr: smt::word(0, 8) };
+        let step = Stmt::Assign { var: i, expr: i }; // no progress
+        let loop_ = Stmt::While {
+            cond: i.lt_val(10),
+            invariant: i.le_val(10),
+            variant: Some(smt::sub(smt::word(10, 8), i)),
+            body: &step,
+        };
+        let prog = Stmt::Seq { first: &init, second: &loop_ };
+
+        let report = verify_program(&prog, smt::truth(true), i.le_val(10));
+        let (ob, _v) = report
+            .first_failure()
+            .expect("a loop that makes no progress cannot terminate");
+        assert_eq!(ob.rule, Rule::LoopVariant);
+    });
+}
+
+#[test]
+fn a_wrapping_variant_is_caught() {
+    smt::with_fresh(|| {
+        // i := 1; while i != 0 { i := i + 2 } with variant `i`.
+        //
+        // This is the divergent loop from `hoare_logic_does_not_prove_termination`
+        // with a variant bolted on. The measure wraps: from i == 253 the body
+        // gives 255, which is *larger*, so `V' < V` fails and the termination
+        // claim is refuted. Bit-vector arithmetic is what makes this catchable —
+        // in unbounded integers `i + 2 < i` would simply be false everywhere.
+        let i = var(8);
+        let init = Stmt::Assign { var: i, expr: smt::word(1, 8) };
+        let step = Stmt::Assign { var: i, expr: i + 2u32 };
+        let loop_ = Stmt::While {
+            cond: smt::not(smt::eq(i, smt::word(0, 8))),
+            invariant: smt::truth(true),
+            variant: Some(i),
+            body: &step,
+        };
+        let prog = Stmt::Seq { first: &init, second: &loop_ };
+
+        let report = verify_program(&prog, smt::truth(true), i.le_val(255));
+        let (ob, verdict) = report
+            .first_failure()
+            .expect("the measure wraps, so it is not a variant");
+        assert_eq!(ob.rule, Rule::LoopVariant);
+
+        // The witness is the state where the wrap makes the measure grow.
+        if let Verdict::Counterexample(c) = verdict {
+            println!("wrapping variant refuted at: {}", c);
+        }
+    });
+}
+
+#[test]
+fn the_variant_is_evaluated_through_a_conditional_body() {
+    smt::with_fresh(|| {
+        // while i < 10 { if i < 5 { i := i + 2 } else { i := i + 1 } }
+        //
+        // The next-iteration value of `10 - i` is not a single expression here:
+        // it depends on the branch. The engine derives it as
+        // `ite(i < 5, 10 - (i + 2), 10 - (i + 1))`, so the user still writes the
+        // measure once.
+        let i = var(8);
+        let then_ = Stmt::Assign { var: i, expr: i + 2u32 };
+        let else_ = Stmt::Assign { var: i, expr: i + 1u32 };
+        let body = Stmt::If {
+            cond: i.lt_val(5),
+            then_: &then_,
+            else_: &else_,
+        };
+        let loop_ = Stmt::While {
+            cond: i.lt_val(10),
+            invariant: i.le_val(10),
+            variant: Some(smt::sub(smt::word(10, 8), i)),
+            body: &body,
+        };
+
+        let report = verify_program(&loop_, i.le_val(10), i.le_val(10));
+        assert!(
+            report.is_verified(),
+            "both branches reduce the measure: {:?}",
+            report.first_failure()
+        );
+    });
+}
+
+#[test]
+fn variant_after_is_symbolic_evaluation_not_weakest_precondition() {
+    smt::with_fresh(|| {
+        // Direct check of the helper: it must build an expression, so a
+        // conditional comes out as `ite` rather than a conjunction, and
+        // sequential composition runs in execution order.
+        let x = var(8);
+        let y = var(8);
+
+        // x := x + 1
+        let inc = Stmt::Assign { var: x, expr: x + 1u32 };
+        let after = wp::variant_after(&inc, x);
+        // The value of `x` after the increment is `x + 1`; asking the engine
+        // whether that is greater than the original for x < 255 confirms it.
+        let v = smt::prove_implies(x.lt_val(255), smt::ult(x, after));
+        assert!(v.is_proved(), "x + 1 > x below the wrap: {}", v);
+
+        // y := x; x := y + 1   =>   value of x afterwards is x + 1, not y + 1.
+        let copy = Stmt::Assign { var: y, expr: x };
+        let bump = Stmt::Assign { var: x, expr: y + 1u32 };
+        let seq = Stmt::Seq { first: &copy, second: &bump };
+        let after_seq = wp::variant_after(&seq, x);
+        let v = smt::prove_implies(x.lt_val(255), smt::eq(after_seq, x + 1u32));
+        assert!(v.is_proved(), "composition order is wrong: {}", v);
+
+        // The same through an if: the value is the ite of the two branches.
+        let t = Stmt::Assign { var: x, expr: smt::word(3, 8) };
+        let e = Stmt::Assign { var: x, expr: smt::word(7, 8) };
+        let branch = Stmt::If {
+            cond: x.lt_val(4),
+            then_: &t,
+            else_: &e,
+        };
+        let after_if = wp::variant_after(&branch, x);
+        let v = smt::prove_implies(x.lt_val(4), smt::eq(after_if, smt::word(3, 8)));
+        assert!(v.is_proved(), "then-branch value wrong: {}", v);
+        let v = smt::prove_implies(smt::not(x.lt_val(4)), smt::eq(after_if, smt::word(7, 8)));
+        assert!(v.is_proved(), "else-branch value wrong: {}", v);
+    });
+}
+
+#[test]
+fn the_report_says_whether_termination_was_proved() {
+    // A loop with a variant establishes total correctness.
+    let total = smt::with_fresh(|| {
+        let i = var(8);
+        let step = Stmt::Assign { var: i, expr: i + 1u32 };
+        let loop_ = Stmt::While {
+            cond: i.lt_val(10),
+            invariant: i.le_val(10),
+            variant: Some(smt::sub(smt::word(10, 8), i)),
+            body: &step,
+        };
+        verify_program(&loop_, i.le_val(10), i.le_val(10))
+    });
+    assert!(total.is_verified());
+    assert!(total.has_termination_proof());
+    assert_eq!(total.correctness(), wp::Correctness::Total);
+
+    // The same loop without a variant establishes only partial correctness.
+    let partial = smt::with_fresh(|| {
+        let i = var(8);
+        let step = Stmt::Assign { var: i, expr: i + 1u32 };
+        let loop_ = Stmt::While {
+            cond: i.lt_val(10),
+            invariant: i.le_val(10),
+            variant: None,
+            body: &step,
+        };
+        verify_program(&loop_, i.le_val(10), i.le_val(10))
+    });
+    assert!(partial.is_verified(), "still a valid partial-correctness proof");
+    assert!(!partial.has_termination_proof());
+    assert_eq!(partial.correctness(), wp::Correctness::Partial);
+}
+
+#[test]
+fn one_unannotated_loop_makes_the_whole_report_partial() {
+    smt::with_fresh(|| {
+        // Two independent loops, only the first carrying a variant. The report
+        // must not claim total correctness: the second loop could still diverge.
+        let i = var(8);
+        let j = var(8);
+        // Each loop's invariant has to be established on entry, so both counters
+        // start at zero.
+        let init_i = Stmt::Assign { var: i, expr: smt::word(0, 8) };
+        let init_j = Stmt::Assign { var: j, expr: smt::word(0, 8) };
+        let step_i = Stmt::Assign { var: i, expr: i + 1u32 };
+        let step_j = Stmt::Assign { var: j, expr: j + 1u32 };
+        let first = Stmt::While {
+            cond: i.lt_val(5),
+            invariant: i.le_val(5),
+            variant: Some(smt::sub(smt::word(5, 8), i)),
+            body: &step_i,
+        };
+        // The second loop's invariant must be established on entry, and nothing
+        // constrains `j` before it, so `true` is the only honest choice. Its
+        // preservation obligation is then trivial — but it still counts as a
+        // loop, which is what makes the report partial rather than total.
+        let second = Stmt::While {
+            cond: j.lt_val(5),
+            invariant: smt::truth(true),
+            variant: None,
+            body: &step_j,
+        };
+        let prog = Stmt::Seq {
+            first: &init_i,
+            second: &Stmt::Seq {
+                first: &init_j,
+                second: &Stmt::Seq { first: &first, second: &second },
+            },
+        };
+
+        let report = verify_program(&prog, smt::truth(true), smt::truth(true));
+        assert!(report.is_verified(), "{:?}", report.first_failure());
+        assert!(
+            !report.has_termination_proof(),
+            "the second loop has no variant, so termination is not proved"
+        );
+        assert_eq!(report.correctness(), wp::Correctness::Partial);
     });
 }
