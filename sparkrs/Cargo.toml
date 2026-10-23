@@ -1,0 +1,19 @@
+[package]
+name = "sparkrs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "In-code formal verification for Rust: embedded bit-blasting SMT decision procedure, symbolic DSL, contracts and a machine-checked proof kernel. SPARK-like safety, no_std, zero dependencies."
+license = "MIT OR Apache-2.0"
+keywords = ["formal-verification", "smt", "no_std", "safety-critical", "contracts"]
+categories = ["no-std", "embedded", "development-tools::testing"]
+
+[features]
+# No default features: the crate is `no_std` + zero-dependency out of the box,
+# which is what a bare-metal safety build wants. `std` only adds the thread-local
+# arena used by the host-side test suite.
+default = []
+std = []
+
+[profile.release]
+opt-level = 2
