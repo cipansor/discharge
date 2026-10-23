@@ -82,6 +82,7 @@ obligation. That is what `examples/flight_control.rs` demonstrates.
 | `wp` | Hoare logic: weakest preconditions, automatic VC generation, loop rules, termination by variant |
 | `smtscript` | SMT-LIB2 export, so an external solver can check the same formula |
 | `mem` | Bounded symbolic memory: `read`/`store`, frame condition, composes with `wp` |
+| `quant` | Bounded `forall`/`exists`, expanded into finite conjunctions/disjunctions |
 | `exhaustive` | Complete proofs by enumeration over `u8`/`u16` |
 | `primitives` | Total integer ops and a refinement-typed `Bounded<MIN, MAX>` |
 | `macros` | `verify!`, `verify_implies!`, `contract!`, `proof!`, `assert_proof!`, `check!`, `verify_exhaustive!` |
@@ -280,16 +281,64 @@ absent, which is a strong guarantee — but it means you must size the memory to
 largest address the real code can produce, and if that is not known, this is the
 wrong tool.
 
-A loop over addresses (`for k in 0..n { m[k] := 0 }`) is **not** verifiable here.
-Its invariant would have to say "every cell below `k` is zero", and that is a
-prefix predicate the representation does not have: a symbolic read is a flat ite
-chain over individual cells, with no notion of a range. Universal statements over
-addresses would need a quantifier the bit-vector logic does not provide. Unroll the
-loop, or state the property cell by cell — both are verified in
-`examples/memory.rs`.
+A loop over addresses (`for k in 0..n { m[k] := 0 }`) *is* verifiable, because
+its invariant needs a quantifier and bounded quantifiers can be expanded — see the
+next section.
 
 Cost: a symbolic read is `2^addr_width` ites and the BDD sees all of them, so
 `MAX_CELLS` caps a memory at 64 cells (6 address bits).
+
+## Bounded quantification: the invariant a loop over memory needs
+
+A fill loop's invariant is "every cell below `k` is zero". That is a quantifier,
+and a bit-vector decision procedure has none. But it is a *bounded* quantifier, and
+a bounded quantifier is a finite conjunction, so it can simply be expanded:
+
+```text
+forall j < k { m[j] == 0 }   =>   (0 < k => m[0] == 0) && (1 < k => m[1] == 0) && ...
+```
+
+`Mem::forall_below` and `Mem::exists_below` do that expansion, which is what makes
+a loop over addresses verifiable at all rather than needing a hand unroll:
+
+```rust
+// for k := 0; k < 4; k += 1 { m[k] := 0 }
+let inv = m.forall_below(k, |cell| smt::eq_const(cell, 0));
+let post = m.forall_cells(|cell| smt::eq_const(cell, 0));
+```
+
+Run it: `cargo run --features std --example memory`. The invariant verifies with
+`Total` correctness; weakening it to "only `m[k]` is zero" makes the proof fail,
+which is the control that shows the quantifier is doing real work rather than being
+decorative. `tests/quant.rs` verifies a fill and a scan this way, and executes both
+on real arrays.
+
+Two details matter:
+
+1. **The loop counter must be wider than the address.** With 4 addresses, a 2-bit
+   counter cannot hold 4, so `while k < 4` would never exit. The counter is 3 bits
+   and `Mem::addr_of` truncates it back to an address at the point of use — a new
+   `truncate` primitive, since widths were previously immutable. Truncation wraps,
+   so it is only sound once you have proved the index is in range; a wrapped write
+   re-zeros an already-zero cell, which is why a fill survives it and a scan would
+   not.
+2. **A bound larger than the memory is fine, not a gap.** The quantifier ranges
+   over the cells that exist, and those are the only addresses that can be named, so
+   `forall k < 8` over four cells constrains exactly cells 0..3. My first version of
+   this documentation claimed the opposite, and the test that caught it is
+   `a_bound_larger_than_the_memory_is_not_a_problem`.
+
+`quant` also offers the plain `forall_range`/`exists_range` over a slice, which is
+useful outside the memory layer. The expansion is exact: a proof of the conjunction
+is a proof of the quantified formula, and a counterexample names the index that
+broke it.
+
+### The bound has to be a number the tool can count to
+
+`forall k < 1000` is a thousand copies of the predicate, so the cost is linear in
+the range. Unbounded quantification over an unknown domain would need a different
+decision procedure — that is the line between this crate and a real SMT solver, and
+it is not a small one.
 
 ## What this is *not* — read this before trusting a green test
 
@@ -299,6 +348,8 @@ Honesty matters more than a nice README, so:
    bounded *array*, addressed by an integer. It does not model pointers, address
    arithmetic across objects, or two threads touching the same cell. You cannot
    state "this pointer is valid" or "these two threads do not race" in it.
+   Quantifiers are bounded and expanded, so `forall` over an unknown domain is not
+   available either — the range must be a number the tool can count to.
 1b. **Termination needs a variant.** Without one, `wp` proves partial correctness
    only: a divergent loop can verify. There is no inference of variants — you
    supply the measure, the engine checks it decreases.
@@ -360,17 +411,19 @@ sparkrs/
 │   └── macros.rs       verify!, contract!, proof!, ...
 │   ├── wp.rs           Hoare logic + automatic VC generation
 │   ├── smtscript.rs    SMT-LIB2 export for independent checking
-│   └── mem.rs          bounded symbolic memory + frame condition
+│   ├── mem.rs          bounded symbolic memory + frame condition
+│   └── quant.rs        bounded forall/exists, expanded to finite form
 ├── tests/
 │   ├── smoke.rs        the engine proves real identities
 │   ├── kernel.rs       the proof kernel, including a compile-fail case
 │   ├── differential.rs symbolic prover vs brute-force execution
 │   ├── wp.rs           generated conditions checked against execution
-│   └── mem.rs          memory proofs checked against real Rust arrays
+│   ├── mem.rs          memory proofs checked against real Rust arrays
+│   └── quant.rs        fill and scan loops, both verified and executed
 └── examples/
     ├── flight_control.rs  a realistic actuator path, all obligations discharged
     ├── pipeline.rs        program -> conditions -> proofs -> SMT-LIB2
-    └── memory.rs          read/store, the frame condition, and the loop limit
+    └── memory.rs          read/store, the frame condition, and a fill loop
 ```
 
 ## Building and testing

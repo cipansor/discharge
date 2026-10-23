@@ -149,6 +149,15 @@ impl fmt::Display for Bits {
             Op::Eq => write!(f, "(= {} {})", Bits(Term(n.a)), Bits(Term(n.b))),
             Op::Ult => write!(f, "(bvult {} {})", Bits(Term(n.a)), Bits(Term(n.b))),
             Op::Ule => write!(f, "(bvule {} {})", Bits(Term(n.a)), Bits(Term(n.b))),
+            // Truncate: keep the low bits. `(_ extract w-1 0 x)` is the identity
+            // when the source is at least `w` wide, and zero-extends when it is
+            // narrower, so one form covers both directions.
+            Op::Trunc => write!(
+                f,
+                "((_ extract {} 0) {})",
+                w.saturating_sub(1),
+                Bits(Term(n.a))
+            ),
             Op::Ite => write!(
                 f,
                 "(ite {} {} {})",

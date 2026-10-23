@@ -278,6 +278,129 @@ impl<'a> Mem<'a> {
         smt::implies(smt::eq(a, b), smt::eq(self.read(a), self.read(b)))
     }
 
+    /// The address bit mask: `len - 1`, the largest address.
+    ///
+    /// All the low bits are set, because the cell count is a power of two.
+    pub fn addr_mask(&self) -> u64 {
+        (self.cells.len() - 1) as u64
+    }
+
+    /// The cell addressed by a *wider* index, truncated to the address width.
+    ///
+    /// A loop counter cannot be `addr_width` bits wide: with 2-bit cells and 4
+    /// addresses, a 2-bit counter can hold 3 at most, so `while k < 4` never exits.
+    /// The counter has to be wider than the address, and then indexing the memory
+    /// needs a truncation — which is what a real machine does when the index
+    /// register is wider than the address bus.
+    ///
+    /// The truncation is a plain bit-mask, so it is exact for every in-range index
+    /// and wraps for out-of-range ones. It is therefore **only sound to use when
+    /// you have proved the index is in range** — normally by carrying
+    /// `index <= len` in the loop invariant, which is exactly what
+    /// [`Mem::forall_below`] asks for anyway. `tests/quant.rs` verifies a fill loop
+    /// both ways: with the bound in the invariant it proves, and without it the
+    /// proof fails.
+    pub fn addr_of(&self, index: Var) -> Var {
+        let w = smt::bits(index);
+        let aw = self.addr_width();
+        if w == aw {
+            index
+        } else {
+            assert!(
+                w > aw,
+                "addr_of: an index of {} bits is too narrow for a {}-bit address",
+                w,
+                aw
+            );
+            smt::truncate(index, aw)
+        }
+    }
+
+    /// `forall k < bound { f(m[k]) }`: every cell below a *symbolic* bound
+    /// satisfies `f`.
+    ///
+    /// This is the predicate that a loop over addresses needs. "Every cell below
+    /// the cursor has been processed" cannot be written as a single bit-vector
+    /// formula, but it can be expanded: the quantifier is replaced by one guarded
+    /// conjunct per cell, `k < bound => f(m[k])`. The expansion is exact and finite,
+    /// so the decision procedure can decide it.
+    ///
+    /// ```text
+    /// forall k < bound { f(m[k]) }  =>  (0 < bound => f(m[0])) && (1 < bound => f(m[1])) && ...
+    /// ```
+    ///
+    /// # The domain is the memory's cells, and that is not a caveat
+    ///
+    /// The quantifier ranges over the cells that exist, which are also the only
+    /// addresses that can be named. So a `bound` larger than the cell count is not a
+    /// problem: `forall k < 10` over a 4-cell memory constrains exactly cells 0..3,
+    /// and there is nothing else it *could* constrain. No separate `bound <= len`
+    /// conjunct is needed, and adding one only makes the invariant harder to
+    /// preserve — `tests/quant.rs` shows a fill loop verifying without it and failing
+    /// when it is added to a loop that runs past the length.
+    ///
+    /// The subtlety is elsewhere: if the *index* used to write is wider than the
+    /// address and can exceed the length, [`Mem::addr_of`] truncates it, so the
+    /// writes wrap. For a fill that is harmless — a wrapped write re-zeros an
+    /// already-zero cell, so the invariant survives — but for a scan it is not, and
+    /// the reason is documented on `addr_of` rather than here.
+    pub fn forall_below<F>(&self, bound: Var, f: F) -> Pred
+    where
+        F: Fn(Var) -> Pred,
+    {
+        self.check_addr_width(bound, "forall_below");
+        crate::quant::forall_guarded(0, self.cells.len(), bound, |k, inside| {
+            smt::implies(inside, f(self.cells[k]))
+        })
+    }
+
+    /// `exists k < bound { f(m[k]) }`: some cell below a symbolic bound satisfies
+    /// `f`. The dual of [`Mem::forall_below`], with the same domain caveat.
+    pub fn exists_below<F>(&self, bound: Var, f: F) -> Pred
+    where
+        F: Fn(Var) -> Pred,
+    {
+        self.check_addr_width(bound, "exists_below");
+        crate::quant::exists_guarded(0, self.cells.len(), bound, |k, inside| {
+            smt::and(inside, f(self.cells[k]))
+        })
+    }
+
+    /// `forall k { f(m[k]) }`: every cell in the memory satisfies `f`.
+    ///
+    /// No guard and no domain caveat: the quantifier ranges over exactly the cells
+    /// that exist.
+    pub fn forall_cells<F>(&self, f: F) -> Pred
+    where
+        F: Fn(Var) -> Pred,
+    {
+        crate::quant::forall_range(0, self.cells.len(), |k| f(self.cells[k]))
+    }
+
+    /// `exists k { f(m[k]) }`: some cell satisfies `f`.
+    pub fn exists_cell<F>(&self, f: F) -> Pred
+    where
+        F: Fn(Var) -> Pred,
+    {
+        crate::quant::exists_range(0, self.cells.len(), |k| f(self.cells[k]))
+    }
+
+    /// Whether `bound` is representable as an address of this memory.
+    ///
+    /// A bound is allowed to equal `len` — "all cells are filled" is the usual
+    /// postcondition — so this checks width only, not range. Range is the caller's
+    /// invariant to state; see [`Mem::forall_below`].
+    fn check_addr_width(&self, bound: Var, who: &str) {
+        let need = self.addr_width().max(1);
+        assert!(
+            smt::bits(bound) >= need,
+            "{}: a bound of {} bits cannot reach the top address of a {}-cell memory",
+            who,
+            smt::bits(bound),
+            self.cells.len()
+        );
+    }
+
     /// Reject an address that cannot name a cell of this memory.
     fn check_addr(&self, addr: Var, who: &str) {
         assert_eq!(

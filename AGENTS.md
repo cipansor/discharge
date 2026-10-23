@@ -79,10 +79,18 @@ mind when editing:
    substitution rewrites every cell variable in it. Writing `m.read(i)` in a
    postcondition means the *new* contents; assign old contents to fresh variables
    first. `tests/mem.rs` shows the swap done correctly.
-3. **No prefix predicates.** `for k in 0..n { m[k] := 0 }` is not verifiable: its
-   invariant would need "all cells below k", which a flat ite chain cannot express.
-   Unroll instead. Do not "fix" this by adding quantifiers to the bit-vector logic;
-   that is a different decision procedure.
+3. **Prefix predicates come from `quant`, not from the engine.** "All cells below
+   k" is a bounded quantifier, and `Mem::forall_below` expands it into one guarded
+   conjunct per cell. That is what makes a fill or scan loop verifiable. Two traps:
+   the loop counter must be *wider* than the address (a 2-bit counter cannot hold 4),
+   so `Mem::addr_of` truncates at the point of use; and the expansion cost is linear
+   in the range, so the bound must be a number the tool can count to. Do not add real
+   quantifiers to the bit-vector logic — that is a different decision procedure.
+4. **`truncate` is the only width-changing operation.** `Op::Trunc` carries its
+   source width in the node's `b` field, which means the substitution walker must
+   treat it like a shift (carry `b` verbatim) rather than substituting it, and the
+   SMT-LIB exporter must render it as `((_ extract w-1 0) x)`. Adding a width-changing
+   op without updating those three places will produce silently wrong widths.
 
 ## Architecture (read this before editing `smt.rs`)
 

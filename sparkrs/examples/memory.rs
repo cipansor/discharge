@@ -122,50 +122,95 @@ fn main() {
     // Where this stops. Stated plainly, because a limit you discover yourself is
     // more expensive than one you were told about.
     // ---------------------------------------------------------------------
-    println!("=== the limit: a loop over addresses ===\n");
-    println!("for k in 0..4 {{ m[k] := 0 }} is fine to *verify* when unrolled, but the");
-    println!("loop form is not verifiable here. Its invariant would have to say \"every");
-    println!("cell below k is zero\", and that is a prefix predicate this representation");
-    println!("does not have: a symbolic read is a flat ite chain over individual cells,");
-    println!("with no notion of a range. Bounds are structural — an address is 2 bits,");
-    println!("so it cannot name a cell outside the memory — but *universal* statements");
-    println!("over addresses need a quantifier the bit-vector logic does not provide.\n");
-    println!("What works instead: unroll, or state the property cell by cell.\n");
+    println!("=== a loop over addresses, which needs a quantifier ===\n");
+    println!("A fill loop's invariant has to say \"every cell below k is zero\". That is");
+    println!("a quantifier, which a bit-vector decision procedure does not have -- but");
+    println!("it is *bounded*, and a bounded quantifier is a finite conjunction, so it");
+    println!("can simply be expanded: (0 < k => m[0] == 0) && (1 < k => m[1] == 0) && ...");
+    println!("`Mem::forall_below` does that, which is what makes this loop verifiable at");
+    println!("all instead of needing a hand unroll.\n");
 
-    // Unrolled, it verifies.
     smt::with_fresh(|| {
         let mut buf = [var(8); 4];
         let n = declare(2, 8, &mut buf);
         let m = Mem::new(&buf[..n], 8);
+        // The counter is 3 bits, one wider than the 2-bit address: a 2-bit counter
+        // could never reach 4, so `while k < 4` would not exit. `addr_of` truncates
+        // it back to an address at the point of use, the way a machine with an
+        // index register wider than its address bus does.
+        let k = var(3);
         let zero = smt::word(0, 8);
 
-        let mut storage = [[(zero, zero); MAX_CELLS]; 4];
-        let mut counts = [0usize; 4];
-        for (k, count) in counts.iter_mut().enumerate() {
-            let addr = smt::word(k as u64, 2);
-            *count = m.store_binds(addr, zero, &mut storage[k]);
-        }
-        let w0 = Stmt::AssignMany { binds: &storage[0][..counts[0]] };
-        let w1 = Stmt::AssignMany { binds: &storage[1][..counts[1]] };
-        let w2 = Stmt::AssignMany { binds: &storage[2][..counts[2]] };
-        let w3 = Stmt::AssignMany { binds: &storage[3][..counts[3]] };
-        let prog = Stmt::Seq {
-            first: &w0,
-            second: &Stmt::Seq {
-                first: &w1,
-                second: &Stmt::Seq { first: &w2, second: &w3 },
-            },
+        let addr = m.addr_of(k);
+        let mut binds = [(addr, zero); MAX_CELLS];
+        let nb = m.store_binds(addr, zero, &mut binds);
+        let store = Stmt::AssignMany { binds: &binds[..nb] };
+        let step = Stmt::Assign { var: k, expr: k + 1u32 };
+        let body = Stmt::Seq { first: &store, second: &step };
+
+        let inv = m.forall_below(k, |cell| smt::eq_const(cell, 0));
+        let loop_ = Stmt::While {
+            cond: smt::ult_const(k, 4),
+            invariant: inv,
+            variant: Some(smt::sub(smt::word(4, 3), k)),
+            body: &body,
         };
-        let post = smt::all(&[
-            smt::eq_const(m.read_const(0), 0),
-            smt::eq_const(m.read_const(1), 0),
-            smt::eq_const(m.read_const(2), 0),
-            smt::eq_const(m.read_const(3), 0),
-        ]);
+        let init = Stmt::Assign { var: k, expr: smt::word(0, 3) };
+        let prog = Stmt::Seq { first: &init, second: &loop_ };
+
+        let post = m.forall_cells(|cell| smt::eq_const(cell, 0));
         let report = wp::verify(&prog, smt::truth(true), post);
-        println!("unrolled memset, all four cells zero:");
-        println!("  verified: {}\n", report.is_verified());
+        println!("for k := 0; k < 4; k += 1 {{ m[k] := 0 }}");
+        println!("  invariant: forall j < k {{ m[j] == 0 }}");
+        println!("  obligations : {}", report.count);
+        println!("  verified    : {}", report.is_verified());
+        println!("  termination : {:?}", report.correctness());
+        if let Some((ob, _)) = report.first_failure() {
+            println!("  FAILED      : {:?}", ob.rule);
+        }
     });
+
+    // The control: the same loop with only "the cell at k is zero" as its
+    // invariant. The postcondition needs all four cells, so it must fail. Without
+    // this, the test above would not show that the quantifier is doing work.
+    smt::with_fresh(|| {
+        let mut buf = [var(8); 4];
+        let n = declare(2, 8, &mut buf);
+        let m = Mem::new(&buf[..n], 8);
+        let k = var(3);
+        let zero = smt::word(0, 8);
+
+        let addr = m.addr_of(k);
+        let mut binds = [(addr, zero); MAX_CELLS];
+        let nb = m.store_binds(addr, zero, &mut binds);
+        let store = Stmt::AssignMany { binds: &binds[..nb] };
+        let step = Stmt::Assign { var: k, expr: k + 1u32 };
+        let body = Stmt::Seq { first: &store, second: &step };
+
+        let loop_ = Stmt::While {
+            cond: smt::ult_const(k, 4),
+            invariant: smt::eq_const(m.read(addr), 0),
+            variant: None,
+            body: &body,
+        };
+        let init = Stmt::Assign { var: k, expr: smt::word(0, 3) };
+        let prog = Stmt::Seq { first: &init, second: &loop_ };
+        let post = m.forall_cells(|cell| smt::eq_const(cell, 0));
+        let report = wp::verify(&prog, smt::truth(true), post);
+        println!();
+        println!("same loop, invariant weakened to \"m[k] == 0\" only:");
+        println!("  verified    : {} (as it must be: one cell is not four)", report.is_verified());
+    });
+
+    println!();
+    println!("=== what is still out of reach ===\n");
+    println!("The bound has to be a number the tool can count to, because the expansion");
+    println!("has one conjunct per cell. `forall k < 1000` is a thousand copies of the");
+    println!("predicate, and `MAX_CELLS` caps a memory at 64 cells for that reason. So:");
+    println!("quantifiers over a *fixed* range are fine, unbounded ones are not, and the");
+    println!("cost grows linearly with the range either way. A true `forall` over an");
+    println!("unknown domain would need a different decision procedure -- that is the line");
+    println!("between this crate and a real SMT solver, and it is not a small one.\n");
 
     println!("done");
 }

@@ -161,6 +161,15 @@ pub(crate) enum Op {
     Ult,
     Ule,
     Ite,
+    /// Zero-extend or truncate: the width changes, the low bits are kept.
+    ///
+    /// `a` is the operand, `b` the source width. Bit `i` of the result is bit `i`
+    /// of the operand when `i < b`, and zero otherwise. This is the one width-
+    /// changing operation in the language, and it exists because a loop counter
+    /// often has to be wider than the value it indexes: with four addresses a
+    /// 2-bit counter cannot reach 4, so the counter is 3 bits and gets truncated
+    /// at the point of use.
+    Trunc,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -454,7 +463,7 @@ impl Ctx {
                     return Term(self.subst_memo[key]);
                 }
                 let a = self.subst(Term(n.a));
-                let b = if n.op == Op::Not {
+                let b = if matches!(n.op, Op::Not | Op::Trunc) {
                     Term(0)
                 } else {
                     self.subst(Term(n.b))
@@ -466,7 +475,7 @@ impl Ctx {
                 };
                 let rebuilt = match n.op {
                     Op::Not => self.mk_term(Node { op: n.op, a: a.0, b: 0, c: 0, width: n.width, hi: 0 }),
-                    Op::Shl | Op::LShr | Op::Shr => {
+                    Op::Shl | Op::LShr | Op::Shr | Op::Trunc => {
                         self.mk_term(Node { op: n.op, a: a.0, b: n.b, c: 0, width: n.width, hi: 0 })
                     }
                     Op::Ite => self.mk_term(Node {
@@ -543,6 +552,19 @@ impl Ctx {
 
     fn un_bool(&mut self, op: Op, a: Term) -> Term {
         self.mk_term(Node { op, a: a.0, b: 0, c: 0, width: 1, hi: 0 })
+    }
+
+    /// Change a term's width, keeping the low bits and zero-filling any new ones.
+    fn trunc(&mut self, a: Term, width: u8) -> Term {
+        let src = self.width_of(a);
+        self.mk_term(Node {
+            op: Op::Trunc,
+            a: a.0,
+            b: src as u32,
+            c: 0,
+            width,
+            hi: 0,
+        })
     }
 
     fn shift(&mut self, op: Op, a: Term, k: u32) -> Term {
@@ -926,6 +948,17 @@ impl Ctx {
                     out[bit] = self.ite_node(c[0], t[bit], e[bit]);
                 }
             }
+            Op::Trunc => {
+                let mut a = [FALSE; 64];
+                self.blast(Term(n.a), &mut a);
+                let src = n.b as usize;
+                for (bit, slot) in out[..w].iter_mut().enumerate() {
+                    // Widening zero-fills; narrowing drops the high bits. One
+                    // expression covers both because the source is only read
+                    // where it exists.
+                    *slot = if bit < src { a[bit] } else { FALSE };
+                }
+            }
         }
     }
 
@@ -1301,6 +1334,23 @@ pub fn lshr(x: Var, k: u32) -> Var {
 pub fn ashr(x: Var, k: u32) -> Var {
     with_ctx(|c| Var(c.shift(Op::Shr, x.0, k)))
 }
+/// `x` re-typed to `width` bits: low bits kept, high bits zero-filled or dropped.
+///
+/// The one operation in the language that changes a width. It is what makes an
+/// index wider than its address space expressible, which a loop over addresses
+/// needs: see [`crate::mem::Mem::addr_of`].
+///
+/// # Panics
+///
+/// If `width` is not in `1..=64`. Shrinking never loses information silently —
+/// the dropped bits are gone by definition, and that is the point of the
+/// operation — but a caller who wants to be sure nothing is dropped should check
+/// `x < 2^width` first.
+pub fn truncate(x: Var, width: u8) -> Var {
+    assert!((1..=64).contains(&width), "width must be 1..=64");
+    with_ctx(|c| Var(c.trunc(x.0, width)))
+}
+
 /// `c ? t : e`
 pub fn ite(c: Pred, t: Var, e: Var) -> Var {
     with_ctx(|c_| {

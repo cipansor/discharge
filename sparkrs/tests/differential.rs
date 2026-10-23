@@ -121,3 +121,65 @@ fn the_runtime_contract_vocabulary_matches_the_symbolic_one() {
     });
     assert!(symbolic.is_proved());
 }
+
+#[test]
+fn truncation_agrees_with_a_rust_cast_on_every_input() {
+    // `truncate` is the only width-changing operation in the language, and a
+    // bit-level primitive like this is exactly where an off-by-one in the bit
+    // index hides. So: for every source width, every destination width, and every
+    // 8-bit input, compare against the Rust cast.
+    for dst in 1..=8u8 {
+        let symbolic: Vec<(u8, bool)> = smt::with_fresh(|| {
+            let x = var(8);
+            let t = smt::truncate(x, dst);
+            assert_eq!(smt::bits(t), dst, "result width must be the requested one");
+            (0..=255u8)
+                .map(|v| {
+                    // Ask the engine for the value at a pinned input.
+                    let p = smt::prove_implies(
+                        smt::eq_const(x, v as u64),
+                        smt::eq_const(t, (v as u64) & mask(dst)),
+                    );
+                    (v, p.is_proved())
+                })
+                .collect()
+        });
+        for (v, proved) in symbolic {
+            assert!(
+                proved,
+                "truncate to {} bits disagrees at input {}",
+                dst, v
+            );
+            // And the Rust cast says the same thing.
+            assert_eq!((v as u64) & mask(dst), (v as u16 % (1u16 << dst)) as u64);
+        }
+    }
+}
+
+#[test]
+fn widening_through_truncate_agrees_with_the_original_value() {
+    for src in 1..=8u8 {
+        for dst in src..=16u8 {
+            smt::with_fresh(|| {
+                let x = var(src);
+                let t = smt::truncate(x, dst);
+                assert_eq!(smt::bits(t), dst);
+                // Widening never changes the value, so the result fits in `src`
+                // bits and matches the original.
+                let p = smt::prove(smt::eq(t, smt::truncate(x, dst)));
+                assert!(p.is_proved());
+                let bound = 1u64 << src;
+                let q = smt::prove(smt::ult_const(t, bound));
+                assert!(q.is_proved(), "widened value escaped its source range");
+            });
+        }
+    }
+}
+
+fn mask(width: u8) -> u64 {
+    if width >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << width) - 1
+    }
+}

@@ -68,6 +68,7 @@ pub mod macros;
 pub mod mem;
 pub mod primitives;
 pub mod proof;
+pub mod quant;
 pub mod smt;
 pub mod smtscript;
 pub mod sym;
