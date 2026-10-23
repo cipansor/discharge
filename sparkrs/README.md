@@ -79,9 +79,99 @@ obligation. That is what `examples/flight_control.rs` demonstrates.
 | `proof` | Curry–Howard kernel (`Truth`, `And`, `Imp`, `Equals`) + composable `Certificate` |
 | `contract` | Runtime `Pre`/`Post`/`Assert` over concrete values, structured errors |
 | `vc` | `requires`/`ensures`/`invariant`, `verify_body`, `Verified<T>` |
+| `wp` | Hoare logic: weakest preconditions, automatic VC generation, loop rules |
+| `smtscript` | SMT-LIB2 export, so an external solver can check the same formula |
 | `exhaustive` | Complete proofs by enumeration over `u8`/`u16` |
 | `primitives` | Total integer ops and a refinement-typed `Bounded<MIN, MAX>` |
 | `macros` | `verify!`, `verify_implies!`, `contract!`, `proof!`, `assert_proof!`, `check!`, `verify_exhaustive!` |
+
+## Verification conditions are generated, not hand-written
+
+`vc` lets you write an obligation by hand. `wp` derives it from the program, which
+is the part that actually feels like SPARK: you state `requires` and `ensures`,
+describe the body, and read a verdict *per rule*.
+
+```rust
+use sparkrs::prelude::*;
+use sparkrs::smt::{self, var};
+use sparkrs::wp::{self, Stmt};
+
+let report = smt::with_fresh(|| {
+    let sum = var(4);
+    let i = var(4);
+    let n = var(4);
+    let step = var(4);
+
+    let pre = smt::and(n.le_val(3), step.le_val(3));      // requires
+
+    let init_sum = Stmt::Assign { var: sum, expr: smt::word(0, 4) };
+    let init_i   = Stmt::Assign { var: i,   expr: smt::word(0, 4) };
+    let bump_sum = Stmt::Assign { var: sum, expr: sum + step };
+    let bump_i   = Stmt::Assign { var: i,   expr: i + 1u32 };
+    let body     = Stmt::Seq { first: &bump_sum, second: &bump_i };
+
+    // The invariant carries the arithmetic link; this is the human's job.
+    let inv = smt::and(i.le(n), sum.eq(smt::mul(i, step)));
+    let loop_ = Stmt::While { cond: i.lt(n), invariant: inv, body: &body };
+    let prog = Stmt::Seq {
+        first: &init_sum,
+        second: &Stmt::Seq { first: &init_i, second: &loop_ },
+    };
+
+    wp::verify(&prog, pre, sum.le(smt::mul(n, step)))     // ensures
+});
+
+for ob in report.obligations.iter().flatten() {
+    println!("{:?}: {}", ob.rule, ob.discharge());   // LoopPreserve: valid
+}                                                    // LoopExit: valid
+assert!(report.is_verified());
+```
+
+Run it: `cargo run --features std --example pipeline`.
+
+Three things about `wp` are worth knowing, because each is a place where a naive
+implementation quietly proves the wrong thing:
+
+1. **The walk starts at the postcondition.** Backward from `post`, through the
+   body, to a weakest precondition; the contract is `pre => wp(body, post)`.
+   Starting from `pre` instead yields a vacuous condition that "verifies" almost
+   anything.
+2. **Loop obligations are universally quantified over the loop-head state.** They
+   are recorded in loop-head terms and *not* rewritten by the assignments that
+   dominate the loop. Rewriting them makes them trivially true whenever the
+   initialisation pins the variables, which turns a broken invariant green.
+   Assertions are the opposite: they are checked where control reaches them, so
+   the dominating assignments *do* apply.
+3. **Only partial correctness is claimed.** Hoare logic says "correct if it
+   exits". There is no variant, so a divergent loop can still be verified — and
+   `tests/wp.rs` contains a test that proves a divergent loop and demonstrates the
+   divergence by execution, so the boundary is documented rather than hidden.
+
+### When the engine says `Unknown`, hand the formula to a solver
+
+`smtscript` prints the *same* formula the engine reasoned about as SMT-LIB2, with
+variables declared and the goal negated, so `unsat` from any compliant solver is a
+proof:
+
+```rust
+let vars = [sum, i, n, step];
+let q = Query::new(&vars, report.contract.goal);
+println!("{}", q.to_smtlib2_string());
+```
+
+```text
+(set-logic QF_BV)
+(declare-fun x0_4 () (_ BitVec 4))
+...
+(assert (not (bvor ... )))
+(check-sat)
+(get-model)
+```
+
+Independence matters for a safety argument: a proof reproduced by a *different*
+tool from a textual artifact is stronger evidence than one produced by the same
+code that generated the obligation. The exporter needs no `std` — it writes into
+any `core::fmt::Write`, including a fixed buffer on bare metal.
 
 ## What this is *not* — read this before trusting a green test
 
@@ -90,6 +180,10 @@ Honesty matters more than a nice README, so:
 1. **It does not model memory, pointers, aliasing, or concurrency.** The logic is
    bit-vectors and booleans. You cannot state "this pointer is valid" or "these
    two threads do not race" in it. That is a different tool.
+1b. **Hoare logic gives partial correctness only.** `wp` does not prove
+   termination; there is no variant. A divergent loop can verify.
+1c. **`with_fresh` must not be nested.** The inner call wipes the term arena and
+   invalidates every `Var` the outer scope holds. One `with_fresh` per proof.
 2. **The BDD engine hits a wall, and says so.** Boolean *equality of two wide
    multipliers* is the classic blow-up: `(a*b)*c == a*(b*c)` at 12 bits returns
    `Unknown`, and the test suite asserts exactly that. This is why `Unknown` is a
@@ -140,12 +234,16 @@ sparkrs/
 │   ├── exhaustive.rs   complete proofs by enumeration
 │   ├── primitives.rs   total ops, Bounded<MIN,MAX>
 │   └── macros.rs       verify!, contract!, proof!, ...
+│   ├── wp.rs           Hoare logic + automatic VC generation
+│   └── smtscript.rs    SMT-LIB2 export for independent checking
 ├── tests/
 │   ├── smoke.rs        the engine proves real identities
 │   ├── kernel.rs       the proof kernel, including a compile-fail case
-│   └── differential.rs symbolic prover vs brute-force execution
+│   ├── differential.rs symbolic prover vs brute-force execution
+│   └── wp.rs           generated conditions checked against execution
 └── examples/
-    └── flight_control.rs  a realistic actuator path, all obligations discharged
+    ├── flight_control.rs  a realistic actuator path, all obligations discharged
+    └── pipeline.rs        program -> conditions -> proofs -> SMT-LIB2
 ```
 
 ## Building and testing

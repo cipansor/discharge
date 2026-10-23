@@ -68,8 +68,10 @@ pub mod macros;
 pub mod primitives;
 pub mod proof;
 pub mod smt;
+pub mod smtscript;
 pub mod sym;
 pub mod vc;
+pub mod wp;
 
 /// The names you almost always want: the prover entry points, the symbolic
 /// constructors, and the verification macros.
@@ -87,6 +89,8 @@ pub mod prelude {
         Var, Verdict,
     };
     pub use crate::vc::{ensures, invariant, requires, verify_body, verify_contract, Verified};
+    pub use crate::smtscript::Query;
+    pub use crate::wp::{verify as verify_program, Rule, Stmt};
 
     // Macros live at the crate root; re-export them so `use prelude::*` is enough.
     pub use crate::{assert_proof, check, contract, proof, verify, verify_exhaustive, verify_implies};

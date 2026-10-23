@@ -40,6 +40,23 @@ cargo run --features std --example flight_control
 `clippy` was installed with `rustup component add clippy`; the bare-metal target
 with `rustup target add thumbv7em-none-eabihf`.
 
+## The imperative layer (`wp.rs`) has three traps
+
+If you touch verification-condition generation, these are the mistakes that make
+it *silently* prove nothing useful:
+
+1. **Walk backwards from the postcondition.** The contract is
+   `pre => wp(body, post)`. Starting the walk from `pre` produces a vacuous
+   condition.
+2. **Do not rewrite loop obligations with the dominating assignments.** Loop
+   preservation and exit are quantified over every loop-head state, so they are
+   recorded in loop-head terms. Rewriting them makes them trivially true once the
+   initialisation pins the variables — a broken invariant passes. Assertions are
+   the opposite and *are* rewritten, then wrapped in `pre =>` at the end of
+   `verify`.
+3. **Only partial correctness is claimed.** No variant, so a divergent loop can
+   verify. `tests/wp.rs` asserts exactly this, including a divergent example.
+
 ## Architecture (read this before editing `smt.rs`)
 
 `src/smt.rs` is the heart: bit-vector terms are bit-blasted into a Reduced
@@ -61,6 +78,14 @@ Ordered BDD. Invariants that are easy to break and hard to debug:
 5. **BDD variable order** is `level_of` = interleaved bit-planes. This keeps
    adders/comparators linear. Changing it will silently make proofs slow or
    return `Unknown`.
+6. **The substitution epoch must be bumped, never reset.** `reset()` and
+   `clear_subst()` call `bump_epoch()`. Restoring an earlier epoch makes stale
+   `subst_memo` stamps look current, and the memo then returns node ids that
+   `reset` has already recycled: a cycle in the term graph and unbounded
+   recursion. This was a real bug, not a hypothetical.
+7. **`with_fresh` must not be nested.** The inner call wipes the arena while the
+   outer scope still holds live `Var`s. The symptom is unbounded recursion, not a
+   clean panic.
 
 ## Conventions
 

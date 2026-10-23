@@ -141,10 +141,10 @@ impl fmt::Display for Verdict {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Term(u32);
+pub(crate) struct Term(pub(crate) u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Op {
+pub(crate) enum Op {
     Var,
     Const,
     Not,
@@ -164,14 +164,14 @@ enum Op {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Node {
-    op: Op,
-    a: u32,
-    b: u32,
-    c: u32,
-    width: u8,
+pub(crate) struct Node {
+    pub(crate) op: Op,
+    pub(crate) a: u32,
+    pub(crate) b: u32,
+    pub(crate) c: u32,
+    pub(crate) width: u8,
     /// High 32 bits of a constant payload.
-    hi: u32,
+    pub(crate) hi: u32,
 }
 
 const FALSE: u32 = 0;
@@ -192,7 +192,7 @@ const fn level_of(v: u32) -> u32 {
 // Manager
 // ---------------------------------------------------------------------------
 
-struct Ctx {
+pub(crate) struct Ctx {
     terms: [Node; CAP],
     n_terms: usize,
     term_key: [u64; CAP],
@@ -221,7 +221,19 @@ struct Ctx {
     n_vars: usize,
     overflow: bool,
     ready: bool,
+
+    // ---- substitution support (weakest-precondition generation) ----
+    // `subst_val[i]` is the replacement term for variable `i`, or `NO_SUBST`.
+    subst_val: [u32; MAX_VARS],
+    // Memo for `subst`, stamped with the current epoch so it never needs
+    // clearing when a new substitution begins.
+    subst_memo: [u32; CAP],
+    subst_epoch: [u32; CAP],
+    epoch: u32,
 }
+
+/// Sentinel: variable `i` has no replacement.
+const NO_SUBST: u32 = u32::MAX;
 
 impl Ctx {
     const fn new() -> Self {
@@ -250,6 +262,10 @@ impl Ctx {
             n_vars: 0,
             overflow: false,
             ready: false,
+            subst_val: [NO_SUBST; MAX_VARS],
+            subst_memo: [0; CAP],
+            subst_epoch: [0; CAP],
+            epoch: 1,
         }
     }
 
@@ -278,7 +294,11 @@ impl Ctx {
         }
         for i in 0..MAX_VARS {
             self.var_width[i] = 0;
+            self.subst_val[i] = NO_SUBST;
         }
+        // A fresh epoch invalidates every memo entry without touching the array.
+        // It must be bumped, not reset: see `bump_epoch`.
+        self.bump_epoch();
         self.ensure_ready();
     }
 
@@ -363,8 +383,111 @@ impl Ctx {
         self.terms[t.0 as usize]
     }
 
-    fn width_of(&self, t: Term) -> u8 {
+    pub(crate) fn width_of(&self, t: Term) -> u8 {
         self.terms[t.0 as usize].width
+    }
+
+    /// Read a term's node. Exposed to the crate so the SMT-LIB exporter can walk
+    /// the same IR the solver reasons about, instead of re-deriving it.
+    pub(crate) fn node_pub(&self, t: Term) -> Node {
+        self.terms[t.0 as usize]
+    }
+
+    // ------------------------- substitution -------------------------
+
+    /// Record that variable `idx` is replaced by term `with` for subsequent
+    /// [`Ctx::subst`] calls. Calling this again with the same `idx` replaces the
+    /// previous binding, which is exactly what a sequence of assignments needs.
+    fn set_subst(&mut self, idx: u32, with: Term) {
+        if (idx as usize) < MAX_VARS {
+            self.subst_val[idx as usize] = with.0;
+        }
+    }
+
+    /// Forget every binding and start a new substitution epoch.
+    fn clear_subst(&mut self) {
+        for i in 0..MAX_VARS {
+            self.subst_val[i] = NO_SUBST;
+        }
+        self.bump_epoch();
+    }
+
+    /// Advance the substitution epoch, invalidating every memo entry.
+    ///
+    /// This must be a *bump*, never a reset to a fixed value. Restoring a
+    /// previous epoch would make stamps from that epoch look current again, and
+    /// the memo would hand back node ids that `reset` has since recycled. The
+    /// result is a cycle in the term graph and unbounded recursion.
+    fn bump_epoch(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            // The counter wrapped, so the stamps are meaningless: clear them.
+            for i in 0..CAP {
+                self.subst_epoch[i] = 0;
+            }
+            self.epoch = 1;
+        }
+    }
+
+    /// Substitute the currently registered variables throughout `t`, rebuilding
+    /// the term bottom-up.
+    ///
+    /// Substitution must go bottom-up because a replacement may itself mention a
+    /// variable that is also being replaced (the classic `x, y := y, x` case).
+    /// Doing it top-down would capture those variables and prove the wrong thing.
+    fn subst(&mut self, t: Term) -> Term {
+        let n = self.node_of(t);
+        match n.op {
+            Op::Var => {
+                let r = self.subst_val[n.a as usize];
+                if r == NO_SUBST {
+                    t
+                } else {
+                    Term(r)
+                }
+            }
+            Op::Const => t,
+            _ => {
+                // Memo keyed by term id, valid only within the current epoch.
+                let key = t.0 as usize;
+                if self.subst_epoch[key] == self.epoch {
+                    return Term(self.subst_memo[key]);
+                }
+                let a = self.subst(Term(n.a));
+                let b = if n.op == Op::Not {
+                    Term(0)
+                } else {
+                    self.subst(Term(n.b))
+                };
+                let c = if n.op == Op::Ite {
+                    self.subst(Term(n.c))
+                } else {
+                    Term(0)
+                };
+                let rebuilt = match n.op {
+                    Op::Not => self.mk_term(Node { op: n.op, a: a.0, b: 0, c: 0, width: n.width, hi: 0 }),
+                    Op::Shl | Op::LShr | Op::Shr => {
+                        self.mk_term(Node { op: n.op, a: a.0, b: n.b, c: 0, width: n.width, hi: 0 })
+                    }
+                    Op::Ite => self.mk_term(Node {
+                        op: n.op,
+                        a: a.0,
+                        b: b.0,
+                        c: c.0,
+                        width: n.width,
+                        hi: 0,
+                    }),
+                    _ => self.mk_term(Node { op: n.op, a: a.0, b: b.0, c: 0, width: n.width, hi: 0 }),
+                };
+                // Do not memoise after an arena overflow: the rebuilt term is
+                // meaningless then, and caching it would corrupt later queries.
+                if !self.overflow {
+                    self.subst_memo[key] = rebuilt.0;
+                    self.subst_epoch[key] = self.epoch;
+                }
+                rebuilt
+            }
+        }
     }
 
     fn konst(&mut self, v: u64, width: u8) -> Term {
@@ -890,7 +1013,7 @@ thread_local! {
 }
 
 #[cfg(feature = "std")]
-fn with_ctx<R>(f: impl FnOnce(&mut Ctx) -> R) -> R {
+pub(crate) fn with_ctx<R>(f: impl FnOnce(&mut Ctx) -> R) -> R {
     CTX.with(|c| {
         let mut c = c.borrow_mut();
         c.ensure_ready();
@@ -902,7 +1025,7 @@ fn with_ctx<R>(f: impl FnOnce(&mut Ctx) -> R) -> R {
 static mut CTX: Ctx = Ctx::new();
 
 #[cfg(not(feature = "std"))]
-fn with_ctx<R>(f: impl FnOnce(&mut Ctx) -> R) -> R {
+pub(crate) fn with_ctx<R>(f: impl FnOnce(&mut Ctx) -> R) -> R {
     // SAFETY: bare-metal `no_std` builds of this crate are single-threaded by
     // construction (the arena is not `Send`/`Sync` and is documented as such).
     // Callers running it from both an interrupt and main context must wrap the
@@ -919,6 +1042,11 @@ pub fn with_fresh<R>(f: impl FnOnce() -> R) -> R {
     with_ctx(|c| c.reset());
     f()
 }
+
+// NOTE: `with_fresh` must not be nested. The inner call wipes the arena, which
+// invalidates every `Var` and `Pred` the enclosing scope is still holding; using
+// one afterwards is use-after-free in the term arena and typically shows up as
+// unbounded recursion rather than a clean panic. One `with_fresh` per proof.
 
 /// Reset the global arena.
 pub fn reset() {
@@ -1208,4 +1336,43 @@ pub fn prove_equiv(a: Pred, b: Pred) -> Verdict {
 /// Find an input satisfying `p`; `Valid` means "always satisfiable".
 pub fn find_model(p: Pred) -> Verdict {
     with_ctx(|c| c.query_model(p.0))
+}
+
+// --- substitution (the engine behind weakest-precondition generation) -------
+
+/// Apply `bindings` to a word, returning the rewritten word.
+///
+/// Bindings are simultaneous: `[(x, y), (y, x)]` swaps the two variables rather
+/// than assigning `x := y` and then clobbering `y` with the already-updated `x`.
+/// This is what makes assignment semantics in [`crate::wp`] correct.
+pub fn substitute_word(w: Var, bindings: &[(Var, Var)]) -> Var {
+    with_ctx(|c| {
+        c.clear_subst();
+        for (from, to) in bindings {
+            let idx = c.node_of(from.0).a;
+            c.set_subst(idx, to.0);
+        }
+        Var(c.subst(w.0))
+    })
+}
+
+/// The internal shape of `p`, for tools that need to walk the formula.
+///
+/// This is the crate's escape hatch for the SMT-LIB exporter in
+/// [`crate::smtscript`]. It is deliberately `pub(crate)`: the representation is
+/// not a stable interface.
+pub(crate) fn pred_node(p: Pred) -> Node {
+    with_ctx(|c| c.node_pub(p.0))
+}
+
+/// Apply `bindings` to a predicate, returning the rewritten predicate.
+pub fn substitute(p: Pred, bindings: &[(Var, Var)]) -> Pred {
+    with_ctx(|c| {
+        c.clear_subst();
+        for (from, to) in bindings {
+            let idx = c.node_of(from.0).a;
+            c.set_subst(idx, to.0);
+        }
+        Pred(c.subst(p.0))
+    })
 }
