@@ -64,6 +64,26 @@ it *silently* prove nothing useful:
    A known gap: `variant_after` treats a nested `while` as a no-op, so an outer
    measure must already account for the inner loop.
 
+## The memory layer (`mem.rs`) is a bounded array, not a heap
+
+`Mem` is `2^addr_width` cells, one symbolic word each. `read` at a symbolic address
+is an ite chain; `store` is a *simultaneous* update produced by `store_binds` and
+applied through `smt::substitute` (or `Stmt::AssignMany`). Two things to keep in
+mind when editing:
+
+1. **Address width must match the cell count exactly.** A wider address could name
+   a value that is not a cell and would silently alias onto the last one, so
+   `check_addr` rejects it. `declare`/`Mem::new` enforce the power-of-two length
+   and the `MAX_CELLS` cap.
+2. **Old values need capturing.** A postcondition lives in the final state, so
+   substitution rewrites every cell variable in it. Writing `m.read(i)` in a
+   postcondition means the *new* contents; assign old contents to fresh variables
+   first. `tests/mem.rs` shows the swap done correctly.
+3. **No prefix predicates.** `for k in 0..n { m[k] := 0 }` is not verifiable: its
+   invariant would need "all cells below k", which a flat ite chain cannot express.
+   Unroll instead. Do not "fix" this by adding quantifiers to the bit-vector logic;
+   that is a different decision procedure.
+
 ## Architecture (read this before editing `smt.rs`)
 
 `src/smt.rs` is the heart: bit-vector terms are bit-blasted into a Reduced

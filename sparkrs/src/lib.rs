@@ -65,6 +65,7 @@ pub mod contract;
 pub mod exhaustive;
 pub mod logic;
 pub mod macros;
+pub mod mem;
 pub mod primitives;
 pub mod proof;
 pub mod smt;
@@ -89,6 +90,7 @@ pub mod prelude {
         Var, Verdict,
     };
     pub use crate::vc::{ensures, invariant, requires, verify_body, verify_contract, Verified};
+    pub use crate::mem::{declare as declare_memory, Mem};
     pub use crate::smtscript::Query;
     pub use crate::wp::{verify as verify_program, Correctness, Rule, Stmt};
 

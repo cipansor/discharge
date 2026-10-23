@@ -81,6 +81,7 @@ obligation. That is what `examples/flight_control.rs` demonstrates.
 | `vc` | `requires`/`ensures`/`invariant`, `verify_body`, `Verified<T>` |
 | `wp` | Hoare logic: weakest preconditions, automatic VC generation, loop rules, termination by variant |
 | `smtscript` | SMT-LIB2 export, so an external solver can check the same formula |
+| `mem` | Bounded symbolic memory: `read`/`store`, frame condition, composes with `wp` |
 | `exhaustive` | Complete proofs by enumeration over `u8`/`u16` |
 | `primitives` | Total integer ops and a refinement-typed `Bounded<MIN, MAX>` |
 | `macros` | `verify!`, `verify_implies!`, `contract!`, `proof!`, `assert_proof!`, `check!`, `verify_exhaustive!` |
@@ -219,13 +220,85 @@ tool from a textual artifact is stronger evidence than one produced by the same
 code that generated the obligation. The exporter needs no `std` — it writes into
 any `core::fmt::Write`, including a fixed buffer on bare metal.
 
+## Memory: `read`, `store`, and the frame condition
+
+Bit-vector logic cannot say "this array element is unchanged". `mem` adds the one
+theory that matters most for safety-critical code, without touching the decision
+procedure: a memory of `2^addr_width` cells, each cell an ordinary symbolic word.
+
+```rust
+use sparkrs::mem::{declare, Mem};
+
+smt::with_fresh(|| {
+    let mut buf = [var(8); 4];
+    let n = declare(2, 8, &mut buf);          // 4 cells, 8 bits each
+    let m = Mem::new(&buf[..n], 8);
+
+    let addr = var(2);
+    let val  = var(8);
+    let at   = var(2);
+
+    // The frame condition, proved for every address and value.
+    assert_eq!(smt::prove(m.frame_lemma(addr, val, at)), Verdict::Valid);
+
+    // A write, then a read back.
+    let readback = m.store_wp(addr, val, smt::eq(m.read(addr), val));
+    assert_eq!(smt::prove(readback), Verdict::Valid);
+});
+```
+
+Run it: `cargo run --features std --example memory`.
+
+Reading at a *concrete* address is a slice index. Reading at a *symbolic* address
+is an ite chain, `ite(a == 0, m[0], ite(a == 1, m[1], ...))`. Because the address
+has exactly `addr_width` bits, every value names exactly one cell: the encoding is
+exact, with no default cell and no aliasing.
+
+Writing is not mutation. `store(m, a, v)` is a *simultaneous* update of every
+cell, `m'[k] = ite(a == k, v, m[k])`, produced by `Mem::store_binds`. That is the
+same mechanism `wp` uses for assignment, which is why a memory write slots into
+verification-condition generation with no new machinery — hand the bindings to
+`Stmt::AssignMany` and the write becomes part of the program the engine reasons
+about.
+
+Two consequences are worth stating, because they are where people trip:
+
+1. **The frame condition is a theorem, not a chore.** "A write to `a` leaves `b`
+   alone" follows from `frame_lemma` rather than needing to be re-stated at every
+   call site.
+2. **Old values must be captured explicitly.** A postcondition is evaluated in the
+   final state, and substitution rewrites every cell variable in it, so
+   `m.read(i)` written directly in a postcondition means the *new* contents. To
+   talk about the old contents you assign them to fresh variables first — the same
+   discipline as SPARK's `m'Old`. `tests/mem.rs` verifies a swap this way.
+
+### The memory limit, stated plainly
+
+Bounds are *structural*: an address is `addr_width` bits, so it cannot name a cell
+outside the memory. Out-of-range access is unrepresentable rather than proved
+absent, which is a strong guarantee — but it means you must size the memory to the
+largest address the real code can produce, and if that is not known, this is the
+wrong tool.
+
+A loop over addresses (`for k in 0..n { m[k] := 0 }`) is **not** verifiable here.
+Its invariant would have to say "every cell below `k` is zero", and that is a
+prefix predicate the representation does not have: a symbolic read is a flat ite
+chain over individual cells, with no notion of a range. Universal statements over
+addresses would need a quantifier the bit-vector logic does not provide. Unroll the
+loop, or state the property cell by cell — both are verified in
+`examples/memory.rs`.
+
+Cost: a symbolic read is `2^addr_width` ites and the BDD sees all of them, so
+`MAX_CELLS` caps a memory at 64 cells (6 address bits).
+
 ## What this is *not* — read this before trusting a green test
 
 Honesty matters more than a nice README, so:
 
-1. **It does not model memory, pointers, aliasing, or concurrency.** The logic is
-   bit-vectors and booleans. You cannot state "this pointer is valid" or "these
-   two threads do not race" in it. That is a different tool.
+1. **Pointers, aliasing and concurrency are still out of scope.** `mem` models a
+   bounded *array*, addressed by an integer. It does not model pointers, address
+   arithmetic across objects, or two threads touching the same cell. You cannot
+   state "this pointer is valid" or "these two threads do not race" in it.
 1b. **Termination needs a variant.** Without one, `wp` proves partial correctness
    only: a divergent loop can verify. There is no inference of variants — you
    supply the measure, the engine checks it decreases.
@@ -286,15 +359,18 @@ sparkrs/
 │   ├── primitives.rs   total ops, Bounded<MIN,MAX>
 │   └── macros.rs       verify!, contract!, proof!, ...
 │   ├── wp.rs           Hoare logic + automatic VC generation
-│   └── smtscript.rs    SMT-LIB2 export for independent checking
+│   ├── smtscript.rs    SMT-LIB2 export for independent checking
+│   └── mem.rs          bounded symbolic memory + frame condition
 ├── tests/
 │   ├── smoke.rs        the engine proves real identities
 │   ├── kernel.rs       the proof kernel, including a compile-fail case
 │   ├── differential.rs symbolic prover vs brute-force execution
-│   └── wp.rs           generated conditions checked against execution
+│   ├── wp.rs           generated conditions checked against execution
+│   └── mem.rs          memory proofs checked against real Rust arrays
 └── examples/
     ├── flight_control.rs  a realistic actuator path, all obligations discharged
-    └── pipeline.rs        program -> conditions -> proofs -> SMT-LIB2
+    ├── pipeline.rs        program -> conditions -> proofs -> SMT-LIB2
+    └── memory.rs          read/store, the frame condition, and the loop limit
 ```
 
 ## Building and testing

@@ -36,6 +36,19 @@ pub enum Stmt<'a> {
         /// The expression assigned to it.
         expr: Var,
     },
+    /// A simultaneous multi-assignment, `v1, v2, ... := e1, e2, ...`.
+    ///
+    /// Every right-hand side is read in the *old* state, so this is a parallel
+    /// assignment, not a sequence of single ones. It exists so that a memory write
+    /// composes with verification-condition generation: [`crate::mem::Mem::store_binds`]
+    /// produces the binding list for a store, and handing it here makes the write
+    /// part of the program the engine reasons about.
+    AssignMany {
+        /// The `(target, expression)` pairs. Targets must be distinct; a repeated
+        /// target would make the semantics depend on evaluation order, which is
+        /// exactly what a simultaneous assignment is meant to rule out.
+        binds: &'a [(Var, Var)],
+    },
     /// Assume `cond`: only states satisfying it continue. This is how a
     /// precondition or a successful earlier check enters the reasoning.
     Assume(Pred),
@@ -202,6 +215,20 @@ fn collect<'a>(
                 }
             }
         }
+        Stmt::AssignMany { binds } => {
+            debug_assert!(distinct_targets(binds), "AssignMany targets must be distinct");
+            *cursor = smt::substitute(*cursor, binds);
+            for slot in out[start..*n].iter_mut() {
+                if let Some(ob) = slot {
+                    if ob.rule == Rule::Assertion {
+                        *slot = Some(Obligation {
+                            rule: ob.rule,
+                            goal: smt::substitute(ob.goal, binds),
+                        });
+                    }
+                }
+            }
+        }
         Stmt::Assume(c) => {
             *cursor = smt::implies(*c, *cursor);
         }
@@ -295,6 +322,7 @@ fn wp_of(s: &Stmt<'_>, post: Pred) -> Pred {
     match s {
         Stmt::Skip => post,
         Stmt::Assign { var, expr } => smt::substitute(post, &[(*var, *expr)]),
+        Stmt::AssignMany { binds } => smt::substitute(post, binds),
         Stmt::Assume(cond) => smt::implies(*cond, post),
         Stmt::Assert(cond) => smt::and(*cond, post),
         Stmt::Seq { first, second } => {
@@ -315,6 +343,22 @@ pub fn ite_pred(c: Pred, t: Pred, e: Pred) -> Pred {
     smt::or(smt::and(c, t), smt::and(smt::not(c), e))
 }
 
+/// Whether every target in a simultaneous assignment is distinct.
+///
+/// A repeated target would make the result depend on evaluation order, which is
+/// the one thing a simultaneous assignment is supposed to rule out. This is
+/// quadratic, but only runs under `debug_assertions` and the lists are short.
+fn distinct_targets(binds: &[(Var, Var)]) -> bool {
+    for (i, (target, _)) in binds.iter().enumerate() {
+        for (other, _) in binds.iter().skip(i + 1) {
+            if target == other {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// The value of the expression `e` after executing `s`, as a symbolic word.
 ///
 /// This is symbolic evaluation, not the weakest-precondition calculus: it builds
@@ -330,6 +374,7 @@ pub fn variant_after(s: &Stmt<'_>, e: Var) -> Var {
     match s {
         Stmt::Skip | Stmt::Assume(_) | Stmt::Assert(_) => e,
         Stmt::Assign { var, expr } => smt::substitute_word(e, &[(*var, *expr)]),
+        Stmt::AssignMany { binds } => smt::substitute_word(e, binds),
         Stmt::Seq { first, second } => variant_after(first, variant_after(second, e)),
         Stmt::If { cond, then_, else_ } => {
             let t = variant_after(then_, e);
