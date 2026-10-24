@@ -383,8 +383,19 @@ alone would not show the postcondition was being used.
 
 ### What a call is not allowed to do
 
-`Stmt::frame` rejects four things, and each is a real hole rather than tidiness:
+`Stmt::frame` rejects five things, and each is a real hole rather than tidiness. The
+declared frame is checked against the frame **derived from the body** by `wp::writes`,
+so it cannot be under-stated:
 
+0. **`writes` must be complete.** This one is the sharpest. A caller that declares an
+   empty frame for a callee that clobbers a variable is not making a bookkeeping
+   error — it is asking the engine to prove that the variable survived, and the
+   engine used to comply. I found this by probing rather than reasoning: the caller
+   "proved" `s == 7` after a call that had overwritten `s` with `6`. A proof about a
+   program that does not exist is worse than no proof, so the derived frame is now
+   computed from the body (recursing through branches, loops and nested calls, and
+   mapping a nested callee's writes through that call's actuals) and the declared
+   frame must cover it. Over-declaring is still fine: the rule is conservative.
 1. **A write the caller does not name.** The caller's state after the call would be
    unknown. Reported as `Rule::CallFrame`.
 2. **A rename that is not a function** — a repeated callee variable.
@@ -400,6 +411,42 @@ alone would not show the postcondition was being used.
 
 An unmodelled call is reported as an obligation that can never hold, not asserted
 away, so a whole program can be checked in one run.
+
+### A call havocs what it writes
+
+The other half of the frame rule, and a soundness fix rather than a refinement. The
+caller-side target of every write is renamed to a **fresh variable** in both the
+assumed postcondition and the continuation. Without that the two sides share a name,
+and the value the variable held *before* the call is mistaken for the value it holds
+after — so `c := 99; c := bump(a); assert c == 99` verified. It no longer does. The
+fresh name is universally quantified by the prover, which is exactly the right
+reading: the caller must be correct for every result the contract permits.
+
+### Two-state specifications need a snapshot, not an `old` operator
+
+"The result equals the argument that came in, plus one" is a two-state property, and
+it needs no new machinery. A variable the callee cannot write has the same value
+before and after, so `old(x)` *is* `x` — provided the frame is honest, which is now
+enforced. The snapshot is an ordinary assignment:
+
+```rust
+a := 5;  old_a := a;  c := bump(a)
+assert c == old_a + 1 && a == old_a
+```
+
+What was missing was not a way to *write* `old(v)` but a way to **ask** which
+variables survive, because the engine was already assuming it silently:
+
+```rust
+wp::unchanged(&bump, &actuals, a)    // true  -- read-only, so it survives
+wp::unchanged(&bump, &actuals, c)    // false -- written, so its old value is gone
+```
+
+Both answer from the *derived* frame, so a caller cannot talk the query into a wrong
+answer. For a written variable there is no query that helps: the caller must capture
+the entry value into a temporary first, exactly as for a memory swap. That is a
+discipline, not a convenience, and `the_snapshot_discipline_is_needed_for_written_variables`
+is its control.
 
 ### The sharp edge, stated rather than hidden
 

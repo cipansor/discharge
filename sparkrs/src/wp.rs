@@ -311,8 +311,20 @@ fn collect<'a>(
             // Conjoining would demand that the callee's result satisfy the caller's
             // postcondition on its own, which is not the rule and makes every
             // interesting call unprovable.
+            //
+            // The written variables are *havoced* first: each caller-side target is
+            // renamed to a fresh variable, in both the assumption and the
+            // continuation. Without this the two sides share a name, and then the
+            // value the variable held *before* the call is mistaken for the value it
+            // holds after — so `c := 99; c := bump(a)` would "prove" `c == 99`. The
+            // fresh name is universally quantified by the prover, which is exactly
+            // the right reading: the caller must be correct for *every* result the
+            // contract permits.
             let renamed_ensures = smt::substitute(proc_.ensures, actuals);
-            *cursor = smt::implies(renamed_ensures, *cursor);
+            let (havoc, n_havoc) = havoc_writes(actuals, writes);
+            let renamed_ensures = smt::substitute(renamed_ensures, &havoc[..n_havoc]);
+            let continuation = smt::substitute(*cursor, &havoc[..n_havoc]);
+            *cursor = smt::implies(renamed_ensures, continuation);
         }
         Stmt::Assume(c) => {
             *cursor = smt::implies(*c, *cursor);
@@ -373,6 +385,30 @@ fn collect<'a>(
     }
 }
 
+/// Fresh variables standing for the caller-side targets a call may write.
+///
+/// Returns a `(target, fresh)` substitution. Applying it to both the assumed
+/// postcondition and the continuation keeps the pre-call and post-call values of a
+/// written variable apart, which is what makes the call rule sound; see the comment
+/// in [`collect`].
+fn havoc_writes(actuals: &[(Var, Var)], writes: &[Var]) -> ([(Var, Var); MAX_CALL_ARGS], usize) {
+    let mut out = [(Var::SENTINEL, Var::SENTINEL); MAX_CALL_ARGS];
+    let mut n = 0;
+    for w in writes.iter() {
+        let Some((_, local)) = actuals.iter().find(|(g, _)| g == w) else {
+            continue;
+        };
+        if out[..n].iter().any(|(t, _)| t == local) {
+            continue;
+        }
+        if n < MAX_CALL_ARGS {
+            out[n] = (*local, smt::var(smt::bits(*local)));
+            n += 1;
+        }
+    }
+    (out, n)
+}
+
 impl<'a> Stmt<'a> {
     /// Whether a call can be justified: every variable the callee may write must
     /// appear in the caller's `actuals`, so that the write has somewhere to land.
@@ -386,6 +422,14 @@ impl<'a> Stmt<'a> {
     /// [`verify`] reports it as a failure rather than silently assuming the frame.
     ///
     /// # What the check rules out, and why each one is needed
+    ///
+    /// 0. **`writes` must be complete.** This is the one that matters most, and it
+    ///    was missing at first. The declared frame is compared against the frame
+    ///    *derived from the body* by [`writes`], and every derived write must be
+    ///    declared. Without this, a caller could declare an empty frame for a callee
+    ///    that clobbers a variable, and the engine would happily prove that the
+    ///    variable survived — a proof about a program that does not exist. See
+    ///    `under_declaring_the_frame_is_rejected` in `tests/call.rs`.
     ///
     /// 1. **Every write must have a target.** Otherwise the callee writes a
     ///    variable the caller does not name, the caller's state after the call is
@@ -404,16 +448,25 @@ impl<'a> Stmt<'a> {
     ///    value into a temporary first, exactly as it must for a memory swap
     ///    (`oi := m[i]`). `tests/call.rs` pins this.
     ///
-    /// # Only the *shape* is checked here
+    /// # What is still trusted
     ///
-    /// This asks whether the write is expressible, not whether it is *right*. A
-    /// caller who renames a write onto the wrong variable passes the check and
-    /// still proves nonsense about the variable it actually reads. That is a real
-    /// limitation, stated rather than left to be discovered: the rename is trusted,
-    /// and a caller that gets it wrong gets a proof about a program it did not
-    /// write.
-    pub fn frame(proc_: &Proc<'_>, actuals: &[(Var, Var)], writes: &[Var]) -> bool {
-        let _ = proc_;
+    /// The *rename* is not checked for meaning. A caller who maps the callee's
+    /// result onto the wrong variable passes every check here and still proves
+    /// nonsense about the variable it actually reads. Likewise a contract whose body
+    /// never established it will be believed by every caller. Neither is fixable by
+    /// a smarter check: the remedy is [`verify_proc`] on every body, and the
+    /// limitation is stated here rather than left to be discovered.
+    pub fn frame(proc_: &Proc<'_>, actuals: &[(Var, Var)], declared: &[Var]) -> bool {
+        // 0. The declared frame must cover the real one. This is a *soundness*
+        //    requirement, not a tidiness one: an under-declared frame lets the
+        //    caller assume a variable survived a call that overwrote it.
+        let (derived, n_derived) = writes(proc_.body);
+        if !derived[..n_derived].iter().all(|w| declared.contains(w)) {
+            return false;
+        }
+        // Everything below is about the *shape* of the rename, which the derived
+        // frame above already relies on to be meaningful.
+        let writes = declared;
         // 1. Every write has a target in the caller.
         if !writes
             .iter()
@@ -494,8 +547,12 @@ fn wp_of(s: &Stmt<'_>, post: Pred) -> Pred {
         Stmt::Skip => post,
         Stmt::Assign { var, expr } => smt::substitute(post, &[(*var, *expr)]),
         Stmt::AssignMany { binds } => smt::substitute(post, binds),
-        Stmt::Call { proc_, actuals, .. } => {
+        Stmt::Call { proc_, actuals, writes } => {
+            // Same rule as `collect`, including the havoc; see the comment there.
             let renamed = smt::substitute(proc_.ensures, actuals);
+            let (havoc, n_havoc) = havoc_writes(actuals, writes);
+            let renamed = smt::substitute(renamed, &havoc[..n_havoc]);
+            let post = smt::substitute(post, &havoc[..n_havoc]);
             smt::implies(renamed, post)
         }
         Stmt::Assume(cond) => smt::implies(*cond, post),
@@ -548,10 +605,15 @@ fn distinct_targets(binds: &[(Var, Var)]) -> bool {
 pub fn variant_after(s: &Stmt<'_>, e: Var) -> Var {
     match s {
         Stmt::Skip | Stmt::Assume(_) | Stmt::Assert(_) => e,
-        // A measure over the caller's own locals survives a call: a callee cannot
-        // write them, because that is what `Stmt::frame` checks. So the value is
-        // unchanged.
-        Stmt::Call { .. } => e,
+        // A measure over a variable the call does not write survives it, because the
+        // derived frame is complete. A measure over one the call *does* write has an
+        // unknown value afterwards, so it is havoced: the resulting obligation then
+        // mentions a fresh variable and cannot be discharged, which is the honest
+        // answer — a call that writes the measure makes termination unprovable.
+        Stmt::Call { actuals, writes, .. } => {
+            let (havoc, n_havoc) = havoc_writes(actuals, writes);
+            smt::substitute_word(e, &havoc[..n_havoc])
+        }
         Stmt::Assign { var, expr } => smt::substitute_word(e, &[(*var, *expr)]),
         Stmt::AssignMany { binds } => smt::substitute_word(e, binds),
         Stmt::Seq { first, second } => variant_after(first, variant_after(second, e)),
@@ -590,6 +652,144 @@ pub const MAX_OBLIGATIONS: usize = 16;
 
 /// The most arguments a call may pass, so the frame check needs no allocator.
 pub const MAX_CALL_ARGS: usize = 16;
+
+/// The most variables one procedure may write.
+pub const MAX_WRITES: usize = 16;
+
+/// The caller's variables a call is guaranteed to leave unchanged.
+///
+/// This is the two-state story, and it turns out to need no `old` operator. A
+/// variable the callee cannot write has the same value before and after the call, so
+/// `old(v)` and `v` are the same thing — *provided* the frame is honest, which
+/// [`Stmt::frame`] now checks. What was missing was not a way to write `old(v)` but a
+/// way to **ask** whether `v` survives, because the engine was already assuming it
+/// silently.
+///
+/// So this is a query, not an assumption. For a variable the callee does write, no
+/// query can help: the caller must capture the entry value into a temporary before
+/// the call, exactly as for a memory swap. `two_state_specs_via_a_caller_snapshot`
+/// in `tests/call.rs` runs that pattern end to end.
+///
+/// The answer is computed from the *derived* frame, not the declared one, so a caller
+/// cannot talk this query into a wrong answer.
+///
+/// The result is in the **caller's** names, which is what a caller can act on: the
+/// arguments the call names but does not write. A caller variable the call never names
+/// is also unchanged, by completeness of the derived frame; the query cannot enumerate
+/// those, because it has never seen the caller's variable set.
+pub fn unchanged_vars<'a>(
+    proc_: &Proc<'_>,
+    actuals: &[(Var, Var)],
+    out: &'a mut [Var; MAX_CALL_ARGS],
+) -> &'a [Var] {
+    // The caller-side images of everything the body may write.
+    let (derived, n) = writes(proc_.body);
+    let mut n_changed = 0;
+    let mut changed = [Var::SENTINEL; MAX_CALL_ARGS];
+    for g in derived[..n].iter() {
+        if let Some((_, l)) = actuals.iter().find(|(global, _)| global == g) {
+            if !changed[..n_changed].contains(l) && n_changed < MAX_CALL_ARGS {
+                changed[n_changed] = *l;
+                n_changed += 1;
+            }
+        }
+    }
+    let mut k = 0;
+    for (_, local) in actuals {
+        // A variable the call names is unchanged exactly when its image is not
+        // written. A caller variable the call does not name is unchanged because the
+        // derived frame is complete, and `frame` refuses to model a call whose
+        // declared frame disagrees with its body.
+        if !changed[..n_changed].contains(local) && k < MAX_CALL_ARGS {
+            out[k] = *local;
+            k += 1;
+        }
+    }
+    &out[..k]
+}
+
+/// Whether a call is guaranteed to leave the caller's variable `g` unchanged.
+///
+/// `g` is a **caller** variable, and it may be named by the call or not; both cases
+/// are answered from the derived frame. See [`unchanged_vars`] for why this needs no
+/// `old` operator.
+///
+/// The declared frame is deliberately *not* an argument. The answer comes from the
+/// body, so a caller cannot talk the query into a wrong answer — and
+/// [`Stmt::frame`] has already refused to model a call whose declared frame disagrees
+/// with its body.
+pub fn unchanged(proc_: &Proc<'_>, actuals: &[(Var, Var)], g: Var) -> bool {
+    let (derived, n) = writes(proc_.body);
+    !derived[..n].iter().any(|w| {
+        actuals
+            .iter()
+            .any(|(global, local)| global == w && *local == g)
+    })
+}
+
+/// The variables a statement may write, derived from its syntax.
+///
+/// This is the *real* frame of a statement, as opposed to the frame its author
+/// claims. The distinction is the whole point: a caller that under-declares what a
+/// callee writes can make the engine believe a variable survived a call that
+/// clobbered it, which is unsound. [`Stmt::frame`] therefore compares the two.
+///
+/// A write inside a branch or a loop still counts. The frame rule is conservative
+/// by construction — "may write" is what matters, not "does write on this path" —
+/// because a caller cannot know which path was taken.
+///
+/// A nested call contributes the caller-side images of its callee's writes, mapped
+/// through that call's `actuals`.
+pub fn writes(s: &Stmt<'_>) -> ([Var; MAX_WRITES], usize) {
+    // Slot 0 is never a real variable: `var()` starts indices at 0, but a
+    // sentinel is all the initialisation needs and it is overwritten before use.
+    let mut out = [Var::SENTINEL; MAX_WRITES];
+    let mut n = 0;
+    collect_written(s, &mut out, &mut n);
+    (out, n)
+}
+
+fn note_written(out: &mut [Var; MAX_WRITES], n: &mut usize, v: Var) {
+    if out[..*n].contains(&v) {
+        return;
+    }
+    if *n < MAX_WRITES {
+        out[*n] = v;
+        *n += 1;
+    }
+}
+
+fn collect_written(s: &Stmt<'_>, out: &mut [Var; MAX_WRITES], n: &mut usize) {
+    match s {
+        Stmt::Assign { var, .. } => note_written(out, n, *var),
+        Stmt::AssignMany { binds } => {
+            for (v, _) in binds.iter() {
+                note_written(out, n, *v);
+            }
+        }
+        Stmt::Seq { first, second } => {
+            collect_written(first, out, n);
+            collect_written(second, out, n);
+        }
+        Stmt::If { then_, else_, .. } => {
+            collect_written(then_, out, n);
+            collect_written(else_, out, n);
+        }
+        Stmt::While { body, .. } => collect_written(body, out, n),
+        Stmt::Call { proc_, actuals, .. } => {
+            // The callee's writes land on whichever caller variables its `actuals`
+            // name. A callee write with no image in the caller is dropped here, and
+            // the *enclosing* frame check is what rejects that situation.
+            let (inner, m) = writes(proc_.body);
+            for g in inner[..m].iter() {
+                if let Some((_, l)) = actuals.iter().find(|(global, _)| global == g) {
+                    note_written(out, n, *l);
+                }
+            }
+        }
+        Stmt::Assume(_) | Stmt::Assert(_) | Stmt::Skip => {}
+    }
+}
 
 /// The result of verifying a program: every obligation, in the order the rules
 /// were applied, plus the verdict of the contract as a whole.

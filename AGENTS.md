@@ -115,6 +115,25 @@ and also what makes the frame check load-bearing:
 5. **`frame` checks shape, not meaning.** Renaming a write onto the wrong variable
    passes. Do not try to "fix" this with a smarter check; the fix is `verify_proc` on
    every body, and the limitation is documented where a user will meet it.
+6. **The declared frame must be *complete*, checked against `wp::writes(&body)`.**
+   `writes` derives the real frame from the syntax and recurses through branches,
+   loops and nested calls (mapping a nested callee's writes through that call's
+   actuals). Without this a caller could declare an empty frame for a callee that
+   clobbers a variable, and the engine would prove the variable survived. That is a
+   proof about a program that does not exist, and it is the worst class of bug in a
+   verifier. Over-declaring is allowed: the rule is conservative.
+7. **A call havocs its written targets: rename each to a fresh variable in both the
+   assumed `ensures` and the continuation.** Skipping this makes the pre-call value
+   masquerade as the post-call result (`c := 99; c := bump(a)` "proved" `c == 99`).
+   The fresh variable is universally quantified, which is the correct reading: the
+   caller must hold for every result the contract permits. `variant_after` havocs too,
+   so a call that writes the loop measure honestly makes termination unprovable.
+8. **Two-state specs use a caller snapshot, not an `old` operator.** For a variable
+   the callee cannot write, `old(v)` and `v` coincide, so no operator is needed; the
+   missing piece was a *query*, `wp::unchanged`, which answers from the derived frame.
+   For a written variable there is no shortcut -- snapshot into a temporary first.
+   Do not add an `old` operator to the symbolic layer to "fix" this: it would give a
+   name to a value the state no longer contains.
 
 Recursion is deliberately unsupported: a cyclic call graph needs an induction
 principle, which is a different feature rather than a missing branch.

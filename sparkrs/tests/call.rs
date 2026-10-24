@@ -474,3 +474,338 @@ fn a_swapped_argument_order_is_caught_by_the_precondition() {
         assert_eq!(ob.rule, Rule::CallRequires);
     });
 }
+
+// ---------------------------------------------------------------------------
+// The frame must be complete, not merely well-formed.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn under_declaring_the_frame_is_rejected() {
+    // The soundness hole, found by probing rather than by reasoning.
+    //
+    // `dbl` writes both `r` and a helper `scratch`. A caller that declares an empty
+    // frame is claiming `scratch` survived the call. The engine used to accept that
+    // and then *prove* `s == 7` after the call — while the callee had overwritten
+    // `s` with `a + a`. A proof about a program that does not exist is worse than no
+    // proof, so the declared frame is now checked against the frame derived from the
+    // body.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let r = var(8);
+        let scratch = var(8);
+        let a1 = Stmt::Assign { var: scratch, expr: x + x };
+        let a2 = Stmt::Assign { var: r, expr: scratch };
+        let body = Stmt::Seq { first: &a1, second: &a2 };
+        let dbl = Proc {
+            name: "dbl",
+            requires: smt::truth(true),
+            ensures: smt::eq(r, x + x),
+            body: &body,
+        };
+        assert!(wp::verify_proc(&dbl).is_verified());
+
+        // The derived frame really does include `scratch`.
+        let (derived, n) = wp::writes(&body);
+        assert!(derived[..n].contains(&scratch));
+        assert!(derived[..n].contains(&r));
+
+        let a = var(8);
+        let c = var(8);
+        let s = var(8);
+        let actuals = [(x, a), (r, c), (scratch, s)];
+
+        // An empty frame is a lie and must be rejected.
+        let empty: [Var; 0] = [];
+        assert!(
+            !Stmt::frame(&dbl, &actuals, &empty),
+            "an empty frame cannot be declared for a body that writes"
+        );
+
+        // And the false proof must be gone. Declaring the empty frame and asserting
+        // that `s` survived now fails with CallFrame rather than verifying.
+        let call = Stmt::Call { proc_: &dbl, actuals: &actuals, writes: &empty };
+        let init = Stmt::Assign { var: s, expr: smt::word(7, 8) };
+        let prog = Stmt::Seq { first: &init, second: &call };
+        let report = wp::verify(&prog, smt::truth(true), smt::eq_const(s, 7));
+        let (ob, _) = report
+            .first_failure()
+            .expect("the under-declared frame must not verify");
+        assert_eq!(ob.rule, Rule::CallFrame);
+
+        // Declaring the truth is accepted.
+        let honest = [r, scratch];
+        assert!(Stmt::frame(&dbl, &actuals, &honest));
+
+        // And over-declaring is fine: the frame rule is conservative.
+        let generous = [r, scratch, x];
+        assert!(Stmt::frame(&dbl, &actuals, &generous));
+    });
+}
+
+#[test]
+fn the_derived_frame_covers_branches_and_loops() {
+    // A write inside a branch or a loop still counts, because "may write" is what
+    // matters: the caller cannot know which path the callee took. If the derivation
+    // missed these, a callee could hide a write from its own frame check.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let y = var(8);
+        let z = var(8);
+        let w = var(8);
+
+        // if x < 10 { y := 1 } else { z := 2 }
+        let then_ = Stmt::Assign { var: y, expr: smt::word(1, 8) };
+        let else_ = Stmt::Assign { var: z, expr: smt::word(2, 8) };
+        let branch = Stmt::If {
+            cond: smt::ult_const(x, 10),
+            then_: &then_,
+            else_: &else_,
+        };
+        let (found, n) = wp::writes(&branch);
+        assert!(found[..n].contains(&y));
+        assert!(found[..n].contains(&z));
+        assert!(!found[..n].contains(&x));
+
+        // while x < 10 { w := w + 1 }
+        let step = Stmt::Assign { var: w, expr: w + 1u32 };
+        let loop_ = Stmt::While {
+            cond: smt::ult_const(x, 10),
+            invariant: smt::truth(true),
+            variant: None,
+            body: &step,
+        };
+        let (found, n) = wp::writes(&loop_);
+        assert!(found[..n].contains(&w));
+
+        // A simultaneous assignment contributes every target.
+        let binds = [(y, z), (w, x)];
+        let many = Stmt::AssignMany { binds: &binds };
+        let (found, n) = wp::writes(&many);
+        assert!(found[..n].contains(&y));
+        assert!(found[..n].contains(&w));
+
+        // `assume` and `assert` write nothing.
+        let (_, n) = wp::writes(&Stmt::Assert(smt::truth(true)));
+        assert_eq!(n, 0);
+        let (_, n) = wp::writes(&Stmt::Skip);
+        assert_eq!(n, 0);
+    });
+}
+
+#[test]
+fn a_nested_call_contributes_its_callees_writes() {
+    // If `outer` calls `inner`, then `outer`'s derived frame must include whatever
+    // `inner` writes, mapped through `outer`'s actuals. Otherwise a caller of `outer`
+    // could under-declare and reintroduce the hole one level up.
+    smt::with_fresh(|| {
+        let ix = var(8);
+        let ir = var(8);
+        let inner_body = Stmt::Assign { var: ir, expr: ix + 1u32 };
+        let inner = Proc {
+            name: "inner",
+            requires: smt::truth(true),
+            ensures: smt::eq(ir, ix + 1u32),
+            body: &inner_body,
+        };
+
+        let ox = var(8);
+        let or_ = var(8);
+        let actuals = [(ix, ox), (ir, or_)];
+        let writes_inner = [ir];
+        let call = Stmt::Call {
+            proc_: &inner,
+            actuals: &actuals,
+            writes: &writes_inner,
+        };
+        let outer_body = Stmt::Seq {
+            first: &call,
+            second: &Stmt::Skip,
+        };
+
+        // `outer` writes `or_`, because that is where `inner`'s `ir` lands.
+        let (found, n) = wp::writes(&outer_body);
+        assert!(found[..n].contains(&or_), "the nested write must propagate");
+        assert!(!found[..n].contains(&ir), "the callee's own name must not leak");
+
+        // Now `outer` in turn is called. Its own actuals map `ox` and `or_` to the
+        // caller's variables, and its declared frame must cover the write that was
+        // propagated from `inner`.
+        let outer = Proc {
+            name: "outer",
+            requires: smt::truth(true),
+            ensures: smt::eq(or_, ox + 1u32),
+            body: &outer_body,
+        };
+        let gx = var(8);
+        let gh = var(8);
+        let outer_actuals = [(ox, gx), (or_, gh)];
+        let empty: [Var; 0] = [];
+        assert!(
+            !Stmt::frame(&outer, &outer_actuals, &empty),
+            "the propagated write must also be declared one level up"
+        );
+        // Declaring the propagated write is accepted.
+        assert!(Stmt::frame(&outer, &outer_actuals, &[or_]));
+    });
+}
+
+#[test]
+fn a_callee_that_writes_nothing_needs_no_frame() {
+    // The other end of the range: a pure procedure has an empty derived frame, so a
+    // caller declaring nothing is correct rather than merely tolerated.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let r = var(8);
+        // The body writes `r`, so to get a genuinely empty frame the procedure must
+        // write nothing at all -- a predicate rather than a function.
+        let pure_body = Stmt::Skip;
+        let is_small = Proc {
+            name: "is_small",
+            requires: smt::truth(true),
+            ensures: smt::ult_const(x, 10),
+            body: &pure_body,
+        };
+        let (_, n) = wp::writes(&pure_body);
+        assert_eq!(n, 0);
+        let a = var(8);
+        let actuals = [(x, a)];
+        let empty: [Var; 0] = [];
+        assert!(Stmt::frame(&is_small, &actuals, &empty));
+        let _ = r;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Two-state specifications.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn two_state_specs_via_a_caller_snapshot() {
+    // "The result equals the argument that came in, plus one" is a two-state
+    // property, and it needs a snapshot — but not a general `old` operator.
+    //
+    // `bump` writes `r` and reads `x`. If the caller captures `x`'s value into a
+    // temporary *before* the call, then after the call that temporary still holds the
+    // entry value, because the callee cannot write it (the derived frame says so).
+    // `old(x)` and the snapshot are therefore the same thing, and the snapshot needs
+    // no new machinery: it is an ordinary assignment.
+    //
+    //   bump: requires x <= 10, ensures r == x + 1
+    //   a := 5; old_a := a; c := bump(a); assert c == old_a + 1 && a == old_a
+    smt::with_fresh(|| {
+        let x = var(8);
+        let r = var(8);
+        let body = Stmt::Assign { var: r, expr: x + 1u32 };
+        let bump = Proc {
+            name: "bump",
+            requires: smt::ule_const(x, 10),
+            ensures: smt::eq(r, x + 1u32),
+            body: &body,
+        };
+        assert!(wp::verify_proc(&bump).is_verified());
+
+        let a = var(8);
+        let snapshot = var(8);
+        let c = var(8);
+        let actuals = [(x, a), (r, c)];
+        let declared = [r];
+        let call = Stmt::Call { proc_: &bump, actuals: &actuals, writes: &declared };
+
+        // The query, before doing anything: which caller variables survive?
+        let mut buf = [Var::SENTINEL; wp::MAX_CALL_ARGS];
+        let survive = wp::unchanged_vars(&bump, &actuals, &mut buf);
+        assert!(survive.contains(&a), "the argument is read-only, so it survives");
+        assert!(!survive.contains(&c), "the result is written, so it does not");
+        assert!(wp::unchanged(&bump, &actuals, a));
+        assert!(!wp::unchanged(&bump, &actuals, c));
+        // A variable the call never names is also untouched.
+        let unrelated = var(8);
+        assert!(wp::unchanged(&bump, &actuals, unrelated));
+
+        let init_a = Stmt::Assign { var: a, expr: smt::word(5, 8) };
+        let snap = Stmt::Assign { var: snapshot, expr: a };
+        let prefix = Stmt::Seq { first: &init_a, second: &snap };
+        let prog = Stmt::Seq { first: &prefix, second: &call };
+
+        // The two-state postcondition: the result follows the entry value, and the
+        // argument itself is unchanged across the call.
+        let post = smt::and(
+            smt::eq(c, snapshot + 1u32),
+            smt::eq(a, snapshot),
+        );
+        let report = wp::verify(&prog, smt::truth(true), post);
+        assert!(report.is_verified(), "{:?}", report.first_failure());
+    });
+
+    // Execution: the snapshot really does hold the entry value.
+    let a = 5u8;
+    let snapshot = a;
+    let c = a + 1;
+    assert_eq!(c, snapshot + 1);
+    assert_eq!(a, snapshot);
+}
+
+#[test]
+fn the_snapshot_discipline_is_needed_for_written_variables() {
+    // The control for the test above, and the reason a snapshot is a *discipline*
+    // rather than a convenience: for a variable the callee writes, there is no query
+    // that helps. `c` is written, so a postcondition mentioning `c`'s old value is
+    // simply false — the old value is gone.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let r = var(8);
+        let body = Stmt::Assign { var: r, expr: x + 1u32 };
+        let bump = Proc {
+            name: "bump",
+            requires: smt::ule_const(x, 10),
+            ensures: smt::eq(r, x + 1u32),
+            body: &body,
+        };
+        let a = var(8);
+        let c = var(8);
+        let actuals = [(x, a), (r, c)];
+        let declared = [r];
+        let call = Stmt::Call { proc_: &bump, actuals: &actuals, writes: &declared };
+        let init_a = Stmt::Assign { var: a, expr: smt::word(5, 8) };
+        let init_c = Stmt::Assign { var: c, expr: smt::word(99, 8) };
+        let prog = Stmt::Seq {
+            first: &init_a,
+            second: &Stmt::Seq { first: &init_c, second: &call },
+        };
+        // "c still holds what it held before the call" is false, and the engine says
+        // so rather than quietly accepting it.
+        let report = wp::verify(&prog, smt::truth(true), smt::eq_const(c, 99));
+        assert!(
+            !report.is_verified(),
+            "a written variable's old value is not recoverable"
+        );
+        // The query agrees: `c` does not survive.
+        assert!(!wp::unchanged(&bump, &actuals, c));
+    });
+}
+
+#[test]
+fn an_unchanged_query_cannot_be_talked_into_a_wrong_answer() {
+    // The query reads the *derived* frame, so the declared frame cannot corrupt it.
+    // Here the caller declares an empty frame for a callee that writes `r`; the
+    // declaration is refused by `frame`, and the query still reports the truth.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let r = var(8);
+        let body = Stmt::Assign { var: r, expr: x + x };
+        let dbl = Proc {
+            name: "dbl",
+            requires: smt::truth(true),
+            ensures: smt::eq(r, x + x),
+            body: &body,
+        };
+        let a = var(8);
+        let c = var(8);
+        let actuals = [(x, a), (r, c)];
+        let lie: [Var; 0] = [];
+        assert!(!Stmt::frame(&dbl, &actuals, &lie));
+        // Even so, the query answers from the body and says `c` is written.
+        assert!(!wp::unchanged(&dbl, &actuals, c));
+        assert!(wp::unchanged(&dbl, &actuals, a));
+    });
+}

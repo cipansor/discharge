@@ -221,6 +221,103 @@ fn main() {
     });
 
     // ---------------------------------------------------------------------
+    // The frame must be complete, not merely well-formed.
+    // ---------------------------------------------------------------------
+    println!("=== the frame must be complete ===\n");
+    println!("A declared frame that *under*-states what a callee writes is not a");
+    println!("bookkeeping error, it is unsound: the caller goes on believing a variable");
+    println!("that was clobbered. So the declared frame is checked against the frame");
+    println!("derived from the body.\n");
+
+    smt::with_fresh(|| {
+        let x = var(8);
+        let r = var(8);
+        let scratch = var(8);
+        let a1 = Stmt::Assign { var: scratch, expr: x + x };
+        let a2 = Stmt::Assign { var: r, expr: scratch };
+        let body = Stmt::Seq { first: &a1, second: &a2 };
+        let dbl = Proc {
+            name: "dbl",
+            requires: smt::truth(true),
+            ensures: smt::eq(r, x + x),
+            body: &body,
+        };
+        let a = var(8);
+        let c = var(8);
+        let s = var(8);
+        let actuals = [(x, a), (r, c), (scratch, s)];
+
+        let (derived, n) = wp::writes(&body);
+        println!("dbl's body writes {} variable(s); derived frame covers `scratch`: {}",
+                 n, derived[..n].contains(&scratch));
+        let empty: [sparkrs::smt::Var; 0] = [];
+        println!("declaring an empty frame        : accepted = {}", Stmt::frame(&dbl, &actuals, &empty));
+        println!("  -> rejected, so the false proof is unreachable");
+        let honest = [r, scratch];
+        println!("declaring the truth (r, scratch): accepted = {}", Stmt::frame(&dbl, &actuals, &honest));
+        println!("declaring extra (r, scratch, x) : accepted = {}", Stmt::frame(&dbl, &actuals, &[r, scratch, x]));
+        println!("  -> over-declaring is fine: the frame rule is conservative\n");
+    });
+
+    // ---------------------------------------------------------------------
+    // Two-state specifications: a snapshot, not an `old` operator.
+    // ---------------------------------------------------------------------
+    println!("=== two-state specifications ===\n");
+    println!("\"The result equals the argument that came in, plus one\" is a two-state");
+    println!("property. It needs no `old` operator: a variable the callee cannot write");
+    println!("has the same value before and after, so `old(x)` *is* `x` -- provided the");
+    println!("frame is honest. What was missing was a way to ask which variables survive,");
+    println!("because the engine was already assuming it silently. `wp::unchanged` answers");
+    println!("from the derived frame, so a caller cannot talk it into a wrong answer.\n");
+
+    smt::with_fresh(|| {
+        let x = var(8);
+        let r = var(8);
+        let body = Stmt::Assign { var: r, expr: x + 1u32 };
+        let bump = Proc {
+            name: "bump",
+            requires: smt::ule_const(x, 10),
+            ensures: smt::eq(r, x + 1u32),
+            body: &body,
+        };
+        let a = var(8);
+        let snapshot = var(8);
+        let c = var(8);
+        let actuals = [(x, a), (r, c)];
+        let declared = [r];
+        let call = Stmt::Call { proc_: &bump, actuals: &actuals, writes: &declared };
+
+        println!("bump: requires x <= 10, ensures r == x + 1");
+        println!("  unchanged(a)?  {}  <- the argument is read-only", wp::unchanged(&bump, &actuals, a));
+        println!("  unchanged(c)?  {}  <- the result is written", wp::unchanged(&bump, &actuals, c));
+
+        // a := 5; old_a := a; c := bump(a); assert c == old_a + 1 && a == old_a
+        let init_a = Stmt::Assign { var: a, expr: smt::word(5, 8) };
+        let snap = Stmt::Assign { var: snapshot, expr: a };
+        let prefix = Stmt::Seq { first: &init_a, second: &snap };
+        let prog = Stmt::Seq { first: &prefix, second: &call };
+        let post = smt::and(smt::eq(c, snapshot + 1u32), smt::eq(a, snapshot));
+        let report = wp::verify(&prog, smt::truth(true), post);
+        println!();
+        println!("a := 5; old_a := a; c := bump(a)");
+        println!("assert c == old_a + 1 && a == old_a");
+        println!("  verified : {}", report.is_verified());
+        println!("  The snapshot is an ordinary assignment, not new machinery.\n");
+
+        // The control: a written variable's old value is not recoverable.
+        let init_c = Stmt::Assign { var: c, expr: smt::word(99, 8) };
+        let prog2 = Stmt::Seq {
+            first: &init_a,
+            second: &Stmt::Seq { first: &init_c, second: &call },
+        };
+        let rep2 = wp::verify(&prog2, smt::truth(true), smt::eq_const(c, 99));
+        println!("the control: c := 99; c := bump(a); assert c == 99");
+        println!("  verified : {}  <- correct, the old value is gone", rep2.is_verified());
+        println!("  A call *havocs* what it writes: the target is renamed to a fresh");
+        println!("  variable, so the pre-call value cannot masquerade as the result.\n");
+    });
+
+    // ---------------------------------------------------------------------
     // The sharp edge, stated rather than hidden.
     // ---------------------------------------------------------------------
     println!("=== the sharp edge ===\n");

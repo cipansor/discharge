@@ -1104,6 +1104,14 @@ pub fn term_count() -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Var(pub(crate) Term);
 
+impl Var {
+    /// A placeholder, for initialising a fixed-size buffer of variables.
+    ///
+    /// Not a usable variable: comparing against it is a way to say "no variable
+    /// here". It exists so that the frame computation needs no allocator.
+    pub const SENTINEL: Var = Var(Term(0));
+}
+
 /// A symbolic boolean predicate (a width-1 term).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pred(pub(crate) Term);
