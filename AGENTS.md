@@ -174,7 +174,7 @@ comment had always said would happen:
   use-after-free in the term arena ... typically shows up as unbounded recursion rather
   than a clean panic
 
-The comment was right. It had been right for fourteen rounds while I read past it, and the
+The comment was right. It had been right for many rounds while I read past it, and the
 reason is worth writing down: it described the *symptom* rather than the *invariant*, so it
 read like documentation of intended behaviour instead of a bug report about missing checks.
 

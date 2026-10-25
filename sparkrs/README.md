@@ -288,6 +288,32 @@ next section.
 Cost: a symbolic read is `2^addr_width` ites and the BDD sees all of them, so
 `MAX_CELLS` caps a memory at 64 cells (6 address bits).
 
+## Staleness is caught once, in the arena
+
+Stamping proof objects with an arena generation raised the obvious follow-up: what *else*
+carries a term id? `Var`, `Pred`, `Mem`, `Query` — none of them stamped. Reusing one after a
+reset did not fail cleanly. It overflowed the stack, exactly as the `with_fresh` comment had
+always said it would:
+
+```
+use-after-free in the term arena ... typically shows up as unbounded recursion
+rather than a clean panic
+```
+
+The comment was right, and had been right for several rounds while I read past it. It
+described the *symptom* rather than the *invariant*, so it read like documentation of
+intended behaviour instead of a bug report about a missing check.
+
+Stamping each type would be whack-a-mole, and the next type would forget. Instead every term
+id records the generation that created it, the term accessors note a mismatch, and the
+traversals refuse to descend into a stale handle. One check covers every handle-carrying type
+at once, and a query that touches a stale handle returns `Unknown`.
+
+The subtlety that took two attempts: checking the *current* node is not enough. A constructor
+can read a stale node and then build a *current* node that refers back to the stale id, so
+the graph holds a cycle whose every node is current. Guarding the root is not guarding the
+traversal — once any stale handle is touched, the whole walk stops.
+
 ## A proof object must not change meaning underneath you
 
 The twelfth hole, and the most serious: a proof whose *meaning* silently changed. A
