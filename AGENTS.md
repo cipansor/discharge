@@ -163,6 +163,26 @@ of an under-declared frame rather than hiding it. Do not "fix" that by having th
 interpreter consult the body: the point is to model the declared contract, which is what
 a real machine executes against.
 
+## Vacuity is not only about widths
+
+The sixth hole was vacuity caused by a width: a bound too narrow to name `len`. The seventh is
+the same failure with no width involved at all -- `verify(s, pre, post)` with an unsatisfiable
+`pre`. The condition `pre => wp(body, post)` is a theorem for *any* body and postcondition
+when `pre` is unsatisfiable, so the report said `Total` about `x := 0` proving `x == 99`.
+
+The lesson is that vacuity is a property of the *premise*, not of any particular construct.
+Every entry point that takes a predicate and proves something under it has to ask whether the
+predicate can hold:
+
+* a top-level precondition (`verify`, `verify_proc`);
+* a guard or a range that could be empty (`forall_guarded(lo, hi, ..)` with `hi <= lo`);
+* a width, mask, or cap that makes a named value unreachable (the sixth hole).
+
+Swept so far: `mem` (width), `verify` (unsatisfiable precondition). `quant::forall_guarded`
+and `exists_guarded` are *not* affected: an empty range yields `true`/`false` respectively,
+which is correct for an empty range, and `inside` already treats an unrepresentable index as
+outside the bound rather than truncating it.
+
 ## The dual class: vacuity, a proof with no evidence
 
 Six holes now, and the sixth is the mirror of the first five. Those were *unsound*: a

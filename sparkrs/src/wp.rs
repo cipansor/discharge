@@ -194,6 +194,25 @@ pub enum Rule {
     /// flag is raised, and `too_many_obligations_is_reported_not_swallowed` in
     /// `tests/wp.rs`.
     ObligationOverflow,
+    /// The precondition cannot hold, so the contract is *vacuously* true.
+    ///
+    /// `pre => wp(body, post)` is a theorem when `pre` is unsatisfiable, whatever the
+    /// body and postcondition say. Every obligation discharges, so `is_verified()` would
+    /// return `true` and `establishes()` would say `Total` — for a specification that
+    /// constrains nothing, because no run can reach it. This is the vacuity twin of the
+    /// truncation defects: the first five let a summary outrun its evidence; this one
+    /// gives a proof with no evidence at all.
+    ///
+    /// Reported as a *failure*, for the same reason [`Rule::ObligationOverflow`] is: the
+    /// honest reading is "nothing was proved", not "the contract holds". Reachable
+    /// preconditions are a precondition of the verification, not an assumption about it,
+    /// and nothing else in the tool checks it. `verify_proc` rarely needs the check, since
+    /// a callee's `requires` is normally reachable — but the obligation is generated
+    /// whether or not the caller can reach it, so `CallRequires` still reports a real
+    /// problem on an unreachable path. The gap is `verify` with a hand-written
+    /// precondition, which is the case the probe hit. See
+    /// `an_unreachable_precondition_is_not_a_proof` in `tests/wp.rs`.
+    VacuousPrecondition,
 }
 
 /// A verification condition, attributed to the rule that produced it.
@@ -578,10 +597,19 @@ fn push(out: &mut [Option<Obligation>], n: &mut usize, rule: Rule, goal: Pred) {
 /// The distinction matters: an overflow notice that is itself dropped by the full
 /// buffer is worse than useless, because the report then looks clean. That is exactly
 /// how the first attempt at this fix failed.
+///
+/// A finding is never dropped. If the reserved slot is already taken — which happens only
+/// when an overflow notice got there first — the newer finding replaces it. Both make the
+/// report unverified, and the newer one is the stronger statement: a vacuous precondition
+/// says the contract was never about anything, which is worth more than "some obligations
+/// did not fit". Either way nothing is silently lost.
 fn push_notice(out: &mut [Option<Obligation>], n: &mut usize, rule: Rule, goal: Pred) {
     if *n < out.len() {
         out[*n] = Some(Obligation { rule, goal });
         *n += 1;
+    } else {
+        let last = out.len() - 1;
+        out[last] = Some(Obligation { rule, goal });
     }
 }
 
@@ -1145,6 +1173,16 @@ pub fn verify(s: &Stmt<'_>, pre: Pred, post: Pred) -> Report {
     // is not about the program's state — it is about the report's own completeness.
     if overflow {
         push_notice(&mut slots, &mut count, Rule::ObligationOverflow, smt::truth(false));
+    }
+
+    // A precondition that cannot hold makes every obligation vacuously true, so the
+    // report would say `verified` / `Total` about a specification that constrains
+    // nothing. Checked *after* the overflow notice so that a report which is both
+    // overflowing and vacuous still fits: the vacuity finding then overwrites the
+    // reserved slot, which is the right precedence — vacuity is the stronger statement,
+    // since it says the contract was never about anything.
+    if smt::prove(smt::not(pre)).is_proved() {
+        push_notice(&mut slots, &mut count, Rule::VacuousPrecondition, smt::truth(false));
     }
 
     Report {

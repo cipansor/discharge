@@ -735,3 +735,73 @@ fn a_report_that_fits_is_unaffected_by_the_reserved_slot() {
         );
     });
 }
+
+#[test]
+fn an_unreachable_precondition_is_not_a_proof() {
+    // The seventh hole, and the second of the vacuity kind.
+    //
+    // `verify(s, pre, post)` generates the single condition `pre => wp(body, post)`. When
+    // `pre` is unsatisfiable that condition is a theorem whatever the body and
+    // postcondition say, so every obligation discharges, `is_verified()` returns true, and
+    // `establishes()` says `Total` — for a specification no run can ever reach. The probe
+    // printed exactly that:
+    //
+    //   pre satisfiable? : false
+    //   is_verified()    : true
+    //   establishes()    : Total
+    //
+    // The report is now unverified, with `VacuousPrecondition` as the first failure.
+    // Reachable preconditions are a precondition of verification, not an assumption about
+    // it, and nothing else in the tool checks them.
+    smt::with_fresh(|| {
+        let x = var(8);
+        // `x < 10 && x > 200` has no solution.
+        let pre = smt::and(smt::ult_const(x, 10), smt::ugt_const(x, 200));
+        let body = Stmt::Assign { var: x, expr: smt::word(0, 8) };
+        // A postcondition that is plainly false, to make the point that the contract
+        // "proves" it only because it cannot be entered.
+        let post = smt::eq_const(x, 99);
+
+        let report = wp::verify(&body, pre, post);
+        assert!(
+            !report.is_verified(),
+            "an unsatisfiable precondition must not produce a verified report"
+        );
+        let (ob, _) = report
+            .first_failure()
+            .expect("a vacuous precondition is a failure");
+        assert_eq!(
+            ob.rule,
+            Rule::VacuousPrecondition,
+            "the failure must be attributed to the vacuous precondition, not to the body"
+        );
+        assert_eq!(report.establishes(), wp::Established::Nothing);
+    });
+}
+
+#[test]
+fn a_reachable_precondition_is_still_proved() {
+    // The teeth of the check above: it must not reject every report. A satisfiable
+    // precondition with a contract that genuinely holds stays verified.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let pre = smt::ult_const(x, 100);
+        // `y := 0` establishes `y == 0`, under any precondition.
+        let y = var(8);
+        let body = Stmt::Assign { var: y, expr: smt::word(0, 8) };
+        let post = smt::eq_const(y, 0);
+        let report = wp::verify(&body, pre, post);
+        assert!(
+            report.is_verified(),
+            "a reachable precondition and a valid contract must still verify"
+        );
+        assert!(
+            !report
+                .obligations
+                .iter()
+                .flatten()
+                .any(|ob| ob.rule == Rule::VacuousPrecondition),
+            "a satisfiable precondition must not be flagged as vacuous"
+        );
+    });
+}

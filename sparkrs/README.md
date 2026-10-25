@@ -288,6 +288,36 @@ next section.
 Cost: a symbolic read is `2^addr_width` ites and the BDD sees all of them, so
 `MAX_CELLS` caps a memory at 64 cells (6 address bits).
 
+## An unreachable precondition is not a proof
+
+The seventh hole, and the second of the vacuity kind. `verify(s, pre, post)` generates one
+condition, `pre => wp(body, post)`. When `pre` is unsatisfiable that condition is a theorem
+whatever the body and postcondition say — so every obligation discharges, `is_verified()`
+returns true, and `establishes()` says `Total`, for a specification no run can ever reach:
+
+```
+pre satisfiable? : false
+is_verified()    : true
+establishes()    : Total
+```
+
+The body there was `x := 0` and the postcondition `x == 99`. The report called that `Total`.
+
+This is the same failure as the bound hole seen from the other end: the first five holes let
+a summary outrun its evidence, and these two give a proof with no evidence at all. Reachable
+preconditions are a precondition *of* verification, not an assumption *about* it, and nothing
+else in the tool was checking. The report now carries `Rule::VacuousPrecondition` as a
+failure, so `establishes()` returns `Nothing`.
+
+A note on where the check is needed. `verify_proc` uses a callee's `requires`, which is
+normally reachable, and a `CallRequires` obligation still reports a real problem on an
+unreachable path — so the gap is `verify` with a hand-written precondition, which is the case
+the probe hit. The check is applied in `verify`, where every precondition arrives.
+
+The teeth are two-sided: `an_unreachable_precondition_is_not_a_proof` pins the rejection, and
+`a_reachable_precondition_is_still_proved` pins that a satisfiable precondition with a valid
+contract still verifies, so the check cannot pass by rejecting everything.
+
 ## A bound must be wider than the address, or "all cells" is vacuous
 
 The sixth hole, and the first of the *vacuity* kind. The previous five were summaries that
