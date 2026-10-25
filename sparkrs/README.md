@@ -288,6 +288,30 @@ next section.
 Cost: a symbolic read is `2^addr_width` ites and the BDD sees all of them, so
 `MAX_CELLS` caps a memory at 64 cells (6 address bits).
 
+## The differential harness now covers memory
+
+The harness in `tests/modular_differential.rs` compares the engine against concrete
+execution, and until now it covered calls, loops containing calls, and obligation pressure.
+The memory rules were the largest part of the crate with no such net, and they are the most
+algebraic: an ite-chain read, a simultaneous binding list for a store, a frame lemma derived
+by pushing one through the other, and a guarded quantifier for a prefix property. Each is a
+place where the symbolic form could quietly disagree with an array.
+
+The fourth family generates a program of stores — one of them at a *symbolic* address — plus
+a postcondition, then checks both directions against an enumerated state space of four 8-bit
+cells:
+
+* `Valid` means no sampled `(initial array, address)` may violate the postcondition.
+* anything else means some sampled input must violate it, and the search must find one.
+
+The state space is small and closed, so unlike the call family this is an equivalence rather
+than a one-way implication. Both directions are asserted, and the family fails if it is
+vacuous in either — no case proved, or no case refuted. A companion test feeds a
+deliberately wrong store rule (one that ignores the address and clobbers every cell) through
+the same comparison to confirm the family can see a bad rule at all; with `store_binds`
+actually broken, the family reports `VERIFIED but 4320 sampled (array, address) pairs
+violate`.
+
 ## A guard compares an index, it does not truncate it
 
 `quant::forall_guarded` and `quant::exists_guarded` quantify over a range while the upper

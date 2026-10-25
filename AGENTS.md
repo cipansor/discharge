@@ -163,6 +163,34 @@ of an under-declared frame rather than hiding it. Do not "fix" that by having th
 interpreter consult the body: the point is to model the declared contract, which is what
 a real machine executes against.
 
+## The harness must cover every module, or it certifies only the covered ones
+
+The differential harness had three families -- calls, loops-with-calls, obligation pressure
+-- and memory had none. Memory is the most algebraic module in the crate (ite-chain read,
+simultaneous store bindings, a derived frame lemma, a guarded quantifier), so that gap was
+not a coverage statistic; it was the module most likely to hold a silent disagreement with
+concrete execution, and the least checked.
+
+The fourth family compares the engine against a concrete array over an enumerated state
+space of four 8-bit cells, in *both* directions, because the state space is small and
+closed. Two lessons from writing it:
+
+* **A teeth test must break in the dangerous direction.** My first attempt at a deliberately
+  wrong store rule made a copy keep the destination's own value, which is the identity: the
+  engine honestly said "not proved", so nothing was caught, and the teeth test failed for
+  the right reason. Proving *too little* is not a soundness bug. The rule has to prove *too
+  much* -- the working version writes `val` to every cell and ignores the address, which
+  makes `m[1] == 5` provable after `m[0] := 5`.
+* **Assert non-vacuity explicitly.** A generated family can pass by producing no interesting
+  cases. Both counts are asserted: at least one case proved, at least one refuted.
+
+The teeth check that matters is against the *real* rule: break `store_binds` so it ignores
+the address, and the family reports `VERIFIED but 4320 sampled (array, address) pairs
+violate`. That is the harness doing its job on the code it exists to guard.
+
+Also, twice now a heredoc-written patch has corrupted a file (a stray leading byte spliced
+into the first line). Prefer the editor tool for multi-line Rust; keep heredocs for shell.
+
 ## The recurring class: a limit that truncates instead of reporting
 
 Five soundness holes in a row, all the same shape — a bounded buffer or a width that

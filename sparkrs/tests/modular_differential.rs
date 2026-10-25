@@ -30,7 +30,7 @@
 //! A generator cannot invent the *shape* of a mistake it was not told about, so each
 //! family is biased towards a shape that had already gone wrong.
 
-use sparkrs::smt::{self, Var};
+use sparkrs::smt::{self, var, Var};
 use sparkrs::wp::{self, Proc, Stmt};
 
 // ---------------------------------------------------------------------------
@@ -914,4 +914,318 @@ fn crossing_the_cap_is_observable() {
         assert!(!report.is_verified());
         assert_eq!(report.establishes(), wp::Established::Nothing);
     });
+}
+
+// ---------------------------------------------------------------------------
+// Memory: the fourth family, and the first module without a harness.
+//
+// The call and loop rules were covered above; the memory rules were not. They are the
+// most algebraic part of the crate -- an ite-chain read, a simultaneous binding list for
+// a store, a frame lemma derived by pushing one through the other, and a guarded
+// quantifier for a prefix property -- and every one of them is a place where the symbolic
+// form could disagree with what an array actually does.
+//
+// The check is a direct comparison against a concrete array over an enumerable state
+// space. A program is a sequence of stores, one of which writes at a *symbolic* address,
+// and the postcondition is a fact about the resulting cells. The engine's verdict on
+// `wp(post, program)` is compared with the array obtained by running the same operations:
+//
+//   Valid      => no sampled (initial array, address) may violate the postcondition
+//   not Valid  => some sampled input must violate it, and the search must find one
+//
+// Both directions are checkable because the state space is small and closed: four 8-bit
+// cells plus the address, and the program mentions nothing else. Initial values are drawn
+// from a set that includes every literal the program and the postcondition use, so the
+// sample is biased towards the interactions that can expose a disagreement.
+// ---------------------------------------------------------------------------
+
+const MEM_VALS: [u8; 6] = [0, 1, 2, 3, 7, 200];
+
+/// One operation on a four-cell memory. Addresses are concrete cell indices except in
+/// [`Op::StoreAtSymbolic`], which uses the program's symbolic address input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op {
+    /// `m[addr] := val`
+    StoreConst { addr: usize, val: u8 },
+    /// `m[dst] := m[src]`
+    StoreCopy { dst: usize, src: usize },
+    /// `t := m[x]; m[x] := m[y]; m[y] := t`
+    SwapCells { x: usize, y: usize },
+    /// `m[a] := m[src]`, where `a` is the program's symbolic address.
+    StoreAtSymbolic { src: usize },
+}
+
+/// The postcondition to check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Post {
+    /// `m[i] == m[j]`
+    EqCells(usize, usize),
+    /// `m[i] == c`
+    EqConst(usize, u8),
+    /// every cell below the symbolic address equals `c`
+    BelowConst(u8),
+}
+
+fn mem_pick_cell(rng: &mut Rng) -> usize {
+    rng.below(4) as usize
+}
+
+fn mem_pick_val(rng: &mut Rng) -> u8 {
+    MEM_VALS[rng.below(6) as usize]
+}
+
+fn gen_ops(rng: &mut Rng, len: usize) -> Vec<Op> {
+    let mut ops = Vec::with_capacity(len);
+    for _ in 0..len {
+        let which = rng.below(4);
+        let op = match which {
+            0 => Op::StoreConst {
+                addr: mem_pick_cell(rng),
+                val: mem_pick_val(rng),
+            },
+            1 => Op::StoreCopy {
+                dst: mem_pick_cell(rng),
+                src: mem_pick_cell(rng),
+            },
+            2 => Op::SwapCells {
+                x: mem_pick_cell(rng),
+                y: mem_pick_cell(rng),
+            },
+            _ => Op::StoreAtSymbolic {
+                src: mem_pick_cell(rng),
+            },
+        };
+        ops.push(op);
+    }
+    ops
+}
+
+fn gen_post(rng: &mut Rng) -> Post {
+    match rng.below(3) {
+        0 => Post::EqCells(mem_pick_cell(rng), mem_pick_cell(rng)),
+        1 => Post::EqConst(mem_pick_cell(rng), mem_pick_val(rng)),
+        _ => Post::BelowConst(mem_pick_val(rng)),
+    }
+}
+
+/// The concrete array after `ops`, with `a` as the symbolic address and `init` the start.
+fn exec_ops(ops: &[Op], a: usize, init: [u8; 4]) -> [u8; 4] {
+    let mut m = init;
+    for op in ops {
+        match *op {
+            Op::StoreConst { addr, val } => m[addr] = val,
+            Op::StoreCopy { dst, src } => m[dst] = m[src],
+            // The symbolic program does this in three steps through a temporary; on an
+            // array the same effect is a swap.
+            Op::SwapCells { x, y } => m.swap(x, y),
+            Op::StoreAtSymbolic { src } => m[a] = m[src],
+        }
+    }
+    m
+}
+
+fn eval_post(post: Post, a: usize, m: [u8; 4]) -> bool {
+    match post {
+        Post::EqCells(i, j) => m[i] == m[j],
+        Post::EqConst(i, c) => m[i] == c,
+        Post::BelowConst(c) => (0..a).all(|k| m[k] == c),
+    }
+}
+
+/// Build the symbolic program for `ops`. `a` is the symbolic address variable.
+fn build_mem_program(
+    ops: &[Op],
+    a: Var,
+    m: &sparkrs::mem::Mem<'_>,
+) -> &'static Stmt<'static> {
+    fn binds_of(b: &[(Var, Var)]) -> &'static [(Var, Var)] {
+        Box::leak(b.to_vec().into_boxed_slice())
+    }
+    let mut stmts: Vec<&'static Stmt<'static>> = Vec::new();
+    let const_addr = |c: usize| smt::word(c as u64, 2);
+    for op in ops {
+        match *op {
+            Op::StoreConst { addr, val } => {
+                let mut b = [(Var::SENTINEL, Var::SENTINEL); sparkrs::mem::MAX_CELLS];
+                let n = m.store_binds(const_addr(addr), smt::word(val as u64, 8), &mut b);
+                stmts.push(Box::leak(Box::new(Stmt::AssignMany {
+                    binds: binds_of(&b[..n]),
+                })));
+            }
+            Op::StoreCopy { dst, src } => {
+                let mut b = [(Var::SENTINEL, Var::SENTINEL); sparkrs::mem::MAX_CELLS];
+                let n = m.store_binds(const_addr(dst), m.read_const(src), &mut b);
+                stmts.push(Box::leak(Box::new(Stmt::AssignMany {
+                    binds: binds_of(&b[..n]),
+                })));
+            }
+            Op::SwapCells { x, y } => {
+                let t = smt::var(8);
+                stmts.push(Box::leak(Box::new(Stmt::Assign {
+                    var: t,
+                    expr: m.read_const(x),
+                })));
+                let mut b = [(Var::SENTINEL, Var::SENTINEL); sparkrs::mem::MAX_CELLS];
+                let n = m.store_binds(const_addr(x), m.read_const(y), &mut b);
+                stmts.push(Box::leak(Box::new(Stmt::AssignMany {
+                    binds: binds_of(&b[..n]),
+                })));
+                let mut b = [(Var::SENTINEL, Var::SENTINEL); sparkrs::mem::MAX_CELLS];
+                let n = m.store_binds(const_addr(y), t, &mut b);
+                stmts.push(Box::leak(Box::new(Stmt::AssignMany {
+                    binds: binds_of(&b[..n]),
+                })));
+            }
+            Op::StoreAtSymbolic { src } => {
+                let mut b = [(Var::SENTINEL, Var::SENTINEL); sparkrs::mem::MAX_CELLS];
+                let n = m.store_binds(a, m.read_const(src), &mut b);
+                stmts.push(Box::leak(Box::new(Stmt::AssignMany {
+                    binds: binds_of(&b[..n]),
+                })));
+            }
+        }
+    }
+    let mut node: &'static Stmt<'static> = Box::leak(Box::new(Stmt::Skip));
+    while let Some(s) = stmts.pop() {
+        node = Box::leak(Box::new(Stmt::Seq { first: s, second: node }));
+    }
+    node
+}
+
+/// Every initial array the sample considers.
+fn sample_arrays() -> Vec<[u8; 4]> {
+    let mut out = Vec::new();
+    for a in MEM_VALS {
+        for b in MEM_VALS {
+            for c in MEM_VALS {
+                for d in MEM_VALS {
+                    out.push([a, b, c, d]);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Count the sampled (array, address) pairs that violate `post` after `ops`.
+fn count_violations(ops: &[Op], post: Post, arrays: &[[u8; 4]]) -> usize {
+    let mut violations = 0;
+    for init in arrays {
+        for a in 0..4usize {
+            if !eval_post(post, a, exec_ops(ops, a, *init)) {
+                violations += 1;
+            }
+        }
+    }
+    violations
+}
+
+#[test]
+fn a_memory_proof_never_outruns_the_array() {
+    let arrays = sample_arrays();
+    let mut verified_cases = 0;
+    let mut falsified_cases = 0;
+
+    for seed in 0..400u64 {
+        let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let len = 1 + rng.below(4) as usize;
+        let ops = gen_ops(&mut rng, len);
+        let post = gen_post(&mut rng);
+
+        let verdict = smt::with_fresh(|| {
+            let mut buf = [Var::SENTINEL; 4];
+            let n = sparkrs::mem::declare(2, 8, &mut buf);
+            let m = sparkrs::mem::Mem::new(&buf[..n], 8);
+            let a = var(2);
+            let prog = build_mem_program(&ops, a, &m);
+            let symbolic_post = match post {
+                Post::EqCells(i, j) => smt::eq(m.read_const(i), m.read_const(j)),
+                Post::EqConst(i, c) => smt::eq(m.read_const(i), smt::word(c as u64, 8)),
+                Post::BelowConst(c) => {
+                    m.forall_below(a, |v| smt::eq(v, smt::word(c as u64, 8)))
+                }
+            };
+            smt::prove(wp::wp(symbolic_post, prog))
+        });
+
+        let violations = count_violations(&ops, post, &arrays);
+
+        if verdict.is_proved() {
+            verified_cases += 1;
+            assert_eq!(
+                violations, 0,
+                "seed {}: VERIFIED but {} sampled (array, address) pairs violate {:?} \
+                 after {:?}",
+                seed, violations, post, ops
+            );
+        } else {
+            assert!(
+                violations > 0,
+                "seed {}: verdict {:?} is not a proof, yet no sampled input violates {:?} \
+                 after {:?}",
+                seed, verdict, post, ops
+            );
+            falsified_cases += 1;
+        }
+    }
+
+    // Non-vacuity in both directions: the sample must contain programs the engine proves
+    // and programs it refutes, or the comparison above checks nothing.
+    assert!(
+        verified_cases > 0,
+        "no case was proved; the memory family is vacuous"
+    );
+    assert!(
+        falsified_cases > 0,
+        "no case was refuted; the memory family cannot detect a bad rule"
+    );
+}
+
+#[test]
+fn the_memory_family_has_teeth() {
+    // A deliberately wrong store rule must be caught, or the family above proves nothing.
+    //
+    // My first attempt at this used a store that kept the destination's own value, which
+    // is the identity -- the engine honestly reported "not proved" and nothing was caught,
+    // because a rule that proves *too little* is not a soundness bug. The dangerous
+    // direction is a rule that proves *too much*: here, a store that writes `val` to
+    // every cell and ignores the address. That makes `m[1] == 5` provable after
+    // `m[0] := 5`, which is false on any array whose cell 1 did not start at 5.
+    let arrays = sample_arrays();
+    let addr = 0usize;
+    let other = 1usize;
+    let val = 5u8;
+
+    let ops = [Op::StoreConst { addr, val }];
+    let post = Post::EqConst(other, val);
+
+    let verdict = smt::with_fresh(|| {
+        let mut buf = [Var::SENTINEL; 4];
+        let n = sparkrs::mem::declare(2, 8, &mut buf);
+        let m = sparkrs::mem::Mem::new(&buf[..n], 8);
+
+        // The broken rule: every cell becomes `val`, the address is ignored.
+        let binds: &'static [(Var, Var)] = Box::leak(
+            m.cells()
+                .iter()
+                .map(|c| (*c, smt::word(val as u64, 8)))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        let prog = Stmt::AssignMany { binds };
+        let symbolic_post = smt::eq(m.read_const(other), smt::word(val as u64, 8));
+        smt::prove(wp::wp(symbolic_post, &prog))
+    });
+
+    let violations = count_violations(&ops, post, &arrays);
+    assert!(
+        verdict.is_proved(),
+        "the broken rule was expected to prove the false postcondition, but gave {:?}",
+        verdict
+    );
+    assert!(
+        violations > 0,
+        "the broken rule proved a postcondition that no sampled array violates; the \
+         teeth test is not exercising the disagreement it claims to"
+    );
 }
