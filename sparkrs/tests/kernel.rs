@@ -105,10 +105,26 @@ fn implication_cut_chains() {
 fn verified_wrapper_requires_a_certificate() {
     smt::with_fresh(|| {
         let x = var(8);
+        // The wrapper records the statement the certificate proves, so it cannot be
+        // tagged with a theorem about something else.
         let cert = Certificate::discharge(x.le_val(255)).unwrap();
-        let v = Verified::new(42u32, cert);
+        let v = Verified::from_certificate(42u32, cert);
         assert_eq!(*v.get(), 42);
         assert_eq!(v.into_inner(), 42);
+
+        // And the statement is retrievable, which is the point: the claim is checkable
+        // rather than implied by the type's name.
+        assert!(smt::prove(v.statement()).is_proved());
+
+        // A statement that is not a theorem cannot be wrapped at all.
+        assert!(
+            Verified::new(42u32, x.lt_val(200)).is_none(),
+            "a refuted statement must not yield a Verified value"
+        );
+        assert!(
+            Verified::new(42u32, x.le_val(255)).is_some(),
+            "a proved statement must yield a Verified value"
+        );
     });
 }
 
@@ -116,3 +132,62 @@ fn verified_wrapper_requires_a_certificate() {
 // `assert_proof!(Falsity)` is a compile error. That is pinned down by the
 // `compile_fail` doctest on the `sparkrs::proof` module, which is the only place
 // `cargo test --doc` actually executes.
+
+#[test]
+fn a_verified_value_records_the_statement_it_proves() {
+    // The eleventh hole, and the one that undercut the crate's central promise: an
+    // overclaiming abstraction. The doc said holding a `Verified<T>` was "a machine-checked
+    // claim that the associated contract was proved", but `Verified` stored no contract and
+    // `new(value, cert)` accepted any certificate. `tests/kernel.rs` had been doing exactly
+    // the wrong thing and passing:
+    //
+    //   let cert = Certificate::discharge(x.le_val(255)).unwrap(); // proves x <= 255
+    //   let v = Verified::new(42u32, cert);                        // value is 42u32
+    //
+    // Nothing connected the two, and the type's name asserted a connection.
+    //
+    // Now the statement is stored and retrievable, so the claim is checkable instead of
+    // implied, and `from_certificate` takes the statement *from* the certificate so it
+    // cannot attest to anything else.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let cert = Certificate::discharge(x.le_val(255)).unwrap();
+        let v = Verified::from_certificate(42u32, cert);
+        assert_eq!(*v.get(), 42);
+        // The stored statement is a theorem, and it is the one the certificate proved.
+        assert!(
+            smt::prove(v.statement()).is_proved(),
+            "the stored statement must itself be a theorem"
+        );
+        // Structural identity, not semantic equivalence. Every certificate is a theorem,
+        // and every theorem is semantically equivalent to `true`, so `prove_equiv` cannot
+        // tell `x <= 255` from `true` here -- it would return Valid either way. The
+        // structural comparison is the one with teeth: it catches a wrapper that records
+        // *some* theorem instead of *the* theorem. (I first wrote this check with
+        // prove_equiv and it passed against a deliberately broken wrapper, which is how
+        // this distinction surfaced.)
+        assert_eq!(
+            v.statement(),
+            x.le_val(255),
+            "the statement must be the certificate's statement, not just any theorem"
+        );
+    });
+}
+
+#[test]
+fn a_verified_value_cannot_be_built_from_a_false_statement() {
+    // The teeth. `Verified::new` discharges the statement, so it refuses anything that is
+    // not a theorem. Without this, a caller could tag a value with a claim the prover had
+    // refuted and get a `Verified` back.
+    smt::with_fresh(|| {
+        let x = var(8);
+        assert!(
+            Verified::new(42u32, x.lt_val(200)).is_none(),
+            "a refuted statement must not yield a Verified value"
+        );
+        assert!(
+            Verified::new(42u32, x.le_val(255)).is_some(),
+            "a proved statement must yield a Verified value"
+        );
+    });
+}

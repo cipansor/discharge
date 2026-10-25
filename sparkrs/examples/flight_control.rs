@@ -187,7 +187,7 @@ fn main() {
     });
     match cert {
         Some(c) => {
-            let v = Verified::new(map_reading(2048), c);
+            let v = Verified::from_certificate(map_reading(2048), c);
             println!("[kernel]    certificate accepted, value = {}", v.get());
         }
         None => {

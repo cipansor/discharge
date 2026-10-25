@@ -97,22 +97,57 @@ where
     })
 }
 
-/// A value that carries evidence its contract was discharged.
+/// A value carrying a machine-checked theorem alongside it.
 ///
-/// The inner value is private and there is no public constructor other than
-/// [`Verified::new`], which demands a [`Certificate`]. So holding a
-/// `Verified<T>` is a machine-checked claim that the associated contract was
-/// proved, not merely asserted in a comment.
+/// The wrapper stores the *statement* the decision procedure proved, so it cannot
+/// claim more than that: [`Verified::new`] discharges the statement itself, and
+/// [`Verified::from_certificate`] records exactly the statement the certificate proves.
+/// Either way, holding a `Verified<T>` means "the stored statement is a theorem", and
+/// [`Verified::statement`] hands you that statement to check.
+///
+/// Two boundaries, stated plainly because the previous version of this comment
+/// overstated what the type gives you.
+///
+/// First, the wrapper does **not** establish that `value` satisfies `statement`. The
+/// statement is a predicate over *symbolic* variables and `value` is a concrete `T`;
+/// there is no evaluation link between them, so no constructor can check the connection.
+/// Relating the two is the caller's job — build the value so that the statement describes
+/// it.
+///
+/// Second, and easy to miss: because the statement is a theorem, it is semantically
+/// equivalent to `true`. Every theorem is. So the statement carries **no semantic content
+/// about the value** — it cannot, or it would not be provable. Its value is *bookkeeping*:
+/// it records which theorem was discharged, so a wrapper cannot silently carry a
+/// certificate for something unrelated, and a reviewer can see the claim. The type
+/// prevents mismatched bookkeeping, not an untrue claim.
 #[derive(Debug, Clone, Copy)]
 pub struct Verified<T> {
     value: T,
+    statement: Pred,
     _cert: Certificate,
 }
 
 impl<T> Verified<T> {
-    /// Wrap a value given a proof of its contract.
-    pub fn new(value: T, cert: Certificate) -> Self {
-        Verified { value, _cert: cert }
+    /// Wrap a value given a statement to prove. Returns `None` if the statement is not
+    /// a theorem (refuted or unknown), so the wrapper cannot be built without a proof.
+    pub fn new(value: T, statement: Pred) -> Option<Self> {
+        Certificate::discharge(statement)
+            .map(|cert| Verified { value, statement, _cert: cert })
+    }
+
+    /// Wrap a value given an existing certificate.
+    ///
+    /// The wrapper's statement is *derived from the certificate*, not supplied separately,
+    /// so it cannot attest to anything other than what was proved. A `Contract` can be
+    /// turned into a certificate with [`Contract::certify`], whose statement is the
+    /// implication `pre => post`.
+    pub fn from_certificate(value: T, cert: Certificate) -> Self {
+        Verified { value, statement: cert.statement(), _cert: cert }
+    }
+
+    /// The statement this value is tagged with. It is a theorem.
+    pub fn statement(&self) -> Pred {
+        self.statement
     }
 
     /// Borrow the value.

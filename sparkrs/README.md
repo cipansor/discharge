@@ -288,6 +288,32 @@ next section.
 Cost: a symbolic read is `2^addr_width` ites and the BDD sees all of them, so
 `MAX_CELLS` caps a memory at 64 cells (6 address bits).
 
+## A wrapper must not overclaim
+
+The eleventh hole, and the one that undercut the crate's central promise: an overclaiming
+abstraction. `Verified<T>` documented itself as evidence that "the associated contract was
+proved", but it stored no contract, and `new(value, cert)` accepted *any* certificate. The
+kernel test had been doing the wrong thing and passing:
+
+```rust
+let cert = Certificate::discharge(x.le_val(255)).unwrap(); // proves x <= 255
+let v = Verified::new(42u32, cert);                        // value is 42u32
+```
+
+Nothing connected the two, and the type's name asserted a connection.
+
+The wrapper now stores the statement, so the claim is checkable: `from_certificate` takes the
+statement *from* the certificate (it cannot attest to anything else), `new` discharges the
+statement itself and returns `None` if it is not a theorem, and `statement()` hands the claim
+back.
+
+Two honest boundaries, because this is exactly where a proof wrapper invites overclaiming.
+First, the wrapper does not establish that `value` satisfies `statement` — the statement is
+over symbolic variables and the value is concrete, so no constructor can check the link.
+Second, and easier to miss: because the statement is a theorem it is equivalent to `true`, so
+it carries no semantic content about the value. Its value is bookkeeping — which theorem was
+discharged — and the type prevents mismatched bookkeeping, not an untrue claim.
+
 ## A truncated witness has to say so
 
 The ninth hole, and the most consequential instance of the class: a *witness* presented as

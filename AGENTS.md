@@ -163,6 +163,26 @@ of an under-declared frame rather than hiding it. Do not "fix" that by having th
 interpreter consult the body: the point is to model the declared contract, which is what
 a real machine executes against.
 
+## The abstraction is where the claim lives
+
+The eleventh hole was `Verified<T>`: it documented itself as "a machine-checked claim that the
+associated contract was proved" while storing no contract and accepting any certificate. A
+kernel test proved `x <= 255` and wrapped `42u32`, and it passed. The type name asserted a
+connection that did not exist.
+
+Two lessons, and the second is the sharp one.
+
+First, an abstraction's doc comment is a claim like any other, and it can outrun the code the
+same way a summary can. When the type is *named* for a guarantee, the name is the claim, and it
+needs the same suspicion as a printed verdict.
+
+Second: I tested the fix with `prove_equiv(v.statement(), x.le_val(255))` and it passed against
+a deliberately broken wrapper. Of course it did — every certificate is a theorem, and every
+theorem is equivalent to `true`. A semantic comparison cannot distinguish theorems, so it has
+no teeth for checking *which* theorem was recorded. Structural equality does. The general
+point: when testing that an object records the right thing, compare structure, not semantics;
+if the object is constrained to be provable, semantics is constant and the test is vacuous.
+
 ## A guard can be correct and still be untested
 
 While sweeping for the ninth hole I checked `MAX_VARS`. `var_term` refuses an index past the

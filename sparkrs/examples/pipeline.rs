@@ -180,7 +180,7 @@ fn main() {
         // `proof!` returns a kernel certificate, or panics. Reaching the next
         // line is itself the proof.
         let cert = proof!(x.le_val(255));
-        let wrapped = Verified::new(7u8, cert);
+        let wrapped = Verified::from_certificate(7u8, cert);
         println!("proof!  certificate accepted, value    : {}", wrapped.get());
 
         // A runtime check on a concrete value, no solver involved.
