@@ -5,6 +5,7 @@
 use sparkrs::exhaustive::{for_all_u8, for_all_u8_2, find_violation_u8};
 use sparkrs::prelude::*;
 use sparkrs::smt::{self, Verdict};
+use sparkrs::wp;
 
 /// For a predicate over one 8-bit variable, symbolic proof and enumeration must
 /// give the same answer.
@@ -924,4 +925,150 @@ fn random_predicates_agree_with_enumeration() {
         }
     }
     assert!(decided > 50, "too few predicates were decided: {}", decided);
+}
+
+// ---------------------------------------------------------------------------
+// The weakest-precondition transformer, checked against a concrete interpreter.
+//
+// The tests above check the *decision procedure* against enumeration. This one checks the
+// thing that runs before it: `wp(post, program)` rewrites the postcondition through the
+// assignments that dominate it, and if that rewriting is wrong the prover will faithfully
+// prove the wrong statement. So for random straight-line and branching programs, evaluate
+// the generated `wp` at every one of the 256 inputs and compare against running the same
+// program concretely. Exhaustive, and it does not depend on the BDD engine at all.
+// ---------------------------------------------------------------------------
+
+enum WpStep {
+    Assign(FuzzExpr),
+    If(PFuzz, Vec<WpStep>, Vec<WpStep>),
+}
+
+fn build_wp_steps(steps: &[WpStep], acc: Var, x: Var) -> &'static Stmt<'static> {
+    let mut seq = Stmt::Skip;
+    for s in steps.iter().rev() {
+        let one = match s {
+            WpStep::Assign(e) => Stmt::Assign { var: acc, expr: e.build(acc, x) },
+            WpStep::If(c, t, e) => Stmt::If {
+                cond: c.build(acc, x),
+                then_: build_wp_steps(t, acc, x),
+                else_: build_wp_steps(e, acc, x),
+            },
+        };
+        seq = Stmt::Seq {
+            first: Box::leak(Box::new(one)),
+            second: Box::leak(Box::new(seq)),
+        };
+    }
+    Box::leak(Box::new(seq))
+}
+
+fn run_wp_steps(steps: &[WpStep], mut acc: u8, x: u8) -> u8 {
+    for s in steps {
+        match s {
+            WpStep::Assign(e) => acc = e.eval(acc, x),
+            WpStep::If(c, t, e) => {
+                acc = if c.eval(acc, x) {
+                    run_wp_steps(t, acc, x)
+                } else {
+                    run_wp_steps(e, acc, x)
+                };
+            }
+        }
+    }
+    acc
+}
+
+fn gen_wp_steps(r: &mut FuzzLcg, depth: u32, n: usize) -> Vec<WpStep> {
+    (0..n)
+        .map(|_| {
+            if depth > 0 && r.below(3) == 0 {
+                let (nt, ne) = (r.below(3) as usize, r.below(3) as usize);
+                let t = gen_wp_steps(r, depth - 1, nt);
+                let e = gen_wp_steps(r, depth - 1, ne);
+                WpStep::If(pfuzz_pred(r, 2), t, e)
+            } else {
+                WpStep::Assign(fuzz_expr(r, 2))
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn wp_matches_concrete_execution() {
+    let mut r = FuzzLcg(0x51ee_d00d_1234_5678);
+    for _ in 0..250 {
+        let n = 1 + r.below(4) as usize;
+        let steps = gen_wp_steps(&mut r, 2, n);
+        let post = pfuzz_pred(&mut r, 2);
+
+        smt::with_fresh(|| {
+            let x = var(8);
+            let acc = var(8);
+            // `acc := x; <steps>`: acc is always defined, so the postcondition never
+            // mentions a free `acc`.
+            let prog = build_wp_steps(&steps, acc, x);
+            let post_p = post.build(acc, x);
+            let w = wp::wp(post_p, prog);
+
+            let (ia, ix) = (acc.index(), x.index());
+            for v in 0..=255u8 {
+                // `acc` starts at `x`; both name the same input.
+                let env = |i: u32| {
+                    if i == ix || i == ia {
+                        Some(v as u64)
+                    } else {
+                        None
+                    }
+                };
+                let got = smt::evaluate_pred(w, env);
+                let want = post.eval(run_wp_steps(&steps, v, v), v);
+                assert_eq!(
+                    got,
+                    Some(want),
+                    "wp(post, program) disagrees with concrete execution at x={}",
+                    v
+                );
+            }
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Substitution must not walk a shift amount as if it were a term id.
+//
+// A shift node stores its amount in the `b` field, which every other binary node uses for
+// a term id. `subst` walked `b` regardless, so substituting through `x << 3` recursed into
+// whatever term happened to have id 3. When that term contained the shift itself the
+// recursion never bottomed out -- `wp` on a two-line program blew the stack. When it did
+// not, the walk still touched an unrelated term, so a stale or oversized id there could
+// flip the `stale` flag and turn a provable goal into `Unknown`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn substitution_through_a_shift_is_finite_and_correct() {
+    smt::with_fresh(|| {
+        let x = var(8);
+        let y = var(8);
+        // `x << 3` then substitute `x := y`. The shift amount (3) must survive untouched.
+        let shifted = smt::shl(x, 3);
+        let sub = smt::substitute_word(shifted, &[(x, y)]);
+        assert_eq!(smt::bits(sub), 8);
+        let y_idx = y.index();
+        let x_idx = x.index();
+        for v in 0..=255u8 {
+            let got = smt::evaluate(sub, |i| if i == y_idx { Some(v as u64) } else { None });
+            let want = (v as u64) << 3 & 0xff;
+            assert_eq!(got, Some(want), "x<<3 with x={} substituted to y should be {}", v, want);
+        }
+
+        // And the same through the weakest-precondition transformer, which is where the
+        // crash showed up.
+        let prog = Stmt::Assign { var: x, expr: smt::shl(x, 3) };
+        let w = wp::wp(smt::ult_const(x, 200), &prog);
+        for v in 0..=255u8 {
+            let got = smt::evaluate_pred(w, |i| if i == x_idx { Some(v as u64) } else { None });
+            let want = (v as u64) << 3 & 0xff < 200;
+            assert_eq!(got, Some(want), "wp through a shift disagrees at x={}", v);
+        }
+    });
 }

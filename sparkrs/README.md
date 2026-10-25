@@ -312,6 +312,21 @@ no wider than the source; for a *widening* `truncate` it produced `((_ extract 1
 extracting bit 15 from an 8-bit vector, which no solver accepts. Widening is `zero_extend`, and
 the source width now decides which form is printed.
 
+## Substitution must not walk a shift amount
+
+A shift node stores its amount in the same field every other binary node uses for a term id.
+`subst` walked that field regardless, so substituting through `x << 3` recursed into whatever
+term happened to have id 3. When that term contained the shift itself, the recursion never
+bottomed out: `wp` on a two-line program blew the stack. When it did not, the walk still
+touched an unrelated term, so a stale or oversized id there could flip the `stale` flag and
+turn a provable goal into `Unknown`.
+
+The differential test over the weakest-precondition transformer found it. It generates random
+straight-line and branching programs, evaluates the generated `wp` at every one of the 256
+inputs, and compares against running the same program concretely — exhaustive, and it does not
+depend on the BDD engine at all. The fix skips the payload field for `Trunc` and the three
+shifts, which the rebuild already carries across.
+
 ## Mixed-width operations are refused, not truncated
 
 A bit-vector operation has no natural width when its operands disagree. The engine used to

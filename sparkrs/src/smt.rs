@@ -560,7 +560,13 @@ impl Ctx {
                     return Term(self.subst_memo[key]);
                 }
                 let a = self.subst(Term(n.a));
-                let b = if matches!(n.op, Op::Not | Op::Trunc) {
+                // `b` is a term id for most operations, but it is a *payload* for the
+                // unary and shift forms: the source width for `Trunc`, and the shift
+                // amount for `Shl`/`LShr`/`Shr`. Recursing into it as if it were a term
+                // id substitutes an unrelated term -- and when that id names a term that
+                // contains this very shift, the recursion never bottoms out. The rebuild
+                // below already carries the payload across, so it must not be traversed.
+                let b = if matches!(n.op, Op::Not | Op::Trunc | Op::Shl | Op::LShr | Op::Shr) {
                     Term(0)
                 } else {
                     self.subst(Term(n.b))
