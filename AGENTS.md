@@ -138,6 +138,31 @@ and also what makes the frame check load-bearing:
 Recursion is deliberately unsupported: a cyclic call graph needs an induction
 principle, which is a different feature rather than a missing branch.
 
+## A verifier needs a differential harness, not just unit tests
+
+Both soundness holes in the call rule were found by accident. `tests/modular_differential.rs`
+is the deliberate version: generate callers, verify, then *interpret concretely* and
+require that a proof never outruns reality. Three rules for keeping it honest:
+
+1. **Validate the oracle before trusting it.** `smt::evaluate` is the concrete semantics
+   and the harness's oracle; `the_evaluator_agrees_with_the_engine_on_every_operator`
+   pins it against the engine. If you add an `Op` variant, add it to `eval_term` *and*
+   to that test, or the oracle silently becomes a second guess.
+2. **Seed what the call writes.** A missing havoc rule is invisible unless a written
+   variable holds a distinguishable value before the call. The generator assigns `t`
+   before calling, precisely so that "the call left `t` alone" is a falsifiable claim.
+   Any new soundness rule needs the same treatment: construct the state where breaking
+   it is observable.
+3. **Show the check can fail.** `the_property_has_teeth` runs one case under a
+   deliberately wrong semantics for calls and requires the detection. When adding a
+   rule, disable it once and confirm the harness goes red; a green check that has never
+   been red is not evidence of anything.
+
+The interpreter is honest about the *declared* frame, so it reproduces the unsoundness
+of an under-declared frame rather than hiding it. Do not "fix" that by having the
+interpreter consult the body: the point is to model the declared contract, which is what
+a real machine executes against.
+
 ## Architecture (read this before editing `smt.rs`)
 
 `src/smt.rs` is the heart: bit-vector terms are bit-blasted into a Reduced

@@ -183,3 +183,121 @@ fn mask(width: u8) -> u64 {
         (1u64 << width) - 1
     }
 }
+
+// ---------------------------------------------------------------------------
+// The concrete evaluator must agree with the bit-level engine.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_evaluator_agrees_with_the_engine_on_every_operator() {
+    // `smt::evaluate` is the concrete semantics of the symbolic language. It is used
+    // as an *oracle* by the modular differential harness, so it has to be right
+    // first — an oracle that disagrees with the engine would send me chasing bugs in
+    // the wrong place. For each operation and every 8-bit input pair, the evaluator's
+    // answer must equal what the engine says when both inputs are pinned.
+    use sparkrs::smt::{self, var};
+
+    // Build every operation, then compare per input pair.
+    type BinOp = fn(smt::Var, smt::Var) -> smt::Var;
+    let ops: Vec<(&str, BinOp)> = vec![
+        ("and", smt::band),
+        ("or", smt::bor),
+        ("xor", smt::bxor),
+        ("add", |a, b| a + b),
+        ("sub", |a, b| a - b),
+        ("mul", |a, b| a * b),
+    ];
+
+    for (name, f) in ops {
+        smt::with_fresh(|| {
+            let a = var(8);
+            let b = var(8);
+            let t = f(a, b);
+            let ai = smt::index(a);
+            let bi = smt::index(b);
+            for x in [0u64, 1, 7, 100, 128, 200, 255] {
+                for y in [0u64, 1, 3, 99, 128, 254, 255] {
+                    let concrete =
+                        smt::evaluate(t, |i| if i == ai { Some(x) } else if i == bi { Some(y) } else { None })
+                            .expect("both inputs are known");
+                    // The engine, with both inputs pinned, must produce the same value.
+                    let proved = smt::prove_implies(
+                        smt::and(smt::eq_const(a, x), smt::eq_const(b, y)),
+                        smt::eq_const(t, concrete),
+                    );
+                    assert!(
+                        proved.is_proved(),
+                        "{} at ({}, {}): evaluator says {} but the engine disagrees",
+                        name,
+                        x,
+                        y,
+                        concrete
+                    );
+                    // And the ground truth in Rust agrees too.
+                    let expected = match name {
+                        "and" => x & y,
+                        "or" => x | y,
+                        "xor" => x ^ y,
+                        "add" => x.wrapping_add(y),
+                        "sub" => x.wrapping_sub(y),
+                        "mul" => x.wrapping_mul(y),
+                        _ => unreachable!(),
+                    } & 0xff;
+                    assert_eq!(concrete, expected, "{} at ({}, {})", name, x, y);
+                }
+            }
+        });
+    }
+}
+
+#[test]
+fn the_evaluator_handles_widths_truncation_and_shifts() {
+    use sparkrs::smt::{self, var};
+
+    smt::with_fresh(|| {
+        let a = var(8);
+        let ai = smt::index(a);
+
+        // A narrow constant masks its own width.
+        let narrow = smt::word(0xff, 4);
+        assert_eq!(smt::evaluate(narrow, |_| None), Some(0xf));
+
+        // Truncation keeps the low bits.
+        let t = smt::truncate(a, 3);
+        for x in 0..=255u64 {
+            let got = smt::evaluate(t, |i| if i == ai { Some(x) } else { None }).unwrap();
+            assert_eq!(got, x & 0b111, "truncate at {}", x);
+        }
+
+        // Widening zero-fills.
+        let w = smt::truncate(a, 16);
+        for x in 0..=255u64 {
+            let got = smt::evaluate(w, |i| if i == ai { Some(x) } else { None }).unwrap();
+            assert_eq!(got, x);
+        }
+
+        // Shifts: left, logical right, arithmetic right.
+        for x in 0..=255u64 {
+            let l = smt::evaluate(a << 2u32, |i| if i == ai { Some(x) } else { None }).unwrap();
+            assert_eq!(l, (x << 2) & 0xff, "shl at {}", x);
+
+            let r = smt::evaluate(a >> 2u32, |i| if i == ai { Some(x) } else { None }).unwrap();
+            assert_eq!(r, x >> 2, "lshr at {}", x);
+
+            // `Shr` is arithmetic: the sign bit replicates.
+            let sar = smt::evaluate(smt::ashr(a, 2), |i| if i == ai { Some(x) } else { None })
+                .unwrap();
+            let expected = ((x as i8) >> 2) as u8 as u64;
+            assert_eq!(sar, expected, "shr at {}", x);
+        }
+
+        // An unknown input yields `None` rather than a guess.
+        assert_eq!(smt::evaluate(a, |_| None), None);
+        assert_eq!(smt::evaluate(t, |i| if i == ai { Some(5) } else { None }), Some(5));
+        assert_eq!(smt::evaluate(a + 1u32, |_| None), None);
+
+        // Predicates evaluate to booleans.
+        assert_eq!(smt::evaluate_pred(smt::ult_const(a, 10), |i| if i == ai { Some(9) } else { None }), Some(true));
+        assert_eq!(smt::evaluate_pred(smt::ult_const(a, 10), |i| if i == ai { Some(10) } else { None }), Some(false));
+    });
+}

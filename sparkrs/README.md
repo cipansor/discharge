@@ -288,6 +288,38 @@ next section.
 Cost: a symbolic read is `2^addr_width` ites and the BDD sees all of them, so
 `MAX_CELLS` caps a memory at 64 cells (6 address bits).
 
+## Differential testing: a proof must not outrun reality
+
+The two soundness holes in the call rule were found by accident — by writing a test
+that asserted the wrong thing and noticing the engine agreed. That is not a method, so
+`tests/modular_differential.rs` is the method: it generates programs containing calls,
+verifies them with the engine, and **interprets them concretely**, then demands:
+
+> if the engine reports the caller verified, no concrete execution in a bounded
+> enumeration violates the postcondition.
+
+That is the direction that matters, because soundness is the property that, if broken,
+lets a verifier certify a bug. The other direction — every reported failure has a real
+counterexample — is checked where it is cheap, but it cannot be complete, since a
+failure may come from a bound the enumeration does not reach.
+
+Three things make the harness trustworthy rather than decorative:
+
+1. **`smt::evaluate` is validated first.** The concrete evaluator is the oracle, so
+   `the_evaluator_agrees_with_the_engine_on_every_operator` pins it against the
+   bit-level engine for every operator and every input pair. An oracle that disagreed
+   would send you chasing bugs in the wrong place.
+2. **The search space targets the known failure shapes.** The generator varies what the
+   callee writes (directly or through a nested call), which caller variables the rename
+   maps, and whether the declared frame is correct, generous, or a lie. It also *seeds*
+   the result variable before the call — without that seeding, a missing havoc rule is
+   invisible, because there is no pre-call value to be confused with the post-call one.
+3. **The property has been observed to fail.** With the havoc rule disabled, the
+   harness fails at a specific case and input; with the frame-completeness check
+   disabled, two tests fail. `the_property_has_teeth` makes the same point inside the
+   suite, by running one case under a deliberately wrong semantics for calls and
+   requiring all 256 inputs to be caught. A check never seen to fail is not evidence.
+
 ## Bounded quantification: the invariant a loop over memory needs
 
 A fill loop's invariant is "every cell below `k` is zero". That is a quantifier,
@@ -541,7 +573,8 @@ sparkrs/
 │   ├── wp.rs           generated conditions checked against execution
 │   ├── mem.rs          memory proofs checked against real Rust arrays
 │   ├── quant.rs        fill and scan loops, both verified and executed
-│   └── call.rs         modular verification, every positive with its control
+│   ├── call.rs         modular verification, every positive with its control
+│   └── modular_differential.rs  generated callers, verified then executed
 └── examples/
     ├── flight_control.rs  a realistic actuator path, all obligations discharged
     ├── pipeline.rs        program -> conditions -> proofs -> SMT-LIB2

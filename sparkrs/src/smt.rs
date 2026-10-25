@@ -1144,6 +1144,114 @@ pub fn bits(v: Var) -> u8 {
     with_ctx(|c| c.width_of(v.0))
 }
 
+/// Evaluate a term under a concrete assignment, if every input is known.
+///
+/// This is the concrete semantics of the symbolic language, and it exists so that a
+/// proof can be compared against what the terms actually *mean*. Two uses:
+///
+/// * [`crate::wp::verify`] decides the same terms with the bit-level engine. Any
+///   disagreement between the two is a bug in one of them, and this makes that
+///   disagreement observable.
+/// * A counterexample reports values only for the variables the engine happened to
+///   fix. Re-evaluating a term under that partial assignment turns a model into a
+///   *checkable* claim: if the term is supposed to be false at the counterexample,
+///   this says so without trusting the engine.
+///
+/// `value` answers with the value of a variable index, or `None` when it is unknown.
+/// A term is evaluated only when every input it needs is known; otherwise the answer
+/// is `None` rather than a guess.
+///
+/// Widths are honoured: results are masked to the term's own width, shifts are by the
+/// constant amount stored in the node, and `Shr` is arithmetic (the sign bit
+/// replicates), matching the bit-blaster exactly.
+pub fn evaluate(t: Var, value: impl Fn(u32) -> Option<u64>) -> Option<u64> {
+    with_ctx(|c| eval_term(c, t.0, &value))
+}
+
+/// [`evaluate`] for a predicate. `None` when some input is unknown.
+pub fn evaluate_pred(p: Pred, value: impl Fn(u32) -> Option<u64>) -> Option<bool> {
+    evaluate(Var(p.0), value).map(|v| v != 0)
+}
+
+fn eval_term(ctx: &mut Ctx, t: Term, value: &impl Fn(u32) -> Option<u64>) -> Option<u64> {
+    let n = ctx.node_of(t);
+    let w = n.width;
+    let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+    let v = match n.op {
+        Op::Var => return value(n.a).map(|x| x & mask),
+        Op::Const => (n.a as u64) | ((n.hi as u64) << 32),
+        Op::Not => !eval_term(ctx, Term(n.a), value)? & mask,
+        Op::And => eval_term(ctx, Term(n.a), value)? & eval_term(ctx, Term(n.b), value)? & mask,
+        Op::Or => eval_term(ctx, Term(n.a), value)? | eval_term(ctx, Term(n.b), value)? & mask,
+        Op::Xor => eval_term(ctx, Term(n.a), value)? ^ eval_term(ctx, Term(n.b), value)? & mask,
+        // The shift amount lives in the node, not in a term; see `shift`.
+        Op::Shl => {
+            let a = eval_term(ctx, Term(n.a), value)?;
+            let sh = n.b;
+            if sh >= 64 {
+                0
+            } else {
+                (a << sh) & mask
+            }
+        }
+        Op::LShr => {
+            let a = eval_term(ctx, Term(n.a), value)?;
+            let sh = n.b;
+            if sh >= 64 {
+                0
+            } else {
+                (a & mask) >> sh
+            }
+        }
+        Op::Shr => {
+            // Arithmetic: replicate the sign bit, matching the bit-blaster.
+            let a = eval_term(ctx, Term(n.a), value)? & mask;
+            let sh = n.b;
+            if sh >= w as u32 {
+                if a >> (w - 1) & 1 == 1 {
+                    mask
+                } else {
+                    0
+                }
+            } else {
+                let sign_fill = if a >> (w - 1) & 1 == 1 { mask } else { 0 };
+                (a >> sh) | (sign_fill & !(mask >> sh))
+            }
+        }
+        Op::Add => eval_term(ctx, Term(n.a), value)?.wrapping_add(eval_term(ctx, Term(n.b), value)?) & mask,
+        Op::Sub => eval_term(ctx, Term(n.a), value)?.wrapping_sub(eval_term(ctx, Term(n.b), value)?) & mask,
+        Op::Mul => eval_term(ctx, Term(n.a), value)?.wrapping_mul(eval_term(ctx, Term(n.b), value)?) & mask,
+        Op::Eq => {
+            u64::from(eval_term(ctx, Term(n.a), value)? == eval_term(ctx, Term(n.b), value)?)
+        }
+        Op::Ult => {
+            u64::from(eval_term(ctx, Term(n.a), value)? < eval_term(ctx, Term(n.b), value)?)
+        }
+        Op::Ule => {
+            u64::from(eval_term(ctx, Term(n.a), value)? <= eval_term(ctx, Term(n.b), value)?)
+        }
+        Op::Ite => {
+            let c = eval_term(ctx, Term(n.a), value)?;
+            if c != 0 {
+                eval_term(ctx, Term(n.b), value)?
+            } else {
+                eval_term(ctx, Term(n.c), value)?
+            }
+        }
+        Op::Trunc => {
+            // Keep the low bits, zero-fill the rest.
+            let a = eval_term(ctx, Term(n.a), value)?;
+            let src = n.b;
+            if src >= 64 {
+                a & mask
+            } else {
+                a & ((1u64 << src) - 1) & mask
+            }
+        }
+    };
+    Some(v & mask)
+}
+
 /// The numeric index of a symbolic variable (as shown in models).
 pub fn index(v: Var) -> u32 {
     with_ctx(|c| c.node_of(v.0).a)
