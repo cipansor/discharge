@@ -379,3 +379,149 @@ fn a_model_that_fits_is_complete() {
         }
     });
 }
+
+// ---------------------------------------------------------------------------
+// Every operation, checked against Rust, at widths the BDD can finish.
+//
+// `blast` (BDD) and `eval_term` (concrete) are independent implementations of the
+// same term language. Above four bits, `mul` exhausts the BDD budget and `prove`
+// returns `Unknown`, so the *blasting* of `mul` was never actually exercised by a
+// passing test -- only its evaluation was. These tests pin every op at widths where
+// the BDD does finish, so a blasting bug cannot hide behind `Unknown`.
+//
+// The oracle is Rust's own wrapping arithmetic, so agreement is evidence about the
+// engine, not about itself.
+// ---------------------------------------------------------------------------
+
+fn width_mask(w: u8) -> u64 {
+    if w >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << w) - 1
+    }
+}
+
+/// `op(a, b)` blasted must equal Rust's `rust(a, b)` for every input pair, and a
+/// deliberately wrong equation must be refuted (so a broken engine cannot pass by
+/// proving everything).
+fn binary_op_agrees(w: u8, name: &str, op: fn(Var, Var) -> Var, rust: fn(u64, u64) -> u64) {
+    let m = width_mask(w);
+    for a in 0..=m {
+        for b in 0..=m {
+            let want = rust(a, b) & m;
+            let valid = smt::with_fresh(|| {
+                let av = smt::word(a, w);
+                let bv = smt::word(b, w);
+                smt::prove(smt::eq(op(av, bv), smt::word(want, w))).is_proved()
+            });
+            assert!(valid, "w={} {}: {}({}, {}) should be {}", w, name, name, a, b, want);
+        }
+    }
+    // Teeth: a wrong result must not be proved. `op(a,b) == want ^ 1` holds for no
+    // input when `want ^ 1 != want`, which is always.
+    let wrong_valid = smt::with_fresh(|| {
+        let av = var(w);
+        let bv = var(w);
+        let shifted = smt::bxor(op(av, bv), smt::word(1, w));
+        smt::prove(smt::eq(op(av, bv), shifted)).is_proved()
+    });
+    assert!(!wrong_valid, "w={} {}: a wrong equation must not be proved", w, name);
+}
+
+#[test]
+fn every_binary_operation_matches_rust() {
+    for w in 1u8..=4 {
+        binary_op_agrees(w, "add", smt::add, |a, b| a.wrapping_add(b));
+        binary_op_agrees(w, "sub", smt::sub, |a, b| a.wrapping_sub(b));
+        binary_op_agrees(w, "mul", smt::mul, |a, b| a.wrapping_mul(b));
+        binary_op_agrees(w, "band", smt::band, |a, b| a & b);
+        binary_op_agrees(w, "bor", smt::bor, |a, b| a | b);
+        binary_op_agrees(w, "bxor", smt::bxor, |a, b| a ^ b);
+    }
+}
+
+#[test]
+fn every_shift_matches_rust() {
+    for w in 1u8..=4 {
+        let m = width_mask(w);
+        for a in 0..=m {
+            for k in 0..=(w as u32 + 1) {
+                let (shl_want, lshr_want, ashr_want) = if w >= 64 {
+                    (a.wrapping_shl(k), a.wrapping_shr(k), ((a as i64) >> k.min(63)) as u64)
+                } else {
+                    (
+                        (a << k) & m,
+                        if k >= w as u32 { 0 } else { (a >> k) & m },
+                        {
+                            // Arithmetic shift on a `w`-bit two's-complement value.
+                            let sign_bit = 1u64 << (w - 1);
+                            let signed = if a & sign_bit != 0 { (a | !m) as i64 } else { a as i64 };
+                            (signed >> k.min(63)) as u64 & m
+                        },
+                    )
+                };
+                // Through `prove`, so the *blasting* is what is checked. Using
+                // `evaluate` here would test `eval_term` instead, and a mutation to the
+                // BDD shift arm would slip through -- which is exactly what the first
+                // version of this test did.
+                // A concrete constant, so the equation is decidable, but routed through
+                // `prove` so the BDD *blast* arm for the shift runs. Using `evaluate` here
+                // would test `eval_term` instead, and a mutation to the blast arm would
+                // slip through -- which is exactly what the first version of this test did.
+                let got = smt::with_fresh(|| {
+                    let av = smt::word(a, w);
+                    (
+                        smt::prove(smt::eq(smt::shl(av, k), smt::word(shl_want, w))).is_proved(),
+                        smt::prove(smt::eq(smt::lshr(av, k), smt::word(lshr_want, w))).is_proved(),
+                        smt::prove(smt::eq(smt::ashr(av, k), smt::word(ashr_want, w))).is_proved(),
+                    )
+                });
+                assert!(got.0, "w={} {} << {} should be {}", w, a, k, shl_want);
+                assert!(got.1, "w={} {} >> {} should be {}", w, a, k, lshr_want);
+                assert!(got.2, "w={} {} >>a {} should be {}", w, a, k, ashr_want);
+            }
+        }
+    }
+}
+
+/// The comparison *blasting* (which evaluation does not exercise) must agree with Rust.
+#[test]
+fn comparison_blasting_matches_rust() {
+    for w in 1u8..=4 {
+        let m = width_mask(w);
+        for a in 0..=m {
+            for b in 0..=m {
+                let (ult, ule, eq) = smt::with_fresh(|| {
+                    let av = smt::word(a, w);
+                    let bv = smt::word(b, w);
+                    (
+                        smt::prove(smt::ult(av, bv)).is_proved(),
+                        smt::prove(smt::ule(av, bv)).is_proved(),
+                        smt::prove(smt::eq(av, bv)).is_proved(),
+                    )
+                });
+                assert_eq!(ult, a < b, "w={} {} < {}", w, a, b);
+                assert_eq!(ule, a <= b, "w={} {} <= {}", w, a, b);
+                assert_eq!(eq, a == b, "w={} {} == {}", w, a, b);
+            }
+        }
+    }
+}
+
+/// Truncation, the one width-changing operation.
+#[test]
+fn truncation_matches_rust() {
+    for src in 1u8..=4 {
+        let m = width_mask(src);
+        for dst in 1u8..=4 {
+            let dm = width_mask(dst);
+            for a in 0..=m {
+                let got = smt::with_fresh(|| {
+                    let av = smt::word(a, src);
+                    smt::evaluate(smt::truncate(av, dst), |_| None).unwrap()
+                });
+                assert_eq!(got, a & dm, "truncate {} ({} bits) to {} bits", a, src, dst);
+            }
+        }
+    }
+}

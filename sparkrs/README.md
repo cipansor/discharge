@@ -288,6 +288,24 @@ next section.
 Cost: a symbolic read is `2^addr_width` ites and the BDD sees all of them, so
 `MAX_CELLS` caps a memory at 64 cells (6 address bits).
 
+## The blasting is checked against Rust, not against itself
+
+The differential harness compared whole predicates at eight bits. Above four bits `mul`
+exhausts the BDD budget and `prove` returns `Unknown`, so the *blasting* of `mul` — the part
+that decides proofs — had never been exercised by a passing test. Only its evaluation had.
+A bug in that arm would be unsound, and nothing would have caught it.
+
+Every operation is now checked at widths the BDD can finish, with Rust's own wrapping
+arithmetic as the oracle: `add`, `sub`, `mul`, `and`, `or`, `xor`, all three shifts,
+`ult`/`ule`/`eq`, and `truncate`. Each equation is routed through `prove`, so the blast arm
+runs, and a deliberately wrong equation is asserted *not* to be proved, so an engine that
+proved everything would fail.
+
+Writing this found a hole in the test itself: the first version checked shifts through
+`evaluate`, which exercises `eval_term` and not `blast`. A mutation to the BDD shift arm
+passed. Routing through `prove` with a concrete constant catches it, and that is verified by
+mutation rather than assumed.
+
 ## Staleness is caught once, in the arena
 
 Stamping proof objects with an arena generation raised the obvious follow-up: what *else*
