@@ -163,6 +163,22 @@ of an under-declared frame rather than hiding it. Do not "fix" that by having th
 interpreter consult the body: the point is to model the declared contract, which is what
 a real machine executes against.
 
+## Quote the count, do not remember it
+
+Three commits in a row said "161 tests pass", "163 tests pass", "165 tests pass" while the
+real numbers were 149, 151, 153. Every other figure in those messages was measured -- the
+differential case counts, the mutation counts, the coverage counters. The test total was the
+one number I recalled, and it drifted by a constant twelve, which is the signature of counting
+something else once (test functions plus doc examples, probably) and then incrementing from
+memory.
+
+The failure is the same class as the seven holes, in the reporting rather than the code: a
+number stated with more confidence than the evidence behind it. The fix is the same shape too
+-- do not argue it, measure it. `scripts/test-count.sh` runs the suite and prints the exact
+count, so the figure is a command rather than a memory. Run it before writing the number.
+
+If a claim is worth putting in a commit message, it is worth the command that produces it.
+
 ## Vacuity is not only about widths
 
 The sixth hole was vacuity caused by a width: a bound too narrow to name `len`. The seventh is

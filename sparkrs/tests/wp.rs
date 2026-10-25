@@ -805,3 +805,41 @@ fn a_reachable_precondition_is_still_proved() {
         );
     });
 }
+
+#[test]
+fn an_unsatisfiable_invariant_is_not_vacuously_proved() {
+    // The vacuity sweep, applied to loops. It would be easy to assume a loop with an
+    // unsatisfiable invariant verifies vacuously -- `I && c => wp(body, I)` is a theorem
+    // when `I` is unsatisfiable -- but the report does not rest on that rule alone. The
+    // contract condition carries the loop's *entry* obligation, `pre => I`, and a
+    // satisfiable precondition cannot imply an unsatisfiable invariant, so the report
+    // fails and attributes the failure to `Body`.
+    //
+    // Pinned because the safety is structural and easy to lose: it depends on the entry
+    // condition being part of `wp` and on `pre` being checked for reachability, not on any
+    // special treatment of loops. If someone later made `Body` weaker, this would be the
+    // test that noticed.
+    smt::with_fresh(|| {
+        let k = var(8);
+        let pre = smt::truth(true);
+        let inv = smt::and(smt::ult_const(k, 10), smt::ugt_const(k, 200));
+        assert!(
+            smt::prove(smt::not(inv)).is_proved(),
+            "the invariant under test must be unsatisfiable"
+        );
+        let body = Stmt::Assign { var: k, expr: k + 1u32 };
+        let loop_ = Stmt::While {
+            cond: smt::ult_const(k, 4),
+            invariant: inv,
+            variant: Some(smt::sub(smt::word(4, 8), k)),
+            body: &body,
+        };
+        let post = smt::eq_const(k, 77);
+        let report = wp::verify(&loop_, pre, post);
+        assert!(
+            !report.is_verified(),
+            "an unsatisfiable invariant must not verify vacuously"
+        );
+        assert_eq!(report.establishes(), wp::Established::Nothing);
+    });
+}
