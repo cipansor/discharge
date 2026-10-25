@@ -827,20 +827,29 @@ impl Report {
         self.first_failure().is_none()
     }
 
-    /// True when *every* loop in the program carried a variant.
+    /// True when every loop in the program carried a variant **that was proved to
+    /// decrease**.
     ///
-    /// Without a variant, a verified report only means *partial* correctness:
-    /// correct if the program terminates. With one for each loop, progress is
-    /// proved too. One loop is one preservation obligation, so comparing the two
-    /// counts is enough; a program with no loops counts as terminating, since
-    /// there is nothing that could diverge.
+    /// Without a variant, a verified report only means *partial* correctness: correct
+    /// if the program terminates. With a discharged variant for each loop, progress is
+    /// proved too. A program with no loops counts as terminating, since there is
+    /// nothing that could diverge.
+    ///
+    /// The variant obligations must be *discharged*, not merely present. A variant that
+    /// is supplied but does not decrease proves nothing, so a report is `Total` only
+    /// when each one was established. This was a real defect: counting variants instead
+    /// of discharging them let a report call itself `Total` on the strength of a measure
+    /// it had failed to justify. `a_variant_that_does_not_decrease_is_not_termination`
+    /// in `tests/wp.rs` pins it.
     pub fn has_termination_proof(&self) -> bool {
         let mut loops = 0;
         let mut variants = 0;
         for ob in self.obligations[..self.count].iter().flatten() {
             match ob.rule {
                 Rule::LoopPreserve => loops += 1,
-                Rule::LoopVariant => variants += 1,
+                // Present *and* proved: an obligation that did not discharge is not
+                // evidence of progress.
+                Rule::LoopVariant if ob.discharge().is_proved() => variants += 1,
                 _ => {}
             }
         }
@@ -849,13 +858,14 @@ impl Report {
 
     /// What a verified report actually establishes.
     ///
-    /// `Total` means every loop carried a variant, so termination is proved as
-    /// well as the contract. `Partial` means the contract holds for any run that
-    /// terminates, but divergence is not ruled out.
+    /// `Total` means every loop carried a variant that was proved to decrease, so
+    /// termination is established as well as the contract. `Partial` means the contract
+    /// holds for any run that terminates, but divergence is not ruled out.
     ///
-    /// This says nothing about whether the report was actually *verified*; it
-    /// only classifies what the obligations would establish if they hold. Check
-    /// [`Report::is_verified`] as well.
+    /// For a report that *is* verified, this is the honest classification. For one that
+    /// is not, read it as the best case: it classifies what the obligations would
+    /// establish if they all held. Check [`Report::is_verified`] first, or use
+    /// [`Report::establishes`], which asks both questions at once.
     pub fn correctness(&self) -> Correctness {
         if self.has_termination_proof() {
             Correctness::Total
@@ -863,6 +873,40 @@ impl Report {
             Correctness::Partial
         }
     }
+
+    /// The single question a caller usually means to ask: what, if anything, did this
+    /// report actually establish?
+    ///
+    /// [`Report::is_verified`] and [`Report::correctness`] answer two halves of that
+    /// question, and asking only one of them is easy to get wrong — a `Total` claim
+    /// from an unverified report is worth nothing. This asks both, so the answer cannot
+    /// be read off the wrong half.
+    pub fn establishes(&self) -> Established {
+        if !self.is_verified() {
+            Established::Nothing
+        } else if self.has_termination_proof() {
+            Established::Total
+        } else {
+            Established::Partial
+        }
+    }
+}
+
+/// What a [`Report`] actually established, as one value.
+///
+/// [`Report::establishes`] produces this. It exists because "is it verified?" and
+/// "does it cover termination?" are two questions whose answers are only useful
+/// together, and a caller who reads one of them in isolation can conclude the wrong
+/// thing from a report that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Established {
+    /// Nothing: the report was not verified, so no claim was established. The other two
+    /// variants say nothing about a report in this state, which is why this one exists.
+    Nothing,
+    /// The contract holds for any run that terminates; divergence is not ruled out.
+    Partial,
+    /// The contract holds and every loop was proved to make progress.
+    Total,
 }
 
 /// How much a verified [`Report`] establishes.

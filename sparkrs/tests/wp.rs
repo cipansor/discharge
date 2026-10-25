@@ -542,3 +542,80 @@ fn one_unannotated_loop_makes_the_whole_report_partial() {
         assert_eq!(report.correctness(), wp::Correctness::Partial);
     });
 }
+
+#[test]
+fn a_variant_that_does_not_decrease_is_not_termination() {
+    // The defect the differential harness found, pinned here so it cannot come back.
+    //
+    // `has_termination_proof` used to count variant obligations instead of discharging
+    // them. So a loop annotated with a measure that does *not* decrease reported
+    // `Total`: the report was not verified (the variant obligation failed), yet
+    // `correctness()` still said `Total`. Two halves of one question, read separately,
+    // gave opposite answers, and the optimistic half was the one a caller is tempted to
+    // read.
+    smt::with_fresh(|| {
+        let i = var(8);
+        let step = Stmt::Assign { var: i, expr: i + 1u32 };
+        // The measure `i` increases as `i` increases, so it cannot decrease.
+        let loop_ = Stmt::While {
+            cond: i.lt_val(10),
+            invariant: i.le_val(10),
+            variant: Some(i),
+            body: &step,
+        };
+        let report = verify_program(&loop_, i.le_val(10), i.le_val(10));
+
+        assert!(!report.is_verified(), "the variant obligation must fail");
+        let (ob, _) = report.first_failure().expect("a failure is expected");
+        assert_eq!(ob.rule, wp::Rule::LoopVariant);
+
+        // The point: no termination claim may survive that failure.
+        assert!(
+            !report.has_termination_proof(),
+            "a variant that was not proved to decrease is not a termination proof"
+        );
+        assert_eq!(report.correctness(), wp::Correctness::Partial);
+        assert_eq!(
+            report.establishes(),
+            wp::Established::Nothing,
+            "an unverified report establishes nothing at all"
+        );
+    });
+}
+
+#[test]
+fn establishes_answers_both_halves_at_once() {
+    // The three states, side by side, so the distinction is visible in one place.
+    smt::with_fresh(|| {
+        let i = var(8);
+        let init = Stmt::Assign { var: i, expr: smt::word(0, 8) };
+        let step = Stmt::Assign { var: i, expr: i + 1u32 };
+
+        // Verified with a decreasing variant: total.
+        let good = Stmt::While {
+            cond: i.lt_val(10),
+            invariant: i.le_val(10),
+            variant: Some(smt::sub(smt::word(10, 8), i)),
+            body: &step,
+        };
+        let prog = Stmt::Seq { first: &init, second: &good };
+        let r = verify_program(&prog, smt::truth(true), smt::truth(true));
+        assert_eq!(r.establishes(), wp::Established::Total);
+
+        // Verified without a variant: partial.
+        let no_variant = Stmt::While {
+            cond: i.lt_val(10),
+            invariant: i.le_val(10),
+            variant: None,
+            body: &step,
+        };
+        let prog = Stmt::Seq { first: &init, second: &no_variant };
+        let r = verify_program(&prog, smt::truth(true), smt::truth(true));
+        assert_eq!(r.establishes(), wp::Established::Partial);
+
+        // Not verified: nothing, whatever the obligations would have said.
+        let r = verify_program(&prog, smt::truth(true), smt::eq_const(i, 99));
+        assert!(!r.is_verified());
+        assert_eq!(r.establishes(), wp::Established::Nothing);
+    });
+}

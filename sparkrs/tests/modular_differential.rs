@@ -505,3 +505,263 @@ fn the_property_has_teeth() {
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// Loops containing calls.
+//
+// This is where the loop rules and the call rule meet, and it is the region where a
+// mistake is most expensive: a wrong invariant, a wrong variant, or a frame that does
+// not survive an iteration. The generator builds
+//
+//   callee: rr := x + 1
+//   c := <free input>; a := c; k := 0
+//   while k < n { tmp := callee(a); a := tmp; k := k + 1 }
+//   assert a == c + n
+//
+// with the contract, the frame, the invariant and the variant each varied. The
+// postcondition is exact, so the invariant `k <= n && a == c + k` is what carries the
+// proof, and it is preserved only because the callee's postcondition pins its result.
+// ---------------------------------------------------------------------------
+
+/// Build and check one loop-with-a-call case. Returns `(verified, termination_proved)`.
+fn run_loop_case(seed: u64, case_no: u32) -> (bool, bool) {
+    let mut rng = Rng::new(seed);
+
+    // 1..=3 iterations, so the loop terminates and the enumeration stays exhaustive.
+    let n = 1 + rng.below(3);
+    let exact_contract = rng.below(4) != 0;
+    let lie_frame = rng.below(4) == 0;
+    let wrong_variant = rng.below(4) == 0;
+    // A body that never advances the counter, so the loop diverges. `variant: None`
+    // then leaves a *partially* correct proof: the invariant is trivially preserved and
+    // the exit condition is vacuous, yet the loop never terminates. That is the case
+    // that makes the termination check non-vacuous.
+    let diverges = rng.below(8) == 0;
+
+    // The callee.
+    let x = smt::var(8);
+    let rr = smt::var(8);
+    let callee_body = Stmt::Assign { var: rr, expr: x + 1u32 };
+    let callee_ensures = if exact_contract {
+        smt::eq(rr, x + 1u32)
+    } else {
+        // Still true, but it does not pin the result when `x` is at the top of its
+        // range -- so the loop invariant cannot be preserved from it.
+        smt::implies(smt::ult_const(x, 255), smt::eq(rr, x + 1u32))
+    };
+    let callee = Proc {
+        name: "inc",
+        requires: smt::truth(true),
+        ensures: callee_ensures,
+        body: &callee_body,
+    };
+    assert!(
+        wp::verify_proc(&callee).is_verified(),
+        "case {}: the callee must verify on its own",
+        case_no
+    );
+
+    // The caller.
+    let c = smt::var(8); // the free input, read-only across the call
+    let a = smt::var(8); // the accumulator
+    let k = smt::var(3); // the counter, wider than nothing but small
+    let tmp = smt::var(8); // the callee's result, then copied back
+
+    let actuals = vec![(x, a), (rr, tmp)];
+    let declared: Vec<Var> = if lie_frame { Vec::new() } else { vec![rr] };
+    let call = Stmt::Call { proc_: &callee, actuals: &actuals, writes: &declared };
+
+    let advance = Stmt::Assign { var: k, expr: k + 1u32 };
+    let copy_back = Stmt::Assign { var: a, expr: tmp };
+    let loop_body = if diverges {
+        // The call still happens, so the call rules are exercised; only the counter
+        // fails to advance.
+        Stmt::Seq { first: &call, second: &copy_back }
+    } else {
+        Stmt::Seq {
+            first: &call,
+            second: &Stmt::Seq { first: &copy_back, second: &advance },
+        }
+    };
+
+    let inv = smt::and(
+        smt::ule_const(k, n),
+        smt::eq(a, c + smt::truncate(k, 8)),
+    );
+    let variant = if diverges || wrong_variant {
+        // A measure that does not decrease, or none at all.
+        Some(k)
+    } else {
+        Some(smt::sub(smt::word(n, 3), k))
+    };
+    let loop_ = Stmt::While {
+        cond: smt::ult_const(k, n),
+        invariant: inv,
+        variant,
+        body: &loop_body,
+    };
+
+    let init_k = Stmt::Assign { var: k, expr: smt::word(0, 3) };
+    let init_a = Stmt::Assign { var: a, expr: c };
+    let prologue = Stmt::Seq { first: &init_k, second: &init_a };
+    let prog = Stmt::Seq { first: &prologue, second: &loop_ };
+
+    let post = smt::eq(a, c + smt::word(n, 8));
+    let report = wp::verify(&prog, smt::truth(true), post);
+    let verified = report.is_verified();
+    // The raw termination claim, read the way a caller who skipped `is_verified` would
+    // read it. This is deliberately *not* `establishes()`: the defect this check exists
+    // for is a `Total` claim on a report that failed, and `establishes()` would fold
+    // that failure into `Nothing` and hide it. Two invariants, checked for every input:
+    //
+    //   verified  => no violating execution
+    //   raw_total => no divergent execution
+    //
+    // The second is what makes the variant rule observable. It has to be checked
+    // outside the `verified` branch, because a variant that fails to discharge leaves
+    // the report unverified — and that is exactly when the old code claimed `Total`.
+    let raw_total = report.correctness() == wp::Correctness::Total;
+    let total = report.establishes() == wp::Established::Total;
+
+    if !verified {
+        assert!(
+            report.first_failure().is_some(),
+            "case {}: a report that is not verified must have a failure",
+            case_no
+        );
+    }
+
+    for v in 0..=255u64 {
+        let mut state = State::new();
+        state.insert(smt::index(c), v);
+        match exec(&prog, &mut state, CallMode::Real) {
+            Ok(()) => {
+                if verified {
+                    let holds = lookup_pred(&state, post);
+                    assert!(
+                        holds != Some(false),
+                        "case {} (seed {}): VERIFIED but input {} violates the \
+                         postcondition",
+                        case_no,
+                        seed,
+                        v
+                    );
+                }
+            }
+            Err(Stopped::Failed) => assert!(
+                !verified,
+                "case {} (seed {}): VERIFIED but input {} fails an assertion",
+                case_no, seed, v
+            ),
+            Err(Stopped::TooLong) => {
+                // A report that claims termination must not diverge concretely. Note
+                // this fires for an *unverified* report too, which is the whole point:
+                // a variant that does not decrease is exactly the case that leaves the
+                // report unverified while still claiming progress.
+                assert!(
+                    !raw_total,
+                    "case {} (seed {}): the report claims TERMINATION but input {} \
+                     diverged. `correctness()` said Total for a loop whose variant was \
+                     never proved to decrease.",
+                    case_no, seed, v
+                );
+            }
+            Err(Stopped::Blocked) => {}
+        }
+    }
+
+    (verified, total)
+}
+
+#[test]
+fn a_loop_with_a_call_never_proves_a_false_postcondition() {
+    let mut verified = 0;
+    let mut total = 0;
+    for i in 0..300u64 {
+        let seed = 0xD1B5_4A32_D192_ED03u64.wrapping_mul(i + 1);
+        let (v, t) = smt::with_fresh(|| run_loop_case(seed, i as u32));
+        if v {
+            verified += 1;
+        }
+        if t {
+            total += 1;
+        }
+    }
+    // Non-vacuity, in both directions: some cases must verify, and some must carry a
+    // termination proof, or the loop side of the harness is checking nothing.
+    assert!(
+        verified > 20,
+        "only {} of 300 loop cases verified, so the check is nearly vacuous",
+        verified
+    );
+    assert!(
+        total > 10,
+        "only {} of 300 loop cases proved termination, so the variant rule is barely \
+         exercised",
+        total
+    );
+}
+
+#[test]
+fn a_total_claim_is_not_made_for_a_divergent_loop() {
+    // The termination rule, isolated. A loop whose counter never advances diverges, so
+    // no variant can exist: the engine may report the loop *partially* correct — the
+    // invariant is preserved and the exit condition is vacuous — but it must not claim
+    // termination. Without this, a `Total` verdict would be worth nothing.
+    smt::with_fresh(|| {
+        let k = smt::var(3);
+        let a = smt::var(8);
+        let c = smt::var(8);
+        // The body does not touch `k`, so `while k < 3` never exits.
+        let body = Stmt::Skip;
+        let inv = smt::and(smt::ule_const(k, 3), smt::eq(a, c));
+        let loop_ = Stmt::While {
+            cond: smt::ult_const(k, 3),
+            invariant: inv,
+            // No variant: only partial correctness is claimed.
+            variant: None,
+            body: &body,
+        };
+        let init_k = Stmt::Assign { var: k, expr: smt::word(0, 3) };
+        let init_a = Stmt::Assign { var: a, expr: c };
+        let prog = Stmt::Seq {
+            first: &init_k,
+            second: &Stmt::Seq { first: &init_a, second: &loop_ },
+        };
+
+        let report = wp::verify(&prog, smt::truth(true), smt::eq(a, c));
+        assert!(report.is_verified(), "{:?}", report.first_failure());
+        assert!(
+            !report.has_termination_proof(),
+            "a divergent loop must not be reported as terminating"
+        );
+        assert_eq!(report.correctness(), wp::Correctness::Partial);
+        assert_eq!(report.establishes(), wp::Established::Partial);
+
+        // And concretely it really does diverge, so the `Partial` verdict is honest.
+        let mut state = State::new();
+        state.insert(smt::index(c), 7);
+        assert_eq!(
+            exec(&prog, &mut state, CallMode::Real),
+            Err(Stopped::TooLong),
+            "the loop must not terminate concretely"
+        );
+
+        // Supplying a measure that cannot decrease turns the claim into a failure.
+        let bad = Stmt::While {
+            cond: smt::ult_const(k, 3),
+            invariant: inv,
+            variant: Some(k),
+            body: &body,
+        };
+        let prog2 = Stmt::Seq {
+            first: &init_k,
+            second: &Stmt::Seq { first: &init_a, second: &bad },
+        };
+        let report2 = wp::verify(&prog2, smt::truth(true), smt::eq(a, c));
+        let (ob, _) = report2
+            .first_failure()
+            .expect("a non-decreasing measure must fail");
+        assert_eq!(ob.rule, wp::Rule::LoopVariant);
+    });
+}

@@ -163,6 +163,34 @@ of an under-declared frame rather than hiding it. Do not "fix" that by having th
 interpreter consult the body: the point is to model the declared contract, which is what
 a real machine executes against.
 
+## Termination claims must be discharged, not counted
+
+`Report::has_termination_proof` counts only variant obligations whose verdict is
+*proved*. Counting the obligations instead of discharging them was a real defect: a
+loop whose measure does not decrease reported `Total` while the report was unverified.
+When adding a rule that contributes to a summary claim, discharge the obligation before
+letting it count. `Report::establishes` answers "verified?" and "termination proved?"
+together, so a caller cannot read the optimistic half alone.
+
+## A behavioural harness cannot see a proof defect
+
+Worth knowing before trusting the differential harness too far. The termination defect
+above is invisible to concrete execution: a loop with a non-decreasing variant still
+*terminates*, so `verified => no violating execution` says nothing about it. What made
+it visible was a loop that diverges *and* is claimed total — the divergence is behaviour,
+the claim is proof, and the two only meet when the proof is wrong in the direction that
+lets a divergence through.
+
+Two consequences for the harness:
+
+1. Check a summary claim **outside** the `verified` branch. A claim like `Total` matters
+   most when the report failed, and that is exactly when an assertion nested inside
+   `if verified` never runs. My first version of the loop check had this bug and so
+   missed the defect entirely.
+2. Read the claim the way a careless caller would. The harness deliberately reads
+   `correctness()` rather than `establishes()`, because `establishes()` folds a failure
+   into `Nothing` and would hide the defect. Test the sharp edge, not the safe wrapper.
+
 ## Architecture (read this before editing `smt.rs`)
 
 `src/smt.rs` is the heart: bit-vector terms are bit-blasted into a Reduced

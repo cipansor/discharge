@@ -314,11 +314,23 @@ Three things make the harness trustworthy rather than decorative:
    maps, and whether the declared frame is correct, generous, or a lie. It also *seeds*
    the result variable before the call — without that seeding, a missing havoc rule is
    invisible, because there is no pre-call value to be confused with the post-call one.
+
+   The loop family does the same for the loop rules: it varies the callee's contract
+   (exact or merely true), the frame, the invariant and the variant, and it includes
+   bodies that never advance the counter. That last shape is what makes termination
+   observable: a diverging loop claimed total is a contradiction the harness can see.
 3. **The property has been observed to fail.** With the havoc rule disabled, the
    harness fails at a specific case and input; with the frame-completeness check
-   disabled, two tests fail. `the_property_has_teeth` makes the same point inside the
-   suite, by running one case under a deliberately wrong semantics for calls and
+   disabled, two tests fail; with the termination check reduced to counting variants,
+   the loop family fails at case 4. `the_property_has_teeth` makes the same point inside
+   the suite, by running one case under a deliberately wrong semantics for calls and
    requiring all 256 inputs to be caught. A check never seen to fail is not evidence.
+
+   Note what the loop defect teaches: a behavioural harness cannot see a *proof* defect
+   directly. A non-decreasing variant still terminates, so comparing against execution
+   is blind to it. It became visible only through the contradiction between a
+   termination claim and a divergence. When a rule's failure mode is "proves the wrong
+   thing" rather than "does the wrong thing", look for the contradiction it licenses.
 
 ## Bounded quantification: the invariant a loop over memory needs
 
