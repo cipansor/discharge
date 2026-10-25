@@ -710,3 +710,218 @@ fn random_expressions_agree_with_enumeration() {
     }
     assert!(decided > 200, "too few cases were decided to be meaningful: {}", decided);
 }
+
+// ---------------------------------------------------------------------------
+// Mixed-width operations must be refused, not truncated.
+//
+// A bit-vector operation has no natural width when its operands disagree. The engine used
+// to take the *left* operand's width and truncate the right one silently. Fuzzing the
+// predicate layer found the consequence: `trunc2(b) + (a + 115)` was computed in 2 bits, so
+// the right-hand sum was masked to `y & 3`, the sum came out 2 instead of 142, and a
+// predicate that is false at (a, b) = (27, 144) read as `Valid`. That is a proof of a false
+// statement.
+//
+// The crate has no widening operation, so the honest answer is to refuse the term. The
+// verdict becomes `Unknown` -- never a wrong `Valid`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_mixed_width_sum_is_refused_not_truncated() {
+    let verdict = smt::with_fresh(|| {
+        let a = var(8);
+        let b = var(8);
+        let narrow = smt::truncate(b, 2);
+        let wide = smt::add(a, smt::word(115, 8));
+        let sum = smt::add(narrow, wide);
+        smt::prove(smt::eq(sum, sum))
+    });
+    assert!(
+        matches!(verdict, Verdict::Unknown),
+        "a mixed-width sum must be refused, got {}",
+        verdict
+    );
+}
+
+#[test]
+fn a_mixed_width_comparison_is_refused() {
+    let verdict = smt::with_fresh(|| {
+        let a = var(8);
+        let b = var(2);
+        smt::prove(smt::ult(a, b))
+    });
+    assert!(
+        matches!(verdict, Verdict::Unknown),
+        "a mixed-width comparison must be refused, got {}",
+        verdict
+    );
+}
+
+#[test]
+fn mixed_width_ite_branches_are_refused() {
+    let verdict = smt::with_fresh(|| {
+        let c = smt::ult_const(var(8), 3);
+        let t = var(8);
+        let e = var(2);
+        let _ = smt::ite(c, t, e);
+        smt::prove(smt::eq(t, t))
+    });
+    assert!(
+        matches!(verdict, Verdict::Unknown),
+        "mixed-width ite branches must be refused, got {}",
+        verdict
+    );
+}
+
+#[test]
+fn same_width_operations_still_decide() {
+    // The teeth on the other side: refusing must not become refusing everything.
+    let valid = smt::with_fresh(|| {
+        let a = var(8);
+        let b = var(8);
+        smt::prove(smt::eq(smt::add(a, b), smt::add(b, a))).is_proved()
+    });
+    assert!(valid, "same-width addition commutativity should still prove");
+
+    let refuted = smt::with_fresh(|| {
+        let a = var(8);
+        smt::prove(smt::eq(a, smt::add(a, smt::word(1, 8))))
+    });
+    assert!(
+        !refuted.is_proved(),
+        "a false same-width equation must not be proved"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The predicate layer, fuzzed against enumeration.
+//
+// A wrong boolean connective is the most damaging kind of bug: it turns a refutable
+// obligation into a proof. This builds random predicates -- comparisons over random word
+// expressions, combined with and/or/not/implies -- proves them symbolically, and compares
+// against enumeration over all 65 536 inputs. This is the harness that found the mixed-width
+// truncation: it reported `Valid` for a predicate that is false at (a, b) = (27, 144).
+// ---------------------------------------------------------------------------
+
+enum PFuzz {
+    T,
+    F,
+    Eq(FuzzExpr, FuzzExpr),
+    Lt(FuzzExpr, FuzzExpr),
+    Le(FuzzExpr, FuzzExpr),
+    Not(Box<PFuzz>),
+    And(Box<PFuzz>, Box<PFuzz>),
+    Or(Box<PFuzz>, Box<PFuzz>),
+    Implies(Box<PFuzz>, Box<PFuzz>),
+}
+
+impl PFuzz {
+    fn build(&self, a: Var, b: Var) -> Pred {
+        match self {
+            PFuzz::T => smt::truth(true),
+            PFuzz::F => smt::truth(false),
+            PFuzz::Eq(x, y) => smt::eq(x.build(a, b), y.build(a, b)),
+            PFuzz::Lt(x, y) => smt::ult(x.build(a, b), y.build(a, b)),
+            PFuzz::Le(x, y) => smt::ule(x.build(a, b), y.build(a, b)),
+            PFuzz::Not(x) => smt::not(x.build(a, b)),
+            PFuzz::And(x, y) => smt::and(x.build(a, b), y.build(a, b)),
+            PFuzz::Or(x, y) => smt::or(x.build(a, b), y.build(a, b)),
+            PFuzz::Implies(x, y) => smt::implies(x.build(a, b), y.build(a, b)),
+        }
+    }
+
+    fn eval(&self, a: u8, b: u8) -> bool {
+        match self {
+            PFuzz::T => true,
+            PFuzz::F => false,
+            PFuzz::Eq(x, y) => x.eval(a, b) == y.eval(a, b),
+            PFuzz::Lt(x, y) => x.eval(a, b) < y.eval(a, b),
+            PFuzz::Le(x, y) => x.eval(a, b) <= y.eval(a, b),
+            PFuzz::Not(x) => !x.eval(a, b),
+            PFuzz::And(x, y) => x.eval(a, b) && y.eval(a, b),
+            PFuzz::Or(x, y) => x.eval(a, b) || y.eval(a, b),
+            PFuzz::Implies(x, y) => !x.eval(a, b) || y.eval(a, b),
+        }
+    }
+
+    fn render(&self) -> String {
+        match self {
+            PFuzz::T => "T".into(),
+            PFuzz::F => "F".into(),
+            PFuzz::Eq(x, y) => format!("({} == {})", x.render(), y.render()),
+            PFuzz::Lt(x, y) => format!("({} < {})", x.render(), y.render()),
+            PFuzz::Le(x, y) => format!("({} <= {})", x.render(), y.render()),
+            PFuzz::Not(x) => format!("!{}", x.render()),
+            PFuzz::And(x, y) => format!("({} && {})", x.render(), y.render()),
+            PFuzz::Or(x, y) => format!("({} || {})", x.render(), y.render()),
+            PFuzz::Implies(x, y) => format!("({} => {})", x.render(), y.render()),
+        }
+    }
+}
+
+fn pfuzz_pred(r: &mut FuzzLcg, depth: u32) -> PFuzz {
+    if depth == 0 || r.below(4) == 0 {
+        return match r.below(5) {
+            0 => PFuzz::T,
+            1 => PFuzz::F,
+            2 => PFuzz::Eq(fuzz_expr(r, 2), fuzz_expr(r, 2)),
+            3 => PFuzz::Lt(fuzz_expr(r, 2), fuzz_expr(r, 2)),
+            _ => PFuzz::Le(fuzz_expr(r, 2), fuzz_expr(r, 2)),
+        };
+    }
+    let choice = r.below(4);
+    let x = pfuzz_pred(r, depth - 1);
+    let y = pfuzz_pred(r, depth - 1);
+    match choice {
+        0 => PFuzz::Not(Box::new(x)),
+        1 => PFuzz::And(Box::new(x), Box::new(y)),
+        2 => PFuzz::Or(Box::new(x), Box::new(y)),
+        _ => PFuzz::Implies(Box::new(x), Box::new(y)),
+    }
+}
+
+#[test]
+fn random_predicates_agree_with_enumeration() {
+    let mut r = FuzzLcg(0x0bad_c0de_dead_beef);
+    let mut decided = 0u32;
+    for _ in 0..300 {
+        let p = pfuzz_pred(&mut r, 3);
+        let concrete_valid = for_all_u8_2(|a, b| p.eval(a, b));
+
+        let (verdict, witness) = smt::with_fresh(|| {
+            let a = var(8);
+            let b = var(8);
+            let v = smt::prove(p.build(a, b));
+            let w = match v {
+                Verdict::Counterexample(c) => Some((c.value_of(0), c.value_of(1))),
+                _ => None,
+            };
+            (v, w)
+        });
+
+        match verdict {
+            Verdict::Unknown => {}
+            Verdict::Valid => {
+                decided += 1;
+                assert!(concrete_valid, "claimed Valid but `{}` has a violation", p.render());
+            }
+            Verdict::Unsat => {
+                decided += 1;
+                assert!(!concrete_valid, "claimed Unsat but `{}` holds for every input", p.render());
+            }
+            Verdict::Counterexample(_) => {
+                decided += 1;
+                assert!(!concrete_valid, "claimed a counterexample but `{}` is valid", p.render());
+                let (ca, cb) = witness.unwrap();
+                let (ca, cb) = (ca.unwrap_or(0) as u8, cb.unwrap_or(0) as u8);
+                assert!(
+                    !p.eval(ca, cb),
+                    "witness a={} b={} does not falsify `{}`",
+                    ca,
+                    cb,
+                    p.render()
+                );
+            }
+        }
+    }
+    assert!(decided > 50, "too few predicates were decided: {}", decided);
+}

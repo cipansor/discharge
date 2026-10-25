@@ -287,6 +287,10 @@ pub(crate) struct Ctx {
     /// Set when a stale handle is touched. Sticky until the next reset, and treated exactly
     /// like `overflow`: the query refuses to answer rather than answer about the wrong term.
     stale: bool,
+    /// Set when a binary operation is built from operands of different widths. Sticky until
+    /// the next reset, and treated like `overflow` and `stale`: the query returns `Unknown`
+    /// rather than a verdict about a term that silently truncated one of its operands.
+    width_clash: bool,
 }
 
 /// Sentinel: variable `i` has no replacement.
@@ -326,6 +330,7 @@ impl Ctx {
             generation: 1,
             term_gen: [0; CAP],
             stale: false,
+            width_clash: false,
         }
     }
 
@@ -373,6 +378,7 @@ impl Ctx {
             self.generation = 1;
         }
         self.stale = false;
+        self.width_clash = false;
         self.ensure_ready();
     }
 
@@ -620,7 +626,24 @@ impl Ctx {
     }
 
     /// Word-shaped binary op (result width = operand width).
+    /// Both operands must be the same width.
+    ///
+    /// A bit-vector operation has no natural width if its operands disagree, and the
+    /// silent choice -- take the *left* operand's width and truncate the right -- is
+    /// unsound. `trunc2(b) + (a + 115)` was computed in 2 bits, so the right-hand sum was
+    /// masked to `y & 3`; a predicate that is false for most inputs came out `Valid`. The
+    /// crate has no widening operation, so the honest answer is to refuse the mixed-width
+    /// term rather than guess: use an explicit [`truncate`] to make the intent visible.
+    /// This matches the convention already used by `mem::Mem::check_addr` and
+    /// `mem::Mem::store_binds`.
+    fn require_same_width(&mut self, a: Term, b: Term, _who: &str) {
+        if self.width_of(a) != self.width_of(b) {
+            self.width_clash = true;
+        }
+    }
+
     fn bin_word(&mut self, op: Op, a: Term, b: Term) -> Term {
+        self.require_same_width(a, b, "binary word operation");
         let w = self.width_of(a);
         self.mk_term(Node { op, a: a.0, b: b.0, c: 0, width: w, hi: 0 })
     }
@@ -637,6 +660,7 @@ impl Ctx {
     }
 
     fn cmp(&mut self, op: Op, a: Term, b: Term) -> Term {
+        self.require_same_width(a, b, "comparison");
         let w = self.width_of(a);
         self.mk_term(Node { op, a: a.0, b: b.0, c: 0, width: w, hi: 0 })
     }
@@ -1121,7 +1145,7 @@ impl Ctx {
 
     fn query_valid(&mut self, t: Term) -> Verdict {
         let node = self.blast_bool(t);
-        if self.overflow || self.stale {
+        if self.overflow || self.stale || self.width_clash {
             return Verdict::Unknown;
         }
         match node {
@@ -1133,7 +1157,7 @@ impl Ctx {
 
     fn query_model(&mut self, t: Term) -> Verdict {
         let node = self.blast_bool(t);
-        if self.overflow || self.stale {
+        if self.overflow || self.stale || self.width_clash {
             return Verdict::Unknown;
         }
         match node {
@@ -1606,6 +1630,7 @@ pub fn truncate(x: Var, width: u8) -> Var {
 /// `c ? t : e`
 pub fn ite(c: Pred, t: Var, e: Var) -> Var {
     with_ctx(|c_| {
+        c_.require_same_width(t.0, e.0, "ite branches");
         let w = c_.width_of(t.0);
         Var(c_.mk_term(Node { op: Op::Ite, a: c.0.0, b: t.0.0, c: e.0.0, width: w, hi: 0 }))
     })

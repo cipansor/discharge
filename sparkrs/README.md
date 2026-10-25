@@ -288,6 +288,25 @@ next section.
 Cost: a symbolic read is `2^addr_width` ites and the BDD sees all of them, so
 `MAX_CELLS` caps a memory at 64 cells (6 address bits).
 
+## Mixed-width operations are refused, not truncated
+
+A bit-vector operation has no natural width when its operands disagree. The engine used to
+take the *left* operand's width and truncate the right one silently. Fuzzing the predicate
+layer found what that costs: `trunc2(b) + (a + 115)` was computed in two bits, so the
+right-hand sum was masked to `y & 3`, the sum came out 2 instead of 142, and a predicate that
+is false at `(a, b) = (27, 144)` read as `Valid`. That is a proof of a false statement, found
+by a random predicate rather than by a test I would have written.
+
+The crate has no widening operation, so the honest answer is to refuse the term. Every
+binary operation — arithmetic, bitwise, comparison — and both branches of `ite` now check
+that their operands agree in width. When they do not, the query returns `Unknown`, the same
+way it does after an arena overflow or a stale handle. It never returns a wrong `Valid`.
+
+This is a behavioural change, and a deliberate one: a term that used to be silently truncated
+is now refused. The remedy at a call site is to write the intended width with `truncate`,
+which makes the intent visible where the truncation happens rather than in the middle of an
+arithmetic expression.
+
 ## Differential fuzzing: the shapes I did not think to test
 
 The fixed harnesses check the cases I wrote down. A fuzzer checks the ones I did not: random
