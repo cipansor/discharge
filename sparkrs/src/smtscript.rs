@@ -118,9 +118,16 @@ impl fmt::Display for Bool {
                 write!(f, "{}", Bits(self.0))
             }
             // A one-bit word used as a proposition: `w != 0`.
+            //
+            // This used to print `(= w (_ bv0 w))`, the negation of what the comment
+            // says. A constant goal came out inverted: `truth(false)` was written as
+            // `(assert (not (= (_ bv0 1) (_ bv0 1))))`, i.e. `(assert false)`, which any
+            // solver reports `unsat` -- so an external checker would call an impossible
+            // obligation *proved*, the opposite of the engine's verdict. `distinct` is
+            // the right spelling of `!=`.
             _ => {
                 let w = n.width;
-                write!(f, "(= {} (_ bv0 {}))", Bits(self.0), w)
+                write!(f, "(distinct {} (_ bv0 {}))", Bits(self.0), w)
             }
         }
     }
@@ -136,9 +143,20 @@ impl fmt::Display for Bits {
                 let v = (n.a as u64) | ((n.hi as u64) << 32);
                 write!(f, "(_ bv{} {})", v, w)
             }
+            // `Not`, `And`, `Or` and `Xor` exist in both readings. A boolean is a
+            // one-bit word in the engine, so the width decides which spelling is
+            // well-sorted: at width 1 the boolean operator applies (its operands are
+            // propositions, printed by `Bool`), and at any wider width the operands are
+            // bit-vectors and the `bv*` operator applies. Using `bvnot` on a comparison
+            // -- `not(x == y)` -- was ill-sorted: a solver rejects the file, and a lenient
+            // one reads something else. The truth tables coincide only at width 1.
+            Op::Not if w == 1 => write!(f, "(not {})", Bool(Term(n.a))),
             Op::Not => write!(f, "(bvnot {})", Bits(Term(n.a))),
+            Op::And if w == 1 => write!(f, "(and {} {})", Bool(Term(n.a)), Bool(Term(n.b))),
             Op::And => write!(f, "(bvand {} {})", Bits(Term(n.a)), Bits(Term(n.b))),
+            Op::Or if w == 1 => write!(f, "(or {} {})", Bool(Term(n.a)), Bool(Term(n.b))),
             Op::Or => write!(f, "(bvor {} {})", Bits(Term(n.a)), Bits(Term(n.b))),
+            Op::Xor if w == 1 => write!(f, "(xor {} {})", Bool(Term(n.a)), Bool(Term(n.b))),
             Op::Xor => write!(f, "(bvxor {} {})", Bits(Term(n.a)), Bits(Term(n.b))),
             Op::Add => write!(f, "(bvadd {} {})", Bits(Term(n.a)), Bits(Term(n.b))),
             Op::Sub => write!(f, "(bvsub {} {})", Bits(Term(n.a)), Bits(Term(n.b))),

@@ -999,3 +999,85 @@ fn a_report_read_in_its_own_arena_is_unchanged() {
         assert!(matches!(bad.contract.discharge(), Verdict::Counterexample(_)));
     });
 }
+
+// ---------------------------------------------------------------------------
+// The SMT-LIB export must not invert a goal, and must be well-sorted.
+//
+// A boolean is a one-bit word in this engine, so the printer has to coerce it. The
+// coercion used to print `(= w (_ bv0 1))` while its own comment said `w != 0` -- the
+// negation. A constant goal therefore came out inverted: `truth(false)` was written as
+// `(assert false)`, which every solver calls `unsat`, so an external checker would report
+// an impossible obligation as *proved*. The operator choice was wrong too: a boolean
+// connective at width 1 was printed with the bit-vector operator, so `not(x == y)` became
+// `(bvnot (= x y))`, which is ill-sorted.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_export_does_not_invert_a_constant_goal() {
+    smt::with_fresh(|| {
+        let q = Query::new(&[], smt::truth(false));
+        let text = q.to_smtlib2_string();
+        // The goal is `false`; its negation is `true`, and a solver would answer `sat`.
+        // The buggy printer wrote the goal as `(= 0 0)` (= true), whose negation is false.
+        assert!(
+            !text.contains("(= (_ bv0 1) (_ bv0 1))"),
+            "a constant-false goal must not be exported as `(= 0 0)`:\n{}",
+            text
+        );
+        assert!(
+            text.contains("(distinct (_ bv0 1) (_ bv0 1))"),
+            "a one-bit word as a proposition must be `distinct` from zero:\n{}",
+            text
+        );
+
+        let q = Query::new(&[], smt::truth(true));
+        let text = q.to_smtlib2_string();
+        assert!(
+            text.contains("(distinct (_ bv1 1) (_ bv0 1))"),
+            "a constant-true goal must export as `1 != 0`:\n{}",
+            text
+        );
+    });
+}
+
+#[test]
+fn the_export_uses_boolean_operators_for_booleans() {
+    smt::with_fresh(|| {
+        let x = var(8);
+        let y = var(8);
+        let vars = [x, y];
+
+        // `not(x == y)` is a boolean; its operand is a boolean. `bvnot` would be ill-sorted.
+        let q = Query::new(&vars, smt::not(smt::eq(x, y)));
+        let text = q.to_smtlib2_string();
+        assert!(
+            text.contains("(not (= x0_8 x1_8))"),
+            "a negated comparison must use the boolean `not`:\n{}",
+            text
+        );
+        assert!(
+            !text.contains("bvnot"),
+            "a boolean must not be printed with a bit-vector operator:\n{}",
+            text
+        );
+
+        // `implies` is `!a || b`, both booleans.
+        let q = Query::new(&vars, smt::implies(smt::eq(x, y), smt::ult(x, y)));
+        let text = q.to_smtlib2_string();
+        assert!(
+            text.contains("(or (not (= x0_8 x1_8)) (bvult x0_8 x1_8))"),
+            "an implication must be printed as a boolean `or` of booleans:\n{}",
+            text
+        );
+
+        // A wider conjunction is still a bit-vector operation.
+        let wide = smt::band(x, y);
+        let q = Query::new(&vars, smt::eq(wide, x));
+        let text = q.to_smtlib2_string();
+        assert!(
+            text.contains("(bvand x0_8 x1_8)"),
+            "a wide bitwise and must stay `bvand`:\n{}",
+            text
+        );
+    });
+}

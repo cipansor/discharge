@@ -288,6 +288,24 @@ next section.
 Cost: a symbolic read is `2^addr_width` ites and the BDD sees all of them, so
 `MAX_CELLS` caps a memory at 64 cells (6 address bits).
 
+## The exported query must mean what the engine proved
+
+The SMT-LIB export exists so an independent solver can reproduce a proof from a textual
+artifact. That is only worth anything if the artifact says the same thing the engine said,
+and twice it did not.
+
+A boolean is a one-bit word here, so the printer has to coerce one to the other. The coercion
+printed `(= w (_ bv0 1))` while its own comment said `w != 0` — the negation. A constant goal
+came out inverted: `truth(false)` was written as `(assert false)`, which every solver reports
+`unsat`, so an external checker would have called an impossible obligation *proved*. The
+spelling of `!=` is `distinct`.
+
+The operator choice was wrong too. `not`, `and`, `or` and `xor` exist in both readings, and
+the printer always used the bit-vector one, so `not(x == y)` became `(bvnot (= x y))` —
+ill-sorted, since `bvnot` wants a bit-vector and a comparison is a boolean. A solver rejects
+that file, and a lenient one reads something else. The width now decides: at width 1 the
+boolean operator applies, above it the bit-vector operator does.
+
 ## Mixed-width operations are refused, not truncated
 
 A bit-vector operation has no natural width when its operands disagree. The engine used to
