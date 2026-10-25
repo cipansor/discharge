@@ -167,9 +167,19 @@ impl fmt::Display for Bits {
             Op::Eq => write!(f, "(= {} {})", Bits(Term(n.a)), Bits(Term(n.b))),
             Op::Ult => write!(f, "(bvult {} {})", Bits(Term(n.a)), Bits(Term(n.b))),
             Op::Ule => write!(f, "(bvule {} {})", Bits(Term(n.a)), Bits(Term(n.b))),
-            // Truncate: keep the low bits. `(_ extract w-1 0 x)` is the identity
-            // when the source is at least `w` wide, and zero-extends when it is
-            // narrower, so one form covers both directions.
+            // Truncate: keep the low bits, zero-fill the rest. The direction decides
+            // the operator, and the source width `n.b` decides the direction.
+            //
+            // `(_ extract w-1 0 x)` needs `x` to be at least `w` bits wide, so it is only
+            // valid when the result is *no wider* than the source. Emitting it for a
+            // widening `truncate` produced `((_ extract 15 0) x0_8)` -- extracting bit 15
+            // from an 8-bit vector, which is ill-sorted. Widening is `zero_extend`.
+            Op::Trunc if w > n.b as u8 => write!(
+                f,
+                "((_ zero_extend {}) {})",
+                w - n.b as u8,
+                Bits(Term(n.a))
+            ),
             Op::Trunc => write!(
                 f,
                 "((_ extract {} 0) {})",

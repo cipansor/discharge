@@ -1081,3 +1081,35 @@ fn the_export_uses_boolean_operators_for_booleans() {
         );
     });
 }
+
+#[test]
+fn the_export_widens_with_zero_extend() {
+    // `truncate` changes a width in either direction. Narrowing keeps the low bits
+    // (`extract`), but widening zero-fills, and `extract w-1 0` on a narrower operand is
+    // ill-sorted: extracting bit 15 from an 8-bit vector. The export used `extract` for
+    // both, so a widening `truncate` produced a file no solver accepts.
+    smt::with_fresh(|| {
+        let x = var(8);
+
+        let wide = smt::truncate(x, 16);
+        let text = Query::new(&[x], smt::eq(wide, smt::word(255, 16))).to_smtlib2_string();
+        assert!(
+            text.contains("((_ zero_extend 8) x0_8)"),
+            "a widening truncate must zero-extend:\n{}",
+            text
+        );
+        assert!(
+            !text.contains("extract 15 0"),
+            "a widening truncate must not extract bits the source does not have:\n{}",
+            text
+        );
+
+        let narrow = smt::truncate(x, 3);
+        let text = Query::new(&[x], smt::eq(narrow, smt::word(5, 3))).to_smtlib2_string();
+        assert!(
+            text.contains("((_ extract 2 0) x0_8)"),
+            "a narrowing truncate must still extract the low bits:\n{}",
+            text
+        );
+    });
+}

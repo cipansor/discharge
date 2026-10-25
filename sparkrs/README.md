@@ -306,6 +306,12 @@ ill-sorted, since `bvnot` wants a bit-vector and a comparison is a boolean. A so
 that file, and a lenient one reads something else. The width now decides: at width 1 the
 boolean operator applies, above it the bit-vector operator does.
 
+A third export bug sat in the same printer. `truncate` changes a width in either direction,
+and the printer emitted `((_ extract w-1 0) x)` for both. That is only valid when the result is
+no wider than the source; for a *widening* `truncate` it produced `((_ extract 15 0) x0_8)` —
+extracting bit 15 from an 8-bit vector, which no solver accepts. Widening is `zero_extend`, and
+the source width now decides which form is printed.
+
 ## Mixed-width operations are refused, not truncated
 
 A bit-vector operation has no natural width when its operands disagree. The engine used to
