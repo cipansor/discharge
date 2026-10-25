@@ -163,6 +163,33 @@ of an under-declared frame rather than hiding it. Do not "fix" that by having th
 interpreter consult the body: the point is to model the declared contract, which is what
 a real machine executes against.
 
+## The recurring class: a limit that truncates instead of reporting
+
+Five soundness holes in a row, all the same shape — a bounded buffer or a width that
+silently truncates a value, so a summary outruns the evidence behind it:
+
+| Claim | Evidence lost | How |
+|---|---|---|
+| `verified` | callee body | under-declared frame |
+| `Total` | variant verdict | counted instead of discharged |
+| `verified` + `Total` | obligations | dropped at `MAX_OBLIGATIONS` |
+| `verified` + queries | real frame | truncated at `MAX_WRITES` |
+| `Valid` from `exists_guarded` | index range | index truncated to the bound's width |
+
+Two of these were *not* buffer caps but width truncations of a value, which is the same
+failure in different clothing: `word(k, w)` silently keeps only the low bits of `k`. When a
+value is narrowed for a comparison, ask whether the comparison is still the one intended.
+
+When auditing, the questions that found all five:
+
+1. Where does a count stop early, and does anything downstream know it stopped?
+2. Where is a value narrowed, and can narrowing change a comparison's answer?
+3. Which summaries (`verified`, `Total`, `Valid`, `unchanged`) are computed from partial
+   evidence, and what happens when the evidence is incomplete?
+
+Report, never truncate. If a function can return partial data, the partiality belongs in
+its type.
+
 ## A truncated set must not look like a small set
 
 Fourth instance of the same class, and the one that defeated the fix for the first.

@@ -93,6 +93,34 @@ pub fn exists_same(lo: usize, hi: usize, p: Pred) -> Pred {
     exists_range(lo, hi, |_| p)
 }
 
+/// The guard `k < bound`, exact even when `k` cannot be represented at `bound`'s width.
+///
+/// The obvious implementation, `ult(word(k, bits(bound)), bound)`, *truncates* `k` to
+/// that width. An index at or above `2^bits(bound)` then wraps to a small value and can
+/// satisfy the guard, so an index that is provably outside the bound is treated as
+/// inside. For [`exists_guarded`] that is a soundness hole rather than a nuisance: a
+/// satisfiable guard *weakens* the disjunction, so the formula becomes provable while the
+/// real obligation is not. It was, before this: `exists_guarded(0, 3, upto_1bit, ..)` came
+/// out `Valid` on an input whose true form had a counterexample.
+///
+/// The fix is to compare the index against the representable range before truncating it.
+/// An index that does not fit is at least `2^bits(bound)`, hence provably `>= bound`, so
+/// the guard is `false`. See `the_guarded_quantifiers_do_not_truncate_their_index` in
+/// `tests/quant.rs`.
+fn inside(k: usize, bound: smt::Var) -> Pred {
+    let w = smt::bits(bound);
+    if w >= usize::BITS as u8 {
+        // Every `usize` index is representable, so `word` is exact.
+        return smt::ult(smt::word(k as u64, w), bound);
+    }
+    if k >= (1usize << w) {
+        // `k` cannot be represented at `bound`'s width, so it is at least `2^w > bound`.
+        // Truncating would wrap it into range; `false` is the truth.
+        return smt::truth(false);
+    }
+    smt::ult(smt::word(k as u64, w), bound)
+}
+
 /// `forall k in lo..hi { j < bound => p(k, j) }`: the quantified predicate is
 /// guarded by a *symbolic* upper bound.
 ///
@@ -100,6 +128,9 @@ pub fn exists_same(lo: usize, hi: usize, p: Pred) -> Pred {
 /// expansion time. `guarded` receives each concrete index together with a
 /// predicate saying "this index is inside the bound"; the caller decides what to
 /// do with it, normally by writing `smt::implies(inside, property)`.
+///
+/// `hi` may exceed `2^bits(bound)`; indices that cannot be represented at the bound's
+/// width are treated as outside it, which is the truth rather than a truncation.
 ///
 /// ```rust
 /// use sparkrs::{quant, smt};
@@ -123,9 +154,7 @@ where
 {
     let mut acc = smt::truth(true);
     for k in lo..hi {
-        // `k < bound`, with `k` a concrete index and `bound` symbolic.
-        let inside = smt::ult(smt::word(k as u64, smt::bits(bound)), bound);
-        acc = smt::and(acc, guarded(k, inside));
+        acc = smt::and(acc, guarded(k, inside(k, bound)));
     }
     acc
 }
@@ -137,8 +166,7 @@ where
 {
     let mut acc = smt::truth(false);
     for k in lo..hi {
-        let inside = smt::ult(smt::word(k as u64, smt::bits(bound)), bound);
-        acc = smt::or(acc, guarded(k, inside));
+        acc = smt::or(acc, guarded(k, inside(k, bound)));
     }
     acc
 }

@@ -300,3 +300,89 @@ fn the_expansion_cost_is_the_number_of_cells() {
         assert!(after >= before);
     });
 }
+
+#[test]
+fn the_guarded_quantifiers_do_not_truncate_their_index() {
+    // The fifth soundness hole, and a fifth instance of the same class: a limit that
+    // truncated a value instead of reporting it.
+    //
+    // `forall_guarded` and `exists_guarded` built their guard as
+    // `ult(word(k, bits(bound)), bound)`, which *truncates* the concrete index `k` to
+    // the bound's width. An index at or above `2^bits(bound)` therefore wrapped to a
+    // small value and satisfied the guard, so an index provably outside the bound was
+    // treated as inside. For `exists_guarded` that weakens the disjunction: a
+    // satisfiable guard makes the formula provable when the real obligation is not.
+    //
+    // The probe: `exists_guarded(0, 3, upto_1bit, ..)` with `k = 2` wrapping to `0`.
+    // The computed form came out `Valid` on an input whose true form had a
+    // counterexample. Now the index is checked against the representable range first,
+    // and an unrepresentable index is provably outside the bound.
+    smt::with_fresh(|| {
+        let upto = var(1); // 1 bit: 0 or 1
+        let c0 = var(8);
+        let c1 = var(8);
+        let c2 = var(8);
+        let cell = |k: usize| match k {
+            0 => c0,
+            1 => c1,
+            _ => c2,
+        };
+
+        // `hi = 3` exceeds the 2 values a 1-bit bound can address.
+        let computed = quant::exists_guarded(0, 3, upto, |k, inside| {
+            smt::and(inside, smt::eq_const(cell(k), 5))
+        });
+        // The truth: only `k = 0` can be below a 1-bit `upto`, so `c2` is irrelevant.
+        let truth = smt::and(smt::eq_const(upto, 1), smt::eq_const(c0, 5));
+        assert_eq!(
+            smt::prove_equiv(computed, truth),
+            Verdict::Valid,
+            "the expansion must agree with the truth; an index past the bound's range is \
+             outside it, not wrapped into it"
+        );
+
+        // The input that used to expose the difference: c2 = 5 while c0 is not.
+        let pre = smt::and(
+            smt::eq_const(upto, 1),
+            smt::and(smt::eq_const(c2, 5), smt::not(smt::eq_const(c0, 5))),
+        );
+        assert!(
+            !smt::prove_implies(pre, computed).is_proved(),
+            "no proof may survive the wrapped index"
+        );
+
+        // The same guard, universally: indices past the range make it vacuous rather
+        // than wrong. With `hi = 3` and a 1-bit bound, the third index cannot be
+        // inside, so `forall_guarded` is the conjunction over the first two only.
+        let all = quant::forall_guarded(0, 3, upto, |k, inside| {
+            smt::implies(inside, smt::eq_const(cell(k), 0))
+        });
+        let all_truth = quant::forall_guarded(0, 2, upto, |k, inside| {
+            smt::implies(inside, smt::eq_const(cell(k), 0))
+        });
+        assert_eq!(smt::prove_equiv(all, all_truth), Verdict::Valid);
+    });
+}
+
+#[test]
+fn a_bound_wide_enough_for_every_index_is_unaffected() {
+    // The other side: when the bound's width can represent every index, the guard is
+    // the plain comparison and nothing changes. This keeps the fix from being a
+    // blanket "unrepresentable means false" that would break ordinary usage.
+    smt::with_fresh(|| {
+        let upto = var(8); // wide enough for every index below
+        let cells: Vec<Var> = (0..4).map(|_| var(8)).collect();
+        let computed = quant::exists_guarded(0, 4, upto, |k, inside| {
+            smt::and(inside, smt::eq_const(cells[k], 7))
+        });
+        // With a wide bound the guard is exactly `k < upto`, so the guarded expansion
+        // is the plain disjunction of `k < upto && cell == 7`.
+        let expected = quant::exists_range(0, 4, |k| {
+            smt::and(
+                smt::ult(smt::word(k as u64, 8), upto),
+                smt::eq_const(cells[k], 7),
+            )
+        });
+        assert_eq!(smt::prove_equiv(computed, expected), Verdict::Valid);
+    });
+}

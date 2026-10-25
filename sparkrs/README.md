@@ -288,6 +288,27 @@ next section.
 Cost: a symbolic read is `2^addr_width` ites and the BDD sees all of them, so
 `MAX_CELLS` caps a memory at 64 cells (6 address bits).
 
+## A guard compares an index, it does not truncate it
+
+`quant::forall_guarded` and `quant::exists_guarded` quantify over a range while the upper
+bound is a symbolic word — "every cell below the cursor". Their guard used to be built as
+`ult(word(k, bits(bound)), bound)`, which truncates the concrete index `k` to the bound's
+width. An index at or above `2^bits(bound)` then wrapped to a small value and satisfied the
+guard, so an index provably *outside* the bound was treated as inside it. For
+`exists_guarded` that is a soundness hole rather than a nuisance, because a satisfiable
+guard weakens the disjunction: the formula becomes provable while the real obligation is
+not. With `hi = 3` and a one-bit bound, `exists_guarded` came out `Valid` on an input whose
+true form had a counterexample.
+
+The guard now checks the index against the representable range first. An index that does
+not fit is at least `2^bits(bound)`, hence provably `>= bound`, so the guard is `false` —
+the truth rather than a wrap. The intended use, `Mem::forall_below` over a memory whose
+cells match the bound's width, was never affected; the hole was reachable only through the
+public `quant` API with a bound narrower than the range.
+
+`tests/quant.rs` pins both directions: the guarded expansion must agree with the truth at a
+narrow bound, and must be unchanged at a bound wide enough for every index.
+
 ## A derived frame says whether it is complete
 
 The frame rule compares what a callee *claims* to write against what its body really
