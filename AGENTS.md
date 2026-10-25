@@ -163,6 +163,27 @@ of an under-declared frame rather than hiding it. Do not "fix" that by having th
 interpreter consult the body: the point is to model the declared contract, which is what
 a real machine executes against.
 
+## A guard can be correct and still be untested
+
+While sweeping for the ninth hole I checked `MAX_VARS`. `var_term` refuses an index past the
+cap by setting `overflow` and returning `Term(0)` — and `Term(0)` is a *valid* node, so the
+guard is what keeps a query from answering about the wrong term. `query_valid` and `query_model`
+both check it and return `Unknown`. No test touched it.
+
+I predicted the unguarded failure would be a false `Valid` (a proof of a false statement).
+Measured, it is a bogus **witness**: `prove(v300 == 0)` comes back `Counterexample(v0 = 1)`,
+because the fallback made v300 alias v0, so the engine names a variable the query never
+mentioned. Wrong prediction, and the measured version is the more useful fact.
+
+Two lessons. First, a guard that is correct is not the same as a guard that is tested — the
+whole overflow path was dead to the suite. Second, and this is the recurring one: I predicted a
+failure mode and it was wrong, which is why the test comment now records what was measured
+rather than what was expected. Prediction is cheap; the probe is what counts.
+
+Both directions are pinned: `exceeding_max_vars_reports_unknown_not_a_proof` and
+`a_query_within_max_vars_is_decided_normally`, so the guard cannot pass by answering `Unknown`
+to everything.
+
 ## The evidence for a refutation is also a claim
 
 The ninth hole was in `Cex`: the model returned with a `Counterexample` verdict. It inlines 16
