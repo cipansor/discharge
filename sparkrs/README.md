@@ -288,6 +288,23 @@ next section.
 Cost: a symbolic read is `2^addr_width` ites and the BDD sees all of them, so
 `MAX_CELLS` caps a memory at 64 cells (6 address bits).
 
+## Differential fuzzing: the shapes I did not think to test
+
+The fixed harnesses check the cases I wrote down. A fuzzer checks the ones I did not: random
+expression trees over two 8-bit variables, each proved symbolically and compared against
+enumeration over all 65 536 inputs. `Valid` when enumeration finds a violation, a witness
+that does not violate, or `Unsat` for a satisfiable equation are all failures. The seed is
+fixed, so a failure is reproducible.
+
+It found a bug in the *test*, not the engine. The oracle used Rust's `wrapping_shl`, which
+masks the shift count by the width — `x << 8` on a `u8` is `x` — while this crate's
+documented semantics is that a shift by at least the width yields zero. The engine was
+right; the oracle was wrong. That is worth stating plainly: a differential test only says
+what its oracle says, and the first oracle here was wrong.
+
+The teeth are real. Making the BDD `Xor` arm behave like `And` makes the fuzzer report
+`(!b) == b` as `Valid`, which it is not. That mutation was applied, observed, and reverted.
+
 ## The blasting is checked against Rust, not against itself
 
 The differential harness compared whole predicates at eight bits. Above four bits `mul`

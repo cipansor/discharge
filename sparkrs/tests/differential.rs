@@ -525,3 +525,188 @@ fn truncation_matches_rust() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Differential fuzzing: random expression trees, BDD `prove` vs enumeration.
+//
+// The harnesses above check the shapes I thought of. This checks shapes I did not:
+// random trees over two 8-bit variables, compared against enumeration over all 65 536
+// inputs. A disagreement in the `Valid` direction, or a witness that does not violate,
+// would be unsoundness. The seed is fixed, so a failure is reproducible.
+//
+// This is the harness that caught a *test-side* error rather than an engine one: Rust's
+// `wrapping_shl` masks the shift count by the width (`x << 8` on a `u8` is `x`), while
+// this crate's documented semantics is that a shift by at least the width yields zero.
+// The oracle was wrong and the engine was right. That divergence is exactly what a
+// differential test is for, and it is why the shift semantics is spelled out here.
+// ---------------------------------------------------------------------------
+
+struct FuzzLcg(u64);
+impl FuzzLcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 >> 33
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+enum FuzzExpr {
+    A,
+    B,
+    K(u8),
+    Add(Box<FuzzExpr>, Box<FuzzExpr>),
+    Sub(Box<FuzzExpr>, Box<FuzzExpr>),
+    Mul(Box<FuzzExpr>, Box<FuzzExpr>),
+    And(Box<FuzzExpr>, Box<FuzzExpr>),
+    Or(Box<FuzzExpr>, Box<FuzzExpr>),
+    Xor(Box<FuzzExpr>, Box<FuzzExpr>),
+    Shl(Box<FuzzExpr>, u32),
+    Shr(Box<FuzzExpr>, u32),
+    Not(Box<FuzzExpr>),
+}
+
+impl FuzzExpr {
+    fn build(&self, a: Var, b: Var) -> Var {
+        match self {
+            FuzzExpr::A => a,
+            FuzzExpr::B => b,
+            FuzzExpr::K(k) => smt::word(*k as u64, 8),
+            FuzzExpr::Add(x, y) => smt::add(x.build(a, b), y.build(a, b)),
+            FuzzExpr::Sub(x, y) => smt::sub(x.build(a, b), y.build(a, b)),
+            FuzzExpr::Mul(x, y) => smt::mul(x.build(a, b), y.build(a, b)),
+            FuzzExpr::And(x, y) => smt::band(x.build(a, b), y.build(a, b)),
+            FuzzExpr::Or(x, y) => smt::bor(x.build(a, b), y.build(a, b)),
+            FuzzExpr::Xor(x, y) => smt::bxor(x.build(a, b), y.build(a, b)),
+            FuzzExpr::Shl(x, k) => smt::shl(x.build(a, b), *k),
+            FuzzExpr::Shr(x, k) => smt::lshr(x.build(a, b), *k),
+            FuzzExpr::Not(x) => smt::bxor(x.build(a, b), smt::word(255, 8)),
+        }
+    }
+
+    fn eval(&self, a: u8, b: u8) -> u8 {
+        match self {
+            FuzzExpr::A => a,
+            FuzzExpr::B => b,
+            FuzzExpr::K(k) => *k,
+            FuzzExpr::Add(x, y) => x.eval(a, b).wrapping_add(y.eval(a, b)),
+            FuzzExpr::Sub(x, y) => x.eval(a, b).wrapping_sub(y.eval(a, b)),
+            FuzzExpr::Mul(x, y) => x.eval(a, b).wrapping_mul(y.eval(a, b)),
+            FuzzExpr::And(x, y) => x.eval(a, b) & y.eval(a, b),
+            FuzzExpr::Or(x, y) => x.eval(a, b) | y.eval(a, b),
+            FuzzExpr::Xor(x, y) => x.eval(a, b) ^ y.eval(a, b),
+            // The crate zeroes on an over-wide shift; Rust's `<<` would mask instead.
+            FuzzExpr::Shl(x, k) => if *k >= 8 { 0 } else { x.eval(a, b) << k },
+            FuzzExpr::Shr(x, k) => if *k >= 8 { 0 } else { x.eval(a, b) >> k },
+            FuzzExpr::Not(x) => !x.eval(a, b),
+        }
+    }
+
+    fn render(&self) -> String {
+        match self {
+            FuzzExpr::A => "a".into(),
+            FuzzExpr::B => "b".into(),
+            FuzzExpr::K(k) => format!("{}", k),
+            FuzzExpr::Add(x, y) => format!("({}+{})", x.render(), y.render()),
+            FuzzExpr::Sub(x, y) => format!("({}-{})", x.render(), y.render()),
+            FuzzExpr::Mul(x, y) => format!("({}*{})", x.render(), y.render()),
+            FuzzExpr::And(x, y) => format!("({}&{})", x.render(), y.render()),
+            FuzzExpr::Or(x, y) => format!("({}|{})", x.render(), y.render()),
+            FuzzExpr::Xor(x, y) => format!("({}^{})", x.render(), y.render()),
+            FuzzExpr::Shl(x, k) => format!("({}<<{})", x.render(), k),
+            FuzzExpr::Shr(x, k) => format!("({}>>{})", x.render(), k),
+            FuzzExpr::Not(x) => format!("(!{})", x.render()),
+        }
+    }
+}
+
+fn fuzz_expr(r: &mut FuzzLcg, depth: u32) -> FuzzExpr {
+    if depth == 0 || r.below(4) == 0 {
+        return match r.below(3) {
+            0 => FuzzExpr::A,
+            1 => FuzzExpr::B,
+            _ => FuzzExpr::K(r.below(256) as u8),
+        };
+    }
+    let choice = r.below(9);
+    let x = fuzz_expr(r, depth - 1);
+    let y = fuzz_expr(r, depth - 1);
+    match choice {
+        0 => FuzzExpr::Add(Box::new(x), Box::new(y)),
+        1 => FuzzExpr::Sub(Box::new(x), Box::new(y)),
+        2 => FuzzExpr::Mul(Box::new(x), Box::new(y)),
+        3 => FuzzExpr::And(Box::new(x), Box::new(y)),
+        4 => FuzzExpr::Or(Box::new(x), Box::new(y)),
+        5 => FuzzExpr::Xor(Box::new(x), Box::new(y)),
+        6 => FuzzExpr::Shl(Box::new(x), r.below(9) as u32),
+        7 => FuzzExpr::Shr(Box::new(x), r.below(9) as u32),
+        _ => FuzzExpr::Not(Box::new(x)),
+    }
+}
+
+#[test]
+fn random_expressions_agree_with_enumeration() {
+    let mut r = FuzzLcg(0x1234_5678_9abc_def0);
+    let mut decided = 0u32;
+    for _ in 0..600 {
+        let lhs = fuzz_expr(&mut r, 3);
+        let rhs = fuzz_expr(&mut r, 3);
+        let concrete_valid = for_all_u8_2(|a, b| lhs.eval(a, b) == rhs.eval(a, b));
+        let concrete_ever = !for_all_u8_2(|a, b| lhs.eval(a, b) != rhs.eval(a, b));
+
+        let (verdict, witness) = smt::with_fresh(|| {
+            let a = var(8);
+            let b = var(8);
+            let v = smt::prove(smt::eq(lhs.build(a, b), rhs.build(a, b)));
+            let w = match v {
+                Verdict::Counterexample(c) => Some((c.value_of(0), c.value_of(1))),
+                _ => None,
+            };
+            (v, w)
+        });
+
+        match verdict {
+            Verdict::Unknown => {}
+            Verdict::Valid => {
+                decided += 1;
+                assert!(
+                    concrete_valid,
+                    "claimed Valid but `{} == {}` has a violation",
+                    lhs.render(),
+                    rhs.render()
+                );
+            }
+            Verdict::Unsat => {
+                decided += 1;
+                assert!(
+                    !concrete_ever,
+                    "claimed Unsat but `{} == {}` is satisfiable",
+                    lhs.render(),
+                    rhs.render()
+                );
+            }
+            Verdict::Counterexample(_) => {
+                decided += 1;
+                assert!(
+                    !concrete_valid,
+                    "claimed a counterexample but `{} == {}` is valid",
+                    lhs.render(),
+                    rhs.render()
+                );
+                let (ca, cb) = witness.unwrap();
+                let (ca, cb) = (ca.unwrap_or(0) as u8, cb.unwrap_or(0) as u8);
+                assert_ne!(
+                    lhs.eval(ca, cb),
+                    rhs.eval(ca, cb),
+                    "witness a={} b={} does not violate `{} == {}`",
+                    ca,
+                    cb,
+                    lhs.render(),
+                    rhs.render()
+                );
+            }
+        }
+    }
+    assert!(decided > 200, "too few cases were decided to be meaningful: {}", decided);
+}
