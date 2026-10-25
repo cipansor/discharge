@@ -288,6 +288,33 @@ next section.
 Cost: a symbolic read is `2^addr_width` ites and the BDD sees all of them, so
 `MAX_CELLS` caps a memory at 64 cells (6 address bits).
 
+## A negative answer has to say what it swept
+
+The eighth hole, and the sharpest instance of the recurring class: a limit that silently means
+something weaker than it looks, in the one function whose whole job is to *catch* the symbolic
+engine being wrong.
+
+`find_counterexample_by_enumeration` took a `limit` and returned `Option<u64>`, so `None` meant
+two different things: "swept the whole domain and found nothing" and "stopped early and found
+nothing". A caller reading `None` as "no counterexample exists" was wrong for the second. The
+probe made it concrete — the claim `clamp(x, 20, 200) <= 100` is false, and the first witness is
+`x = 101`:
+
+```
+limit=100 (a prefix)  : None   <- reads as "no counterexample"
+limit=256 (the domain): Some(101)
+```
+
+The function now takes the **domain**, not a search budget — the domain *is* the search — and
+returns `Search`, which separates `Witness(u64)` from `NoWitness`. `NoWitness` is explicitly a
+statement about the domain that was searched, and `domain_of_bits(8)` derives `256` from the
+input width so the domain cannot drift from the symbolic width or be mistyped.
+
+`exhaustive.rs` was checked and is not affected: its domain is the whole type, derived from the
+type itself, and termination uses `checked_add` so it cannot wrap. `None` there unambiguously
+means "swept everything". The difference was the `limit` parameter, which let a caller pass a
+prefix.
+
 ## An unreachable precondition is not a proof
 
 The seventh hole, and the second of the vacuity kind. `verify(s, pre, post)` generates one

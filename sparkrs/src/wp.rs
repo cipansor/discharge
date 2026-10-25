@@ -1234,25 +1234,84 @@ pub fn verify_contract(s: &Stmt<'_>, pre: Pred, post: Pred) -> Verdict {
     }
 }
 
-/// Independent check by execution: the first input in `0..limit` that satisfies
-/// `pre` but violates `post` after `body` runs, if any.
+/// The size of a `bits`-wide unsigned input domain: every value of an unsigned `bits`-bit
+/// integer, i.e. `0..2^bits`.
 ///
-/// This is the differential counterpart of the symbolic proof: if the symbolic
-/// engine says `Valid` and this finds a witness, one of them is wrong.
+/// Exists so that the domain size is *derived* from the input width rather than typed by
+/// hand. The width has to match the symbolic width anyway, and a hand-written `256` is one
+/// transposition away from `26` — which is the eighth defect in miniature.
+///
+/// Panics for `bits == 0` or `bits > 63`, where a full domain cannot be enumerated.
+pub fn domain_of_bits(bits: u32) -> u64 {
+    assert!(
+        (1..=63).contains(&bits),
+        "domain_of_bits: {} bits is not enumerable (want 1..=63)",
+        bits
+    );
+    1u64 << bits
+}
+
+/// What an exhaustive search found.
+///
+/// The distinction is the whole point. An `Option<u64>` conflates "swept the entire domain
+/// and found nothing" with "stopped early and found nothing", and a caller reading `None`
+/// as "no counterexample exists" is then wrong for the second case. That is the eighth
+/// defect: an ambiguous negative, in the function used to *certify* the rest of the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Search {
+    /// An input that satisfies `pre` and violates `post` after `body` runs.
+    Witness(u64),
+    /// Every input in the searched domain that satisfies `pre` also satisfies `post`.
+    ///
+    /// This is only as strong as the domain that was searched. It is a statement about
+    /// `0..domain`, not about every possible input, so the caller must pass the *whole*
+    /// domain — [`domain_of_bits`] for an unsigned input of known width.
+    NoWitness,
+}
+
+impl Search {
+    /// The witness, if the search found one.
+    pub fn witness(self) -> Option<u64> {
+        match self {
+            Search::Witness(v) => Some(v),
+            Search::NoWitness => None,
+        }
+    }
+
+    /// True when the domain was swept and nothing violated `post`.
+    ///
+    /// Named for what it is: a statement about the searched domain, not about the program.
+    pub fn is_clean_over_domain(self) -> bool {
+        matches!(self, Search::NoWitness)
+    }
+}
+
+/// Independent check by execution: the first input in `0..domain` that satisfies `pre` but
+/// violates `post` after `body` runs, if any.
+///
+/// This is the differential counterpart of the symbolic proof: if the symbolic engine says
+/// `Valid` and this finds a witness, one of them is wrong.
+///
+/// `domain` is the size of the input space, not a search budget. There is no separate
+/// budget: the domain *is* the search. Passing a prefix of the domain makes `NoWitness`
+/// mean "no counterexample in the part I looked at", which is not what a caller wants to
+/// hear, so pass the whole thing — [`domain_of_bits`] when the input is an unsigned value
+/// of known width. The return type keeps the two cases apart instead of collapsing them
+/// into `None`; see [`Search`].
 pub fn find_counterexample_by_enumeration(
-    limit: u64,
+    domain: u64,
     pre: impl Fn(u64) -> bool,
     body: impl Fn(u64) -> u64,
     post: impl Fn(u64, u64) -> bool,
-) -> Option<u64> {
+) -> Search {
     let mut v = 0;
-    while v < limit {
+    while v < domain {
         if pre(v) && !post(v, body(v)) {
-            return Some(v);
+            return Search::Witness(v);
         }
         v += 1;
     }
-    None
+    Search::NoWitness
 }
 
 #[cfg(test)]

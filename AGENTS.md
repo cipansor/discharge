@@ -163,6 +163,26 @@ of an under-declared frame rather than hiding it. Do not "fix" that by having th
 interpreter consult the body: the point is to model the declared contract, which is what
 a real machine executes against.
 
+## An ambiguous negative is the same bug as a silent truncation
+
+The eighth hole lived in `find_counterexample_by_enumeration`, the function the tests use to
+check the engine. It took a `limit` and returned `Option<u64>`, so `None` meant either "swept
+the whole domain, nothing violated" or "stopped early, nothing violated". Searching a prefix of
+the domain reported no counterexample for a property that is false.
+
+That is the recurring class one level up: not a limit that truncates a *result*, but a limit
+that truncates the *search* and then reports the same value as a complete sweep. The tell is a
+negative answer whose type does not say what was covered. So:
+
+6. When a function returns "nothing found", `false`, or `None`, does the type say whether the
+   whole space was covered? If a caller can pass a smaller space and get the same answer, the
+   negative is ambiguous, and it will eventually be read as a proof.
+
+The fix removes the choice rather than documenting it: the parameter is now the domain size,
+derived by `domain_of_bits(bits)` from the input width, and the return is `Search::Witness` or
+`Search::NoWitness`. Checked while sweeping: `exhaustive.rs` is safe because its domain is the
+type itself and its loop uses `checked_add`.
+
 ## Quote the count, do not remember it
 
 Three commits in a row said "161 tests pass", "163 tests pass", "165 tests pass" while the

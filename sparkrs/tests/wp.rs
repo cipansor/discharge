@@ -47,14 +47,20 @@ fn clamp_meets_its_contract_and_execution_agrees() {
         let v = wp::verify_contract(&outer, smt::truth(true), post);
         assert!(v.is_proved(), "clamp should meet its contract, got {}", v);
 
-        // Independent check: no 8-bit input may escape the range.
-        let witness = find_counterexample_by_enumeration(
-            256,
+        // Independent check: no 8-bit input may escape the range. The domain is
+        // *derived* from the input width, so it cannot drift from the symbolic width.
+        let found = find_counterexample_by_enumeration(
+            wp::domain_of_bits(8),
             |_| true,
             |v| clamp_exec(v as u8, lo as u8, hi as u8) as u64,
             |_x, out| out >= lo && out <= hi,
         );
-        assert!(witness.is_none(), "execution found a witness: {:?}", witness);
+        assert_eq!(
+            found,
+            wp::Search::NoWitness,
+            "execution found a witness: {:?}",
+            found.witness()
+        );
     });
 }
 
@@ -82,14 +88,20 @@ fn a_too_tight_bound_is_refuted_and_execution_agrees() {
         let v = wp::verify_contract(&outer, smt::truth(true), y.le_val(100));
         assert!(!v.is_proved(), "this bound is too tight and must be refuted");
 
-        // Execution must agree, and must produce a witness.
-        let witness = find_counterexample_by_enumeration(
-            256,
+        // Execution must agree, and must produce a witness. A truncated domain would
+        // also be worth reporting here, and the return type makes that impossible to
+        // confuse with a clean sweep.
+        let found = find_counterexample_by_enumeration(
+            wp::domain_of_bits(8),
             |_| true,
             |v| clamp_exec(v as u8, 20, 200) as u64,
             |_x, out| out <= 100,
         );
-        assert!(witness.is_some(), "execution should also find a violation");
+        assert!(
+            found.witness().is_some(),
+            "execution should also find a violation, got {:?}",
+            found
+        );
     });
 }
 
@@ -842,4 +854,65 @@ fn an_unsatisfiable_invariant_is_not_vacuously_proved() {
         );
         assert_eq!(report.establishes(), wp::Established::Nothing);
     });
+}
+
+#[test]
+fn a_truncated_domain_cannot_masquerade_as_a_clean_sweep() {
+    // The eighth hole, and the sharpest instance of the recurring class: a limit that
+    // silently means something weaker than it looks, in the one function whose whole job
+    // is to *catch* the symbolic engine being wrong.
+    //
+    // The function used to return `Option<u64>`, and `None` meant two different things:
+    // "swept the whole domain, nothing violated" and "stopped early, nothing violated".
+    // A caller reading `None` as "no counterexample exists" would be wrong for the second,
+    // and this probe showed exactly that:
+    //
+    //   limit=100 (a prefix)  : None   <- reads as "no counterexample"
+    //   limit=256 (the domain): Some(101)
+    //
+    // The claim being tested is false -- `clamp(x, 20, 200) <= 100` fails as soon as x
+    // exceeds 100, and the first witness is x = 101. Searching a prefix of the domain
+    // reports no counterexample. The return type now says which case it is, and
+    // `NoWitness` is explicitly a statement about the domain that was searched.
+    let post = |_x: u64, out: u64| out <= 100;
+    let run = |v: u64| clamp_exec(v as u8, 20, 200) as u64;
+
+    // A prefix of the domain: honest, but only about the prefix.
+    let prefix = find_counterexample_by_enumeration(100, |_| true, run, post);
+    assert_eq!(prefix, wp::Search::NoWitness);
+    assert!(
+        prefix.is_clean_over_domain(),
+        "a clean sweep of a prefix is still a clean sweep of *that* prefix"
+    );
+
+    // The whole domain: the counterexample is there, and must be found.
+    let full = find_counterexample_by_enumeration(wp::domain_of_bits(8), |_| true, run, post);
+    assert_eq!(
+        full,
+        wp::Search::Witness(101),
+        "the first counterexample (x = 101, which returns 101 > 100) must be found over \
+         the full domain"
+    );
+
+    // The two are now distinguishable at the type level, which is the fix: the negative
+    // is unambiguous, so `NoWitness` over a prefix can never be read as a proof.
+    assert_ne!(prefix, full);
+}
+
+#[test]
+fn the_search_domain_matches_the_symbolic_width() {
+    // `domain_of_bits` exists so the domain is derived from the input width rather than
+    // typed by hand. This pins the derivation and the refusal of unenumerable widths, so
+    // the two cannot drift.
+    assert_eq!(wp::domain_of_bits(1), 2);
+    assert_eq!(wp::domain_of_bits(8), 256);
+    assert_eq!(wp::domain_of_bits(16), 65536);
+
+    let zero = std::panic::catch_unwind(|| wp::domain_of_bits(0));
+    assert!(zero.is_err(), "a zero-bit domain cannot be enumerated");
+    let too_wide = std::panic::catch_unwind(|| wp::domain_of_bits(64));
+    assert!(
+        too_wide.is_err(),
+        "a 64-bit domain cannot be enumerated, and must be refused rather than wrapped"
+    );
 }
