@@ -163,6 +163,25 @@ of an under-declared frame rather than hiding it. Do not "fix" that by having th
 interpreter consult the body: the point is to model the declared contract, which is what
 a real machine executes against.
 
+## The evidence for a refutation is also a claim
+
+The ninth hole was in `Cex`: the model returned with a `Counterexample` verdict. It inlines 16
+assignments, `model` stopped at the cap silently, and `value_of` returned `None` for a dropped
+variable exactly as for an untouched one. So a caller could not tell an incomplete witness from
+a complete one, and a witness is the *evidence* for a refutation.
+
+That is the same class from a third angle. The first five holes let a **summary** outrun its
+evidence; the sixth and seventh gave a **proof** with no evidence; the eighth gave an ambiguous
+**negative**; this one gives a **witness** with a hole. In every case the object claims more
+coverage than it has. So the sweep question generalises:
+
+6. When something is reported as a *result* — a verdict, a summary, a witness, a count — does
+   the type say what it covers? The negative and the positive both need the answer, and the
+   fixed-size buffer is where the coverage quietly shrinks.
+
+`Cex` now carries `total` alongside `n`, `is_complete()` compares them, and `Display` prints
+`TRUNCATED`. Nothing else in the crate consumed `Cex` fields, so the fix is contained.
+
 ## An ambiguous negative is the same bug as a silent truncation
 
 The eighth hole lived in `find_counterexample_by_enumeration`, the function the tests use to

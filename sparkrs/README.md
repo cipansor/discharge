@@ -288,6 +288,28 @@ next section.
 Cost: a symbolic read is `2^addr_width` ites and the BDD sees all of them, so
 `MAX_CELLS` caps a memory at 64 cells (6 address bits).
 
+## A truncated witness has to say so
+
+The ninth hole, and the most consequential instance of the class: a *witness* presented as
+complete while missing variables. A model is the evidence for a refutation, so a truncated one
+is evidence with a hole in it.
+
+`Cex` inlines `MAX_CEX` (16) assignments, and `model` stopped filling at the cap with no record
+that it had. Worse, `value_of` returned `None` for a *dropped* variable exactly as it does for
+one that was never mentioned, so an incomplete model was indistinguishable from a complete one.
+The probe asks for a goal whose negation forces all twenty variables to be fixed:
+
+```
+assignments reported : 16
+variables touched    : 20
+is_complete()        : false
+rendered             : v0:u1 = 1, … v15:u1 = 1 … 16/20 shown (TRUNCATED)
+```
+
+`Cex` now carries `total`, the number of variables the model touched, and `is_complete()`
+reports whether every one of them is present. The `Display` impl marks a truncated model too,
+because a witness printed as if whole is the failure mode the flag exists to prevent.
+
 ## A negative answer has to say what it swept
 
 The eighth hole, and the sharpest instance of the recurring class: a limit that silently means

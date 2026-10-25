@@ -301,3 +301,81 @@ fn the_evaluator_handles_widths_truncation_and_shifts() {
         assert_eq!(smt::evaluate_pred(smt::ult_const(a, 10), |i| if i == ai { Some(10) } else { None }), Some(false));
     });
 }
+
+#[test]
+fn a_truncated_model_says_so() {
+    // The ninth hole, and the most consequential instance of the class: a *witness* that
+    // is presented as complete while missing variables. A model is the evidence for a
+    // refutation, so a truncated one is evidence with a hole in it.
+    //
+    // `Cex` inlines MAX_CEX assignments, and `model` used to stop filling at the cap with
+    // no record that it had. Worse, `value_of` returned None for a dropped variable
+    // exactly as it does for a variable that was never mentioned, so an incomplete model
+    // was indistinguishable from a complete one.
+    //
+    // The goal here is `v0 == 0 || ... || v19 == 0`. Its negation is "every vi == 1", so
+    // any counterexample must fix all twenty variables, and MAX_CEX is 16:
+    //
+    //   assignments reported : 16
+    //   variables touched    : 20
+    //   is_complete()        : false
+    //
+    // The assignments that fit are still correct; what changed is that the hole is now
+    // visible in the API and in the rendering.
+    smt::with_fresh(|| {
+        let mut goal = smt::truth(false);
+        for _ in 0..20 {
+            let v = var(1);
+            goal = smt::or(goal, smt::eq_const(v, 0));
+        }
+        match smt::prove(goal) {
+            Verdict::Counterexample(cex) => {
+                assert_eq!(cex.len(), smt::MAX_CEX, "the buffer holds MAX_CEX entries");
+                assert_eq!(cex.total(), 20, "twenty variables were touched");
+                assert!(
+                    !cex.is_complete(),
+                    "a model missing four of twenty variables must not claim completeness"
+                );
+                // The rendering has to carry the same warning, since a truncated witness
+                // printed as if whole is the failure mode the flag exists to prevent.
+                let shown = format!("{}", cex);
+                assert!(
+                    shown.contains("TRUNCATED"),
+                    "the rendering must mark a truncated model, got: {}",
+                    shown
+                );
+            }
+            other => panic!("expected a counterexample, got {:?}", other),
+        }
+    });
+}
+
+#[test]
+fn a_model_that_fits_is_complete() {
+    // The teeth: the flag must not cry truncation on every model, or it would be ignored.
+    // A small query produces a model that fits, and it must report itself complete.
+    smt::with_fresh(|| {
+        let a = var(8);
+        // `a == 5 || a == 7` is not valid; a counterexample fixes one 8-bit variable.
+        let goal = smt::or(smt::eq_const(a, 5), smt::eq_const(a, 7));
+        match smt::prove(goal) {
+            Verdict::Counterexample(cex) => {
+                assert!(
+                    cex.is_complete(),
+                    "a model that fits in the buffer must report completeness, got {} \
+                     of {}",
+                    cex.len(),
+                    cex.total()
+                );
+                assert_eq!(cex.total(), cex.len() as u32);
+                let shown = format!("{}", cex);
+                assert!(
+                    !shown.contains("TRUNCATED"),
+                    "a complete model must not be marked truncated, got: {}",
+                    shown
+                );
+            }
+            other => panic!("expected a counterexample, got {:?}", other),
+        }
+    });
+}

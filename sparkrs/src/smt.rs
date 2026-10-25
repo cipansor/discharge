@@ -51,14 +51,29 @@ pub const MAX_CEX: usize = 16;
 /// type `Copy` and allocation-free. That makes this the largest variant of
 /// [`Verdict`]; boxing it would require an allocator, which this crate does not
 /// use, so the size is accepted deliberately.
+///
+/// Because the buffer is fixed, a model with more than `MAX_CEX` variables cannot be
+/// reported in full. It used to be truncated silently, and `value_of` then returned
+/// `None` for a *dropped* variable exactly as it does for one that was never mentioned —
+/// so a caller could not tell an incomplete witness from a complete one. A model is the
+/// evidence for a refutation; a truncated one is evidence with a hole in it, and the hole
+/// has to be visible. [`Cex::is_complete`] reports it, and `total` records how many
+/// variables the model actually touched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cex {
     assignments: [(u32, u8, u64); MAX_CEX],
     n: u8,
+    /// How many variables the model touched, which may exceed `n` when the buffer was
+    /// too small to hold them all. `n < total` means the witness is truncated.
+    total: u32,
 }
 
 impl Cex {
     /// Value assigned to variable `var`, if that variable appears in the model.
+    ///
+    /// `None` means either that the variable was not mentioned or that the model was
+    /// truncated before reaching it. Check [`Cex::is_complete`] to tell those apart; a
+    /// `None` from an incomplete model is not evidence that the variable is unconstrained.
     pub fn value_of(&self, var: u32) -> Option<u64> {
         for i in 0..self.n as usize {
             let (v, _w, val) = self.assignments[i];
@@ -69,7 +84,7 @@ impl Cex {
         None
     }
 
-    /// Number of variables mentioned.
+    /// Number of variables reported.
     pub fn len(&self) -> usize {
         self.n as usize
     }
@@ -77,6 +92,21 @@ impl Cex {
     /// True when no variable was mentioned.
     pub fn is_empty(&self) -> bool {
         self.n == 0
+    }
+
+    /// True when every variable the model touched is present.
+    ///
+    /// A complete model is a witness: replaying its assignments satisfies the query. An
+    /// incomplete one is a *partial* witness — the assignments it does carry are correct,
+    /// but the model also relied on variables that were dropped, so replaying it alone
+    /// need not reproduce the verdict.
+    pub fn is_complete(&self) -> bool {
+        self.n as u32 == self.total
+    }
+
+    /// How many variables the model touched, reported or not.
+    pub fn total(&self) -> u32 {
+        self.total
     }
 }
 
@@ -88,6 +118,11 @@ impl fmt::Display for Cex {
                 write!(f, ", ")?;
             }
             write!(f, "v{}:u{} = {}", v, w, val)?;
+        }
+        if !self.is_complete() {
+            // Say so in the rendering, not only in the API: a truncated witness printed
+            // as if complete is the failure mode this flag exists to prevent.
+            write!(f, " … {}/{} shown (TRUNCATED)", self.n, self.total)?;
         }
         Ok(())
     }
@@ -1000,12 +1035,19 @@ impl Ctx {
                 node = hi;
             }
         }
-        let mut cex = Cex { assignments: [(0, 0, 0); MAX_CEX], n: 0 };
+        let mut cex = Cex { assignments: [(0, 0, 0); MAX_CEX], n: 0, total: 0 };
         for idx in 0..MAX_VARS {
-            if touched[idx] && (cex.n as usize) < MAX_CEX {
-                let w = self.var_width[idx];
-                cex.assignments[cex.n as usize] = (idx as u32, w, bits[idx]);
-                cex.n += 1;
+            if touched[idx] {
+                // Count every touched variable, whether or not it fits. The count is what
+                // makes truncation visible: `n < total` means the witness has a hole, and
+                // a caller that cannot see the hole will treat a partial model as a whole
+                // one. The assignments that do fit are still recorded.
+                cex.total += 1;
+                if (cex.n as usize) < MAX_CEX {
+                    let w = self.var_width[idx];
+                    cex.assignments[cex.n as usize] = (idx as u32, w, bits[idx]);
+                    cex.n += 1;
+                }
             }
         }
         cex
