@@ -16,11 +16,19 @@
 //! enumeration does not reach. Soundness is the property that, if broken, lets a
 //! verifier certify a bug, so it is the one tested exhaustively.
 //!
-//! Both of the holes I found by hand are in this file's search space: an
-//! under-declared frame, and a call whose written target keeps its pre-call value. A
-//! generator cannot invent the *shape* of a mistake it was not told about, so the
-//! space below is deliberately biased towards the two things a frame rule can get
-//! wrong — what the callee writes, and what the caller is told about it.
+//! Three families live here, each aimed at a class of mistake that had already occurred:
+//!
+//! 1. **Callers**, where the frame rule can be wrong about what a callee writes and what
+//!    the caller is told about it.
+//! 2. **Loops containing calls**, where the loop rules and the call rule meet, and where
+//!    a termination claim can outrun its variant.
+//! 3. **Obligation pressure**, where a program has more side obligations than the report
+//!    can hold. This one found the worst defect in the crate: obligations past the cap
+//!    were dropped silently, so a program could report `Total` while a failing `LoopExit`
+//!    sat in the part that did not fit.
+//!
+//! A generator cannot invent the *shape* of a mistake it was not told about, so each
+//! family is biased towards a shape that had already gone wrong.
 
 use sparkrs::smt::{self, Var};
 use sparkrs::wp::{self, Proc, Stmt};
@@ -763,5 +771,147 @@ fn a_total_claim_is_not_made_for_a_divergent_loop() {
             .first_failure()
             .expect("a non-decreasing measure must fail");
         assert_eq!(ob.rule, wp::Rule::LoopVariant);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Obligation pressure: more side obligations than the report can hold.
+//
+// The worst defect in the crate. `push` dropped obligations once the buffer was full, so
+// a program could report `verified` — and `Total` — while a failing `LoopExit` sat in the
+// part that did not fit. Nothing about the call rule or the loop rule was wrong; the
+// report was simply claiming more than it had checked.
+//
+// This family makes the class catchable by machine: build a loop whose exit obligation
+// fails, pad the program with assertions so the obligation count crosses the cap, and
+// demand that a report which says `verified` is never contradicted by execution.
+// ---------------------------------------------------------------------------
+
+/// Build a program whose `LoopExit` fails, padded with `padding` assertions, and check
+/// the property. Returns whether the engine verified it.
+///
+/// The postcondition is `100 <= i` while the loop exits at `i == 10`, so the exit
+/// obligation is genuinely false. Preservation holds, so `LoopExit` is the only
+/// obligation that can report it — which is what makes the cap dangerous.
+fn run_padded_case(padding: u32, case_no: u32) -> bool {
+    smt::with_fresh(|| {
+        let i = smt::var(8);
+        let init: &'static Stmt<'static> = Box::leak(Box::new(Stmt::Assign {
+            var: i,
+            expr: smt::word(0, 8),
+        }));
+        let step: &'static Stmt<'static> =
+            Box::leak(Box::new(Stmt::Assign { var: i, expr: i + 1u32 }));
+        let loop_: &'static Stmt<'static> = Box::leak(Box::new(Stmt::While {
+            cond: smt::ult_const(i, 10),
+            invariant: smt::ule_const(i, 10),
+            variant: None,
+            body: step,
+        }));
+        let core: &'static Stmt<'static> = Box::leak(Box::new(Stmt::Seq {
+            first: init,
+            second: loop_,
+        }));
+
+        // Padding after the loop, so a right-to-left walk fills the buffer before it
+        // reaches the loop.
+        let mut node = core;
+        for _ in 0..padding {
+            let leaf: &'static Stmt<'static> =
+                Box::leak(Box::new(Stmt::Assert(smt::truth(true))));
+            node = Box::leak(Box::new(Stmt::Seq { first: node, second: leaf }));
+        }
+
+        let post = smt::not(smt::ult_const(i, 100));
+        let report = wp::verify(node, smt::truth(true), post);
+        let verified = report.is_verified();
+
+        if verified {
+            // If the report claims verification, execution must agree. This is where the
+            // old code failed: the failing exit obligation was dropped, so the report
+            // verified, and the postcondition was false for every input.
+            let mut state = State::new();
+            let outcome = exec(node, &mut state, CallMode::Real);
+            assert!(
+                outcome != Ok(()),
+                "case {} (padding {}): VERIFIED but the program runs to completion and \
+                 the postcondition is false",
+                case_no,
+                padding
+            );
+            let holds = lookup_pred(&state, post);
+            assert!(
+                holds != Some(false),
+                "case {} (padding {}): VERIFIED but the postcondition is false on \
+                 completion",
+                case_no,
+                padding
+            );
+        }
+        verified
+    })
+}
+
+#[test]
+fn obligation_pressure_never_produces_a_false_verification() {
+    // Padding from 0 to well past the cap, so the boundary is crossed in both
+    // directions. Nothing here should ever verify, because the exit obligation is false
+    // for every input — and with the cap handled honestly, nothing does.
+    let mut verified = 0;
+    for padding in 0..28u32 {
+        if run_padded_case(padding, padding) {
+            verified += 1;
+        }
+    }
+    assert_eq!(
+        verified, 0,
+        "no padding may turn a failing program into a verified one, but {} did",
+        verified
+    );
+}
+
+#[test]
+fn crossing_the_cap_is_observable() {
+    // The boundary itself, so the test above cannot pass by the padding being
+    // ineffective. Below the cap the failure is the loop's; at and above it the failure
+    // is the overflow, and the rule named changes.
+    smt::with_fresh(|| {
+        let i = smt::var(8);
+        let init: &'static Stmt<'static> = Box::leak(Box::new(Stmt::Assign {
+            var: i,
+            expr: smt::word(0, 8),
+        }));
+        let step: &'static Stmt<'static> =
+            Box::leak(Box::new(Stmt::Assign { var: i, expr: i + 1u32 }));
+        let loop_: &'static Stmt<'static> = Box::leak(Box::new(Stmt::While {
+            cond: smt::ult_const(i, 10),
+            invariant: smt::ule_const(i, 10),
+            variant: None,
+            body: step,
+        }));
+        let core: &'static Stmt<'static> = Box::leak(Box::new(Stmt::Seq {
+            first: init,
+            second: loop_,
+        }));
+        let post = smt::not(smt::ult_const(i, 100));
+
+        // No padding: the loop's own obligations fit, and `LoopExit` is what fails.
+        let report = wp::verify(core, smt::truth(true), post);
+        let (ob, _) = report.first_failure().expect("the exit obligation fails");
+        assert_eq!(ob.rule, wp::Rule::LoopExit);
+
+        // Enough padding to overrun: now the report names the overflow instead, and
+        // stops claiming to have checked the loop at all.
+        let mut node = core;
+        for _ in 0..wp::MAX_OBLIGATIONS {
+            let leaf: &'static Stmt<'static> =
+                Box::leak(Box::new(Stmt::Assert(smt::truth(true))));
+            node = Box::leak(Box::new(Stmt::Seq { first: node, second: leaf }));
+        }
+        let report = wp::verify(node, smt::truth(true), post);
+        let (ob, _) = report.first_failure().expect("the overflow must be reported");
+        assert_eq!(ob.rule, wp::Rule::ObligationOverflow);
+        assert!(!report.is_verified());
+        assert_eq!(report.establishes(), wp::Established::Nothing);
     });
 }

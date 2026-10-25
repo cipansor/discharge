@@ -183,6 +183,17 @@ pub enum Rule {
     /// This is not a proof failure but a modelling one, and it is reported rather
     /// than asserted so that a whole program can be checked in one run.
     CallFrame,
+    /// The program has more side obligations than the report can hold, so some were
+    /// not checked.
+    ///
+    /// This exists because silently dropping them is unsound. The cap is
+    /// [`MAX_OBLIGATIONS`], and a dropped obligation is one nobody looked at — so a
+    /// program could report `Total` while a failing `LoopExit` sat in the part that did
+    /// not fit. Reporting the overflow as a *failure* is the only honest answer: the
+    /// claim has to shrink to what was actually checked. See `obligations` for where the
+    /// flag is raised, and `too_many_obligations_is_reported_not_swallowed` in
+    /// `tests/wp.rs`.
+    ObligationOverflow,
 }
 
 /// A verification condition, attributed to the rule that produced it.
@@ -231,10 +242,26 @@ pub fn obligations<'a>(
     post: Pred,
     out: &mut [Option<Obligation>],
 ) -> (Pred, usize) {
+    let (goal, n, _) = obligations_checked(s, post, out);
+    (goal, n)
+}
+
+/// [`obligations`], plus whether any claim-carrying obligation had to be dropped.
+///
+/// The flag is the whole point: [`MAX_OBLIGATIONS`] is a fixed-size buffer, and a
+/// program larger than it must not be reported as verified on the strength of the part
+/// that fit. [`verify`] turns a raised flag into a failing [`Rule::ObligationOverflow`]
+/// obligation.
+fn obligations_checked<'a>(
+    s: &'a Stmt<'a>,
+    post: Pred,
+    out: &mut [Option<Obligation>],
+) -> (Pred, usize, bool) {
     let mut n = 0;
+    let mut overflow = false;
     let mut cursor = post;
-    collect(s, &mut cursor, out, 0, &mut n);
-    (cursor, n)
+    collect(s, &mut cursor, out, 0, &mut n, &mut overflow);
+    (cursor, n, overflow)
 }
 
 /// Walk `s` backwards, appending loop and assertion obligations to `out`.
@@ -254,12 +281,13 @@ fn collect<'a>(
     out: &mut [Option<Obligation>],
     start: usize,
     n: &mut usize,
+    overflow: &mut bool,
 ) {
     match s {
         Stmt::Seq { first, second } => {
             // Backwards: handle the second statement first, then the first.
-            collect(second, cursor, out, start, n);
-            collect(first, cursor, out, start, n);
+            collect(second, cursor, out, start, n, overflow);
+            collect(first, cursor, out, start, n, overflow);
         }
         Stmt::Assign { var, expr } => {
             *cursor = smt::substitute(*cursor, &[(*var, *expr)]);
@@ -296,7 +324,7 @@ fn collect<'a>(
                 // can never hold, rather than asserting and aborting: a verifier
                 // that panics on a bad input is a verifier you cannot run on a
                 // program you do not yet trust.
-                push(out, n, Rule::CallFrame, smt::truth(false));
+                push_checked(out, n, overflow, Rule::CallFrame, smt::truth(false));
                 *cursor = smt::truth(false);
                 return;
             }
@@ -305,7 +333,13 @@ fn collect<'a>(
             // dominate it rewrite it, and `verify` wraps it with the precondition.
             // The rename is simultaneous, so `requires` and `ensures` are
             // substituted independently.
-            push(out, n, Rule::CallRequires, smt::substitute(proc_.requires, actuals));
+            push_checked(
+                out,
+                n,
+                overflow,
+                Rule::CallRequires,
+                smt::substitute(proc_.requires, actuals),
+            );
             // After the call, `ensures[actuals]` may be *assumed*. Assumption in a
             // backward calculus is implication: `ensures => Q`, not `ensures && Q`.
             // Conjoining would demand that the callee's result satisfy the caller's
@@ -339,18 +373,19 @@ fn collect<'a>(
             // Each branch is walked in its own slot range so its assignments do
             // not rewrite the sibling's obligations.
             let mut then_cursor = after;
-            collect(then_, &mut then_cursor, out, *n, n);
+            collect(then_, &mut then_cursor, out, *n, n, overflow);
             let mut else_cursor = after;
-            collect(else_, &mut else_cursor, out, *n, n);
+            collect(else_, &mut else_cursor, out, *n, n, overflow);
             *cursor = ite_pred(*cond, then_cursor, else_cursor);
         }
         Stmt::While { cond, invariant, variant, body } => {
             let inv = *invariant;
             let q = *cursor;
             // Preservation, universally quantified over the loop-head state.
-            push(
+            push_checked(
                 out,
                 n,
+                overflow,
                 Rule::LoopPreserve,
                 smt::implies(smt::and(inv, *cond), wp(inv, body)),
             );
@@ -359,25 +394,27 @@ fn collect<'a>(
             // obligation is `I && c => V' < V` with `V'` derived, not restated.
             if let Some(v) = variant {
                 let after = variant_after(body, *v);
-                push(
+                push_checked(
                     out,
                     n,
+                    overflow,
                     Rule::LoopVariant,
                     smt::implies(smt::and(inv, *cond), smt::ult(after, *v)),
                 );
             }
             // Exit: the invariant and the failed guard must satisfy whatever the
             // rest of the program needs.
-            push(
+            push_checked(
                 out,
                 n,
+                overflow,
                 Rule::LoopExit,
                 smt::implies(smt::and(inv, smt::not(*cond)), q),
             );
             // Obligations inside the body are checked under the invariant and the
             // guard, which is the context every iteration begins from.
             let mut body_cursor = inv;
-            collect(body, &mut body_cursor, out, *n, n);
+            collect(body, &mut body_cursor, out, *n, n, overflow);
             // All a caller may assume after the loop is the invariant.
             *cursor = inv;
         }
@@ -512,10 +549,54 @@ impl<'a> Stmt<'a> {
     }
 }
 
+/// The last slot of a report's buffer is reserved for a report-level finding, so the
+/// program's own obligations never fill it. See [`push_notice`].
+fn program_limit(out: &[Option<Obligation>]) -> usize {
+    out.len().saturating_sub(1)
+}
+
+/// Record an obligation about the program, if there is room below the reserved slot.
+///
+/// Used for assertions, where dropping one is not a soundness problem: a dropped
+/// assertion still poisons the weakest precondition, so the contract obligation catches
+/// it. Claim-carrying obligations use [`push_checked`], which reports the drop.
 fn push(out: &mut [Option<Obligation>], n: &mut usize, rule: Rule, goal: Pred) {
+    if *n < program_limit(out) {
+        out[*n] = Some(Obligation { rule, goal });
+        *n += 1;
+    }
+}
+
+/// Record a report-level finding, which is allowed to use the reserved last slot.
+///
+/// The distinction matters: an overflow notice that is itself dropped by the full
+/// buffer is worse than useless, because the report then looks clean. That is exactly
+/// how the first attempt at this fix failed.
+fn push_notice(out: &mut [Option<Obligation>], n: &mut usize, rule: Rule, goal: Pred) {
     if *n < out.len() {
         out[*n] = Some(Obligation { rule, goal });
         *n += 1;
+    }
+}
+
+/// Like [`push`], but records that an obligation was dropped when the buffer is full.
+///
+/// Used for the obligations that carry a *claim*: a dropped loop rule or call rule is a
+/// missing proof, and the report has to say so. Dropping one silently would let
+/// `verified` mean "the obligations that fit were fine", which is not what a reader
+/// takes it to mean.
+fn push_checked(
+    out: &mut [Option<Obligation>],
+    n: &mut usize,
+    overflow: &mut bool,
+    rule: Rule,
+    goal: Pred,
+) {
+    if *n < program_limit(out) {
+        out[*n] = Some(Obligation { rule, goal });
+        *n += 1;
+    } else {
+        *overflow = true;
     }
 }
 
@@ -648,6 +729,11 @@ pub fn termination_obligation(
 }
 
 /// How many obligations [`verify`] can report at once.
+///
+/// A [`Report`] actually carries one more slot than this, so that a report-level finding
+/// such as [`Rule::ObligationOverflow`] always has somewhere to go. Without that extra
+/// slot the overflow notice would itself be dropped by the full buffer — which is exactly
+/// how this was missed the first time.
 pub const MAX_OBLIGATIONS: usize = 16;
 
 /// The most arguments a call may pass, so the frame check needs no allocator.
@@ -795,8 +881,9 @@ fn collect_written(s: &Stmt<'_>, out: &mut [Var; MAX_WRITES], n: &mut usize) {
 /// were applied, plus the verdict of the contract as a whole.
 #[derive(Debug, Clone, Copy)]
 pub struct Report {
-    /// Loop obligations, in the order generated.
-    pub obligations: [Option<Obligation>; MAX_OBLIGATIONS],
+    /// Loop, assertion and call obligations, in the order generated, plus one spare
+    /// slot at the end for a report-level finding. See [`MAX_OBLIGATIONS`].
+    pub obligations: [Option<Obligation>; MAX_OBLIGATIONS + 1],
     /// How many entries of `obligations` are set.
     pub count: usize,
     /// The overall contract condition, `pre => wp(body, post)`.
@@ -929,8 +1016,8 @@ pub enum Correctness {
 /// This discharges the loop obligations *and* the body condition, and reports the
 /// first failure with the rule that produced it.
 pub fn verify(s: &Stmt<'_>, pre: Pred, post: Pred) -> Report {
-    let mut slots: [Option<Obligation>; MAX_OBLIGATIONS] = [None; MAX_OBLIGATIONS];
-    let (goal, count) = obligations(s, post, &mut slots);
+    let mut slots: [Option<Obligation>; MAX_OBLIGATIONS + 1] = [None; MAX_OBLIGATIONS + 1];
+    let (goal, mut count, overflow) = obligations_checked(s, post, &mut slots);
 
     // An assertion's recorded goal has already been rewritten by the assignments
     // that dominate it, so it is `wp(prefix, c)`. The obligation to discharge is
@@ -945,6 +1032,14 @@ pub fn verify(s: &Stmt<'_>, pre: Pred, post: Pred) -> Report {
                 });
             }
         }
+    }
+
+    // A dropped obligation is a claim that was never checked. Record it as a failure
+    // rather than letting `verified` mean "the ones that fit were fine": the report has
+    // to shrink to what was actually proved. `false` is the goal because the obligation
+    // is not about the program's state — it is about the report's own completeness.
+    if overflow {
+        push_notice(&mut slots, &mut count, Rule::ObligationOverflow, smt::truth(false));
     }
 
     Report {

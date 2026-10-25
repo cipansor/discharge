@@ -163,6 +163,28 @@ of an under-declared frame rather than hiding it. Do not "fix" that by having th
 interpreter consult the body: the point is to model the declared contract, which is what
 a real machine executes against.
 
+## A capped summary must fail loudly
+
+`MAX_OBLIGATIONS` is a fixed-size buffer, and `push` used to drop obligations silently when
+it filled. A program with more side obligations than the cap could therefore report
+`verified` — and `Total` — while a failing `LoopExit` sat in the part that did not fit. Two
+rules follow, and both bit me:
+
+1. **Claim-carrying obligations must report the drop.** Loop rules and call rules go
+   through `push_checked`, which raises an `ObligationOverflow` obligation with goal
+   `false`. Assertions may still be dropped quietly, because a dropped assertion poisons
+   the weakest precondition and the contract obligation catches it.
+2. **The notice needs a slot the program cannot occupy.** `Report::obligations` is one
+   longer than `MAX_OBLIGATIONS`, and `push` stops at `program_limit` (one below the end)
+   while `push_notice` may use the last slot. My first fix appended the overflow obligation
+   with `push`, so a full buffer dropped the notice too and the report still said
+   `verified`. When adding a report-level finding, reserve its space explicitly.
+
+The general lesson, which is the third instance of the same class: **a summary claim is
+only as good as the checks behind it.** `verified`, `Total` and `Partial` are summaries.
+Whenever one is computed, ask what happens when the underlying evidence is incomplete —
+missing, dropped, or merely assumed — and make that case a failure rather than a silence.
+
 ## Termination claims must be discharged, not counted
 
 `Report::has_termination_proof` counts only variant obligations whose verdict is

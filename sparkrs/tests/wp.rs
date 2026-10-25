@@ -619,3 +619,119 @@ fn establishes_answers_both_halves_at_once() {
         assert_eq!(r.establishes(), wp::Established::Nothing);
     });
 }
+
+#[test]
+fn too_many_obligations_is_reported_not_swallowed() {
+    // The worst defect found in this crate, and the same *class* as the termination one:
+    // a summary claim outrunning what was actually proved.
+    //
+    // `push` used to drop obligations silently once `MAX_OBLIGATIONS` was reached. So a
+    // program with more than 16 side obligations could have a *failing* `LoopExit` land
+    // in the part that did not fit, and the report would still say `verified` — worse,
+    // `Total`. The probe that found it printed:
+    //
+    //     verified : true
+    //     establishes : Total
+    //     ground truth: loop exits at i=10, so '100 <= i' is FALSE
+    //
+    // A proof of a false statement is the one outcome a verifier must never produce, so
+    // a dropped obligation is now a failure rather than a silence.
+    smt::with_fresh(|| {
+        let i = var(8);
+        let init: &'static Stmt<'static> = Box::leak(Box::new(Stmt::Assign {
+            var: i,
+            expr: smt::word(0, 8),
+        }));
+        // The loop exits at i == 10, so `i <= 10` is preserved but `100 <= i` is false
+        // at exit. Only `LoopExit` can report a failure.
+        let step: &'static Stmt<'static> =
+            Box::leak(Box::new(Stmt::Assign { var: i, expr: i + 1u32 }));
+        let loop_: &'static Stmt<'static> = Box::leak(Box::new(Stmt::While {
+            cond: smt::ult_const(i, 10),
+            invariant: smt::ule_const(i, 10),
+            variant: None,
+            body: step,
+        }));
+        let program: &'static Stmt<'static> = Box::leak(Box::new(Stmt::Seq {
+            first: init,
+            second: loop_,
+        }));
+
+        // Filler assertions after the loop, enough to overrun the buffer.
+        let mut node = program;
+        for _ in 0..16 {
+            let leaf: &'static Stmt<'static> =
+                Box::leak(Box::new(Stmt::Assert(smt::truth(true))));
+            node = Box::leak(Box::new(Stmt::Seq { first: node, second: leaf }));
+        }
+
+        let post = smt::not(smt::ult_const(i, 100));
+        let report = wp::verify(node, smt::truth(true), post);
+
+        // The claim must shrink to what was checked.
+        assert!(
+            !report.is_verified(),
+            "a program too large for the buffer must not be reported as verified"
+        );
+        assert_eq!(
+            report.establishes(),
+            wp::Established::Nothing,
+            "no claim survives an unchecked obligation"
+        );
+        let (ob, _) = report.first_failure().expect("the overflow must be reported");
+        assert_eq!(ob.rule, Rule::ObligationOverflow);
+
+        // And the overflow really is what happened: the program has more obligations
+        // than the buffer holds, so at least one was dropped.
+        let mut slots = [None; wp::MAX_OBLIGATIONS + 1];
+        let (_, count) = wp::obligations(node, post, &mut slots);
+        assert_eq!(
+            count,
+            wp::MAX_OBLIGATIONS,
+            "the buffer below the reserved slot should be exactly full"
+        );
+    });
+}
+
+#[test]
+fn a_report_that_fits_is_unaffected_by_the_reserved_slot() {
+    // The other side of the fix: the reserved slot must not cost a program anything.
+    // A program with exactly `MAX_OBLIGATIONS - 1` side obligations still reports all of
+    // them, verifies, and is not mistaken for an overflow.
+    smt::with_fresh(|| {
+        let i = var(8);
+        let step: &'static Stmt<'static> =
+            Box::leak(Box::new(Stmt::Assign { var: i, expr: i + 1u32 }));
+        let init: &'static Stmt<'static> = Box::leak(Box::new(Stmt::Assign {
+            var: i,
+            expr: smt::word(0, 8),
+        }));
+        let loop_: &'static Stmt<'static> = Box::leak(Box::new(Stmt::While {
+            cond: smt::ult_const(i, 10),
+            invariant: smt::ule_const(i, 10),
+            variant: None,
+            body: step,
+        }));
+        let mut node: &'static Stmt<'static> = Box::leak(Box::new(Stmt::Seq {
+            first: init,
+            second: loop_,
+        }));
+        // 10 assertions plus the loop's two obligations: comfortably inside the buffer.
+        for _ in 0..10 {
+            let leaf: &'static Stmt<'static> =
+                Box::leak(Box::new(Stmt::Assert(smt::truth(true))));
+            node = Box::leak(Box::new(Stmt::Seq { first: node, second: leaf }));
+        }
+        let report = wp::verify(node, smt::truth(true), smt::ule_const(i, 10));
+        assert!(report.is_verified(), "{:?}", report.first_failure());
+        assert_eq!(report.establishes(), wp::Established::Partial);
+        assert!(
+            !report
+                .obligations
+                .iter()
+                .flatten()
+                .any(|ob| ob.rule == Rule::ObligationOverflow),
+            "a program that fits must not be flagged as overflowing"
+        );
+    });
+}

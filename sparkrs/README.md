@@ -288,6 +288,38 @@ next section.
 Cost: a symbolic read is `2^addr_width` ites and the BDD sees all of them, so
 `MAX_CELLS` caps a memory at 64 cells (6 address bits).
 
+## The obligation cap fails loudly, never silently
+
+`verify` collects side obligations — loop preservation, variants, exits, assertions, call
+contracts — into a fixed-size buffer, `MAX_OBLIGATIONS`. It used to drop them silently once
+the buffer was full. That is unsound in the worst possible way: a program with more than
+sixteen side obligations could have a *failing* `LoopExit` land in the part that did not
+fit, and the report would still say `verified` — and `Total`. The probe that found it
+printed:
+
+```
+verified    : true
+establishes : Total
+--- ground truth: loop exits at i=10, so '100 <= i' is FALSE
+```
+
+A proof of a false statement is the one outcome a verifier must never produce. So the cap
+now does two things:
+
+* **Claim-carrying obligations report the drop.** A dropped loop rule or call rule raises
+  `Rule::ObligationOverflow`, whose goal is `false`, so `verified` becomes false and the
+  claim shrinks to what was actually checked. Assertions are still dropped quietly, and
+  that is safe: a dropped assertion still poisons the weakest precondition, so the
+  contract obligation catches it.
+* **The overflow notice itself cannot be dropped.** A `Report` carries one slot more than
+  `MAX_OBLIGATIONS`, reserved for a report-level finding. Without that reservation the
+  notice would be dropped by the same full buffer that caused it — which is exactly how
+  the first attempt at this fix failed.
+
+`tests/modular_differential.rs` has an obligation-pressure family that pads a program with
+assertions until the count crosses the cap and demands that nothing ever verifies; with the
+fix reverted it fails at padding 15.
+
 ## Differential testing: a proof must not outrun reality
 
 The two soundness holes in the call rule were found by accident — by writing a test
