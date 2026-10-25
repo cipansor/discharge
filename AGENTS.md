@@ -163,6 +163,32 @@ of an under-declared frame rather than hiding it. Do not "fix" that by having th
 interpreter consult the body: the point is to model the declared contract, which is what
 a real machine executes against.
 
+## A truncated set must not look like a small set
+
+Fourth instance of the same class, and the one that defeated the fix for the first.
+`writes` derived a procedure's real frame into a `MAX_WRITES` buffer and returned
+`(array, count)`, truncating silently. The frame-completeness check added for the
+under-declared-frame hole then compared the declared frame against a *prefix* of the truth,
+so a callee writing more than `MAX_WRITES` variables was indistinguishable from one writing
+exactly that many — and a caller could prove a clobbered variable survived the call.
+
+The fix is a type change, not a flag: `writes` returns `Frame`, whose `complete()` is
+`false` past the cap, and `Stmt::frame`, `unchanged_vars` and `unchanged` all treat an
+incomplete frame as an unmodelled program. A separate boolean return value would have been
+easy to ignore, which is exactly what happened for three rounds.
+
+Two lessons worth keeping:
+
+* **A count that saturates is not a count.** `(buf, n)` where `n` stops at the cap carries
+  no information about whether it stopped. If a function can return partial data, the
+  partiality has to be part of its type or it will be lost at some call site.
+* **Independent constants that must stay in a relation are a bug waiting.** `MAX_WRITES`
+  and `MAX_CALL_ARGS` had to satisfy `MAX_WRITES <= MAX_CALL_ARGS` for `unchanged_vars` to
+  be total, and nothing said so. It is now a `const _: () = assert!(..)`.
+
+Also: when a heredoc-written Python patch garbles itself, the failure mode is duplicated
+definitions, not a clean error — `git checkout` the file and use a precise edit instead.
+
 ## A capped summary must fail loudly
 
 `MAX_OBLIGATIONS` is a fixed-size buffer, and `push` used to drop obligations silently when

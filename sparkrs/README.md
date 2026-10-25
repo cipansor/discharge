@@ -288,6 +288,33 @@ next section.
 Cost: a symbolic read is `2^addr_width` ites and the BDD sees all of them, so
 `MAX_CELLS` caps a memory at 64 cells (6 address bits).
 
+## A derived frame says whether it is complete
+
+The frame rule compares what a callee *claims* to write against what its body really
+writes. That second set is derived from the syntax, and it is capped at `MAX_WRITES`.
+Truncating it silently was a soundness hole that defeated the very check added to close
+the first one: an under-complete "real" frame is exactly the condition the rule exists to
+reject, so a callee writing more than `MAX_WRITES` variables looked like one writing
+exactly `MAX_WRITES`, and a caller could prove that a clobbered variable survived.
+
+So `writes` does not return `(array, count)` any more. It returns a `Frame`, whose
+`complete()` is `false` when the body writes more than the cap, and every consumer treats
+that as an unmodelled program rather than a partially modelled one:
+
+```rust
+let derived = wp::writes(callee.body);
+if !derived.complete() { return false; }   // `Stmt::frame` refuses the call
+```
+
+`unchanged_vars` returns nothing for such a call and `unchanged` answers `false` — no
+caller variable is known to survive a body the engine cannot fully see. A count that stops
+at the cap is indistinguishable from a body that writes exactly that many, which is why a
+flag had to be part of the type rather than a separate return value.
+
+`MAX_WRITES <= MAX_CALL_ARGS` is now a compile-time assertion, because `unchanged_vars`
+maps a complete frame into a buffer sized by `MAX_CALL_ARGS`; the two constants being
+independent was a latent version of the same bug.
+
 ## The obligation cap fails loudly, never silently
 
 `verify` collects side obligations — loop preservation, variants, exits, assertions, call

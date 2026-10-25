@@ -247,9 +247,9 @@ fn main() {
         let s = var(8);
         let actuals = [(x, a), (r, c), (scratch, s)];
 
-        let (derived, n) = wp::writes(&body);
+        let derived = wp::writes(&body);
         println!("dbl's body writes {} variable(s); derived frame covers `scratch`: {}",
-                 n, derived[..n].contains(&scratch));
+                 derived.len(), derived.contains(&scratch));
         let empty: [sparkrs::smt::Var; 0] = [];
         println!("declaring an empty frame        : accepted = {}", Stmt::frame(&dbl, &actuals, &empty));
         println!("  -> rejected, so the false proof is unreachable");

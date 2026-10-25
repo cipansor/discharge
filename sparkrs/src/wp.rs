@@ -494,11 +494,17 @@ impl<'a> Stmt<'a> {
     /// a smarter check: the remedy is [`verify_proc`] on every body, and the
     /// limitation is stated here rather than left to be discovered.
     pub fn frame(proc_: &Proc<'_>, actuals: &[(Var, Var)], declared: &[Var]) -> bool {
-        // 0. The declared frame must cover the real one. This is a *soundness*
-        //    requirement, not a tidiness one: an under-declared frame lets the
-        //    caller assume a variable survived a call that overwrote it.
-        let (derived, n_derived) = writes(proc_.body);
-        if !derived[..n_derived].iter().all(|w| declared.contains(w)) {
+        // 0. The derived frame must be *complete*, and the declared frame must cover
+        //    it. Both halves are soundness requirements rather than tidiness ones. An
+        //    under-declared frame lets the caller assume a variable survived a call that
+        //    overwrote it; an *incomplete* derived frame is worse, because it makes that
+        //    first check pass when it should not. A body writing more than `MAX_WRITES`
+        //    variables is therefore unmodelled, not partially modelled.
+        let derived = writes(proc_.body);
+        if !derived.complete() {
+            return false;
+        }
+        if !derived.vars().iter().all(|w| declared.contains(w)) {
             return false;
         }
         // Everything below is about the *shape* of the rename, which the derived
@@ -740,7 +746,24 @@ pub const MAX_OBLIGATIONS: usize = 16;
 pub const MAX_CALL_ARGS: usize = 16;
 
 /// The most variables one procedure may write.
+///
+/// Deliberately equal to [`MAX_CALL_ARGS`]: `unchanged_vars` maps a complete derived
+/// frame into a `changed` buffer sized by `MAX_CALL_ARGS`, and the mapping is only total
+/// when every write has room. A complete frame has at most `MAX_WRITES` entries and
+/// `frame` admits at most `MAX_CALL_ARGS` writes, so equality is what makes the two fit.
+/// The relation is checked at compile time rather than left to whoever changes one of the
+/// constants.
 pub const MAX_WRITES: usize = 16;
+
+/// `MAX_WRITES <= MAX_CALL_ARGS`, enforced by the compiler.
+///
+/// Not a style preference: if `MAX_WRITES` grew past `MAX_CALL_ARGS`, a complete frame
+/// would have more writes than `unchanged_vars` can record as changed, and a variable the
+/// call *does* write could be reported as unchanged — the very hole the frame rule exists
+/// to close. `frame` currently refuses any call with more than `MAX_CALL_ARGS` writes, so
+/// the invariant holds today; this makes breaking it a build error instead of a quiet
+/// soundness bug.
+const _: () = assert!(MAX_WRITES <= MAX_CALL_ARGS);
 
 /// The caller's variables a call is guaranteed to leave unchanged.
 ///
@@ -769,12 +792,25 @@ pub fn unchanged_vars<'a>(
     out: &'a mut [Var; MAX_CALL_ARGS],
 ) -> &'a [Var] {
     // The caller-side images of everything the body may write.
-    let (derived, n) = writes(proc_.body);
+    let derived = writes(proc_.body);
+    // An incomplete frame means the body writes more than the buffer holds, so "this
+    // variable is not written" cannot be concluded for any variable. Returning nothing
+    // is the honest answer: no caller variable is known to survive.
+    if !derived.complete() {
+        return &out[..0];
+    }
     let mut n_changed = 0;
     let mut changed = [Var::SENTINEL; MAX_CALL_ARGS];
-    for g in derived[..n].iter() {
+    for g in derived.vars().iter() {
         if let Some((_, l)) = actuals.iter().find(|(global, _)| global == g) {
-            if !changed[..n_changed].contains(l) && n_changed < MAX_CALL_ARGS {
+            if !changed[..n_changed].contains(l) {
+                // `frame` admits at most `MAX_CALL_ARGS` writes, so this cannot fill up
+                // on a modelled call; the compile-time check `MAX_WRITES_FITS_CALL_ARGS`
+                // keeps it that way. Bail out rather than truncate if it ever does, since
+                // a dropped image would make a written variable look unchanged.
+                if n_changed == MAX_CALL_ARGS {
+                    return &out[..0];
+                }
                 changed[n_changed] = *l;
                 n_changed += 1;
             }
@@ -805,8 +841,12 @@ pub fn unchanged_vars<'a>(
 /// [`Stmt::frame`] has already refused to model a call whose declared frame disagrees
 /// with its body.
 pub fn unchanged(proc_: &Proc<'_>, actuals: &[(Var, Var)], g: Var) -> bool {
-    let (derived, n) = writes(proc_.body);
-    !derived[..n].iter().any(|w| {
+    let derived = writes(proc_.body);
+    // An incomplete frame cannot support this conclusion; see `unchanged_vars`.
+    if !derived.complete() {
+        return false;
+    }
+    !derived.vars().iter().any(|w| {
         actuals
             .iter()
             .any(|(global, local)| global == w && *local == g)
@@ -826,50 +866,115 @@ pub fn unchanged(proc_: &Proc<'_>, actuals: &[(Var, Var)], g: Var) -> bool {
 ///
 /// A nested call contributes the caller-side images of its callee's writes, mapped
 /// through that call's `actuals`.
-pub fn writes(s: &Stmt<'_>) -> ([Var; MAX_WRITES], usize) {
-    // Slot 0 is never a real variable: `var()` starts indices at 0, but a
-    // sentinel is all the initialisation needs and it is overwritten before use.
-    let mut out = [Var::SENTINEL; MAX_WRITES];
-    let mut n = 0;
-    collect_written(s, &mut out, &mut n);
-    (out, n)
+///
+/// # Completeness is part of the answer
+///
+/// The set is capped at [`MAX_WRITES`], and truncating it is a soundness hole rather than
+/// an inconvenience: an under-complete "real" frame is exactly the condition the frame
+/// rule exists to reject. So the result is not a bare slice and count. If a body writes
+/// more than [`MAX_WRITES`] variables, [`Frame::complete`] is `false` and every consumer
+/// must treat the program as unmodelled. In particular [`Stmt::frame`] returns `false`,
+/// so a truncated frame cannot slip past the check.
+///
+/// Returning `(array, count)` hid this: a count that stops at the cap is
+/// indistinguishable from a body that writes exactly that many, so the completeness check
+/// passed on a frame that was only a prefix. `MAX_WRITES` is not merely small — the probe
+/// that found this had a callee writing 17 variables, and the caller then "proved" that
+/// the 17th survived the call.
+#[derive(Debug, Clone, Copy)]
+pub struct Frame {
+    vars: [Var; MAX_WRITES],
+    n: usize,
+    /// `false` when the body writes more than [`MAX_WRITES`] variables, so `vars` is a
+    /// prefix of the truth rather than all of it.
+    complete: bool,
 }
 
-fn note_written(out: &mut [Var; MAX_WRITES], n: &mut usize, v: Var) {
-    if out[..*n].contains(&v) {
+impl Frame {
+    /// The written variables. A *prefix* of the truth when [`Frame::complete`] is false.
+    pub fn vars(&self) -> &[Var] {
+        &self.vars[..self.n]
+    }
+
+    /// How many were recorded. Stops at [`MAX_WRITES`].
+    pub fn len(&self) -> usize {
+        self.n
+    }
+
+    /// True when nothing is written.
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    /// Whether this set is the whole truth. `false` means the body writes more than
+    /// [`MAX_WRITES`] variables, so this must not be trusted as a frame.
+    pub fn complete(&self) -> bool {
+        self.complete
+    }
+
+    /// Whether the recorded set contains `v`.
+    pub fn contains(&self, v: &Var) -> bool {
+        self.vars[..self.n].contains(v)
+    }
+}
+
+/// The variables `s` may write, as a [`Frame`] that also says whether the set is
+/// complete. See [`Frame`] for why completeness has to be part of the result.
+pub fn writes(s: &Stmt<'_>) -> Frame {
+    let mut frame = Frame {
+        // Slot 0 is never a real variable: `var()` starts indices at 0, but a
+        // sentinel is all the initialisation needs and it is overwritten before use.
+        vars: [Var::SENTINEL; MAX_WRITES],
+        n: 0,
+        complete: true,
+    };
+    collect_written(s, &mut frame);
+    frame
+}
+
+fn note_written(frame: &mut Frame, v: Var) {
+    if frame.vars[..frame.n].contains(&v) {
         return;
     }
-    if *n < MAX_WRITES {
-        out[*n] = v;
-        *n += 1;
+    if frame.n < MAX_WRITES {
+        frame.vars[frame.n] = v;
+        frame.n += 1;
+    } else {
+        // Past the cap the set is no longer the truth, and saying so is the only safe
+        // answer. Dropping the write silently is what made this a soundness hole.
+        frame.complete = false;
     }
 }
 
-fn collect_written(s: &Stmt<'_>, out: &mut [Var; MAX_WRITES], n: &mut usize) {
+fn collect_written(s: &Stmt<'_>, frame: &mut Frame) {
     match s {
-        Stmt::Assign { var, .. } => note_written(out, n, *var),
+        Stmt::Assign { var, .. } => note_written(frame, *var),
         Stmt::AssignMany { binds } => {
             for (v, _) in binds.iter() {
-                note_written(out, n, *v);
+                note_written(frame, *v);
             }
         }
         Stmt::Seq { first, second } => {
-            collect_written(first, out, n);
-            collect_written(second, out, n);
+            collect_written(first, frame);
+            collect_written(second, frame);
         }
         Stmt::If { then_, else_, .. } => {
-            collect_written(then_, out, n);
-            collect_written(else_, out, n);
+            collect_written(then_, frame);
+            collect_written(else_, frame);
         }
-        Stmt::While { body, .. } => collect_written(body, out, n),
+        Stmt::While { body, .. } => collect_written(body, frame),
         Stmt::Call { proc_, actuals, .. } => {
             // The callee's writes land on whichever caller variables its `actuals`
             // name. A callee write with no image in the caller is dropped here, and
             // the *enclosing* frame check is what rejects that situation.
-            let (inner, m) = writes(proc_.body);
-            for g in inner[..m].iter() {
+            let inner = writes(proc_.body);
+            if !inner.complete() {
+                // The nested frame is already only a prefix, so this one is too.
+                frame.complete = false;
+            }
+            for g in inner.vars() {
                 if let Some((_, l)) = actuals.iter().find(|(global, _)| global == g) {
-                    note_written(out, n, *l);
+                    note_written(frame, *l);
                 }
             }
         }

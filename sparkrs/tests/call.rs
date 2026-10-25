@@ -8,7 +8,7 @@
 //! every positive test here has a matching negative one.
 
 use sparkrs::smt::{self, var, Var, Verdict};
-use sparkrs::wp::{self, Proc, Rule, Stmt};
+use sparkrs::wp::{self, Proc, Rule, Stmt, MAX_CALL_ARGS, MAX_WRITES};
 
 /// `double`: requires `x <= 100`, ensures `r == x + x`.
 ///
@@ -505,9 +505,9 @@ fn under_declaring_the_frame_is_rejected() {
         assert!(wp::verify_proc(&dbl).is_verified());
 
         // The derived frame really does include `scratch`.
-        let (derived, n) = wp::writes(&body);
-        assert!(derived[..n].contains(&scratch));
-        assert!(derived[..n].contains(&r));
+        let derived = wp::writes(&body);
+        assert!(derived.contains(&scratch));
+        assert!(derived.contains(&r));
 
         let a = var(8);
         let c = var(8);
@@ -561,10 +561,10 @@ fn the_derived_frame_covers_branches_and_loops() {
             then_: &then_,
             else_: &else_,
         };
-        let (found, n) = wp::writes(&branch);
-        assert!(found[..n].contains(&y));
-        assert!(found[..n].contains(&z));
-        assert!(!found[..n].contains(&x));
+        let found = wp::writes(&branch);
+        assert!(found.contains(&y));
+        assert!(found.contains(&z));
+        assert!(!found.contains(&x));
 
         // while x < 10 { w := w + 1 }
         let step = Stmt::Assign { var: w, expr: w + 1u32 };
@@ -574,21 +574,19 @@ fn the_derived_frame_covers_branches_and_loops() {
             variant: None,
             body: &step,
         };
-        let (found, n) = wp::writes(&loop_);
-        assert!(found[..n].contains(&w));
+        let found = wp::writes(&loop_);
+        assert!(found.contains(&w));
 
         // A simultaneous assignment contributes every target.
         let binds = [(y, z), (w, x)];
         let many = Stmt::AssignMany { binds: &binds };
-        let (found, n) = wp::writes(&many);
-        assert!(found[..n].contains(&y));
-        assert!(found[..n].contains(&w));
+        let found = wp::writes(&many);
+        assert!(found.contains(&y));
+        assert!(found.contains(&w));
 
         // `assume` and `assert` write nothing.
-        let (_, n) = wp::writes(&Stmt::Assert(smt::truth(true)));
-        assert_eq!(n, 0);
-        let (_, n) = wp::writes(&Stmt::Skip);
-        assert_eq!(n, 0);
+        assert!(wp::writes(&Stmt::Assert(smt::truth(true))).is_empty());
+        assert!(wp::writes(&Stmt::Skip).is_empty());
     });
 }
 
@@ -623,9 +621,9 @@ fn a_nested_call_contributes_its_callees_writes() {
         };
 
         // `outer` writes `or_`, because that is where `inner`'s `ir` lands.
-        let (found, n) = wp::writes(&outer_body);
-        assert!(found[..n].contains(&or_), "the nested write must propagate");
-        assert!(!found[..n].contains(&ir), "the callee's own name must not leak");
+        let found = wp::writes(&outer_body);
+        assert!(found.contains(&or_), "the nested write must propagate");
+        assert!(!found.contains(&ir), "the callee's own name must not leak");
 
         // Now `outer` in turn is called. Its own actuals map `ox` and `or_` to the
         // caller's variables, and its declared frame must cover the write that was
@@ -665,8 +663,7 @@ fn a_callee_that_writes_nothing_needs_no_frame() {
             ensures: smt::ult_const(x, 10),
             body: &pure_body,
         };
-        let (_, n) = wp::writes(&pure_body);
-        assert_eq!(n, 0);
+        assert!(wp::writes(&pure_body).is_empty());
         let a = var(8);
         let actuals = [(x, a)];
         let empty: [Var; 0] = [];
@@ -807,5 +804,148 @@ fn an_unchanged_query_cannot_be_talked_into_a_wrong_answer() {
         // Even so, the query answers from the body and says `c` is written.
         assert!(!wp::unchanged(&dbl, &actuals, c));
         assert!(wp::unchanged(&dbl, &actuals, a));
+    });
+}
+
+#[test]
+fn an_over_long_body_is_unmodelled_not_partially_modelled() {
+    // The fourth soundness hole, and the one that defeated the fix for the first.
+    //
+    // `writes` used to return `(array, count)` and truncate at `MAX_WRITES`, silently.
+    // The frame-completeness check I added for the under-declared-frame hole then
+    // compared the declared frame against a *prefix* of the truth, so a callee writing
+    // more than `MAX_WRITES` variables looked like one writing exactly `MAX_WRITES` — and
+    // a caller could "prove" that a variable survived a call that clobbered it.
+    //
+    // The probe printed `caller proved 'victim == 9' : true` for a callee that assigns
+    // `victim := x + x`. A truncated frame is therefore not a smaller frame; it is an
+    // unknown frame, and the only sound answer is to refuse the call.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let r = var(8);
+        // 16 helper variables plus the result: 17 writes, one past the cap.
+        let helpers: Vec<Var> = (0..MAX_WRITES).map(|_| var(8)).collect();
+
+        let mut nodes: Vec<Stmt> = vec![Stmt::Assign { var: r, expr: x + 1u32 }];
+        for h in &helpers {
+            nodes.push(Stmt::Assign { var: *h, expr: x + x });
+        }
+        let mut body = nodes.pop().unwrap();
+        while let Some(nd) = nodes.pop() {
+            body = Stmt::Seq {
+                first: Box::leak(Box::new(nd)),
+                second: Box::leak(Box::new(body)),
+            };
+        }
+        let body: &'static Stmt<'static> = Box::leak(Box::new(body));
+
+        // The derived frame must admit it is not the truth.
+        let derived = wp::writes(body);
+        assert_eq!(derived.len(), MAX_WRITES, "the buffer fills");
+        assert!(
+            !derived.complete(),
+            "a body writing more than MAX_WRITES variables must report incompleteness, \
+             not a truncated set"
+        );
+
+        let callee = Proc {
+            name: "wide",
+            requires: smt::truth(true),
+            ensures: smt::truth(true),
+            body,
+        };
+
+        // The caller names every write, so nothing else can reject the call.
+        let ca = var(8);
+        let ct = var(8);
+        let c_helpers: Vec<Var> = (0..MAX_WRITES).map(|_| var(8)).collect();
+        let mut actuals: Vec<(Var, Var)> = vec![(x, ca), (r, ct)];
+        for (h, c) in helpers.iter().zip(c_helpers.iter()) {
+            actuals.push((*h, *c));
+        }
+        let mut declared: Vec<Var> = vec![r];
+        declared.extend(helpers.iter().copied());
+
+        assert!(
+            !Stmt::frame(&callee, &actuals, &declared),
+            "an over-long body is unmodelled, so the frame must be refused"
+        );
+
+        // The victim is the 17th write, the one past the cap. The callee clobbers it.
+        let victim = c_helpers[MAX_WRITES - 1];
+        assert!(
+            !wp::unchanged(&callee, &actuals, victim),
+            "`unchanged` must not claim a variable survives a body it cannot fully see"
+        );
+
+        let mut out = [Var::SENTINEL; MAX_CALL_ARGS];
+        assert!(
+            wp::unchanged_vars(&callee, &actuals, &mut out).is_empty(),
+            "no variable is known to survive an unmodelled call"
+        );
+
+        // And the false proof is unreachable: the call is rejected, so the caller's
+        // `victim == 9` cannot be established.
+        let init = Stmt::Assign { var: victim, expr: smt::word(9, 8) };
+        let call = Stmt::Call {
+            proc_: &callee,
+            actuals: &actuals,
+            writes: &declared,
+        };
+        let prog = Stmt::Seq { first: &init, second: &call };
+        let report = wp::verify(&prog, smt::truth(true), smt::eq_const(victim, 9));
+        assert!(
+            !report.is_verified(),
+            "the caller must not be able to prove a variable survived a call that writes it"
+        );
+        let (ob, _) = report.first_failure().expect("the call is unmodelled");
+        assert_eq!(ob.rule, Rule::CallFrame);
+    });
+}
+
+#[test]
+fn a_body_at_exactly_the_cap_is_still_modelled() {
+    // The boundary from the other side: incompleteness must mean "more than the cap",
+    // not "the cap", or every wide-but-legal procedure would become unverifiable.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let targets: Vec<Var> = (0..MAX_WRITES).map(|_| var(8)).collect();
+        let mut nodes: Vec<Stmt> = targets
+            .iter()
+            .map(|t| Stmt::Assign { var: *t, expr: x + 1u32 })
+            .collect();
+        let mut body = nodes.pop().unwrap();
+        while let Some(nd) = nodes.pop() {
+            body = Stmt::Seq {
+                first: Box::leak(Box::new(nd)),
+                second: Box::leak(Box::new(body)),
+            };
+        }
+        let body: &'static Stmt<'static> = Box::leak(Box::new(body));
+
+        let derived = wp::writes(body);
+        assert_eq!(derived.len(), MAX_WRITES);
+        assert!(
+            derived.complete(),
+            "exactly MAX_WRITES writes is the whole truth, not a truncation"
+        );
+
+        let callee = Proc {
+            name: "at_cap",
+            requires: smt::truth(true),
+            ensures: smt::truth(true),
+            body,
+        };
+        let cx = var(8);
+        let mut actuals: Vec<(Var, Var)> = vec![(x, cx)];
+        let caller_targets: Vec<Var> = (0..MAX_WRITES).map(|_| var(8)).collect();
+        for (g, c) in targets.iter().zip(caller_targets.iter()) {
+            actuals.push((*g, *c));
+        }
+        let declared: Vec<Var> = targets.clone();
+        assert!(
+            Stmt::frame(&callee, &actuals, &declared),
+            "a body writing exactly MAX_WRITES variables is modelled"
+        );
     });
 }
