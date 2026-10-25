@@ -1125,12 +1125,27 @@ fn a_memory_proof_never_outruns_the_array() {
     let arrays = sample_arrays();
     let mut verified_cases = 0;
     let mut falsified_cases = 0;
+    // Coverage counters. "The generator covers the interesting shapes" is exactly the kind
+    // of claim this project exists to distrust, so the shapes are counted and asserted
+    // rather than argued. A future edit that quietly stopped emitting the symbolic-address
+    // store would leave a family that still passes and still proves nothing about it.
+    let mut symbolic_store_ops = 0;
+    let mut swap_ops = 0;
+    let mut below_posts = 0;
 
     for seed in 0..400u64 {
         let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let len = 1 + rng.below(4) as usize;
         let ops = gen_ops(&mut rng, len);
         let post = gen_post(&mut rng);
+        symbolic_store_ops += ops
+            .iter()
+            .filter(|o| matches!(o, Op::StoreAtSymbolic { .. }))
+            .count();
+        swap_ops += ops.iter().filter(|o| matches!(o, Op::SwapCells { .. })).count();
+        if matches!(post, Post::BelowConst(_)) {
+            below_posts += 1;
+        }
 
         let verdict = smt::with_fresh(|| {
             let mut buf = [Var::SENTINEL; 4];
@@ -1178,6 +1193,25 @@ fn a_memory_proof_never_outruns_the_array() {
     assert!(
         falsified_cases > 0,
         "no case was refuted; the memory family cannot detect a bad rule"
+    );
+    // The shapes that exercise the non-trivial rules must actually appear.
+    assert!(
+        symbolic_store_ops > 0,
+        "no store at a symbolic address was generated; the ite-chain read and the frame \
+         rule are not being exercised"
+    );
+    assert!(
+        swap_ops > 0,
+        "no swap was generated; the simultaneous-binding path is not being exercised"
+    );
+    assert!(
+        below_posts > 0,
+        "no `forall_below` postcondition was generated; the guarded quantifier is not \
+         being exercised"
+    );
+    eprintln!(
+        "memory family: {} proved, {} refuted; {} symbolic stores, {} swaps, {} below-posts",
+        verified_cases, falsified_cases, symbolic_store_ops, swap_ops, below_posts
     );
 }
 
