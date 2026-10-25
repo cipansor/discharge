@@ -188,7 +188,10 @@ fn main() {
     match cert {
         Some(c) => {
             let v = Verified::from_certificate(map_reading(2048), c);
-            println!("[kernel]    certificate accepted, value = {}", v.get());
+            match v {
+                Some(v) => println!("[kernel]    certificate accepted, value = {}", v.get()),
+                None => println!("[kernel]    certificate was stale, refused"),
+            }
         }
         None => {
             println!("[kernel]    certificate rejected");

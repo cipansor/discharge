@@ -288,6 +288,33 @@ next section.
 Cost: a symbolic read is `2^addr_width` ites and the BDD sees all of them, so
 `MAX_CELLS` caps a memory at 64 cells (6 address bits).
 
+## A proof object must not change meaning underneath you
+
+The twelfth hole, and the most serious: a proof whose *meaning* silently changed. A
+`Certificate` stores a `Pred`, which is a term **id**, and `with_fresh` resets the arena so
+ids restart at 0. So a certificate from one scope named a *different formula* in the next:
+
+```
+scope A statement id : Pred(Term(2))
+scope B predicate id : Pred(Term(2))     <- id recycled
+same id?             : true
+prove(cert.statement()) in scope B : Counterexample
+cert.weaken_to(y < 200) -> true          <- a certificate for a falsehood
+```
+
+The engine knew `y < 200` was false, and the certificate claimed it was proved. The comment on
+`with_fresh` had warned about exactly this — "use-after-free in the term arena" — but a warning
+is not a check, and the failure was silent rather than a panic.
+
+The arena now carries a `generation`, bumped by every reset, and `Certificate` and
+`Implication` record it. Every rule re-checks it: `statement()` and `antecedent()` return
+`None`, `weaken_to`/`and`/`apply`/`then` return `None`, and `Verified::from_certificate`
+returns `None`. A stale proof object composes into nothing rather than into a falsehood.
+
+A bare `Var` or `Pred` still carries no generation, so the "one `with_fresh` per proof" rule
+still stands for those — the type cannot catch it. What the generation covers is the case that
+outlives a scope *by construction*: the objects designed to be carried.
+
 ## A wrapper must not overclaim
 
 The eleventh hole, and the one that undercut the crate's central promise: an overclaiming

@@ -163,6 +163,40 @@ of an under-declared frame rather than hiding it. Do not "fix" that by having th
 interpreter consult the body: the point is to model the declared contract, which is what
 a real machine executes against.
 
+## A proof object has a lifetime the type does not encode
+
+The twelfth hole, and the most serious one: `Certificate` stored a `Pred`, which is a term
+*id*, and `with_fresh` resets the arena so ids restart at 0. A certificate from one scope named
+a different formula in the next, and `weaken_to` returned a certificate for a statement the
+engine itself refuted:
+
+  scope A statement id : Pred(Term(2))
+  scope B predicate id : Pred(Term(2))     <- id recycled
+  same id?             : true
+  prove(cert.statement()) in scope B : Counterexample
+  cert.weaken_to(y < 200) -> true          <- a certificate for a falsehood
+
+The engine knew the statement was false and the certificate claimed it proved. The comment on
+`with_fresh` warned about this in so many words — "use-after-free in the term arena" — and the
+warning did not help, because a warning is not a check and the failure is silent rather than a
+panic. A proof object whose meaning changes underneath it is worse than one that panics.
+
+Fixed with an arena `generation` bumped by every reset; `Certificate` and `Implication` record
+it, and every rule re-checks it and returns `None` on a mismatch.
+
+Two general lessons, both about handles.
+
+1. An id into a reusable arena is a *pointer*, and a pointer with no generation is dangling
+   after a reset. If a type is designed to outlive the scope that created it, it must carry
+   whatever makes it valid, and the rules that use it must re-check. "One `with_fresh` per
+   proof" is a convention; the generation is a check, and only the check survives a caller who
+   did not read the comment.
+
+2. A documented hazard is not a handled hazard. This project treats an unbacked claim as a
+   defect; a comment warning that a thing will corrupt the arena is an unbacked claim about
+   *safety* unless something enforces it. When a comment says "do not do X or Y happens", ask
+   whether Y is caught or merely described.
+
 ## The abstraction is where the claim lives
 
 The eleventh hole was `Verified<T>`: it documented itself as "a machine-checked claim that the

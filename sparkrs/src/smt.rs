@@ -274,6 +274,12 @@ pub(crate) struct Ctx {
     subst_memo: [u32; CAP],
     subst_epoch: [u32; CAP],
     epoch: u32,
+
+    /// Bumped by every [`Ctx::reset`]. Term ids are recycled by a reset, so a handle from
+    /// one arena can name a different term in the next. `epoch` cannot serve here: it is
+    /// about the substitution memo, and it is also bumped by `clear_subst` within a single
+    /// arena. This counter changes only when the arena is wiped.
+    generation: u32,
 }
 
 /// Sentinel: variable `i` has no replacement.
@@ -310,6 +316,7 @@ impl Ctx {
             subst_memo: [0; CAP],
             subst_epoch: [0; CAP],
             epoch: 1,
+            generation: 0,
         }
     }
 
@@ -343,6 +350,11 @@ impl Ctx {
         // A fresh epoch invalidates every memo entry without touching the array.
         // It must be bumped, not reset: see `bump_epoch`.
         self.bump_epoch();
+        // Term ids restart at 0, so every handle from the previous arena now names a
+        // different term. Bumping the generation is what lets a certificate say which
+        // arena justified it, and be rejected in any other. Must be bumped, never reset
+        // to a constant: a repeated generation would validate a stale certificate.
+        self.generation = self.generation.wrapping_add(1);
         self.ensure_ready();
     }
 
@@ -1122,10 +1134,29 @@ pub fn with_fresh<R>(f: impl FnOnce() -> R) -> R {
 // invalidates every `Var` and `Pred` the enclosing scope is still holding; using
 // one afterwards is use-after-free in the term arena and typically shows up as
 // unbounded recursion rather than a clean panic. One `with_fresh` per proof.
+//
+// A bare `Var` or `Pred` carries no generation, so this remains a rule the caller
+// must keep: the type cannot catch it. What the generation *does* cover is the case
+// that outlives a scope by construction -- `proof::Certificate` and
+// `proof::Implication` store handles deliberately, so they record the generation and
+// reject a stale one. Anything else that stores a `Pred` across a reset needs the
+// same treatment, or it has the silent-meaning-change bug the generation exists to
+// prevent.
 
 /// Reset the global arena.
 pub fn reset() {
     with_ctx(|c| c.reset());
+}
+
+/// The current arena generation, bumped by every reset.
+///
+/// Term ids are recycled when the arena is reset, so a handle from one arena can name a
+/// different term in the next. A [`Pred`] carries no generation of its own (it is a plain
+/// handle, kept `Copy` and cheap), so anything that *stores* a handle for later use must
+/// record this alongside it and re-check it before use. [`crate::proof::Certificate`] does
+/// exactly that: a certificate is valid only in the arena that produced it.
+pub fn generation() -> u32 {
+    with_ctx(|c| c.generation)
 }
 
 /// Number of BDD nodes currently allocated, for diagnostics.

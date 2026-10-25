@@ -162,9 +162,16 @@ pub fn truth_proof() -> TruthProof {
 
 /// A proof of a bit-vector formula, obtained from the embedded decision
 /// procedure. Constructible only from [`Verdict::Valid`].
+///
+/// A certificate is tied to the arena that produced it. Term ids are recycled when the
+/// arena is reset ([`crate::smt::with_fresh`]), so the same id means a different formula
+/// afterwards; a certificate that outlived its arena would otherwise attest to whatever
+/// now occupies that id. Every rule re-checks the generation and returns `None` on a
+/// mismatch, so a stale certificate composes into nothing rather than into a falsehood.
 #[derive(Debug, Clone, Copy)]
 pub struct Certificate {
     statement: Pred,
+    generation: u32,
 }
 
 impl Certificate {
@@ -172,72 +179,131 @@ impl Certificate {
     /// proved (refuted or unknown) — the caller must not assume it.
     pub fn discharge(statement: Pred) -> Option<Certificate> {
         match smt::prove(statement) {
-            Verdict::Valid => Some(Certificate { statement }),
+            Verdict::Valid => Some(Certificate { statement, generation: smt::generation() }),
             _ => None,
         }
     }
 
     /// The statement this certificate proves.
-    pub fn statement(&self) -> Pred {
-        self.statement
+    ///
+    /// `None` if the arena has been reset since: the id no longer names this formula, so
+    /// there is no statement to hand back. This is the safe reading of a stale handle,
+    /// not a limitation — the alternative is a formula the certificate never proved.
+    pub fn statement(&self) -> Option<Pred> {
+        if self.is_current() {
+            Some(self.statement)
+        } else {
+            None
+        }
+    }
+
+    /// True if this certificate still refers to the arena that produced it.
+    pub fn is_current(&self) -> bool {
+        self.generation == smt::generation()
     }
 
     /// Conjunction introduction: two proved statements yield their conjunction.
     /// This is a kernel rule, so no re-checking is required.
-    pub fn and(self, other: Certificate) -> Certificate {
-        Certificate { statement: smt::and(self.statement, other.statement) }
+    ///
+    /// Both certificates must belong to the current arena; otherwise this returns `None`,
+    /// because a recycled id would make the conjunction say something neither proved.
+    pub fn and(self, other: Certificate) -> Option<Certificate> {
+        if !self.is_current() || !other.is_current() {
+            return None;
+        }
+        Some(Certificate {
+            statement: smt::and(self.statement, other.statement),
+            generation: self.generation,
+        })
     }
 
     /// Weakening: a proved statement may be re-checked against a weaker one.
-    /// Returns `None` if the weakening does not hold.
+    /// Returns `None` if the weakening does not hold, or if the certificate is stale.
     pub fn weaken_to(self, weaker: Pred) -> Option<Certificate> {
+        if !self.is_current() {
+            return None;
+        }
         match smt::prove_implies(self.statement, weaker) {
-            Verdict::Valid => Some(Certificate { statement: weaker }),
+            Verdict::Valid => {
+                Some(Certificate { statement: weaker, generation: self.generation })
+            }
             _ => None,
         }
     }
 }
 
 /// A proved implication, applicable to a certificate with [`Implication::apply`].
+///
+/// Like [`Certificate`], an implication is valid only in the arena that produced it; every
+/// rule re-checks the generation.
 #[derive(Debug, Clone, Copy)]
 pub struct Implication {
     pre: Pred,
     post: Pred,
+    generation: u32,
 }
 
 impl Implication {
     /// Discharge `pre => post` symbolically.
     pub fn discharge(pre: Pred, post: Pred) -> Option<Implication> {
         match smt::prove_implies(pre, post) {
-            Verdict::Valid => Some(Implication { pre, post }),
+            Verdict::Valid => {
+                Some(Implication { pre, post, generation: smt::generation() })
+            }
             _ => None,
         }
     }
 
-    /// The antecedent.
-    pub fn antecedent(&self) -> Pred {
-        self.pre
+    /// True if this implication still refers to the arena that produced it.
+    pub fn is_current(&self) -> bool {
+        self.generation == smt::generation()
     }
 
-    /// The consequent.
-    pub fn consequent(&self) -> Pred {
-        self.post
+    /// The antecedent, or `None` if the arena has been reset since.
+    pub fn antecedent(&self) -> Option<Pred> {
+        if self.is_current() {
+            Some(self.pre)
+        } else {
+            None
+        }
+    }
+
+    /// The consequent, or `None` if the arena has been reset since.
+    pub fn consequent(&self) -> Option<Pred> {
+        if self.is_current() {
+            Some(self.post)
+        } else {
+            None
+        }
     }
 
     /// Modus ponens for formulas: given a certificate for the antecedent,
     /// produce a certificate for the consequent. The kernel checks that the
     /// certificate really proves the antecedent before applying the rule.
     pub fn apply(self, premise: Certificate) -> Option<Certificate> {
+        if !self.is_current() || !premise.is_current() {
+            return None;
+        }
         match smt::prove_equiv(premise.statement, self.pre) {
-            Verdict::Valid => Some(Certificate { statement: self.post }),
+            Verdict::Valid => Some(Certificate {
+                statement: self.post,
+                generation: self.generation,
+            }),
             _ => None,
         }
     }
 
     /// Cut: chain two proved implications.
     pub fn then(self, next: Implication) -> Option<Implication> {
+        if !self.is_current() || !next.is_current() {
+            return None;
+        }
         match smt::prove_equiv(self.post, next.pre) {
-            Verdict::Valid => Some(Implication { pre: self.pre, post: next.post }),
+            Verdict::Valid => Some(Implication {
+                pre: self.pre,
+                post: next.post,
+                generation: self.generation,
+            }),
             _ => None,
         }
     }

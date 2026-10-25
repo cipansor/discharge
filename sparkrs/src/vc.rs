@@ -141,8 +141,14 @@ impl<T> Verified<T> {
     /// so it cannot attest to anything other than what was proved. A `Contract` can be
     /// turned into a certificate with [`Contract::certify`], whose statement is the
     /// implication `pre => post`.
-    pub fn from_certificate(value: T, cert: Certificate) -> Self {
-        Verified { value, statement: cert.statement(), _cert: cert }
+    ///
+    /// `None` if the certificate is stale — that is, the arena has been reset since it was
+    /// issued. Term ids are recycled by a reset, so a stale certificate's id now names a
+    /// different formula; wrapping a value with it would tag the value with a claim nobody
+    /// proved.
+    pub fn from_certificate(value: T, cert: Certificate) -> Option<Self> {
+        cert.statement()
+            .map(|statement| Verified { value, statement, _cert: cert })
     }
 
     /// The statement this value is tagged with. It is a theorem.

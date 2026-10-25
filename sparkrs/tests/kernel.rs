@@ -56,8 +56,9 @@ fn certificates_compose_by_kernel_rules() {
         let b = Certificate::discharge(x.ge_val(0)).unwrap();
 
         // Conjunction introduction, as a kernel rule (no re-checking needed).
-        let both = a.and(b);
-        assert!(matches!(smt::prove(both.statement()), Verdict::Valid));
+        // Both certificates belong to this arena, so the rule applies.
+        let both = a.and(b).expect("both certificates are current");
+        assert!(matches!(smt::prove(both.statement().unwrap()), Verdict::Valid));
 
         // Weakening: a proved statement may be re-checked against a weaker one.
         // `x <= 255` does *not* entail `x < 255` (take x = 255), so this fails.
@@ -75,8 +76,8 @@ fn implication_modus_ponens() {
 
         // x < 16  =>  x < 32
         let imp = Implication::discharge(x.lt_val(16), x.lt_val(32)).unwrap();
-        assert_eq!(imp.antecedent(), x.lt_val(16));
-        assert_eq!(imp.consequent(), x.lt_val(32));
+        assert_eq!(imp.antecedent(), Some(x.lt_val(16)));
+        assert_eq!(imp.consequent(), Some(x.lt_val(32)));
 
         // `x < 16` is not a theorem for a free `u8`, so there is no certificate
         // for the bare antecedent: this is the kernel refusing to invent proof.
@@ -85,7 +86,7 @@ fn implication_modus_ponens() {
         // Under the antecedent as a hypothesis, modus ponens does go through:
         // prove `(x < 16) => (x < 32)` and `(x < 32) => (x < 64)` compose.
         let guard = Certificate::discharge(x.lt_val(16).implies(x.lt_val(32))).unwrap();
-        assert_eq!(guard.statement(), x.lt_val(16).implies(x.lt_val(32)));
+        assert_eq!(guard.statement(), Some(x.lt_val(16).implies(x.lt_val(32))));
     });
 }
 
@@ -96,8 +97,8 @@ fn implication_cut_chains() {
         let a = Implication::discharge(x.lt_val(16), x.lt_val(32)).unwrap();
         let b = Implication::discharge(x.lt_val(32), x.lt_val(64)).unwrap();
         let chained = a.then(b).expect("chain should compose");
-        assert_eq!(chained.antecedent(), x.lt_val(16));
-        assert_eq!(chained.consequent(), x.lt_val(64));
+        assert_eq!(chained.antecedent(), Some(x.lt_val(16)));
+        assert_eq!(chained.consequent(), Some(x.lt_val(64)));
     });
 }
 
@@ -108,7 +109,7 @@ fn verified_wrapper_requires_a_certificate() {
         // The wrapper records the statement the certificate proves, so it cannot be
         // tagged with a theorem about something else.
         let cert = Certificate::discharge(x.le_val(255)).unwrap();
-        let v = Verified::from_certificate(42u32, cert);
+        let v = Verified::from_certificate(42u32, cert).expect("certificate is current");
         assert_eq!(*v.get(), 42);
         assert_eq!(v.into_inner(), 42);
 
@@ -152,7 +153,7 @@ fn a_verified_value_records_the_statement_it_proves() {
     smt::with_fresh(|| {
         let x = var(8);
         let cert = Certificate::discharge(x.le_val(255)).unwrap();
-        let v = Verified::from_certificate(42u32, cert);
+        let v = Verified::from_certificate(42u32, cert).expect("certificate is current");
         assert_eq!(*v.get(), 42);
         // The stored statement is a theorem, and it is the one the certificate proved.
         assert!(
@@ -188,6 +189,94 @@ fn a_verified_value_cannot_be_built_from_a_false_statement() {
         assert!(
             Verified::new(42u32, x.le_val(255)).is_some(),
             "a proved statement must yield a Verified value"
+        );
+    });
+}
+
+#[test]
+fn a_certificate_does_not_survive_an_arena_reset() {
+    // The twelfth hole, and the most serious: a proof object whose *meaning* changes
+    // underneath it. A `Certificate` stores a `Pred`, which is a term id, and `with_fresh`
+    // resets the arena so ids restart at 0. So a certificate from one scope named a
+    // different formula in the next, and a kernel rule would then produce a certificate
+    // for a statement the engine itself refutes:
+    //
+    //   scope A statement id : Pred(Term(2))
+    //   scope B predicate id : Pred(Term(2))     <- id recycled
+    //   same id?             : true
+    //   prove(cert.statement()) in scope B : Counterexample
+    //   cert.weaken_to(y < 200) -> true          <- a certificate for a falsehood
+    //
+    // The engine knew `y < 200` was false and the certificate claimed it was proved. The
+    // comment on `with_fresh` warned about exactly this ("use-after-free in the term
+    // arena"), but a warning is not a check, and the failure is silent rather than a
+    // panic. A certificate now records the arena generation and every rule re-checks it.
+    let cert = smt::with_fresh(|| {
+        let x = var(8);
+        Certificate::discharge(x.le_val(255)).unwrap()
+    });
+    assert!(cert.is_current(), "the certificate is current in its own arena");
+
+    smt::with_fresh(|| {
+        let y = var(8);
+        assert!(
+            !cert.is_current(),
+            "a reset must invalidate the certificate's generation"
+        );
+        assert!(
+            cert.statement().is_none(),
+            "a stale certificate has no statement: its id names a different formula now"
+        );
+        assert!(
+            cert.weaken_to(y.lt_val(200)).is_none(),
+            "a stale certificate must not weaken into a statement the engine refutes"
+        );
+        assert!(
+            cert.and(cert).is_none(),
+            "a stale certificate must not compose with itself"
+        );
+        // And the arena really does refute the statement the stale id now names.
+        assert!(
+            matches!(smt::prove(y.lt_val(200)), Verdict::Counterexample(_)),
+            "the recycled id names a refuted formula, which is the danger"
+        );
+    });
+}
+
+#[test]
+fn a_certificate_still_works_inside_its_own_arena() {
+    // The teeth. The generation check must not reject certificates that are in scope, or
+    // every kernel rule would break. Inside one arena, everything composes as before.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let a = Certificate::discharge(x.le_val(255)).unwrap();
+        let b = Certificate::discharge(x.ge_val(0)).unwrap();
+        assert!(a.is_current() && b.is_current());
+        let both = a.and(b).expect("current certificates compose");
+        assert!(matches!(smt::prove(both.statement().unwrap()), Verdict::Valid));
+        assert!(b.weaken_to(x.le_val(255)).is_some());
+        assert!(a.weaken_to(x.lt_val(255)).is_none(), "a false weakening still fails");
+
+        let imp = Implication::discharge(x.lt_val(16), x.lt_val(32)).unwrap();
+        assert!(imp.is_current());
+        assert_eq!(imp.antecedent(), Some(x.lt_val(16)));
+        let chained = imp.then(Implication::discharge(x.lt_val(32), x.lt_val(64)).unwrap());
+        assert!(chained.is_some(), "current implications chain");
+    });
+}
+
+#[test]
+fn a_verified_value_cannot_be_built_from_a_stale_certificate() {
+    // The wrapper is the other place a certificate is stored, so it needs the same check.
+    // A stale certificate would tag a value with a claim nobody proved.
+    let cert = smt::with_fresh(|| {
+        let x = var(8);
+        Certificate::discharge(x.le_val(255)).unwrap()
+    });
+    smt::with_fresh(|| {
+        assert!(
+            Verified::from_certificate(42u32, cert).is_none(),
+            "a stale certificate must not produce a Verified value"
         );
     });
 }

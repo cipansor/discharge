@@ -181,7 +181,10 @@ fn main() {
         // line is itself the proof.
         let cert = proof!(x.le_val(255));
         let wrapped = Verified::from_certificate(7u8, cert);
-        println!("proof!  certificate accepted, value    : {}", wrapped.get());
+        match wrapped {
+            Some(v) => println!("proof!  certificate accepted, value    : {}", v.get()),
+            None => println!("proof!  certificate was stale, refused"),
+        }
 
         // A runtime check on a concrete value, no solver involved.
         let _ = check!(contract::Pred::Le(255), 200u64);
