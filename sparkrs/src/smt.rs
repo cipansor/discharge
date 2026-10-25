@@ -280,6 +280,13 @@ pub(crate) struct Ctx {
     /// about the substitution memo, and it is also bumped by `clear_subst` within a single
     /// arena. This counter changes only when the arena is wiped.
     generation: u32,
+    /// The generation that created each term id. A handle is stale when its id's stamp is
+    /// not the current generation. Deliberately *not* cleared by `reset`: remembering the
+    /// old stamps is what makes staleness detectable.
+    term_gen: [u32; CAP],
+    /// Set when a stale handle is touched. Sticky until the next reset, and treated exactly
+    /// like `overflow`: the query refuses to answer rather than answer about the wrong term.
+    stale: bool,
 }
 
 /// Sentinel: variable `i` has no replacement.
@@ -316,7 +323,9 @@ impl Ctx {
             subst_memo: [0; CAP],
             subst_epoch: [0; CAP],
             epoch: 1,
-            generation: 0,
+            generation: 1,
+            term_gen: [0; CAP],
+            stale: false,
         }
     }
 
@@ -351,10 +360,19 @@ impl Ctx {
         // It must be bumped, not reset: see `bump_epoch`.
         self.bump_epoch();
         // Term ids restart at 0, so every handle from the previous arena now names a
-        // different term. Bumping the generation is what lets a certificate say which
-        // arena justified it, and be rejected in any other. Must be bumped, never reset
-        // to a constant: a repeated generation would validate a stale certificate.
+        // different term. Bumping the generation is what lets a handle say which arena
+        // justified it, and be rejected in any other. Must be bumped, never reset to a
+        // constant: a repeated generation would validate a stale handle.
         self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            // The counter wrapped, so the old stamps would match again. Clear them; the
+            // stamp for anything still live is rewritten by `mk_term`.
+            for i in 0..CAP {
+                self.term_gen[i] = u32::MAX;
+            }
+            self.generation = 1;
+        }
+        self.stale = false;
         self.ensure_ready();
     }
 
@@ -415,6 +433,7 @@ impl Ctx {
                 let id = self.n_terms as u32;
                 self.n_terms += 1;
                 self.terms[id as usize] = n;
+                self.term_gen[id as usize] = self.generation;
                 self.term_key[i as usize] = key;
                 self.term_val[i as usize] = id;
                 return Term(id);
@@ -435,17 +454,38 @@ impl Ctx {
         }
     }
 
-    fn node_of(&self, t: Term) -> Node {
+    /// Note a stale handle. Every accessor funnels through here, so one check covers
+    /// `Var`, `Pred`, and anything else that carries a term id — the caller does not have
+    /// to remember to look.
+    pub(crate) fn is_current_term(&mut self, t: Term) -> bool {
+        if self.term_gen[t.0 as usize] != self.generation {
+            self.stale = true;
+            false
+        } else {
+            true
+        }
+    }
+
+    fn note_if_stale(&mut self, t: Term) {
+        if self.term_gen[t.0 as usize] != self.generation {
+            self.stale = true;
+        }
+    }
+
+    fn node_of(&mut self, t: Term) -> Node {
+        self.note_if_stale(t);
         self.terms[t.0 as usize]
     }
 
-    pub(crate) fn width_of(&self, t: Term) -> u8 {
+    pub(crate) fn width_of(&mut self, t: Term) -> u8 {
+        self.note_if_stale(t);
         self.terms[t.0 as usize].width
     }
 
     /// Read a term's node. Exposed to the crate so the SMT-LIB exporter can walk
     /// the same IR the solver reasons about, instead of re-deriving it.
-    pub(crate) fn node_pub(&self, t: Term) -> Node {
+    pub(crate) fn node_pub(&mut self, t: Term) -> Node {
+        self.note_if_stale(t);
         self.terms[t.0 as usize]
     }
 
@@ -492,6 +532,10 @@ impl Ctx {
     /// variable that is also being replaced (the classic `x, y := y, x` case).
     /// Doing it top-down would capture those variables and prove the wrong thing.
     fn subst(&mut self, t: Term) -> Term {
+        if self.stale || self.term_gen[t.0 as usize] != self.generation {
+            self.stale = true;
+            return Term(0);
+        }
         let n = self.node_of(t);
         match n.op {
             Op::Var => {
@@ -558,7 +602,7 @@ impl Ctx {
         })
     }
 
-    fn const_value(&self, t: Term) -> u64 {
+    fn const_value(&mut self, t: Term) -> u64 {
         let n = self.node_of(t);
         (n.a as u64) | ((n.hi as u64) << 32)
     }
@@ -852,6 +896,16 @@ impl Ctx {
     // ------------------------- bit-blasting -------------------------
 
     fn blast(&mut self, t: Term, out: &mut [u32; 64]) {
+        // Check `stale` first, so once any stale handle has been touched the whole
+        // traversal stops. Checking only the current node is not enough: a constructor can
+        // read a stale node and then *build* a current node that refers back to the stale
+        // id, so the graph contains a cycle whose every node is current. Stopping the
+        // whole traversal on the first stale touch is what breaks it.
+        if self.stale || self.term_gen[t.0 as usize] != self.generation {
+            self.stale = true;
+            out.fill(FALSE);
+            return;
+        }
         let n = self.node_of(t);
         let w = n.width as usize;
         match n.op {
@@ -1067,7 +1121,7 @@ impl Ctx {
 
     fn query_valid(&mut self, t: Term) -> Verdict {
         let node = self.blast_bool(t);
-        if self.overflow {
+        if self.overflow || self.stale {
             return Verdict::Unknown;
         }
         match node {
@@ -1079,7 +1133,7 @@ impl Ctx {
 
     fn query_model(&mut self, t: Term) -> Verdict {
         let node = self.blast_bool(t);
-        if self.overflow {
+        if self.overflow || self.stale {
             return Verdict::Unknown;
         }
         match node {
@@ -1131,17 +1185,21 @@ pub fn with_fresh<R>(f: impl FnOnce() -> R) -> R {
 }
 
 // NOTE: `with_fresh` must not be nested. The inner call wipes the arena, which
-// invalidates every `Var` and `Pred` the enclosing scope is still holding; using
-// one afterwards is use-after-free in the term arena and typically shows up as
-// unbounded recursion rather than a clean panic. One `with_fresh` per proof.
+// invalidates every `Var` and `Pred` the enclosing scope is still holding. One
+// `with_fresh` per proof.
 //
-// A bare `Var` or `Pred` carries no generation, so this remains a rule the caller
-// must keep: the type cannot catch it. What the generation *does* cover is the case
-// that outlives a scope by construction -- `proof::Certificate` and
-// `proof::Implication` store handles deliberately, so they record the generation and
-// reject a stale one. Anything else that stores a `Pred` across a reset needs the
-// same treatment, or it has the silent-meaning-change bug the generation exists to
-// prevent.
+// This used to be a warning only, and the warning was accurate about the symptom:
+// reusing a stale handle was "use-after-free in the term arena, typically unbounded
+// recursion rather than a clean panic". It is now enforced. Every term id records the
+// generation that created it (`term_gen`), the term accessors note a mismatch, and
+// `blast`/`subst`/`eval_term` refuse to traverse a stale handle. A query that touches
+// one returns `Unknown`, so nesting `with_fresh` degrades to "no answer" rather than
+// "an answer about the wrong term" or a stack overflow.
+//
+// The check lives in the arena rather than in each handle type on purpose: `Var`,
+// `Pred`, `Mem`, `Query` and the rest all carry term ids, and a per-type stamp is one
+// that a future type will forget. `proof::Certificate` and `proof::Implication` also
+// stamp the generation, so they can refuse without touching the arena at all.
 
 /// Reset the global arena.
 pub fn reset() {
@@ -1247,6 +1305,11 @@ pub fn evaluate_pred(p: Pred, value: impl Fn(u32) -> Option<u64>) -> Option<bool
 }
 
 fn eval_term(ctx: &mut Ctx, t: Term, value: &impl Fn(u32) -> Option<u64>) -> Option<u64> {
+    if !ctx.is_current_term(t) {
+        // A stale handle has no meaning to evaluate; `None` is "cannot say", which is
+        // what `evaluate` already means by it.
+        return None;
+    }
     let n = ctx.node_of(t);
     let w = n.width;
     let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };

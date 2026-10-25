@@ -8,7 +8,7 @@
 
 use sparkrs::prelude::*;
 use sparkrs::smt::{self, var, Verdict};
-use sparkrs::wp::{self, find_counterexample_by_enumeration, Rule, Stmt};
+use sparkrs::wp::{self, find_counterexample_by_enumeration, verify, Established, Rule, Stmt};
 
 /// A clamp, the canonical safety-critical shape: `y := min(max(x, lo), hi)`.
 /// Written with nested `if`s so the verifier has to consider both branches.
@@ -915,4 +915,87 @@ fn the_search_domain_matches_the_symbolic_width() {
         too_wide.is_err(),
         "a 64-bit domain cannot be enumerated, and must be refused rather than wrapped"
     );
+}
+
+#[test]
+fn a_report_does_not_change_its_verdict_after_a_reset() {
+    // The thirteenth hole, and the same class as the twelfth but at the top-level verdict:
+    // a `Report` records obligations and discharges them *lazily*, each time `is_verified`
+    // or `first_failure` is called, against whatever arena is current. A goal is a term id,
+    // so after a reset the recorded id named a different formula, and a refuted program
+    // could read as verified:
+    //
+    //   goal id (as recorded): Pred(Term(10))
+    //   filler  0: contract discharge = "Counterexample"   <- correct
+    //   filler  1: contract discharge = "Valid"            <- a failing report read as proved
+    //
+    // That is the worst answer this crate can give, on its headline verdict. Obligations
+    // now record the arena generation, and `discharge` returns `Unknown` when the arena has
+    // moved on, so a stale report fails rather than flips.
+    let report = smt::with_fresh(|| {
+        let x = var(8);
+        let y = var(8);
+        let body = Stmt::Assign { var: y, expr: x + 1u32 };
+        // Pre: x < 10. Body: y := x+1. Post: y <= 5 -- false for x = 9.
+        verify(&body, x.lt_val(10), y.le_val(5))
+    });
+    assert!(!report.is_verified(), "the contract does not hold, in its own arena");
+    assert!(report.contract.is_current(), "freshly built, so current");
+
+    // Every arena, with filler to shift what the recycled id names.
+    for n in 0..6 {
+        smt::with_fresh(|| {
+            for _ in 0..n {
+                let _ = smt::truth(true);
+            }
+            assert!(
+                !report.is_verified(),
+                "a stale report must never read as verified (filler {})",
+                n
+            );
+            assert!(
+                !report.contract.is_current(),
+                "after a reset the obligation is no longer current"
+            );
+            assert!(
+                matches!(report.contract.discharge(), Verdict::Unknown),
+                "a stale obligation discharges as Unknown, not as a verdict"
+            );
+            assert!(
+                matches!(report.establishes(), Established::Nothing),
+                "a stale report establishes nothing"
+            );
+            assert!(
+                report.first_failure().is_some(),
+                "a stale report has a failure to report"
+            );
+        });
+    }
+}
+
+#[test]
+fn a_report_read_in_its_own_arena_is_unchanged() {
+    // The teeth. The generation check must not break ordinary use: a report read in the
+    // arena that produced it must decide exactly as before, both for a good contract and
+    // a bad one.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let y = var(8);
+        let body = Stmt::Assign { var: y, expr: x + 1u32 };
+        let good = verify(&body, x.lt_val(10), y.le_val(10));
+        assert!(good.is_verified(), "{:?}", good.first_failure());
+        assert!(good.contract.is_current());
+        assert!(matches!(good.contract.discharge(), Verdict::Valid));
+        // No loops, so termination is trivial and the report is Total. (I wrote Partial
+        // first; the run corrected me.)
+        assert!(matches!(good.establishes(), Established::Total));
+    });
+    smt::with_fresh(|| {
+        let x = var(8);
+        let y = var(8);
+        let body = Stmt::Assign { var: y, expr: x + 1u32 };
+        let bad = verify(&body, x.lt_val(10), y.le_val(5));
+        assert!(!bad.is_verified());
+        assert!(matches!(bad.contract.discharge(), Verdict::Counterexample(_)));
+    });
 }

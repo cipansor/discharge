@@ -222,11 +222,34 @@ pub struct Obligation {
     pub rule: Rule,
     /// The predicate that must hold for every input.
     pub goal: Pred,
+    /// The arena generation this obligation was built in. `goal` is a term id, and a
+    /// reset recycles ids, so a report that outlived its arena would otherwise discharge
+    /// an id that now names a different formula — a failing report could read as
+    /// verified. Private: callers should not construct one by hand.
+    generation: u32,
 }
 
 impl Obligation {
+    fn new(rule: Rule, goal: Pred) -> Obligation {
+        Obligation { rule, goal, generation: smt::generation() }
+    }
+
+    /// True if this obligation still refers to the arena that produced it.
+    pub fn is_current(&self) -> bool {
+        self.generation == smt::generation()
+    }
+
     /// Discharge this obligation with the embedded decision procedure.
+    ///
+    /// Returns [`Verdict::Unknown`] if the arena has been reset since the obligation was
+    /// recorded: the goal is a recycled id and no longer names the formula that was
+    /// generated, so nothing can be concluded. `Unknown` rather than a verdict is the
+    /// honest answer, and it is also the safe one — a stale report reports failure rather
+    /// than success.
     pub fn discharge(&self) -> Verdict {
+        if !self.is_current() {
+            return Verdict::Unknown;
+        }
         smt::prove(self.goal)
     }
 }
@@ -315,10 +338,10 @@ fn collect<'a>(
             for slot in out[start..*n].iter_mut() {
                 if let Some(ob) = slot {
                     if ob.rule == Rule::Assertion || ob.rule == Rule::CallRequires {
-                        *slot = Some(Obligation {
-                            rule: ob.rule,
-                            goal: smt::substitute(ob.goal, &[(*var, *expr)]),
-                        });
+                        *slot = Some(Obligation::new(
+                            ob.rule,
+                            smt::substitute(ob.goal, &[(*var, *expr)]),
+                        ));
                     }
                 }
             }
@@ -329,10 +352,10 @@ fn collect<'a>(
             for slot in out[start..*n].iter_mut() {
                 if let Some(ob) = slot {
                     if ob.rule == Rule::Assertion || ob.rule == Rule::CallRequires {
-                        *slot = Some(Obligation {
-                            rule: ob.rule,
-                            goal: smt::substitute(ob.goal, binds),
-                        });
+                        *slot = Some(Obligation::new(
+                            ob.rule,
+                            smt::substitute(ob.goal, binds),
+                        ));
                     }
                 }
             }
@@ -587,7 +610,7 @@ fn program_limit(out: &[Option<Obligation>]) -> usize {
 /// it. Claim-carrying obligations use [`push_checked`], which reports the drop.
 fn push(out: &mut [Option<Obligation>], n: &mut usize, rule: Rule, goal: Pred) {
     if *n < program_limit(out) {
-        out[*n] = Some(Obligation { rule, goal });
+        out[*n] = Some(Obligation::new(rule, goal));
         *n += 1;
     }
 }
@@ -605,11 +628,11 @@ fn push(out: &mut [Option<Obligation>], n: &mut usize, rule: Rule, goal: Pred) {
 /// did not fit". Either way nothing is silently lost.
 fn push_notice(out: &mut [Option<Obligation>], n: &mut usize, rule: Rule, goal: Pred) {
     if *n < out.len() {
-        out[*n] = Some(Obligation { rule, goal });
+        out[*n] = Some(Obligation::new(rule, goal));
         *n += 1;
     } else {
         let last = out.len() - 1;
-        out[last] = Some(Obligation { rule, goal });
+        out[last] = Some(Obligation::new(rule, goal));
     }
 }
 
@@ -627,7 +650,7 @@ fn push_checked(
     goal: Pred,
 ) {
     if *n < program_limit(out) {
-        out[*n] = Some(Obligation { rule, goal });
+        out[*n] = Some(Obligation::new(rule, goal));
         *n += 1;
     } else {
         *overflow = true;
@@ -756,10 +779,10 @@ pub fn termination_obligation(
     variant: Var,
     body: &Stmt<'_>,
 ) -> Obligation {
-    Obligation {
-        rule: Rule::LoopVariant,
-        goal: smt::implies(smt::and(invariant, guard), smt::ult(variant_after(body, variant), variant)),
-    }
+    Obligation::new(
+        Rule::LoopVariant,
+        smt::implies(smt::and(invariant, guard), smt::ult(variant_after(body, variant), variant)),
+    )
 }
 
 /// How many obligations [`verify`] can report at once.
@@ -1159,10 +1182,7 @@ pub fn verify(s: &Stmt<'_>, pre: Pred, post: Pred) -> Report {
     for slot in slots[..count].iter_mut() {
         if let Some(ob) = slot {
             if ob.rule == Rule::Assertion || ob.rule == Rule::CallRequires {
-                *slot = Some(Obligation {
-                    rule: ob.rule,
-                    goal: smt::implies(pre, ob.goal),
-                });
+                *slot = Some(Obligation::new(ob.rule, smt::implies(pre, ob.goal)));
             }
         }
     }
@@ -1188,10 +1208,7 @@ pub fn verify(s: &Stmt<'_>, pre: Pred, post: Pred) -> Report {
     Report {
         obligations: slots,
         count,
-        contract: Obligation {
-            rule: Rule::Body,
-            goal: smt::implies(pre, goal),
-        },
+        contract: Obligation::new(Rule::Body, smt::implies(pre, goal)),
     }
 }
 

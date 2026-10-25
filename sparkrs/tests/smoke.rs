@@ -1,3 +1,5 @@
+use sparkrs::mem;
+use sparkrs::smt;
 use sparkrs::smt::*;
 
 #[test]
@@ -105,5 +107,75 @@ fn a_query_within_max_vars_is_decided_normally() {
             matches!(prove(eq_const(last, 0)), Verdict::Counterexample(_)),
             "a satisfiable-but-not-valid statement under the cap must be refuted"
         );
+    });
+}
+
+#[test]
+fn a_stale_variable_is_refused_not_misread() {
+    // The fourteenth hole, found by asking "what else carries a term id, and what happens
+    // when the arena moves on?". `Certificate` and `Report` were stamped, but a bare `Var`
+    // or `Pred` — and `Mem`, and `Query` — carry a term id with no stamp. Reusing one after
+    // a reset does not fail cleanly: the id names a different term, and the *old comment on
+    // `with_fresh`* said exactly what that produces — "use-after-free in the term arena,
+    // typically unbounded recursion rather than a clean panic". It was right. A stale `Var`
+    // through `prove` overflowed the stack.
+    //
+    // The fix is one check at the arena's term accessors, so every handle-carrying type is
+    // covered without each having to remember. A stale handle now yields `Unknown`.
+    let x = smt::with_fresh(|| var(8));
+    smt::with_fresh(|| {
+        // Do not assert the exact verdict's identity beyond Unknown: the point is that it
+        // is not `Valid` and does not recurse forever.
+        let v = prove(eq(x, x));
+        assert!(
+            matches!(v, Verdict::Unknown),
+            "a stale variable must be refused, got {}",
+            v
+        );
+        assert!(!v.is_proved(), "a stale variable must never be reported as proved");
+    });
+}
+
+#[test]
+fn a_stale_memory_is_refused_not_misread() {
+    // The same check covers `Mem`, which holds cell variables declared in some arena. Built
+    // in a later arena, its ids name other terms and the memory is not the one declared —
+    // and there is no way for the type to know, because the ids are just numbers.
+    let mut cells = [Var::SENTINEL; 4];
+    smt::with_fresh(|| {
+        mem::declare(2, 8, &mut cells);
+    });
+    smt::with_fresh(|| {
+        let m = mem::Mem::new(&cells, 8);
+        let r = m.read(var(2));
+        let v = prove(eq(r, r));
+        assert!(
+            matches!(v, Verdict::Unknown),
+            "a stale memory must be refused, got {}",
+            v
+        );
+    });
+}
+
+#[test]
+fn fresh_handles_still_decide_normally() {
+    // The teeth. A check that refused everything would pass the two tests above and break
+    // the crate. Inside one arena, ordinary queries must still be decided.
+    smt::with_fresh(|| {
+        let x = var(8);
+        assert!(prove(eq(x, x)).is_proved(), "a tautology must still be proved");
+        assert!(
+            matches!(prove(eq_const(x, 0)), Verdict::Counterexample(_)),
+            "a satisfiable-but-not-valid statement must still be refuted"
+        );
+    });
+    smt::with_fresh(|| {
+        let mut cells = [Var::SENTINEL; 4];
+        mem::declare(2, 8, &mut cells);
+        let m = mem::Mem::new(&cells, 8);
+        let r = m.read(var(2));
+        // A fresh memory read is a real term of the declared width, and `r == r` is proved.
+        assert_eq!(bits(r), 8, "a fresh read has the element width");
+        assert!(prove(eq(r, r)).is_proved(), "a fresh memory query must still be decided");
     });
 }

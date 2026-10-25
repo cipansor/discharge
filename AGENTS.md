@@ -163,6 +163,34 @@ of an under-declared frame rather than hiding it. Do not "fix" that by having th
 interpreter consult the body: the point is to model the declared contract, which is what
 a real machine executes against.
 
+## A hazard you can detect beats a hazard you document
+
+The twelfth hole stamped `Certificate` and `Implication` with an arena generation. The
+thirteenth did the same for `Report`. The fourteenth asked the obvious follow-up -- what
+*else* carries a term id? -- and found `Var`, `Pred`, `Mem`, `Query`, none of them stamped.
+A stale `Var` through `prove` overflowed the stack, which is exactly what the `with_fresh`
+comment had always said would happen:
+
+  use-after-free in the term arena ... typically shows up as unbounded recursion rather
+  than a clean panic
+
+The comment was right. It had been right for fourteen rounds while I read past it, and the
+reason is worth writing down: it described the *symptom* rather than the *invariant*, so it
+read like documentation of intended behaviour instead of a bug report about missing checks.
+
+Two lessons.
+
+1. Stamping types one at a time is whack-a-mole; the next type forgets. The fix is a check
+   where the data lives -- term ids record their creating generation, and the arena's term
+   accessors note a mismatch -- so every handle-carrying type is covered by construction.
+
+2. The first version of the check still overflowed. It tested the current node, and a
+   constructor can read a stale node then build a *current* node referring back to the stale
+   id, giving a cycle whose every node is current. Guarding the root is not guarding the
+   traversal: once anything stale is touched, the whole walk has to stop. I only found this
+   because I ran the probe and watched the stack blow, after having convinced myself the fix
+   was complete.
+
 ## A proof object has a lifetime the type does not encode
 
 The twelfth hole, and the most serious one: `Certificate` stored a `Pred`, which is a term
