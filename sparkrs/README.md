@@ -288,6 +288,47 @@ next section.
 Cost: a symbolic read is `2^addr_width` ites and the BDD sees all of them, so
 `MAX_CELLS` caps a memory at 64 cells (6 address bits).
 
+## A bound must be wider than the address, or "all cells" is vacuous
+
+The sixth hole, and the first of the *vacuity* kind. The previous five were summaries that
+outran their evidence — a proof stronger than what was proved. This one is the dual: a proof
+whose evidence is empty.
+
+`Mem::check_addr_width` accepted a bound exactly as wide as the address, while its own
+documentation told the caller to pass something wider. With a 4-cell memory the address is
+2 bits, so a 2-bit bound cannot hold 4 — and "every cell is filled" is stated at
+`bound == len`, i.e. `bound == 4`. The precondition was unsatisfiable, so the obligation was
+vacuously true: `bound == 4 => P` *and* `bound == 4 => !P` both proved. A fill loop's
+postcondition was "proved" without saying anything about the cells.
+
+The tell was an impossible precondition reported as valid:
+
+```
+narrow(2-bit) bound == 4 satisfiable? : Valid
+  pre_narrow => post_narrow          : Valid
+  pre_narrow => NOT post_narrow      : Valid
+```
+
+The check now requires strictly more bits than the address, which is what every intended use
+already passes — a loop counter must be wider than the address anyway, or `while k < len`
+never terminates. `tests/mem.rs` pins the refusal, and also checks the *sensitivity* the old
+behaviour lacked: at the intended width the property holds when the cells are zero and fails
+when one is not.
+
+## The memory family, positive side
+
+The random memory family is 90% refutations, which tests strength but barely tests
+soundness. A second family is therefore built the other way: templates that are *correct by
+construction*, one per non-trivial rule (ite-chain read at a symbolic address, the frame
+rule, `forall_below`, simultaneous bindings, read/write composition). Each must be proved by
+the engine and must satisfy its own postcondition on every sampled array.
+
+Each template also has a mutated twin — the same program with a false postcondition — which
+must *not* be proved, so a template that verified for the wrong reason (a goal that collapsed
+to `true`, say) cannot look like a success. 140 templates proved, 134 mutations refuted; the
+six survivors are all the `n: 0` boundary, which is genuinely vacuous and is asserted to be
+so explicitly rather than quietly skipped.
+
 ## The differential harness now covers memory
 
 The harness in `tests/modular_differential.rs` compares the engine against concrete

@@ -306,3 +306,76 @@ fn the_declared_memory_is_the_size_asked_for() {
         assert!(!m.is_empty());
     });
 }
+
+#[test]
+fn a_bound_the_same_width_as_the_address_is_rejected() {
+    // The sixth soundness hole, and the first of the *vacuity* kind: not a summary that
+    // outran its evidence, but a proof whose evidence was empty.
+    //
+    // `check_addr_width` used to accept a bound exactly as wide as the address, and its own
+    // documentation said the caller should pass something wider. With a 4-cell memory the
+    // address is 2 bits, so a 2-bit bound cannot hold 4 — and "all cells are filled" is
+    // stated at `bound == 4`. The precondition was therefore unsatisfiable, and the
+    // obligation was vacuously true: `bound == 4 => P` *and* `bound == 4 => !P` both proved,
+    // so a fill loop's postcondition was "proved" without saying anything. The probe printed
+    // `narrow(2-bit) bound == 4 satisfiable? : Valid`, which is the tell: an impossible
+    // precondition reported as valid.
+    //
+    // The check now requires strictly more bits than the address, so the trap is refused
+    // rather than documented.
+    smt::with_fresh(|| {
+        let mut buf = [var(8); 4];
+        let m = mem4(&mut buf);
+
+        // 2 bits, the address width: cannot hold `len`, so it is refused.
+        let narrow = var(2);
+        let r = std::panic::catch_unwind(|| {
+            smt::with_fresh(|| {
+                let mut buf = [var(8); 4];
+                let m = mem4(&mut buf);
+                let narrow = var(2);
+                let _ = m.forall_below(narrow, |cell| smt::eq_const(cell, 0));
+            })
+        });
+        assert!(
+            r.is_err(),
+            "a bound the same width as the address must be rejected: it cannot represent \
+             `len`, so `bound == len` is unsatisfiable and the property is vacuously true"
+        );
+        let _ = narrow;
+
+        // 3 bits, one wider: the intended width, and `bound == len` is expressible.
+        let wide = var(3);
+        assert!(
+            !smt::prove_implies(smt::eq_const(wide, 4), smt::truth(false)).is_proved(),
+            "`bound == len` must be satisfiable at the intended width, or every \"all \
+             cells\" property would be vacuous"
+        );
+        let post = m.forall_below(wide, |cell| smt::eq_const(cell, 0));
+        // With every cell zero, the wide property holds and is not vacuous.
+        let pre = smt::and(
+            smt::eq_const(wide, 4),
+            smt::and(
+                smt::eq_const(m.read_const(0), 0),
+                smt::and(
+                    smt::eq_const(m.read_const(1), 0),
+                    smt::and(
+                        smt::eq_const(m.read_const(2), 0),
+                        smt::eq_const(m.read_const(3), 0),
+                    ),
+                ),
+            ),
+        );
+        assert_eq!(smt::prove_implies(pre, post), Verdict::Valid);
+        // And it is *sensitive*: change one cell and it fails. A vacuously true property
+        // would prove here too, which is exactly what the narrow bound did.
+        let bad = smt::and(
+            smt::eq_const(wide, 4),
+            smt::not(smt::eq_const(m.read_const(2), 0)),
+        );
+        assert!(
+            !smt::prove_implies(bad, post).is_proved(),
+            "the property must be sensitive to the cells it quantifies over"
+        );
+    });
+}

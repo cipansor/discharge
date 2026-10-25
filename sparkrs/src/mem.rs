@@ -344,6 +344,11 @@ impl<'a> Mem<'a> {
     /// writes wrap. For a fill that is harmless — a wrapped write re-zeros an
     /// already-zero cell, so the invariant survives — but for a scan it is not, and
     /// the reason is documented on `addr_of` rather than here.
+    ///
+    /// The bound must be *wider* than the address, not merely as wide. A bound the same
+    /// width cannot represent `len`, so the usual postcondition `bound == len` would be
+    /// unsatisfiable and the property vacuously true — proved for every predicate, which
+    /// proves nothing. The width check enforces the extra bit.
     pub fn forall_below<F>(&self, bound: Var, f: F) -> Pred
     where
         F: Fn(Var) -> Pred,
@@ -385,19 +390,31 @@ impl<'a> Mem<'a> {
         crate::quant::exists_range(0, self.cells.len(), |k| f(self.cells[k]))
     }
 
-    /// Whether `bound` is representable as an address of this memory.
+    /// Whether `bound` can represent every value a bound of this memory needs.
     ///
-    /// A bound is allowed to equal `len` — "all cells are filled" is the usual
-    /// postcondition — so this checks width only, not range. Range is the caller's
-    /// invariant to state; see [`Mem::forall_below`].
+    /// The width must be *strictly* greater than the address width, not merely equal to
+    /// it. Equality looks harmless and is not: a bound exactly as wide as the address
+    /// cannot hold `len`, so the idiom "all cells are filled", `bound == len`, becomes
+    /// unsatisfiable. The obligation is then vacuously true — both `bound == len => P` and
+    /// `bound == len => !P` prove — and a fill loop's postcondition is "proved" without
+    /// saying anything. That is the vacuity twin of the truncation bugs: a proof whose
+    /// evidence is empty rather than a summary whose evidence is missing.
+    ///
+    /// Every intended use already passes a wider bound, and the loop counter has to be
+    /// wider than the address anyway or `while k < len` never terminates; see
+    /// [`Mem::addr_of`]. So the requirement costs nothing and closes the trap.
     fn check_addr_width(&self, bound: Var, who: &str) {
-        let need = self.addr_width().max(1);
+        let need = self.addr_width() + 1;
         assert!(
             smt::bits(bound) >= need,
-            "{}: a bound of {} bits cannot reach the top address of a {}-cell memory",
+            "{}: a bound of {} bits cannot represent `len` ({}), the value every \
+             \"all cells\" property is stated at; {} bits are needed. A bound the same \
+             width as the address makes `bound == len` unsatisfiable and the property \
+             vacuously true",
             who,
             smt::bits(bound),
-            self.cells.len()
+            self.cells.len(),
+            need
         );
     }
 

@@ -163,6 +163,36 @@ of an under-declared frame rather than hiding it. Do not "fix" that by having th
 interpreter consult the body: the point is to model the declared contract, which is what
 a real machine executes against.
 
+## The dual class: vacuity, a proof with no evidence
+
+Six holes now, and the sixth is the mirror of the first five. Those were *unsound*: a
+summary (`verified`, `Total`, `Valid`, `unchanged`) stronger than the evidence behind it. The
+sixth is *vacuous*: a proof whose evidence is empty.
+
+`Mem::check_addr_width` accepted a bound exactly as wide as the address. A 2-bit bound on a
+4-cell memory cannot hold `len`, so the standard postcondition `bound == len` was
+unsatisfiable, and `bound == len => P` and `bound == len => !P` both proved. The tell is
+unmistakable once seen: **an impossible precondition reported as valid.** Ask of any proof
+not only "is the conclusion true" but "is the premise reachable". A verifier that cannot
+distinguish `Valid` from `vacuously Valid` will certify a specification that constrains
+nothing.
+
+The fix is one bit: the bound must be strictly wider than the address. Every intended use
+already passed a wider bound, so the check costs nothing and closes the trap.
+
+Two auditing questions to add to the three above:
+
+4. Can a precondition or guard be unsatisfiable, making the obligation vacuous? In
+   particular, can a width, mask, or cap make a value that the specification names
+   unreachable?
+5. Is a proved obligation *sensitive* to the thing it claims to constrain? A mutation test —
+   change the postcondition to something false and demand the proof fails — is the cheapest
+   way to tell a real proof from a vacuous one.
+
+That is what the memory positive family does: templates correct by construction, each with a
+mutated twin that must be refuted. 140 proved, 134 mutations refuted, and the six survivors
+are the `n: 0` boundary, asserted to be vacuous on purpose.
+
 ## The harness must cover every module, or it certifies only the covered ones
 
 The differential harness had three families -- calls, loops-with-calls, obligation pressure

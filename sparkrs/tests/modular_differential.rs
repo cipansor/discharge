@@ -1152,12 +1152,15 @@ fn a_memory_proof_never_outruns_the_array() {
             let n = sparkrs::mem::declare(2, 8, &mut buf);
             let m = sparkrs::mem::Mem::new(&buf[..n], 8);
             let a = var(2);
+            // The quantifier bound needs a width that can hold `len`, which is one more
+            // than the address width; see `Mem::check_addr_width`.
+            let bound = var(3);
             let prog = build_mem_program(&ops, a, &m);
             let symbolic_post = match post {
                 Post::EqCells(i, j) => smt::eq(m.read_const(i), m.read_const(j)),
                 Post::EqConst(i, c) => smt::eq(m.read_const(i), smt::word(c as u64, 8)),
                 Post::BelowConst(c) => {
-                    m.forall_below(a, |v| smt::eq(v, smt::word(c as u64, 8)))
+                    m.forall_below(bound, |v| smt::eq(v, smt::word(c as u64, 8)))
                 }
             };
             smt::prove(wp::wp(symbolic_post, prog))
@@ -1261,5 +1264,301 @@ fn the_memory_family_has_teeth() {
         violations > 0,
         "the broken rule proved a postcondition that no sampled array violates; the \
          teeth test is not exercising the disagreement it claims to"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Memory, positive side: programs that *should* verify.
+//
+// The random family above is dominated by refutations -- 362 of 400 -- because a randomly
+// chosen postcondition is rarely true unless the program forces it. Refutation is a test of
+// *strength*: a weak rule proves too much, so it fails to refute. Soundness is tested by
+// the other direction, and the random family gives only 38 proved cases to test it with.
+// That is thin, and the thinness is structural, not bad luck.
+//
+// So this family is biased the other way. Each case is a template that is *correct by
+// construction*, aimed at one of the four non-trivial rules:
+//
+//   StoreReadSymbolic  the ite-chain read: read back what was just stored, at a symbolic
+//                      address, for every address.
+//   StoreFrameSymbolic the frame rule: a store at one address leaves another alone.
+//   FillBelow          the guarded quantifier: fill a prefix, then `forall_below` it.
+//   Swap               simultaneous bindings: an exchange through a temporary.
+//   Copy               the read/write composition: a cell equals the source it was copied
+//                      from, using a snapshot for the old value.
+//
+// Every case must satisfy two things at once: the engine must *prove* it, and no concrete
+// array may violate it. A template that fails to prove is a false negative -- not a
+// soundness bug, but worth knowing. A template that proves while an array violates it is a
+// soundness bug, and that is the case this family exists to catch.
+//
+// Each template also gets a mutated twin: the same program with the postcondition changed so
+// it is false. The mutation must *not* be proved. Without that, a template that the engine
+// proved for the wrong reason -- say, because the goal collapsed to `true` -- would look
+// like a success.
+// ---------------------------------------------------------------------------
+
+/// A program that should verify, plus what it should do to a concrete array.
+#[derive(Debug, Clone, Copy)]
+enum Pos {
+    /// `m[a] := v; assert m[a] == v`
+    StoreReadSymbolic { val: u8 },
+    /// `old := m[at]; m[a] := v; assert a != at => m[at] == old`
+    StoreFrameSymbolic { val: u8, at: usize },
+    /// fill cells `0..n` with `v`, then `assert forall k < n { m[k] == v }`
+    FillBelow { n: usize, val: u8 },
+    /// `t := m[x]; m[x] := m[y]; m[y] := t; assert m[x] == old m[y] && m[y] == old m[x]`
+    Swap { x: usize, y: usize },
+    /// `m[dst] := m[src]; assert m[dst] == old m[src]`
+    Copy { dst: usize, src: usize },
+}
+
+fn pos_templates() -> Vec<Pos> {
+    let mut out = Vec::new();
+    for val in MEM_VALS {
+        out.push(Pos::StoreReadSymbolic { val });
+        for at in 0..4usize {
+            out.push(Pos::StoreFrameSymbolic { val, at });
+        }
+        for n in 0..=4usize {
+            out.push(Pos::FillBelow { n, val });
+        }
+    }
+    for x in 0..4usize {
+        for y in 0..4usize {
+            out.push(Pos::Swap { x, y });
+            for src in 0..4usize {
+                out.push(Pos::Copy { dst: x, src });
+            }
+        }
+    }
+    out
+}
+
+fn pos_seq(stmts: Vec<&'static Stmt<'static>>) -> &'static Stmt<'static> {
+    let mut node: &'static Stmt<'static> = Box::leak(Box::new(Stmt::Skip));
+    for s in stmts.into_iter().rev() {
+        node = Box::leak(Box::new(Stmt::Seq { first: s, second: node }));
+    }
+    node
+}
+
+fn pos_store(
+    m: &sparkrs::mem::Mem<'_>,
+    addr: Var,
+    val: Var,
+) -> &'static Stmt<'static> {
+    let mut b = [(Var::SENTINEL, Var::SENTINEL); sparkrs::mem::MAX_CELLS];
+    let n = m.store_binds(addr, val, &mut b);
+    let binds: &'static [(Var, Var)] = Box::leak(b[..n].to_vec().into_boxed_slice());
+    Box::leak(Box::new(Stmt::AssignMany { binds }))
+}
+
+fn pos_assign(v: Var, e: Var) -> &'static Stmt<'static> {
+    Box::leak(Box::new(Stmt::Assign { var: v, expr: e }))
+}
+
+/// Build the symbolic program and postcondition for `p`, and the precondition under which
+/// the postcondition is expected to hold. `mutate` replaces the postcondition with a false
+/// one, for the teeth check.
+fn build_pos(
+    p: Pos,
+    m: &sparkrs::mem::Mem<'_>,
+    a: Var,
+    bound: Var,
+    mutate: bool,
+) -> (smt::Pred, &'static Stmt<'static>, smt::Pred) {
+    let caddr = |c: usize| smt::word(c as u64, 2);
+    let w8 = |v: u8| smt::word(v as u64, 8);
+    match p {
+        Pos::StoreReadSymbolic { val } => {
+            let prog = pos_store(m, a, w8(val));
+            let post = if mutate {
+                smt::eq(m.read(a), w8(val.wrapping_add(1)))
+            } else {
+                smt::eq(m.read(a), w8(val))
+            };
+            (smt::truth(true), pos_seq(vec![prog]), post)
+        }
+        Pos::StoreFrameSymbolic { val, at } => {
+            let old = var(8);
+            let save = pos_assign(old, m.read_const(at));
+            let store = pos_store(m, a, w8(val));
+            let post = smt::implies(
+                smt::not(smt::eq(a, caddr(at))),
+                smt::eq(m.read_const(at), if mutate { w8(val) } else { old }),
+            );
+            (smt::truth(true), pos_seq(vec![save, store]), post)
+        }
+        Pos::FillBelow { n, val } => {
+            let mut stmts = Vec::new();
+            for k in 0..n {
+                stmts.push(pos_store(m, caddr(k), w8(val)));
+            }
+            let post = m.forall_below(
+                bound,
+                |c| {
+                    smt::eq(
+                        c,
+                        if mutate { w8(val.wrapping_add(1)) } else { w8(val) },
+                    )
+                },
+            );
+            // The bound must be the fill count, or the quantifier ranges over cells that
+            // were never written. It needs to hold `len`, so it is wider than the address.
+            (smt::eq_const(bound, n as u64), pos_seq(stmts), post)
+        }
+        Pos::Swap { x, y } => {
+            let t = var(8);
+            let oi = var(8);
+            let oj = var(8);
+            let save_x = pos_assign(oi, m.read_const(x));
+            let save_y = pos_assign(oj, m.read_const(y));
+            let save_t = pos_assign(t, oi);
+            let wr_x = pos_store(m, caddr(x), oj);
+            let wr_y = pos_store(m, caddr(y), t);
+            let (e0, e1) = if mutate {
+                (w8(0), w8(0))
+            } else {
+                (oj, oi)
+            };
+            let post = smt::and(
+                smt::eq(m.read_const(x), e0),
+                smt::eq(m.read_const(y), e1),
+            );
+            (smt::truth(true), pos_seq(vec![save_x, save_y, save_t, wr_x, wr_y]), post)
+        }
+        Pos::Copy { dst, src } => {
+            let old = var(8);
+            let save = pos_assign(old, m.read_const(src));
+            let store = pos_store(m, caddr(dst), m.read_const(src));
+            let post = smt::eq(
+                m.read_const(dst),
+                if mutate { w8(0) } else { old },
+            );
+            (smt::truth(true), pos_seq(vec![save, store]), post)
+        }
+    }
+}
+
+/// Check a template concretely: does every sampled array satisfy the expected effect?
+fn pos_concrete_ok(p: Pos, arrays: &[[u8; 4]]) -> bool {
+    for init in arrays {
+        let mut m = *init;
+        let ok = match p {
+            Pos::StoreReadSymbolic { val } => {
+                // For every address the store lands on, reading it back gives `val`.
+                (0..4usize).all(|addr| {
+                    let mut mm = m;
+                    mm[addr] = val;
+                    mm[addr] == val
+                })
+            }
+            Pos::StoreFrameSymbolic { val, at } => (0..4usize).all(|addr| {
+                let mut mm = m;
+                let old = mm[at];
+                mm[addr] = val;
+                addr == at || mm[at] == old
+            }),
+            Pos::FillBelow { n, val } => {
+                for slot in m.iter_mut().take(n) {
+                    *slot = val;
+                }
+                m.iter().take(n).all(|cell| *cell == val)
+            }
+            Pos::Swap { x, y } => {
+                let (ox, oy) = (m[x], m[y]);
+                m.swap(x, y);
+                m[x] == oy && m[y] == ox
+            }
+            Pos::Copy { dst, src } => {
+                let old = m[src];
+                m[dst] = old;
+                m[dst] == old
+            }
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+#[test]
+fn memory_programs_that_should_verify_do_verify() {
+    let arrays = sample_arrays();
+    let mut proved = 0usize;
+    let mut mutations_refuted = 0usize;
+
+    for p in pos_templates() {
+        let concrete_ok = pos_concrete_ok(p, &arrays);
+        assert!(
+            concrete_ok,
+            "template {:?} violates its own postcondition on a concrete array; the template \
+             is wrong, not the engine",
+            p
+        );
+
+        let verdict = smt::with_fresh(|| {
+            let mut buf = [Var::SENTINEL; 4];
+            let n = sparkrs::mem::declare(2, 8, &mut buf);
+            let m = sparkrs::mem::Mem::new(&buf[..n], 8);
+            let a = var(2);
+            let bound = var(3);
+            let (pre, prog, post) = build_pos(p, &m, a, bound, false);
+            smt::prove_implies(pre, wp::wp(post, prog))
+        });
+        assert!(
+            verdict.is_proved(),
+            "template {:?} should verify but the engine gave {:?}",
+            p,
+            verdict
+        );
+        proved += 1;
+
+        // The mutated twin must not be proved, or the proof above is insensitive.
+        //
+        // The one exception is `FillBelow { n: 0 }`, and it is a legitimate one: filling
+        // zero cells and then asserting "every cell below 0 is v" is *genuinely* true, so
+        // changing `v` cannot make it false. That is a vacuously true boundary case, not a
+        // hole -- unlike the narrow bound, where vacuity came from an unsatisfiable
+        // precondition that looked satisfiable. Excluding it here keeps the mutation count
+        // meaningful instead of padding it with a case that cannot be refuted.
+        let vacuously_true = matches!(p, Pos::FillBelow { n: 0, .. });
+        let mutated = smt::with_fresh(|| {
+            let mut buf = [Var::SENTINEL; 4];
+            let n = sparkrs::mem::declare(2, 8, &mut buf);
+            let m = sparkrs::mem::Mem::new(&buf[..n], 8);
+            let a = var(2);
+            let bound = var(3);
+            let (pre, prog, post) = build_pos(p, &m, a, bound, true);
+            smt::prove_implies(pre, wp::wp(post, prog))
+        });
+        if vacuously_true {
+            assert!(
+                mutated.is_proved(),
+                "{:?} is vacuously true and its mutation should also prove",
+                p
+            );
+        } else {
+            assert!(
+                !mutated.is_proved(),
+                "the mutated postcondition of {:?} was proved, so the template's proof is                  insensitive to the postcondition",
+                p
+            );
+            mutations_refuted += 1;
+        }
+    }
+
+    assert!(proved > 100, "expected many templates to verify, got {}", proved);
+    assert!(
+        mutations_refuted > 100,
+        "expected nearly every mutated template to be refuted, got {}; a template whose \
+         mutation survives is proving nothing",
+        mutations_refuted
+    );
+    eprintln!(
+        "memory positive family: {} templates proved, {} mutations refuted",
+        proved, mutations_refuted
     );
 }
