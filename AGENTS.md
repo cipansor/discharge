@@ -443,6 +443,20 @@ and `exists_guarded` are *not* affected: an empty range yields `true`/`false` re
 which is correct for an empty range, and `inside` already treats an unrepresentable index as
 outside the bound rather than truncating it.
 
+## A binding target must be a variable
+
+`substitute` read a binding's left-hand side as `node_of(from).a`, with no check that `from`
+was a variable. But `a` means different things per operation: for a `Var` it is the index, for
+a `Const` it is the *value*, and for `Trunc`/`Ite` it is a *term id*. So binding the constant
+`word(7, 8)` -- whose `a` is 7 -- silently substituted variable index 7, and a program that
+"assigns" to a constant proved `v7 == 0`. A binding to a `Trunc` read a term id as an index,
+which either fell outside `MAX_VARS` and was dropped, or named an unrelated variable.
+
+None of these are refusals; they are silent rewrites of the wrong variable. The fix is that
+the target must be `Op::Var`, asserted. The general pattern: `a` is an overloaded field, so
+every consumer has to know which operation it is reading before it can interpret `a`, and the
+only safe default is to check the operation first.
+
 ## The shift amount is a literal too
 
 The out-of-range constant bug (`word`) had a twin in the exporter. A shift amount is printed

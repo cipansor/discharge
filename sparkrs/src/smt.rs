@@ -491,6 +491,28 @@ impl Ctx {
         self.terms[t.0 as usize]
     }
 
+    /// The variable index a binding target names, refusing anything that is not a variable.
+    ///
+    /// A binding is `(from, to)`, and `from` has to be a *variable*. It was previously read
+    /// as `node_of(from).a` without a check, and `a` means different things per operation:
+    /// for a `Var` it is the index, but for a `Const` it is the *value*. So binding the
+    /// constant `word(7, 8)` -- whose `a` is 7 -- silently substituted variable index 7, and
+    /// `x := 7` written with a constant target proved `v7 == 0`. For a `Trunc` or an `Ite`,
+    /// `a` is a *term id*, which as an index is either out of range (silently dropped by
+    /// `set_subst`) or an unrelated variable. All of those are silent mis-substitutions
+    /// rather than refusals, which is exactly the failure mode this crate exists to avoid.
+    fn subst_target(&mut self, from: Term) -> u32 {
+        let n = self.node_of(from);
+        assert!(
+            n.op == Op::Var,
+            "substitution target must be a variable, not {:?}; `word`/`truncate`/`ite` \
+             terms carry a value or a term id in that field, so binding one would rewrite \
+             an unrelated variable",
+            n.op
+        );
+        n.a
+    }
+
     pub(crate) fn width_of(&mut self, t: Term) -> u8 {
         self.note_if_stale(t);
         self.terms[t.0 as usize].width
@@ -1717,7 +1739,7 @@ pub fn substitute_word(w: Var, bindings: &[(Var, Var)]) -> Var {
     with_ctx(|c| {
         c.clear_subst();
         for (from, to) in bindings {
-            let idx = c.node_of(from.0).a;
+            let idx = c.subst_target(from.0);
             c.set_subst(idx, to.0);
         }
         Var(c.subst(w.0))
@@ -1738,11 +1760,45 @@ pub fn substitute(p: Pred, bindings: &[(Var, Var)]) -> Pred {
     with_ctx(|c| {
         c.clear_subst();
         for (from, to) in bindings {
-            let idx = c.node_of(from.0).a;
+            let idx = c.subst_target(from.0);
             c.set_subst(idx, to.0);
         }
         Pred(c.subst(p.0))
     })
+}
+
+#[cfg(test)]
+mod subst_tests {
+    use super::*;
+
+    #[test]
+    fn a_binding_target_must_be_a_variable() {
+        // `word(7, 8)` is a `Const` whose `a` field is the *value* 7, not an index. Binding
+        // it used to substitute variable index 7, so an assignment written with a constant
+        // target silently rewrote an unrelated variable and proved things about it.
+        with_fresh(|| {
+            let v = var_named(7, 8);
+            let p = eq_const(v, 0);
+            let r = std::panic::catch_unwind(|| substitute(p, &[(word(7, 8), word(0, 8))]));
+            assert!(r.is_err(), "binding a constant must be refused, not misread as index 7");
+        });
+        // The same for an operation term, whose `a` is a term id.
+        with_fresh(|| {
+            let x = var(8);
+            let t = truncate(x, 4);
+            let p = eq_const(x, 0);
+            let r = std::panic::catch_unwind(|| substitute(p, &[(t, word(0, 8))]));
+            assert!(r.is_err(), "binding a non-variable term must be refused");
+        });
+        // And a genuine variable binding still works, so the check is not refusing everything.
+        with_fresh(|| {
+            let x = var(8);
+            let p = eq_const(x, 0);
+            // `x == 0` with `x := 9` is `9 == 0`, which is false: `Unsat`, not `Valid`.
+            let q = substitute(p, &[(x, word(9, 8))]);
+            assert_eq!(prove(q), Verdict::Unsat);
+        });
+    }
 }
 
 #[cfg(test)]
