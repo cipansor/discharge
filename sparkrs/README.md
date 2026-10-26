@@ -195,6 +195,46 @@ somewhere.
 A report can be `Total` and still `!is_verified()`: the two questions — does it
 terminate, and does it meet its contract — are answered independently.
 
+### Why `variant_after` must havoc a nested loop
+
+The variant obligation is `I && guard => V' < V`, where `V'` is the measure evaluated
+after one iteration of the body. The whole proof rests on `V'` being the measure's *real*
+value after that iteration, so `variant_after` must model the body's effect on the measure
+faithfully. For an assignment, a sequence, or a conditional that is substitution and
+`ite`. For a nested loop it is harder, because the loop runs an unknown number of times.
+
+The first version read a nested `while` as a no-op — the measure "survives" it. That is
+false whenever the inner body writes a variable the measure reads, and it is false in the
+worst possible direction. Consider:
+
+```text
+while i < 100 {
+    i := i + 1;
+    while i != 0 { i := 0 }   // resets i every outer iteration
+}
+```
+
+This diverges. But with the inner loop read as a no-op, the outer obligation became
+`100 - (i + 1) < 100 - i`, which is a tautology — so the engine returned `Valid` and the
+report claimed `Total` for a program that never halts. A termination proof for a divergent
+program is precisely the claim this crate exists to make honestly, so this is the worst
+class of defect in it: not a missing proof, but a wrong one.
+
+The fix is to havoc exactly the variables the inner body can write, since after the inner
+loop each holds the result of applying the body some unknown number of times. A measure
+that mentions one of them then reduces to a fresh variable and cannot be discharged, which
+is the honest answer — the caller must supply a measure the inner loop cannot disturb, or
+one that accounts for it. A measure that mentions none of them survives untouched, so the
+common nested shape (an inner scan over `j` under an outer counter `i`) still proves.
+`writes` supplies the write set; when it is incomplete, the effect is unknown outright
+rather than under-approximated.
+
+Two tests pin this: `a_nested_loop_cannot_make_the_outer_variant_look_healthy` (the
+divergent program above must be refuted) and
+`a_nested_loop_that_leaves_the_measure_alone_still_proves` (the sound nested shape must
+still verify). Reverting the fix fails the first and leaves the second passing, which is
+the signature of a soundness fix rather than a tightened heuristic.
+
 ### When the engine says `Unknown`, hand the formula to a solver
 
 `smtscript` prints the *same* formula the engine reasoned about as SMT-LIB2, with
@@ -933,10 +973,14 @@ Honesty matters more than a nice README, so:
 1b. **Termination needs a variant.** Without one, `wp` proves partial correctness
    only: a divergent loop can verify. There is no inference of variants — you
    supply the measure, the engine checks it decreases.
-1c. **A nested loop's effect on an outer variant is not tracked.** `variant_after`
-   treats an inner `while` as a no-op, so an outer measure must already account
-   for the inner loop. This is the usual obligation when nesting loops, but it is
-   a real gap rather than a solved problem.
+1c. **A nested loop's effect on an outer variant is handled by havocing, not by
+   tracking.** `variant_after` treats an inner `while` as writing every variable its
+   body can write, so a measure that mentions one of them becomes an obligation about a
+   fresh variable and cannot be discharged. That is sound but conservative: you must
+   supply an outer measure that does not depend on the inner loop's writes, or a measure
+   that accounts for them explicitly. The alternative — reading the inner loop as a no-op —
+   was a real soundness hole and is described under "Why `variant_after` must havoc a
+   nested loop" below.
 1d. **`with_fresh` must not be nested.** The inner call wipes the term arena and
    invalidates every `Var` the outer scope holds. One `with_fresh` per proof.
 2. **The BDD engine hits a wall, and says so.** Boolean *equality of two wide

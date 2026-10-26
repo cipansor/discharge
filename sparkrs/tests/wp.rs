@@ -1516,3 +1516,63 @@ fn a_nested_if_reaches_an_assertion_after_both() {
         assert!(r.is_verified(), "nesting must compose");
     });
 }
+
+#[test]
+fn a_nested_loop_cannot_make_the_outer_variant_look_healthy() {
+    // `while i < 100 { i := i + 1; while i != 0 { i := 0 } }` never terminates: the
+    // inner loop resets `i` on every outer iteration, so the outer counter makes no
+    // progress. The inner loop's body writes `i`, so `i` has an unknown value after it,
+    // and the outer measure `100 - i` must therefore be refuted.
+    //
+    // This used to be *proved*. `variant_after` read a nested `While` as leaving the
+    // measure alone, so the obligation reduced to `100 - (i + 1) < 100 - i`, which is
+    // valid -- and the report claimed `Total` for a program that does not halt. A
+    // termination proof for a divergent program is the exact claim this crate exists to
+    // make honestly, so this is a soundness regression test, not a feature test.
+    smt::with_fresh(|| {
+        let i = var(8);
+        let inner_body = Stmt::Assign { var: i, expr: smt::word(0, 8) };
+        let inner = Stmt::While {
+            cond: smt::not(i.eq_val(0)),
+            invariant: i.le_val(100),
+            variant: None,
+            body: &inner_body,
+        };
+        let bump = Stmt::Assign { var: i, expr: i + 1u32 };
+        let outer_body = Stmt::Seq { first: &bump, second: &inner };
+        let measure = smt::sub(smt::word(100, 8), i);
+        let ob = wp::termination_obligation(i.lt_val(100), i.le_val(100), measure, &outer_body);
+        assert!(
+            !ob.discharge().is_proved(),
+            "a nested loop that resets the outer counter must not yield a termination proof"
+        );
+    });
+}
+
+#[test]
+fn a_nested_loop_that_leaves_the_measure_alone_still_proves() {
+    // The control, and the reason the fix havocs only what the inner body writes rather
+    // than the whole state. `while i < 100 { i := i + 1; while j != 0 { j := 0 } }`
+    // terminates: the inner loop cannot touch `i`. The outer measure `100 - i` must still
+    // be proved, or the fix would have replaced a soundness hole with a loss of the
+    // common nested-loop shape (an inner scan under an outer counter).
+    smt::with_fresh(|| {
+        let i = var(8);
+        let j = var(8);
+        let inner_body = Stmt::Assign { var: j, expr: smt::word(0, 8) };
+        let inner = Stmt::While {
+            cond: smt::not(j.eq_val(0)),
+            invariant: j.le_val(100),
+            variant: None,
+            body: &inner_body,
+        };
+        let bump = Stmt::Assign { var: i, expr: i + 1u32 };
+        let outer_body = Stmt::Seq { first: &bump, second: &inner };
+        let measure = smt::sub(smt::word(100, 8), i);
+        let ob = wp::termination_obligation(i.lt_val(100), i.le_val(100), measure, &outer_body);
+        assert!(
+            ob.discharge().is_proved(),
+            "an inner loop that does not write the measured variable must not break the proof"
+        );
+    });
+}

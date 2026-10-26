@@ -922,10 +922,36 @@ pub fn variant_after(s: &Stmt<'_>, e: Var) -> Var {
             let el = variant_after(else_, e);
             smt::ite(*cond, t, el)
         }
-        // A nested loop's effect on the measure is not tracked; the caller has
-        // to supply a measure that accounts for the inner loop, which is the
-        // usual obligation when nesting loops.
-        Stmt::While { .. } => e,
+        // A nested loop's effect on the measure is *not* a no-op, and treating it as one
+        // was a soundness hole in the termination claim. `while i < 100 { i := i + 1;
+        // while i != 0 { i := 0 } }` diverges -- the inner loop resets the counter every
+        // iteration -- but with the inner loop read as "leaves `i` alone", the outer
+        // obligation `100 - i' < 100 - i` came back `Valid` and the report claimed `Total`
+        // for a program that never halts.
+        //
+        // The honest reading is that after a nested loop, every variable its body can
+        // write has an *unknown* value: the loop runs an unknown number of times, so the
+        // value is the result of applying the body some non-negative number of times. So
+        // havoc exactly those variables. A measure that does not mention them survives
+        // untouched, which is what makes the common shape (an inner scan over `j`, an
+        // outer measure over `i`) still provable. A measure that *does* mention them
+        // becomes an obligation about a fresh variable, which cannot be discharged --
+        // the caller must then supply a measure that accounts for the inner loop, which
+        // is the real obligation when nesting loops.
+        Stmt::While { body, .. } => {
+            let frame = writes(body);
+            if !frame.complete {
+                // The write set is not the truth, so the effect is unknown outright.
+                return smt::var(smt::bits(e));
+            }
+            let mut binds = [(Var::SENTINEL, Var::SENTINEL); MAX_WRITES];
+            let mut n = 0;
+            for v in frame.vars[..frame.n].iter() {
+                binds[n] = (*v, smt::var(smt::bits(*v)));
+                n += 1;
+            }
+            smt::substitute_word(e, &binds[..n])
+        }
     }
 }
 
