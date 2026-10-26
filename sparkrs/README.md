@@ -354,11 +354,22 @@ one-bit connectives as `and`/`or`/`xor`/`not`; `Bits` prints comparisons as
 `(ite <cmp> (_ bv1 1) (_ bv0 1))` and one-bit connectives as `bvand`/`bvor`/`bvxor`/`bvnot`.
 
 `examples/z3diff.rs` is the harness that settles this rather than an argument. It generates random
-predicates over 1-, 2-, 3-, 4-, 8- and 12-bit variables, asks the engine, exports the same
-predicate, and asks z3. With the fix: 800 predicates, 0 parse errors, 0 disagreements; 3000
-predicates, 0 parse errors, 0 disagreements. With the width rule restored: 21 of 800 rejected
-outright by z3 as ill-sorted. The harness needs `z3-solver` installed; it is a development tool and
-the crate itself still has no dependencies.
+predicates over 1-, 2-, 3-, 4-, 8- and 12-bit variables, with arithmetic, bitwise ops, shifts
+(including over-shifts), `truncate` in both directions, and `ite`; asks the engine; exports the
+same predicate; and asks z3. Measured with the current harness: 800 predicates — 0 parse errors,
+0 disagreements, 29 refused; 3000 predicates — 0 parse errors, 0 disagreements, 108 refused.
+"Refused" means the engine answered `Unknown` (typically a mixed-width term) and the exporter
+declined to write a query for it, so there is nothing for z3 to contradict. With the width-based
+printing rule restored the same harness gets 21 of 800 rejected outright by z3 as ill-sorted. The
+harness needs `z3-solver` installed; it is a development tool and the crate itself still has no
+dependencies.
+
+The harness also has to be run against the *defect* to be worth anything: an oracle that passes
+both with and without the fix proves nothing, and the classification has to be right. My first
+version called `prove(p) == Unsat` a disagreement with z3's `sat`; it is not, since `prove`
+answers `Unsat` when `p` is identically false, which is a tautology failure like any
+counterexample. `Unknown` on our side is likewise never a disagreement — the engine is allowed to
+be conservative, and z3 deciding is a stronger result, not a conflict.
 
 This bug is worth the space because of how it hid. The engine was right the whole time — every
 verdict it returned was correct. Only the *text* was wrong, so nothing in the crate's own tests
@@ -371,6 +382,26 @@ and the printer emitted `((_ extract w-1 0) x)` for both. That is only valid whe
 no wider than the source; for a *widening* `truncate` it produced `((_ extract 15 0) x0_8)` —
 extracting bit 15 from an 8-bit vector, which no solver accepts. Widening is `zero_extend`, and
 the source width now decides which form is printed.
+
+A fourth was not a printing bug at all, which is why it took longest to see. The engine
+*refuses* a mixed-width operation — it returns `Unknown` and sets an internal flag — but the
+term still exists, and the exporter printed its tree. So a query the engine had already
+declined to decide was written out as `(bvadd x0_12 x1_8)`, which z3 rejects as ill-sorted.
+The export is the artifact whose whole purpose is independent checking, and it was the one
+thing that could not be checked: a reviewer would see a file that failed to load and read it
+as a broken proof rather than a refused term.
+
+The fix is that the export consults the same flag the engine does. `smt::is_ill_formed` is
+public for exactly this reason, and a refused query writes a comment saying so and no
+`(check-sat)` — there is no formula to hand to a solver, and pretending otherwise is worse
+than saying nothing. `the_export_refuses_an_ill_formed_term_instead_of_printing_it` pins both
+halves, and `a_well_formed_query_is_still_exported_in_full` is the control, so the refusal
+cannot silently widen into refusing everything.
+
+This is the general shape to watch for: a refusal that lives in the *engine* but not in the
+*artifact*. The engine and the printer share a term representation, not a decision, so every
+refusal has to be re-applied on the printing side, and only a test on the printed text can
+show that it was.
 
 ## Substitution must not walk a shift amount
 

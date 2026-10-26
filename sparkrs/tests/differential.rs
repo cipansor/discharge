@@ -1994,3 +1994,46 @@ fn the_export_prints_assumptions_as_extra_asserts() {
         assert_eq!(rd.i, rd.s.len(), "trailing text in {}", line);
     }
 }
+
+#[test]
+fn the_export_refuses_an_ill_formed_term_instead_of_printing_it() {
+    // A term the engine *refuses* still has a tree, and printing that tree produces a file
+    // no solver parses: `(bvadd x0_12 x1_8)` is ill-sorted. The engine returns `Unknown`
+    // for a mixed-width operation, so there is no verdict to check -- but the exporter used
+    // to print the tree anyway, and z3 rejects the whole file. That is the worst outcome
+    // for the one artifact whose purpose is independent checking: it looks like a proof
+    // that failed to load rather than a term that was refused.
+    //
+    // So the export must check the same flag the engine does. This test pins both halves:
+    // the engine says `Unknown`, and the export contains no `(check-sat)` at all.
+    smt::with_fresh(|| {
+        let a = var(12);
+        let b = var(8);
+        let mixed = smt::add(a, b);
+        assert!(
+            matches!(smt::prove(smt::not(smt::eq(mixed, smt::word(0, 12)))), smt::Verdict::Unknown),
+            "a mixed-width operation must be refused, not decided"
+        );
+        assert!(smt::is_ill_formed(), "the arena must record the refusal");
+        let text = Query::new(&[a, b], smt::eq(mixed, smt::word(0, 12))).to_smtlib2_string();
+        assert!(
+            !text.contains("(check-sat)"),
+            "a refused term must not produce a query:\n{}",
+            text
+        );
+        assert!(text.contains("refused"), "the refusal must be stated:\n{}", text);
+    });
+}
+
+#[test]
+fn a_well_formed_query_is_still_exported_in_full() {
+    // The control: the refusal check must not fire on a healthy query. Without this, the
+    // previous test would pass if the exporter refused *everything*.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let text = Query::new(&[x], x.lt_val(100)).to_smtlib2_string();
+        assert!(!smt::is_ill_formed(), "a same-width query is well-formed");
+        assert!(text.contains("(check-sat)"), "a healthy query must be exported:\n{}", text);
+        assert!(text.contains("(declare-fun"), "declarations must be present:\n{}", text);
+    });
+}

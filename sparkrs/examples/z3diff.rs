@@ -2,7 +2,7 @@
 //
 // Generates random predicates over small bit-vectors, asks the engine, exports the SAME
 // predicate as SMT-LIB2, and asks z3. The two verdicts must agree whenever both decide.
-use sparkrs::smt::{self, Pred, Var};
+use sparkrs::smt::{self, Pred, Var, Verdict};
 use sparkrs::smtscript::Query;
 use std::io::Write as _;
 use std::process::{Command, Stdio};
@@ -26,14 +26,15 @@ fn rand_word(r: &mut Lcg, vars: &[Var], depth: u32) -> Var {
             vars[r.below(vars.len() as u64) as usize]
         };
     }
-    match r.below(8) {
+    match r.below(9) {
         0 => smt::add(rand_word(r, vars, depth - 1), rand_word(r, vars, depth - 1)),
         1 => smt::sub(rand_word(r, vars, depth - 1), rand_word(r, vars, depth - 1)),
         2 => smt::band(rand_word(r, vars, depth - 1), rand_word(r, vars, depth - 1)),
         3 => smt::bor(rand_word(r, vars, depth - 1), rand_word(r, vars, depth - 1)),
         4 => smt::bxor(rand_word(r, vars, depth - 1), rand_word(r, vars, depth - 1)),
-        5 => smt::shl(rand_word(r, vars, depth - 1), r.below(w as u64) as u32),
-        6 => smt::lshr(rand_word(r, vars, depth - 1), r.below(w as u64) as u32),
+        5 => smt::shl(rand_word(r, vars, depth - 1), r.below(w as u64 + 2) as u32),
+        6 => smt::lshr(rand_word(r, vars, depth - 1), r.below(w as u64 + 2) as u32),
+        7 => smt::truncate(rand_word(r, vars, depth - 1), 1 + r.below(w as u64) as u8),
         _ => smt::ite(rand_pred(r, vars, depth - 1), rand_word(r, vars, depth - 1), rand_word(r, vars, depth - 1)),
     }
 }
@@ -71,7 +72,7 @@ fn ask_z3(text: &str) -> (String, String) {
 
 fn main() {
     let mut r = Lcg(0x51ed_2701_9ab3_c4f7);
-    let (mut agree, mut mismatch, mut parse_err) = (0u32, 0u32, 0u32);
+    let (mut agree, mut mismatch, mut parse_err, mut refused) = (0u32, 0u32, 0u32, 0u32);
     let cases: u32 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(800);
     let total: u32 = cases;
     for _ in 0..cases {
@@ -83,6 +84,13 @@ fn main() {
             let v = smt::prove(p);
             (Query::new(&vars, p).to_smtlib2_string(), v)
         });
+        // A refused export contains no `(check-sat)`: the engine answered `Unknown` for an
+        // ill-formed term and the printer declined to write a query no solver could parse.
+        // Both sides then agree on "no verdict", so it is not a parse error.
+        if !text.contains("(check-sat)") {
+            if ours == Verdict::Unknown { refused += 1; continue; }
+            panic!("export refused for a decided query: ours={:?}\n{}", ours, text);
+        }
         let (z, zerr) = ask_z3(&text);
         // The file asserts `(not p)`, so:
         //   z3 unsat  <=>  not p unsatisfiable  <=>  p is a tautology  <=>  ours Valid
@@ -90,6 +98,13 @@ fn main() {
         //                                              <=> ours Unsat or Counterexample
         // `prove` answers Unsat when p is identically false, which is a *stronger* result
         // than a counterexample and still a tautology failure, so it agrees with `sat`.
+        // `Unknown` on our side is never a disagreement: the engine is allowed to be
+        // conservative, and z3 deciding either way is a stronger result, not a conflict.
+        // Only a *definite* verdict that z3 contradicts is a soundness mismatch.
+        if ours == Verdict::Unknown {
+            agree += 1;
+            continue;
+        }
         let tautology = ours.is_proved();
         match z.as_str() {
             "unsat" if tautology => agree += 1,
@@ -104,5 +119,5 @@ fn main() {
             }
         }
     }
-    println!("total={} agree={} mismatch={} parse_err={}", total, agree, mismatch, parse_err);
+    println!("total={} agree={} mismatch={} parse_err={} refused={}", total, agree, mismatch, parse_err, refused);
 }

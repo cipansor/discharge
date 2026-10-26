@@ -1742,6 +1742,20 @@ pub fn prove(p: Pred) -> Verdict {
     with_ctx(|c| c.query_valid(p.0))
 }
 
+/// Whether the arena currently holds an *ill-formed* term: a binary operation over
+/// operands of different widths, a constant that does not fit its width, or two bindings
+/// for the same substitution target.
+///
+/// Such a query answers [`Verdict::Unknown`], never a wrong verdict. This accessor exists
+/// for the *exporter*: a term the engine refuses still has a tree, and printing that tree
+/// produces SMT-LIB2 that no solver accepts -- `(bvadd x0_12 x1_8)` is ill-sorted, and z3
+/// rejects the file outright. So the export has to check the same flag the engine does, or
+/// it would hand a reviewer an artifact that cannot be checked and looks like a failed
+/// proof rather than a refused term.
+pub fn is_ill_formed() -> bool {
+    with_ctx(|c| c.ill_formed)
+}
+
 /// Prove that `pre` implies `post` for every input.
 pub fn prove_implies(pre: Pred, post: Pred) -> Verdict {
     with_ctx(|c| {
