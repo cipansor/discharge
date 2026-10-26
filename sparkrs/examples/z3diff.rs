@@ -59,20 +59,73 @@ fn rand_pred(r: &mut Lcg, vars: &[Var], depth: u32) -> Pred {
     }
 }
 
-/// Returns (check_result, stderr). An empty `check_result` means z3 rejected the file.
-fn ask_z3(text: &str) -> (String, String) {
+/// The outcome of asking z3 about one query.
+///
+/// These used to be collapsed into "empty stdout = parse error", which conflated two
+/// completely different facts: *z3 refused the text we printed* (a bug in the exporter,
+/// and the whole point of the harness) and *the oracle was not there to ask* (an
+/// environment problem that says nothing about the exporter). With `z3-solver` absent the
+/// harness reported `parse_err=771` and exited 0 -- the exporter's real bug count silently
+/// swapped for an environment failure, with no way to tell them apart and no failure
+/// signalled. That is the same defect class this crate hunts: a summary that outruns its
+/// evidence.
+enum Z3 {
+    /// z3 answered.
+    Verdict(String),
+    /// z3 loaded but rejected the text we printed: an exporter bug.
+    ParseFail(String),
+    /// z3 loaded but could not answer (crashed, unexpected exception).
+    Error(String),
+    /// No `z3` module: the oracle could not run at all.
+    Unavailable,
+}
+
+/// Ask z3 about `text`. See [`Z3`] for why the outcomes are not collapsed.
+fn ask_z3(text: &str) -> Z3 {
     let mut ch = Command::new("python3").arg("-c").arg(
         "import sys,z3\ns=z3.Solver()\ntry:\n    f=z3.parse_smt2_string(sys.stdin.read())\nexcept Exception as e:\n    print('PARSEFAIL', file=sys.stderr); raise\ns.add(f)\nprint(s.check())")
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     ch.stdin.as_mut().unwrap().write_all(text.as_bytes()).unwrap();
     let out = ch.wait_with_output().unwrap();
-    (String::from_utf8_lossy(&out.stdout).trim().to_string(),
-     String::from_utf8_lossy(&out.stderr).trim().to_string())
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if stderr.contains("No module named 'z3'") {
+        Z3::Unavailable
+    } else if stderr.contains("PARSEFAIL") {
+        Z3::ParseFail(stderr)
+    } else if matches!(stdout.as_str(), "sat" | "unsat" | "unknown") {
+        Z3::Verdict(stdout)
+    } else {
+        Z3::Error(format!("stdout={:?} stderr={}", stdout, stderr))
+    }
+}
+
+/// Whether the `z3` oracle can be loaded at all.
+fn z3_available() -> bool {
+    Command::new("python3")
+        .arg("-c")
+        .arg("import z3")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn main() {
+    // Refuse to run without the oracle, rather than reporting its absence as a result.
+    // A harness that cannot fail is not a harness, and "0 mismatches" from a run that never
+    // reached z3 is exactly the vacuous proof this crate is about.
+    if !z3_available() {
+        eprintln!(
+            "z3diff: the `z3` Python module is not importable, so the oracle cannot run.\n\
+             Install it (`python3 -m pip install z3-solver`) and re-run.\n\
+             This is a hard error: an unavailable oracle is not evidence about the exporter."
+        );
+        std::process::exit(2);
+    }
     let mut r = Lcg(0x51ed_2701_9ab3_c4f7);
-    let (mut agree, mut mismatch, mut parse_err, mut refused) = (0u32, 0u32, 0u32, 0u32);
+    let (mut agree, mut mismatch, mut parse_err, mut oracle_err, mut refused) = (0u32, 0u32, 0u32, 0u32, 0u32);
     let cases: u32 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(800);
     let total: u32 = cases;
     for _ in 0..cases {
@@ -91,7 +144,6 @@ fn main() {
             if ours == Verdict::Unknown { refused += 1; continue; }
             panic!("export refused for a decided query: ours={:?}\n{}", ours, text);
         }
-        let (z, zerr) = ask_z3(&text);
         // The file asserts `(not p)`, so:
         //   z3 unsat  <=>  not p unsatisfiable  <=>  p is a tautology  <=>  ours Valid
         //   z3 sat    <=>  not p satisfiable    <=>  p is not a tautology
@@ -106,18 +158,47 @@ fn main() {
             continue;
         }
         let tautology = ours.is_proved();
-        match z.as_str() {
-            "unsat" if tautology => agree += 1,
-            "sat" if !tautology => agree += 1,
-            "sat" | "unsat" => {
-                mismatch += 1;
-                if mismatch < 4 { eprintln!("MISMATCH ours={:?} z3={}\n{}", ours, z, text); }
-            }
-            _ => {
+        match ask_z3(&text) {
+            Z3::Verdict(z) => match z.as_str() {
+                "unsat" if tautology => agree += 1,
+                "sat" if !tautology => agree += 1,
+                // z3 saying `unknown` is z3 being conservative, not a disagreement; it is
+                // the oracle's version of our own `Unknown` and is counted as agreement.
+                "unknown" => agree += 1,
+                "sat" | "unsat" => {
+                    mismatch += 1;
+                    if mismatch < 4 { eprintln!("MISMATCH ours={:?} z3={}\n{}", ours, z, text); }
+                }
+                other => {
+                    oracle_err += 1;
+                    if oracle_err < 4 { eprintln!("ORACLE ERR ours={:?} z3={:?}\n{}", ours, other, text); }
+                }
+            },
+            Z3::ParseFail(err) => {
                 parse_err += 1;
-                if parse_err < 4 { eprintln!("PARSE ERR ours={:?} z3={:?} stderr={}\n{}", ours, z, zerr, text); }
+                if parse_err < 4 { eprintln!("PARSE ERR ours={:?} stderr={}\n{}", ours, err, text); }
             }
+            Z3::Error(err) => {
+                oracle_err += 1;
+                if oracle_err < 4 { eprintln!("ORACLE ERR ours={:?} {}\n{}", ours, err, text); }
+            }
+            // The availability check above should have caught this; if it happens anyway,
+            // it is a hard error, not a silent tally.
+            Z3::Unavailable => panic!("z3 became unavailable mid-run"),
         }
     }
-    println!("total={} agree={} mismatch={} parse_err={} refused={}", total, agree, mismatch, parse_err, refused);
+    println!(
+        "total={} agree={} mismatch={} parse_err={} oracle_err={} refused={}",
+        total, agree, mismatch, parse_err, oracle_err, refused
+    );
+    // A mismatch is a soundness disagreement and must fail the run. A parse error means we
+    // printed a query z3 will not load, which is the exporter bug the harness exists to
+    // catch, so it fails too. Only agreement, refusal, and z3's own conservatism pass.
+    if mismatch > 0 || parse_err > 0 || oracle_err > 0 {
+        eprintln!(
+            "z3diff FAILED: mismatch={} parse_err={} oracle_err={}",
+            mismatch, parse_err, oracle_err
+        );
+        std::process::exit(1);
+    }
 }

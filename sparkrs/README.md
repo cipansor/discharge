@@ -370,6 +370,13 @@ printing rule restored the same harness gets 21 of 800 rejected outright by z3 a
 harness needs `z3-solver` installed; it is a development tool and the crate itself still has no
 dependencies.
 
+The harness also *fails* when it should. It exits 2 if the `z3` module is not importable, and
+exits 1 on any disagreement or any file z3 refuses, printing the failing query. That matters
+because the first version could not fail at all: it folded "the oracle is not installed" and "z3
+rejected the file we printed" into the same `parse_err` tally and exited 0 either way, so a
+broken exporter and a missing dependency produced the same green-looking line. A check that
+cannot fail is not evidence.
+
 The harness also has to be run against the *defect* to be worth anything: an oracle that passes
 both with and without the fix proves nothing, and the classification has to be right. My first
 version called `prove(p) == Unsat` a disagreement with z3's `sat`; it is not, since `prove`

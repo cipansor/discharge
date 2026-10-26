@@ -1240,3 +1240,38 @@ Both are found by reading the signatures and the doc comments against the behavi
 probing the decision procedure. Worth doing as its own pass once the semantic audit settles,
 because the failures are silent by construction — nothing in the test suite is asking the
 question.
+
+## A harness that cannot fail is not a harness
+
+Two findings this session, both on *tooling* rather than the engine, and both the same
+shape: a check that reports a number while being structurally unable to signal failure.
+
+* `examples/z3diff.rs` collapsed every non-answer from the oracle into one tally. When the
+  `z3` Python module was absent from the environment, the harness printed `parse_err=771`
+  and exited `0`. So "the exporter printed a file z3 rejects" — the exact bug the harness
+  exists to catch — and "the oracle was not installed" were the same output, and neither
+  failed the run. Fixing the environment restored the README's `agree=771`, but the harness
+  would have reported the same green-looking line had the exporter been broken. The fix
+  separates the outcomes (`Verdict` / `ParseFail` / `Error` / `Unavailable`), refuses to run
+  without the oracle (exit 2), and fails the run on any mismatch or parse error (exit 1).
+* `scripts/test-count.sh` summed lines matching `test result: ok`, so a suite with a failing
+  test printed a *smaller* number and exited `0`. A failed run and a smaller passing run were
+  indistinguishable, and the number was one this project quotes. The fix makes a failure,
+  a compile error, or an empty run a hard error, and prints the count only when the whole run
+  is green.
+
+The question to ask of any script or harness in this repo: **can it exit 0 while the thing it
+checks is wrong?** If yes, it is not evidence, and quoting its output is a claim, not a
+measurement. Teeth for both fixes were run: shadowing the `z3` module (`PYTHONPATH` with a
+stub that raises `ImportError`) makes `z3diff` exit 2 with a message; mutating the exporter
+(`bvult` -> `bvule`) makes it exit 1 with `mismatch=50`; a deliberately failing test makes
+`test-count.sh` exit 1 and name the failure.
+
+## Reading a tool's output is part of the audit
+
+The `parse_err=771` was in the resumed task's own notes as a *passing* figure
+(`agree=771`), because the run that produced it had the oracle installed. Re-running the
+same command in the resumed environment produced a different, wrong-looking line that was
+easy to skim past as "still fine". The lesson: re-run the commands a summary quotes, and
+read the *whole* output line — a tally that shifted from `agree` to `parse_err` with the
+same total is a silent failure, not a stable result.
