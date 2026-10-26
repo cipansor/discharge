@@ -443,6 +443,44 @@ and `exists_guarded` are *not* affected: an empty range yields `true`/`false` re
 which is correct for an empty range, and `inside` already treats an unrepresentable index as
 outside the bound rather than truncating it.
 
+## Two rules, one program: `verify` and `wp` must agree
+
+`verify` runs `collect`, which checks `Stmt::frame` at every call and reports a bad frame as
+an obligation. `wp::wp` is *also* public -- it is the rule a caller uses to build a weakest
+precondition by hand -- and it applied the same call rule *without* the frame check. So the
+two entry points disagreed about the same program.
+
+The consequence was a false proof, not a missing one. A callee whose body zeroes `g`, called
+with an empty declared frame, havocs nothing under the old `wp`, so `wp(call, g == 7)` was
+just `g == 7`, and `g == 7 => wp` came back `Valid`: a proof that the callee's write did not
+happen. `verify` rejected the same call.
+
+The fix is that `wp_of` checks the frame too, and returns `false` when it fails -- there is no
+report to carry the failure, and the honest weakest precondition of an unmodelled call is
+`false`. The general lesson: a second entry point into one rule is a second chance to forget
+a precondition, and the tests have to drive *both*. `tests/call.rs` now has
+`wp_refuses_to_reason_about_a_call_with_a_bad_frame` (the bad frame) and
+`wp_still_reasons_about_a_call_with_a_good_frame` (a framed call still works), because a fix
+that returned `false` for every call would pass the first test alone.
+
+## A test that passes by failing to parse
+
+The first version of the independent SMT-LIB reader could not parse `((_ extract 7 0) x)` --
+a standard *indexed application*, whose head is itself a parenthesised `(_ ...)`. It handled
+only the self-contained literal `(_ bvN w)`, which has one `(`.
+
+That bug made a "teeth" test lie. `the_export_checker_rejects_what_the_old_exporter_printed`
+asserted that `extract` past the end of a vector is rejected, and it was -- but by a *parser
+error* at byte 10, not by the sort check the test is named for. Worse, every well-formed
+export containing an `extract` or a `zero_extend` was rejected too, so the new
+mixed-operator fuzzer failed on correct output.
+
+Two things follow. First, a rejection test needs a positive control: the same test now asserts
+that a well-formed `extract` and `zero_extend` *parse*, so it cannot pass by refusing
+everything. Second, "the checker rejects X" is only evidence of a sort check if the checker can
+parse X's valid neighbours. When the checker is the oracle, its own parser is part of the
+thing under test.
+
 ## Read the printer with a parser, not with your eyes
 
 Three defects in the SMT-LIB2 exporter were found by *reading* the output: an inverted

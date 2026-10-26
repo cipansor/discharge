@@ -949,3 +949,68 @@ fn a_body_at_exactly_the_cap_is_still_modelled() {
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// `wp::wp` must apply the same call rule as `verify`.
+//
+// `collect` (which `verify` runs) checks `Stmt::frame` at a call and reports a bad frame
+// as an obligation. `wp::wp` is also public and is the rule a caller uses to build a
+// weakest precondition by hand, and it did *not* check the frame: it assumed every caller
+// variable the callee writes kept its old value. A callee that zeroes `g`, called with an
+// empty declared frame, then let `wp(call, g == 7)` come out provable from `g == 7` -- a
+// proof that the callee's write did not happen. The honest weakest precondition of an
+// unmodelled call is `false`: nothing is guaranteed about the state after it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wp_refuses_to_reason_about_a_call_with_a_bad_frame() {
+    smt::with_fresh(|| {
+        let g = var(8);
+        // The body writes `g`; the declared frame is empty, so the call is unmodelled.
+        let body = Stmt::Assign { var: g, expr: smt::word(0, 8) };
+        let callee = Proc {
+            name: "zero_g",
+            requires: smt::truth(true),
+            ensures: smt::truth(true),
+            body: &body,
+        };
+        let call = Stmt::Call { proc_: &callee, actuals: &[(g, g)], writes: &[] };
+
+        // The false claim: starting from `g == 7`, the call leaves `g == 7`. With an
+        // empty declared frame the old rule havocs nothing, so `wp` was just the
+        // postcondition and `pre => wp` came out `Valid` -- a proof that the callee's
+        // write to `g` did not happen.
+        let pre = g.eq_val(7);
+        let w = wp::wp(pre, &call);
+        assert!(
+            !smt::prove_implies(pre, w).is_proved(),
+            "wp trusted an unmodelled call and proved a variable survived a write"
+        );
+        // And `verify` agrees, for the same program.
+        assert!(!wp::verify(&call, pre, pre).is_verified());
+    });
+}
+
+#[test]
+fn wp_still_reasons_about_a_call_with_a_good_frame() {
+    smt::with_fresh(|| {
+        let x = var(8);
+        let r = var(8);
+        let body = Stmt::Assign { var: r, expr: x + x };
+        let callee = Proc {
+            name: "double",
+            requires: smt::ule_const(x, 100),
+            ensures: smt::eq(r, x + x),
+            body: &body,
+        };
+        let a = var(8);
+        let c = var(8);
+        let call = Stmt::Call { proc_: &callee, actuals: &[(x, a), (r, c)], writes: &[r] };
+
+        // A well-framed call still yields a usable rule: with the callee's contract
+        // assumed, `c == 10` follows from `a == 5`.
+        let pre = smt::eq_const(a, 5);
+        let goal = smt::implies(pre, wp::wp(c.eq_val(10), &call));
+        assert_eq!(smt::prove(goal), Verdict::Valid, "a framed call must still verify");
+    });
+}

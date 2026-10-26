@@ -650,24 +650,17 @@ fn push(out: &mut [Option<Obligation>], n: &mut usize, rule: Rule, goal: Pred) {
     }
 }
 
-/// Record a report-level finding, which is allowed to use the reserved last slot.
-///
-/// The distinction matters: an overflow notice that is itself dropped by the full
-/// buffer is worse than useless, because the report then looks clean. That is exactly
-/// how the first attempt at this fix failed.
-///
-/// A finding is never dropped. If the reserved slot is already taken — which happens only
-/// when an overflow notice got there first — the newer finding replaces it. Both make the
-/// report unverified, and the newer one is the stronger statement: a vacuous precondition
-/// says the contract was never about anything, which is worth more than "some obligations
-/// did not fit". Either way nothing is silently lost.
 /// Record a report-level finding in the reserved trailing slot.
 ///
+/// The distinction matters: an overflow notice that is itself dropped by the full buffer
+/// is worse than useless, because the report then looks clean. A finding is therefore never
+/// dropped -- if the reserved slot is already taken, the newer finding replaces it.
+///
 /// There is exactly one reserved slot and up to three findings, so the calls are ordered
-/// from least to most severe: the reserved slot is overwritten by each later call, and the
-/// most severe finding is the one that survives. `Rule::VacuousPrecondition` is last and
-/// therefore wins, which is the documented precedence -- a contract that was never about
-/// anything is the stronger statement.
+/// from least to most severe: the slot is overwritten by each later call, and the most
+/// severe finding survives. `Rule::VacuousPrecondition` is last and therefore wins, which
+/// is the documented precedence -- a contract that was never about anything is the stronger
+/// statement than "some obligations did not fit".
 fn push_notice(out: &mut [Option<Obligation>], n: &mut usize, rule: Rule, goal: Pred) {
     if *n < out.len() {
         out[*n] = Some(Obligation::new(rule, goal));
@@ -712,12 +705,21 @@ fn push_checked(
 /// wp(if c then A else B, Q) = (c && wp(A,Q)) || (!c && wp(B,Q))
 /// wp(while c inv I { B }, Q) = I        (with the three loop conditions
 ///                                        checked separately, see `obligations`)
+/// wp(call p(a), Q)     = ensures[a]' => Q'   (with the written targets havoced;
+///                                        `false` if the frame is not modelled)
 /// ```
 ///
 /// For `while` the returned predicate is the invariant, because that is all the
 /// weakest-precondition calculus can conclude without a variant to show
 /// termination. The obligations that make the invariant sound — preservation and
 /// exit — are produced by [`obligations`], and by [`verify`], which runs them.
+///
+/// A call applies the *same* rule as [`obligations`], including the frame check
+/// [`Stmt::frame`]. There is no report here to carry a failure, so an unmodelled call
+/// returns `false`: nothing is guaranteed about the state after a call whose writes the
+/// caller did not name. Skipping the check would make `wp` assume that every variable the
+/// callee writes kept its old value, which is how `wp(call, g == 7)` once proved that a
+/// callee which zeroes `g` had not.
 pub fn wp(post: Pred, s: &Stmt<'_>) -> Pred {
     wp_of(s, post)
 }
@@ -728,7 +730,16 @@ fn wp_of(s: &Stmt<'_>, post: Pred) -> Pred {
         Stmt::Assign { var, expr } => smt::substitute(post, &[(*var, *expr)]),
         Stmt::AssignMany { binds } => smt::substitute(post, binds),
         Stmt::Call { proc_, actuals, writes } => {
-            // Same rule as `collect`, including the havoc; see the comment there.
+            // Same rule as `collect`, including the havoc *and the frame check*; see the
+            // comment there. The frame check is not optional: without it this rule
+            // silently assumes the caller's variables that the callee writes keep their
+            // old values, and `wp(call, Q)` comes out true for a `Q` the call cannot
+            // establish. `collect` reports the bad frame as an obligation; here there is
+            // no report to report to, so the honest weakest precondition of an unmodelled
+            // call is `false` -- nothing is guaranteed about the state after it.
+            if !Stmt::frame(proc_, actuals, writes) {
+                return smt::truth(false);
+            }
             let renamed = smt::substitute(proc_.ensures, actuals);
             let (havoc, n_havoc) = havoc_writes(actuals, writes);
             let renamed = smt::substitute(renamed, &havoc[..n_havoc]);

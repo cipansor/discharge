@@ -1351,6 +1351,16 @@ impl<'a> Reader<'a> {
 
     fn list(&mut self) -> Result<E, String> {
         self.eat(b'(')?;
+        // An *indexed application* is `((_ extract 7 0) x)`: two opening parentheses,
+        // because the operator itself is a parenthesised `(_ ...)` head. Only the
+        // self-contained literal `(_ bvN w)` has a single `(`. This branch was missing, so
+        // the reader rejected every well-formed `extract`/`zero_extend` -- and the
+        // "rejects what the old exporter printed" test then passed for the wrong reason, by
+        // failing to parse rather than by sort-checking.
+        if self.peek() == Some(b'(') {
+            self.eat(b'(')?;
+            return self.indexed();
+        }
         if self.peek() == Some(b'_') {
             return self.indexed();
         }
@@ -1640,6 +1650,12 @@ fn the_export_checker_rejects_what_the_old_exporter_printed() {
         parse_exported("(assert (= x0_8 (_ bv300 8)))").is_err(),
         "an oversized literal must be rejected"
     );
+    // 4. And a well-formed `extract` must be *accepted* -- the previous version of this
+    //    checker rejected it too, which is how it "rejected" case 2 for the wrong reason.
+    let ok = parse_exported("(assert (= x0_8 ((_ extract 7 0) x1_8)))");
+    assert!(ok.is_ok(), "a well-formed extract must parse: {:?}", ok.err());
+    let ok = parse_exported("(assert (= x0_8 ((_ zero_extend 0) x1_8)))");
+    assert!(ok.is_ok(), "a well-formed zero_extend must parse: {:?}", ok.err());
     // And a well-formed one is accepted, so the checker is not refusing everything.
     assert!(parse_exported("(assert (= x0_8 (bvand x1_8 (_ bv255 8))))").is_ok());
 }
@@ -1655,4 +1671,272 @@ fn the_export_keeps_a_constant_goal_upright() {
         assert!(!parse_exported(&t).unwrap().eval(0, 0).b(), "{}", t);
         assert!(parse_exported(&f).unwrap().eval(0, 0).b(), "{}", f);
     });
+}
+
+// ---------------------------------------------------------------------------
+// The export fuzzer, extended to the operators the first version never emitted.
+//
+// The first export fuzz covered 8-bit word expressions and the comparisons over them. It
+// therefore never printed `truncate`, `ite`, `ashr` or `zero_extend` -- which is exactly
+// where the three real exporter bugs had lived. A fuzzer only checks the shapes it
+// generates, so the generator is widened here to truncations, `ite`, and the arithmetic
+// shift, plus assumptions, which the exporter prints as extra asserts.
+//
+// Widths are normalised deliberately: every binary operand is rebuilt at 8 bits, so the
+// generator never asks the engine for a mixed-width term (which the engine refuses by
+// design). A `Trunc` to a narrower width is always re-widened by its parent, which is what
+// exercises both the `extract` and the `zero_extend` printing directions.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+enum WE {
+    A,
+    B,
+    K(u64),
+    Add(Box<WE>, Box<WE>),
+    Sub(Box<WE>, Box<WE>),
+    And(Box<WE>, Box<WE>),
+    Or(Box<WE>, Box<WE>),
+    Xor(Box<WE>, Box<WE>),
+    Shl(Box<WE>, u32),
+    LShr(Box<WE>, u32),
+    Ashr(Box<WE>, u32),
+    Trunc(Box<WE>, u8),
+    Ite(Box<WE>, Box<WE>, Box<WE>),
+}
+
+impl WE {
+    /// Build the term at exactly `w` bits. Children of a binary operator are built at 8
+    /// bits, so no mixed-width term is ever requested.
+    fn build_w(&self, a: Var, b: Var, w: u8) -> Var {
+        let raw = match self {
+            WE::A => a,
+            WE::B => b,
+            WE::K(k) => smt::word(*k, 8),
+            WE::Add(x, y) => smt::add(x.build_w(a, b, 8), y.build_w(a, b, 8)),
+            WE::Sub(x, y) => smt::sub(x.build_w(a, b, 8), y.build_w(a, b, 8)),
+            WE::And(x, y) => smt::band(x.build_w(a, b, 8), y.build_w(a, b, 8)),
+            WE::Or(x, y) => smt::bor(x.build_w(a, b, 8), y.build_w(a, b, 8)),
+            WE::Xor(x, y) => smt::bxor(x.build_w(a, b, 8), y.build_w(a, b, 8)),
+            WE::Shl(x, k) => smt::shl(x.build_w(a, b, 8), *k),
+            WE::LShr(x, k) => smt::lshr(x.build_w(a, b, 8), *k),
+            WE::Ashr(x, k) => smt::ashr(x.build_w(a, b, 8), *k),
+            WE::Trunc(x, tw) => x.build_w(a, b, *tw),
+            WE::Ite(_, t, e) => {
+                let t8 = t.build_w(a, b, 8);
+                let e8 = e.build_w(a, b, 8);
+                let cond = smt::ult(t8, e8);
+                smt::ite(cond, t8, e8)
+            }
+        };
+        smt::truncate(raw, w)
+    }
+
+    fn build(&self, a: Var, b: Var) -> Var {
+        self.build_w(a, b, 8)
+    }
+
+    /// The value of the term, masked to `w` bits -- the same `w` that `build_w` was given
+    /// and that `smt::bits` reports for the built term.
+    fn eval(&self, a: u64, b: u64, w: u8) -> u64 {
+        let raw = match self {
+            WE::A => a,
+            WE::B => b,
+            WE::K(k) => *k,
+            WE::Add(x, y) => x.eval(a, b, 8).wrapping_add(y.eval(a, b, 8)),
+            WE::Sub(x, y) => x.eval(a, b, 8).wrapping_sub(y.eval(a, b, 8)),
+            WE::And(x, y) => x.eval(a, b, 8) & y.eval(a, b, 8),
+            WE::Or(x, y) => x.eval(a, b, 8) | y.eval(a, b, 8),
+            WE::Xor(x, y) => x.eval(a, b, 8) ^ y.eval(a, b, 8),
+            WE::Shl(x, k) => {
+                let v = x.eval(a, b, 8);
+                if *k >= 8 {
+                    0
+                } else {
+                    v << k
+                }
+            }
+            WE::LShr(x, k) => {
+                let v = x.eval(a, b, 8);
+                if *k >= 8 {
+                    0
+                } else {
+                    v >> k
+                }
+            }
+            WE::Ashr(x, k) => {
+                let v = x.eval(a, b, 8) & 0xff;
+                let sign = (v >> 7) & 1 == 1;
+                if *k >= 8 {
+                    if sign {
+                        0xff
+                    } else {
+                        0
+                    }
+                } else if sign {
+                    (v >> k) | (!(0xffu64 >> k) & 0xff)
+                } else {
+                    v >> k
+                }
+            }
+            WE::Trunc(x, tw) => x.eval(a, b, 8) & bit_mask(*tw),
+            WE::Ite(_, t, e) => {
+                let tv = t.eval(a, b, 8);
+                let ev = e.eval(a, b, 8);
+                if tv < ev {
+                    tv
+                } else {
+                    ev
+                }
+            }
+        };
+        raw & bit_mask(w)
+    }
+}
+
+fn we_expr(r: &mut FuzzLcg, depth: u32) -> WE {
+    if depth == 0 || r.below(5) == 0 {
+        return match r.below(3) {
+            0 => WE::A,
+            1 => WE::B,
+            _ => WE::K(r.below(256)),
+        };
+    }
+    let x = we_expr(r, depth - 1);
+    let y = we_expr(r, depth - 1);
+    let z = we_expr(r, depth - 1);
+    match r.below(11) {
+        0 => WE::Add(Box::new(x), Box::new(y)),
+        1 => WE::Sub(Box::new(x), Box::new(y)),
+        2 => WE::And(Box::new(x), Box::new(y)),
+        3 => WE::Or(Box::new(x), Box::new(y)),
+        4 => WE::Xor(Box::new(x), Box::new(y)),
+        5 => WE::Shl(Box::new(x), r.below(9) as u32),
+        6 => WE::LShr(Box::new(x), r.below(9) as u32),
+        7 => WE::Ashr(Box::new(x), r.below(9) as u32),
+        8 => WE::Trunc(Box::new(x), 1 + r.below(8) as u8),
+        9 => WE::Ite(Box::new(x), Box::new(y), Box::new(z)),
+        _ => WE::Add(Box::new(x), Box::new(y)),
+    }
+}
+
+/// The `WE` tree as a display string, so a failure names the input.
+fn we_render(e: &WE) -> String {
+    match e {
+        WE::A => "a".into(),
+        WE::B => "b".into(),
+        WE::K(k) => format!("{}", k),
+        WE::Add(x, y) => format!("({}+{})", we_render(x), we_render(y)),
+        WE::Sub(x, y) => format!("({}-{})", we_render(x), we_render(y)),
+        WE::And(x, y) => format!("({}&{})", we_render(x), we_render(y)),
+        WE::Or(x, y) => format!("({}|{})", we_render(x), we_render(y)),
+        WE::Xor(x, y) => format!("({}^{})", we_render(x), we_render(y)),
+        WE::Shl(x, k) => format!("({}<<{})", we_render(x), k),
+        WE::LShr(x, k) => format!("({}>>{})", we_render(x), k),
+        WE::Ashr(x, k) => format!("({}>>a{})", we_render(x), k),
+        WE::Trunc(x, w) => format!("trunc{}({})", w, we_render(x)),
+        WE::Ite(c, t, e) => format!("ite({}, {}, {})", we_render(c), we_render(t), we_render(e)),
+    }
+}
+
+#[test]
+fn the_export_handles_truncate_ite_and_ashr() {
+    // Deep terms are built and dropped recursively, and the default 2 MiB test-thread stack
+    // is not enough for a depth-3 tree once every level is wrapped in `truncate`. Run on a
+    // thread with a stack sized for the job rather than shrinking the generator, which would
+    // weaken what the test reaches.
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(the_export_handles_truncate_ite_and_ashr_inner)
+        .expect("spawn")
+        .join()
+        .expect("the export fuzzer panicked");
+}
+
+fn the_export_handles_truncate_ite_and_ashr_inner() {
+    let mut r = FuzzLcg(0xc0ff_ee00_1234_5678);
+    let mut trunc_seen = 0;
+    let mut ite_seen = 0;
+    let mut ashr_seen = 0;
+    let mut checked = 0u32;
+    for _ in 0..120 {
+        let e = we_expr(&mut r, 3);
+        let (text, w, want) = smt::with_fresh(|| {
+            let a = var(8);
+            let b = var(8);
+            let t = e.build(a, b);
+            let goal = smt::eq_const(t, 0);
+            let s = Query::new(&[a, b], goal).to_smtlib2_string();
+            let w = smt::bits(t);
+            let mut want = [[false; 256]; 256];
+            for x in 0..256u64 {
+                for y in 0..256u64 {
+                    // The export asserts the negation of the goal.
+                    want[x as usize][y as usize] = e.eval(x, y, w) != 0;
+                }
+            }
+            (s, w, want)
+        });
+        let parsed = parse_exported(&text).unwrap_or_else(|err| {
+            panic!("export was not well-sorted ({}): {}\n{}", err, we_render(&e), text)
+        });
+        assert_eq!(parsed.sort(), Sort::Bool, "the asserted goal must be a boolean");
+        for x in 0..256u64 {
+            for y in 0..256u64 {
+                let got = parsed.eval(x, y).b();
+                assert_eq!(
+                    got, want[x as usize][y as usize],
+                    "export disagrees at (a, b) = ({}, {}) for {} (width {})\n{}",
+                    x, y, we_render(&e), w, text
+                );
+            }
+        }
+        let shown = we_render(&e);
+        if shown.contains("trunc") {
+            trunc_seen += 1;
+        }
+        if shown.contains("ite") {
+            ite_seen += 1;
+        }
+        if shown.contains(">>a") {
+            ashr_seen += 1;
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 120);
+    // Coverage is asserted, not assumed: a future edit that stopped emitting any of these
+    // would leave this test passing and proving nothing about the printer path in question.
+    assert!(trunc_seen > 0, "no truncate was generated");
+    assert!(ite_seen > 0, "no ite was generated");
+    assert!(ashr_seen > 0, "no arithmetic shift was generated");
+}
+
+#[test]
+fn the_export_prints_assumptions_as_extra_asserts() {
+    // A query with assumptions must print one assert per assumption plus the negated goal,
+    // and every assert must parse on its own. This is the shape the module exists to emit,
+    // and the first fuzzer never produced it.
+    let text = smt::with_fresh(|| {
+        let a = var(8);
+        let b = var(8);
+        let pre = smt::ult(a, b);
+        let goal = smt::ule(a, b);
+        Query::new(&[a, b], goal).assuming(&[pre]).to_smtlib2_string()
+    });
+    let asserts: Vec<&str> = text.lines().filter(|l| l.starts_with("(assert")).collect();
+    assert_eq!(asserts.len(), 2, "one assert per assumption plus the goal:\n{}", text);
+    for line in asserts {
+        let inner = line
+            .trim()
+            .strip_prefix("(assert")
+            .and_then(|x| x.strip_suffix(')'))
+            .unwrap();
+        let mut rd = Reader::new(inner);
+        let e = rd
+            .term()
+            .unwrap_or_else(|err| panic!("ill-sorted assert ({}): {}", err, line));
+        assert_eq!(e.sort(), Sort::Bool, "an assert must be a boolean: {}", line);
+        rd.skip_ws();
+        assert_eq!(rd.i, rd.s.len(), "trailing text in {}", line);
+    }
 }
