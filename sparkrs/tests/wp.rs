@@ -1213,3 +1213,40 @@ fn a_reachable_assume_still_verifies() {
         assert_eq!(r.establishes(), Established::Total);
     });
 }
+
+#[test]
+fn a_duplicated_assign_many_target_is_refused_not_ordered() {
+    // `x := 1, x := 2` as a *simultaneous* assignment has no single meaning: keeping the
+    // last proves `x == 2`, keeping the first proves `x == 1`, and which one you get is
+    // list order rather than anything the specification says. The only safe answer is
+    // `Unknown`, and it must hold in release builds too, where the `debug_assert!` that
+    // guards `AssignMany` is compiled out. This pins the behavior at the `wp` layer; the
+    // `smt` layer is pinned by `smt::subst_tests::two_bindings_for_one_target_are_refused`.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let binds = [(x, smt::word(1, 8)), (x, smt::word(2, 8))];
+        let s = Stmt::AssignMany { binds: &binds };
+        // Whichever way the list is read, the *other* postcondition would be "proved".
+        for post in [x.eq_val(1), x.eq_val(2)] {
+            let pre = wp::wp(post, &s);
+            assert_eq!(
+                smt::prove(pre),
+                smt::Verdict::Unknown,
+                "a duplicated target must not be resolved by list order"
+            );
+        }
+    });
+}
+
+#[test]
+fn distinct_assign_many_targets_still_work() {
+    // The refusal above must not come from refusing every `AssignMany`.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let y = var(8);
+        let binds = [(x, smt::word(1, 8)), (y, smt::word(2, 8))];
+        let s = Stmt::AssignMany { binds: &binds };
+        let pre = wp::wp(smt::and(x.eq_val(1), y.eq_val(2)), &s);
+        assert_eq!(smt::prove(pre), smt::Verdict::Valid);
+    });
+}
