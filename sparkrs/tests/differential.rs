@@ -4,6 +4,7 @@
 
 use sparkrs::exhaustive::{for_all_u8, for_all_u8_2, find_violation_u8};
 use sparkrs::prelude::*;
+use sparkrs::smtscript::Query;
 use sparkrs::smt::{self, Verdict};
 use sparkrs::wp;
 
@@ -1070,5 +1071,588 @@ fn substitution_through_a_shift_is_finite_and_correct() {
             let want = (v as u64) << 3 & 0xff < 200;
             assert_eq!(got, Some(want), "wp through a shift disagrees at x={}", v);
         }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// The SMT-LIB2 export, checked by an independent parser.
+//
+// `smtscript.rs` turns a verification condition into SMT-LIB2 so an external solver can
+// reproduce the proof. That makes the printer soundness-critical: if it prints a different
+// formula, or an ill-sorted one, the external evidence does not apply. Three bugs were found
+// here by reading the output (inverted polarity, `bvnot` on a boolean, `extract` for a
+// widening truncate). Reading is not a check, so this is the check: a small independent
+// reader that (a) rejects any ill-sorted operator application and (b) evaluates the parsed
+// text, which is then compared against the predicate it came from, over all 65 536 inputs.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Sort {
+    Bool,
+    Bv(u8),
+}
+
+#[derive(Debug, Clone)]
+enum E {
+    BoolConst(bool),
+    BvConst(u64, u8),
+    Var(u32, u8),
+    Not(Box<E>),
+    And(Box<E>, Box<E>),
+    Or(Box<E>, Box<E>),
+    Xor(Box<E>, Box<E>),
+    BvNot(Box<E>),
+    BvAnd(Box<E>, Box<E>),
+    BvOr(Box<E>, Box<E>),
+    BvXor(Box<E>, Box<E>),
+    BvAdd(Box<E>, Box<E>),
+    BvSub(Box<E>, Box<E>),
+    BvMul(Box<E>, Box<E>),
+    BvShl(Box<E>, Box<E>),
+    BvLShr(Box<E>, Box<E>),
+    BvAshr(Box<E>, Box<E>),
+    Eq(Box<E>, Box<E>),
+    BvUlt(Box<E>, Box<E>),
+    BvUle(Box<E>, Box<E>),
+    Extract(u8, u8, Box<E>),
+    ZeroExtend(u8, Box<E>),
+    Ite(Box<E>, Box<E>, Box<E>),
+}
+
+fn bit_mask(w: u8) -> u64 {
+    if w >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << w) - 1
+    }
+}
+
+impl E {
+    fn sort(&self) -> Sort {
+        match self {
+            E::BoolConst(_) | E::Not(_) | E::And(..) | E::Or(..) | E::Xor(..) | E::Eq(..)
+            | E::BvUlt(..) | E::BvUle(..) => Sort::Bool,
+            E::BvConst(_, w) => Sort::Bv(*w),
+            E::Var(_, w) => Sort::Bv(*w),
+            E::BvNot(x) => x.sort(),
+            E::BvAnd(a, _)
+            | E::BvOr(a, _)
+            | E::BvXor(a, _)
+            | E::BvAdd(a, _)
+            | E::BvSub(a, _)
+            | E::BvMul(a, _)
+            | E::BvShl(a, _)
+            | E::BvLShr(a, _)
+            | E::BvAshr(a, _) => a.sort(),
+            E::Extract(hi, lo, _) => Sort::Bv(hi - lo + 1),
+            E::ZeroExtend(n, x) => match x.sort() {
+                Sort::Bv(w) => Sort::Bv(w + n),
+                Sort::Bool => Sort::Bool,
+            },
+            E::Ite(_, t, _) => t.sort(),
+        }
+    }
+
+    fn eval(&self, a: u64, b: u64) -> V {
+        match self {
+            E::BoolConst(v) => V::B(*v),
+            E::BvConst(v, w) => V::W(*v, *w),
+            E::Var(idx, w) => V::W(if *idx == 0 { a } else { b }, *w),
+            E::Not(x) => V::B(!x.eval(a, b).b()),
+            E::And(x, y) => V::B(x.eval(a, b).b() && y.eval(a, b).b()),
+            E::Or(x, y) => V::B(x.eval(a, b).b() || y.eval(a, b).b()),
+            E::Xor(x, y) => V::B(x.eval(a, b).b() ^ y.eval(a, b).b()),
+            E::BvNot(x) => {
+                let (v, w) = x.eval(a, b).w();
+                V::W(!v & bit_mask(w), w)
+            }
+            E::BvAnd(x, y) => {
+                let (v, w) = x.eval(a, b).w();
+                V::W(v & y.eval(a, b).w().0, w)
+            }
+            E::BvOr(x, y) => {
+                let (v, w) = x.eval(a, b).w();
+                V::W(v | y.eval(a, b).w().0, w)
+            }
+            E::BvXor(x, y) => {
+                let (v, w) = x.eval(a, b).w();
+                V::W(v ^ y.eval(a, b).w().0, w)
+            }
+            E::BvAdd(x, y) => {
+                let (v, w) = x.eval(a, b).w();
+                V::W(v.wrapping_add(y.eval(a, b).w().0) & bit_mask(w), w)
+            }
+            E::BvSub(x, y) => {
+                let (v, w) = x.eval(a, b).w();
+                V::W(v.wrapping_sub(y.eval(a, b).w().0) & bit_mask(w), w)
+            }
+            E::BvMul(x, y) => {
+                let (v, w) = x.eval(a, b).w();
+                V::W(v.wrapping_mul(y.eval(a, b).w().0) & bit_mask(w), w)
+            }
+            E::BvShl(x, y) => {
+                let (v, w) = x.eval(a, b).w();
+                let sh = y.eval(a, b).w().0;
+                V::W(if sh >= w as u64 { 0 } else { (v << sh) & bit_mask(w) }, w)
+            }
+            E::BvLShr(x, y) => {
+                let (v, w) = x.eval(a, b).w();
+                let sh = y.eval(a, b).w().0;
+                V::W(if sh >= w as u64 { 0 } else { v >> sh }, w)
+            }
+            E::BvAshr(x, y) => {
+                let (v, w) = x.eval(a, b).w();
+                let sh = y.eval(a, b).w().0;
+                let sign = (v >> (w - 1)) & 1 == 1;
+                let r = if sh >= w as u64 {
+                    if sign {
+                        bit_mask(w)
+                    } else {
+                        0
+                    }
+                } else if sign {
+                    (v >> sh) | !(bit_mask(w) >> sh)
+                } else {
+                    v >> sh
+                };
+                V::W(r & bit_mask(w), w)
+            }
+            E::Eq(x, y) => V::B(x.eval(a, b).w().0 == y.eval(a, b).w().0),
+            E::BvUlt(x, y) => V::B(x.eval(a, b).w().0 < y.eval(a, b).w().0),
+            E::BvUle(x, y) => V::B(x.eval(a, b).w().0 <= y.eval(a, b).w().0),
+            E::Extract(hi, lo, x) => {
+                let (v, _) = x.eval(a, b).w();
+                let width = hi - lo + 1;
+                V::W((v >> lo) & bit_mask(width), width)
+            }
+            E::ZeroExtend(n, x) => {
+                let (v, w) = x.eval(a, b).w();
+                V::W(v, w + n)
+            }
+            E::Ite(c, t, e) => {
+                if c.eval(a, b).b() {
+                    t.eval(a, b)
+                } else {
+                    e.eval(a, b)
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum V {
+    B(bool),
+    W(u64, u8),
+}
+
+impl V {
+    fn b(self) -> bool {
+        match self {
+            V::B(v) => v,
+            V::W(v, _) => v != 0,
+        }
+    }
+    fn w(self) -> (u64, u8) {
+        match self {
+            V::W(v, w) => (v & bit_mask(w), w),
+            V::B(v) => (u64::from(v), 1),
+        }
+    }
+}
+
+struct Reader<'a> {
+    s: &'a [u8],
+    i: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(s: &'a str) -> Self {
+        Reader {
+            s: s.as_bytes(),
+            i: 0,
+        }
+    }
+
+    fn skip_ws(&mut self) {
+        while self.i < self.s.len() && self.s[self.i].is_ascii_whitespace() {
+            self.i += 1;
+        }
+    }
+
+    fn token(&mut self) -> Result<String, String> {
+        self.skip_ws();
+        let start = self.i;
+        while self.i < self.s.len()
+            && !self.s[self.i].is_ascii_whitespace()
+            && self.s[self.i] != b'('
+            && self.s[self.i] != b')'
+        {
+            self.i += 1;
+        }
+        if start == self.i {
+            return Err(format!("expected a token at byte {}", self.i));
+        }
+        Ok(String::from_utf8_lossy(&self.s[start..self.i]).into_owned())
+    }
+
+    fn eat(&mut self, c: u8) -> Result<(), String> {
+        self.skip_ws();
+        if self.i < self.s.len() && self.s[self.i] == c {
+            self.i += 1;
+            Ok(())
+        } else {
+            Err(format!("expected '{}' at byte {}", c as char, self.i))
+        }
+    }
+
+    fn peek(&mut self) -> Option<u8> {
+        self.skip_ws();
+        self.s.get(self.i).copied()
+    }
+
+    fn width_of(&self, name: &str) -> Result<u8, String> {
+        let rest = name
+            .strip_prefix('x')
+            .ok_or_else(|| format!("unknown symbol {}", name))?;
+        let (_idx, w) = rest
+            .split_once('_')
+            .ok_or_else(|| format!("bad symbol {}", name))?;
+        w.parse::<u8>().map_err(|_| format!("bad width in {}", name))
+    }
+
+    fn index_of(&self, name: &str) -> Result<u32, String> {
+        let rest = name
+            .strip_prefix('x')
+            .ok_or_else(|| format!("unknown symbol {}", name))?;
+        let (idx, _w) = rest
+            .split_once('_')
+            .ok_or_else(|| format!("bad symbol {}", name))?;
+        idx.parse::<u32>()
+            .map_err(|_| format!("bad index in {}", name))
+    }
+
+    fn term(&mut self) -> Result<E, String> {
+        self.skip_ws();
+        if self.peek() == Some(b'(') {
+            return self.list();
+        }
+        let t = self.token()?;
+        match t.as_str() {
+            "true" => Ok(E::BoolConst(true)),
+            "false" => Ok(E::BoolConst(false)),
+            _ => {
+                let w = self.width_of(&t)?;
+                let idx = self.index_of(&t)?;
+                Ok(E::Var(idx, w))
+            }
+        }
+    }
+
+    fn list(&mut self) -> Result<E, String> {
+        self.eat(b'(')?;
+        if self.peek() == Some(b'_') {
+            return self.indexed();
+        }
+        let head = self.token()?;
+        let out = match head.as_str() {
+            "not" => E::Not(Box::new(self.bool_arg()?)),
+            "and" => {
+                let a = self.bool_arg()?;
+                let b = self.bool_arg()?;
+                E::And(Box::new(a), Box::new(b))
+            }
+            "or" => {
+                let a = self.bool_arg()?;
+                let b = self.bool_arg()?;
+                E::Or(Box::new(a), Box::new(b))
+            }
+            "xor" => {
+                let a = self.bool_arg()?;
+                let b = self.bool_arg()?;
+                E::Xor(Box::new(a), Box::new(b))
+            }
+            "distinct" => {
+                let a = self.term()?;
+                let b = self.term()?;
+                if a.sort() != b.sort() {
+                    return Err("distinct on different sorts".into());
+                }
+                if b.eval(0, 0).w().0 != 0 {
+                    return Err("distinct with a nonzero constant".into());
+                }
+                E::Not(Box::new(E::Eq(
+                    Box::new(a),
+                    Box::new(E::BvConst(0, b.eval(0, 0).w().1)),
+                )))
+            }
+            "bvnot" => E::BvNot(Box::new(self.bv_arg()?)),
+            "bvand" => {
+                let a = self.bv_arg()?;
+                let b = self.bv_arg()?;
+                same_width(&a, &b, "bvand")?;
+                E::BvAnd(Box::new(a), Box::new(b))
+            }
+            "bvor" => {
+                let a = self.bv_arg()?;
+                let b = self.bv_arg()?;
+                same_width(&a, &b, "bvor")?;
+                E::BvOr(Box::new(a), Box::new(b))
+            }
+            "bvxor" => {
+                let a = self.bv_arg()?;
+                let b = self.bv_arg()?;
+                same_width(&a, &b, "bvxor")?;
+                E::BvXor(Box::new(a), Box::new(b))
+            }
+            "bvadd" => {
+                let a = self.bv_arg()?;
+                let b = self.bv_arg()?;
+                same_width(&a, &b, "bvadd")?;
+                E::BvAdd(Box::new(a), Box::new(b))
+            }
+            "bvsub" => {
+                let a = self.bv_arg()?;
+                let b = self.bv_arg()?;
+                same_width(&a, &b, "bvsub")?;
+                E::BvSub(Box::new(a), Box::new(b))
+            }
+            "bvmul" => {
+                let a = self.bv_arg()?;
+                let b = self.bv_arg()?;
+                same_width(&a, &b, "bvmul")?;
+                E::BvMul(Box::new(a), Box::new(b))
+            }
+            "bvshl" => {
+                let a = self.bv_arg()?;
+                let b = self.bv_arg()?;
+                same_width(&a, &b, "bvshl")?;
+                E::BvShl(Box::new(a), Box::new(b))
+            }
+            "bvlshr" => {
+                let a = self.bv_arg()?;
+                let b = self.bv_arg()?;
+                same_width(&a, &b, "bvlshr")?;
+                E::BvLShr(Box::new(a), Box::new(b))
+            }
+            "bvashr" => {
+                let a = self.bv_arg()?;
+                let b = self.bv_arg()?;
+                same_width(&a, &b, "bvashr")?;
+                E::BvAshr(Box::new(a), Box::new(b))
+            }
+            "=" => {
+                let a = self.bv_arg()?;
+                let b = self.bv_arg()?;
+                same_width(&a, &b, "=")?;
+                E::Eq(Box::new(a), Box::new(b))
+            }
+            "bvult" => {
+                let a = self.bv_arg()?;
+                let b = self.bv_arg()?;
+                same_width(&a, &b, "bvult")?;
+                E::BvUlt(Box::new(a), Box::new(b))
+            }
+            "bvule" => {
+                let a = self.bv_arg()?;
+                let b = self.bv_arg()?;
+                same_width(&a, &b, "bvule")?;
+                E::BvUle(Box::new(a), Box::new(b))
+            }
+            "ite" => {
+                let c = self.bool_arg()?;
+                let t = self.bv_arg()?;
+                let e = self.bv_arg()?;
+                same_width(&t, &e, "ite branches")?;
+                E::Ite(Box::new(c), Box::new(t), Box::new(e))
+            }
+            other => return Err(format!("unknown operator {}", other)),
+        };
+        self.eat(b')')?;
+        Ok(out)
+    }
+
+    /// `(_ bvN w)`, `((_ extract hi lo) x)`, `((_ zero_extend n) x)`.
+    fn indexed(&mut self) -> Result<E, String> {
+        self.eat(b'_')?;
+        let head = self.token()?;
+        if let Some(num) = head.strip_prefix("bv") {
+            let v: u128 = num
+                .parse()
+                .map_err(|_| format!("bad bv literal {}", num))?;
+            let w: u8 = self
+                .token()?
+                .parse()
+                .map_err(|_| "bad bv width".to_string())?;
+            self.eat(b')')?;
+            if w < 64 && v >= (1u128 << w) {
+                return Err(format!("(_ bv{} {}) does not fit {} bits", v, w, w));
+            }
+            return Ok(E::BvConst(v as u64, w));
+        }
+        let (hi, lo) = match head.as_str() {
+            "extract" => {
+                let h: u8 = self
+                    .token()?
+                    .parse()
+                    .map_err(|_| "bad extract hi".to_string())?;
+                let l: u8 = self
+                    .token()?
+                    .parse()
+                    .map_err(|_| "bad extract lo".to_string())?;
+                (h, l)
+            }
+            "zero_extend" => {
+                let n: u8 = self
+                    .token()?
+                    .parse()
+                    .map_err(|_| "bad zero_extend".to_string())?;
+                (n, 0)
+            }
+            other => return Err(format!("unknown indexed operator {}", other)),
+        };
+        self.eat(b')')?;
+        let arg = self.bv_arg()?;
+        self.eat(b')')?;
+        match head.as_str() {
+            "extract" => {
+                if hi < lo {
+                    return Err("extract with hi < lo".into());
+                }
+                if let Sort::Bv(aw) = arg.sort() {
+                    if hi >= aw {
+                        return Err(format!("extract {} {} from a {}-bit vector", hi, lo, aw));
+                    }
+                }
+                Ok(E::Extract(hi, lo, Box::new(arg)))
+            }
+            _ => Ok(E::ZeroExtend(hi, Box::new(arg))),
+        }
+    }
+
+    fn bool_arg(&mut self) -> Result<E, String> {
+        let t = self.term()?;
+        if t.sort() != Sort::Bool {
+            return Err(format!("expected a boolean, found {:?}", t.sort()));
+        }
+        Ok(t)
+    }
+
+    fn bv_arg(&mut self) -> Result<E, String> {
+        let t = self.term()?;
+        if let Sort::Bv(_) = t.sort() {
+            Ok(t)
+        } else {
+            Err(format!("expected a bit-vector, found {:?}", t.sort()))
+        }
+    }
+}
+
+fn same_width(a: &E, b: &E, who: &str) -> Result<(), String> {
+    if a.sort() != b.sort() {
+        Err(format!(
+            "{} on different widths: {:?} vs {:?}",
+            who,
+            a.sort(),
+            b.sort()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Parse an exported query, checking sorts, and return the last assertion (the goal, which
+/// the exporter has already negated).
+fn parse_exported(text: &str) -> Result<E, String> {
+    let mut goal = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(';') || !line.starts_with("(assert") {
+            continue;
+        }
+        let inner = line
+            .strip_prefix("(assert")
+            .and_then(|r| r.strip_suffix(')'))
+            .ok_or_else(|| format!("malformed assert: {}", line))?;
+        let mut r = Reader::new(inner);
+        goal = Some(r.term()?);
+        r.skip_ws();
+        if r.i != r.s.len() {
+            return Err(format!("trailing text in assert: {}", line));
+        }
+    }
+    goal.ok_or_else(|| "no assert found".to_string())
+}
+
+#[test]
+fn the_exported_smtlib2_is_well_sorted_and_means_the_same_thing() {
+    let mut r = FuzzLcg(0x5eed_1234_abcd_0001);
+    let mut checked = 0u32;
+    for _ in 0..150 {
+        let p = pfuzz_pred(&mut r, 3);
+        let text = smt::with_fresh(|| {
+            let a = var(8);
+            let b = var(8);
+            let pred = p.build(a, b);
+            Query::new(&[a, b], pred).to_smtlib2_string()
+        });
+        let parsed = match parse_exported(&text) {
+            Ok(e) => e,
+            Err(e) => panic!("export was not well-sorted: {}\n{}", e, text),
+        };
+        // The exporter asserts the *negation* of the goal, so the parsed text must be
+        // false exactly when the predicate is true.
+        for a in 0..=255u64 {
+            for b in 0..=255u64 {
+                let want = !p.eval(a as u8, b as u8);
+                let got = parsed.eval(a, b).b();
+                assert_eq!(
+                    got,
+                    want,
+                    "export disagrees at (a, b) = ({}, {}) for {}\n{}",
+                    a,
+                    b,
+                    p.render(),
+                    text
+                );
+            }
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 150);
+}
+
+#[test]
+fn the_export_checker_rejects_what_the_old_exporter_printed() {
+    // Teeth: three shapes the exporter once emitted, each rejected by sort checking.
+    // 1. `bvnot` applied to a comparison (a boolean).
+    assert!(
+        parse_exported("(assert (bvnot (= x0_8 x1_8)))").is_err(),
+        "bvnot on a boolean must be rejected"
+    );
+    // 2. `extract` past the end of the vector.
+    assert!(
+        parse_exported("(assert (= x0_8 ((_ extract 15 0) x1_8)))").is_err(),
+        "extract 15 from 8 bits must be rejected"
+    );
+    // 3. A constant that does not fit its width.
+    assert!(
+        parse_exported("(assert (= x0_8 (_ bv300 8)))").is_err(),
+        "an oversized literal must be rejected"
+    );
+    // And a well-formed one is accepted, so the checker is not refusing everything.
+    assert!(parse_exported("(assert (= x0_8 (bvand x1_8 (_ bv255 8))))").is_ok());
+}
+
+#[test]
+fn the_export_keeps_a_constant_goal_upright() {
+    // Pinned directly: `truth(false)` must not export as `(assert false)`.
+    smt::with_fresh(|| {
+        let a = var(8);
+        let t = Query::new(&[a], smt::truth(true)).to_smtlib2_string();
+        let f = Query::new(&[a], smt::truth(false)).to_smtlib2_string();
+        // `true` exports as `(not true)` = false; `false` exports as `(not false)` = true.
+        assert!(!parse_exported(&t).unwrap().eval(0, 0).b(), "{}", t);
+        assert!(parse_exported(&f).unwrap().eval(0, 0).b(), "{}", f);
     });
 }

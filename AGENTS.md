@@ -443,6 +443,24 @@ and `exists_guarded` are *not* affected: an empty range yields `true`/`false` re
 which is correct for an empty range, and `inside` already treats an unrepresentable index as
 outside the bound rather than truncating it.
 
+## Read the printer with a parser, not with your eyes
+
+Three defects in the SMT-LIB2 exporter were found by *reading* the output: an inverted
+polarity, `bvnot` applied to a boolean, and `extract` for a widening truncate. Each was
+invisible in the source -- `write!(f, "(bvnot {})", ...)` looks fine -- and each made the
+external evidence not apply, because an ill-sorted file is rejected or misread.
+
+The fix for "reading is not a check" is a second implementation. `tests/differential.rs` now
+carries an independent SMT-LIB reader: it parses the export, rejects any ill-sorted operator
+application (the three shapes above are its regression cases), and *evaluates* the parsed
+term over all 65 536 inputs to compare against the predicate it came from. The exporter and
+the engine are no longer the only two things that agree with each other.
+
+The general lesson, and the reason it took three rounds: a printer's contract is
+well-sortedness *and* meaning, and the two fail differently. Meaning you can only check by
+evaluating; sort you can only check by knowing the operand types, which means the checker has
+to be a type checker, not a text diff.
+
 ## Vacuity is a property of the *path*, not just the premise
 
 The seventh hole was an unsatisfiable precondition. The next one is the same failure one
