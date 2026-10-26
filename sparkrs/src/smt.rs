@@ -666,6 +666,17 @@ impl Ctx {
             self.overflow = true;
             return Term(0);
         }
+        // A variable is identified by its *index*, and the blaster keys its BDD variables
+        // by `(index, bit)`. Declaring the same index at two widths therefore aliases the
+        // low bits: `var_named(0, 8)` and `var_named(0, 16)` share bits 0..7, so
+        // `a == 3 => truncate(b, 8) == 3` was proved -- a theorem about one variable
+        // silently constraining another. Same index at the same width is the intended
+        // "fetch the same variable again" case and stays allowed; a width change is a
+        // modelling mistake, and the honest answer is to refuse the query.
+        let prev = self.var_width[idx as usize];
+        if prev != 0 && prev != width {
+            self.ill_formed = true;
+        }
         self.var_width[idx as usize] = width;
         if idx as usize + 1 > self.n_vars {
             self.n_vars = idx as usize + 1;
@@ -1836,6 +1847,38 @@ mod subst_tests {
             let p = and(eq_const(x, 1), eq_const(y, 2));
             let q = substitute(p, &[(x, word(1, 8)), (y, word(2, 8))]);
             assert_eq!(prove(q), Verdict::Valid);
+        });
+    }
+}
+
+#[cfg(test)]
+mod var_tests {
+    use super::*;
+
+    #[test]
+    fn one_index_at_two_widths_is_refused() {
+        // The low bits of the two declarations are the same BDD variables, so without the
+        // refusal `b`'s low byte is `a` and this comes out `Valid`.
+        with_fresh(|| {
+            let a = var_named(0, 8);
+            let b = var_named(0, 16);
+            let forced = implies(eq_const(a, 3), eq_const(truncate(b, 8), 3));
+            assert_eq!(
+                prove(forced),
+                Verdict::Unknown,
+                "a re-declared index at a different width must not alias"
+            );
+        });
+    }
+
+    #[test]
+    fn one_index_at_one_width_is_the_same_variable() {
+        // The intended use: naming a variable for a readable model. Fetching it twice
+        // gives the same variable, which is what makes an explicit index useful.
+        with_fresh(|| {
+            let a = var_named(0, 8);
+            let b = var_named(0, 8);
+            assert_eq!(prove(eq(a, b)), Verdict::Valid);
         });
     }
 }

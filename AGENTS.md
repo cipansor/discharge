@@ -443,6 +443,20 @@ and `exists_guarded` are *not* affected: an empty range yields `true`/`false` re
 which is correct for an empty range, and `inside` already treats an unrepresentable index as
 outside the bound rather than truncating it.
 
+## One variable index is one variable, at one width
+
+The blaster keys its BDD variables by `(index, bit)`, and a variable's index is what
+`var_named` sets. Declaring the same index at two widths therefore aliases the low bits:
+`var_named(0, 8)` and `var_named(0, 16)` share bits 0..7, so `a == 3 => truncate(b, 8) == 3`
+came back `Valid` -- a theorem about one variable silently constraining another. The engine
+even handed back a counterexample naming one `(0, 16)` assignment while the model also touched
+`(0, 8)`, because the model builder reports one entry per index.
+
+`var_named(idx, w)` called twice at the same `w` is the intended "name a variable for a
+readable model" case and stays allowed; calling it at a *different* width is a modelling
+mistake, and the query is now refused. The general rule: if a name carries an index, the
+index has to determine the variable completely, or the name is not a name.
+
 ## A proof that never mentions the thing it is named after
 
 `verify_scale_identity` was documented as proving `k * SCALE / SCALE == k`, but its formula
