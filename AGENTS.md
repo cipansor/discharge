@@ -400,6 +400,29 @@ count, so the figure is a command rather than a memory. Run it before writing th
 
 If a claim is worth putting in a commit message, it is worth the command that produces it.
 
+## A literal is a claim about a width
+
+`word(v, w)` truncated `v` to `w` bits. `word(300, 8)` was the same term as `word(44, 8)`, so
+the DSL expression `x + 300u32` on a `u8` silently meant `x + 44`, and the engine would
+happily return a counterexample or a proof about a constant nobody wrote. `eq_const` already
+refused an out-of-range constant, so the two spellings of the same intent disagreed -- a
+sure sign that one of them was wrong.
+
+`word` now marks the term, and the query answers `Unknown`. The one legitimate use of the
+truncation was the "all ones" idiom, `word(u64::MAX, w)`, used for a mask or a maximum; that
+is now `all_ones(w)`, which says what it means and does not read as a 64-bit constant.
+
+Two lessons.
+
+1. A helper that takes a value and a width has a contract, and "it fits" is part of it. When
+   the type system cannot express the constraint (a runtime `u64` and a runtime width), the
+   check has to be explicit and the failure has to be *visible* -- here, a refusal rather
+   than a wrapped value.
+
+2. When two entry points express the same idea (`eq_val` and `x + k`), test that they agree.
+   The disagreement was the bug, and it would have been caught by a one-line differential
+   test between the honest spelling and the convenient one.
+
 ## Vacuity is not only about widths
 
 The sixth hole was vacuity caused by a width: a bound too narrow to name `len`. The seventh is

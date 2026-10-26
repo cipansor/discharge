@@ -158,7 +158,7 @@ pub fn verify_saturating_add_monotone(width: u8, k: u64) -> Verdict {
         let b = smt::var(width);
         let ka = smt::word(k, width);
         // sat(x) = min(x + k, MAX). Model MAX as 2^width - 1.
-        let max = smt::word(u64::MAX, width);
+        let max = smt::all_ones(width);
         let sa = sat_add(a, ka, max, width);
         let sb = sat_add(b, ka, max, width);
         let pre = smt::ule(a, b);

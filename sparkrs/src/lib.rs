@@ -86,7 +86,7 @@ pub mod prelude {
     pub use crate::primitives::{safe_add, safe_div, safe_mul, safe_rem, safe_sub, Bounded};
     pub use crate::proof::{Certificate, Implication};
     pub use crate::smt::{
-        self, and, bits, eq, eq_const, find_model, iff, implies, index, ite, mul, not, or, prove,
+        self, all_ones, and, bits, eq, eq_const, find_model, iff, implies, index, ite, mul, not, or, prove,
         prove_equiv, prove_implies, ule, ule_const, ult, ult_const, var, var_named, word, Cex, Pred,
         Var, Verdict,
     };

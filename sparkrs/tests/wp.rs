@@ -1113,3 +1113,46 @@ fn the_export_widens_with_zero_extend() {
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// A constant that does not fit its width is a mistake, not a value to wrap.
+//
+// `x + 300u32` on a `u8` used to build the same term as `x + 44`: `word` truncated the
+// literal silently, and the proof then said something true about a constant nobody wrote.
+// `eq_const` already refuses an out-of-range constant, so the two spellings of the same
+// intent disagreed. `word` now marks the term, and the query answers `Unknown`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_constant_that_does_not_fit_its_width_is_not_wrapped() {
+    // `eq_const` already handles this one honestly and *decides* it: no 8-bit value
+    // equals 300, so the predicate is unsatisfiable. That is a real answer, not a refusal.
+    smt::with_fresh(|| {
+        let x = var(8);
+        assert_eq!(smt::prove(x.eq_val(300)), Verdict::Unsat);
+    });
+    // The DSL spelling used to wrap: `x + 300u32` built the same term as `x + 44`, so
+    // `sum == 44` came back as a counterexample instead of a refusal. It must refuse.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let sum = x + 300u32;
+        assert_eq!(smt::prove(sum.eq_val(44)), Verdict::Unknown);
+        assert_eq!(smt::prove(sum.eq_val(300)), Verdict::Unknown);
+    });
+    // `word` itself, for the same reason.
+    smt::with_fresh(|| {
+        assert_eq!(smt::prove(smt::word(300, 8).eq_val(44)), Verdict::Unknown);
+    });
+}
+
+#[test]
+fn a_constant_that_fits_is_unaffected() {
+    smt::with_fresh(|| {
+        let x = var(8);
+        // In-range literals, including the exact maximum, still decide normally.
+        assert_eq!(smt::prove((x + 44u32).eq_val(44).implies(x.eq_val(0))), Verdict::Valid);
+        assert_eq!(smt::prove((x & 0xffu32).le_val(255)), Verdict::Valid);
+        assert_eq!(smt::prove(smt::word(255, 8).le_val(255)), Verdict::Valid);
+        assert_eq!(smt::prove(smt::word(0, 8).eq_val(0)), Verdict::Valid);
+    });
+}

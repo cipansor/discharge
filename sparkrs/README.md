@@ -31,7 +31,7 @@ $ cargo run --features std --example flight_control
 [exhaustive] mapping is monotone           : true
 [kernel]    certificate accepted, value = 1500
 [refuted]   raw < ADC_MAX is false, witness raw = 4095
-[honesty]   (a*b)*c == a*(b*c) at 12 bits  : unknown (node budget exhausted)
+[honesty]   (a*b)*c == a*(b*c) at 12 bits  : unknown (no conclusion: budget exhausted, ill-formed width, or stale handle)
 
 all obligations discharged
 ```

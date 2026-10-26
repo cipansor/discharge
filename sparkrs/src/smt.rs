@@ -166,7 +166,15 @@ impl fmt::Display for Verdict {
             Verdict::Valid => write!(f, "valid (proved for all inputs)"),
             Verdict::Unsat => write!(f, "unsat (no input satisfies it)"),
             Verdict::Counterexample(c) => write!(f, "refuted: {}", c),
-            Verdict::Unknown => write!(f, "unknown (node budget exhausted)"),
+            // `Unknown` has more than one cause: the node budget, a width clash, an
+            // out-of-range variable index, or a stale handle. Naming only the budget made
+            // a width clash read as "try a smaller formula" when the formula was simply
+            // ill-formed. The cause is not carried in the verdict (it would widen a
+            // `Copy` enum used in hot loops), so the message stays general and honest.
+            Verdict::Unknown => write!(
+                f,
+                "unknown (no conclusion: budget exhausted, ill-formed width, or stale handle)"
+            ),
         }
     }
 }
@@ -1424,8 +1432,35 @@ pub fn index(v: Var) -> u32 {
 }
 
 /// A word-shaped constant.
+/// A constant of the given width.
+///
+/// `v` must fit in `width` bits. A constant that does not is a mistake in the
+/// specification, not a value to wrap: `word(300, 8)` would otherwise be the same term as
+/// `word(44, 8)`, and a DSL expression like `x + 300u32` on a `u8` would silently mean
+/// `x + 44`. `eq_const` already refuses an out-of-range constant; this marks the term
+/// instead, so the query answers `Unknown` rather than a verdict about a constant that was
+/// never written. [`all_ones`] and [`truncate`] remain the ways to say "wrap on purpose".
 pub fn word(v: u64, width: u8) -> Var {
-    with_ctx(|c| Var(c.konst(v, width)))
+    with_ctx(|c| {
+        if !fits(v, width) {
+            c.width_clash = true;
+        }
+        Var(c.konst(v, width))
+    })
+}
+
+/// The largest value of the given width, i.e. every bit set.
+///
+/// This is the explicit spelling of the "all ones" idiom, so that `word(u64::MAX, 8)` --
+/// which reads as a 64-bit constant but is the same term as `word(255, 8)` -- can go away.
+/// A mask or a maximum should say what it is rather than rely on truncation.
+pub fn all_ones(width: u8) -> Var {
+    word(if width >= 64 { u64::MAX } else { (1u64 << width) - 1 }, width)
+}
+
+/// Whether `v` is representable in `width` bits.
+fn fits(v: u64, width: u8) -> bool {
+    width >= 64 || v < (1u64 << width)
 }
 
 /// `true` / `false`.
@@ -1708,4 +1743,47 @@ pub fn substitute(p: Pred, bindings: &[(Var, Var)]) -> Pred {
         }
         Pred(c.subst(p.0))
     })
+}
+
+#[cfg(test)]
+mod word_tests {
+    use super::*;
+
+    #[test]
+    fn word_flags_a_constant_that_does_not_fit() {
+        // In range: no clash, and the value is exact.
+        with_fresh(|| {
+            assert_eq!(prove(eq_const(word(255, 8), 255)), Verdict::Valid);
+            assert_eq!(prove(eq_const(word(0, 8), 0)), Verdict::Valid);
+        });
+        // Out of range: refuse, do not wrap to `word(v & mask, w)`.
+        for (v, w) in [(256u64, 8u8), (300, 8), (u64::MAX, 8), (65536, 16)] {
+            with_fresh(|| {
+                let c = word(v, w);
+                assert_eq!(
+                    prove(eq_const(c, v & ((1u64 << w) - 1))),
+                    Verdict::Unknown,
+                    "word({}, {}) must not silently wrap",
+                    v,
+                    w
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn all_ones_is_the_explicit_mask() {
+        for w in [1u8, 4, 8, 16, 32, 64] {
+            with_fresh(|| {
+                let ones = all_ones(w);
+                // Every bit set: OR-ing in anything changes nothing.
+                let x = var(w);
+                assert_eq!(prove(eq(bor(x, ones), ones)), Verdict::Valid);
+            });
+        }
+        // And it does not trip the out-of-range check.
+        with_fresh(|| {
+            assert_eq!(prove(eq_const(all_ones(8), 255)), Verdict::Valid);
+        });
+    }
 }

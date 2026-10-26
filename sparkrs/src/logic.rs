@@ -113,7 +113,7 @@ pub fn verify_algebraic_identities() -> usize {
             let x = smt::var(w);
             let zero = smt::word(0, w);
             let one = smt::word(1, w);
-            let all_ones = smt::word(u64::MAX, w);
+            let all_ones = smt::all_ones(w);
             [
                 // x + 0 == x
                 smt::prove(smt::eq(smt::add(x, zero), x)),
