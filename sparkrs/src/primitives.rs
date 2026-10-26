@@ -44,6 +44,12 @@ pub const fn safe_rem(a: u32, b: u32) -> Option<u32> {
 ///
 /// The constructor is the only way in, so `Bounded<MIN, MAX>` is a
 /// refinement-typed integer: the invariant cannot be broken by construction.
+///
+/// Both constructors, [`new`](Self::new) and [`clamp`](Self::clamp), refuse an *empty*
+/// range: when `MIN > MAX` no `u64` satisfies `MIN <= v <= MAX`, so neither can produce a
+/// value. `clamp` used to return `MIN` in that case, which is outside `[LOW, HIGH]` and
+/// so broke the very invariant the type exists to carry; see
+/// `an_empty_bounded_range_admits_nothing` in the tests below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Bounded<const MIN: u64, const MAX: u64>(u64);
 
@@ -67,15 +73,25 @@ impl<const MIN: u64, const MAX: u64> Bounded<MIN, MAX> {
         self.0
     }
 
-    /// Clamp an arbitrary value into the range.
-    pub const fn clamp(v: u64) -> Self {
-        if v < MIN {
+    /// Clamp an arbitrary value into the range, or `None` when the range is empty.
+    ///
+    /// `MIN > MAX` is an empty range: no `u64` satisfies `MIN <= v <= MAX`, so there is
+    /// no value to return. Returning `MIN` (the old behaviour) produced a `Bounded` whose
+    /// `get()` is outside its own `[LOW, HIGH]`, which breaks the invariant the type
+    /// exists to carry -- `Bounded<100, 10>::clamp(50)` gave `100`, and `100 <= 10` is
+    /// false. [`new`](Self::new) already returns `None` for the same range, so the two
+    /// constructors now agree: an empty range admits nothing.
+    pub const fn clamp(v: u64) -> Option<Self> {
+        if MIN > MAX {
+            return None;
+        }
+        Some(if v < MIN {
             Bounded(MIN)
         } else if v > MAX {
             Bounded(MAX)
         } else {
             Bounded(v)
-        }
+        })
     }
 
     /// Add, or `None` if the sum leaves the range.
@@ -320,11 +336,30 @@ mod tests {
         type Pwm = Bounded<0, 1000>;
         assert_eq!(Pwm::new(500).unwrap().get(), 500);
         assert!(Pwm::new(1001).is_none());
-        assert_eq!(Pwm::clamp(5000).get(), 1000);
+        assert_eq!(Pwm::clamp(5000).unwrap().get(), 1000);
+        assert_eq!(Pwm::clamp(0).unwrap().get(), 0);
         let a = Pwm::new(600).unwrap();
         let b = Pwm::new(500).unwrap();
         // 600 + 500 = 1100 leaves [0, 1000], so the refinement rejects it.
         assert_eq!(a.add(b), None);
         assert_eq!(a.sub(b).unwrap().get(), 100);
+    }
+
+    #[test]
+    fn an_empty_bounded_range_admits_nothing() {
+        // `MIN > MAX` is an empty range, and every constructor must agree that no value
+        // is in it. `new` already returned `None`; `clamp` returned `MIN`, which is
+        // outside `[LOW, HIGH]` -- `Bounded<100, 10>::clamp(50)` gave `100`, and
+        // `100 <= 10` is false. A type whose whole purpose is to carry
+        // `LOW <= get() <= HIGH` cannot have a constructor that breaks it.
+        type Empty = Bounded<100, 10>;
+        assert_eq!(Empty::new(50), None, "new already refuses an empty range");
+        assert_eq!(Empty::clamp(50), None, "clamp must refuse it too");
+        assert_eq!(Empty::clamp(0), None);
+        assert_eq!(Empty::clamp(200), None);
+        // The control: a real range still clamps, in both directions and in the middle.
+        type Pwm = Bounded<0, 1000>;
+        assert_eq!(Pwm::clamp(5000).unwrap().get(), 1000);
+        assert_eq!(Pwm::clamp(500).unwrap().get(), 500);
     }
 }
