@@ -83,6 +83,13 @@ impl Shr<u32> for Var {
 // `x & 0xff` should read as a mask, not require spelling out `word(0xff, 32)`.
 // Both `u32` and `u64` literals are accepted because Rust will infer either
 // depending on how the specification is written.
+//
+// The set of operators here has to be *complete*, not merely the convenient ones. It
+// originally covered `+`, `*`, `&` and `|` but not `-` or `^`, so `x - 1u32` and
+// `x ^ 0xffu32` were compile errors while `x + 1u32` and `x & 0xffu32` were fine. A user
+// cannot predict which literal operations exist from the ones that do, and the DSL's whole
+// claim is that a specification reads like the expression it describes. Subtraction and
+// XOR by a constant are as natural as addition and AND, so all six are provided.
 macro_rules! impl_word_literal_ops {
     ($($t:ty),*) => {$(
         impl BitAnd<$t> for Var {
@@ -99,10 +106,24 @@ macro_rules! impl_word_literal_ops {
             }
         }
 
+        impl BitXor<$t> for Var {
+            type Output = Var;
+            fn bitxor(self, rhs: $t) -> Var {
+                smt::bxor(self, smt::word(rhs as u64, smt::bits(self)))
+            }
+        }
+
         impl Add<$t> for Var {
             type Output = Var;
             fn add(self, rhs: $t) -> Var {
                 smt::add(self, smt::word(rhs as u64, smt::bits(self)))
+            }
+        }
+
+        impl Sub<$t> for Var {
+            type Output = Var;
+            fn sub(self, rhs: $t) -> Var {
+                smt::sub(self, smt::word(rhs as u64, smt::bits(self)))
             }
         }
 

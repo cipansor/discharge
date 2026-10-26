@@ -424,6 +424,20 @@ inputs, and compares against running the same program concretely — exhaustive,
 depend on the BDD engine at all. The fix skips the payload field for `Trunc` and the three
 shifts, which the rebuild already carries across.
 
+## A DSL's operator set is a claim too
+
+The whole point of `sym` is that a specification reads like the expression it describes, so a
+gap in it is not cosmetic. The literal-operator impls covered `x + 1u32`, `x * 2u32`,
+`x & 0xffu32` and `x | 1u32` — but not `x - 1u32` or `x ^ 0xffu32`, which were compile errors.
+Nothing about the four that worked tells you the other two are missing; a user has to discover
+it by failing to compile, and a reader of the module cannot see the asymmetry at all.
+
+Subtraction and XOR by a constant are as natural as addition and AND, so all six are now
+provided, and `tests/sym.rs` pins each one against the `smt` primitive it is defined as. The
+same file's teeth: it also asserts the six are *different* from one another, so a future edit
+that wires every literal operator to `add` fails rather than passing six consistent
+identities. (The DSL had no test file before this, which is how the gap survived.)
+
 ## Mixed-width operations are refused, not truncated
 
 A bit-vector operation has no natural width when its operands disagree. The engine used to

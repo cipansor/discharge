@@ -925,6 +925,13 @@ The teeth check that matters is against the *real* rule: break `store_binds` so 
 the address, and the family reports `VERIFIED but 4320 sampled (array, address) pairs
 violate`. That is the harness doing its job on the code it exists to guard.
 
+The same "cover every module" rule caught `sym`, which had *no* test file at all. A DSL with
+no test is a module whose surface is only ever exercised by the doc example, and the doc
+example used one operator. Walking it turned up the missing literal `-` and `^` (see the
+README). A module that only wraps other modules still needs its own tests, because the
+*wrapping* is the code under test — an operator mapped to the wrong primitive is invisible to
+every test of the primitive.
+
 Also, twice now a heredoc-written patch has corrupted a file (a stray leading byte spliced
 into the first line). Prefer the editor tool for multi-line Rust; keep heredocs for shell.
 
