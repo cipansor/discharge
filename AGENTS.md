@@ -443,6 +443,25 @@ and `exists_guarded` are *not* affected: an empty range yields `true`/`false` re
 which is correct for an empty range, and `inside` already treats an unrepresentable index as
 outside the bound rather than truncating it.
 
+## A sufficient condition that goes vacuous is not a proof
+
+`verify_accumulator_no_overflow` proved "the sum cannot wrap" as `sum <= 2 * max`. That is a
+sufficient condition only while `2 * max` fits the width. When it does not, `ule_const` reads
+the bound as "every value is below it" and answers `true`, so the obligation was *vacuously*
+proved for exactly the `max` values whose sums overflow. `verify_accumulator_no_overflow(8, 200)`
+returned `Valid`, though 200 + 200 = 400 wraps to 144 in 8 bits. This is the whole safety
+argument for an accumulator, so the vacuity sat on the most load-bearing proof in the module.
+
+The fix is to test the property itself rather than a bound on it: a sum wraps exactly when
+`sum < a`, which is width-independent and needs no side condition. The lesson is that any
+"check `x <= bound`" goal has a `bound` large enough to make the check vacuous, and a proof
+obligation must be phrased so that no value of its parameters can make it trivial. When the
+goal mentions a constant, ask what happens when that constant is at the edge of its range.
+
+The test now asserts the positive case *and* the four refutations, checking they come back as
+counterexamples rather than merely "not proved", so a future fix that returns `Unknown` for
+everything cannot pass it.
+
 ## Refuse an ambiguous assignment, do not pick one
 
 `substitute` applied its bindings in order and kept the last for a repeated target, so a

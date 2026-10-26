@@ -102,16 +102,26 @@ impl<const MIN: u64, const MAX: u64> Bounded<MIN, MAX> {
 /// Proves that adding two values below `max` cannot wrap at the given width.
 ///
 /// This is the *whole* safety argument for an accumulator: if every term is
-/// `<= max` and `2 * max` fits in `width` bits, then no intermediate sum
-/// overflows. The caller supplies the width and `max`; the proof is
-/// unconditional.
+/// `<= max`, then no intermediate sum overflows. The caller supplies the width
+/// and `max`; the proof is unconditional, and it *refuses* when `max` is large
+/// enough that a sum can wrap.
 pub fn verify_accumulator_no_overflow(width: u8, max: u64) -> Verdict {
     smt::with_fresh(|| {
         let a = smt::var(width);
         let b = smt::var(width);
         let pre = smt::and(smt::ule_const(a, max), smt::ule_const(b, max));
         let sum = smt::add(a, b);
-        smt::prove_implies(pre, smt::ule_const(sum, max.saturating_mul(2)))
+        // "No overflow" is exactly "the wrapped sum is not below an operand": `a + b`
+        // wraps precisely when `sum < a`.
+        //
+        // The goal used to be `sum <= 2 * max`, which is only a sufficient condition and
+        // degenerates at the one place it matters. When `2 * max` does not fit the width,
+        // `ule_const` treats the bound as "every value is below it" and answers `true`, so
+        // the obligation was *vacuously* proved for exactly the `max` values whose sums do
+        // overflow: `verify_accumulator_no_overflow(8, 200)` came back `Valid`, though
+        // 200 + 200 = 400 wraps to 144 in 8 bits. Testing the wrap directly is
+        // width-independent and needs no side condition.
+        smt::prove_implies(pre, smt::ule(a, sum))
     })
 }
 
@@ -193,6 +203,26 @@ mod tests {
     fn accumulator_never_overflows() {
         // 12-bit terms bounded by 1000: 2000 fits, no wrap.
         assert!(verify_accumulator_no_overflow(12, 1000).is_proved());
+        // And it must refuse when the bound is too large for the width: 200 + 200 = 400
+        // wraps in 8 bits, so the claim is false and must not be proved. This is the case
+        // the old `sum <= 2 * max` goal got wrong, by going vacuous.
+        for (w, max) in [(8u8, 200u64), (8, 128), (8, 255), (16, 40000)] {
+            let v = verify_accumulator_no_overflow(w, max);
+            assert!(
+                !v.is_proved(),
+                "width {} max {} can overflow but was proved: {}",
+                w,
+                max,
+                v
+            );
+            assert!(
+                matches!(v, Verdict::Counterexample(_)),
+                "width {} max {} should be refuted with a witness, got {}",
+                w,
+                max,
+                v
+            );
+        }
     }
 
     #[test]
