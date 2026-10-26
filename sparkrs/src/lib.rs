@@ -23,6 +23,10 @@
 //! | [`mod@contract`] | `requires` / `ensures` / `invariant`, checked at runtime *and* provable symbolically. |
 //! | [`exhaustive`] | Complete proofs by enumeration over small domains. |
 //! | [`primitives`] | Drop-in safe integer ops whose absence of overflow is proved. |
+//! | [`wp`] | Weakest-precondition generation for statements, loops and calls, with a `Report`. |
+//! | [`mem`] | A bounded symbolic array with a proved `read`/`store` frame condition. |
+//! | [`quant`] | Bounded quantifiers, expanded into finite conjunctions. |
+//! | [`smtscript`] | SMT-LIB2 export, so an independent solver can decide a condition. |
 //!
 //! # The three ways this crate proves something
 //!
@@ -42,8 +46,10 @@
 //!
 //! It is not a replacement for SPARK's proof tooling, and it does not make
 //! arbitrary Rust correct. It reasons about **bit-vectors and boolean
-//! predicates**; it does not (yet) model memory, pointers, aliasing or
-//! concurrency. The BDD engine is not a CDCL SAT solver: equalities between two
+//! predicates**, plus one bounded *array* (`mem`, addressed by an integer). It
+//! does not model pointers, address arithmetic across objects, aliasing or
+//! concurrency: you cannot state "this pointer is valid" or "these two threads
+//! do not race". The BDD engine is not a CDCL SAT solver: equalities between two
 //! wide multipliers can hit the size wall, in which case the honest answer is
 //! `Unknown`. Read the module docs before trusting a green test.
 //!
