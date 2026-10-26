@@ -235,6 +235,24 @@ pub enum Rule {
     /// informative in that case. A per-path check would need the path predicate threaded
     /// into `collect`, which is the natural next step if this proves too weak in practice.
     VacuousAssume,
+    /// A call is made to a procedure whose postcondition cannot hold, so the callee never
+    /// returns.
+    ///
+    /// A `Call` is modelled as "assume `ensures`; continue". When `ensures` is
+    /// unsatisfiable that assumption is `false`, so the *continuation* becomes vacuous --
+    /// `false => Q` is a theorem -- and every claim after the call discharges for free.
+    /// A report that also had no loops would then say `verified` / `Total` about a program
+    /// that cannot reach its postcondition, because it never gets past the call. This is
+    /// the call analogue of [`Rule::VacuousAssume`]: a statement inside the body cuts the
+    /// path off, and everything downstream is vacuously true.
+    ///
+    /// Reported as a *failure*, like the other vacuity findings: the honest reading is
+    /// "nothing was proved", not "the contract holds". The callee itself is separately
+    /// unverified -- `verify_proc` on a body of `skip` with `ensures false` fails its own
+    /// contract -- so this finding is about the *caller*, which was trusting a contract
+    /// that no run can satisfy. See `a_call_to_a_never_returning_proc_is_not_total` in
+    /// `tests/call.rs`.
+    DivergentCall,
 }
 
 /// A verification condition, attributed to the rule that produced it.
@@ -306,7 +324,7 @@ pub fn obligations<'a>(
     post: Pred,
     out: &mut [Option<Obligation>],
 ) -> (Pred, usize) {
-    let (goal, n, _, _) = obligations_checked(s, post, out);
+    let (goal, n, _, _, _) = obligations_checked(s, post, out);
     (goal, n)
 }
 
@@ -320,13 +338,14 @@ fn obligations_checked<'a>(
     s: &'a Stmt<'a>,
     post: Pred,
     out: &mut [Option<Obligation>],
-) -> (Pred, usize, bool, bool) {
+) -> (Pred, usize, bool, bool, bool) {
     let mut n = 0;
     let mut overflow = false;
     let mut vacuous = false;
+    let mut divergent = false;
     let mut cursor = post;
-    collect(s, &mut cursor, out, 0, &mut n, &mut overflow, &mut vacuous);
-    (cursor, n, overflow, vacuous)
+    collect(s, &mut cursor, out, 0, &mut n, &mut overflow, &mut vacuous, &mut divergent);
+    (cursor, n, overflow, vacuous, divergent)
 }
 
 /// Walk `s` backwards, appending loop and assertion obligations to `out`.
@@ -349,12 +368,13 @@ fn collect<'a>(
     n: &mut usize,
     overflow: &mut bool,
     vacuous: &mut bool,
+    divergent: &mut bool,
 ) {
     match s {
         Stmt::Seq { first, second } => {
             // Backwards: handle the second statement first, then the first.
-            collect(second, cursor, out, start, n, overflow, vacuous);
-            collect(first, cursor, out, start, n, overflow, vacuous);
+            collect(second, cursor, out, start, n, overflow, vacuous, divergent);
+            collect(first, cursor, out, start, n, overflow, vacuous, divergent);
         }
         Stmt::Assign { var, expr } => {
             *cursor = smt::substitute(*cursor, &[(*var, *expr)]);
@@ -430,6 +450,17 @@ fn collect<'a>(
             let (havoc, n_havoc) = havoc_writes(actuals, writes);
             let renamed_ensures = smt::substitute(renamed_ensures, &havoc[..n_havoc]);
             let continuation = smt::substitute(*cursor, &havoc[..n_havoc]);
+            // A postcondition that cannot hold means the callee never returns, so the
+            // `implies(renamed_ensures, ...)` below is `false => ...` -- a theorem. Every
+            // claim after the call discharges for free and, with no loops in the program,
+            // the report says `verified` / `Total` about a program that cannot get past the
+            // call. Record it here, where the cut is, exactly as an unsatisfiable `Assume`
+            // is recorded. `prove(not ensures)` is a definite answer, and an `Unknown`
+            // leaves the report alone -- the same conservative choice the `Assume` arm
+            // makes.
+            if smt::prove(smt::not(renamed_ensures)).is_proved() {
+                *divergent = true;
+            }
             // A claim to the *right* of the call is only made for the states the call can
             // produce, so it must be checked under the assumption the call makes:
             // `ensures[actuals] => goal`, with the written targets havoced so the pre-call
@@ -500,11 +531,11 @@ fn collect<'a>(
             // not rewrite the sibling's obligations.
             let then_start = *n;
             let mut then_cursor = after;
-            collect(then_, &mut then_cursor, out, *n, n, overflow, vacuous);
+            collect(then_, &mut then_cursor, out, *n, n, overflow, vacuous, divergent);
             let then_end = *n;
             let else_start = *n;
             let mut else_cursor = after;
-            collect(else_, &mut else_cursor, out, *n, n, overflow, vacuous);
+            collect(else_, &mut else_cursor, out, *n, n, overflow, vacuous, divergent);
             let else_end = *n;
             // A claim in a branch is only made for the states that reach it, so each
             // branch's claims are checked under its guard. The guard is in the state at
@@ -567,7 +598,7 @@ fn collect<'a>(
             // the body's assignments have been applied, never substituted through them.
             let body_start = *n;
             let mut body_cursor = inv;
-            collect(body, &mut body_cursor, out, *n, n, overflow, vacuous);
+            collect(body, &mut body_cursor, out, *n, n, overflow, vacuous, divergent);
             let body_end = *n;
             guard_range(out, body_start, body_end, smt::and(inv, *cond));
             // A claim *after* the loop is only made for the states the loop can produce, so
@@ -1281,6 +1312,14 @@ impl Report {
                 // Present *and* proved: an obligation that did not discharge is not
                 // evidence of progress.
                 Rule::LoopVariant if ob.discharge().is_proved() => variants += 1,
+                // A call to a never-returning procedure is a termination finding, not a
+                // loop one, so it has to be checked here too. Without this, a program
+                // whose only divergence is a divergent call has `loops == variants == 0`
+                // and this method would report progress on the strength of the loops it
+                // does not have. `establishes` already refuses it via `is_verified`, but
+                // `correctness` asks this question alone, and the answer has to be right
+                // on its own.
+                Rule::DivergentCall => return false,
                 _ => {}
             }
         }
@@ -1361,7 +1400,7 @@ pub enum Correctness {
 /// first failure with the rule that produced it.
 pub fn verify(s: &Stmt<'_>, pre: Pred, post: Pred) -> Report {
     let mut slots: [Option<Obligation>; MAX_OBLIGATIONS + 1] = [None; MAX_OBLIGATIONS + 1];
-    let (goal, mut count, overflow, vacuous) = obligations_checked(s, post, &mut slots);
+    let (goal, mut count, overflow, vacuous, divergent) = obligations_checked(s, post, &mut slots);
 
     // An assertion's recorded goal has already been rewritten by the assignments
     // that dominate it, so it is `wp(prefix, c)`. The obligation to discharge is
@@ -1396,6 +1435,14 @@ pub fn verify(s: &Stmt<'_>, pre: Pred, post: Pred) -> Report {
     // since it says the contract was never about anything.
     if smt::prove(smt::not(pre)).is_proved() {
         push_notice(&mut slots, &mut count, Rule::VacuousPrecondition, smt::truth(false));
+    }
+
+    // A call to a procedure whose postcondition cannot hold never returns, so every claim
+    // after it is vacuously true. Same precedence argument as the two findings above:
+    // recorded last, in the reserved slot, because "the program cannot get past this call"
+    // is the strongest statement the report can make about it.
+    if divergent {
+        push_notice(&mut slots, &mut count, Rule::DivergentCall, smt::truth(false));
     }
 
     Report {

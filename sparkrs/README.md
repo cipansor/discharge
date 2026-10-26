@@ -630,6 +630,41 @@ The teeth are two-sided: `an_unreachable_precondition_is_not_a_proof` pins the r
 `a_reachable_precondition_is_still_proved` pins that a satisfiable precondition with a valid
 contract still verifies, so the check cannot pass by rejecting everything.
 
+### A call to a procedure that never returns is not a proof either
+
+The third of the vacuity kind — reached through a `Call` rather than an
+`Assume`. A callee whose postcondition is unsatisfiable never returns: `ensures false` says
+there is no state in which the call completes. A `Call` is modelled as "assume `ensures`;
+continue", so that assumption is `false`, the continuation becomes vacuous (`false => Q` is a
+theorem), and every claim after the call discharges for free. With no loops in the program,
+the report said:
+
+```
+is_verified() : true
+establishes() : Total
+```
+
+for `boom(); x := 7` with postcondition `x == 7`, where `boom` is `requires true; ensures
+false`. The program cannot get past the call, so the postcondition is never reached — and the
+report called that progress.
+
+This is the call-shaped twin of the unreachable-`Assume` hole, and it takes the same fix: the
+walk records a `Rule::DivergentCall` finding at the call site, where the cut is, and reports
+it as a failure. `Report::has_termination_proof` refuses it too, because a divergent call is a
+termination finding and `correctness()` asks about termination on its own — otherwise
+`loops == variants == 0` would read as progress on the strength of loops the program does not
+have.
+
+Two tests pin it, a matched pair again: `a_call_to_a_never_returning_proc_is_not_total` and,
+as the control, `a_call_to_a_proc_that_merely_returns_nothing_is_still_total`. Reverting the
+check fails the first and leaves the second green, so the fix refuses divergence, not calls.
+
+The general shape, now seen three times: **a construct that cuts a path off makes everything
+downstream vacuously true, and vacuous truth is indistinguishable from proof unless the cut is
+recorded as a failure.** `Assume(false)`, an unsatisfiable precondition, and a never-returning
+call are the three ways this fragment can cut a path, and each needed its own finding because
+each is a different statement in the calculus.
+
 ## A bound must be wider than the address, or "all cells" is vacuous
 
 The sixth hole, and the first of the *vacuity* kind. The previous five were summaries that
@@ -1014,6 +1049,12 @@ Honesty matters more than a nice README, so:
    nested loop" below.
 1d. **`with_fresh` must not be nested.** The inner call wipes the term arena and
    invalidates every `Var` the outer scope holds. One `with_fresh` per proof.
+1e. **A call to a procedure whose postcondition is unsatisfiable is refused, not
+   trusted.** `ensures false` means the callee never returns, so a caller's claims after
+   the call are vacuous. The report carries a `Rule::DivergentCall` failure rather than
+   calling it `Total`. This is the call-shaped twin of the unreachable-`Assume` and
+   unreachable-precondition findings; see "A call to a procedure that never returns is not
+   a proof either".
 2. **The BDD engine hits a wall, and says so.** Boolean *equality of two wide
    multipliers* is the classic blow-up: `(a*b)*c == a*(b*c)` at 12 bits returns
    `Unknown`, and the test suite asserts exactly that. This is why `Unknown` is a

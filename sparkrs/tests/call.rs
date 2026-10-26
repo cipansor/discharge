@@ -1086,3 +1086,79 @@ fn an_assertion_after_a_call_sees_the_call() {
         );
     });
 }
+
+#[test]
+fn a_call_to_a_never_returning_proc_is_not_total() {
+    // A callee whose postcondition is unsatisfiable never returns: `ensures false` says
+    // there is no state in which the call completes. A `Call` is modelled as "assume
+    // `ensures`; continue", so that assumption is `false`, the continuation becomes
+    // vacuous (`false => Q` is a theorem), and every claim after the call discharges for
+    // free. With no loops in the program the report used to say `verified` / `Total` --
+    // about a program that cannot get past the call.
+    //
+    // The callee is separately unverified, so this is not a claim about the callee: it is
+    // that the *caller* was trusting a contract no run can satisfy and the report called
+    // that progress. The finding is now `Rule::DivergentCall`, reported as a failure like
+    // the other vacuity findings.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let boom = Proc {
+            name: "boom",
+            requires: smt::truth(true),
+            ensures: smt::truth(false),
+            body: &Stmt::Skip,
+        };
+        let call = Stmt::Call { proc_: &boom, actuals: &[], writes: &[] };
+        let after = Stmt::Assign { var: x, expr: smt::word(7, 8) };
+        let body = Stmt::Seq { first: &call, second: &after };
+
+        let report = wp::verify(&body, smt::truth(true), x.eq_val(7));
+        assert!(
+            !report.is_verified(),
+            "a call to a never-returning procedure must not verify: {:?}",
+            report.correctness()
+        );
+        assert!(
+            report.obligations[..report.count]
+                .iter()
+                .flatten()
+                .any(|ob| ob.rule == Rule::DivergentCall),
+            "the divergence must be attributed to the call"
+        );
+        // `correctness` asks about termination alone, so it must refuse this too rather
+        // than seeing `loops == variants == 0` and calling it `Total`.
+        assert!(
+            !report.has_termination_proof(),
+            "a divergent call is not a termination proof"
+        );
+    });
+}
+
+#[test]
+fn a_call_to_a_proc_that_merely_returns_nothing_is_still_total() {
+    // The control: a call to a procedure that returns normally -- `ensures true`, no
+    // result pinned -- is not divergence, and must keep verifying. Without this the
+    // `DivergentCall` check would pass by flagging every call.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let nop = Proc {
+            name: "nop",
+            requires: smt::truth(true),
+            ensures: smt::truth(true),
+            body: &Stmt::Skip,
+        };
+        let call = Stmt::Call { proc_: &nop, actuals: &[], writes: &[] };
+        let after = Stmt::Assign { var: x, expr: smt::word(7, 8) };
+        let body = Stmt::Seq { first: &call, second: &after };
+
+        let report = wp::verify(&body, smt::truth(true), x.eq_val(7));
+        assert!(report.is_verified(), "a normal call must still verify");
+        assert!(
+            !report.obligations[..report.count]
+                .iter()
+                .flatten()
+                .any(|ob| ob.rule == Rule::DivergentCall),
+            "a returning call must not be flagged as divergent"
+        );
+    });
+}
