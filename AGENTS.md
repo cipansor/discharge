@@ -324,6 +324,47 @@ no teeth for checking *which* theorem was recorded. Structural equality does. Th
 point: when testing that an object records the right thing, compare structure, not semantics;
 if the object is constrained to be provable, semantics is constant and the test is vacuous.
 
+## A kernel rule with no bounds proves anything
+
+The `Theorem` impl for `Imp` was
+
+```rust
+impl<P, Q> Theorem for Imp<P, Q> {
+    type Proof = ImpProof<P, Q>;   // the *propositions*, not their proofs
+}
+```
+
+There is no bound on `P` or `Q`, and the associated type names `P` and `Q` rather than
+`P::Proof` and `Q::Proof`. So `assert_proof!(Imp<Truth, Falsity>)` compiled: the kernel
+accepted `Truth => Falsity`, a falsehood, while correctly rejecting `And<Truth, Falsity>` and
+`Equals<u8, u16>`. The module's doc says "if the reasoning is wrong, the program does not
+compile", and it was false for the one connective that carries reasoning. The fix is both
+bounds and the proof types:
+
+```rust
+impl<P: Theorem, Q: Theorem> Theorem for Imp<P, Q> {
+    type Proof = ImpProof<P::Proof, Q::Proof>;
+}
+```
+
+Two things had to be true for this to survive, and both are worth checking for elsewhere.
+
+1. **A missing bound is invisible until something requires it.** `And` and `Equals` carry
+   bounds (`P: Theorem, Q: Theorem`; `impl<A> Theorem for Equals<A, A>`), so a false `And` or a
+   false `Equals` fails to compile. `Imp` did not, and nothing noticed, because the only way to
+   notice is to ask for the proof of a false implication -- which no test did.
+
+2. **A constructor that does not type-check against the associated type is a warning nobody
+   reads.** `imp_intro` and `modus_ponens` already used `P::Proof`/`Q::Proof`, so they returned
+   `ImpProof<TruthProof, TruthProof>` while the associated type was `ImpProof<Truth, Truth>`.
+   That mismatch is a compile error the moment a test *names* the associated type, and no test
+   did. The regression test now names it, and the `compile_fail` doctest
+   `assert_proof!(Imp<Truth, Falsity>)` is the teeth: reverting the impl turns it red.
+
+The general rule for a proof kernel: every connective needs a `compile_fail` example for a
+*false* instance of it. A kernel is only as strong as its weakest rule, and the untested rule
+is the one that is wrong.
+
 ## A guard can be correct and still be untested
 
 While sweeping for the ninth hole I checked `MAX_VARS`. `var_term` refuses an index past the

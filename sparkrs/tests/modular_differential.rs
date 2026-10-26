@@ -1715,7 +1715,6 @@ fn leaked_seq(steps: &[Step], x: Var) -> &'static Stmt<'static> {
 }
 
 /// Execute the built program on one concrete input, `false` if an assertion fails.
-/// Execute the built program on one concrete input, `false` if an assertion fails.
 ///
 /// The state is threaded by `&mut` through the branches. Passing it by value instead
 /// loses every assignment made inside an `if`, which makes the interpreter disagree with

@@ -3,8 +3,8 @@
 
 use sparkrs::prelude::*;
 use sparkrs::proof::{
-    conj, conj_left, conj_right, id_imp, modus_ponens, truth_proof, And, Equals, Imp, Theorem,
-    Truth,
+    conj, conj_left, conj_right, id_imp, imp_intro, modus_ponens, truth_proof, And, Equals, Imp,
+    Theorem, Truth, TruthProof,
 };
 use sparkrs::smt::{self, Verdict};
 
@@ -30,6 +30,30 @@ fn modus_ponens_composes() {
     let out = modus_ponens::<Truth, Truth>(imp, truth_proof());
     // `out` has type TruthProof; the assertion is really that this compiles.
     let _ = out;
+}
+
+#[test]
+fn the_imp_associated_proof_type_is_a_function_between_proofs() {
+    // The `Theorem` impl for `Imp` once had no bounds and used the *propositions* `P, Q`
+    // as its `Proof` type, so `<Imp<Truth, Truth> as Theorem>::Proof` was
+    // `ImpProof<Truth, Truth>` while `id_imp` produced `ImpProof<TruthProof, TruthProof>`.
+    // Nothing caught the mismatch, because no test ever named the associated type -- and
+    // the same missing bound let `assert_proof!(Imp<Truth, Falsity>)` compile, so the
+    // kernel proved a falsehood. Naming the type here is what pins it: this does not
+    // compile unless `Proof` is `ImpProof<P::Proof, Q::Proof>`.
+    let via_constructor: <Imp<Truth, Truth> as Theorem>::Proof = id_imp::<Truth>();
+    let via_intro: <Imp<Truth, Truth> as Theorem>::Proof =
+        imp_intro::<Truth, Truth>(|t: TruthProof| t);
+    // And the two are usable by modus ponens, which is the point of the type.
+    let _a = modus_ponens::<Truth, Truth>(via_constructor, truth_proof());
+    let _b = modus_ponens::<Truth, Truth>(via_intro, truth_proof());
+
+    // The nested case: `Truth => (Truth => Truth)` is a theorem, and its proof type is a
+    // function from `TruthProof` to the proof of the inner implication. A wrong `Proof`
+    // type for `Imp` shows up here as a type error.
+    let nested: <Imp<Truth, Imp<Truth, Truth>> as Theorem>::Proof =
+        imp_intro::<Truth, Imp<Truth, Truth>>(|_| id_imp::<Truth>());
+    let _c = modus_ponens::<Truth, Imp<Truth, Truth>>(nested, truth_proof());
 }
 
 #[test]

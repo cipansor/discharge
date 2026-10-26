@@ -34,6 +34,21 @@
 //! assert_proof!(Falsity);
 //! ```
 //!
+//! The same must hold for a *false implication*, and it is a separate check because an
+//! implication is the one connective that carries reasoning. `Imp<P, Q>` is only a theorem
+//! when `P` and `Q` are, so `Truth => Falsity` must not compile:
+//!
+//! ```compile_fail
+//! use sparkrs::assert_proof;
+//! use sparkrs::proof::{Falsity, Imp, Truth};
+//! assert_proof!(Imp<Truth, Falsity>);
+//! ```
+//!
+//! This example is not decoration. The `Theorem` impl for `Imp` originally carried no
+//! bounds and used the *propositions* `P, Q` as its `Proof` type, so the kernel accepted
+//! `Truth => Falsity` -- a proof of a falsehood, from the module whose doc says a wrong
+//! proof does not compile. The two `compile_fail` examples are the teeth.
+//!
 //! # A proposition that is proved by the compiler
 //!
 //! ```
@@ -104,9 +119,22 @@ impl<P: Theorem, Q: Theorem> Theorem for And<P, Q> {
     type Proof = AndProof<P::Proof, Q::Proof>;
 }
 
-impl<P, Q> Theorem for Imp<P, Q> {
-    // A proof of `P => Q` is a function from proofs of `P` to proofs of `Q`.
-    type Proof = ImpProof<P, Q>;
+impl<P: Theorem, Q: Theorem> Theorem for Imp<P, Q> {
+    // A proof of `P => Q` is a function from proofs of `P` to proofs of `Q`, so the
+    // parameters are the *proof* types, not the propositions.
+    //
+    // Both bounds are load-bearing, and the first version of this impl had neither. With
+    // no bounds and `type Proof = ImpProof<P, Q>`, the associated type was the function
+    // `fn(P) -> Q` over the *propositions*, which is not a function between proofs at all
+    // -- and, because no bound mentioned `Theorem`, `assert_proof!(Imp<Truth, Falsity>)`
+    // compiled. The kernel accepted `Truth => Falsity`, a falsehood, while correctly
+    // rejecting `And<Truth, Falsity>` and `Equals<u8, u16>`; the module's own promise that
+    // "if the reasoning is wrong, the program does not compile" was false for the one
+    // connective that carries reasoning. `imp_intro` and `modus_ponens` already used
+    // `P::Proof`/`Q::Proof`, so the constructors did not type-check against the associated
+    // type either -- a mismatch nothing was testing, because no test named the associated
+    // type. `tests/kernel.rs` now does.
+    type Proof = ImpProof<P::Proof, Q::Proof>;
 }
 
 impl<A> Theorem for Equals<A, A> {
