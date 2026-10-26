@@ -332,11 +332,21 @@ pub fn verify_fixed_roundtrip() -> Verdict {
 }
 
 /// `k * SCALE / SCALE == k`, the fixed-point identity behind unit conversion.
+///
+/// Unlike [`verify_fixed_roundtrip`], which models `from_int`/`to_int` as the shift pair
+/// `<<` then `>>`, this one performs a real `bvmul` by the scale factor and *then* divides
+/// by shifting. That distinction is the whole content of the identity: the previous version
+/// was a copy of the roundtrip proof with only the local variable names changed, so it never
+/// mentioned a scale factor at all and would have "proved" the identity for any scale,
+/// including one that is not a power of two. Multiplying by the factor is what makes the
+/// statement be about unit conversion.
 pub fn verify_scale_identity() -> Verdict {
     smt::with_fresh(|| {
         let k = smt::var(8);
+        // `k < 16` keeps `k * 16` inside 8 bits, so the multiply itself cannot wrap and
+        // the only question is whether dividing by the scale recovers `k`.
         let small = smt::ult_const(k, 16);
-        let scaled = smt::shl(k, 4);
+        let scaled = smt::mul(k, smt::word(16, 8));
         let unscaled = smt::lshr(scaled, 4);
         smt::prove_implies(small, smt::eq(unscaled, k))
     })
@@ -400,6 +410,19 @@ mod tests {
     fn fixed_point_roundtrips() {
         assert!(verify_fixed_roundtrip().is_proved());
         assert!(verify_scale_identity().is_proved());
+        // Teeth: the identity must depend on the scale *being* `SCALE`. With a
+        // non-power-of-two factor the same shift does not recover `k`, so the multiply in
+        // the proof is load-bearing and this is not the roundtrip proof renamed.
+        smt::with_fresh(|| {
+            let k = smt::var(8);
+            let small = smt::ult_const(k, 16);
+            let scaled = smt::mul(k, smt::word(10, 8));
+            let unscaled = smt::lshr(scaled, 4);
+            assert!(
+                !smt::prove_implies(small, smt::eq(unscaled, k)).is_proved(),
+                "a scale of 10 must not satisfy the identity"
+            );
+        });
     }
 
     #[test]

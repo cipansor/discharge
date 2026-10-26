@@ -443,6 +443,20 @@ and `exists_guarded` are *not* affected: an empty range yields `true`/`false` re
 which is correct for an empty range, and `inside` already treats an unrepresentable index as
 outside the bound rather than truncating it.
 
+## A proof that never mentions the thing it is named after
+
+`verify_scale_identity` was documented as proving `k * SCALE / SCALE == k`, but its formula
+was the `verify_fixed_roundtrip` proof with the local variable names changed: `shl(k, 4)` then
+`lshr(..., 4)`. No scale factor appeared anywhere. The identity therefore held for *any* scale
+value, because the scale was never an input -- a multiplication by 10 instead of 16 would have
+"satisfied" it just the same. The function had a name, a doc comment and a passing test, and it
+proved the roundtrip lemma a second time.
+
+The fix is to actually multiply by the scale before dividing. The tell is general and cheap to
+apply: read the formula and check that every noun in the doc comment appears in it. A verifier
+whose name mentions a constant, a mode, a bound or a factor must have that thing as a term in
+its goal, or the parameter is decorative.
+
 ## A proof about the wrong quantity
 
 `verify_saturating_add_bounds` was documented as "the saturating result is always `>= a` and
