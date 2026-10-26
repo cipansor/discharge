@@ -227,6 +227,13 @@ pub enum Rule {
     /// "this Assume is unsatisfiable". Reported as a *failure*, like the other vacuity
     /// findings: the honest reading is "nothing was proved", not "the contract holds".
     /// See `an_unreachable_assume_is_not_a_proof` in `tests/wp.rs`.
+    ///
+    /// The check is *local*: it asks whether the condition can hold at all, not whether it
+    /// can hold on the path that reaches it. `Assume(y < 10)` under a precondition that
+    /// already forces `y >= 10` cuts the path but is individually satisfiable, so it is not
+    /// flagged. That is a limit, not an unsoundness -- the report is still sound, just less
+    /// informative in that case. A per-path check would need the path predicate threaded
+    /// into `collect`, which is the natural next step if this proves too weak in practice.
     VacuousAssume,
 }
 
