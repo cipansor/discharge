@@ -1156,3 +1156,60 @@ fn a_constant_that_fits_is_unaffected() {
         assert_eq!(smt::prove(smt::word(0, 8).eq_val(0)), Verdict::Valid);
     });
 }
+
+// ---------------------------------------------------------------------------
+// An unsatisfiable `Assume` makes everything after it vacuous.
+//
+// `Assume(false); y := 0` with postcondition `y == 99` used to come back `verified` and
+// `Total`: `false => wp(y := 0, y == 99)` is a theorem, so every obligation discharged and
+// the report claimed a proof of code no run can reach. This is the vacuity class one level
+// down from `VacuousPrecondition` -- the precondition is reachable, but a statement inside
+// the body cuts the path off. A *reachable* `Assume` is a normal modelling tool and must
+// still verify, so the check is "this Assume cannot hold", not "there is an Assume".
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unreachable_assume_is_not_a_proof() {
+    smt::with_fresh(|| {
+        let y = var(8);
+        let s = Stmt::Seq {
+            first: &Stmt::Assume(smt::truth(false)),
+            second: &Stmt::Assign { var: y, expr: smt::word(0, 8) },
+        };
+        let r = verify(&s, smt::truth(true), y.eq_val(99));
+        assert!(!r.is_verified(), "an unreachable assume certified y == 99");
+        assert_eq!(r.establishes(), Established::Nothing);
+        let (ob, v) = r.first_failure().expect("a failure was expected");
+        assert_eq!(ob.rule, Rule::VacuousAssume);
+        assert!(!v.is_proved());
+    });
+}
+
+#[test]
+fn a_contradicting_assume_is_caught() {
+    smt::with_fresh(|| {
+        let y = var(8);
+        // The first assume is reachable; the second contradicts it, so the path dies here.
+        let s = Stmt::Seq {
+            first: &Stmt::Assume(y.lt_val(10)),
+            second: &Stmt::Assume(smt::and(y.lt_val(10), y.gt_val(100))),
+        };
+        let r = verify(&s, smt::truth(true), y.eq_val(99));
+        assert!(!r.is_verified());
+        assert_eq!(r.first_failure().unwrap().0.rule, Rule::VacuousAssume);
+    });
+}
+
+#[test]
+fn a_reachable_assume_still_verifies() {
+    smt::with_fresh(|| {
+        let y = var(8);
+        let s = Stmt::Seq {
+            first: &Stmt::Assume(y.lt_val(10)),
+            second: &Stmt::Assign { var: y, expr: y },
+        };
+        let r = verify(&s, smt::truth(true), y.lt_val(10));
+        assert!(r.is_verified(), "a reachable assume must not be refused");
+        assert_eq!(r.establishes(), Established::Total);
+    });
+}

@@ -213,6 +213,21 @@ pub enum Rule {
     /// precondition, which is the case the probe hit. See
     /// `an_unreachable_precondition_is_not_a_proof` in `tests/wp.rs`.
     VacuousPrecondition,
+    /// An [`Stmt::Assume`] cannot hold, so everything after it is unreachable and every
+    /// obligation that follows is vacuously true.
+    ///
+    /// The same failure as [`Rule::VacuousPrecondition`], one level down: the precondition
+    /// is reachable, but a *statement inside the body* cuts the path off. `Assume(false);
+    /// y := 0` with postcondition `y == 99` used to come back `verified` / `Total`, because
+    /// `false => wp(y := 0, y == 99)` is a theorem. The proof constrains nothing, because
+    /// no run reaches the code it is supposed to be about.
+    ///
+    /// A reachable `Assume` is fine and common -- it is how a callee guard or a
+    /// case-analysis split is written -- so this is not "Assume is suspicious", it is
+    /// "this Assume is unsatisfiable". Reported as a *failure*, like the other vacuity
+    /// findings: the honest reading is "nothing was proved", not "the contract holds".
+    /// See `an_unreachable_assume_is_not_a_proof` in `tests/wp.rs`.
+    VacuousAssume,
 }
 
 /// A verification condition, attributed to the rule that produced it.
@@ -284,7 +299,7 @@ pub fn obligations<'a>(
     post: Pred,
     out: &mut [Option<Obligation>],
 ) -> (Pred, usize) {
-    let (goal, n, _) = obligations_checked(s, post, out);
+    let (goal, n, _, _) = obligations_checked(s, post, out);
     (goal, n)
 }
 
@@ -298,12 +313,13 @@ fn obligations_checked<'a>(
     s: &'a Stmt<'a>,
     post: Pred,
     out: &mut [Option<Obligation>],
-) -> (Pred, usize, bool) {
+) -> (Pred, usize, bool, bool) {
     let mut n = 0;
     let mut overflow = false;
+    let mut vacuous = false;
     let mut cursor = post;
-    collect(s, &mut cursor, out, 0, &mut n, &mut overflow);
-    (cursor, n, overflow)
+    collect(s, &mut cursor, out, 0, &mut n, &mut overflow, &mut vacuous);
+    (cursor, n, overflow, vacuous)
 }
 
 /// Walk `s` backwards, appending loop and assertion obligations to `out`.
@@ -317,6 +333,7 @@ fn obligations_checked<'a>(
 /// assignment rewrites only the slots in `start..*n`, which keeps a branch's
 /// assignments from reaching into the sibling branch's obligations while still
 /// letting the enclosing assignments rewrite both.
+#[allow(clippy::too_many_arguments)]
 fn collect<'a>(
     s: &'a Stmt<'a>,
     cursor: &mut Pred,
@@ -324,18 +341,21 @@ fn collect<'a>(
     start: usize,
     n: &mut usize,
     overflow: &mut bool,
+    vacuous: &mut bool,
 ) {
     match s {
         Stmt::Seq { first, second } => {
             // Backwards: handle the second statement first, then the first.
-            collect(second, cursor, out, start, n, overflow);
-            collect(first, cursor, out, start, n, overflow);
+            collect(second, cursor, out, start, n, overflow, vacuous);
+            collect(first, cursor, out, start, n, overflow, vacuous);
         }
         Stmt::Assign { var, expr } => {
             *cursor = smt::substitute(*cursor, &[(*var, *expr)]);
             // Assertions recorded to the right are reached only after this
-            // assignment, so it dominates them and must be substituted in.
-            for slot in out[start..*n].iter_mut() {
+            // assignment, so it dominates them and must be substituted in. Bounded by
+            // `program_limit` so the reserved notice slot is never rewritten here.
+            let stop = (*n).min(program_limit(out));
+            for slot in out[start..stop].iter_mut() {
                 if let Some(ob) = slot {
                     if ob.rule == Rule::Assertion || ob.rule == Rule::CallRequires {
                         *slot = Some(Obligation::new(
@@ -403,6 +423,14 @@ fn collect<'a>(
             *cursor = smt::implies(renamed_ensures, continuation);
         }
         Stmt::Assume(c) => {
+            // An `Assume` that cannot hold makes every obligation after it vacuous, and
+            // `is_verified` cannot see that: `false => Q` is a theorem for any `Q`. Record
+            // the finding at the Assume itself, where the cut is, rather than letting the
+            // report claim a proof of unreachable code. `prove(not c)` is a definite
+            // answer; an `Unknown` here leaves the report alone.
+            if smt::prove(smt::not(*c)).is_proved() {
+                *vacuous = true;
+            }
             *cursor = smt::implies(*c, *cursor);
         }
         Stmt::Assert(c) => {
@@ -415,9 +443,9 @@ fn collect<'a>(
             // Each branch is walked in its own slot range so its assignments do
             // not rewrite the sibling's obligations.
             let mut then_cursor = after;
-            collect(then_, &mut then_cursor, out, *n, n, overflow);
+            collect(then_, &mut then_cursor, out, *n, n, overflow, vacuous);
             let mut else_cursor = after;
-            collect(else_, &mut else_cursor, out, *n, n, overflow);
+            collect(else_, &mut else_cursor, out, *n, n, overflow, vacuous);
             *cursor = ite_pred(*cond, then_cursor, else_cursor);
         }
         Stmt::While { cond, invariant, variant, body } => {
@@ -456,7 +484,7 @@ fn collect<'a>(
             // Obligations inside the body are checked under the invariant and the
             // guard, which is the context every iteration begins from.
             let mut body_cursor = inv;
-            collect(body, &mut body_cursor, out, *n, n, overflow);
+            collect(body, &mut body_cursor, out, *n, n, overflow, vacuous);
             // All a caller may assume after the loop is the invariant.
             *cursor = inv;
         }
@@ -626,6 +654,13 @@ fn push(out: &mut [Option<Obligation>], n: &mut usize, rule: Rule, goal: Pred) {
 /// report unverified, and the newer one is the stronger statement: a vacuous precondition
 /// says the contract was never about anything, which is worth more than "some obligations
 /// did not fit". Either way nothing is silently lost.
+/// Record a report-level finding in the reserved trailing slot.
+///
+/// There is exactly one reserved slot and up to three findings, so the calls are ordered
+/// from least to most severe: the reserved slot is overwritten by each later call, and the
+/// most severe finding is the one that survives. `Rule::VacuousPrecondition` is last and
+/// therefore wins, which is the documented precedence -- a contract that was never about
+/// anything is the stronger statement.
 fn push_notice(out: &mut [Option<Obligation>], n: &mut usize, rule: Rule, goal: Pred) {
     if *n < out.len() {
         out[*n] = Some(Obligation::new(rule, goal));
@@ -1173,7 +1208,7 @@ pub enum Correctness {
 /// first failure with the rule that produced it.
 pub fn verify(s: &Stmt<'_>, pre: Pred, post: Pred) -> Report {
     let mut slots: [Option<Obligation>; MAX_OBLIGATIONS + 1] = [None; MAX_OBLIGATIONS + 1];
-    let (goal, mut count, overflow) = obligations_checked(s, post, &mut slots);
+    let (goal, mut count, overflow, vacuous) = obligations_checked(s, post, &mut slots);
 
     // An assertion's recorded goal has already been rewritten by the assignments
     // that dominate it, so it is `wp(prefix, c)`. The obligation to discharge is
@@ -1191,6 +1226,11 @@ pub fn verify(s: &Stmt<'_>, pre: Pred, post: Pred) -> Report {
     // rather than letting `verified` mean "the ones that fit were fine": the report has
     // to shrink to what was actually proved. `false` is the goal because the obligation
     // is not about the program's state — it is about the report's own completeness.
+    // Least severe first; each call may overwrite the single reserved slot, so the most
+    // severe finding is the one that survives.
+    if vacuous {
+        push_notice(&mut slots, &mut count, Rule::VacuousAssume, smt::truth(false));
+    }
     if overflow {
         push_notice(&mut slots, &mut count, Rule::ObligationOverflow, smt::truth(false));
     }

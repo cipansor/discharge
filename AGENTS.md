@@ -443,6 +443,28 @@ and `exists_guarded` are *not* affected: an empty range yields `true`/`false` re
 which is correct for an empty range, and `inside` already treats an unrepresentable index as
 outside the bound rather than truncating it.
 
+## Vacuity is a property of the *path*, not just the premise
+
+The seventh hole was an unsatisfiable precondition. The next one is the same failure one
+level down: an unsatisfiable `Assume` *inside* the body. `Assume(false); y := 0` with
+postcondition `y == 99` came back `verified` / `Total`, because `false => wp(y := 0, y == 99)`
+is a theorem. The contract was about code no run can reach.
+
+The precondition check could not see it: the precondition was `true`, perfectly reachable.
+Vacuity is not about the *entry* predicate, it is about whether any execution reaches the
+code the proof is supposed to cover. Every construct that can cut a path has to ask whether
+it did:
+
+* a precondition (`verify`, `verify_proc`);
+* an `Assume` inside the body -- this hole;
+* a guard that is unsatisfiable, which the loop rules inherit from `Assume`-like reasoning;
+* a branch condition that is a contradiction, which makes the branch vacuous.
+
+`Assume` cannot simply be refused: a reachable `Assume` is how a callee guard or a
+case-analysis split is written, and it must still verify. The check is "this `Assume` cannot
+hold", not "there is an `Assume`", and the reachable case is pinned by a test so the fix
+cannot degrade into refusing all of them.
+
 ## The dual class: vacuity, a proof with no evidence
 
 Six holes now, and the sixth is the mirror of the first five. Those were *unsound*: a
