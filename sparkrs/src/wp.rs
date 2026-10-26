@@ -497,6 +497,9 @@ fn collect<'a>(
         Stmt::While { cond, invariant, variant, body } => {
             let inv = *invariant;
             let q = *cursor;
+            // Slots recorded before this arm ran are claims to the *right* of the loop, and
+            // they are dominated by it; see the rewrite at the end of this arm.
+            let entry_n = *n;
             // Preservation, universally quantified over the loop-head state.
             push_checked(
                 out,
@@ -536,6 +539,18 @@ fn collect<'a>(
             collect(body, &mut body_cursor, out, *n, n, overflow, vacuous);
             let body_end = *n;
             guard_range(out, body_start, body_end, smt::and(inv, *cond));
+            // A claim *after* the loop is only made for the states the loop can produce, so
+            // it is checked under the loop's exit condition, `invariant && !guard`. This is
+            // the loop analogue of the `if` rewrite above, and it was missing for the same
+            // reason: the claim was checked in the *pre-loop* state. `while x < 3 inv x <= 3
+            // { x := x + 1 }; assert x >= 3` was reported as a failure even though the
+            // loop's own `LoopExit` obligation proves the claim at every state the loop can
+            // leave. `LoopExit` is deliberately not touched here: it is `inv && !cond => q`
+            // and already carries its own context, so wrapping it again would only weaken it.
+            if entry_n > start {
+                let exit = smt::and(inv, smt::not(*cond));
+                guard_range(out, start, entry_n, exit);
+            }
             // All a caller may assume after the loop is the invariant.
             *cursor = inv;
         }

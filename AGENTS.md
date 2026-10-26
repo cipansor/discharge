@@ -324,6 +324,26 @@ no teeth for checking *which* theorem was recorded. Structural equality does. Th
 point: when testing that an object records the right thing, compare structure, not semantics;
 if the object is constrained to be provable, semantics is constant and the test is vacuous.
 
+## The same defect, one construct over
+
+An assertion after an `if` was checked as if the `if` were absent (a false refusal, fixed
+by rewriting the claim to `wp(if, g)`). The loop arm had exactly the same hole and was not
+touched by that fix: an assertion after a `while` was checked in the *pre-loop* state.
+`while x < 3 inv x <= 3 { x := x + 1 }; assert x >= 3` came back refuted with counterexample
+`x = 0` -- the entry state, which the loop body never leaves untouched -- while the loop's
+own `LoopExit` obligation, `inv && !guard => q`, proved the very same claim.
+
+The tell is that the loop *already computes* the context the claim needs. `LoopExit` is
+`inv && !guard => q` for the continuation `q`; a claim to the right of the loop is the same
+`q`, so it wants the same context, `inv && !guard`. Fixing one construct does not fix its
+sibling, and the sibling is found by asking where else the same expression is built: search
+for the *shape*, not for the bug.
+
+`LoopExit` itself must not be wrapped again -- it already carries its context, and
+`guard_range`-ing it would only weaken a correct obligation. The rewrite is applied to
+slots strictly to the right of the loop (`start..entry_n`), which is why `entry_n` is
+captured before the loop's own obligations are pushed.
+
 ## A kernel rule with no bounds proves anything
 
 The `Theorem` impl for `Imp` was

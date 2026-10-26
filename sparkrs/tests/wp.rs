@@ -1403,6 +1403,55 @@ fn an_assertion_after_an_if_sees_the_if() {
 }
 
 #[test]
+fn an_assertion_after_a_loop_sees_the_loop() {
+    // The loop analogue of `an_assertion_after_an_if_sees_the_if`, and the same defect one
+    // construct over: an assertion to the *right* of a loop was checked in the pre-loop
+    // state. `while x < 3 inv x <= 3 { x := x + 1 }; assert x >= 3` was reported as a
+    // failure (with counterexample `x = 0`, the entry state) even though the loop's own
+    // `LoopExit` obligation proves the claim at every state the loop can leave. A claim
+    // after a loop is only made for the states the loop can produce, so it is checked
+    // under `invariant && !guard`.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let body = Stmt::Assign { var: x, expr: smt::add(x, smt::word(1, 8)) };
+        let l = Stmt::While {
+            cond: x.lt_val(3),
+            invariant: x.le_val(3),
+            variant: None,
+            body: &body,
+        };
+        let s = Stmt::Seq {
+            first: &l,
+            second: &Stmt::Assert(x.ge_val(3)),
+        };
+        let r = verify_program(&s, x.le_val(3), x.le_val(3));
+        assert!(
+            r.is_verified(),
+            "the loop must reach the assertion after it; obligations were {:?}",
+            r.obligations.iter().flatten().map(|o| (o.rule, o.discharge())).collect::<Vec<_>>()
+        );
+
+        // Teeth: a claim the loop's exit does not establish must still fail. `x <= 3` is the
+        // invariant, so `x < 3` is not implied by the exit state `x == 3`.
+        let s = Stmt::Seq {
+            first: &l,
+            second: &Stmt::Assert(x.lt_val(3)),
+        };
+        let r = verify_program(&s, x.le_val(3), x.le_val(3));
+        assert!(!r.is_verified(), "the loop exits at x == 3, so x < 3 fails");
+
+        // And the exit context is the *invariant* plus the failed guard, not the guard
+        // itself: `x >= 3` holds at the exit even though nothing else does.
+        let s = Stmt::Seq {
+            first: &l,
+            second: &Stmt::Assert(x.le_val(3)),
+        };
+        let r = verify_program(&s, x.le_val(3), x.le_val(3));
+        assert!(r.is_verified(), "the invariant still holds after the loop");
+    });
+}
+
+#[test]
 fn a_nested_if_reaches_an_assertion_after_both() {
     smt::with_fresh(|| {
         let x = var(8);
