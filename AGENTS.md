@@ -1318,3 +1318,19 @@ terminated and overflowed the stack (found with `RUST_MIN_STACK=33554432`: the t
 passes). The fix threads the incoming depth through the base case, so each round trip loses
 one level. When two grammars call each other, the depth has to decrease along the *cycle*,
 not just along each grammar's own edges -- a base case that hardcodes a depth is the trap.
+
+## A file tree in the docs is a claim about the filesystem, and nothing checks it
+
+The README's "Layout" section drew `sparkrs/` as a tree. It had drifted from the
+filesystem in three ways at once: `src/lib.rs` was missing, `tests/sym.rs` was missing,
+`examples/report_probe.rs` was missing, and the `examples/` and `scripts/` blocks were
+*drawn* as if each were the last child of the root (two `└──` siblings), so the tree was
+also malformed as a tree. Nothing in the build reads the block, so it stayed wrong across
+several commits that each added or renamed a file.
+
+A prose tree is a hand-maintained mirror of `ls`, which is exactly the kind of second copy
+that goes stale silently -- the same defect class as a stale test count. The fix here was
+manual, but the durable check is one command: extract the names from the block and diff
+them against the directories. It caught the last two omissions in seconds. When a document
+restates something the code already knows, make the check mechanical or accept that it will
+drift; do not fix it by hand and assume it stays fixed.

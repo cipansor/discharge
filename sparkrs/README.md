@@ -1169,6 +1169,7 @@ is instantaneous while a 12-bit multiplier equality is not.
 ```
 sparkrs/
 ├── src/
+│   ├── lib.rs          crate root: module map, prelude, the three proof routes
 │   ├── smt.rs          the decision procedure (the heart of the crate)
 │   ├── sym.rs          symbolic DSL via operator overloading
 │   ├── logic.rs        verified arithmetic + Q16.16 fixed point
@@ -1177,15 +1178,16 @@ sparkrs/
 │   ├── contract.rs     runtime predicate checking
 │   ├── exhaustive.rs   complete proofs by enumeration
 │   ├── primitives.rs   total ops, Bounded<MIN,MAX>
-│   └── macros.rs       verify!, contract!, proof!, ...
+│   ├── macros.rs       verify!, contract!, proof!, ...
 │   ├── wp.rs           Hoare logic + automatic VC generation
+│   │                   (also carries Proc + Stmt::Call for modular verification)
 │   ├── smtscript.rs    SMT-LIB2 export for independent checking
 │   ├── mem.rs          bounded symbolic memory + frame condition
 │   └── quant.rs        bounded forall/exists, expanded to finite form
-│                       (wp.rs also carries Proc + Stmt::Call for modular verification)
 ├── tests/
 │   ├── smoke.rs        the engine proves real identities
 │   ├── kernel.rs       the proof kernel, including a compile-fail case
+│   ├── sym.rs          the DSL operators, each against the primitive it wraps
 │   ├── differential.rs symbolic prover vs brute-force execution
 │   ├── wp.rs           generated conditions checked against execution
 │   ├── mem.rs          memory proofs checked against real Rust arrays
@@ -1193,13 +1195,14 @@ sparkrs/
 │   ├── call.rs         modular verification, every positive with its control
 │   ├── loopdiff.rs     verifier vs exhaustive execution, loops and claims included
 │   └── modular_differential.rs  generated callers, verified then executed
-└── examples/
-    ├── flight_control.rs  a realistic actuator path, all obligations discharged
-    ├── pipeline.rs        program -> conditions -> proofs -> SMT-LIB2
-    ├── memory.rs          read/store, the frame condition, and a fill loop
-    ├── contracts.rs       procedures verified once, calls reasoned about by contract
-    └── z3diff.rs          differential harness: engine vs z3 on the exported text
-                           (needs z3-solver; a development tool, not a dependency)
+├── examples/
+│   ├── flight_control.rs  a realistic actuator path, all obligations discharged
+│   ├── pipeline.rs        program -> conditions -> proofs -> SMT-LIB2
+│   ├── memory.rs          read/store, the frame condition, and a fill loop
+│   ├── contracts.rs       procedures verified once, calls reasoned about by contract
+│   ├── report_probe.rs    a report's verdict must not depend on the arena it is read in
+│   └── z3diff.rs          differential harness: engine vs z3 on the exported text
+│                          (needs z3-solver; a development tool, not a dependency)
 └── scripts/
     ├── gate.sh            every gate in one command, failing loudly
     └── test-count.sh      the exact passing-test count, only when all pass
