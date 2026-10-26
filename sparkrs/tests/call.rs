@@ -963,6 +963,73 @@ fn a_body_at_exactly_the_cap_is_still_modelled() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn a_declared_frame_longer_than_the_cap_is_refused() {
+    // The open thread after the `writes` truncation fix: `havoc_writes` renames the
+    // written targets into a `MAX_CALL_ARGS` buffer and, like the old `writes`, stops at
+    // the cap. If a call with more than `MAX_CALL_ARGS` declared writes ever reached it,
+    // the writes past the cap would keep their pre-call names, so a claim that one of them
+    // changed would be checked against its *old* value -- the exact confusion the havoc
+    // exists to prevent.
+    //
+    // `Stmt::frame` check 3 is what makes that unreachable: it refuses the frame when the
+    // number of distinct written targets exceeds `MAX_CALL_ARGS`, before any havoc runs.
+    // This test pins that refusal so a future edit that loosens check 3 cannot quietly
+    // reintroduce the truncation.
+    //
+    // The body writes a *single* variable on purpose. With a body at the `MAX_WRITES` cap
+    // the derived frame would be complete and the over-long *declared* frame would be
+    // caught by check 0 instead, so the test would pass for the wrong reason and would not
+    // fail if check 3 were removed -- which is exactly what happened to the first version
+    // of this test. Here the derived frame is complete, every declared write has a target,
+    // the globals and images are distinct, so checks 0-2 all pass and only the `n_written`
+    // cap in check 3 can be what refuses it.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let r = var(8);
+        let body: &'static Stmt<'static> =
+            Box::leak(Box::new(Stmt::Assign { var: r, expr: x + 1u32 }));
+        let callee = Proc {
+            name: "one",
+            requires: smt::truth(true),
+            ensures: smt::truth(true),
+            body,
+        };
+        // `r` plus `MAX_CALL_ARGS` extras: `MAX_CALL_ARGS + 1` declared writes.
+        let extra: Vec<Var> = (0..MAX_CALL_ARGS).map(|_| var(8)).collect();
+        let cx = var(8);
+        let cr = var(8);
+        let mut actuals: Vec<(Var, Var)> = vec![(x, cx), (r, cr)];
+        let mut declared: Vec<Var> = vec![r];
+        for e in &extra {
+            actuals.push((*e, var(8)));
+            declared.push(*e);
+        }
+        assert!(wp::writes(body).complete(), "the body's own frame is small and complete");
+        assert!(
+            !Stmt::frame(&callee, &actuals, &declared),
+            "a declared frame of {} writes exceeds the {}-entry havoc buffer and must be \
+             refused, not silently truncated",
+            declared.len(),
+            MAX_CALL_ARGS
+        );
+
+        // The boundary: exactly `MAX_CALL_ARGS` declared writes is modelled. The same
+        // body, `r` plus `MAX_CALL_ARGS - 1` extras.
+        let mut actuals: Vec<(Var, Var)> = vec![(x, cx), (r, cr)];
+        let mut declared: Vec<Var> = vec![r];
+        for e in extra.iter().take(MAX_CALL_ARGS - 1) {
+            actuals.push((*e, var(8)));
+            declared.push(*e);
+        }
+        assert_eq!(declared.len(), MAX_CALL_ARGS);
+        assert!(
+            Stmt::frame(&callee, &actuals, &declared),
+            "a declared frame of exactly MAX_CALL_ARGS writes is modelled"
+        );
+    });
+}
+
+#[test]
 fn wp_refuses_to_reason_about_a_call_with_a_bad_frame() {
     smt::with_fresh(|| {
         let g = var(8);

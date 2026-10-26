@@ -1068,6 +1068,18 @@ the entry value into a temporary first, exactly as for a memory swap. That is a
 discipline, not a convenience, and `the_snapshot_discipline_is_needed_for_written_variables`
 is its control.
 
+The havoc itself has a cap, and the cap has the same shape as the `writes` truncation it
+shares a buffer size with: `havoc_writes` renames into a `MAX_CALL_ARGS` buffer and stops
+at the end. That is sound only because `frame` refuses a declared frame with more than
+`MAX_CALL_ARGS` distinct targets *before* the havoc runs, so a call that reaches the
+rename can never overflow it. `a_declared_frame_longer_than_the_cap_is_refused` pins the
+refusal, and its teeth are deliberate: it uses a body that writes a single variable, so
+the derived-frame check passes and only the declared-frame cap can be what refuses the
+call. (The first version of that test used a body at the `MAX_WRITES` cap and passed for
+the wrong reason — check 0 refused it, not the cap — and did not fail when the cap was
+removed. A test whose teeth are never pulled is a test that documents, not one that
+guards.)
+
 ### The sharp edge, stated rather than hidden
 
 `frame` checks the *shape* of the rename, not its meaning. A caller who wires the

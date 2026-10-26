@@ -1062,6 +1062,24 @@ paths in one mutation, or aim the mutation at the shared rule. `LoopExit` droppe
 caught by `tests/loopdiff.rs`; the cursor's claim propagation dropped alone is not, and that
 is a property of the design rather than a gap in the test.
 
+## Teeth have to isolate the guard they claim to test
+
+The mirror of the lesson above, and the opposite failure: a test whose teeth are never
+pulled, because a *different* check refuses the input first. The test
+`a_declared_frame_longer_than_the_cap_is_refused` was written to pin that `Stmt::frame`
+refuses a declared frame with more than `MAX_CALL_ARGS` writes — the guard that keeps
+`havoc_writes` from truncating. Its first version built a body writing `MAX_CALL_ARGS + 1`
+variables, which the *derived-frame* check (check 0, `!derived.complete()`) refuses long
+before the declared-frame cap is reached. So the test passed, and kept passing when the cap
+check was deleted: it was asserting the wrong guard, and the mutation could not tell.
+
+The fix is to make every earlier check pass, so only the guard under test can be what
+refuses: a body writing a *single* variable (derived frame small and complete), distinct
+globals, distinct images. Then removing the cap makes the test fail, which is the only
+proof that the teeth are real. The rule: before trusting a rejection test, run the mutation
+that removes the guard it names, and confirm it fails. If a nearer check could also reject
+the input, the test is ambiguous and you cannot tell which check fired.
+
 ## A SAFETY comment is a claim, and it needs the same treatment as any other
 
 The `no_std` `with_ctx` takes `&mut` to a `static mut`, and justified it with "the arena is
