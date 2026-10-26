@@ -978,6 +978,15 @@ Two lessons worth keeping:
   and `MAX_CALL_ARGS` had to satisfy `MAX_WRITES <= MAX_CALL_ARGS` for `unchanged_vars` to
   be total, and nothing said so. It is now a `const _: () = assert!(..)`.
 
+Fifth instance, found in the same session as the surface pass: the *public* `wp::obligations`
+also returned a saturating count, so a caller inspecting obligations directly could not tell
+a complete set of `MAX_OBLIGATIONS` from a truncated prefix. `verify` was never fooled — it
+reads the internal flag and raises `Rule::ObligationOverflow` — but the public accessor was,
+which is the point: **fixing a defect in one path does not fix the same defect in a sibling
+path that re-exposes the same data.** When a fix adds a completeness flag to an internal
+helper, walk every public function that wraps that helper and check it does not re-hide the
+partiality behind the old return shape.
+
 Also: when a heredoc-written Python patch garbles itself, the failure mode is duplicated
 definitions, not a clean error — `git checkout` the file and use a precise edit instead.
 
