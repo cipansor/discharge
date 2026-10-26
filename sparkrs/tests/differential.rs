@@ -567,6 +567,13 @@ enum FuzzExpr {
     Shl(Box<FuzzExpr>, u32),
     Shr(Box<FuzzExpr>, u32),
     Not(Box<FuzzExpr>),
+    Trunc(Box<FuzzExpr>, u8),
+    /// `ite(c, t, e)`. The condition is a predicate, so the random *word* tree cannot
+    /// produce it on its own -- the generator reaches into the predicate grammar for it.
+    /// `Trunc` and `Ite` are also the two nodes that hold a *payload* rather than a term id
+    /// (the source width and the condition), and the substitution walk has a special case
+    /// for each, so generating them makes those cases load-bearing.
+    Ite(Box<PFuzz>, Box<FuzzExpr>, Box<FuzzExpr>),
 }
 
 impl FuzzExpr {
@@ -584,6 +591,8 @@ impl FuzzExpr {
             FuzzExpr::Shl(x, k) => smt::shl(x.build(a, b), *k),
             FuzzExpr::Shr(x, k) => smt::lshr(x.build(a, b), *k),
             FuzzExpr::Not(x) => smt::bxor(x.build(a, b), smt::word(255, 8)),
+            FuzzExpr::Trunc(x, w) => smt::truncate(x.build(a, b), *w),
+            FuzzExpr::Ite(c, t, e) => smt::ite(c.build(a, b), t.build(a, b), e.build(a, b)),
         }
     }
 
@@ -602,6 +611,8 @@ impl FuzzExpr {
             FuzzExpr::Shl(x, k) => if *k >= 8 { 0 } else { x.eval(a, b) << k },
             FuzzExpr::Shr(x, k) => if *k >= 8 { 0 } else { x.eval(a, b) >> k },
             FuzzExpr::Not(x) => !x.eval(a, b),
+            FuzzExpr::Trunc(x, w) => if *w >= 8 { x.eval(a, b) } else { x.eval(a, b) & ((1u8 << w) - 1) },
+            FuzzExpr::Ite(c, t, e) => if c.eval(a, b) { t.eval(a, b) } else { e.eval(a, b) },
         }
     }
 
@@ -619,11 +630,30 @@ impl FuzzExpr {
             FuzzExpr::Shl(x, k) => format!("({}<<{})", x.render(), k),
             FuzzExpr::Shr(x, k) => format!("({}>>{})", x.render(), k),
             FuzzExpr::Not(x) => format!("(!{})", x.render()),
+            FuzzExpr::Trunc(x, w) => format!("trunc{}({})", w, x.render()),
+            FuzzExpr::Ite(c, t, e) => format!("({} ? {} : {})", c.render(), t.render(), e.render()),
         }
     }
 }
 
 fn fuzz_expr(r: &mut FuzzLcg, depth: u32) -> FuzzExpr {
+    fuzz_expr_maybe_trunc(r, depth, true)
+}
+
+/// A width-preserving 8-bit expression: like [`fuzz_expr`] but never `truncate`.
+///
+/// The predicate layer compares two word expressions, and a comparison across different
+/// widths is ill-formed -- the engine refuses the query with `Unknown`. The predicate fuzz
+/// wants well-typed terms so that a `Valid`/`Unsat`/counterexample verdict is always
+/// meaningful, and the same applies to the exporter and the wp differential, which evaluate
+/// the term against a concrete one. The refusal path is exercised elsewhere: by the word
+/// fuzz (which only requires "never a wrong `Valid`") and by the dedicated
+/// `a_mixed_width_sum_is_refused_not_truncated`.
+fn fuzz_expr_w8(r: &mut FuzzLcg, depth: u32) -> FuzzExpr {
+    fuzz_expr_maybe_trunc(r, depth, false)
+}
+
+fn fuzz_expr_maybe_trunc(r: &mut FuzzLcg, depth: u32, allow_trunc: bool) -> FuzzExpr {
     if depth == 0 || r.below(4) == 0 {
         return match r.below(3) {
             0 => FuzzExpr::A,
@@ -631,9 +661,9 @@ fn fuzz_expr(r: &mut FuzzLcg, depth: u32) -> FuzzExpr {
             _ => FuzzExpr::K(r.below(256) as u8),
         };
     }
-    let choice = r.below(9);
-    let x = fuzz_expr(r, depth - 1);
-    let y = fuzz_expr(r, depth - 1);
+    let choice = r.below(if allow_trunc { 11 } else { 10 });
+    let x = fuzz_expr_maybe_trunc(r, depth - 1, allow_trunc);
+    let y = fuzz_expr_maybe_trunc(r, depth - 1, allow_trunc);
     match choice {
         0 => FuzzExpr::Add(Box::new(x), Box::new(y)),
         1 => FuzzExpr::Sub(Box::new(x), Box::new(y)),
@@ -643,7 +673,9 @@ fn fuzz_expr(r: &mut FuzzLcg, depth: u32) -> FuzzExpr {
         5 => FuzzExpr::Xor(Box::new(x), Box::new(y)),
         6 => FuzzExpr::Shl(Box::new(x), r.below(9) as u32),
         7 => FuzzExpr::Shr(Box::new(x), r.below(9) as u32),
-        _ => FuzzExpr::Not(Box::new(x)),
+        8 => FuzzExpr::Not(Box::new(x)),
+        9 if allow_trunc => FuzzExpr::Trunc(Box::new(x), 1 + r.below(8) as u8),
+        _ => FuzzExpr::Ite(Box::new(pfuzz_pred(r, depth - 1)), Box::new(x), Box::new(y)),
     }
 }
 
@@ -862,12 +894,19 @@ impl PFuzz {
 
 fn pfuzz_pred(r: &mut FuzzLcg, depth: u32) -> PFuzz {
     if depth == 0 || r.below(4) == 0 {
+        // The comparison operands use the *same* depth this call received. They used to be
+        // generated at a fixed depth of 2, which is fine only while a word tree cannot reach
+        // back into the predicate grammar. Once `ite` did, `pfuzz_pred(1)` -> `fuzz_expr(2)`
+        // -> `pfuzz_pred(1)` was a cycle that never decremented and overflowed the stack.
+        // Threading the depth through makes the pair terminate: `fuzz_expr(d)` reaches
+        // `pfuzz_pred(d - 1)`, and the base here reaches `fuzz_expr(d)`, so each round trip
+        // loses one level.
         return match r.below(5) {
             0 => PFuzz::T,
             1 => PFuzz::F,
-            2 => PFuzz::Eq(fuzz_expr(r, 2), fuzz_expr(r, 2)),
-            3 => PFuzz::Lt(fuzz_expr(r, 2), fuzz_expr(r, 2)),
-            _ => PFuzz::Le(fuzz_expr(r, 2), fuzz_expr(r, 2)),
+            2 => PFuzz::Eq(fuzz_expr_w8(r, depth), fuzz_expr_w8(r, depth)),
+            3 => PFuzz::Lt(fuzz_expr_w8(r, depth), fuzz_expr_w8(r, depth)),
+            _ => PFuzz::Le(fuzz_expr_w8(r, depth), fuzz_expr_w8(r, depth)),
         };
     }
     let choice = r.below(4);
@@ -979,6 +1018,23 @@ fn run_wp_steps(steps: &[WpStep], mut acc: u8, x: u8) -> u8 {
     acc
 }
 
+fn render_wp_steps(steps: &[WpStep], out: &mut String) {
+    out.push('[');
+    for s in steps {
+        match s {
+            WpStep::Assign(e) => out.push_str(&format!("acc := {}; ", e.render())),
+            WpStep::If(c, t, e) => {
+                out.push_str(&format!("if {} {{ ", c.render()));
+                render_wp_steps(t, out);
+                out.push_str("} else { ");
+                render_wp_steps(e, out);
+                out.push_str("} ");
+            }
+        }
+    }
+    out.push(']');
+}
+
 fn gen_wp_steps(r: &mut FuzzLcg, depth: u32, n: usize) -> Vec<WpStep> {
     (0..n)
         .map(|_| {
@@ -988,7 +1044,7 @@ fn gen_wp_steps(r: &mut FuzzLcg, depth: u32, n: usize) -> Vec<WpStep> {
                 let e = gen_wp_steps(r, depth - 1, ne);
                 WpStep::If(pfuzz_pred(r, 2), t, e)
             } else {
-                WpStep::Assign(fuzz_expr(r, 2))
+                WpStep::Assign(fuzz_expr_w8(r, 2))
             }
         })
         .collect()
@@ -1023,12 +1079,18 @@ fn wp_matches_concrete_execution() {
                 };
                 let got = smt::evaluate_pred(w, env);
                 let want = post.eval(run_wp_steps(&steps, v, v), v);
-                assert_eq!(
-                    got,
-                    Some(want),
-                    "wp(post, program) disagrees with concrete execution at x={}",
-                    v
-                );
+                if got != Some(want) {
+                    let mut prog_s = String::new();
+                    render_wp_steps(&steps, &mut prog_s);
+                    panic!(
+                        "wp(post, program) disagrees with concrete execution at x={}\n  program: {}\n  post: {}\n  got {:?} want {:?}",
+                        v,
+                        prog_s,
+                        post.render(),
+                        got,
+                        Some(want)
+                    );
+                }
             }
         });
     }

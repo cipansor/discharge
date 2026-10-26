@@ -1290,3 +1290,31 @@ This is the same lesson as the two tooling defects above, one level up: **a gate
 not run is not a gate you passed**, and the only way to keep that honest is to make "run
 all the gates" a single command whose exit code is the claim. A summary that says "gates
 green" should quote that command's output, not a memory of running the pieces.
+
+## An untyped generator is a second program, and it needs its own type discipline
+
+The fuzz generator built random *word* expressions, so every comparison it formed was
+8-bit against 8-bit and the query was always well-typed. Adding `truncate` to the grammar
+made it able to build `(b < (trunc3(b) << 2))` -- an 8-bit value compared with a 3-bit one --
+which the engine *correctly* refuses as ill-formed (`Unknown`). Two existing tests then
+failed, and neither failure was an engine bug: the generator had started producing
+ill-typed programs that the tests' concrete oracles (`eval`, `evaluate_pred`) cannot be
+asked about, because those only have a meaning for a well-sorted term.
+
+The lesson is that a random generator is a second implementation of the language, and it
+needs the same type discipline the language does. The fix is two entry points:
+`fuzz_expr` (the full grammar, including `truncate`, used only by the word fuzz, which
+asserts the weaker "never a wrong `Valid`") and `fuzz_expr_w8` (width-preserving, used
+wherever the test compares the term against a concrete value). The refusal path keeps its
+own dedicated test. A single generator for both jobs silently moves the well-typedness
+burden onto every oracle.
+
+## Mutual recursion between two grammars must decrement on every round trip
+
+Making `ite` reach into the predicate grammar created a cycle: `pfuzz_pred`'s base case
+called `fuzz_expr_w8(r, 2)` at a *fixed* depth, while `fuzz_expr_w8(d)` reaches
+`pfuzz_pred(d - 1)`. So `pfuzz_pred(1) -> fuzz_expr_w8(2) -> pfuzz_pred(1)` never
+terminated and overflowed the stack (found with `RUST_MIN_STACK=33554432`: the test then
+passes). The fix threads the incoming depth through the base case, so each round trip loses
+one level. When two grammars call each other, the depth has to decrease along the *cycle*,
+not just along each grammar's own edges -- a base case that hardcodes a depth is the trap.
