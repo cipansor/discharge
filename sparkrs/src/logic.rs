@@ -133,8 +133,14 @@ pub fn verify_algebraic_identities() -> usize {
                 smt::prove(smt::eq(smt::lshr(x, w as u32), zero)),
                 // 0 <= x, always
                 smt::prove(smt::ule(zero, x)),
-                // x < 2^w, always
-                smt::prove(smt::ult(x, smt::word(0, w)).iff(smt::truth(false))),
+                // x <= 2^w - 1, always -- the range law that says an `w`-bit value cannot
+                // exceed its width. This slot previously held `ult(x, 0) <=> false`, which
+                // is a tautology of the *encoding* (an unsigned value is never below zero)
+                // rather than a statement about `x`: it is unchanged by substituting any
+                // term for `x`, including a constant, so it added no coverage while the
+                // comment claimed the range law. `all_ones(w)` is `2^w - 1`, so this is the
+                // "x < 2^w" law written in a form that fits the width.
+                smt::prove(smt::ule(x, all_ones)),
             ]
         });
         for v in verdicts {
@@ -280,21 +286,26 @@ impl Fixed {
     }
 }
 
-/// Adding two Q16.16 values in `i32` cannot overflow when both are bounded by
-/// half the range. This is the guard a controller uses before summing terms.
+/// Adding two non-negative Q16.16 values cannot overflow a signed 16-bit sum when
+/// each is bounded by `2^14 - 1`. This is the guard a controller uses before summing terms.
+///
+/// The bound is `2^14 - 1`, not `2^14`. A signed 16-bit value tops out at `2^15 - 1`, and at
+/// the inclusive bound `2^14` the sum `2^14 + 2^14` is exactly `2^15`, which sets the sign
+/// bit and reads as `-32768`. The proof used to conclude only `sum <= 2^15` while the
+/// comment said "sign bit clear": the conclusion was true and one larger than the property
+/// it claimed, which is the same off-by-one a caller reading the guard would act on.
 pub fn verify_fixed_add_no_overflow() -> Verdict {
     smt::with_fresh(|| {
         // 16-bit operands standing in for the sign+integer part, so the BDD
         // stays small while the *structure* of the argument is the real one.
         let a = smt::var(16);
         let b = smt::var(16);
-        // |a|, |b| <= 2^14 (half the positive range) => a + b <= 2^15, which
-        // still fits in 16 bits with the sign bit clear.
-        let bound = 1u64 << 14;
+        // a, b <= 2^14 - 1  =>  a + b <= 2^15 - 2, so the sign bit stays clear.
+        let bound = (1u64 << 14) - 1;
         let a_ok = smt::ule_const(a, bound);
         let b_ok = smt::ule_const(b, bound);
         let sum = smt::add(a, b);
-        let fits = smt::ule_const(sum, 1u64 << 15);
+        let fits = smt::ule_const(sum, (1u64 << 15) - 1);
         let pre = smt::and(a_ok, b_ok);
         smt::prove_implies(pre, fits)
     })
@@ -377,6 +388,22 @@ mod tests {
     #[test]
     fn fixed_add_guard_is_sound() {
         assert!(verify_fixed_add_no_overflow().is_proved());
+        // Teeth: the bound has to be `2^14 - 1`. With `2^14` the sum `2^14 + 2^14 = 2^15`
+        // sets the sign bit, so the goal `sum <= 2^15 - 1` must be refuted -- the old proof
+        // concluded the weaker `sum <= 2^15` and passed anyway.
+        smt::with_fresh(|| {
+            let a = smt::var(16);
+            let b = smt::var(16);
+            let bound = 1u64 << 14;
+            let pre = smt::and(smt::ule_const(a, bound), smt::ule_const(b, bound));
+            let sum = smt::add(a, b);
+            assert!(
+                !smt::prove_implies(pre, smt::ule_const(sum, (1u64 << 15) - 1)).is_proved(),
+                "the inclusive bound 2^14 lets the sum reach 2^15, which overflows i16"
+            );
+        });
+        // And the concrete witness: 2^14 + 2^14 overflows a signed 16-bit add.
+        assert_eq!((16384i32 + 16384) as i16, -32768);
     }
 
     #[test]

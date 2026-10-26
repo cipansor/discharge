@@ -443,6 +443,24 @@ and `exists_guarded` are *not* affected: an empty range yields `true`/`false` re
 which is correct for an empty range, and `inside` already treats an unrepresentable index as
 outside the bound rather than truncating it.
 
+## Prove the property the comment claims, at the boundary
+
+Two verifier functions in `logic.rs` proved a true statement that was one step weaker than the
+claim their comments made, and the gap was exactly at the boundary:
+
+* `verify_fixed_add_no_overflow` concluded `sum <= 2^15` while the comment said the sign bit
+  stays clear. `2^15` *is* the sign bit. At the stated inclusive bound `2^14` the sum
+  `2^14 + 2^14 = 2^15` reads as `-32768` in a signed 16-bit add. The bound is now `2^14 - 1`
+  and the goal is `sum <= 2^15 - 1`.
+* The tenth "algebraic identity" was `ult(x, 0) <=> false` with the comment "x < 2^w". That is
+  a tautology of the encoding -- an unsigned value is never below zero -- and it is unchanged
+  by substituting *any* term for `x`, including a constant, so it proved nothing about `x`.
+  It is now `x <= all_ones(w)`, the range law the comment described.
+
+Both are the same mistake: the comment and the formula describe different propositions, and
+the formula is the weaker one. A verifier function is read by its comment; if the comment names
+a bound, the formula has to prove *that* bound, at *that* boundary, including the endpoints.
+
 ## A parameter the proof never mentions is a parameter the proof cannot use
 
 `verify_bounded_sub_is_total(min, max)` proved the refinement invariant of `Bounded::sub`, but
