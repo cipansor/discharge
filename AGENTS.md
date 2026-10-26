@@ -1185,3 +1185,24 @@ Neither is reachable by reading the code for arithmetic mistakes. They are reach
 writing down what each rule claims about the program and asking for a counterexample to the
 claim. `examples/` probes are the cheap way to do this; delete them once the finding is
 pinned by a test.
+
+## An API surface is a set of claims, and each one has to be walked
+
+The four path-cut findings were all *semantic* — a rule that modelled a construct wrongly.
+The findings on the surface are quieter and come from walking each public name and asking
+two questions:
+
+* **What does this return, and can the caller silently drop it?** `verify_exhaustive!`
+  returned a `bool` while every sibling `verify!` macro panicked, so a false property written
+  as a statement ran to completion. A returned `bool` is easy to ignore; a panic is not. When
+  a name promises verification, the failure must be unmissable.
+* **Does the doc name *every* way the function can fail?** `Fixed::checked_div_int` said
+  `None` means `k == 0`, but `i32::MIN / -1` also yields `None`. The function was right; the
+  doc named half its failure modes, which is enough for a reader to write the wrong guard.
+  The same shape applies to a *type's* constructors: walk every constructor and every entry
+  point for the degenerate input (empty range, zero width, `MIN > MAX`).
+
+Both are found by reading the signatures and the doc comments against the behaviour, not by
+probing the decision procedure. Worth doing as its own pass once the semantic audit settles,
+because the failures are silent by construction — nothing in the test suite is asking the
+question.
