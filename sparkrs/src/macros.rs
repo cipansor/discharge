@@ -103,22 +103,55 @@ macro_rules! check {
     }};
 }
 
-/// Complete proof by enumeration over a small domain.
+/// Complete proof by enumeration over a small domain, panicking with the smallest
+/// counterexample if the property does not hold.
 ///
 /// ```ignore
 /// // ∀ a b:u8. (a + b) wraps  <=>  result < a
 /// verify_exhaustive!(a: u8, b: u8 => (a as u16 + b as u16 > 255) == (a.wrapping_add(b) < a));
 /// ```
+///
+/// This used to *return* the boolean from `for_all_u8` and friends, so a false property
+/// used as a statement — which is exactly how the example above reads, and how a reader
+/// would naturally write it — was silently discarded and execution continued. Every
+/// sibling macro in this module (`verify!`, `verify_implies!`, `contract!`, `proof!`)
+/// panics on a failed obligation; a name that begins with `verify` must not be the one
+/// that returns a value the caller can drop on the floor. The property is now discharged
+/// by finding a violation and panicking with it, so the failure names the witness. Callers
+/// who want the boolean call [`crate::exhaustive::for_all_u8`] and friends directly.
 #[macro_export]
 macro_rules! verify_exhaustive {
     ($a:ident : u8, $b:ident : u8 => $prop:expr $(,)?) => {{
-        $crate::exhaustive::for_all_u8_2(|$a, $b| $prop)
+        match $crate::exhaustive::find_violation_u8_2(|$a, $b| $prop) {
+            ::core::option::Option::Some((a, b)) => panic!(
+                "sparkrs: exhaustive verification failed: counterexample {} = {}, {} = {}",
+                ::core::stringify!($a),
+                a,
+                ::core::stringify!($b),
+                b
+            ),
+            ::core::option::Option::None => {}
+        }
     }};
     ($a:ident : u8 => $prop:expr $(,)?) => {{
-        $crate::exhaustive::for_all_u8(|$a| $prop)
+        match $crate::exhaustive::find_violation_u8(|$a| $prop) {
+            ::core::option::Option::Some(a) => panic!(
+                "sparkrs: exhaustive verification failed: counterexample {} = {}",
+                ::core::stringify!($a),
+                a
+            ),
+            ::core::option::Option::None => {}
+        }
     }};
     ($a:ident : u16 => $prop:expr $(,)?) => {{
-        $crate::exhaustive::for_all_u16(|$a| $prop)
+        match $crate::exhaustive::find_violation_u16(|$a| $prop) {
+            ::core::option::Option::Some(a) => panic!(
+                "sparkrs: exhaustive verification failed: counterexample {} = {}",
+                ::core::stringify!($a),
+                a
+            ),
+            ::core::option::Option::None => {}
+        }
     }};
 }
 
@@ -162,10 +195,33 @@ mod tests {
     }
 
     #[test]
+    fn check_macro_checks_concrete_values() {
+        // `check!` is the runtime counterpart of `verify!`: the same predicate vocabulary
+        // evaluated on one value, returning a structured error rather than panicking so it
+        // can stay enabled in a deployed `no_std` build. It had no test, which is the one
+        // macro in this module whose behaviour is observable at runtime rather than at
+        // compile time.
+        use crate::contract::{Obligation, Pred};
+        assert!(check!(Pred::Lt(10), 9).is_ok());
+        let err = check!(Pred::Lt(10), 10).unwrap_err();
+        assert_eq!(err.kind, Obligation::Assertion);
+        assert_eq!(err.value, 10);
+    }
+
+    #[test]
     fn exhaustive_macro_works() {
         // Wrapping addition overflows exactly when the result is below an operand.
-        let ok = verify_exhaustive!(a: u8, b: u8 =>
+        verify_exhaustive!(a: u8, b: u8 =>
             (a as u16 + b as u16 > 255) == (a.wrapping_add(b) < a));
-        assert!(ok);
+        verify_exhaustive!(a: u8 => a.wrapping_add(0) == a);
+    }
+
+    #[test]
+    #[should_panic(expected = "exhaustive verification failed: counterexample a = 128")]
+    fn exhaustive_macro_rejects_falsehoods() {
+        // The teeth for the fix: a false property must fail loudly, with the smallest
+        // witness, rather than returning a boolean the caller can ignore. Before the fix
+        // this ran to completion and printed nothing.
+        verify_exhaustive!(a: u8 => a < 128);
     }
 }

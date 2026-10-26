@@ -600,6 +600,31 @@ type itself, and termination uses `checked_add` so it cannot wrap. `None` there 
 means "swept everything". The difference was the `limit` parameter, which let a caller pass a
 prefix.
 
+### A `verify_` name must not hand back a value the caller can drop
+
+The library is honest — `for_all_u8` returns `false` for a refuted property — but the *macro*
+built on it was not. `verify_exhaustive!` expanded to `for_all_u8(...)` and returned the
+boolean, so the natural way to write it, as a statement:
+
+```rust
+verify_exhaustive!(a: u8 => a < 128);   // false: 128..=255 violate it
+println!("still here");
+```
+
+ran to completion and printed `still here`. Every sibling macro in the module (`verify!`,
+`verify_implies!`, `contract!`, `proof!`) panics on a failed obligation, so the one macro whose
+name also begins with `verify` was the one that could be ignored — and a reader who trusts the
+name would not look for a returned boolean to check.
+
+The fix makes it a statement: it finds the smallest violation and panics with it, naming the
+witness (`counterexample a = 128`). Callers who want the boolean call `for_all_u8` directly. The
+teeth are `exhaustive_macro_rejects_falsehoods`, a `#[should_panic]` test that pins both the
+failure and the witness it reports.
+
+The general question, and the third time this class has appeared: **which of a function's
+results is a claim, and can the caller silently ignore it?** A returned `bool` is easy to drop; a
+`panic` or a type is not. When a name promises verification, the failure has to be unmissable.
+
 ## An unreachable precondition is not a proof
 
 The seventh hole, and the second of the vacuity kind. `verify(s, pre, post)` generates one
