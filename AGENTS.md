@@ -1031,6 +1031,60 @@ Two consequences for the harness:
    `correctness()` rather than `establishes()`, because `establishes()` folds a failure
    into `Nothing` and would hide the defect. Test the sharp edge, not the safe wrapper.
 
+## Two paths for one obligation mean neither path's teeth are real
+
+`wp` carries an `assert` two ways: as its own recorded obligation *and* in the backward
+cursor that the enclosing rule consumes. Three defects lived in this area, and each was
+found by a hand-built example rather than by a test, for a reason worth internalising:
+breaking *either* path alone changes nothing observable, because the other still discharges
+the claim. Only a mutation that breaks both at once — or that breaks the composition rule
+they share — shows the harness is load-bearing.
+
+The consequence for testing: when a mutation does not make a test fail, do not conclude the
+test is weak. First ask whether the property is enforced twice. If it is, either break both
+paths in one mutation, or aim the mutation at the shared rule. `LoopExit` dropped alone is
+caught by `tests/loopdiff.rs`; the cursor's claim propagation dropped alone is not, and that
+is a property of the design rather than a gap in the test.
+
+## A SAFETY comment is a claim, and it needs the same treatment as any other
+
+The `no_std` `with_ctx` takes `&mut` to a `static mut`, and justified it with "the arena is
+not `Send`/`Sync`". It was: every field of `Ctx` is a plain array or integer, so `Ctx` was
+auto-`Send` and auto-`Sync`, and a `Sync` type can be shared across threads. The comment was
+false, which is worse than absent — a reviewer checks the unsafe block against it.
+
+The fix was not to reword it but to make it true: `Ctx` now carries
+`PhantomData<*mut ()>`, the one pointer type with no `Send`/`Sync` impl. Verify this kind of
+claim by asserting the trait bound in a scratch test and watching it fail. A comment that
+names a mechanism the type system enforces will survive refactoring; one that names an
+intention will not.
+
+## A number in a document is a claim that must reproduce
+
+The README said "77 of 800 random predicates" were ill-sorted by the old exporter. The
+number came from a generator that no longer exists, so no reader could check it. The fix is
+`examples/z3diff.rs`, a committed harness whose output the README quotes: 800 and 3000
+predicates, 0 parse errors, 0 mismatches with the current printer; 21 of 800 rejected with
+the old one. Prefer a number a reader can regenerate to a number that sounds precise.
+
+The harness also had to be checked against itself. Its first version called
+`prove(p) == Unsat` a disagreement with z3's `sat`; it is not, because `prove` answers
+`Unsat` when `p` is identically false, which is a tautology failure like any counterexample.
+111 apparent mismatches were the harness's comparison being wrong. A differential test needs
+its own oracle stated explicitly, in a comment, before its output means anything.
+
+## Documentation drifts to describe code that no longer exists
+
+Three README defects in one session, all the same shape: the exporter paragraph described
+the *first* fix for the sort bug (the width rule) after the *second* fix replaced it; the
+demo output quoted the old `Verdict::Unknown` wording; the layout tree listed `wp.rs` twice
+and omitted a test file. Code changes get a test; doc changes get nothing, so docs are where
+the previous revision survives.
+
+Two habits help. Quote demo output by *running the example* rather than by remembering it.
+And when a fix supersedes a documented behaviour, search the prose for the superseded rule —
+`grep` for the phrase the old fix introduced, not for the new one.
+
 ## Architecture (read this before editing `smt.rs`)
 
 `src/smt.rs` is the heart: bit-vector terms are bit-blasted into a Reduced
