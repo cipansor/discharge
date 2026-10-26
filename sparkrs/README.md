@@ -309,12 +309,22 @@ The first fix made the *node's own width* decide: at width 1 the boolean operato
 bit-vector one. That is still wrong, because a one-bit connective's sort depends on **where it
 sits**, not on how wide it is. As the goal, `x & y == 1` wants `and`; as an operand of `bvadd` it
 wants `bvand`, and `Bool` is not `(_ BitVec 1)`. The width rule emitted `(bvule (_ bv1 1) (or …))`,
-which z3 rejects as ill-sorted, in 77 of 800 random predicates. The sort now decides: `Bool`
-prints comparisons natively and one-bit connectives as `and`/`or`/`xor`/`not`; `Bits` prints
-comparisons as `(ite <cmp> (_ bv1 1) (_ bv0 1))` and one-bit connectives as `bvand`/`bvor`/
-`bvxor`/`bvnot`. The same 800 predicates now export with zero parse errors and zero disagreements
-against z3 — a check that only exists because the text was handed to a real solver rather than
-reasoned about, since the unit tests asserted the old shape and passed throughout.
+which z3 rejects as ill-sorted. The sort now decides: `Bool` prints comparisons natively and
+one-bit connectives as `and`/`or`/`xor`/`not`; `Bits` prints comparisons as
+`(ite <cmp> (_ bv1 1) (_ bv0 1))` and one-bit connectives as `bvand`/`bvor`/`bvxor`/`bvnot`.
+
+`examples/z3diff.rs` is the harness that settles this rather than an argument. It generates random
+predicates over 1-, 2-, 3-, 4-, 8- and 12-bit variables, asks the engine, exports the same
+predicate, and asks z3. With the fix: 800 predicates, 0 parse errors, 0 disagreements; 3000
+predicates, 0 parse errors, 0 disagreements. With the width rule restored: 21 of 800 rejected
+outright by z3 as ill-sorted. The harness needs `z3-solver` installed; it is a development tool and
+the crate itself still has no dependencies.
+
+This bug is worth the space because of how it hid. The engine was right the whole time — every
+verdict it returned was correct. Only the *text* was wrong, so nothing in the crate's own tests
+could see it, and the unit tests had been asserting the ill-sorted shape and passing. It took
+handing the artifact to a different solver to notice that the artifact did not say what the
+engine meant.
 
 A third export bug sat in the same printer. `truncate` changes a width in either direction,
 and the printer emitted `((_ extract w-1 0) x)` for both. That is only valid when the result is
@@ -998,7 +1008,9 @@ sparkrs/
     ├── flight_control.rs  a realistic actuator path, all obligations discharged
     ├── pipeline.rs        program -> conditions -> proofs -> SMT-LIB2
     ├── memory.rs          read/store, the frame condition, and a fill loop
-    └── contracts.rs       procedures verified once, calls reasoned about by contract
+    ├── contracts.rs       procedures verified once, calls reasoned about by contract
+    └── z3diff.rs          differential harness: engine vs z3 on the exported text
+                           (needs z3-solver; a development tool, not a dependency)
 ```
 
 ## Building and testing
