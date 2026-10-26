@@ -1452,6 +1452,48 @@ fn an_assertion_after_a_loop_sees_the_loop() {
 }
 
 #[test]
+fn a_claim_after_a_loop_inside_a_branch_is_still_checked() {
+    // The combination of the `if` rewrite (DEFECT 37) and the loop rewrite (DEFECT 40): a
+    // claim after a loop that is itself inside a branch. Both rewrites must apply, and the
+    // loop's own `LoopExit` obligation is the independent backstop -- it is `inv && !guard
+    // => q`, so it catches a false claim even if the rewrite were wrong. This case is here
+    // because "fix one construct" twice in a row is how the family got its members, and the
+    // composition is where a fix for one can silently undo the other.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let body = Stmt::Assign { var: x, expr: smt::add(x, smt::word(1, 8)) };
+        let l = Stmt::While {
+            cond: x.lt_val(3),
+            invariant: x.le_val(3),
+            variant: None,
+            body: &body,
+        };
+        // if x == 0 { while x < 3 inv x <= 3 { x := x + 1 }; assert x >= 3 } else skip
+        let inner = Stmt::Seq {
+            first: &l,
+            second: &Stmt::Assert(x.ge_val(3)),
+        };
+        let prog = Stmt::If { cond: x.eq_val(0), then_: &inner, else_: &Stmt::Skip };
+        let r = verify_program(&prog, x.le_val(3), x.le_val(3));
+        assert!(r.is_verified(), "nested loop claim must verify; got {:?}", r.first_failure());
+
+        // Teeth: a false claim inside the branch must still fail. It is caught by `LoopExit`
+        // (`x == 5` is not implied by the exit state `x == 3`), so this also checks that the
+        // loop rewrite did not weaken `LoopExit` while making the assertion pass.
+        let bad = Stmt::Seq {
+            first: &l,
+            second: &Stmt::Assert(x.eq_val(5)),
+        };
+        let prog = Stmt::If { cond: x.eq_val(0), then_: &bad, else_: &Stmt::Skip };
+        let r = verify_program(&prog, x.le_val(3), x.le_val(3));
+        assert!(
+            !r.is_verified(),
+            "x == 5 is not implied by the loop exit, so it must fail"
+        );
+    });
+}
+
+#[test]
 fn a_nested_if_reaches_an_assertion_after_both() {
     smt::with_fresh(|| {
         let x = var(8);
