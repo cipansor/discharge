@@ -163,6 +163,25 @@ of an under-declared frame rather than hiding it. Do not "fix" that by having th
 interpreter consult the body: the point is to model the declared contract, which is what
 a real machine executes against.
 
+## A total function can still be wrong
+
+Two bugs in `Fixed` (Q16.16) were invisible to the proof layer, because both operations are
+total and the engine proves things about them happily.
+
+1. **`to_int` floored instead of truncating.** The doc said "truncated toward zero"; `>> 16`
+   is an arithmetic shift, which floors, so `-0.5` gave `-1`. Every negative fractional
+   input was off by one. This is the mirror of the shift-amount bug: the operator is total,
+   so nothing complains, and the comment described the *intent* rather than the code.
+
+2. **`from_int` wrapped.** Q16.16 in `i32` spans `[-32768, 32767]` integers, and `v << 16`
+   silently wraps outside that, so `from_int(32768)` produced `-32768`. Saturating is the fix,
+   and it matches what `saturating_add`/`saturating_mul_int` already promise.
+
+The lesson generalises: "this operation cannot panic" is not "this operation is correct". A
+primitive that is total by construction (a shift, a cast, a bitwise op) is exactly where a
+wrong result hides, because there is no trap to notice. Test the *value*, against the
+language's own operator where one exists (`bits / 65536` is the definition of toward-zero).
+
 ## Fuzz the layers, not just the top
 
 The differential harness started at the decision procedure and had to be pushed down twice,

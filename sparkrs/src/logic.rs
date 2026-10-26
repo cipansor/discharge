@@ -207,14 +207,34 @@ impl Fixed {
     /// The smallest representable value.
     pub const MIN: Fixed = Fixed(i32::MIN);
 
-    /// From an integer.
+    /// From an integer, saturating.
+    ///
+    /// The range of Q16.16 in `i32` is `[-32768, 32767]` integers, so `v << 16` silently
+    /// wraps for `|v| >= 32768`: `from_int(32768)` used to give `-32768`. A shift is a
+    /// total function, which is exactly why the wrap is invisible. Saturating keeps this
+    /// module's promise that no primitive overflows without saying so.
     pub const fn from_int(v: i32) -> Fixed {
-        Fixed(v << 16)
+        if v > i32::MAX >> 16 {
+            Fixed(i32::MAX)
+        } else if v < i32::MIN >> 16 {
+            Fixed(i32::MIN)
+        } else {
+            Fixed(v << 16)
+        }
     }
 
     /// The integer part, truncated toward zero.
+    ///
+    /// Truncation toward zero is not `self.0 >> 16` for negative values: an arithmetic
+    /// shift is a floor, so `-0.5 >> 16` gives `-1`, not `0`. That one-bit bias on every
+    /// negative fractional input is the kind of error a control law cannot see. The
+    /// magnitude is truncated and the sign restored, which is `as i32` behaviour.
     pub const fn to_int(self) -> i32 {
-        self.0 >> 16
+        if self.0 >= 0 {
+            self.0 >> 16
+        } else {
+            -((self.0.unsigned_abs() >> 16) as i32)
+        }
     }
 
     /// Construct from raw bits.
@@ -357,6 +377,42 @@ mod tests {
     #[test]
     fn fixed_add_guard_is_sound() {
         assert!(verify_fixed_add_no_overflow().is_proved());
+    }
+
+    #[test]
+    fn fixed_to_int_truncates_toward_zero() {
+        // `-0.5` and `-1/65536` both have integer part zero, not -1. An arithmetic shift
+        // floors, so the old `>> 16` was wrong for every negative fractional input.
+        assert_eq!(Fixed::from_bits(-32768).to_int(), 0);
+        assert_eq!(Fixed::from_bits(-1).to_int(), 0);
+        assert_eq!(Fixed::from_bits(-65536).to_int(), -1);
+        assert_eq!(Fixed::from_bits(-65537).to_int(), -1);
+        assert_eq!(Fixed::from_bits(65535).to_int(), 0);
+        assert_eq!(Fixed::from_bits(i32::MIN).to_int(), -32768);
+        assert_eq!(Fixed::from_bits(i32::MAX).to_int(), 32767);
+        // Matches the language's own cast, which is the definition of "toward zero".
+        for bits in [i32::MIN, -70000, -65536, -32768, -1, 0, 1, 32768, 65535, i32::MAX] {
+            assert_eq!(
+                Fixed::from_bits(bits).to_int(),
+                bits / 65536,
+                "bits {}",
+                bits
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_from_int_saturates_instead_of_wrapping() {
+        assert_eq!(Fixed::from_int(0).to_bits(), 0);
+        assert_eq!(Fixed::from_int(1).to_bits(), 65536);
+        assert_eq!(Fixed::from_int(-1).to_bits(), -65536);
+        assert_eq!(Fixed::from_int(32767).to_bits(), 32767 << 16);
+        assert_eq!(Fixed::from_int(-32768).to_bits(), i32::MIN);
+        // Out of range: clamp, do not wrap to the opposite sign.
+        assert_eq!(Fixed::from_int(32768), Fixed::MAX);
+        assert_eq!(Fixed::from_int(40000), Fixed::MAX);
+        assert_eq!(Fixed::from_int(-32769), Fixed::MIN);
+        assert_eq!(Fixed::from_int(i32::MAX), Fixed::MAX);
     }
 
     #[test]
