@@ -438,21 +438,43 @@ fn collect<'a>(
             if smt::prove(smt::not(*c)).is_proved() {
                 *vacuous = true;
             }
+            // A dominating `assume` is part of the context for every claim to its right:
+            // `assume k; assert c` is the obligation `k => c`, not `c`. The backward walk
+            // reaches the `assume` *after* the claims it dominates, so they are all in
+            // `start..*n` by now.
+            guard_range(out, start, *n, *c);
             *cursor = smt::implies(*c, *cursor);
         }
         Stmt::Assert(c) => {
-            // Reaching the assertion means the cursor holds, so `c` must too.
-            push(out, n, Rule::Assertion, smt::implies(*cursor, *c));
+            // The claim is `c`, in the state that reaches the assertion. That state is
+            // fixed by the assignments that dominate it (applied later, as substitutions)
+            // and by the guards, invariants and assumes that dominate it (applied here, as
+            // context, by `guard_range` at the enclosing construct). Recording
+            // `implies(*cursor, *c)` instead would ask only that `c` hold whenever the
+            // *continuation* is satisfiable, which is a weaker claim and not the one an
+            // assertion makes.
+            push(out, n, Rule::Assertion, *c);
             *cursor = smt::and(*c, *cursor);
         }
         Stmt::If { cond, then_, else_ } => {
             let after = *cursor;
             // Each branch is walked in its own slot range so its assignments do
             // not rewrite the sibling's obligations.
+            let then_start = *n;
             let mut then_cursor = after;
             collect(then_, &mut then_cursor, out, *n, n, overflow, vacuous);
+            let then_end = *n;
+            let else_start = *n;
             let mut else_cursor = after;
             collect(else_, &mut else_cursor, out, *n, n, overflow, vacuous);
+            let else_end = *n;
+            // A claim in a branch is only made for the states that reach it, so each
+            // branch's claims are checked under its guard. The guard is in the state at
+            // the `if`, and the branch's own assignments have already been applied to the
+            // claims, so wrapping here (rather than substituting the guard in) is what
+            // keeps the guard about the *entry* state.
+            guard_range(out, then_start, then_end, *cond);
+            guard_range(out, else_start, else_end, smt::not(*cond));
             *cursor = ite_pred(*cond, then_cursor, else_cursor);
         }
         Stmt::While { cond, invariant, variant, body } => {
@@ -489,9 +511,14 @@ fn collect<'a>(
                 smt::implies(smt::and(inv, smt::not(*cond)), q),
             );
             // Obligations inside the body are checked under the invariant and the
-            // guard, which is the context every iteration begins from.
+            // guard, which is the context every iteration begins from. The invariant and
+            // guard describe the loop-head state, so they are attached as context after
+            // the body's assignments have been applied, never substituted through them.
+            let body_start = *n;
             let mut body_cursor = inv;
             collect(body, &mut body_cursor, out, *n, n, overflow, vacuous);
+            let body_end = *n;
+            guard_range(out, body_start, body_end, smt::and(inv, *cond));
             // All a caller may assume after the loop is the invariant.
             *cursor = inv;
         }
@@ -643,6 +670,25 @@ fn program_limit(out: &[Option<Obligation>]) -> usize {
 /// Used for assertions, where dropping one is not a soundness problem: a dropped
 /// assertion still poisons the weakest precondition, so the contract obligation catches
 /// it. Claim-carrying obligations use [`push_checked`], which reports the drop.
+/// Strengthen the state claims in `out[start..end]` with the context that reaches them.
+///
+/// An assertion and a call's precondition are claims about the state at a point, and that
+/// state is reached only under the guards, invariants and assumes that dominate the point.
+/// Attaching the context turns `c` into `context => c`. Without it a correct program such
+/// as `if x == 1 { assert x == 1 }` was reported as a failure, because the assertion was
+/// checked against every `x` rather than the `x` the guard admits. Loop obligations are
+/// deliberately not touched: they are universally quantified over the loop-head state and
+/// carry their own context.
+fn guard_range(out: &mut [Option<Obligation>], start: usize, end: usize, context: Pred) {
+    for slot in out[start..end].iter_mut() {
+        if let Some(ob) = slot {
+            if ob.rule == Rule::Assertion || ob.rule == Rule::CallRequires {
+                *slot = Some(Obligation::new(ob.rule, smt::implies(context, ob.goal)));
+            }
+        }
+    }
+}
+
 fn push(out: &mut [Option<Obligation>], n: &mut usize, rule: Rule, goal: Pred) {
     if *n < program_limit(out) {
         out[*n] = Some(Obligation::new(rule, goal));

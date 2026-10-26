@@ -1250,3 +1250,124 @@ fn distinct_assign_many_targets_still_work() {
         assert_eq!(smt::prove(pre), smt::Verdict::Valid);
     });
 }
+
+#[test]
+fn an_assertion_is_checked_under_the_guard_that_reaches_it() {
+    // `if x == 1 { assert x == 1 }` is correct: the assertion is only reached when the
+    // guard holds. It used to be reported as a failure, because the assertion was checked
+    // against every `x` instead of the `x` the guard admits -- so a correct program could
+    // not use an assertion inside a branch at all.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let guard = x.eq_val(1);
+        let s = Stmt::If {
+            cond: guard,
+            then_: &Stmt::Assert(guard),
+            else_: &Stmt::Skip,
+        };
+        let r = verify_program(&s, smt::truth(true), smt::truth(true));
+        assert!(r.is_verified(), "a guarded assertion must not be refused");
+    });
+}
+
+#[test]
+fn both_branches_see_their_own_guard() {
+    smt::with_fresh(|| {
+        let x = var(8);
+        let guard = x.eq_val(1);
+        let s = Stmt::If {
+            cond: guard,
+            then_: &Stmt::Assert(guard),
+            else_: &Stmt::Assert(smt::not(guard)),
+        };
+        let r = verify_program(&s, smt::truth(true), smt::truth(true));
+        assert!(r.is_verified(), "each branch must see its own guard");
+    });
+}
+
+#[test]
+fn a_false_assertion_inside_a_branch_is_still_caught() {
+    // The teeth for the fix above: widening the context must not turn a real failure into
+    // a green check. `assert x == 2` under `x == 1` is false, and a write inside the branch
+    // must not be substituted into the guard either.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let s = Stmt::If {
+            cond: x.eq_val(1),
+            then_: &Stmt::Assert(x.eq_val(2)),
+            else_: &Stmt::Skip,
+        };
+        let r = verify_program(&s, smt::truth(true), smt::truth(true));
+        assert!(!r.is_verified(), "a false assertion must not verify");
+        assert_eq!(r.first_failure().unwrap().0.rule, Rule::Assertion);
+    });
+
+    smt::with_fresh(|| {
+        let x = var(8);
+        // `if x == 1 { x := 5; assert x == 1 }`: the guard is about the *entry* state, so
+        // substituting the write into it would make this vacuously true.
+        let inner = Stmt::Seq {
+            first: &Stmt::Assign { var: x, expr: smt::word(5, 8) },
+            second: &Stmt::Assert(x.eq_val(1)),
+        };
+        let s = Stmt::If {
+            cond: x.eq_val(1),
+            then_: &inner,
+            else_: &Stmt::Skip,
+        };
+        let r = verify_program(&s, smt::truth(true), smt::truth(true));
+        assert!(!r.is_verified(), "the guard must not be rewritten by the branch");
+    });
+}
+
+#[test]
+fn a_dominating_assume_is_context_for_a_later_assertion() {
+    smt::with_fresh(|| {
+        let x = var(8);
+        let fact = x.eq_val(7);
+        let s = Stmt::Seq {
+            first: &Stmt::Assume(fact),
+            second: &Stmt::Assert(fact),
+        };
+        let r = verify_program(&s, smt::truth(true), smt::truth(true));
+        assert!(r.is_verified(), "an assumed fact may be asserted");
+
+        // And the reverse order must not: the assertion runs before the assume, so the
+        // assume cannot reach back and justify it.
+        let s = Stmt::Seq {
+            first: &Stmt::Assert(fact),
+            second: &Stmt::Assume(fact),
+        };
+        let r = verify_program(&s, smt::truth(true), smt::truth(true));
+        assert!(!r.is_verified(), "an assume must not justify an earlier assertion");
+    });
+}
+
+#[test]
+fn an_assertion_in_a_loop_body_sees_the_invariant_and_guard() {
+    smt::with_fresh(|| {
+        let i = var(8);
+        // while i < 10 invariant i <= 10 { assert i <= 10 }
+        let body = Stmt::Assert(i.le_val(10));
+        let s = Stmt::While {
+            cond: i.lt_val(10),
+            invariant: i.le_val(10),
+            variant: None,
+            body: &body,
+        };
+        let r = verify(&s, i.le_val(10), i.le_val(10));
+        assert!(r.is_verified(), "the invariant is the context of the body");
+
+        // Teeth: an assertion the invariant does not imply must still fail, even though
+        // the loop obligations themselves are fine.
+        let bad = Stmt::Assert(i.le_val(3));
+        let s = Stmt::While {
+            cond: i.lt_val(10),
+            invariant: i.le_val(10),
+            variant: None,
+            body: &bad,
+        };
+        let r = verify(&s, i.le_val(10), i.le_val(10));
+        assert!(!r.is_verified(), "an unimplied assertion must not verify");
+    });
+}

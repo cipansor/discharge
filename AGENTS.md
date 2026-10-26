@@ -443,6 +443,33 @@ and `exists_guarded` are *not* affected: an empty range yields `true`/`false` re
 which is correct for an empty range, and `inside` already treats an unrepresentable index as
 outside the bound rather than truncating it.
 
+## A claim is made in the state that reaches it, not in the state after it
+
+An assertion recorded as `implies(cursor, c)` is the wrong claim. The cursor is what the
+*continuation* needs, so `implies(cursor, c)` says "if whatever comes after this assertion is
+satisfiable, then `c`". That is not what `assert c` means, and it has two consequences.
+
+The visible one is that correct programs were refused. `if x == 1 { assert x == 1 }` was
+reported as a failure, because the assertion was checked against every `x` rather than the `x`
+the guard admits -- so an assertion inside a branch could never be used. `wp.rs` documented the
+opposite ("checked in the context of the state that reaches it"), and no test exercised an
+assertion inside a branch, so the documentation and the code disagreed and nothing noticed.
+
+The assertion's goal is now just `c`. The state that reaches it is fixed by two mechanisms,
+and keeping them separate is what makes the guard correct:
+
+* assignments that dominate the assertion are applied as *substitutions*, in the backward
+  walk, so `x := 5; assert x == 1` becomes `assert 5 == 1`;
+* guards, loop invariants and dominating `assume`s are attached as *context*, by
+  `guard_range`, after the branch or body has been walked. Wrapping `c` in `g => c` at the
+  enclosing construct keeps `g` about the entry state. Substituting `g` in instead would let a
+  write inside the branch rewrite the guard, which turns `if x == 1 { x := 5; assert x == 1 }`
+  into a green check.
+
+`guard_range` applies to `Assertion` and `CallRequires` obligations only. Loop obligations are
+universally quantified over the loop-head state and already carry their own context; rewriting
+them with a dominating guard is the vacuity bug they exist to avoid.
+
 ## One variable index is one variable, at one width
 
 The blaster keys its BDD variables by `(index, bit)`, and a variable's index is what
