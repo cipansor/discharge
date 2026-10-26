@@ -324,6 +324,26 @@ no teeth for checking *which* theorem was recorded. Structural equality does. Th
 point: when testing that an object records the right thing, compare structure, not semantics;
 if the object is constrained to be provable, semantics is constant and the test is vacuous.
 
+## Third time: the call arm
+
+After `if` and `while` came the call, the third construct whose right-hand claims were
+checked in the wrong state. `a := 5; c := double(a); assert c == 10` was refuted with `c`
+free, even though the callee's contract says `c == a + a == 10` and the `CallRequires`
+obligation was discharged.
+
+The fix differs from the other two in a way that matters, and getting it wrong would have
+looked like success. `if` and `while` describe their entry state in the *same* variables,
+so wrapping the claim with `guard_range` suffices. A call *renames* every written target
+(that is the havoc that keeps pre- and post-call values apart), so the goal must be
+substituted too. Wrapping alone would leave `implies(v == a + a, c == 10)` with the old `c`
+still free -- still refuted, the change inert. The arm therefore substitutes the goal by the
+havoc list *and* wraps it, which `guard_range` cannot express.
+
+The pattern to carry forward: after a `while` or a call, a claim to the right is checked
+under that construct's exit assumption, and the transformation must touch both the
+assumption and the goal. `Assume` is the fourth instance of the same family and already does
+this via `guard_range` plus `*cursor = implies(*c, *cursor)`.
+
 ## The same defect, one construct over
 
 An assertion after an `if` was checked as if the `if` were absent (a false refusal, fixed

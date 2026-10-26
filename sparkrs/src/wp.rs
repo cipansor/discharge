@@ -388,6 +388,9 @@ fn collect<'a>(
             }
         }
         Stmt::Call { proc_, actuals, writes } => {
+            // Claims already recorded to the right of this call are dominated by it; they
+            // are rewritten at the end of this arm.
+            let entry_n = *n;
             if !Stmt::frame(proc_, actuals, writes) {
                 // Unmodelled, not merely unproved. Report it as an obligation that
                 // can never hold, rather than asserting and aborting: a verifier
@@ -427,6 +430,34 @@ fn collect<'a>(
             let (havoc, n_havoc) = havoc_writes(actuals, writes);
             let renamed_ensures = smt::substitute(renamed_ensures, &havoc[..n_havoc]);
             let continuation = smt::substitute(*cursor, &havoc[..n_havoc]);
+            // A claim to the *right* of the call is only made for the states the call can
+            // produce, so it must be checked under the assumption the call makes:
+            // `ensures[actuals] => goal`, with the written targets havoced so the pre-call
+            // values are not confused with the post-call ones. Without this the claim was
+            // checked in the pre-call state, and `a := 5; c := double(a); assert c == 10`
+            // was refuted with `c = 1` even though the callee's own contract guarantees
+            // `c == 10`. This is the call analogue of the `if` and `while` rewrites above,
+            // and the third construct to need it.
+            //
+            // Both halves of the transformation are required, unlike the `if` and `while`
+            // cases: those describe the entry state in the *same* variables, but the call
+            // renames every written target, so the goal must be havoced too. Wrapping the
+            // goal without substituting would leave `implies(v == a + a, c == 10)` --
+            // `c` free, hence still refuted -- and the fix would look right while changing
+            // nothing. `guard_range` cannot do this, so the loop is written out.
+            if entry_n > start {
+                for slot in out[start..entry_n].iter_mut() {
+                    if let Some(ob) = slot {
+                        if ob.rule == Rule::Assertion || ob.rule == Rule::CallRequires {
+                            let goal = smt::substitute(ob.goal, &havoc[..n_havoc]);
+                            *slot = Some(Obligation::new(
+                                ob.rule,
+                                smt::implies(renamed_ensures, goal),
+                            ));
+                        }
+                    }
+                }
+            }
             *cursor = smt::implies(renamed_ensures, continuation);
         }
         Stmt::Assume(c) => {

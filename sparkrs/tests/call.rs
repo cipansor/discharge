@@ -1014,3 +1014,75 @@ fn wp_still_reasons_about_a_call_with_a_good_frame() {
         assert_eq!(smt::prove(goal), Verdict::Valid, "a framed call must still verify");
     });
 }
+
+#[test]
+fn an_assertion_after_a_call_sees_the_call() {
+    // The call analogue of `an_assertion_after_an_if_sees_the_if`, and the third construct
+    // to have the same hole: a claim to the *right* of a call was checked in the pre-call
+    // state. `a := 5; c := double(a); assert c == 10` was reported as a failure, with the
+    // written target `c` free, even though the callee's own contract guarantees `c == 10`.
+    //
+    // Two halves are needed here, unlike `if` and `while`: the goal must be checked under
+    // the call's `ensures`, *and* the written targets must be havoced in the goal as well
+    // as in the assumption, because the call renames them. Wrapping without havocing leaves
+    // the goal mentioning the old `c`, which proves nothing.
+    smt::with_fresh(|| {
+        let (x, r, body) = double_parts();
+        let p = Proc {
+            name: "double",
+            requires: smt::ule_const(x, 100),
+            ensures: smt::eq(r, x + x),
+            body: &body,
+        };
+        let a = var(8);
+        let c = var(8);
+        let call = Stmt::Call { proc_: &p, actuals: &[(x, a), (r, c)], writes: &[r] };
+        let init = Stmt::Assign { var: a, expr: smt::word(5, 8) };
+
+        // True claim: the contract gives `c == a + a == 10`.
+        let s = Stmt::Seq {
+            first: &init,
+            second: &Stmt::Seq {
+                first: &call,
+                second: &Stmt::Assert(smt::eq(c, smt::word(10, 8))),
+            },
+        };
+        let r = wp::verify(&s, smt::truth(true), smt::truth(true));
+        assert!(
+            r.is_verified(),
+            "the call's ensures must reach the assertion after it; got {:?}",
+            r.first_failure()
+        );
+
+        // Teeth: a claim the contract does not establish must still fail.
+        let s = Stmt::Seq {
+            first: &init,
+            second: &Stmt::Seq {
+                first: &call,
+                second: &Stmt::Assert(smt::eq(c, smt::word(11, 8))),
+            },
+        };
+        let r = wp::verify(&s, smt::truth(true), smt::truth(true));
+        assert!(!r.is_verified(), "c == a + a == 10, so c == 11 must fail");
+
+        // Teeth for the havoc: `c := 99` before the call must not make `c == 99` provable
+        // after it, because the call overwrites `c`. Without the havoc in the goal, this
+        // would pass and certify a stale value.
+        let stale = Stmt::Assign { var: c, expr: smt::word(99, 8) };
+        let s = Stmt::Seq {
+            first: &init,
+            second: &Stmt::Seq {
+                first: &stale,
+                second: &Stmt::Seq {
+                    first: &call,
+                    second: &Stmt::Assert(smt::eq(c, smt::word(99, 8))),
+                },
+            },
+        };
+        let r = wp::verify(&s, smt::truth(true), smt::truth(true));
+        assert!(
+            !r.is_verified(),
+            "the call writes `c`, so its pre-call value 99 must not survive"
+        );
+    });
+}
