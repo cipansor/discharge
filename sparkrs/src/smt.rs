@@ -304,6 +304,15 @@ pub(crate) struct Ctx {
     /// pick one of several meanings silently, which is the failure this crate exists to
     /// prevent.
     ill_formed: bool,
+
+    /// Makes `Ctx` `!Send` and `!Sync`, so the claim in the `no_std` `with_ctx` SAFETY
+    /// comment is enforced by the type system rather than merely asserted. Every field
+    /// above is a plain array or integer, so without this marker `Ctx` is auto-`Send` and
+    /// auto-`Sync` -- and a type that is `Sync` can be shared across threads, which is
+    /// exactly the sharing the single global `static mut CTX` cannot survive. The marker
+    /// is a `*mut` because it is the one pointer type with no `Send`/`Sync` impl; it is
+    /// never dereferenced, and it costs nothing at runtime.
+    _not_shared: core::marker::PhantomData<*mut ()>,
 }
 
 /// Sentinel: variable `i` has no replacement.
@@ -344,6 +353,7 @@ impl Ctx {
             term_gen: [0; CAP],
             stale: false,
             ill_formed: false,
+            _not_shared: core::marker::PhantomData,
         }
     }
 
@@ -1250,10 +1260,14 @@ static mut CTX: Ctx = Ctx::new();
 
 #[cfg(not(feature = "std"))]
 pub(crate) fn with_ctx<R>(f: impl FnOnce(&mut Ctx) -> R) -> R {
-    // SAFETY: bare-metal `no_std` builds of this crate are single-threaded by
-    // construction (the arena is not `Send`/`Sync` and is documented as such).
-    // Callers running it from both an interrupt and main context must wrap the
-    // query in their own critical section.
+    // SAFETY: `CTX` is a `static mut`, so taking `&mut` to it is a promise that no other
+    // reference to it exists. Two things carry that promise. First, `Ctx` is `!Send` and
+    // `!Sync` (the `_not_shared` marker), so the arena cannot be shared across threads by
+    // any safe code. Second, a bare-metal `no_std` build of this crate is single-threaded:
+    // there is no second thread to race. What is left is re-entrancy from an interrupt on
+    // the same core, which the type system cannot see -- a handler that runs a query while
+    // main is inside one would alias `CTX`. That is the caller's obligation, and it is why
+    // the crate documents wrapping queries in a critical section.
     unsafe {
         let ctx = &mut *core::ptr::addr_of_mut!(CTX);
         ctx.ensure_ready();
