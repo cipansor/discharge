@@ -1334,3 +1334,17 @@ manual, but the durable check is one command: extract the names from the block a
 them against the directories. It caught the last two omissions in seconds. When a document
 restates something the code already knows, make the check mechanical or accept that it will
 drift; do not fix it by hand and assume it stays fixed.
+
+## `ignore` on a doc example is an example that was never compiled
+
+Two examples in `macros.rs` were marked ```` ```ignore ````: the `contract!` example was
+not even valid Rust (it used `x` with no declaration) and the `verify_exhaustive!` example
+was a claim about a macro whose whole recent fix was that it must *panic* on a false
+property -- the exact property its own unit test checks, written in the docs and never
+run. `ignore` is not "this is illustrative"; to `rustdoc` it means "do not check me", so a
+doc example marked `ignore` is a sentence that no tool will ever contradict.
+
+Both were made real doctests (the count went 8 passed + 2 ignored -> 10 passed + 0 ignored,
+and the gate's test count 247 -> 249). When you write ```` ```ignore ````, ask which
+mechanism would notice if the code stopped being true. If the answer is "none", it is not a
+doc example, it is prose in a code block.

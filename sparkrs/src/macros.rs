@@ -55,11 +55,16 @@ macro_rules! verify_implies {
 
 /// State a contract with SPARK-like syntax and discharge it.
 ///
-/// ```ignore
-/// let verdict = contract! {
-///     requires x.le_val(1000),
-///     ensures  x.lt_val(2000),
-/// };
+/// ```
+/// use sparkrs::prelude::*;
+/// sparkrs::smt::with_fresh(|| {
+///     let x = var(8);
+///     let verdict = contract! {
+///         requires x.lt_val(16),
+///         ensures  x.lt_val(32),
+///     };
+///     assert!(verdict.is_proved());
+/// });
 /// ```
 #[macro_export]
 macro_rules! contract {
@@ -106,7 +111,9 @@ macro_rules! check {
 /// Complete proof by enumeration over a small domain, panicking with the smallest
 /// counterexample if the property does not hold.
 ///
-/// ```ignore
+/// ```
+/// use sparkrs::prelude::*;
+/// use sparkrs::sym::*;
 /// // ∀ a b:u8. (a + b) wraps  <=>  result < a
 /// verify_exhaustive!(a: u8, b: u8 => (a as u16 + b as u16 > 255) == (a.wrapping_add(b) < a));
 /// ```
