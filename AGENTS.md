@@ -1127,3 +1127,61 @@ Ordered BDD. Invariants that are easy to break and hard to debug:
   be real.
 - Keep the README honest about limits. Do not claim memory/aliasing/concurrency
   coverage; the logic is bit-vectors and booleans only.
+
+## A construct that cuts a path off is a claim, and vacuous truth is not proof
+
+The recurring shape, now met four times, and worth stating as a rule rather than a story.
+Three ways this fragment cuts a path off, each of which makes everything downstream
+*vacuously* true — `false => Q` is a theorem for any `Q` — and each of which was, at some
+point, reported as a proof:
+
+| the cut | why downstream is vacuous | how it was found |
+| --- | --- | --- |
+| `Assume(false)` | the assumption is unsatisfiable | hand-built example |
+| unreachable `pre` | `pre => wp(body, post)` is a theorem | hand-built example |
+| a call to `ensures false` | the callee never returns, so the post-call state is empty | probing the `Call` rule |
+
+All three are now recorded as *failures* (`VacuousAssume`, `VacuousPrecondition`,
+`DivergentCall`), because the honest reading is "nothing was proved", not "the contract
+holds". The questions to ask, generalising the three above:
+
+* Which statements can cut a path off, and does the report say so when one does?
+* When a summary (`verified`, `Total`) is computed, does it distinguish "proved" from
+  "proved only because the path was cut"?
+* A cut makes the *continuation* vacuous. Does any summary read the continuation without
+  noticing the cut? `has_termination_proof` did: `loops == variants == 0` on a program
+  whose only divergence was a call.
+
+## A type's invariant must hold for every constructor, including the degenerate input
+
+`Bounded<MIN, MAX>` advertises `LOW <= get() <= HIGH` as an invariant that "cannot be broken
+by construction". `new` upheld it; `clamp` returned `MIN` when `MIN > MAX`, so
+`Bounded<100, 10>::clamp(50)` gave `100` — outside the type's own range, in the one type the
+crate offers as the example of an invariant that holds by construction. Nothing tested the
+degenerate range, because every test used a real one.
+
+The question generalises: for a type that claims an invariant, walk every constructor and
+every public entry point and ask what the degenerate input does — empty range, zero width,
+empty slice, `MIN > MAX`. A refinement type is only as strong as its weakest constructor,
+and the degenerate case is where the invariant is usually not even well-defined.
+
+Also: the fix was a signature change (`clamp -> Option<Self>`), not a `debug_assert`. A
+`panic` would turn a specification mistake into a runtime abort in the deployed build,
+which is the opposite of what this crate is for. When a constructor cannot honour its
+invariant, the partiality belongs in its type.
+
+## Probing a rule means probing what it *models*, not what it computes
+
+Both termination findings this session (DEFECT 44's nested-loop havoc, and the
+never-returning call) came from the same move: take a rule, ask what program construct it
+stands for, and check the model against the construct's real meaning.
+
+* `variant_after` modelled an inner loop as a no-op. Its *computation* was fine; the
+  *model* was wrong, and a divergent program was proved `Total`.
+* The `Call` rule models "assume `ensures`; continue". That is right for a returning call
+  and wrong for one that never returns, and the difference is invisible in the computation.
+
+Neither is reachable by reading the code for arithmetic mistakes. They are reachable by
+writing down what each rule claims about the program and asking for a counterexample to the
+claim. `examples/` probes are the cheap way to do this; delete them once the finding is
+pinned by a test.
