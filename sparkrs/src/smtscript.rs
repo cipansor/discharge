@@ -101,35 +101,72 @@ struct Bool(Term);
 /// Wrapper marking a term as a bit-vector for printing.
 struct Bits(Term);
 
-/// Does this operation produce a boolean rather than a word?
+/// Wrapper printing a comparison as its native, boolean-sorted SMT-LIB form.
 ///
-/// `And`, `Or`, `Xor` and `Not` appear in both roles; at width 1 the two readings
-/// coincide, and SMT-LIB's boolean and one-bit-vector operators agree there, so
-/// treating them as boolean is safe.
-fn is_bool(op: Op) -> bool {
-    matches!(op, Op::Not | Op::And | Op::Or | Op::Xor | Op::Eq | Op::Ult | Op::Ule)
+/// Comparisons are the one class of term whose SMT-LIB sort is fixed -- always `Bool`,
+/// never a bit-vector -- so both `Bool` and `Bits` need their spelling. Printing it in
+/// one place keeps `Bool` from delegating to `Bits` which delegates back to `Bool` for
+/// the same node, which recursed forever.
+struct Cmp(Term);
+
+impl fmt::Display for Cmp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let n = smt::pred_node(Pred(self.0));
+        match n.op {
+            Op::Eq => write!(f, "(= {} {})", Bits(Term(n.a)), Bits(Term(n.b))),
+            Op::Ult => write!(f, "(bvult {} {})", Bits(Term(n.a)), Bits(Term(n.b))),
+            Op::Ule => write!(f, "(bvule {} {})", Bits(Term(n.a)), Bits(Term(n.b))),
+            _ => unreachable!("Cmp is only built for comparisons"),
+        }
+    }
+}
+
+/// Does this operation *always* produce a boolean rather than a word?
+///
+/// Only the comparisons do. `And`, `Or`, `Xor` and `Not` are ambiguous: they are a
+/// boolean operator when their operand is a proposition and a one-bit-vector operator
+/// when it is a word, and the engine gives them width 1 either way. The width alone
+/// cannot decide the sort, and neither can the operator -- the *context* decides.
+/// SMT-LIB is strongly sort-checked, so the two are not interchangeable even where
+/// their truth tables agree; treating them as boolean (as this function's predecessor
+/// did) emitted `(bvule (_ bv1 1) (or ...))`, ill-sorted and rejected by any compliant
+/// solver. `Display for Bool` and `Display for Bits` therefore render from the expected
+/// sort, and this predicate is used only to classify genuine comparisons.
+fn is_comparison(op: Op) -> bool {
+    matches!(op, Op::Eq | Op::Ult | Op::Ule)
+}
+
+/// Whether a term is a one-bit connective, which exists in both a boolean and a
+/// one-bit-vector reading.
+fn is_one_bit_connective(op: Op) -> bool {
+    matches!(op, Op::Not | Op::And | Op::Or | Op::Xor)
 }
 
 impl fmt::Display for Bool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let n = smt::pred_node(Pred(self.0));
-        match n.op {
-            Op::Not | Op::And | Op::Or | Op::Xor | Op::Eq | Op::Ult | Op::Ule => {
-                write!(f, "{}", Bits(self.0))
-            }
-            // A one-bit word used as a proposition: `w != 0`.
-            //
-            // This used to print `(= w (_ bv0 w))`, the negation of what the comment
-            // says. A constant goal came out inverted: `truth(false)` was written as
-            // `(assert (not (= (_ bv0 1) (_ bv0 1))))`, i.e. `(assert false)`, which any
-            // solver reports `unsat` -- so an external checker would call an impossible
-            // obligation *proved*, the opposite of the engine's verdict. `distinct` is
-            // the right spelling of `!=`.
-            _ => {
-                let w = n.width;
-                write!(f, "(distinct {} (_ bv0 {}))", Bits(self.0), w)
-            }
+        if is_comparison(n.op) {
+            return write!(f, "{}", Cmp(self.0));
         }
+        if n.width == 1 && is_one_bit_connective(n.op) {
+            // A one-bit connective is already a proposition in this reading.
+            return match n.op {
+                Op::Not => write!(f, "(not {})", Bool(Term(n.a))),
+                Op::And => write!(f, "(and {} {})", Bool(Term(n.a)), Bool(Term(n.b))),
+                Op::Or => write!(f, "(or {} {})", Bool(Term(n.a)), Bool(Term(n.b))),
+                _ => write!(f, "(xor {} {})", Bool(Term(n.a)), Bool(Term(n.b))),
+            };
+        }
+        // Any other word used as a proposition: `w != 0`.
+        //
+        // This used to print `(= w (_ bv0 w))`, the negation of what the comment
+        // says. A constant goal came out inverted: `truth(false)` was written as
+        // `(assert (not (= (_ bv0 1) (_ bv0 1))))`, i.e. `(assert false)`, which any
+        // solver reports `unsat` -- so an external checker would call an impossible
+        // obligation *proved*, the opposite of the engine's verdict. `distinct` is
+        // the right spelling of `!=`.
+        let w = n.width;
+        write!(f, "(distinct {} (_ bv0 {}))", Bits(self.0), w)
     }
 }
 
@@ -143,20 +180,14 @@ impl fmt::Display for Bits {
                 let v = (n.a as u64) | ((n.hi as u64) << 32);
                 write!(f, "(_ bv{} {})", v, w)
             }
-            // `Not`, `And`, `Or` and `Xor` exist in both readings. A boolean is a
-            // one-bit word in the engine, so the width decides which spelling is
-            // well-sorted: at width 1 the boolean operator applies (its operands are
-            // propositions, printed by `Bool`), and at any wider width the operands are
-            // bit-vectors and the `bv*` operator applies. Using `bvnot` on a comparison
-            // -- `not(x == y)` -- was ill-sorted: a solver rejects the file, and a lenient
-            // one reads something else. The truth tables coincide only at width 1.
-            Op::Not if w == 1 => write!(f, "(not {})", Bool(Term(n.a))),
+            // `Not`, `And`, `Or` and `Xor` exist in both readings. In a bit-vector
+            // position the `bv*` spelling is the well-sorted one at every width,
+            // including 1: the boolean spelling has sort Bool, which is not
+            // `(_ BitVec 1)` even though the truth tables coincide. The boolean
+            // reading is produced by `Display for Bool`, so no information is lost.
             Op::Not => write!(f, "(bvnot {})", Bits(Term(n.a))),
-            Op::And if w == 1 => write!(f, "(and {} {})", Bool(Term(n.a)), Bool(Term(n.b))),
             Op::And => write!(f, "(bvand {} {})", Bits(Term(n.a)), Bits(Term(n.b))),
-            Op::Or if w == 1 => write!(f, "(or {} {})", Bool(Term(n.a)), Bool(Term(n.b))),
             Op::Or => write!(f, "(bvor {} {})", Bits(Term(n.a)), Bits(Term(n.b))),
-            Op::Xor if w == 1 => write!(f, "(xor {} {})", Bool(Term(n.a)), Bool(Term(n.b))),
             Op::Xor => write!(f, "(bvxor {} {})", Bits(Term(n.a)), Bits(Term(n.b))),
             Op::Add => write!(f, "(bvadd {} {})", Bits(Term(n.a)), Bits(Term(n.b))),
             Op::Sub => write!(f, "(bvsub {} {})", Bits(Term(n.a)), Bits(Term(n.b))),
@@ -164,9 +195,12 @@ impl fmt::Display for Bits {
             Op::Shl => write!(f, "(bvshl {} {})", Bits(Term(n.a)), shift(n.b, w)),
             Op::LShr => write!(f, "(bvlshr {} {})", Bits(Term(n.a)), shift(n.b, w)),
             Op::Shr => write!(f, "(bvashr {} {})", Bits(Term(n.a)), shift(n.b, w)),
-            Op::Eq => write!(f, "(= {} {})", Bits(Term(n.a)), Bits(Term(n.b))),
-            Op::Ult => write!(f, "(bvult {} {})", Bits(Term(n.a)), Bits(Term(n.b))),
-            Op::Ule => write!(f, "(bvule {} {})", Bits(Term(n.a)), Bits(Term(n.b))),
+            // A comparison has sort Bool, so in a bit-vector position it is coerced to a
+            // one-bit vector: `(bvadd (= a b) x)` is ill-sorted, and this is what a solver
+            // accepts. The other half of the same sort bug as the `bv*` connectives below.
+            Op::Eq | Op::Ult | Op::Ule => {
+                write!(f, "(ite {} (_ bv1 1) (_ bv0 1))", Cmp(self.0))
+            }
             // Truncate: keep the low bits, zero-fill the rest. The direction decides
             // the operator, and the source width `n.b` decides the direction.
             //
@@ -243,7 +277,7 @@ pub fn var_name(v: Var) -> Name {
 /// connective. Exposed so tests can assert the shape of the output.
 pub fn is_boolean_term(p: Pred) -> bool {
     let n = smt::pred_node(p);
-    is_bool(n.op)
+    is_comparison(n.op)
 }
 
 #[cfg(feature = "std")]
@@ -329,6 +363,70 @@ mod tests {
             let vars = [a];
             let text = Query::new(&vars, a.eq_val(1)).to_smtlib2_string();
             assert!(text.contains("(assert (not (= x0_1 (_ bv1 1))))"), "{}", text);
+        });
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_one_bit_connective_in_a_bitvector_position_prints_as_a_bitvector() {
+        // The sort bug the `is_comparison` note describes. A one-bit `and`/`or`/`xor`/
+        // `not` is a word when it feeds a bit-vector operator and a proposition when it is
+        // the goal. Printing it as a boolean operator in the bit-vector position emitted
+        // `(bvule (_ bv1 1) (or ...))`, which z3 rejects as ill-sorted -- so an independent
+        // check of the *wrong formula* would fail, silently, and the export would look
+        // like a failed proof rather than a broken printer.
+        smt::with_fresh(|| {
+            let x = var(1);
+            let y = var(1);
+            let p = smt::eq(smt::band(x, y), smt::word(1, 1));
+            let text = Query::new(&[x, y], p).to_smtlib2_string();
+            assert!(
+                text.contains("(assert (not (= (bvand x0_1 x1_1) (_ bv1 1))))"),
+                "a one-bit word operand must use the bv spelling: {}",
+                text
+            );
+        });
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_comparison_used_as_a_word_is_coerced() {
+        // The other half: a comparison has sort Bool, so in a bit-vector position it needs
+        // `(ite <cmp> (_ bv1 1) (_ bv0 1))`. This shape is reachable through `smt::ite`
+        // over one-bit branches, where a branch may be a comparison.
+        smt::with_fresh(|| {
+            let a = var(8);
+            let b = var(8);
+            let t = smt::ult(a, b);          // a Pred: boolean-sorted
+            let one = smt::word(1, 1);
+            let zero = smt::word(0, 1);
+            // `ite(t, one, zero)` forces both branches to one bit, and `t` to a word.
+            let w = smt::ite(t, one, zero);
+            let p = smt::eq(w, one);
+            let text = Query::new(&[a, b], p).to_smtlib2_string();
+            assert!(
+                text.contains("(ite (bvult x0_8 x1_8) (_ bv1 1) (_ bv0 1))"),
+                "a comparison in a word position must be coerced: {}",
+                text
+            );
+        });
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_boolean_combination_of_comparisons_stays_boolean() {
+        // The positive control: when the term *is* the goal, the boolean spelling is the
+        // right one, and the fix must not have turned it into a `bv*` form.
+        smt::with_fresh(|| {
+            let x = var(1);
+            let y = var(1);
+            let p = smt::and(x.lt_val(1), y.le_val(1));
+            let text = Query::new(&[x, y], p).to_smtlib2_string();
+            assert!(
+                text.contains("(assert (not (and (bvult x0_1 (_ bv1 1)) (bvule x1_1 (_ bv1 1)))))"),
+                "a boolean goal must keep the boolean spelling: {}",
+                text
+            );
         });
     }
 

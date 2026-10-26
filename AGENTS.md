@@ -324,6 +324,32 @@ no teeth for checking *which* theorem was recorded. Structural equality does. Th
 point: when testing that an object records the right thing, compare structure, not semantics;
 if the object is constrained to be provable, semantics is constant and the test is vacuous.
 
+## The exporter emitted formulas no solver would accept
+
+The SMT-LIB2 exporter's doc said the boolean and one-bit-vector readings of `and`/`or`/
+`xor`/`not` "coincide, so treating them as boolean is safe". They coincide *semantically*
+and not *syntactically*: SMT-LIB is strongly sort-checked, and `Bool` is not `(_ BitVec 1)`.
+Printing a one-bit connective in a bit-vector position produced
+
+    (bvule (_ bv1 1) (or (distinct ...) (distinct ...)))
+
+which every compliant solver rejects. The failure mode is the worst kind for this module:
+the export exists so an *independent* solver can check the proof, and an ill-sorted file is
+not a failed check but no check at all -- the independence claim is quietly void.
+
+It was found only by handing the text to a real solver. Unit tests asserted the *shape* of
+the output and passed; a z3 differential over random predicates failed on 77 of 800 cases,
+all of them width 1 or a comparison in a word position. Hand-wavy "the truth tables agree"
+reasoning is not a substitute for running the artifact through the consumer.
+
+The fix renders from the expected *sort*, not the node's own width: `Bool` prints
+comparisons natively and one-bit connectives as `and`/`or`/`xor`/`not`; `Bits` prints
+comparisons as `(ite <cmp> (_ bv1 1) (_ bv0 1))` and one-bit connectives as
+`bvand`/`bvor`/`bvxor`/`bvnot`. A comparison's spelling lives in its own `Cmp` printer
+because both contexts need it -- and because `Bool` delegating to `Bits` which delegates
+back to `Bool` for the same node recursed until the stack overflowed, which the first
+attempt at the fix did.
+
 ## Third time: the call arm
 
 After `if` and `while` came the call, the third construct whose right-hand claims were
