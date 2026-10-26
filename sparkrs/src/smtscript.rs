@@ -273,8 +273,13 @@ pub fn var_name(v: Var) -> Name {
     Name(smt::index(v), smt::bits(v))
 }
 
-/// Whether the SMT-LIB text for a predicate would print as a bare boolean
-/// connective. Exposed so tests can assert the shape of the output.
+/// Whether the predicate prints as a comparison, i.e. a term whose SMT-LIB sort is
+/// `Bool` natively rather than a one-bit word. Exposed so tests can assert the shape of
+/// the output.
+///
+/// A one-bit `and`/`or`/`xor`/`not` is *not* counted: it is a word that `Bool` may render
+/// as a boolean connective, but `Bits` renders it as a `bv*` term, so its sort depends on
+/// context rather than on the node.
 pub fn is_boolean_term(p: Pred) -> bool {
     let n = smt::pred_node(p);
     is_comparison(n.op)
