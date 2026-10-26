@@ -443,6 +443,26 @@ and `exists_guarded` are *not* affected: an empty range yields `true`/`false` re
 which is correct for an empty range, and `inside` already treats an unrepresentable index as
 outside the bound rather than truncating it.
 
+## The shift amount is a literal too
+
+The out-of-range constant bug (`word`) had a twin in the exporter. A shift amount is printed
+as a literal of the shift's width: `(bvshl x (_ bv300 8))`. `300` does not fit 8 bits, so that
+is not a legal 8-bit literal -- a solver rejects the file or reads 44. And for `k >= 2^width`
+the *wrap* changes the meaning: `shl(x, 256)` printed `(_ bv0 8)`, the identity, while the
+engine's rule is that a shift of at least the width yields 0. So the exported file disagreed
+with the engine on a legal program.
+
+The engine's rule makes every amount `>= width` equivalent, so the exporter clamps the printed
+amount to `width`: a legal literal with the same meaning. It is the same "a literal is a claim
+about a width" mistake as `word`, in a different place, which is why it is worth stating as a
+pattern rather than as a one-off.
+
+The first export fuzzer could not have found it: its shift amounts were always `<= 8`, and the
+bug lives at `>= 2^width`. A generator that only emits well-behaved inputs checks only the
+well-behaved paths. The amounts now span `0..=11` (including `k == width` and just past it),
+and a dedicated test drives `k` in `{8, 9, 255, 256, 300, u32::MAX}` and compares the parsed
+meaning against the engine's rule for every input.
+
 ## Two rules, one program: `verify` and `wp` must agree
 
 `verify` runs `collect`, which checks `Stmt::frame` at every call and reports a bad frame as

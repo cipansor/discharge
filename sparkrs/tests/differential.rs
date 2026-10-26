@@ -1673,6 +1673,56 @@ fn the_export_keeps_a_constant_goal_upright() {
     });
 }
 
+#[test]
+fn the_export_clamps_an_oversized_shift_amount() {
+    // A shift amount is printed as a literal of the shift's width, and a literal has to fit
+    // that width. `shl(x, 300)` on an 8-bit value printed `(_ bv300 8)`, which no solver
+    // accepts as an 8-bit literal, and for `k >= 2^w` the wrap changed the meaning: a shift
+    // by 256 printed as `(_ bv0 8)`, i.e. the identity, while the engine says a shift of at
+    // least the width yields 0. The engine's rule makes every amount `>= width` equivalent,
+    // so the exporter clamps to `width`, a legal literal with the same meaning.
+    for k in [8u32, 9, 255, 256, 300, u32::MAX] {
+        let text = smt::with_fresh(|| {
+            let x = var(8);
+            let vars = [x];
+            let terms = [
+                smt::eq(smt::shl(x, k), smt::word(0, 8)),
+                smt::eq(smt::lshr(x, k), smt::word(0, 8)),
+                smt::eq(smt::ashr(x, k), smt::word(0, 8)),
+            ];
+            let mut out = String::new();
+            for (i, t) in terms.iter().enumerate() {
+                out.push_str(&Query::new(&vars, *t).to_smtlib2_string());
+                if i + 1 < terms.len() {
+                    out.push('\n');
+                }
+            }
+            out
+        });
+        // Every emitted literal must be a legal one; the reader enforces `v < 2^w`.
+        let parsed = parse_exported(&text)
+            .unwrap_or_else(|e| panic!("shift by {} did not export a legal literal ({}):\n{}", k, e, text));
+        assert_eq!(parsed.sort(), Sort::Bool);
+        // The parsed text is the *conjunction* of the three negated goals, so it must be
+        // false exactly when all three goals hold. `shl`/`lshr` by at least the width give
+        // 0; `ashr` replicates the sign bit, which is 0 only for a non-negative input.
+        for a in 0..256u64 {
+            let shl_ok = true; // shl(x, k) == 0 for k >= width
+            let lshr_ok = true; // lshr(x, k) == 0 for k >= width
+            let ashr_ok = a & 0x80 == 0; // ashr(x, k) == 0 iff the sign bit is clear
+            let all_hold = shl_ok && lshr_ok && ashr_ok;
+            assert_eq!(
+                parsed.eval(a, 0).b(),
+                !all_hold,
+                "shift by {} disagrees at x = {}:\n{}",
+                k,
+                a,
+                text
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The export fuzzer, extended to the operators the first version never emitted.
 //
@@ -1811,9 +1861,13 @@ fn we_expr(r: &mut FuzzLcg, depth: u32) -> WE {
         2 => WE::And(Box::new(x), Box::new(y)),
         3 => WE::Or(Box::new(x), Box::new(y)),
         4 => WE::Xor(Box::new(x), Box::new(y)),
-        5 => WE::Shl(Box::new(x), r.below(9) as u32),
-        6 => WE::LShr(Box::new(x), r.below(9) as u32),
-        7 => WE::Ashr(Box::new(x), r.below(9) as u32),
+        // Shift amounts span 0..=11, which includes `k >= width` (the region where the
+        // engine returns 0 or the sign) and the boundary `k == width`. `k >= 2^w` (e.g. 256
+        // for 8 bits) is covered by the dedicated test below, because a generator that only
+        // emits small amounts cannot reach the clamp that bug lived in.
+        5 => WE::Shl(Box::new(x), r.below(12) as u32),
+        6 => WE::LShr(Box::new(x), r.below(12) as u32),
+        7 => WE::Ashr(Box::new(x), r.below(12) as u32),
         8 => WE::Trunc(Box::new(x), 1 + r.below(8) as u8),
         9 => WE::Ite(Box::new(x), Box::new(y), Box::new(z)),
         _ => WE::Add(Box::new(x), Box::new(y)),

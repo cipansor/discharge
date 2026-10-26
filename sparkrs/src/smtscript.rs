@@ -205,7 +205,18 @@ struct ShiftAmount(u32, u8);
 
 impl fmt::Display for ShiftAmount {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "(_ bv{} {})", self.0, self.1)
+        // The shift amount is a *value*, and it has to be a legal literal of the shift's
+        // width. `(_ bv300 8)` is not: 300 does not fit 8 bits, so a solver either rejects
+        // the file or reads 44 -- and when `amount >= 2^width` the meaning changes outright
+        // (a shift by 256 on an 8-bit value became a shift by 0, i.e. the identity). The
+        // engine's rule is `amount >= width` yields 0 (or the sign for `ashr`), so any
+        // amount at or above `width` is clamped to `width`, which is a legal literal and
+        // yields exactly that. This is the shift-amount twin of the out-of-range constant
+        // bug (`word`): the same "a literal is a claim about a width" mistake, in a
+        // different place.
+        let w = self.1;
+        let amount = if self.0 >= w as u32 { w as u32 } else { self.0 };
+        write!(f, "(_ bv{} {})", amount, w)
     }
 }
 
