@@ -280,3 +280,179 @@ fn a_verified_report_never_misses_a_failed_claim() {
         with_failed_claim
     );
 }
+
+/// What a loop body does to the variable it runs on.
+#[derive(Clone, Copy)]
+enum Act {
+    Add(u8),
+    Set(u8),
+    Skip,
+}
+
+impl Act {
+    fn apply(self, v: u8) -> u8 {
+        match self {
+            Act::Add(k) => v.wrapping_add(k),
+            Act::Set(k) => k,
+            Act::Skip => v,
+        }
+    }
+    fn build(self, v: Var) -> Stmt<'static> {
+        match self {
+            Act::Add(k) => Stmt::Assign { var: v, expr: v + k as u32 },
+            Act::Set(k) => Stmt::Assign { var: v, expr: smt::word(k as u64, 8) },
+            Act::Skip => Stmt::Skip,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Act::Add(k) => match k { 1 => "Add(1)", 2 => "Add(2)", _ => "Add(50)" },
+            Act::Set(k) => match k { 0 => "Set(0)", 10 => "Set(10)", 100 => "Set(100)", _ => "Set(255)" },
+            Act::Skip => "Skip",
+        }
+    }
+}
+
+/// A nested loop over two variables: the outer counter `i` and an inner scan `j`, plus an
+/// optional extra action the inner body performs on `i` -- which is the divergence shape
+/// (`i := 0` inside the inner loop resets the outer counter forever).
+struct Nested {
+    outer_guard: u8,
+    outer: Act,
+    inner_guard: u8,
+    inner: Act,
+    inner_on_i: Option<Act>,
+    start_i: u8,
+    start_j: u8,
+}
+
+/// Run the nested loop concretely. `None` means the fuel ran out, which for a two-byte
+/// state means a cycle, i.e. non-termination.
+fn run_nested(p: &Nested) -> Option<u8> {
+    let (mut i, mut j) = (p.start_i, p.start_j);
+    let mut fuel = 100_000u32;
+    while i < p.outer_guard {
+        if fuel == 0 {
+            return None;
+        }
+        fuel -= 1;
+        i = p.outer.apply(i);
+        while j < p.inner_guard {
+            if fuel == 0 {
+                return None;
+            }
+            fuel -= 1;
+            j = p.inner.apply(j);
+            if let Some(a) = p.inner_on_i {
+                i = a.apply(i);
+            }
+        }
+        // The inner loop's index is reset so the next outer iteration runs it again.
+        // Without this the inner loop runs at most once and a body that writes the outer
+        // counter from inside it cannot cause divergence -- which is why the first version
+        // of this family contained no divergent program that the report called `Total`.
+        j = p.start_j;
+    }
+    Some(i)
+}
+
+fn build_nested(p: &Nested) -> Stmt<'static> {
+    let i = var(8);
+    let j = var(8);
+    let mut inner_body: Stmt<'static> = Stmt::Skip;
+    if let Some(a) = p.inner_on_i {
+        inner_body = Stmt::Seq {
+            first: Box::leak(Box::new(inner_body)),
+            second: Box::leak(Box::new(a.build(i))),
+        };
+    }
+    let inner_body = Stmt::Seq {
+        first: Box::leak(Box::new(p.inner.build(j))),
+        second: Box::leak(Box::new(inner_body)),
+    };
+    let inner_loop = Stmt::While {
+        cond: j.lt_val(p.inner_guard as u64),
+        invariant: j.le_val(255),
+        variant: Some(smt::sub(smt::word(p.inner_guard as u64, 8), j)),
+        body: Box::leak(Box::new(inner_body)),
+    };
+    let reset_j = Stmt::Assign { var: j, expr: smt::word(p.start_j as u64, 8) };
+    let outer_body = Stmt::Seq {
+        first: Box::leak(Box::new(p.outer.build(i))),
+        second: Box::leak(Box::new(Stmt::Seq {
+            first: Box::leak(Box::new(inner_loop)),
+            second: Box::leak(Box::new(reset_j)),
+        })),
+    };
+    Stmt::While {
+        cond: i.lt_val(p.outer_guard as u64),
+        invariant: i.le_val(255),
+        variant: Some(smt::sub(smt::word(p.outer_guard as u64, 8), i)),
+        body: Box::leak(Box::new(outer_body)),
+    }
+}
+
+#[test]
+fn a_total_report_means_the_nested_loop_terminates() {
+    // The behavioural oracle for a termination *claim* -- the one claim a concrete run
+    // cannot otherwise see. `variant_after` used to read a nested loop as a no-op, so
+    // `while i < 100 { i := i + 1; while i != 0 { i := 0 } }` was proved `Total` and
+    // diverges. Here a whole family of nested loops is enumerated, each run concretely
+    // with a fuel cap, and the report's `Total` is checked against whether the run ended.
+    //
+    // Two variables, deliberately. With one variable the inner loop always havocs the
+    // outer measure, so no program in the family is ever `Total` and the oracle would
+    // assert nothing -- the first version of this test failed exactly that way, on
+    // `total == 0`. The inner scan now runs on `j`, so the outer counter `i` survives it
+    // and a genuine `Total` is reachable; the `inner_on_i` field re-introduces the
+    // divergence by writing `i` from inside the inner loop.
+    //
+    // The assertion is one-directional on purpose: a report that is not `Total` may be a
+    // divergent program correctly refused, or a terminating one whose stated invariant or
+    // variant is too weak. Both are legitimate, so nothing is asserted in that direction.
+    let mut total = 0u32;
+    let mut divergent = 0u32;
+    let outer_acts = [Act::Add(1), Act::Add(2), Act::Add(50), Act::Set(0), Act::Skip];
+    let inner_acts = [Act::Add(1), Act::Add(2), Act::Set(10), Act::Set(100), Act::Set(0), Act::Skip];
+    let inner_on_i = [None, Some(Act::Set(0)), Some(Act::Add(1))];
+    for &outer_guard in &[10u8, 100] {
+        for &inner_guard in &[10u8, 100, 255] {
+            for &outer in &outer_acts {
+                for &inner in &inner_acts {
+                    for &on_i in &inner_on_i {
+                        for &(start_i, start_j) in &[(0u8, 0u8), (1, 0), (50, 5)] {
+                            let p = Nested { outer_guard, outer, inner_guard, inner, inner_on_i: on_i, start_i, start_j };
+                            let terminates = run_nested(&p);
+                            if terminates.is_none() {
+                                divergent += 1;
+                            }
+                            smt::with_fresh(|| {
+                                let i = var(8);
+                                let j = var(8);
+                                let prog = build_nested(&p);
+                                let pre = smt::and(i.eq_val(start_i as u64), j.eq_val(start_j as u64));
+                                let report = verify(&prog, pre, smt::truth(true));
+                                if report.establishes() == Established::Total {
+                                    total += 1;
+                                    assert!(
+                                        terminates.is_some(),
+                                        "the report says Total, but the program diverges: \
+                                         outer_guard={}, outer={}, inner_guard={}, inner={}, \
+                                         inner_on_i={:?}, start=({}, {})",
+                                        outer_guard, outer.name(), inner_guard, inner.name(),
+                                        on_i.map(Act::name), start_i, start_j
+                                    );
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(total > 20, "too few Total reports to be meaningful: {}", total);
+    assert!(
+        divergent > 0,
+        "the family must contain a divergent program, or it proves nothing"
+    );
+}
