@@ -841,6 +841,15 @@ now does two things:
 assertions until the count crosses the cap and demands that nothing ever verifies; with the
 fix reverted it fails at padding 15.
 
+The low-level `wp::obligations` had the same shape of hole one level down. It returned a
+count that saturates at `MAX_OBLIGATIONS`, so a caller could not tell a complete set of
+that size from a truncated prefix — two different facts behind one number, exactly the
+defect `writes` was fixed for. It now returns a third value, `complete`, which is `true`
+only when every side obligation is in the buffer. `verify` already turned the flag into a
+failure; this makes the same information available to a caller inspecting obligations
+directly. `a_complete_obligation_set_reports_itself_complete` and
+`too_many_obligations_is_reported_not_swallowed` pin both directions.
+
 ## Differential testing: a proof must not outrun reality
 
 The two soundness holes in the call rule were found by accident — by writing a test

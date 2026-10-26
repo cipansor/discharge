@@ -319,13 +319,24 @@ impl Obligation {
 /// * The loop's *entry* condition is not a separate obligation: it is the
 ///   contract's own `pre => apply(dominators, I)`, which the cursor produces for
 ///   free once the walk continues past the initialisation.
+///
+/// # The returned count can be a prefix, so completeness is returned too
+///
+/// `out` is a fixed-size buffer. A program with more side obligations than `out` holds
+/// gets a *prefix* of them, and a bare count of `MAX_OBLIGATIONS` then means either
+/// "there were exactly that many" or "there were more and some were dropped" — two
+/// different facts with one number. That is the same defect [`writes`] had, and it is
+/// the same fix: the third element of the result is `true` only when every side
+/// obligation of `s` is in `out`. [`verify`] is the safe entry point and turns a `false`
+/// here into a failing [`Rule::ObligationOverflow`]; this function is for a caller who
+/// wants the obligations themselves, and it now says when it could not hand them all over.
 pub fn obligations<'a>(
     s: &'a Stmt<'a>,
     post: Pred,
     out: &mut [Option<Obligation>],
-) -> (Pred, usize) {
-    let (goal, n, _, _, _) = obligations_checked(s, post, out);
-    (goal, n)
+) -> (Pred, usize, bool) {
+    let (goal, n, overflow, _, _) = obligations_checked(s, post, out);
+    (goal, n, !overflow)
 }
 
 /// [`obligations`], plus whether any claim-carrying obligation had to be dropped.

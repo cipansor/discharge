@@ -696,12 +696,44 @@ fn too_many_obligations_is_reported_not_swallowed() {
         // And the overflow really is what happened: the program has more obligations
         // than the buffer holds, so at least one was dropped.
         let mut slots = [None; wp::MAX_OBLIGATIONS + 1];
-        let (_, count) = wp::obligations(node, post, &mut slots);
+        let (_, count, complete) = wp::obligations(node, post, &mut slots);
         assert_eq!(
             count,
             wp::MAX_OBLIGATIONS,
             "the buffer below the reserved slot should be exactly full"
         );
+        // A bare count of `MAX_OBLIGATIONS` is ambiguous -- exactly this many, or a
+        // truncated prefix? -- so `obligations` reports completeness too. The same shape
+        // as `writes`: a saturated summary must not read as a complete one.
+        assert!(!complete, "a truncated set must not report itself complete");
+    });
+}
+
+#[test]
+fn a_complete_obligation_set_reports_itself_complete() {
+    // The other half of the truncation fix: a set that fits must say so, or a caller
+    // could not tell a genuine `MAX_OBLIGATIONS`-sized set from a truncated one. Without
+    // this, `complete == true` would be untested and could silently be always-false.
+    smt::with_fresh(|| {
+        let i = var(8);
+        let step: &'static Stmt<'static> =
+            Box::leak(Box::new(Stmt::Assign { var: i, expr: i + 1u32 }));
+        let init: &'static Stmt<'static> = Box::leak(Box::new(Stmt::Assign {
+            var: i,
+            expr: smt::word(0, 8),
+        }));
+        let loop_: &'static Stmt<'static> = Box::leak(Box::new(Stmt::While {
+            cond: smt::ult_const(i, 10),
+            invariant: smt::ule_const(i, 10),
+            variant: None,
+            body: step,
+        }));
+        let node: &'static Stmt<'static> =
+            Box::leak(Box::new(Stmt::Seq { first: init, second: loop_ }));
+        let mut slots = [None; wp::MAX_OBLIGATIONS + 1];
+        let (_, count, complete) = wp::obligations(node, smt::truth(true), &mut slots);
+        assert_eq!(count, 2, "preserve and exit");
+        assert!(complete, "a set that fits must report itself complete");
     });
 }
 
