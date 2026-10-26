@@ -283,7 +283,11 @@ impl Fixed {
         }
     }
 
-    /// Truncating division by an integer. `None` when `k == 0`.
+    /// Truncating division by an integer. `None` when `k == 0`, and also when the quotient
+    /// is not representable -- the single overflowing case, `i32::MIN / -1`, whose true
+    /// result `2^31` is one past `i32::MAX`. `checked_div` reports both, so this returns
+    /// `None` for either rather than wrapping to `i32::MIN`; the doc used to name only the
+    /// zero divisor, which read as if that were the only failure mode.
     pub const fn checked_div_int(self, k: i32) -> Option<Fixed> {
         match self.0.checked_div(k) {
             Some(v) => Some(Fixed(v)),
@@ -497,5 +501,9 @@ mod tests {
         assert_eq!(a.to_int(), 3);
         assert_eq!(a.saturating_mul_int(2), Fixed::from_int(6));
         assert_eq!(a.checked_div_int(0), None);
+        // The doc names only the zero divisor; the overflow case is the other `None`, and
+        // the comment above is a claim about the function's failure modes, so pin both.
+        assert_eq!(Fixed::MIN.checked_div_int(-1), None);
+        assert_eq!(Fixed::from_bits(i32::MIN).checked_div_int(2), Some(Fixed(i32::MIN / 2)));
     }
 }
