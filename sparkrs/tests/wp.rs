@@ -1371,3 +1371,57 @@ fn an_assertion_in_a_loop_body_sees_the_invariant_and_guard() {
         assert!(!r.is_verified(), "an unimplied assertion must not verify");
     });
 }
+
+#[test]
+fn an_assertion_after_an_if_sees_the_if() {
+    // `if c { A } else { B }; assert g` is only reached in a state the `if` can produce,
+    // so the claim is `wp(if, g)`. It used to be checked as if the `if` were absent, so
+    // this correct program was reported as a failure even though the contract obligation
+    // proved it.
+    smt::with_fresh(|| {
+        let x = var(8);
+        let branch = Stmt::If {
+            cond: x.eq_val(1),
+            then_: &Stmt::Assign { var: x, expr: smt::word(1, 8) },
+            else_: &Stmt::Assign { var: x, expr: smt::word(2, 8) },
+        };
+        let s = Stmt::Seq {
+            first: &branch,
+            second: &Stmt::Assert(smt::or(x.eq_val(1), x.eq_val(2))),
+        };
+        let r = verify_program(&s, smt::truth(true), smt::truth(true));
+        assert!(r.is_verified(), "the `if` must reach the assertion after it");
+
+        // Teeth: a claim the branches do not both establish must still fail.
+        let s = Stmt::Seq {
+            first: &branch,
+            second: &Stmt::Assert(x.eq_val(1)),
+        };
+        let r = verify_program(&s, smt::truth(true), smt::truth(true));
+        assert!(!r.is_verified(), "one branch leaves x == 2, so x == 1 fails");
+    });
+}
+
+#[test]
+fn a_nested_if_reaches_an_assertion_after_both() {
+    smt::with_fresh(|| {
+        let x = var(8);
+        let inner = Stmt::If {
+            cond: x.eq_val(1),
+            then_: &Stmt::Assign { var: x, expr: smt::word(1, 8) },
+            else_: &Stmt::Assign { var: x, expr: smt::word(2, 8) },
+        };
+        let outer = Stmt::If {
+            cond: x.eq_val(1),
+            then_: &Stmt::Assign { var: x, expr: smt::word(3, 8) },
+            else_: &inner,
+        };
+        let g = smt::or(x.eq_val(1), smt::or(x.eq_val(2), x.eq_val(3)));
+        let s = Stmt::Seq {
+            first: &outer,
+            second: &Stmt::Assert(g),
+        };
+        let r = verify_program(&s, smt::truth(true), smt::truth(true));
+        assert!(r.is_verified(), "nesting must compose");
+    });
+}

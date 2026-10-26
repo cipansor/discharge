@@ -443,6 +443,30 @@ and `exists_guarded` are *not* affected: an empty range yields `true`/`false` re
 which is correct for an empty range, and `inside` already treats an unrepresentable index as
 outside the bound rather than truncating it.
 
+## A claim after a statement is made in a state that statement can produce
+
+An assertion recorded to the *right* of an `if` is dominated by it, so its claim is
+`wp(if, g)`, not `g`. The walk already rewrote dominated claims through `Assign` and
+`AssignMany`, but not through `If`, so `if x == 1 { x := 1 } else { x := 2 }; assert x == 1 ||
+x == 2` was reported as a failure while the contract obligation proved it -- the assertion was
+checked as if the `if` were not there. The `If` arm now rewrites the slots recorded before it
+with `ite(cond, wp(then, g), wp(else, g))`.
+
+This is the mirror image of the previous defect and it is worth seeing the pair together:
+
+* a claim *inside* a branch is checked under the branch's guard (`guard_range`), because the
+  branch is what reaches it;
+* a claim *after* the branch is checked through the branch's effect (`wp_of`), because the
+  branch is what the state came from.
+
+Both are "the claim is about the states that can reach it", read in the two directions. A
+statement that changes the state has to reach every claim it dominates, and an `If` was the
+one statement that did not. Loops are deliberately excluded: a loop's effect on a claim after
+it is only the invariant, and the cursor already carries that, but a dominated assertion is
+not re-derived through a loop for the same reason loop obligations are not rewritten with a
+dominating guard -- the invariant is universally quantified and rewriting through it would
+hide a real failure behind a vacuous one.
+
 ## A claim is made in the state that reaches it, not in the state after it
 
 An assertion recorded as `implies(cursor, c)` is the wrong claim. The cursor is what the

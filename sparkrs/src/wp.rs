@@ -458,6 +458,13 @@ fn collect<'a>(
         }
         Stmt::If { cond, then_, else_ } => {
             let after = *cursor;
+            // The claims already recorded to the *right* of this `if` are dominated by it,
+            // so its effect has to reach them: a claim `g` after `if c then A else B` is
+            // only made for the states the `if` can produce, i.e. `wp(if, g)`. Without
+            // this, `if x == 1 { x := 1 } else { x := 2 }; assert x == 1 || x == 2` was
+            // reported as a failure even though the contract obligation proved it -- the
+            // assertion was checked as if the `if` were not there.
+            let entry_n = *n;
             // Each branch is walked in its own slot range so its assignments do
             // not rewrite the sibling's obligations.
             let then_start = *n;
@@ -475,6 +482,16 @@ fn collect<'a>(
             // keeps the guard about the *entry* state.
             guard_range(out, then_start, then_end, *cond);
             guard_range(out, else_start, else_end, smt::not(*cond));
+            // Now the dominated claims, using the same branch-conditional shape the cursor
+            // gets. `wp_of` is the pure calculus, so this records nothing new.
+            for slot in out[start..entry_n].iter_mut() {
+                if let Some(ob) = slot {
+                    if ob.rule == Rule::Assertion || ob.rule == Rule::CallRequires {
+                        let goal = ite_pred(*cond, wp_of(then_, ob.goal), wp_of(else_, ob.goal));
+                        *slot = Some(Obligation::new(ob.rule, goal));
+                    }
+                }
+            }
             *cursor = ite_pred(*cond, then_cursor, else_cursor);
         }
         Stmt::While { cond, invariant, variant, body } => {
