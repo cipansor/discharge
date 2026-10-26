@@ -18,6 +18,20 @@ fn mem4<'a>(buf: &'a mut [Var; 4]) -> Mem<'a> {
 }
 
 #[test]
+#[should_panic(expected = "0-bit address space")]
+fn a_single_cell_memory_is_refused() {
+    // A single cell is a power of two, so `Mem::new` used to accept it -- but then
+    // `addr_width()` is 0, and no `Var` can be zero bits wide. The memory had no address
+    // type with which to be read or written, so `new` accepted a value no operation could
+    // use. The degenerate-constructor case from the type-invariant lesson: `new` now
+    // enforces `addr_width() >= 1`, which `declare` already did.
+    smt::with_fresh(|| {
+        let cells = [var(8)];
+        let _ = Mem::new(&cells, 8);
+    });
+}
+
+#[test]
 fn a_write_then_read_returns_the_written_value_for_all_inputs() {
     smt::with_fresh(|| {
         let mut buf = [var(8); 4];

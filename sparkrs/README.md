@@ -328,6 +328,12 @@ next section.
 Cost: a symbolic read is `2^addr_width` ites and the BDD sees all of them, so
 `MAX_CELLS` caps a memory at 64 cells (6 address bits).
 
+The smallest memory is *two* cells, not one. A single cell is a power of two, so `new`
+used to accept it — but then `addr_width()` is 0, and no `Var` can be zero bits wide, so
+there was no address type with which to read or write it. `new` now refuses it, matching
+`declare`, whose `addr_width` is already `1..=MAX_ADDR_WIDTH`. `a_single_cell_memory_is_refused`
+pins it.
+
 ## The exported query must mean what the engine proved
 
 The SMT-LIB export exists so an independent solver can reproduce a proof from a textual

@@ -122,14 +122,30 @@ pub fn declare(addr_width: u8, elem_width: u8, out: &mut [Var]) -> usize {
 impl<'a> Mem<'a> {
     /// Wrap a cell slice as a memory.
     ///
-    /// The length must be a power of two, because the address space is the full
-    /// range of an `addr_width`-bit word.
+    /// The length must be a power of two *greater than one*, because the address space is
+    /// the full range of an `addr_width`-bit word and a symbolic address must be at least
+    /// one bit wide.
+    ///
+    /// A single cell is a power of two and used to be accepted, but it has
+    /// `addr_width() == 0`, and no `Var` can be zero bits wide (`var` requires `1..=64`).
+    /// So there was no address type with which to read or write the memory: `read`,
+    /// `store_binds`, `frame_lemma` and `addr_of` all reject a 0-bit address, and
+    /// `forall_below` needs a bound of `addr_width + 1 == 1` bit whose guarded expansion
+    /// over the single cell is vacuous. The type accepted a value that no operation could
+    /// use, which is the degenerate-constructor case: the invariant `addr_width() >= 1` is
+    /// part of "this is a usable memory", and `new` now enforces it. [`declare`] already
+    /// does, because its `addr_width` must be `1..=MAX_ADDR_WIDTH`.
     pub fn new(cells: &'a [Var], elem_width: u8) -> Mem<'a> {
         assert!(!cells.is_empty(), "a memory needs at least one cell");
         assert!(
             cells.len().is_power_of_two(),
             "cell count {} is not a power of two, so no address width matches it",
             cells.len()
+        );
+        assert!(
+            cells.len() > 1,
+            "a single-cell memory has a 0-bit address space, which no `Var` can name; \
+             use at least two cells"
         );
         assert!(
             cells.len() <= MAX_CELLS,
