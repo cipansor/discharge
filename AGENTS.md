@@ -531,6 +531,30 @@ readable model" case and stays allowed; calling it at a *different* width is a m
 mistake, and the query is now refused. The general rule: if a name carries an index, the
 index has to determine the variable completely, or the name is not a name.
 
+## A missing conjunct hides in the ranges the tests do not use
+
+`verify_bounded_sub_is_total` states the refinement of `Bounded::sub`. Its doc named three
+conjuncts -- no underflow, result at or above `min`, and (free) at or below `max` -- and the
+goal carried only two, as `iff(in_range(diff), want)`. The underflow gate `b <= a` was on the
+right side but not on the left, so the left side asked whether the *wrapping* difference is in
+range.
+
+For the ranges the tests used that is the same question. A narrow range makes an underflow wrap
+to a value above `max`, so `in_range(diff)` is false and the two sides agree. Every test used
+`min`/`max` inside `[0, 1000]`, and all of them passed. At `min == 0`, `max == u32::MAX`, an
+underflow wraps to a value that is still `<= max`, so the left side is true while `checked_sub`
+returned `None`: the goal became `true <=> false` and the obligation was refuted. It was never
+proved for a wide range at all.
+
+The fix is to gate the left side exactly as `checked_sub` does -- `result_ok = no_underflow &&
+in_range(diff)` -- and the new tests pin both the full range (it must now be proved) and the
+ungated statement (it must still be refuted there, so the gate cannot be dropped again).
+
+The general lesson is about the *test inputs*, not the formula: a proof obligation parameterised
+by `min`/`max` is only as strong as the ranges the tests exercise. A boundary that the tests
+never approach is a boundary the formula is free to get wrong, and a parameter that is always
+zero or small in the tests is nearly a parameter the proof does not use.
+
 ## A proof that never mentions the thing it is named after
 
 `verify_scale_identity` was documented as proving `k * SCALE / SCALE == k`, but its formula

@@ -137,15 +137,25 @@ pub fn verify_safe_add_is_exact(width: u8) -> Verdict {
     })
 }
 
-/// Proves the refinement invariant of [`Bounded::sub`]: for in-range `a` and `b`, the
-/// difference is in range exactly when `b <= a` and `a - b >= min`.
+/// Proves the refinement invariant of [`Bounded::sub`]: for in-range `a` and `b`,
+/// [`Bounded::sub`] returns a value exactly when `b <= a` and `a - b >= min`.
 ///
-/// That is the *whole* condition, and it needs both halves. The lower bound is not
+/// That is the *whole* condition, and it needs all three halves. The lower bound is not
 /// decoration: at `min == 10`, `a == 11` and `b == 10` are both in range and `a >= b`, yet
 /// `a - b == 1` is below `min`, so [`Bounded::sub`] rejects it. An earlier version of this
 /// obligation dropped `min` entirely (`let _ = min;`) and documented the claim as
 /// "in range exactly when `a >= b`" -- which is false for any non-zero `min`. It was proved
 /// only because the formula no longer mentioned the parameter it was given.
+///
+/// The underflow gate is the other half, and it went missing the same way: the goal was
+/// `iff(in_range(diff), want)`, where `diff` is the *wrapping* difference. For a narrow
+/// range that is harmless, because an underflow wraps to a value above `max` and
+/// `in_range(diff)` is false. For a range whose `max` is near `2^32 - 1` it is false: at
+/// `min == 0`, `max == u32::MAX`, `a == 0`, `b == 2^31`, the wrapped `diff` is `2^31`, which
+/// is `<= max`, so `in_range(diff)` holds while `checked_sub` returned `None`. The claim was
+/// then `true <=> false` and the obligation was refuted -- correctly, because the statement
+/// was wrong, not because the engine failed. `checked_sub` gates on `b <= a` first, so the
+/// left side must too. `result_ok` is exactly that: the value `sub` would return.
 pub fn verify_bounded_sub_is_total(min: u64, max: u64) -> Verdict {
     smt::with_fresh(|| {
         let w = 32u8;
@@ -156,10 +166,14 @@ pub fn verify_bounded_sub_is_total(min: u64, max: u64) -> Verdict {
         };
         let pre = smt::and(in_range(a), in_range(b));
         let diff = smt::sub(a, b);
-        // No underflow in the subtraction itself, and the result above the lower bound.
-        // The upper bound is free: `a <= max` and `b >= min >= 0` give `a - b <= max`.
-        let want = smt::and(smt::ule(b, a), smt::uge_const(diff, min));
-        smt::prove_implies(pre, smt::iff(in_range(diff), want))
+        // `checked_sub` yields a value only when `b <= a`; gate the left side on it, or a
+        // wrapping underflow whose result happens to land in range makes the claim false.
+        let no_underflow = smt::ule(b, a);
+        let result_ok = smt::and(no_underflow, in_range(diff));
+        // The upper bound is free: `a <= max` and `b >= min >= 0` give `a - b <= max`, so
+        // the condition reduces to the lower bound once the gate holds.
+        let want = smt::and(no_underflow, smt::uge_const(diff, min));
+        smt::prove_implies(pre, smt::iff(result_ok, want))
     })
 }
 
@@ -249,6 +263,32 @@ mod tests {
         let a = R::new(11).unwrap();
         let b = R::new(10).unwrap();
         assert_eq!(a.sub(b), None, "1 is below min = 10");
+
+        // The full range is the case the *underflow gate* exists for: at `min == 0` and
+        // `max == u32::MAX`, an underflow wraps to a value that is still `<= max`, so a goal
+        // of `iff(in_range(diff), want)` without the gate is refuted. It must now be proved.
+        assert!(verify_bounded_sub_is_total(0, u32::MAX as u64).is_proved());
+        assert!(verify_bounded_sub_is_total(1, u32::MAX as u64).is_proved());
+        assert!(verify_bounded_sub_is_total(5, u32::MAX as u64).is_proved());
+
+        // Teeth for the underflow gate: the same statement *without* it must be refuted at
+        // the full range, so the gate cannot be dropped again. `a = 0`, `b = 2^31`: the
+        // wrapped difference is `2^31 <= max`, so the ungated left side is true while
+        // `checked_sub` returned `None`.
+        smt::with_fresh(|| {
+            let a = smt::var(32);
+            let b = smt::var(32);
+            let in_range = |v: smt::Var| {
+                smt::and(smt::uge_const(v, 0), smt::ule_const(v, u32::MAX as u64))
+            };
+            let pre = smt::and(in_range(a), in_range(b));
+            let diff = smt::sub(a, b);
+            let ungated = smt::iff(in_range(diff), smt::ule(b, a));
+            assert!(
+                !smt::prove_implies(pre, ungated).is_proved(),
+                "the claim without the underflow gate must be refuted at the full range"
+            );
+        });
 
         // Teeth for the `min` conjunct: state the claim without it and show it is false,
         // so the conjunct cannot be dropped again. `a = 11`, `b = 10` are in `[10, 100]`
