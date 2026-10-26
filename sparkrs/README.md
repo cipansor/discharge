@@ -31,7 +31,7 @@ $ cargo run --features std --example flight_control
 [exhaustive] mapping is monotone           : true
 [kernel]    certificate accepted, value = 1500
 [refuted]   raw < ADC_MAX is false, witness raw = 4095
-[honesty]   (a*b)*c == a*(b*c) at 12 bits  : unknown (no conclusion: budget exhausted, ill-formed width, or stale handle)
+[honesty]   (a*b)*c == a*(b*c) at 12 bits  : unknown (no conclusion: budget exhausted, ill-formed query, or stale handle)
 
 all obligations discharged
 ```
@@ -303,8 +303,18 @@ spelling of `!=` is `distinct`.
 The operator choice was wrong too. `not`, `and`, `or` and `xor` exist in both readings, and
 the printer always used the bit-vector one, so `not(x == y)` became `(bvnot (= x y))` —
 ill-sorted, since `bvnot` wants a bit-vector and a comparison is a boolean. A solver rejects
-that file, and a lenient one reads something else. The width now decides: at width 1 the
-boolean operator applies, above it the bit-vector operator does.
+that file, and a lenient one reads something else.
+
+The first fix made the *node's own width* decide: at width 1 the boolean operator, above it the
+bit-vector one. That is still wrong, because a one-bit connective's sort depends on **where it
+sits**, not on how wide it is. As the goal, `x & y == 1` wants `and`; as an operand of `bvadd` it
+wants `bvand`, and `Bool` is not `(_ BitVec 1)`. The width rule emitted `(bvule (_ bv1 1) (or …))`,
+which z3 rejects as ill-sorted, in 77 of 800 random predicates. The sort now decides: `Bool`
+prints comparisons natively and one-bit connectives as `and`/`or`/`xor`/`not`; `Bits` prints
+comparisons as `(ite <cmp> (_ bv1 1) (_ bv0 1))` and one-bit connectives as `bvand`/`bvor`/
+`bvxor`/`bvnot`. The same 800 predicates now export with zero parse errors and zero disagreements
+against z3 — a check that only exists because the text was handed to a real solver rather than
+reasoned about, since the unit tests asserted the old shape and passed throughout.
 
 A third export bug sat in the same printer. `truncate` changes a width in either direction,
 and the printer emitted `((_ extract w-1 0) x)` for both. That is only valid when the result is
@@ -972,8 +982,8 @@ sparkrs/
 │   ├── wp.rs           Hoare logic + automatic VC generation
 │   ├── smtscript.rs    SMT-LIB2 export for independent checking
 │   ├── mem.rs          bounded symbolic memory + frame condition
-│   ├── quant.rs        bounded forall/exists, expanded to finite form
-│   └── wp.rs           also: Proc + Stmt::Call for modular verification
+│   └── quant.rs        bounded forall/exists, expanded to finite form
+│                       (wp.rs also carries Proc + Stmt::Call for modular verification)
 ├── tests/
 │   ├── smoke.rs        the engine proves real identities
 │   ├── kernel.rs       the proof kernel, including a compile-fail case
@@ -982,6 +992,7 @@ sparkrs/
 │   ├── mem.rs          memory proofs checked against real Rust arrays
 │   ├── quant.rs        fill and scan loops, both verified and executed
 │   ├── call.rs         modular verification, every positive with its control
+│   ├── loopdiff.rs     verifier vs exhaustive execution, loops and claims included
 │   └── modular_differential.rs  generated callers, verified then executed
 └── examples/
     ├── flight_control.rs  a realistic actuator path, all obligations discharged
