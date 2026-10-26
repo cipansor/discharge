@@ -443,6 +443,20 @@ and `exists_guarded` are *not* affected: an empty range yields `true`/`false` re
 which is correct for an empty range, and `inside` already treats an unrepresentable index as
 outside the bound rather than truncating it.
 
+## A parameter the proof never mentions is a parameter the proof cannot use
+
+`verify_bounded_sub_is_total(min, max)` proved the refinement invariant of `Bounded::sub`, but
+the formula dropped `min` outright (`let _ = min;`) and the doc claimed "in range exactly when
+`a >= b`". That claim is false for any non-zero `min`: at `min == 10`, `a == 11` and `b == 10`
+are in range and `a >= b`, but `a - b == 1` is below `min`, so `sub` rejects it. The proof
+succeeded because it no longer mentioned the parameter it had been given.
+
+The corrected obligation is `in_range(diff) <=> (b <= a && diff >= min)`, with the `min`
+conjunct doing real work, and the test now states the claim *without* that conjunct and shows
+it is refuted. The pattern to watch for: a verifier function that takes a parameter and
+discards it. `let _ = min;` is a confession that the formula and the signature have drifted
+apart, and the honest response is to either use the parameter or remove it.
+
 ## A sufficient condition that goes vacuous is not a proof
 
 `verify_accumulator_no_overflow` proved "the sum cannot wrap" as `sum <= 2 * max`. That is a

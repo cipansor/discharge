@@ -137,8 +137,15 @@ pub fn verify_safe_add_is_exact(width: u8) -> Verdict {
     })
 }
 
-/// Proves the refinement invariant of [`Bounded`]: for in-range `a` and `b`,
-/// `a - b` is in range exactly when `a >= b`.
+/// Proves the refinement invariant of [`Bounded::sub`]: for in-range `a` and `b`, the
+/// difference is in range exactly when `b <= a` and `a - b >= min`.
+///
+/// That is the *whole* condition, and it needs both halves. The lower bound is not
+/// decoration: at `min == 10`, `a == 11` and `b == 10` are both in range and `a >= b`, yet
+/// `a - b == 1` is below `min`, so [`Bounded::sub`] rejects it. An earlier version of this
+/// obligation dropped `min` entirely (`let _ = min;`) and documented the claim as
+/// "in range exactly when `a >= b`" -- which is false for any non-zero `min`. It was proved
+/// only because the formula no longer mentioned the parameter it was given.
 pub fn verify_bounded_sub_is_total(min: u64, max: u64) -> Verdict {
     smt::with_fresh(|| {
         let w = 32u8;
@@ -149,13 +156,10 @@ pub fn verify_bounded_sub_is_total(min: u64, max: u64) -> Verdict {
         };
         let pre = smt::and(in_range(a), in_range(b));
         let diff = smt::sub(a, b);
-        // With `min == 0` there is nothing below the range, so an underflow
-        // shows up as a wrapped value *above* `max`. The refinement invariant
-        // is therefore: `a < b` exactly when `a - b` leaves the range upward.
-        let _ = min;
-        let underflow = smt::ult(a, b);
-        let above_max = smt::ugt_const(diff, max);
-        smt::prove_implies(pre, smt::iff(underflow, above_max))
+        // No underflow in the subtraction itself, and the result above the lower bound.
+        // The upper bound is free: `a <= max` and `b >= min >= 0` give `a - b <= max`.
+        let want = smt::and(smt::ule(b, a), smt::uge_const(diff, min));
+        smt::prove_implies(pre, smt::iff(in_range(diff), want))
     })
 }
 
@@ -235,6 +239,35 @@ mod tests {
     #[test]
     fn bounded_sub_refinement_holds() {
         assert!(verify_bounded_sub_is_total(0, 1000).is_proved());
+        // A non-zero lower bound is the case the old obligation ignored: it must still be
+        // proved, and now the goal actually depends on `min`.
+        assert!(verify_bounded_sub_is_total(10, 100).is_proved());
+        assert!(verify_bounded_sub_is_total(5, 200).is_proved());
+        // The concrete instance the old doc got wrong: 11 and 10 are in [10, 100] and
+        // 11 >= 10, but the difference 1 is below `min`, so `sub` must reject it.
+        type R = Bounded<10, 100>;
+        let a = R::new(11).unwrap();
+        let b = R::new(10).unwrap();
+        assert_eq!(a.sub(b), None, "1 is below min = 10");
+
+        // Teeth for the `min` conjunct: state the claim without it and show it is false,
+        // so the conjunct cannot be dropped again. `a = 11`, `b = 10` are in `[10, 100]`
+        // and `b <= a`, but the difference is below `min`.
+        let (min, max) = (10u64, 100u64);
+        smt::with_fresh(|| {
+            let a = smt::var(32);
+            let b = smt::var(32);
+            let in_range = |v: smt::Var| {
+                smt::and(smt::uge_const(v, min), smt::ule_const(v, max))
+            };
+            let pre = smt::and(in_range(a), in_range(b));
+            let diff = smt::sub(a, b);
+            let without_min = smt::iff(in_range(diff), smt::ule(b, a));
+            assert!(
+                !smt::prove_implies(pre, without_min).is_proved(),
+                "the claim without the min conjunct must be refuted"
+            );
+        });
     }
 
     #[test]
