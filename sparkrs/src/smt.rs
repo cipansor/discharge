@@ -166,14 +166,15 @@ impl fmt::Display for Verdict {
             Verdict::Valid => write!(f, "valid (proved for all inputs)"),
             Verdict::Unsat => write!(f, "unsat (no input satisfies it)"),
             Verdict::Counterexample(c) => write!(f, "refuted: {}", c),
-            // `Unknown` has more than one cause: the node budget, a width clash, an
-            // out-of-range variable index, or a stale handle. Naming only the budget made
-            // a width clash read as "try a smaller formula" when the formula was simply
-            // ill-formed. The cause is not carried in the verdict (it would widen a
-            // `Copy` enum used in hot loops), so the message stays general and honest.
+            // `Unknown` has more than one cause: the node budget, an ill-formed query
+            // (a width clash, an out-of-range constant, or a duplicated binding target),
+            // an out-of-range variable index, or a stale handle. Naming only the budget
+            // made an ill-formed query read as "try a smaller formula". The cause is not
+            // carried in the verdict (it would widen a `Copy` enum used in hot loops), so
+            // the message stays general and honest.
             Verdict::Unknown => write!(
                 f,
-                "unknown (no conclusion: budget exhausted, ill-formed width, or stale handle)"
+                "unknown (no conclusion: budget exhausted, ill-formed query, or stale handle)"
             ),
         }
     }
@@ -295,10 +296,14 @@ pub(crate) struct Ctx {
     /// Set when a stale handle is touched. Sticky until the next reset, and treated exactly
     /// like `overflow`: the query refuses to answer rather than answer about the wrong term.
     stale: bool,
-    /// Set when a binary operation is built from operands of different widths. Sticky until
-    /// the next reset, and treated like `overflow` and `stale`: the query returns `Unknown`
-    /// rather than a verdict about a term that silently truncated one of its operands.
-    width_clash: bool,
+    /// Set when the query is ill-formed: a binary operation over operands of different
+    /// widths, a constant that does not fit its width, or two bindings for the same
+    /// substitution target. Sticky until the next reset, and treated like `overflow` and
+    /// `stale`: the query returns `Unknown` rather than a verdict about a term that was
+    /// never written. Each of those is a *refusal*; the alternative in every case is to
+    /// pick one of several meanings silently, which is the failure this crate exists to
+    /// prevent.
+    ill_formed: bool,
 }
 
 /// Sentinel: variable `i` has no replacement.
@@ -338,7 +343,7 @@ impl Ctx {
             generation: 1,
             term_gen: [0; CAP],
             stale: false,
-            width_clash: false,
+            ill_formed: false,
         }
     }
 
@@ -386,7 +391,7 @@ impl Ctx {
             self.generation = 1;
         }
         self.stale = false;
-        self.width_clash = false;
+        self.ill_formed = false;
         self.ensure_ready();
     }
 
@@ -532,6 +537,13 @@ impl Ctx {
     /// previous binding, which is exactly what a sequence of assignments needs.
     fn set_subst(&mut self, idx: u32, with: Term) {
         if (idx as usize) < MAX_VARS {
+            // A second binding for the same target is ambiguous: "keep the last" silently
+            // picks one meaning for `x := 1, x := 2`, and which one it picks is the order
+            // of the list rather than anything the specification says. Mark the query
+            // ill-formed instead, so it answers `Unknown`.
+            if self.subst_val[idx as usize] != NO_SUBST {
+                self.ill_formed = true;
+            }
             self.subst_val[idx as usize] = with.0;
         }
     }
@@ -674,7 +686,7 @@ impl Ctx {
     /// `mem::Mem::store_binds`.
     fn require_same_width(&mut self, a: Term, b: Term, _who: &str) {
         if self.width_of(a) != self.width_of(b) {
-            self.width_clash = true;
+            self.ill_formed = true;
         }
     }
 
@@ -1181,7 +1193,7 @@ impl Ctx {
 
     fn query_valid(&mut self, t: Term) -> Verdict {
         let node = self.blast_bool(t);
-        if self.overflow || self.stale || self.width_clash {
+        if self.overflow || self.stale || self.ill_formed {
             return Verdict::Unknown;
         }
         match node {
@@ -1193,7 +1205,7 @@ impl Ctx {
 
     fn query_model(&mut self, t: Term) -> Verdict {
         let node = self.blast_bool(t);
-        if self.overflow || self.stale || self.width_clash {
+        if self.overflow || self.stale || self.ill_formed {
             return Verdict::Unknown;
         }
         match node {
@@ -1465,7 +1477,7 @@ pub fn index(v: Var) -> u32 {
 pub fn word(v: u64, width: u8) -> Var {
     with_ctx(|c| {
         if !fits(v, width) {
-            c.width_clash = true;
+            c.ill_formed = true;
         }
         Var(c.konst(v, width))
     })
@@ -1797,6 +1809,33 @@ mod subst_tests {
             // `x == 0` with `x := 9` is `9 == 0`, which is false: `Unsat`, not `Valid`.
             let q = substitute(p, &[(x, word(9, 8))]);
             assert_eq!(prove(q), Verdict::Unsat);
+        });
+    }
+
+    #[test]
+    fn two_bindings_for_one_target_are_refused() {
+        // `x := 1, x := 2` has no single meaning. Keeping the last silently proves
+        // `x == 2`; keeping the first proves `x == 1`; and which one you get is the order
+        // of the list, not anything the specification says. The query must refuse.
+        with_fresh(|| {
+            let x = var(8);
+            let p = eq_const(x, 2);
+            let q = substitute(p, &[(x, word(1, 8)), (x, word(2, 8))]);
+            assert_eq!(prove(q), Verdict::Unknown);
+        });
+        with_fresh(|| {
+            let x = var(8);
+            let p = eq_const(x, 1);
+            let q = substitute(p, &[(x, word(2, 8)), (x, word(1, 8))]);
+            assert_eq!(prove(q), Verdict::Unknown);
+        });
+        // Two *different* targets are still fine, so the check is not refusing everything.
+        with_fresh(|| {
+            let x = var(8);
+            let y = var(8);
+            let p = and(eq_const(x, 1), eq_const(y, 2));
+            let q = substitute(p, &[(x, word(1, 8)), (y, word(2, 8))]);
+            assert_eq!(prove(q), Verdict::Valid);
         });
     }
 }

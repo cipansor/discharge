@@ -443,6 +443,22 @@ and `exists_guarded` are *not* affected: an empty range yields `true`/`false` re
 which is correct for an empty range, and `inside` already treats an unrepresentable index as
 outside the bound rather than truncating it.
 
+## Refuse an ambiguous assignment, do not pick one
+
+`substitute` applied its bindings in order and kept the last for a repeated target, so a
+simultaneous assignment written `x := 1, x := 2` proved `x == 2` -- a claim about a value that
+appeared once in the list and lost. Reordering the same bindings proved `x == 1`. Both are
+silent choices of one meaning among several, which is the failure this crate exists to prevent;
+the honest answer is `Unknown`.
+
+The refusal reuses the query-level ill-formed flag, which already covered a width clash and an
+out-of-range constant, and is now named `ill_formed` rather than `width_clash` because it no
+longer means only widths. Two different targets still substitute normally, which the test
+asserts so the check cannot pass by refusing everything.
+
+The general rule: when a list admits two readings, refuse. "Last one wins" is a convention, not
+a specification, and it is invisible at the call site.
+
 ## A binding target must be a variable
 
 `substitute` read a binding's left-hand side as `node_of(from).a`, with no check that `from`
