@@ -443,6 +443,21 @@ and `exists_guarded` are *not* affected: an empty range yields `true`/`false` re
 which is correct for an empty range, and `inside` already treats an unrepresentable index as
 outside the bound rather than truncating it.
 
+## A proof about the wrong quantity
+
+`verify_saturating_add_bounds` was documented as "the saturating result is always `>= a` and
+`>= b`", but the formula never built the saturating result. It proved a *conditional* statement
+about the *wrapping* sum, `a <= sum => (a <= sum && b <= sum)`. The hypothesis it carried is the
+complement of the case that matters: saturation is interesting exactly when the sum overflows,
+which is when `a <= sum` is false. So the one scenario the function is named for was excluded by
+its own precondition.
+
+The goal is now unconditional and about the saturating value. The test also asserts that the
+wrapping sum violates the bound for some input, so the `ite` cannot be dropped.
+
+The tell, shared with the earlier vacuity defects: the comment and the formula are about
+different objects. Read the formula and ask which term in it is the one the comment names.
+
 ## Prove the property the comment claims, at the boundary
 
 Two verifier functions in `logic.rs` proved a true statement that was one step weaker than the

@@ -79,17 +79,23 @@ pub fn verify_checked_add() -> Verdict {
     })
 }
 
-/// Saturating add never wraps: the result is always `>= a` and `>= b`.
+/// Saturating add never wraps below an operand: the *saturating* result is always `>= a`
+/// and `>= b`, with no hypothesis.
+///
+/// The previous version proved `a <= sum => (a <= sum && b <= sum)` about the *wrapping* sum
+/// and never built the saturating result at all. That is a conditional statement about a
+/// different quantity than the comment names -- and the interesting case, where the sum
+/// overflows and saturation is what saves the bound, is exactly the case its hypothesis
+/// excludes. The goal below is the unconditional property, over the saturating value.
 pub fn verify_saturating_add_bounds() -> Verdict {
     smt::with_fresh(|| {
         let a = smt::var(8);
         let b = smt::var(8);
         let sum = smt::add(a, b);
-        // If no overflow, sat(a,b) == a + b. Encode "no overflow" as sum >= a.
-        let no_overflow = smt::ule(a, sum);
-        // Under that hypothesis the true sum is at least both operands.
-        let goal = smt::and(smt::ule(a, sum), smt::ule(b, sum));
-        smt::prove_implies(no_overflow, goal)
+        // Overflow iff the wrapped sum fell below an operand; then saturate to all ones.
+        let overflow = smt::ult(sum, a);
+        let sat = smt::ite(overflow, smt::all_ones(8), sum);
+        smt::prove(smt::and(smt::ule(a, sat), smt::ule(b, sat)))
     })
 }
 
@@ -348,6 +354,17 @@ mod tests {
     #[test]
     fn saturating_add_bounds_hold() {
         assert!(verify_saturating_add_bounds().is_proved());
+        // Teeth: without saturation the bound is false, so the `ite` is load-bearing and
+        // this is not just a restatement of the wrapping-sum law.
+        smt::with_fresh(|| {
+            let a = smt::var(8);
+            let b = smt::var(8);
+            let sum = smt::add(a, b);
+            assert!(
+                !smt::prove(smt::and(smt::ule(a, sum), smt::ule(b, sum))).is_proved(),
+                "the wrapping sum must violate the bound for some input"
+            );
+        });
     }
 
     #[test]
