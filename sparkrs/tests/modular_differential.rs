@@ -1562,3 +1562,235 @@ fn memory_programs_that_should_verify_do_verify() {
         proved, mutations_refuted
     );
 }
+
+// ---------------------------------------------------------------------------
+// Assertions inside and after branches.
+//
+// The claim an assertion makes is about the states that *reach* it, and two defects in a
+// row got that wrong in opposite directions. An assertion inside a branch was checked
+// against every input, so a correct program was refused; an assertion after a branch was
+// checked as if the branch were absent, also a refusal. Neither was caught by the soundness
+// families above, and that is the point: a verifier that refuses too much never certifies a
+// bug, so over-refusal is invisible to a one-directional soundness test.
+//
+// This family pins the claim on both sides:
+//
+// > the engine verifies the program if and only if no concrete execution reaches a failed
+// > assertion.
+//
+// The left-to-right direction is soundness (the fix must not admit a real failure); the
+// right-to-left direction is the guard against over-refusal that the two fixes had to
+// satisfy. A generator cannot invent the shape of a mistake it was not told about, so the
+// shapes here are exactly the ones that had gone wrong: asserts under a guard, asserts
+// under the negated guard, asserts after a branch, and writes between a guard and an
+// assertion inside the branch.
+// ---------------------------------------------------------------------------
+
+/// A word expression, as a description that can be built in any arena.
+#[derive(Clone, Copy, Debug)]
+enum EDesc {
+    X,
+    K(u64),
+    AddK(u64),
+    MaskK(u64),
+}
+
+/// A predicate description.
+#[derive(Clone, Debug)]
+enum PDesc {
+    EqK(u64),
+    LtK(u64),
+    Not(Box<PDesc>),
+    Or(Box<PDesc>, Box<PDesc>),
+}
+
+/// A program description.
+#[derive(Clone, Debug)]
+enum SDesc {
+    Assign(EDesc),
+    Assert(PDesc),
+    If(PDesc, Vec<SDesc>, Vec<SDesc>),
+}
+
+fn gen_edesc(rng: &mut Rng) -> EDesc {
+    match rng.below(4) {
+        0 => EDesc::X,
+        1 => EDesc::K(rng.below(4)),
+        2 => EDesc::AddK(1 + rng.below(2)),
+        _ => EDesc::MaskK(rng.below(8)),
+    }
+}
+
+fn gen_pdesc(rng: &mut Rng, depth: u32) -> PDesc {
+    if depth == 0 || rng.below(3) == 0 {
+        return if rng.below(2) == 0 {
+            PDesc::EqK(rng.below(4))
+        } else {
+            PDesc::LtK(rng.below(4))
+        };
+    }
+    match rng.below(3) {
+        0 => PDesc::Not(Box::new(gen_pdesc(rng, depth - 1))),
+        _ => {
+            let a = gen_pdesc(rng, depth - 1);
+            let b = gen_pdesc(rng, depth - 1);
+            PDesc::Or(Box::new(a), Box::new(b))
+        }
+    }
+}
+
+fn gen_sdesc(rng: &mut Rng, depth: u32, n: usize) -> Vec<SDesc> {
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let which = rng.below(if depth > 0 { 3 } else { 2 });
+        let s = match which {
+            0 => SDesc::Assign(gen_edesc(rng)),
+            1 => SDesc::Assert(gen_pdesc(rng, 1)),
+            _ => {
+                let c = gen_pdesc(rng, 1);
+                let (nt, ne) = (rng.below(3) as usize, rng.below(3) as usize);
+                let t = gen_sdesc(rng, depth - 1, nt);
+                let e = gen_sdesc(rng, depth - 1, ne);
+                SDesc::If(c, t, e)
+            }
+        };
+        out.push(s);
+    }
+    out
+}
+
+/// A built program, with terms that live in the arena current when it was built.
+enum Step {
+    Assign(Var),
+    Assert(smt::Pred),
+    If(smt::Pred, Vec<Step>, Vec<Step>),
+}
+
+fn build_step(d: &SDesc, x: Var) -> Step {
+    match d {
+        SDesc::Assign(e) => Step::Assign(match e {
+            EDesc::X => x,
+            EDesc::K(k) => smt::word(*k, 8),
+            EDesc::AddK(k) => smt::add(x, smt::word(*k, 8)),
+            EDesc::MaskK(k) => smt::band(x, smt::word(*k, 8)),
+        }),
+        SDesc::Assert(p) => Step::Assert(build_pdesc(p, x)),
+        SDesc::If(c, t, e) => Step::If(
+            build_pdesc(c, x),
+            t.iter().map(|s| build_step(s, x)).collect(),
+            e.iter().map(|s| build_step(s, x)).collect(),
+        ),
+    }
+}
+
+fn build_pdesc(d: &PDesc, x: Var) -> smt::Pred {
+    match d {
+        PDesc::EqK(k) => x.eq_val(*k),
+        PDesc::LtK(k) => x.lt_val(*k),
+        PDesc::Not(p) => smt::not(build_pdesc(p, x)),
+        PDesc::Or(a, b) => smt::or(build_pdesc(a, x), build_pdesc(b, x)),
+    }
+}
+
+fn build_program(steps: &[SDesc], x: Var) -> &'static Stmt<'static> {
+    let built: Vec<Step> = steps.iter().map(|d| build_step(d, x)).collect();
+    leaked_seq(&built, x)
+}
+
+fn leaked_seq(steps: &[Step], x: Var) -> &'static Stmt<'static> {
+    let mut seq: &'static Stmt<'static> = Box::leak(Box::new(Stmt::Skip));
+    for s in steps.iter().rev() {
+        let one: &'static Stmt<'static> = match s {
+            Step::Assign(e) => Box::leak(Box::new(Stmt::Assign { var: x, expr: *e })),
+            Step::Assert(p) => Box::leak(Box::new(Stmt::Assert(*p))),
+            Step::If(c, t, e) => Box::leak(Box::new(Stmt::If {
+                cond: *c,
+                then_: leaked_seq(t, x),
+                else_: leaked_seq(e, x),
+            })),
+        };
+        seq = Box::leak(Box::new(Stmt::Seq { first: one, second: seq }));
+    }
+    seq
+}
+
+/// Execute the built program on one concrete input, `false` if an assertion fails.
+/// Execute the built program on one concrete input, `false` if an assertion fails.
+///
+/// The state is threaded by `&mut` through the branches. Passing it by value instead
+/// loses every assignment made inside an `if`, which makes the interpreter disagree with
+/// the engine about a program the engine is right about -- so the differential property
+/// fails on a correct program and sends you looking for a soundness hole that is not
+/// there. That happened: it cost an afternoon. The `&mut` is the fix.
+fn run_steps(steps: &[Step], x: u64) -> bool {
+    let mut x = x;
+    run_steps_mut(steps, &mut x)
+}
+
+fn run_steps_mut(steps: &[Step], x: &mut u64) -> bool {
+    for s in steps {
+        match s {
+            Step::Assign(e) => {
+                let cur = *x;
+                if let Some(v) = smt::evaluate(*e, |_| Some(cur)) {
+                    *x = v;
+                }
+            }
+            Step::Assert(p) => {
+                let cur = *x;
+                if smt::evaluate_pred(*p, |_| Some(cur)) != Some(true) {
+                    return false;
+                }
+            }
+            Step::If(c, t, e) => {
+                let cur = *x;
+                let take_then = smt::evaluate_pred(*c, |_| Some(cur)) == Some(true);
+                if !run_steps_mut(if take_then { t } else { e }, x) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+#[test]
+fn an_assertion_claim_matches_concrete_execution_both_ways() {
+    let mut rng = Rng::new(0xa55e_2718_1337_0001);
+    let mut verified = 0u32;
+    let mut refused = 0u32;
+    for case in 0..500u32 {
+        let n = 1 + rng.below(4) as usize;
+        let desc = gen_sdesc(&mut rng, 2, n);
+        smt::with_fresh(|| {
+            let x = var(8);
+            let steps: Vec<Step> = desc.iter().map(|d| build_step(d, x)).collect();
+            let any_failure = (0..=255u64).any(|v| !run_steps(&steps, v));
+            let prog = build_program(&desc, x);
+            let is_verified = wp::verify(prog, smt::truth(true), smt::truth(true)).is_verified();
+
+            // Soundness: a proof must not outrun reality.
+            assert!(
+                !(is_verified && any_failure),
+                "case {}: the engine verified a program whose assertion fails on a real input",
+                case
+            );
+            // And no over-refusal: if every input is fine, the engine must say so. This is
+            // the direction the guard-context fixes had to establish, and the one a
+            // one-directional soundness test cannot see.
+            assert!(
+                !(!is_verified && !any_failure),
+                "case {}: every concrete run is fine but the engine refused the program",
+                case
+            );
+            if is_verified {
+                verified += 1;
+            } else {
+                refused += 1;
+            }
+        });
+    }
+    assert!(verified > 20, "expected some programs to verify, got {}", verified);
+    assert!(refused > 20, "expected some programs to be refused, got {}", refused);
+    eprintln!("assertion family: {} verified, {} refused", verified, refused);
+}

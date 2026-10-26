@@ -443,6 +443,29 @@ and `exists_guarded` are *not* affected: an empty range yields `true`/`false` re
 which is correct for an empty range, and `inside` already treats an unrepresentable index as
 outside the bound rather than truncating it.
 
+## A differential test that fails on a correct program is a bug in the test
+
+The soundness families in `tests/modular_differential.rs` check one direction: if the engine
+reports verified, no concrete execution violates the postcondition. That direction cannot see
+over-refusal, and over-refusal is exactly what the two defects above were -- so the new
+assertion family checks both directions:
+
+> verified if and only if no concrete execution reaches a failed assertion.
+
+Both defects 36 and 37 are caught by it. The teeth were confirmed by reverting each fix in
+turn: without the branch guard the family reports "every concrete run is fine but the engine
+refused the program", and dropping the assertion obligation outright makes it report "the
+engine verified a program whose assertion fails on a real input".
+
+The family also cost an afternoon to a phantom soundness hole, and that is worth recording.
+The concrete interpreter threaded the state *by value* into the recursive branch call, so every
+assignment made inside an `if` was lost. The engine was right and the interpreter was wrong, but
+the failure message said the engine had verified a program with a real violation -- the most
+alarming message a verifier's test suite can produce. The lesson is the ordering of suspicion: a
+differential test that disagrees with the engine on a *correct* program is almost always the
+test's bug, and the interpreter is the less-trusted component, because it is the newer and less
+carefully reviewed one. Thread the state by `&mut` through branches.
+
 ## A claim after a statement is made in a state that statement can produce
 
 An assertion recorded to the *right* of an `if` is dominated by it, so its claim is
