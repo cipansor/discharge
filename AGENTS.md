@@ -1275,3 +1275,18 @@ same command in the resumed environment produced a different, wrong-looking line
 easy to skim past as "still fine". The lesson: re-run the commands a summary quotes, and
 read the *whole* output line — a tally that shifted from `agree` to `parse_err` with the
 same total is a silent failure, not a stable result.
+
+## Gates quoted in prose stop being run; make them one command
+
+The five gates this crate depends on (clippy `-D warnings`, the test suite, the bare-metal
+`no_std` build, the zero-dependency check, the z3 oracle) were five separate commands,
+written in the README and copied into summaries by hand. That is exactly how a gate quietly
+stops being run: the summary says "all gates green" because the four that were re-run were
+green, and the fifth was recalled rather than executed. `scripts/gate.sh` is now the single
+entry point, it fails on the first gate that does not hold, and it treats an unavailable z3
+oracle as a failure rather than a pass.
+
+This is the same lesson as the two tooling defects above, one level up: **a gate you did
+not run is not a gate you passed**, and the only way to keep that honest is to make "run
+all the gates" a single command whose exit code is the claim. A summary that says "gates
+green" should quote that command's output, not a memory of running the pieces.

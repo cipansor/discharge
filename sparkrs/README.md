@@ -1200,11 +1200,17 @@ sparkrs/
     ├── contracts.rs       procedures verified once, calls reasoned about by contract
     └── z3diff.rs          differential harness: engine vs z3 on the exported text
                            (needs z3-solver; a development tool, not a dependency)
+└── scripts/
+    ├── gate.sh            every gate in one command, failing loudly
+    └── test-count.sh      the exact passing-test count, only when all pass
 ```
 
 ## Building and testing
 
 ```console
+# Everything, in one command that fails loudly on the first gate that does not hold
+scripts/gate.sh
+
 # Host, with the thread-local arena and the full test suite
 cargo test --features std
 
@@ -1212,6 +1218,12 @@ cargo test --features std
 rustup target add thumbv7em-none-eabihf
 cargo build --no-default-features --target thumbv7em-none-eabihf
 ```
+
+`scripts/gate.sh` runs clippy (with `-D warnings`), the test suite, the bare-metal
+`no_std` build, a zero-dependency check, and the z3 differential oracle. It exists because
+the gates were previously five separate commands quoted in prose, which is how a gate
+quietly stops being run. It also refuses to report success when the z3 oracle is not
+installed: an oracle that did not run is not evidence about the exporter.
 
 The `differential` test is the one that makes the approach trustworthy: for a
 family of predicates it checks that the symbolic prover and brute-force
