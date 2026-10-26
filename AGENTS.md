@@ -163,6 +163,66 @@ of an under-declared frame rather than hiding it. Do not "fix" that by having th
 interpreter consult the body: the point is to model the declared contract, which is what
 a real machine executes against.
 
+## Fuzz the layers, not just the top
+
+The differential harness started at the decision procedure and had to be pushed down twice,
+each time finding a bug that the layer above could not see.
+
+1. **The word layer.** `random_expressions_agree_with_enumeration` builds random expression
+   trees over two 8-bit variables and compares `prove` against enumeration over all 65 536
+   inputs. Mutation-validated: an Xor bug was caught (it claimed `(!b) == b` valid).
+
+2. **The predicate layer.** `random_predicates_agree_with_enumeration` builds random
+   comparisons over random word expressions combined with and/or/not/implies. This found
+   DEFECT 15: a mixed-width operation silently truncated, so `trunc2(b) + (a + 115)` was
+   computed in two bits and a refutable predicate read as `Valid`. Both `evaluate_pred` and
+   the BDD agreed with each other because they share the constructor that was wrong; only
+   enumeration disagreed.
+
+3. **The weakest-precondition layer.** `wp_matches_concrete_execution` builds random
+   straight-line and branching programs, evaluates the generated `wp` at all 256 inputs, and
+   compares against a concrete interpreter. It is exhaustive and does not touch the BDD
+   engine, so it tests the substitution machinery on its own. This found DEFECT 19: `subst`
+   walked a shift amount as if it were a term id, which on a two-line program recursed
+   forever and blew the stack.
+
+Each layer needs its own oracle. When a bug is found, the oracle is usually the only thing
+that disagrees -- which is the point.
+
+## A field is not a term id just because its neighbours are
+
+`Node.b` is a term id for most operations, but it is a *payload* for `Trunc` (source width)
+and `Shl`/`LShr`/`Shr` (shift amount). Every traversal that reads `n.b` as a term has to
+carve out those four ops. `blast` and `eval_term` do; `subst` did not, and that was DEFECT 19.
+The symptom was not a wrong answer but unbounded recursion: term id 3 named a term that
+contained the shift, so the walk never bottomed out.
+
+When you add a traversal over `Node`, list the ops whose fields are payloads and handle them
+explicitly. The compiler cannot help, because a shift amount and a term id have the same
+type. Grep for `Term(n.b)` and check each site.
+
+## A printer is part of the proof
+
+`smtscript.rs` turns the engine's formula into SMT-LIB2 so an independent solver can
+reproduce the proof. That makes the printer soundness-critical: if it prints a different
+formula, the external evidence does not apply. Three bugs, all found by reading the output:
+
+1. **Polarity.** A one-bit word used as a proposition printed as `(= w 0)` while the comment
+   said `w != 0`. `truth(false)` came out as `(assert false)`, which every solver reports
+   `unsat` -- so an external checker would call an impossible obligation proved. `distinct`
+   is the spelling of `!=`.
+
+2. **Sort.** `not`, `and`, `or`, `xor` exist in both readings, and the printer always used the
+   bit-vector operator, so `not(x == y)` became `(bvnot (= x y))` -- ill-sorted, since `bvnot`
+   wants a bit-vector and a comparison is a boolean. The width decides which spelling is valid.
+
+3. **Direction.** `truncate` widens as well as narrows, and the printer used `extract` for both,
+   so a widening `truncate` produced `((_ extract 15 0) x0_8)` -- extracting bit 15 from an
+   8-bit vector. Widening is `zero_extend`.
+
+The lesson is that a comment stating the intended semantics is not a check. Two of the three
+bugs were under a comment that described the correct behaviour.
+
 ## A hazard you can detect beats a hazard you document
 
 The twelfth hole stamped `Certificate` and `Implication` with an arena generation. The
