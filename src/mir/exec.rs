@@ -582,9 +582,10 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
                 .unwrap_or(64);
             let x = operand(env, a);
             let y = operand(env, b);
-            let res = eval_binary(*op, x, y, Some(w), operand_is_signed(f, a));
+            let signed = operand_is_signed(f, a);
+            let res = eval_binary(*op, x, y, Some(w), signed);
             env.set(&Place { local: dest.local, proj: vec![Proj::Field(0)] }, res);
-            match overflow_pred(*op, x, y, w) {
+            match overflow_pred(*op, x, y, w, signed) {
                 Some(p) => {
                     env.set(&Place { local: dest.local, proj: vec![Proj::Field(1)] }, Val::Bool(p));
                 }
@@ -606,6 +607,9 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
                     Some(w) => Val::Sym(smt::bxor(s, smt::all_ones(w))),
                     None => Val::Unknown,
                 },
+                // `-x` is `0 - x`, which is the right bit pattern for every input
+                // including `MIN` (it wraps back to `MIN`, which is what rustc's
+                // own `assert(x != MIN)` guards and then computes anyway).
                 (UnOp::Neg, Val::Sym(s)) => match dest_w {
                     Some(w) => Val::Sym(smt::sub(smt::word(0, w), s)),
                     None => Val::Unknown,
@@ -693,6 +697,15 @@ fn eval_binary(op: BinOp, a: Val, b: Val, width: Option<u8>, signed: bool) -> Va
             Val::Bool(match op {
                 BinOp::Eq => smt::eq(x, y),
                 BinOp::Ne => smt::not(smt::eq(x, y)),
+                // Signedness matters here and only here: `<` on an `i8` is not
+                // `<` on a `u8`, and the unsigned form calls `-1` the largest
+                // value. rustc picks signed or unsigned by the operand type, so
+                // the type is what decides -- a wrong choice is not a missed
+                // proof but a wrong branch, which is a wrong answer.
+                BinOp::Lt if signed => smt::slt(x, y),
+                BinOp::Le if signed => smt::sle(x, y),
+                BinOp::Gt if signed => smt::sgt(x, y),
+                BinOp::Ge if signed => smt::sge(x, y),
                 BinOp::Lt => smt::ult(x, y),
                 BinOp::Le => smt::ule(x, y),
                 BinOp::Gt => smt::ult(y, x),
@@ -703,6 +716,20 @@ fn eval_binary(op: BinOp, a: Val, b: Val, width: Option<u8>, signed: bool) -> Va
         _ => {
             let (x, y) = match (a, b) {
                 (Val::Sym(x), Val::Sym(y)) => (x, y),
+                // Bitwise operators on `bool`. rustc lowers `p && q` to
+                // `BitAnd(p, q)` and the OR/XOR forms likewise, so a contract
+                // assert whose condition was written with `&&` arrives here as a
+                // bitwise op on two booleans. Refusing it would leave the assert
+                // unmodelled and the obligation open, which is a coverage hole
+                // rather than a wrong answer -- but an avoidable one.
+                (Val::Bool(p), Val::Bool(q)) => {
+                    return Val::Bool(match op {
+                        BinOp::BitAnd => smt::and(p, q),
+                        BinOp::BitOr => smt::or(p, q),
+                        BinOp::BitXor => smt::xor(p, q),
+                        _ => return Val::Unknown,
+                    })
+                }
                 _ => return Val::Unknown,
             };
             if width.is_none() {
@@ -718,9 +745,19 @@ fn eval_binary(op: BinOp, a: Val, b: Val, width: Option<u8>, signed: bool) -> Va
                 // Division and remainder go through the engine's restoring
                 // divider, which is exact. `y == 0` has a defined value there,
                 // and rustc's own divide-by-zero assert is what turns that into
-                // a reported panic, so the pair is consistent.
-                BinOp::Div => smt::udiv(x, y),
-                BinOp::Rem => smt::urem(x, y),
+                // a reported panic, so the pair is consistent. A signed operand
+                // needs the *signed* divider: the unsigned one would return a
+                // huge positive quotient for `-7 / 2`, which is a wrong value
+                // and not merely a weaker proof.
+                BinOp::Div | BinOp::Rem => {
+                    let signed_pair = (signed, op);
+                    match signed_pair {
+                        (true, BinOp::Div) => smt::sdiv(x, y),
+                        (true, BinOp::Rem) => smt::srem(x, y),
+                        (false, BinOp::Div) => smt::udiv(x, y),
+                        _ => smt::urem(x, y),
+                    }
+                }
                 // A *variable* shift amount is a barrel shifter (see
                 // `smt::shift_var`). rustc guards it with `assert(n < w)`
                 // immediately before, so the amount is in range on every path that
@@ -761,25 +798,59 @@ fn eval_binary(op: BinOp, a: Val, b: Val, width: Option<u8>, signed: bool) -> Va
 /// dischargeable and an overflowing program would be reported panic-free — the
 /// exact failure mode the README calls out, where an unsound engine reports a
 /// *better-looking* result than the truth.
-fn overflow_pred(op: BinOp, a: Val, b: Val, w: u8) -> Option<Pred> {
+fn overflow_pred(op: BinOp, a: Val, b: Val, w: u8, signed: bool) -> Option<Pred> {
     let (x, y) = match (a, b) {
         (Val::Sym(x), Val::Sym(y)) => (x, y),
         _ => return None,
     };
     Some(match op {
-        // `x + y` wraps exactly when the sum is below `x`.
+        // Unsigned `x + y` wraps exactly when the sum is below `x`: that is the
+        // carry out of the top bit, and the unsigned order tracks it.
+        //
+        // Signed addition is a *different* condition, and getting it wrong is
+        // unsound rather than merely weak. The carry test is not enough: `127 + 1`
+        // at `i8` carries into a result that is *below* `127` read unsigned, so
+        // the unsigned test happens to fire there — but it also fires on `-1 + 1`
+        // (no overflow, result `0`), and it misses `-128 + -1`, whose sum `127u8`
+        // carries yet lands below `127`... in a direction that depends on which
+        // operand you compare against. The sign rule is the sound one and has no
+        // such cases: the result is wrong exactly when the operands agree in sign
+        // and the result disagrees with them.
+        BinOp::Add if signed => {
+            let sum = smt::add(x, y);
+            let same_sign = smt::iff(smt::negative(x), smt::negative(y));
+            smt::and(same_sign, smt::xor(smt::negative(x), smt::negative(sum)))
+        }
         BinOp::Add => smt::ult(smt::add(x, y), x),
-        // `x - y` wraps exactly when `x < y`.
+        // Unsigned `x - y` wraps exactly when `x < y` (the borrow).
+        //
+        // Signed subtraction wraps when the operands *differ* in sign and the
+        // result takes the sign of the subtrahend: `x - y` is wrong exactly when
+        // `x` and `y` disagree and the result agrees with `y`.
+        BinOp::Sub if signed => {
+            let diff = smt::sub(x, y);
+            let differ = smt::xor(smt::negative(x), smt::negative(y));
+            smt::and(differ, smt::iff(smt::negative(y), smt::negative(diff)))
+        }
         BinOp::Sub => smt::ult(x, y),
         // `x * y` wraps exactly when the exact product needs more than `w` bits.
         //
-        // The engine has no division, so the high half is computed by widening:
-        // `smt::truncate` zero-extends when the target width is larger, so the
-        // operands are widened to `2w`, multiplied exactly there, and the
+        // The engine has no wide multiplication, so the high half is computed by
+        // widening: `smt::truncate` zero-extends when the target width is larger,
+        // so the operands are widened to `2w`, multiplied exactly there, and the
         // overflow test is `>= 2^w`. That is exact rather than a sufficient
         // condition, which matters because a too-weak predicate here would make
         // the `assert` look dischargeable and report an overflowing function as
         // panic-free.
+        //
+        // Widening is where signedness matters, and the direction is worth being
+        // exact about. rustc computes the *sign-extended* product and then tests
+        // whether it equals the `w`-bit result sign-extended back to `2w`. That
+        // test is about magnitudes, so it is neither "the unsigned product is
+        // below `2^w`" (which fires spuriously for `-1 * -1` at `i8`) nor the
+        // `2^(2w-1)` magnitude rule (which fires spuriously for `-128 * 1`). The
+        // sign-extended product is built here, and the equality is what is
+        // checked.
         BinOp::Mul => {
             let wide = w.saturating_mul(2).min(64);
             if wide <= w {
@@ -797,13 +868,25 @@ fn overflow_pred(op: BinOp, a: Val, b: Val, w: u8) -> Option<Pred> {
             if wide > 16 {
                 return None;
             }
-            let xw = smt::truncate(x, wide);
-            let yw = smt::truncate(y, wide);
-            let exact = smt::mul(xw, yw);
-            // 2^w, as a constant in the widened width.
-            let limit = 1u64 << (w - 1);
-            let limit = limit.saturating_mul(2);
-            smt::uge_const(exact, limit)
+            if signed {
+                // Sign-extend the operands, so the product is exact; the
+                // `2w`-bit product of two `w`-bit signed values always fits in
+                // `2w` signed bits, so this multiply cannot itself wrap.
+                let exact = smt::mul(smt::sign_extend(x, wide), smt::sign_extend(y, wide));
+                // The exact product is right exactly when it equals the `w`-bit
+                // wrapped result *sign-extended* back to `2w`. Sign-extending the
+                // wrapped result is what makes this rustc's test rather than a
+                // magnitude test -- comparing a zero-extended result would fire
+                // on every negative product.
+                let want = smt::sign_extend(smt::mul(x, y), wide);
+                smt::not(smt::eq(exact, want))
+            } else {
+                let exact = smt::mul(smt::truncate(x, wide), smt::truncate(y, wide));
+                // 2^w, as a constant in the widened width.
+                let limit = 1u64 << (w - 1);
+                let limit = limit.saturating_mul(2);
+                smt::uge_const(exact, limit)
+            }
         }
         _ => return None,
     })

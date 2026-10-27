@@ -101,6 +101,27 @@ Three engine consequences worth remembering:
   fills. The threshold is a time guard, and 16 is where it sits. If you raise it,
   time the demo rather than trusting the fallback's existence.
 
+- **Signedness is part of the *value*, not a display detail.** The engine's
+  arithmetic is bit-vector arithmetic, so every operation has one bit-pattern
+  answer; signedness decides which *question* a comparison asks. `-1 < 1` is
+  `false` read unsigned and `true` read signed, `-7 / 2` is `-3` signed and a huge
+  positive number unsigned, and a signed add's overflow is not the unsigned
+  carry. The frontend therefore reads signedness off the declared type and picks
+  `smt::slt`/`sle`/`sgt`/`sge` and `smt::sdiv`/`srem` rather than the unsigned
+  forms. The contract evaluator does the same, because a contract's `<` is the
+  same comparison as the code's. Two consequences worth remembering:
+  - `MIN` is *not* zero. `parse_const` used to return `0` for both `MIN` and
+    `MAX`, so `a != i8::MIN` meant `a != 0` and a signed negation guarded by it
+    was reported panic-free. `MIN` of a signed type is the top bit alone.
+  - The overflow rules are not the unsigned ones. For a signed add it is "the
+    operands agree in sign and the result disagrees"; for a subtract, "the
+    operands differ and the result takes the subtrahend's sign". The unsigned
+    carry test happens to fire on `127 + 1` but also fires on `-1 + 1`, which is
+    not an overflow. For a signed multiply the test is rustc's own: the
+    sign-extended product equals the sign-extension of the wrapped result.
+    `smt::sign_extend` exists for exactly this, because `truncate` zero-fills and
+    a zero-extended `-1` has the wrong magnitude.
+
 Three traps that cost time here, all in the frontend rather than the engine:
 
 - **`Term::Assert` must assume the guard it just checked on the fall-through

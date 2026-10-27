@@ -1164,6 +1164,16 @@ unchecked_sub    FAILED: panic: attempt to compute `{} - {}`, which would overfl
 unchecked_div    FAILED: panic: attempt to divide `{}` by zero — v2:u32 = 0
 unchecked_mul    FAILED: panic: attempt to compute `{} * {}`, which would overflow — v1:u8 = 128, v2:u8 = 128
 off_by_one_guard FAILED: postcondition — v1:u16 = 32768, v2:u16 = 32768
+clamp_signed     verified (3 obligation(s), 0 panic(s) ruled out)
+checked_div_signed verified (3 obligation(s), 0 panic(s) ruled out)
+unchecked_div_signed FAILED: panic: attempt to divide `{}` by zero — v2:u16 = 0
+signed_add_misguarded FAILED: panic: attempt to compute `{} + {}`, which would overflow — v1:u8 = 128, v2:u8 = 128
+signed_add_guarded verified (2 obligation(s), 0 panic(s) ruled out)
+signed_mul_guarded verified (2 obligation(s), 0 panic(s) ruled out)
+signed_mul_negative FAILED: panic: attempt to compute `{} * {}`, which would overflow — v1:u8 = 128, v2:u8 = 128
+checked_neg      verified (2 obligation(s), 0 panic(s) ruled out)
+
+verified=11 failed=9 incomplete=1
 ```
 
 `unchecked_add` is `fn unchecked_add(a: u16, b: u16) -> u16 { a + b }` — ordinary
@@ -1261,6 +1271,31 @@ The frontend refuses far more than it accepts, and every refusal is reported:
 - **Anything with a `core::` callee other than a plain function.** Intrinsics and
   trait methods are not modelled.
 - **Aggregates, slices, references.** No pointer model.
+
+### Signedness is a value question, not a display one
+
+`i8`, `i16` and friends are bit patterns like any other, so every operation has one
+bit-pattern answer — but signedness decides *which question a comparison asks*.
+`-1 < 1` is `false` read unsigned and `true` read signed; `-7 / 2` is `-3` signed
+and a huge positive number unsigned; and a signed add overflows where the unsigned
+carry says nothing is wrong. The frontend reads the declared type and picks the
+signed form (`slt`/`sle`/`sgt`/`sge`, `sdiv`/`srem`), and the contract evaluator
+does the same, because a contract's `<` is the same comparison as the code's.
+
+The overflow rules differ too. A signed add wraps exactly when the operands agree
+in sign and the result disagrees; a signed multiply when the sign-extended product
+is not the sign-extension of the wrapped result, which is `rustc`'s own test. This
+matters in the direction that hides bugs: the unsigned carry test fires on
+`127 + 1` but *also* on `-1 + 1`, which does not overflow, and `MIN` is the top bit
+rather than zero. The demo's `signed_add_misguarded` is the case that pins it —
+`requires: a <= 127 && b <= 1` reads like a safe guard and is not one.
+
+`tests/signed.rs` checks the signed operators differentially against Rust's own on
+the same two's-complement values, and `examples/z3diff.rs` carries signed
+identities in its corpus. `MIN / -1` and a zero divisor are *defined* rather than
+trapped, for the same reason the unsigned divider defines `y == 0`: a hole in the
+model is a hole in the proof. `rustc`'s own `assert`s are what turn those inputs
+into reported panics.
 
 `FnOutcome::Incomplete` is not a pass. `FileReport::is_clean` is false whenever any
 path was unmodelled or any contracted function is missing from the MIR, and a

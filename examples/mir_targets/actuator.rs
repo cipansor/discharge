@@ -112,9 +112,93 @@ pub fn sat_shift(x: u16, n: u16) -> u16 {
 }
 
 // ---------------------------------------------------------------------------
-// Must fail: these are the bugs the frontend exists to find.
+// Signed arithmetic. The unsigned cases above cannot tell a signed comparison
+// from an unsigned one, so these exist to pin the difference.
 // ---------------------------------------------------------------------------
 
+/// A signed clamp. `lo <= hi` and the two comparisons must be *signed*: the
+/// unsigned order calls `-1` the largest value, which would take the wrong
+/// branch for every negative input.
+/// requires: lo <= hi
+/// ensures: lo <= ret
+/// ensures: ret <= hi
+pub fn clamp_signed(x: i32, lo: i32, hi: i32) -> i32 {
+    if x < lo {
+        lo
+    } else if x > hi {
+        hi
+    } else {
+        x
+    }
+}
+
+/// A signed division whose guard excludes both traps: a zero divisor and the
+/// `MIN / -1` overflow. rustc emits an assert for each.
+/// requires: b != 0 && !(a == i16::MIN && b == -1)
+/// ensures: true
+pub fn checked_div_signed(a: i16, b: i16) -> i16 {
+    a / b
+}
+
+/// A signed division with no guard at all, so the zero divisor and the
+/// `MIN / -1` overflow are both reachable and both must be reported.
+/// requires: true
+pub fn unchecked_div_signed(a: i16, b: i16) -> i16 {
+    a / b
+}
+
+/// A signed addition guarded on the *positive* side only. `a <= 127 && b <= 1`
+/// reads like a safe guard and is not one: `127 + 1` overflows `i8`. The
+/// unsigned overflow predicate would call this safe, because the wrapped sum
+/// `128u8` is not below `127u8`; a signed predicate that compared the wrapped
+/// sum signed would also call it safe. The correct test is the unsigned carry,
+/// which fires here — this is the case that pins it.
+/// requires: a <= 127 && b <= 1
+/// ensures: true
+pub fn signed_add_misguarded(a: i8, b: i8) -> i8 {
+    a + b
+}
+
+/// A signed addition guarded on *both* ends of the range, which is what a signed
+/// guard has to do. An upper bound alone is not enough: `a <= 60 && b <= 60`
+/// admits `-128 + -128`, which overflows downward. The tempting unsigned-style
+/// `a <= 100 && b <= 100` is wrong too — `100 + 100 = 200` overflows upward. A
+/// magnitude bound of 60 admits no overflowing pair in either direction.
+/// requires: a >= -60 && a <= 60 && b >= -60 && b <= 60
+/// ensures: true
+pub fn signed_add_guarded(a: i8, b: i8) -> i8 {
+    a + b
+}
+
+/// A signed multiply guarded by magnitude, so it cannot overflow: the product of
+/// two values of magnitude at most 10 is at most 100, well inside `i8`.
+/// requires: a >= -10 && a <= 10 && b >= -10 && b <= 10
+/// ensures: true
+pub fn signed_mul_guarded(a: i8, b: i8) -> i8 {
+    a * b
+}
+
+/// A signed multiply whose operands can be negative, where a zero-extending
+/// widening would *understate* the product and miss the overflow. `-128 * -1`
+/// overflows `i8`; the sign-extended widening sees it, the zero-extended one
+/// would not.
+/// requires: a <= 0 && b <= 0
+/// ensures: true
+pub fn signed_mul_negative(a: i8, b: i8) -> i8 {
+    a * b
+}
+
+/// A signed negation guarded against `MIN`, which is the one input that has no
+/// positive counterpart.
+/// requires: a != i8::MIN
+/// ensures: true
+pub fn checked_neg(a: i8) -> i8 {
+    -a
+}
+
+// ---------------------------------------------------------------------------
+// Must fail: these are the bugs the frontend exists to find.
+// ---------------------------------------------------------------------------
 /// Plain `a + b` on `u16` with no guard. rustc emits `AddWithOverflow` and an
 /// assert, so there is a reachable overflow and it must be reported.
 /// requires: true

@@ -60,6 +60,14 @@ fn verify_all() -> Option<verify::FileReport> {
         "unchecked_div",
         "unchecked_mul",
         "off_by_one_guard",
+        "clamp_signed",
+        "checked_div_signed",
+        "unchecked_div_signed",
+        "signed_add_misguarded",
+        "signed_add_guarded",
+        "signed_mul_guarded",
+        "signed_mul_negative",
+        "checked_neg",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -133,7 +141,7 @@ fn contract_expressions_evaluate() {
     smt::with_fresh(|| {
         let mut args = std::collections::BTreeMap::new();
         args.insert("b".to_string(), smt::var_named(2, 32));
-        let p = spec::eval_requires("b != 0", &args).expect("should parse");
+        let p = spec::eval_requires("b != 0", &args, &std::collections::BTreeSet::new()).expect("should parse");
         // `b != 0` is satisfiable but not valid: some b violates it.
         assert!(!smt::prove(p).is_proved());
     });
@@ -147,7 +155,7 @@ fn a_contradictory_contract_is_refused_or_vacuous() {
         args.insert("b".to_string(), smt::var_named(2, 32));
         // `b < 3 && b > 10` describes no input. The parser should read it, and
         // the engine should say the precondition is unsatisfiable.
-        let p = spec::eval_requires("b < 3 && b > 10", &args).expect("should parse");
+        let p = spec::eval_requires("b < 3 && b > 10", &args, &std::collections::BTreeSet::new()).expect("should parse");
         assert_eq!(smt::find_model(p), smt::Verdict::Unsat);
     });
 }
@@ -159,11 +167,11 @@ fn refuses_a_contract_it_cannot_read() {
         let args = std::collections::BTreeMap::new();
         // A function call is not in the grammar, so it must be refused rather
         // than approximated.
-        assert!(spec::eval_requires("foo(b) < 3", &args).is_err());
+        assert!(spec::eval_requires("foo(b) < 3", &args, &std::collections::BTreeSet::new()).is_err());
         // A cast is not in the grammar either.
-        assert!(spec::eval_requires("b as u64 < 3", &args).is_err());
+        assert!(spec::eval_requires("b as u64 < 3", &args, &std::collections::BTreeSet::new()).is_err());
         // An unknown name is not an argument.
-        assert!(spec::eval_requires("zzz < 3", &args).is_err());
+        assert!(spec::eval_requires("zzz < 3", &args, &std::collections::BTreeSet::new()).is_err());
     });
 }
 
@@ -233,6 +241,13 @@ fn counterexamples_really_panic() {
         // The variable shift is modelled now, so its counterexample is a real
         // one: `n == 16` is exactly what rustc's own `assert(n < 16)` rejects.
         "shift_left",
+        // The signed cases. These are the ones that would have slipped through
+        // while comparisons and overflow tests were unsigned-only, so replaying
+        // their witnesses against the real functions is what keeps the fix
+        // honest.
+        "unchecked_div_signed",
+        "signed_add_misguarded",
+        "signed_mul_negative",
     ] {
         let o = outcome(&report, name);
         let FnOutcome::Failed { detail, .. } = o else {
@@ -254,6 +269,15 @@ fn counterexamples_really_panic() {
             "unchecked_div" => std::panic::catch_unwind(|| unchecked_div(a as u32, b as u32)).is_err(),
             "unchecked_mul" => std::panic::catch_unwind(|| unchecked_mul(a as u8, b as u8)).is_err(),
             "shift_left" => std::panic::catch_unwind(|| shift_left(a as u16, b as u16)).is_err(),
+            "unchecked_div_signed" => {
+                std::panic::catch_unwind(|| unchecked_div_signed(a as i16, b as i16)).is_err()
+            }
+            "signed_add_misguarded" => {
+                std::panic::catch_unwind(|| signed_add_misguarded(a as i8, b as i8)).is_err()
+            }
+            "signed_mul_negative" => {
+                std::panic::catch_unwind(|| signed_mul_negative(a as i8, b as i8)).is_err()
+            }
             _ => unreachable!(),
         };
         if !panicked {
@@ -344,6 +368,100 @@ fn sat_mul_is_reported_incomplete_not_verified() {
     assert!(
         matches!(o, FnOutcome::Incomplete { .. }),
         "sat_mul should be incomplete, got: {o}"
+    );
+}
+
+/// The signed/unsigned split, pinned so it cannot regress.
+///
+/// While comparisons and overflow tests were unsigned-only, every case here
+/// produced the wrong answer and every *unsigned* case above still passed — the
+/// whole suite was green while the engine called `127 + 1` panic-free. These
+/// assertions are what would have caught it.
+#[test]
+fn signed_arithmetic_is_not_verified_as_unsigned() {
+    let Some(report) = verify_all() else { return };
+
+    // `signed_add_misguarded` has `requires: a <= 127 && b <= 1` and adds. The
+    // unsigned overflow test calls it safe because the wrapped sum `128u8` is not
+    // below `127u8`; the correct signed rule fires. It must be a *failure*, and
+    // it must not be reported verified.
+    let o = outcome(&report, "signed_add_misguarded");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "a signed add that overflows on `127 + 1` must be refuted, got: {o}"
+    );
+
+    // The guard that actually holds, so the fix is not "reject everything signed".
+    for name in ["signed_add_guarded", "signed_mul_guarded", "clamp_signed", "checked_neg"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "{name} should verify, got: {o}");
+    }
+
+    // A signed comparison must take the negative branch. `clamp_signed` cannot
+    // verify at all if `x < lo` is read unsigned, because `-1` would look larger
+    // than any positive bound — so its `Verified` above is the comparison check.
+    // This asserts the same thing from the other side: the misguarded add fails,
+    // which requires the *overflow* test to be signed-aware rather than the
+    // comparison alone.
+    let o = outcome(&report, "signed_mul_negative");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "a signed multiply of two negatives must be refuted, got: {o}"
+    );
+}
+
+/// `i8::MIN` must parse as the top bit, not as zero.
+///
+/// `checked_neg`'s guard is `a != i8::MIN`. When the constant parser returned 0
+/// for every `MIN`, that guard meant `a != 0`, so the `-128` case looked excluded
+/// and the negation was reported panic-free. The function must verify *now* only
+/// because the guard is real, and a version without it must fail.
+#[test]
+fn the_min_constant_is_the_top_bit() {
+    let Some(report) = verify_all() else { return };
+    let o = outcome(&report, "checked_neg");
+    assert!(
+        o.is_verified(),
+        "checked_neg excludes i8::MIN and should verify, got: {o}"
+    );
+    // Replay the guard's own boundary against the real function: `-128` really
+    // does panic under debug overflow checks, which is why excluding it matters.
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let panics = std::panic::catch_unwind(|| {
+        // `black_box` keeps the constant from being folded, so the negation is
+        // computed at runtime and its overflow check is the one being tested.
+        let a: i8 = std::hint::black_box(i8::MIN);
+        -a
+    })
+    .is_err();
+    std::panic::set_hook(prev);
+    assert!(panics, "`-i8::MIN` must panic, so the guard is load-bearing");
+}
+
+/// The other direction for signed code: a function reported panic-free must not
+/// panic on any input it admits.
+#[test]
+fn verified_signed_functions_do_not_panic_concretely() {
+    let Some(report) = verify_all() else { return };
+    if !outcome(&report, "signed_add_guarded").is_verified() {
+        return;
+    }
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let mut violations = Vec::new();
+    // The guard admits only `|a|, |b| <= 60`, so sweep that box exhaustively.
+    for a in -60i16..=60 {
+        for b in -60i16..=60 {
+            if std::panic::catch_unwind(|| signed_add_guarded(a as i8, b as i8)).is_err() {
+                violations.push((a, b));
+            }
+        }
+    }
+    std::panic::set_hook(prev);
+    assert!(
+        violations.is_empty(),
+        "signed_add_guarded was verified but panics on {violations:?}"
     );
 }
 

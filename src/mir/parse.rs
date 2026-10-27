@@ -478,28 +478,64 @@ fn parse_const(s: &str) -> Const {
     }
     // `<digits>_<ty>` — the suffix is the type, not part of the number.
     if let Some((num, ty)) = t.rsplit_once('_') {
-        if let Ok(v) = num.replace('_', "").parse::<u128>() {
-            return Const::UInt(v, Some(Ty::parse(ty)));
+        let ty = Ty::parse(ty);
+        let digits = num.replace('_', "");
+        if let Ok(v) = digits.parse::<u128>() {
+            return Const::UInt(v, Some(ty));
+        }
+        // A *negative* literal, as in `const -1_i16`. The dump prints it with a
+        // sign, which `u128` will not take, so it is read as a magnitude and
+        // stored as the two's-complement bit pattern at the type's width. This is
+        // the value the machine actually compares against; refusing it would leave
+        // `b == -1` unknown and hide the `MIN / -1` overflow behind an
+        // unmodelled condition.
+        if let Some(mag) = digits.strip_prefix('-') {
+            if let (Ok(mag), Some(w)) = (mag.parse::<u128>(), ty.width()) {
+                if w < 128 {
+                    let mask = (1u128 << w) - 1;
+                    return Const::UInt((0u128.wrapping_sub(mag)) & mask, Some(ty));
+                }
+            }
         }
     }
     if let Ok(v) = t.parse::<u128>() {
         return Const::UInt(v, None);
     }
-    // Associated constants: rustc prints `u16::MAX` as
-    // `core::num::<impl u16>::MAX`. The type is in the path, so the value is
-    // recovered from it. Only the standard integer types are recognized; any
-    // other associated constant stays `Other` and becomes unknown downstream.
-    if let Some(name) = t.rsplit("::").next() {
+    // Associated constants. rustc prints these two ways: the long form
+    // `core::num::<impl u16>::MAX`, and the short `i8::MIN` when the type is a
+    // primitive. Both name an integer bound, and the value is recovered from the
+    // type rather than guessed. Only the standard integer types are recognized;
+    // anything else stays `Other` and becomes unknown downstream.
+    if let Some((prefix, name)) = t.rsplit_once("::") {
         if name == "MAX" || name == "MIN" {
-            if let Some(ty) = type_in_impl_path(t) {
+            let ty = type_in_impl_path(t).or_else(|| {
+                let p = Ty::parse(prefix);
+                if p.width().is_some() {
+                    Some(p)
+                } else {
+                    None
+                }
+            });
+            if let Some(ty) = ty {
                 if let Some(w) = ty.width() {
-                    let v = if name == "MAX" {
-                        match w {
-                            64 => u128::from(u64::MAX),
-                            n => (1u128 << n) - 1,
+                    // `MAX` is `2^(w-1) - 1` for a signed type and `2^w - 1` for
+                    // an unsigned one. `MIN` is the *most negative* value for a
+                    // signed type, whose bit pattern is the top bit alone, and
+                    // zero for an unsigned one. Returning zero for both used to
+                    // make `a != i8::MIN` mean `a != 0`, so the assert guarding a
+                    // signed negation looked dischargeable and the negation was
+                    // reported panic-free.
+                    let v = match (name, ty.is_signed()) {
+                        ("MAX", true) => (1u128 << (w - 1)) - 1,
+                        ("MAX", false) => {
+                            if w == 64 {
+                                u128::from(u64::MAX)
+                            } else {
+                                (1u128 << w) - 1
+                            }
                         }
-                    } else {
-                        0
+                        ("MIN", true) => 1u128 << (w - 1),
+                        _ => 0,
                     };
                     return Const::UInt(v, Some(ty));
                 }

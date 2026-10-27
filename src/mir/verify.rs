@@ -170,6 +170,8 @@ impl std::fmt::Display for FnOutcome {
 pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome {
     let contract = specs.get(&f.name);
     let arg_vars = spec::arg_vars(f);
+    let signed = spec::signed_args(f);
+    let ret_signed = f.ret_ty.is_signed();
 
     // Build the precondition. No contract means `true`, which is the right
     // default: a function with no `requires` is checked for panic freedom on
@@ -177,7 +179,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     let mut pre = None;
     if let Some(c) = contract {
         for r in &c.requires {
-            match spec::eval_requires(r, &arg_vars) {
+            match spec::eval_requires(r, &arg_vars, &signed) {
                 Ok(p) => pre = Some(match pre {
                     None => p,
                     Some(prev) => smt::and(prev, p),
@@ -200,7 +202,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         Some(move |ret| {
             let mut acc: Option<crate::smt::Pred> = None;
             for e in &ensures {
-                if let Ok(p) = spec::eval_ensures(e, &args_for_post, ret) {
+                if let Ok(p) = spec::eval_ensures(e, &args_for_post, ret, &signed, ret_signed) {
                     acc = Some(match acc {
                         None => p,
                         Some(prev) => smt::and(prev, p),

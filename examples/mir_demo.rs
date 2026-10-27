@@ -35,7 +35,7 @@ pub enum Expect {
 }
 
 /// The expectations, stated as data so the demo and the test suite share them.
-pub fn expectations() -> [(&'static str, Expect); 13] {
+pub fn expectations() -> [(&'static str, Expect); 21] {
     use Expect::*;
     [
         ("clamp", Verified),
@@ -57,6 +57,29 @@ pub fn expectations() -> [(&'static str, Expect); 13] {
         // `ensures` is wrong, and a postcondition obligation catches that.
         // This is the case that shows the check is not only about panics.
         ("off_by_one_guard", Failed),
+
+        // --- signed arithmetic ---------------------------------------------
+        // These pin the signed/unsigned split. The unsigned cases above cannot
+        // tell `<` on `i32` from `<` on `u32`, so a comparison that read the
+        // wrong one would still pass every one of them.
+        ("clamp_signed", Verified),
+        // A guard that excludes both division traps: zero and `MIN / -1`.
+        ("checked_div_signed", Verified),
+        // No guard at all, so the zero divisor is reachable.
+        ("unchecked_div_signed", Failed),
+        // The guard reads like a safe one and is not: `127 + 1` overflows `i8`.
+        // The unsigned overflow test would call it safe, which is the bug this
+        // case exists to catch.
+        ("signed_add_misguarded", Failed),
+        // A magnitude bound that holds in both directions.
+        ("signed_add_guarded", Verified),
+        // A product of two magnitude-10 values, well inside `i8`.
+        ("signed_mul_guarded", Verified),
+        // Both operands negative, so a zero-extending widening would understate
+        // the product and miss the overflow; the sign-extended one sees it.
+        ("signed_mul_negative", Failed),
+        // Negation guarded against `MIN`, the one input with no positive form.
+        ("checked_neg", Verified),
     ]
 }
 

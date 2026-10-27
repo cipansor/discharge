@@ -1753,6 +1753,38 @@ pub fn ult(x: Var, y: Var) -> Pred {
 pub fn ule(x: Var, y: Var) -> Pred {
     with_ctx(|c| Pred(c.cmp(Op::Ule, x.0, y.0)))
 }
+/// The sign bit of `x` as a predicate: true when the top bit is set, which is
+/// what "negative" means in two's complement.
+pub fn negative(x: Var) -> Pred {
+    let w = bits(x);
+    // `x >= 2^(w-1)` is exactly "the top bit is set".
+    uge_const(x, 1u64 << (w - 1))
+}
+/// `x < y` (signed, two's complement).
+///
+/// The unsigned comparison next to this one is *wrong* for a signed operand, and
+/// wrong in the direction that hides bugs: it calls `-1` larger than `1`. The
+/// sign bits settle it -- equal signs mean the unsigned order is the signed
+/// order, and differing signs mean the negative one is smaller -- so the
+/// unsigned primitive is reused rather than a second ordering circuit built.
+pub fn slt(x: Var, y: Var) -> Pred {
+    let sx = negative(x);
+    let sy = negative(y);
+    let same = iff(sx, sy);
+    or(and(same, ult(x, y)), and(not(same), sx))
+}
+/// `x <= y` (signed)
+pub fn sle(x: Var, y: Var) -> Pred {
+    not(slt(y, x))
+}
+/// `x > y` (signed)
+pub fn sgt(x: Var, y: Var) -> Pred {
+    slt(y, x)
+}
+/// `x >= y` (signed)
+pub fn sge(x: Var, y: Var) -> Pred {
+    not(slt(x, y))
+}
 /// `x < k`
 pub fn ult_const(x: Var, k: u64) -> Pred {
     with_ctx(|c| {
@@ -1874,6 +1906,62 @@ pub fn urem(x: Var, y: Var) -> Var {
     divmod(x, y).1
 }
 
+/// `x / y` and `x % y`, *signed*, two's complement, truncating toward zero.
+///
+/// The unsigned divider computes a non-negative quotient from non-negative
+/// operands, so the signed case reduces to it once the operands are made
+/// non-negative and the signs of the results are put back. Rust truncates toward
+/// zero, so the remainder takes the *dividend's* sign.
+///
+/// The overflow case, `MIN / -1`, is given a defined value -- `MIN`, matching the
+/// wrapping result Rust would produce if the operation were unchecked -- rather
+/// than being left as a hole. rustc guards it with its own `assert`, so a path
+/// that reaches the division with that pair is already a reported panic; defining
+/// it keeps the function total, exactly as `y == 0` is handled. `-1` is a
+/// nonzero divisor here, so the two holes are independent.
+pub fn sdivmod(x: Var, y: Var) -> (Var, Var) {
+    let w = bits(x);
+    let zero = word(0, w);
+    let nx = negative(x);
+    let ny = negative(y);
+    // Magnitudes as unsigned values. Negating `MIN` wraps back to `MIN`, whose
+    // bit pattern *is* the magnitude `2^(w-1)`, so the plain wrapping subtract
+    // is already the right magnitude for every input.
+    let ax = ite(nx, sub(zero, x), x);
+    let ay = ite(ny, sub(zero, y), y);
+    let (q, r) = divmod(ax, ay);
+    // Truncation toward zero: the quotient is negative when the signs differ,
+    // and the remainder takes the *dividend's* sign. Getting the remainder's
+    // sign backwards is a wrong value, not a weak proof -- `-127 % 3` is `-1`,
+    // and `1` is a different number.
+    let q = ite(iff(nx, ny), q, sub(zero, q));
+    let r = ite(nx, sub(zero, r), r);
+    // `y == 0` is given the same defined value as the unsigned divider: the
+    // quotient is all ones and the remainder is the dividend. The unsigned
+    // `divmod` already does that, but its inputs here are *magnitudes*, so the
+    // remainder would come back as `|x|` and the sign fixup above would turn it
+    // into `-x`. Overriding both explicitly keeps the signed zero case equal to
+    // the unsigned one rather than one sign away from it.
+    let is_zero = eq(y, zero);
+    let q = ite(is_zero, all_ones(w), q);
+    let r = ite(is_zero, x, r);
+    // `MIN / -1` wraps to `MIN` with remainder 0; select it explicitly.
+    let min = word(1u64 << (w - 1), w);
+    let minus_one = all_ones(w);
+    let overflow = and(eq(x, min), eq(y, minus_one));
+    (ite(overflow, min, q), ite(overflow, zero, r))
+}
+
+/// `x / y`, signed. See [`sdivmod`].
+pub fn sdiv(x: Var, y: Var) -> Var {
+    sdivmod(x, y).0
+}
+
+/// `x % y`, signed. See [`sdivmod`].
+pub fn srem(x: Var, y: Var) -> Var {
+    sdivmod(x, y).1
+}
+
 /// `x + y == z`
 pub fn add_eq(x: Var, y: Var, z: Var) -> Pred {
     with_ctx(|c| {
@@ -1938,6 +2026,23 @@ pub fn bor(x: Var, y: Var) -> Var {
 pub fn bxor(x: Var, y: Var) -> Var {
     with_ctx(|c| Var(c.bin_word(Op::Xor, x.0, y.0)))
 }
+/// `x` widened to `wide` bits by replicating its sign bit.
+///
+/// A *value* operation, unlike [`truncate`], which zero-fills. The difference is
+/// the whole of signed multiplication: zero-extending `-1` to 16 bits gives `255`
+/// rather than `65535`, and a product computed from the wrong magnitude is a
+/// product that misses its overflow. Built from shifts the engine already has:
+/// move the `w` significant bits to the top of the wide word, then bring them
+/// back with the sign fill.
+pub fn sign_extend(x: Var, wide: u8) -> Var {
+    let w = bits(x);
+    if wide <= w {
+        return truncate(x, wide);
+    }
+    let sh = (wide - w) as u32;
+    ashr(shl(truncate(x, wide), sh), sh)
+}
+
 /// `x << k`
 pub fn shl(x: Var, k: u32) -> Var {
     with_ctx(|c| Var(c.shift(Op::Shl, x.0, k)))

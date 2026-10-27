@@ -54,7 +54,7 @@
 //! exactly is a contract it cannot check, and silently dropping it would report
 //! success for an unchecked property.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::mir::parse::Ty;
 use crate::smt::{self, Pred, Var};
@@ -190,8 +190,12 @@ impl std::fmt::Display for SpecError {
 }
 
 /// Turn a `requires` contract into a predicate over the named arguments.
-pub fn eval_requires(text: &str, args: &BTreeMap<String, Var>) -> Result<Pred, SpecError> {
-    let mut p = Parser::new(text, args, None);
+pub fn eval_requires(
+    text: &str,
+    args: &BTreeMap<String, Var>,
+    signed: &BTreeSet<String>,
+) -> Result<Pred, SpecError> {
+    let mut p = Parser::new(text, args, None, signed, false);
     let pred = p.parse_or()?;
     p.expect_end()?;
     Ok(pred)
@@ -202,8 +206,10 @@ pub fn eval_ensures(
     text: &str,
     args: &BTreeMap<String, Var>,
     ret: Var,
+    signed: &BTreeSet<String>,
+    ret_signed: bool,
 ) -> Result<Pred, SpecError> {
-    let mut p = Parser::new(text, args, Some(ret));
+    let mut p = Parser::new(text, args, Some(ret), signed, ret_signed);
     let pred = p.parse_or()?;
     p.expect_end()?;
     Ok(pred)
@@ -215,6 +221,14 @@ struct Parser<'a> {
     args: &'a BTreeMap<String, Var>,
     ret: Option<Var>,
     text: String,
+    /// Which argument names have a *signed* type. A contract's `<` is the
+    /// signed or the unsigned comparison depending on the operand, and the
+    /// unsigned one calls `-1` the largest value, so reading it off the type is
+    /// the difference between a contract that says what it means and one that
+    /// silently says something else.
+    signed: &'a BTreeSet<String>,
+    /// Whether `ret` is signed.
+    ret_signed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -271,8 +285,22 @@ fn tokenize(s: &str) -> Vec<Tok> {
 }
 
 impl<'a> Parser<'a> {
-    fn new(s: &str, args: &'a BTreeMap<String, Var>, ret: Option<Var>) -> Parser<'a> {
-        Parser { toks: tokenize(s), pos: 0, args, ret, text: s.to_string() }
+    fn new(
+        s: &str,
+        args: &'a BTreeMap<String, Var>,
+        ret: Option<Var>,
+        signed: &'a BTreeSet<String>,
+        ret_signed: bool,
+    ) -> Parser<'a> {
+        Parser { toks: tokenize(s), pos: 0, args, ret, text: s.to_string(), signed, ret_signed }
+    }
+
+    /// Whether the variable named `name` is signed, for choosing the comparison.
+    fn is_signed_name(&self, name: &str) -> bool {
+        if name == "ret" || name == "result" {
+            return self.ret_signed;
+        }
+        self.signed.contains(name)
     }
 
     fn peek(&self) -> Option<&Tok> {
@@ -288,6 +316,29 @@ impl<'a> Parser<'a> {
             if o == op {
                 self.pos += 1;
                 return true;
+            }
+        }
+        false
+    }
+
+    /// Whether the `(` at the cursor opens a parenthesized *predicate* rather
+    /// than arithmetic. Scans to the matching `)` and looks for a comparator or
+    /// a boolean operator at that level. Only a lookahead -- nothing is consumed.
+    fn paren_is_predicate(&self) -> bool {
+        let mut depth = 0usize;
+        for t in &self.toks[self.pos..] {
+            match t {
+                Tok::Op(o) if o == "(" => depth += 1,
+                Tok::Op(o) if o == ")" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return false;
+                    }
+                }
+                Tok::Op(o) if depth == 1 && matches!(o.as_str(), "==" | "!=" | "<=" | ">=" | "<" | ">" | "&&" | "||") => {
+                    return true
+                }
+                _ => {}
             }
         }
         false
@@ -333,13 +384,33 @@ impl<'a> Parser<'a> {
             let inner = self.parse_cmp()?;
             return Ok(smt::not(inner));
         }
-        let left = self.parse_expr()?;
+        // A parenthesized *predicate*, as in `!(a == MIN && b == -1)`. Which
+        // meaning a `(` has is decided by a lookahead to its matching `)`: if a
+        // comparator appears at that level it is a predicate, otherwise it is
+        // arithmetic and `parse_expr` below handles it.
+        if matches!(self.peek(), Some(Tok::Op(o)) if o == "(") && self.paren_is_predicate() {
+            self.pos += 1;
+            let inner = self.parse_or()?;
+            if !self.eat_op(")") {
+                return Err(self.err("missing `)`"));
+            }
+            return Ok(inner);
+        }
+        let (left, ls) = self.parse_expr()?;
         for op in ["==", "!=", "<=", ">=", "<", ">"] {
             if self.eat_op(op) {
-                let right = self.parse_expr()?;
+                let (right, rs) = self.parse_expr()?;
+                // Both sides of a Rust comparison have the same signedness (the
+                // language will not compare an `i8` with a `u8`), so either flag
+                // decides it, and a literal on one side leaves the other to say.
+                let signed = ls || rs;
                 return Ok(match op {
                     "==" => smt::eq(left, right),
                     "!=" => smt::not(smt::eq(left, right)),
+                    "<=" if signed => smt::sle(left, right),
+                    ">=" if signed => smt::sge(left, right),
+                    "<" if signed => smt::slt(left, right),
+                    ">" if signed => smt::sgt(left, right),
                     "<=" => smt::ule(left, right),
                     ">=" => smt::ule(right, left),
                     "<" => smt::ult(left, right),
@@ -351,43 +422,63 @@ impl<'a> Parser<'a> {
         Err(self.err("expected a comparison operator"))
     }
 
-    fn parse_expr(&mut self) -> Result<Var, SpecError> {
-        let mut left = self.parse_term()?;
+    /// An additive expression, plus whether it is *signed*.
+    ///
+    /// The flag is carried alongside the value because a comparison's meaning
+    /// depends on it, and the grammar has no casts or type names to recover it
+    /// later. An expression is signed when any name in it is, which is exact:
+    /// Rust would reject a mixed-sign arithmetic expression.
+    fn parse_expr(&mut self) -> Result<(Var, bool), SpecError> {
+        let (mut left, mut sgn) = self.parse_term()?;
         loop {
-            if self.eat_op("+") {
-                let r = self.parse_term()?;
-                left = smt::add(left, r);
+            let op = if self.eat_op("+") {
+                "+"
             } else if self.eat_op("-") {
-                let r = self.parse_term()?;
-                left = smt::sub(left, r);
+                "-"
             } else if self.eat_op("|") {
-                let r = self.parse_term()?;
-                left = smt::bor(left, r);
+                "|"
             } else if self.eat_op("^") {
-                let r = self.parse_term()?;
-                left = smt::bxor(left, r);
+                "^"
             } else {
-                return Ok(left);
-            }
+                return Ok((left, sgn));
+            };
+            let (r, rs) = self.parse_term()?;
+            left = match op {
+                "+" => smt::add(left, r),
+                "-" => smt::sub(left, r),
+                "|" => smt::bor(left, r),
+                _ => smt::bxor(left, r),
+            };
+            sgn = sgn || rs;
         }
     }
 
-    fn parse_term(&mut self) -> Result<Var, SpecError> {
-        let mut left = self.parse_atom()?;
+    fn parse_term(&mut self) -> Result<(Var, bool), SpecError> {
+        let (mut left, mut sgn) = self.parse_atom()?;
         loop {
-            if self.eat_op("*") {
-                let r = self.parse_atom()?;
-                left = smt::mul(left, r);
+            let op = if self.eat_op("*") {
+                "*"
             } else if self.eat_op("&") {
-                let r = self.parse_atom()?;
-                left = smt::band(left, r);
+                "&"
             } else {
-                return Ok(left);
-            }
+                return Ok((left, sgn));
+            };
+            let (r, rs) = self.parse_atom()?;
+            left = if op == "*" { smt::mul(left, r) } else { smt::band(left, r) };
+            sgn = sgn || rs;
         }
     }
 
-    fn parse_atom(&mut self) -> Result<Var, SpecError> {
+    /// An atom, plus whether it is signed.
+    fn parse_atom(&mut self) -> Result<(Var, bool), SpecError> {
+        // A unary minus is folded into the literal or the name it precedes, so
+        // `-10` and `-a` are both expressible. It is a *value* negation, not a
+        // subtraction, which is what makes `a >= -10` read the way it looks.
+        if self.eat_op("-") {
+            let (v, s) = self.parse_atom()?;
+            let w = smt::bits(v);
+            return Ok((smt::sub(smt::word(0, w), v), s));
+        }
         match self.peek().cloned() {
             Some(Tok::Num(n)) => {
                 self.pos += 1;
@@ -396,35 +487,108 @@ impl<'a> Parser<'a> {
                 // whose literal does not fit that width is refused by the engine
                 // as ill-formed, which surfaces as `Unknown`.
                 let w = self.args.values().chain(self.ret.iter()).map(|v| smt::bits(*v)).max().unwrap_or(64);
-                Ok(smt::word(n, w))
+                Ok((smt::word(n, w), false))
             }
             Some(Tok::Ident(name)) => {
                 self.pos += 1;
                 if name == "ret" || name == "result" {
-                    return self.ret.ok_or_else(|| self.err("`ret` is only meaningful in `ensures`"));
+                    let v = self.ret.ok_or_else(|| self.err("`ret` is only meaningful in `ensures`"))?;
+                    return Ok((v, self.ret_signed));
                 }
                 if name == "true" || name == "false" {
                     return Err(self.err("use a comparison for a boolean contract"));
                 }
-                self.args
+                // `i16::MIN` and friends: the named bound of an integer type,
+                // which is how a contract names the value it must exclude. The
+                // tokenizer splits `::` into two single `:` operators, so both
+                // spellings are recognized.
+                let assoc = if let Some((ty, a)) = name.split_once("::") {
+                    Some((ty.to_string(), a.to_string()))
+                } else if matches!(self.peek(), Some(Tok::Op(o)) if o == ":") {
+                    let mut it = self.toks[self.pos..].iter();
+                    match (it.next(), it.next(), it.next()) {
+                        (Some(Tok::Op(c1)), Some(Tok::Op(c2)), Some(Tok::Ident(a)))
+                            if c1 == ":" && c2 == ":" =>
+                        {
+                            let a = a.clone();
+                            self.pos += 3;
+                            Some((name.clone(), a))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some((ty, a)) = assoc {
+                    if let Some(k) = type_bound(&ty, &a) {
+                        let w = self.args.values().chain(self.ret.iter()).map(|v| smt::bits(*v)).max().unwrap_or(64);
+                        return Ok((smt::word(k, w), ty.starts_with('i')));
+                    }
+                    return Err(self.err(format!("unknown constant `{ty}::{a}`")));
+                }
+                let v = self
+                    .args
                     .get(&name)
                     .copied()
-                    .ok_or_else(|| self.err(format!("unknown name `{name}` (not an argument)")))
+                    .ok_or_else(|| self.err(format!("unknown name `{name}` (not an argument)")))?;
+                let s = self.is_signed_name(&name);
+                Ok((v, s))
             }
             Some(Tok::Op(o)) if o == "(" => {
                 self.pos += 1;
-                let inner = self.parse_or()?;
+                // A parenthesized *arithmetic* expression is fine; only a
+                // parenthesized predicate is refused, and that is caught by the
+                // grammar because `parse_expr` cannot consume `&&`.
+                let (v, s) = self.parse_expr()?;
                 if !self.eat_op(")") {
                     return Err(self.err("missing `)`"));
                 }
-                // A parenthesized *predicate* used as a value is refused; the
-                // grammar has no booleans-as-values, which keeps it decidable.
-                let _ = inner;
-                Err(self.err("a parenthesized boolean cannot be used as a value"))
+                Ok((v, s))
             }
             Some(t) => Err(self.err(format!("unexpected token {t:?}"))),
             None => Err(self.err("unexpected end of contract")),
         }
+    }
+}
+
+/// The argument names whose declared type is signed, for comparison signedness.
+pub fn signed_args(f: &crate::mir::parse::MirFn) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for &l in &f.arg_locals {
+        if f.ty_of(l).map(|t| t.is_signed()).unwrap_or(false) {
+            out.insert(f.name_of(l));
+        }
+    }
+    out
+}
+
+/// `MIN` / `MAX` for an integer type name, as a bit pattern at that type's width.
+///
+/// A contract says `a != i16::MIN`, and the parser has no way to look the value
+/// up except here. Returning `None` for an unknown type keeps an unrecognized
+/// name a refusal rather than a zero.
+fn type_bound(ty: &str, assoc: &str) -> Option<u64> {
+    let signed = ty.starts_with('i');
+    let unsigned = ty.starts_with('u');
+    if !signed && !unsigned {
+        return None;
+    }
+    let bits: u32 = match ty {
+        "i8" | "u8" => 8,
+        "i16" | "u16" => 16,
+        "i32" | "u32" => 32,
+        "i64" | "u64" => 64,
+        "isize" | "usize" => 64,
+        _ => return None,
+    };
+    match assoc {
+        "MAX" if signed => Some((1u64 << (bits - 1)) - 1),
+        "MAX" => Some(if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 }),
+        // `MIN` for a signed type is the most negative value, which as a bit
+        // pattern is the top bit alone.
+        "MIN" if signed => Some(1u64 << (bits - 1)),
+        "MIN" => Some(0),
+        _ => None,
     }
 }
 
