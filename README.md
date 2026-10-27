@@ -94,6 +94,7 @@ obligation. That is what `examples/flight_control.rs` demonstrates.
 | `exhaustive` | Complete proofs by enumeration over `u8`/`u16` |
 | `primitives` | Total integer ops and a refinement-typed `Bounded<MIN, MAX>` |
 | `macros` | `verify!`, `verify_implies!`, `contract!`, `proof!`, `assert_proof!`, `check!`, `verify_exhaustive!` |
+| `mir` (`std` only) | verify **real Rust**: read `rustc`'s own MIR, symbolically execute it, discharge rustc's overflow/underflow/div-by-zero asserts and doc-comment contracts |
 
 ## Verification conditions are generated, not hand-written
 
@@ -1132,6 +1133,133 @@ The discipline is therefore: verify every body against its contract with
 Recursion is not supported — a call graph with a cycle would need an induction
 principle, and that is a different feature.
 
+## Verifying real Rust: the MIR frontend
+
+Everything above has the same shape: you write a formula, or a `wp` program, and
+the engine discharges it. The obligation is a *model* of the code, and a model can
+drift from the code it describes. A human has to keep the two in step, and the
+day they stop agreeing the proof is about the wrong program.
+
+`discharge::mir` removes that step. It reads the **actual MIR** that `rustc`
+lowers a real Rust function to, symbolically executes it, and discharges the
+obligations it finds — the overflow, underflow and divide-by-zero `assert`s that
+`rustc` itself emits, plus the pre- and postconditions you wrote. Nothing is
+re-modelled by hand, so there is nothing to keep in sync.
+
+```console
+$ DISCHARGE_RUSTC=$(rustup which --toolchain nightly rustc) \
+    cargo run --features std --example mir_demo
+=== examples/mir_targets/actuator.rs ===
+clamp            verified (3 obligation(s), 0 panic(s) ruled out)
+rate_limit       verified (5 obligation(s), 0 panic(s) ruled out)
+sat_add          verified (4 obligation(s), 0 panic(s) ruled out)
+sat_sub          verified (1 obligation(s), 0 panic(s) ruled out)
+sat_mul          incomplete (2 reason(s))
+      - unmodelled assert condition: attempt to compute `{} * {}`, which would overflow
+unchecked_add    FAILED: panic: attempt to compute `{} + {}`, which would overflow — v1:u16 = 32768, v2:u16 = 32768
+unchecked_sub    FAILED: panic: attempt to compute `{} - {}`, which would overflow — v1:u16 = 0, v2:u16 = 32768
+unchecked_div    FAILED: panic: attempt to divide `{}` by zero — v2:u32 = 0
+unchecked_mul    FAILED: panic: attempt to compute `{} * {}`, which would overflow — v1:u8 = 128, v2:u8 = 128
+```
+
+`unchecked_add` is `fn unchecked_add(a: u16, b: u16) -> u16 { a + b }` — ordinary
+Rust with no annotations of any kind. The counterexample `32768 + 32768` is read
+off the MIR, and `tests/mir.rs` feeds exactly that pair back into the compiled
+function and requires the panic. That is the property worth having: the witness is
+checked against `rustc`'s own code generator, not against another model.
+
+### Contracts are doc comments, and that is forced
+
+The obvious syntax is an attribute:
+
+```rust,ignore
+#[requires(lo <= hi)]
+pub fn clamp(x: u32, lo: u32, hi: u32) -> u32 { … }
+```
+
+That cannot be done here. An unknown attribute on a function is not Rust; it needs
+a proc-macro to consume it, and a proc-macro is a dependency, which would break the
+zero-dependency gate that `scripts/gate.sh` enforces. So contracts live in doc
+comments, which `rustc` accepts and the frontend reads out of the source:
+
+```rust,ignore
+/// requires: lo <= hi
+/// ensures: lo <= ret
+/// ensures: ret <= hi
+pub fn clamp(x: u32, lo: u32, hi: u32) -> u32 {
+    if x < lo { lo } else if x > hi { hi } else { x }
+}
+```
+
+The scanner is deliberately strict. A `requires:` or `ensures:` that sits before a
+`const`, a `struct` or a module comment is *not* attached to the next function, so
+a misplaced contract is dropped rather than silently applied to the wrong item.
+A contract expression outside the small grammar — a function call, a cast, an
+unknown name — is refused rather than approximated.
+
+### What is read from where, and why
+
+| Part | Source | Reason |
+|---|---|---|
+| the body | `rustc --emit=mir` | the real lowering, including the checks `rustc` inserts |
+| the contract | the source text | MIR carries no attributes or doc comments |
+| the compiler | `DISCHARGE_RUSTC`, else `rustc` | `--emit=mir` needs nightly; naming it separately keeps cargo's `rustc` alone |
+
+### The arithmetic, and one new primitive
+
+MIR makes the checks explicit, so modelling them is most of the work. `a + b`
+lowers to `AddWithOverflow` plus `assert(!(_3.1))`; the same for `SubWithOverflow`
+and `MulWithOverflow`, and `/` comes with a `assert(!(_6))` for a zero divisor. The
+`!` matters: rustc prints the failing polarity, and dropping it inverts every
+check. `tests/mir.rs` and the parser's unit tests pin that.
+
+Modelling overflow exactly needed a widened product, which exposed a fact worth
+writing down: **`smt::truncate` zero-extends when the target is wider.** `a * b`
+at `u16` is computed at 32 bits and tested against `2^16`, so the predicate is
+exact rather than approximate. Division needed something the engine did not have,
+so `smt::divmod` builds a restoring divider out of shifts, subtract, compare and
+select. It is exact — `tests/divmod.rs` checks it against Rust's own `/` and `%`
+at every interesting boundary and proves `(x / y) * y + x % y == x` and
+`x % y < y` symbolically. `y == 0` is given a *defined* value (quotient all ones,
+remainder the dividend) rather than being left as a hole, and rustc's own
+divide-by-zero assert is what turns that case into a reported panic.
+
+### What it declines, and why that is the point
+
+The frontend refuses far more than it accepts, and every refusal is reported:
+
+- **MIR it cannot parse.** An unrecognized statement becomes `Unknown`, which
+  makes the path "not modelled", never "proved".
+- **Widened products past 16 bits.** `sat_mul` at `u16` needs a 32-bit product,
+  which is the BDD scaling wall. The honest answer is `incomplete`.
+- **Variable shift amounts.** See "Substitution must not walk a shift amount"
+  above; a shift by a symbolic amount is not in the vocabulary.
+- **Anything with a `core::` callee other than a plain function.** Intrinsics and
+  trait methods are not modelled.
+- **Aggregates, slices, references.** No pointer model.
+
+`FnOutcome::Incomplete` is not a pass. `FileReport::is_clean` is false whenever any
+path was unmodelled or any contracted function is missing from the MIR, and a
+missing contract is reported rather than quietly turning a function green. This is
+the same discipline as `Verdict::Unknown` in the engine: a bounded checker that
+says "I could not decide" is worth more than one that guesses.
+
+### The known gaps, stated
+
+1. **Calls are inlined one level, non-recursively.** A call to a function in the
+   same file is symbolically executed; a call to anything else is `Unknown`.
+2. **The dump is textual.** The frontend parses `--emit=mir` output rather than
+   linking `rustc-dev`. That keeps the dependency count at zero and makes the
+   input inspectable, but it means a rustc release that changes the pretty-printer
+   can break the parser. It fails closed when that happens.
+3. **Contracts are checked at entry and exit only.** A loop invariant written as a
+   contract is not an invariant; it is an assertion at two points.
+4. **The verifier is not inside the artifact.** `gnatprove` and this crate's own
+   embedded engine are in-process; the MIR frontend shells out to `rustc` and lives
+   behind the `std` feature. The engine it uses is the embedded one, but the
+   frontend that feeds it is a development tool, not something that ships on a
+   microcontroller.
+
 ## What this is *not* — read this before trusting a green test
 
 Honesty matters more than a nice README, so:
@@ -1238,7 +1366,12 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   │                   (also carries Proc + Stmt::Call for modular verification)
 │   ├── smtscript.rs    SMT-LIB2 export for independent checking
 │   ├── mem.rs          bounded symbolic memory + frame condition
-│   └── quant.rs        bounded forall/exists, expanded to finite form
+│   ├── quant.rs        bounded forall/exists, expanded to finite form
+│   └── mir/            the real-Rust frontend (`std` only)
+│       ├── parse.rs    rustc's textual MIR -> a small IR, failing closed
+│       ├── exec.rs     symbolic execution of that IR, with a frame stack for calls
+│       ├── spec.rs     contract scanner + the small contract-expression grammar
+│       └── verify.rs   driver: emit MIR, extract contracts, discharge, report
 ├── tests/
 │   ├── smoke.rs        the engine proves real identities
 │   ├── kernel.rs       the proof kernel, including a compile-fail case
@@ -1250,7 +1383,10 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   ├── quant.rs        fill and scan loops, both verified and executed
 │   ├── call.rs         modular verification, every positive with its control
 │   ├── loopdiff.rs     verifier vs exhaustive execution, loops and claims included
-│   └── modular_differential.rs  generated callers, verified then executed
+│   ├── modular_differential.rs  generated callers, verified then executed
+│   ├── mir.rs          real-Rust verification, with counterexamples replayed
+│   │                   against the compiled functions
+│   └── divmod.rs       the divider the MIR frontend needs, vs Rust's own `/` and `%`
 ├── examples/
 │   ├── flight_control.rs  a realistic actuator path, all obligations discharged
 │   ├── pipeline.rs        program -> conditions -> proofs -> SMT-LIB2
@@ -1264,8 +1400,11 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   │                      (needs `cargo kani`; a development tool, not a dependency)
 │   ├── verusdiff.rs       differential harness: engine vs Verus on a spec fn
 │   │                      (needs the Verus driver; a development tool, not a dependency)
-│   └── support/           the IR the two engine harnesses share, so they check the
-│                          same formulas rather than two drifting corpora
+│   ├── support/           the IR the two engine harnesses share, so they check the
+│   │                      same formulas rather than two drifting corpora
+│   ├── mir_demo.rs        verifies real Rust read from MIR, end to end
+│   └── mir_targets/
+│       └── actuator.rs    the Rust under verification; imports no `discharge`
 └── scripts/
     ├── gate.sh            every gate in one command, failing loudly
     └── test-count.sh      the exact passing-test count, only when all pass

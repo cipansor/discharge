@@ -1799,6 +1799,81 @@ pub fn uge_const(x: Var, k: u64) -> Pred {
         Pred(c.cmp(Op::Ule, kt, x.0))
     })
 }
+/// `x / y` and `x % y`, unsigned, as a *restoring divider* built from the
+/// operators the engine already has.
+///
+/// Division used to be absent from the vocabulary, which meant a frontend reading
+/// real code had to refuse `a / b` -- and the MIR frontend does refuse what it
+/// cannot model. But division is not actually out of reach: a restoring divider
+/// is nothing but shifts by constants, a subtract, a compare and a select, all of
+/// which are here. Building it costs `w` steps and `O(w)` terms, and it is exact,
+/// so a proof that goes through it is a real proof about `a / b`.
+///
+/// Two cases, and the split is what keeps it sound. If `y` has its top bit set
+/// then `x < 2^w <= 2y`, so the quotient is 0 or 1 and the remainder is `x` or
+/// `x - y`. Otherwise `y < 2^(w-1)`, so a running remainder that stays below `y`
+/// can be doubled without losing its top bit -- which is exactly what the
+/// restoring loop needs, and exactly what would break if the wide case were run
+/// through the same loop.
+///
+/// `y == 0` is given a defined result rather than being left as a trap: the
+/// quotient is all ones and the remainder is `x`. That keeps the function total,
+/// which matters because an undefined operation in a verifier is a hole. Callers
+/// that want Rust's panic on division by zero must state `y != 0` -- and the MIR
+/// frontend does, because `rustc` emits that assert for them.
+pub fn divmod(x: Var, y: Var) -> (Var, Var) {
+    let w = bits(x);
+    if w == 1 {
+        // 1-bit: for a nonzero divisor the quotient is `x & y` and the remainder
+        // is `x & !y`. The `y == 0` case still has to go through the same
+        // definition as every other width, or this fast path would disagree with
+        // the general one at exactly the input the contract calls out.
+        let y_zero = eq_const(y, 0);
+        let q = ite(y_zero, all_ones(1), band(x, y));
+        let r = ite(y_zero, x, band(x, bxor(y, all_ones(1))));
+        return (q, r);
+    }
+    let zero = word(0, w);
+    let one = word(1, w);
+    // Does `y` have its top bit set?
+    let top = word(1u64 << (w - 1), w);
+    let y_top_set = not(eq_const(band(y, top), 0));
+    let y_zero = eq_const(y, 0);
+
+    // Wide divisor: quotient is 0 or 1.
+    let ge = ule(y, x);
+    let q_wide = ite(ge, one, zero);
+    let r_wide = ite(ge, sub(x, y), x);
+
+    // Narrow divisor: the restoring loop. The remainder stays below `y`, so
+    // `rem << 1` cannot lose a bit.
+    let mut rem = zero;
+    let mut quot = zero;
+    let mut i = w;
+    while i > 0 {
+        i -= 1;
+        let bit = band(lshr(x, i as u32), one);
+        rem = bor(shl(rem, 1), bit);
+        let enough = ule(y, rem);
+        rem = ite(enough, sub(rem, y), rem);
+        quot = ite(enough, bor(quot, word(1u64 << i, w)), quot);
+    }
+
+    let q = ite(y_zero, all_ones(w), ite(y_top_set, q_wide, quot));
+    let r = ite(y_zero, x, ite(y_top_set, r_wide, rem));
+    (q, r)
+}
+
+/// `x / y`, unsigned. See [`divmod`] for the semantics, including `y == 0`.
+pub fn udiv(x: Var, y: Var) -> Var {
+    divmod(x, y).0
+}
+
+/// `x % y`, unsigned. See [`divmod`] for the semantics, including `y == 0`.
+pub fn urem(x: Var, y: Var) -> Var {
+    divmod(x, y).1
+}
+
 /// `x + y == z`
 pub fn add_eq(x: Var, y: Var, z: Var) -> Pred {
     with_ctx(|c| {

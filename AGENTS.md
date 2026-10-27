@@ -36,10 +36,63 @@ cargo build --no-default-features --target thumbv7em-none-eabihf
 
 # The flagship demo
 cargo run --features std --example flight_control
+
+# The MIR frontend: verify real Rust, reading the MIR rustc lowers it to.
+# `--emit=mir` needs nightly, and the compiler is named separately from RUSTC
+# so that pointing this at a nightly does not disturb the cargo building it.
+DISCHARGE_RUSTC="$(rustup which --toolchain nightly rustc)" \
+  cargo run --features std --example mir_demo
+DISCHARGE_RUSTC="$(rustup which --toolchain nightly rustc)" \
+  cargo test --features std --test mir
 ```
 
 `clippy` was installed with `rustup component add clippy`; the bare-metal target
 with `rustup target add thumbv7em-none-eabihf`.
+
+## Verifying real Rust: the MIR frontend (`src/mir/`)
+
+The rest of the crate proves things about *models*: a formula, or a `wp` program.
+`src/mir/` proves things about the code itself, by reading the MIR that `rustc`
+lowers it to. Five facts about it cost the most time to discover:
+
+1. **A MIR dump carries no attributes and no doc comments.** So contracts cannot
+   come from MIR; they are scanned out of the *source* text, while bodies come
+   from MIR. That split is the design, not a limitation to work around.
+2. **`rustc` prints the failing polarity of its arithmetic asserts:**
+   `assert(!move (_5.1: bool), "attempt to compute ...")`. Dropping the `!`
+   inverts every overflow, underflow and divide-by-zero check, and the tool then
+   reports safe code as broken. The flag is carried through the IR and pinned by
+   a parser unit test.
+3. **A checked binary writes a tuple, and the tuple has no width.** `_3 =
+   AddWithOverflow(a, b)` makes `_3` a `(uN, bool)`. Reading the operand width
+   from `_3` gives 64 for every type, which silently mis-sizes the overflow test.
+   The width comes from `_3.0`.
+4. **`smt::truncate` zero-extends when the target is wider.** That is what makes
+   the multiplication-overflow predicate exact: compute at `2w`, test the top
+   `w` bits against zero.
+5. **The output path matters.** `-o /dev/stdout` makes rustc try to create a temp
+   directory in `/dev` and fail; the MIR goes to a unique temp file. The name must
+   be unique per *call*, not per process, or parallel tests delete each other's
+   files.
+
+Two engine consequences worth remembering:
+
+- **Division is now in the engine** (`smt::divmod`, exact, restoring), because a
+  frontend reading real code meets `a / b` and must not guess. `y == 0` is a
+  *defined* value rather than a hole, and rustc's own divide-by-zero assert is
+  what reports the panic. The 1-bit fast path must honour the same `y == 0`
+  contract or it disagrees with the general path at exactly that input — a test
+  caught this.
+- **Widened products past 16 bits are declined, not approximated.** `sat_mul` at
+  `u16` needs a 32-bit product, which is the BDD wall. A *weaker* overflow
+  predicate would be worse than declining, because it would make an overflowing
+  function look panic-free. So the code returns "no predicate" and the path is
+  reported `incomplete`.
+
+`tests/mir.rs` is the oracle that matters: it feeds each reported counterexample
+back into the *compiled* function and requires the panic. That checks the engine
+against rustc's code generator rather than against another model. `tests/divmod.rs`
+does the same for the divider, against Rust's own `/` and `%`.
 
 ## The imperative layer (`wp.rs`) has three traps
 

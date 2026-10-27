@@ -75,6 +75,8 @@ pub mod exhaustive;
 pub mod logic;
 pub mod macros;
 pub mod mem;
+#[cfg(feature = "std")]
+pub mod mir;
 pub mod primitives;
 pub mod proof;
 pub mod quant;
