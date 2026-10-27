@@ -1631,3 +1631,51 @@ a local run mean the same thing. The other two install Kani (cached) and Verus (
 release) and run `kanidiff` and `verusdiff` as hard gates. `gate.sh`'s Kani and Verus steps
 skip when those tools are absent -- reported, not silent -- because both are large downloads;
 CI is where they become mandatory. Gate count is now 7.
+
+## A fallback engine is only worth its weight if the wall actually moves
+
+`smt.rs` is a BDD engine; when its arena fills, `query_valid`/`query_model` hand the *same*
+term graph to `sat.rs`, a CDCL SAT solver, via `bitblast.rs`. Both engines consume one
+netlist on purpose: two bit-slicers would drift and an adder bug would then be caught in
+only one place.
+
+The point of recording this here is the measurement discipline, because the first version
+of this feature *claimed* to have broken the wall and had not.
+
+1. **An unsound solver reports a "better" result than the truth.** The first SAT engine
+   answered `Valid` on queries the BDD engine could not decide. That looked like the wall
+   breaking. It was a bug: the watch-list arena was one shared array with per-literal
+   *counts* but no per-literal *offsets*, so two literals' watch lists overlapped, unit
+   propagation was missed, and the solver called unsatisfiable formulas satisfiable. The
+   "success" and the unsoundness were the same event. Differential tests against
+   brute-force enumeration (`tests/sat_engine.rs`) are what separated them.
+
+2. **The wall is where `Unknown` appears, and it is printed, not remembered.** After the
+   solver was made sound the wall came back. Run `cargo run --release --features std
+   --example probe` for the table. The honest result: adder equivalence now settles at 64
+   bits (`Unknown` with the fallback disabled, `Valid` with it); wide *multiplier*
+   equivalence is out of reach at both engines' budgets.
+
+3. **Tombstoning is not deletion.** `reduce_db` marked dead learnt clauses with `c_len = 0`
+   but left their ids in the occurrence lists, whose spans were sized for the pre-deletion
+   clause set. `propagate` then walked a stale span and could report a conflict that did not
+   exist. If a clause is removed from a list, remove it from every list that indexes it, or
+   rebuild them.
+
+4. **Learnt clauses that are never freed are a memory leak with a proof-theoretic cost.**
+   The literal arena filled with worthless learnt clauses, so a query the solver could still
+   decide came back `Unknown` for lack of space. `reduce_db` now keeps a set (originals,
+   current reasons, the more active half of the rest) and `compact` re-lays the arena,
+   remapping `reason` and rebuilding the occurrence lists. `SOLVER_BYTES` is
+   `size_of::<Solver>()` for this reason -- the hand-summed version went stale the moment
+   the new fields landed.
+
+5. **An incomplete engine needs a budget, not patience.** `MAX_CONFLICTS` bounds the search;
+   past it the solver returns `Sat::Unknown`. A verifier that hangs is worse than one that
+   declines. The budget is also the honest knob: 20 000 conflicts cannot decide 64-bit
+   adder equivalence, 50 000 can, and `MAX_CONFLICTS` records which side of that line the
+   crate commits to.
+
+The pattern is the one the rest of this file keeps finding: a claim about the engine is
+worth only the command that measures it, and a *better-looking* claim is the first thing to
+suspect.

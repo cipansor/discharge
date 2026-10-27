@@ -70,7 +70,7 @@ They are deliberately different tools, and each has a different honesty profile.
 
 | # | Mechanism | Entry point | Complete? | Can it lie? |
 |---|---|---|---|---|
-| 1 | **Symbolic** — BDD decision procedure | `smt::prove`, `sym::*::prove()` | no (BDD wall) | no — it returns `Unknown` |
+| 1 | **Symbolic** — BDD, then CDCL SAT fallback | `smt::prove`, `sym::*::prove()` | no (scaling wall) | no — it returns `Unknown` |
 | 2 | **Exhaustive** — every input of a real `fn` | `exhaustive::for_all_u8/u16` | yes, small domains | no |
 | 3 | **Type-level** — Curry–Howard kernel | `proof::Certificate`, `assert_proof!` | yes, for composition | no — it will not compile |
 
@@ -1161,14 +1161,26 @@ Honesty matters more than a nice README, so:
    calling it `Total`. This is the call-shaped twin of the unreachable-`Assume` and
    unreachable-precondition findings; see "A call to a procedure that never returns is not
    a proof either".
-2. **The BDD engine hits a wall, and says so.** Boolean *equality of two wide
-   multipliers* is the classic blow-up: `(a*b)*c == a*(b*c)` at 12 bits returns
-   `Unknown`, and the test suite asserts exactly that. This is why `Unknown` is a
-   first-class verdict: the engine refuses to guess.
-3. **It is not a CDCL SAT solver.** BDDs are canonical and give free
-   equivalence checking, but a modern SAT/SMT solver will beat them on many
-   industrial formulas. The trade made here is *no external process, no
-   allocator, deterministic memory* in exchange for weaker scaling.
+2. **There is a scaling wall, and the engine says so.** Boolean *equality of two
+   wide multipliers* is the classic blow-up: `(a*b)*c == a*(b*c)` at 12 bits
+   returns `Unknown`, and the test suite asserts exactly that. This is why
+   `Unknown` is a first-class verdict: the engine refuses to guess. The wall is
+   not removed, only pushed out.
+3. **Two engines, one netlist.** BDDs are canonical and give equivalence
+   checking for free, but they blow up on multipliers. When the BDD arena fills,
+   the *same* bit-level circuit is handed to a CDCL SAT solver (`sat.rs`,
+   `bitblast.rs`) that has no canonical-form wall. Both engines consume one
+   netlist on purpose: two separate bit-slicers would drift, and an adder bug
+   would then be caught in only one place.
+   The SAT engine is exact but not fast, so it runs under a conflict budget and
+   answers `Unknown` when it expires — a verifier that hangs is worse than one
+   that declines. The gain is real but specific: `add_comm` at 64 bits is
+   `Unknown` from the BDD engine alone and `Valid` with the fallback
+   (`examples/probe.rs` prints the table). Multiplication equality stays out of
+   reach at both engines' budgets; that is the honest state.
+   The trade made here is still *no external process, no allocator,
+   deterministic memory*. The SAT arena is a `static` in BSS, sized at compile
+   time, and a capacity overrun yields `Unknown`, never a wrong verdict.
 4. **`no_std` uses a single static arena**, so the symbolic engine is not
    re-entrant across interrupt contexts. Wrap queries in a critical section, or
    use one context per core. This is documented at the definition site.
@@ -1204,6 +1216,8 @@ discharge/
 ├── src/
 │   ├── lib.rs          crate root: module map, prelude, the three proof routes
 │   ├── smt.rs          the decision procedure (the heart of the crate)
+│   ├── bitblast.rs     bit-level circuit -> CNF, shared by both engines
+│   ├── sat.rs          CDCL SAT solver: the fallback when the BDD arena fills
 │   ├── sym.rs          symbolic DSL via operator overloading
 │   ├── logic.rs        verified arithmetic + Q16.16 fixed point
 │   ├── proof.rs        Curry–Howard kernel + certificates
@@ -1222,6 +1236,7 @@ discharge/
 │   ├── kernel.rs       the proof kernel, including a compile-fail case
 │   ├── sym.rs          the DSL operators, each against the primitive it wraps
 │   ├── differential.rs symbolic prover vs brute-force execution
+│   ├── sat_engine.rs   the SAT solver vs brute force on raw CNFs
 │   ├── wp.rs           generated conditions checked against execution
 │   ├── mem.rs          memory proofs checked against real Rust arrays
 │   ├── quant.rs        fill and scan loops, both verified and executed
@@ -1332,7 +1347,10 @@ lesson that keeps recurring: when a harness disagrees, suspect the harness first
 The engine's `Unknown` on `mul_comm` (an 8×8 multiplier) is the documented size wall, not a
 disagreement: both backends prove the identity, so the engine is incomplete there, which the
 harnesses count separately (`undecided_identity=1`) and do not fail on. A *refuted* identity
-is a soundness failure and does fail the run.
+is a soundness failure and does fail the run. Note that the SAT fallback also tries this
+identity and also declines it, which is the intended outcome: the fallback moves the wall, it
+does not remove it, and an incomplete-but-honest answer is what keeps the differential
+harness meaningful.
 
 The `differential` test is the one that makes the approach trustworthy: for a
 family of predicates it checks that the symbolic prover and brute-force

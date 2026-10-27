@@ -286,6 +286,15 @@ pub(crate) struct Ctx {
     var_width: [u8; MAX_VARS],
     n_vars: usize,
     overflow: bool,
+    /// Set when a variable index past `MAX_VARS` was requested.
+    ///
+    /// `overflow` alone is not enough to decide whether to fall back to the SAT engine.
+    /// Every place that sets `overflow` is either a BDD arena that filled -- a scale
+    /// problem the SAT engine can solve -- or this one, a modelling mistake (asking for
+    /// variable #257). In the latter case `var_term` returns the term sentinel, and blasting
+    /// the sentinel is *stale*, so a fallback would report `Unsat` for a query that is
+    /// really malformed. This flag lets the fallback refuse instead.
+    var_overflow: bool,
     ready: bool,
 
     // ---- substitution support (weakest-precondition generation) ----
@@ -358,6 +367,7 @@ impl Ctx {
             var_width: [0; MAX_VARS],
             n_vars: 0,
             overflow: false,
+            var_overflow: false,
             ready: false,
             subst_val: [NO_SUBST; MAX_VARS],
             subst_memo: [0; CAP],
@@ -380,6 +390,7 @@ impl Ctx {
         self.n_nodes = 2;
         self.n_vars = 0;
         self.overflow = false;
+        self.var_overflow = false;
         self.ready = false;
         for i in 0..CAP {
             self.term_key[i] = u64::MAX;
@@ -686,9 +697,66 @@ impl Ctx {
         (n.a as u64) | ((n.hi as u64) << 32)
     }
 
+    // ---- read-only accessors, for the SAT bit-blaster --------------------
+    //
+    // The SAT blaster lives in `crate::bitblast` and walks the same term arena. It is a
+    // separate module rather than a method because it needs `&mut Cnf` at the same time,
+    // and these accessors are what let it read terms without a second `&mut self`.
+    // `note_if_stale`/`mark_stale` are called explicitly by the blaster so the stale
+    // bookkeeping stays identical to the BDD path.
+
+    /// Whether `t` carries a stale generation stamp.
+    pub(crate) fn is_stale(&self, t: Term) -> bool {
+        self.stale || self.term_gen[t.0 as usize] != self.generation
+    }
+
+    /// Poison the traversal, exactly as `blast` does on a stale touch.
+    pub(crate) fn mark_stale(&mut self) {
+        self.stale = true;
+    }
+
+    /// Read a term node without the stale check; the caller has already done it.
+    pub(crate) fn peek(&self, t: Term) -> Node {
+        self.terms[t.0 as usize]
+    }
+
+    /// The constant payload of a `Const` term, without the stale check.
+    pub(crate) fn const_of(&self, t: Term) -> u64 {
+        let n = self.terms[t.0 as usize];
+        (n.a as u64) | ((n.hi as u64) << 32)
+    }
+
+    /// Build a counterexample from a SAT model. Mirrors `model`'s truncation accounting so
+    /// `Cex::is_complete` means the same thing on both paths.
+    pub(crate) fn cex_from_sat(&self, val: impl Fn(u32) -> Option<bool>) -> Cex {
+        let mut cex = Cex { assignments: [(0, 0, 0); MAX_CEX], n: 0, total: 0 };
+        for idx in 0..self.n_vars {
+            let w = self.var_width[idx];
+            let mut bits = 0u64;
+            let mut touched = false;
+            for bit in 0..w as u32 {
+                if let Some(b) = val(idx as u32 * 64 + bit) {
+                    touched = true;
+                    if b {
+                        bits |= 1u64 << bit;
+                    }
+                }
+            }
+            if touched {
+                cex.total += 1;
+                if (cex.n as usize) < MAX_CEX {
+                    cex.assignments[cex.n as usize] = (idx as u32, w, bits);
+                    cex.n += 1;
+                }
+            }
+        }
+        cex
+    }
+
     fn var_term(&mut self, idx: u32, width: u8) -> Term {
         if idx as usize >= MAX_VARS {
             self.overflow = true;
+            self.var_overflow = true;
             return Term(0);
         }
         // A variable is identified by its *index*, and the blaster keys its BDD variables
@@ -1229,25 +1297,82 @@ impl Ctx {
 
     fn query_valid(&mut self, t: Term) -> Verdict {
         let node = self.blast_bool(t);
-        if self.overflow || self.stale || self.ill_formed {
+        if self.stale || self.ill_formed || self.var_overflow {
             return Verdict::Unknown;
         }
-        match node {
-            TRUE => Verdict::Valid,
-            FALSE => Verdict::Unsat,
-            _ => Verdict::Counterexample(self.model(node, true)),
+        if !self.overflow {
+            return match node {
+                TRUE => Verdict::Valid,
+                FALSE => Verdict::Unsat,
+                _ => Verdict::Counterexample(self.model(node, true)),
+            };
         }
+        // The BDD arena filled, so the diagram is a truncated approximation and cannot be
+        // trusted for *either* verdict. The term graph itself is intact, so hand the same
+        // query to the SAT engine, which does not have a canonical-form wall.
+        self.query_valid_sat(t)
     }
 
     fn query_model(&mut self, t: Term) -> Verdict {
         let node = self.blast_bool(t);
-        if self.overflow || self.stale || self.ill_formed {
+        if self.stale || self.ill_formed || self.var_overflow {
             return Verdict::Unknown;
         }
-        match node {
-            TRUE => Verdict::Valid,
-            FALSE => Verdict::Unsat,
-            _ => Verdict::Counterexample(self.model(node, false)),
+        if !self.overflow {
+            return match node {
+                TRUE => Verdict::Valid,
+                FALSE => Verdict::Unsat,
+                _ => Verdict::Counterexample(self.model(node, false)),
+            };
+        }
+        self.query_model_sat(t)
+    }
+
+    /// `prove` via the SAT engine: the query is valid iff `!t` is unsatisfiable.
+    ///
+    /// Falls back to `Unknown` when the encoding itself overflows a capacity, because a
+    /// truncated encoding proves nothing -- reporting `Valid` from one would be exactly the
+    /// lie the BDD engine refuses to tell.
+    fn query_valid_sat(&mut self, t: Term) -> Verdict {
+        let mut enc_overflow = false;
+        let (sat, model) = crate::sat::query(|cnf| {
+            let mut bits = [cnf.false_lit(); crate::bitblast::MAX_BITS];
+            crate::bitblast::blast(self, cnf, t, &mut bits);
+            enc_overflow = cnf.overflowed();
+            if enc_overflow {
+                return cnf.true_lit();
+            }
+            bits[0].not()
+        });
+        if enc_overflow {
+            return Verdict::Unknown;
+        }
+        match sat {
+            crate::sat::Sat::Sat => Verdict::Counterexample(self.cex_from_sat(|i| model.bit(i))),
+            crate::sat::Sat::Unsat => Verdict::Valid,
+            crate::sat::Sat::Unknown => Verdict::Unknown,
+        }
+    }
+
+    /// `find_model` via the SAT engine: satisfiable iff `t` is satisfiable.
+    fn query_model_sat(&mut self, t: Term) -> Verdict {
+        let mut enc_overflow = false;
+        let (sat, model) = crate::sat::query(|cnf| {
+            let mut bits = [cnf.false_lit(); crate::bitblast::MAX_BITS];
+            crate::bitblast::blast(self, cnf, t, &mut bits);
+            enc_overflow = cnf.overflowed();
+            if enc_overflow {
+                return cnf.true_lit();
+            }
+            bits[0]
+        });
+        if enc_overflow {
+            return Verdict::Unknown;
+        }
+        match sat {
+            crate::sat::Sat::Sat => Verdict::Counterexample(self.cex_from_sat(|i| model.bit(i))),
+            crate::sat::Sat::Unsat => Verdict::Unsat,
+            crate::sat::Sat::Unknown => Verdict::Unknown,
         }
     }
 }

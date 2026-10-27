@@ -16,7 +16,9 @@
 //!
 //! | Module | What it gives you |
 //! |---|---|
-//! | [`smt`] | The decision procedure. `no_std`, zero dependencies, fixed-size arena. |
+//! | [`smt`] | The decision procedure: BDDs, with a CDCL SAT fallback past the BDD wall. `no_std`, zero dependencies, fixed-size arena. |
+//! | [`bitblast`] | The bit-level netlist -> CNF lowering both engines share. |
+//! | [`sat`] | The CDCL SAT solver used as the fallback. |
 //! | [`sym`] | A symbolic DSL: `(x + y).eq(y + x).prove()`. |
 //! | [`logic`] | Verified arithmetic and Q16.16 fixed point, with proofs attached. |
 //! | [`mod@proof`] | A Curry–Howard proof kernel plus composable certificates. |
@@ -67,6 +69,7 @@
 //! assert!(proved);
 //! ```
 
+pub mod bitblast;
 pub mod contract;
 pub mod exhaustive;
 pub mod logic;
@@ -75,6 +78,7 @@ pub mod mem;
 pub mod primitives;
 pub mod proof;
 pub mod quant;
+pub mod sat;
 pub mod smt;
 pub mod smtscript;
 pub mod sym;
