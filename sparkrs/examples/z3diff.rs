@@ -125,7 +125,7 @@ fn main() {
         std::process::exit(2);
     }
     let mut r = Lcg(0x51ed_2701_9ab3_c4f7);
-    let (mut agree, mut mismatch, mut parse_err, mut oracle_err, mut refused) = (0u32, 0u32, 0u32, 0u32, 0u32);
+    let (mut agree, mut mismatch, mut parse_err, mut oracle_err, mut refused, mut undecided) = (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
     let cases: u32 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(800);
     let total: u32 = cases;
     for _ in 0..cases {
@@ -153,8 +153,18 @@ fn main() {
         // `Unknown` on our side is never a disagreement: the engine is allowed to be
         // conservative, and z3 deciding either way is a stronger result, not a conflict.
         // Only a *definite* verdict that z3 contradicts is a soundness mismatch.
+        //
+        // This branch is a *well-formed* export (it carries `(check-sat)`) that the engine
+        // declined to decide, so the harness could have asked z3 and does not. It is counted
+        // as `undecided`, not `agree`: `agree` must mean z3 returned a verdict consistent
+        // with ours, and z3 is never consulted here. (The `refused` branch above is
+        // different in kind: the export has no `(check-sat)` at all, so there is no query to
+        // send, and it already has its own counter.) Keeping the two apart makes a non-zero
+        // `undecided` visible as "the engine gave up on queries z3 could have checked",
+        // instead of quietly inflating the agreement count. At the sizes the README quotes
+        // this is 0.
         if ours == Verdict::Unknown {
-            agree += 1;
+            undecided += 1;
             continue;
         }
         let tautology = ours.is_proved();
@@ -188,8 +198,8 @@ fn main() {
         }
     }
     println!(
-        "total={} agree={} mismatch={} parse_err={} oracle_err={} refused={}",
-        total, agree, mismatch, parse_err, oracle_err, refused
+        "total={} agree={} mismatch={} parse_err={} oracle_err={} refused={} undecided={}",
+        total, agree, mismatch, parse_err, oracle_err, refused, undecided
     );
     // A mismatch is a soundness disagreement and must fail the run. A parse error means we
     // printed a query z3 will not load, which is the exporter bug the harness exists to

@@ -363,9 +363,13 @@ one-bit connectives as `and`/`or`/`xor`/`not`; `Bits` prints comparisons as
 predicates over 1-, 2-, 3-, 4-, 8- and 12-bit variables, with arithmetic, bitwise ops, shifts
 (including over-shifts), `truncate` in both directions, and `ite`; asks the engine; exports the
 same predicate; and asks z3. Measured with the current harness: 800 predicates — 0 parse errors,
-0 disagreements, 29 refused; 3000 predicates — 0 parse errors, 0 disagreements, 108 refused.
+0 disagreements, 29 refused, 0 undecided; 3000 predicates — 0 parse errors, 0 disagreements,
+108 refused, 0 undecided.
 "Refused" means the engine answered `Unknown` (typically a mixed-width term) and the exporter
-declined to write a query for it, so there is nothing for z3 to contradict. With the width-based
+declined to write a query for it, so there is nothing for z3 to contradict. "Undecided" is the
+other way an `Unknown` can arise: the export *is* well formed, but the engine gave no verdict, so
+z3 is never asked. It is counted separately rather than folded into the agreement count, because a
+case z3 never saw is not a case z3 agreed with; it is 0 at both sizes. With the width-based
 printing rule restored the same harness gets 21 of 800 rejected outright by z3 as ill-sorted. The
 harness needs `z3-solver` installed; it is a development tool and the crate itself still has no
 dependencies.

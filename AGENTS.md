@@ -1348,3 +1348,25 @@ Both were made real doctests (the count went 8 passed + 2 ignored -> 10 passed +
 and the gate's test count 247 -> 249). When you write ```` ```ignore ````, ask which
 mechanism would notice if the code stopped being true. If the answer is "none", it is not a
 doc example, it is prose in a code block.
+
+## A bucket named "agreement" that z3 was never asked to fill
+
+`examples/z3diff.rs` counted three things as agreement: z3 said the same thing, our engine
+declined to decide (`Unknown`) on a *well-formed* export, and both sides declined on an
+ill-formed one. The first is real agreement. The third has its own counter already and is
+different in kind: the export carries no `(check-sat)`, so there is no query to send. The
+second is the one that was mislabelled: the export was well formed and z3 was never
+invoked, so the case reached one party, not two. Folding it into `agree` means the summary
+reports agreement for cases the oracle never saw.
+
+Measured before changing anything: the bucket was 0 at both 800 and 3000 predicates, so the
+quoted numbers were not wrong -- they were only *accidentally* right, on the strength of the
+generator happening never to emit a well-formed-but-undecided case. The defect is that
+nothing distinguished "z3 agreed" from "z3 was not asked"; the correct count depended on a
+property of the input distribution rather than on the code.
+
+Split into a separate `undecided` counter, reported in the summary line, with the reasoning
+in the comment. The README's measured line now carries it too. This is the same class as the
+rest of the crate's findings: a summary that can outrun the run it summarizes. When you
+write `agree += 1`, name the two things that agreed; if one of them was never asked, it is
+not agreement.
