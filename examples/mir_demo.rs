@@ -35,13 +35,18 @@ pub enum Expect {
 }
 
 /// The expectations, stated as data so the demo and the test suite share them.
-pub fn expectations() -> [(&'static str, Expect); 10] {
+pub fn expectations() -> [(&'static str, Expect); 13] {
     use Expect::*;
     [
         ("clamp", Verified),
         ("rate_limit", Verified),
         ("sat_add", Verified),
         ("sat_sub", Verified),
+        ("shift_const", Verified),
+        // The guard is the caller's here, and rustc's own `assert(n < 16)` still
+        // reports `n == 16` as a panic, so this must fail.
+        ("shift_left", Failed),
+        ("sat_shift", Verified),
         // The widened product is past the wall; declining is correct here.
         ("sat_mul", Incomplete),
         ("unchecked_add", Failed),

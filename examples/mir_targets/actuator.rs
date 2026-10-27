@@ -85,6 +85,32 @@ pub fn sat_sub(a: u16, b: u16) -> u16 {
     }
 }
 
+/// A *variable* shift with no guard of its own. rustc emits `assert(n < 16)`
+/// before the shift, so `n == 16` is a real panic and must be reported; the
+/// barrel shifter models the shift itself. This is the case that shows the
+/// amount is now *modelled* rather than refused, while the panic is still found.
+/// requires: true
+pub fn shift_left(x: u16, n: u16) -> u16 {
+    x << n
+}
+
+/// A shift by a constant. No guard is needed because the amount is in range, so
+/// this proves on the cheap `Op::Shl` path.
+/// requires: true
+pub fn shift_const(x: u16) -> u16 {
+    x << 3
+}
+
+/// A saturating variable shift, guarded the way real code guards one.
+/// requires: true
+pub fn sat_shift(x: u16, n: u16) -> u16 {
+    if n >= 16 {
+        0
+    } else {
+        x << n
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Must fail: these are the bugs the frontend exists to find.
 // ---------------------------------------------------------------------------

@@ -666,17 +666,22 @@ fn parse_bb_ref(s: &str) -> Option<usize> {
 fn parse_rvalue(s: &str) -> Rvalue {
     let t = s.trim();
     // A call is handled by the caller (it is a terminator).
+    //
+    // The cast check has to come *before* the `const ` check, because rustc prints
+    // a cast constant as `const 3_i32 as u32 (IntToInt)`. Matching `const ` first
+    // hands the whole string to `parse_const`, which reads `i32 as u32 (IntToInt)`
+    // as a type name and produces a constant with no width -- an `Unknown` that
+    // then makes every guard written against it unmodelled.
+    if let Some(i) = t.find(" as ") {
+        let (src, dst) = (t[..i].trim(), t[i + 4..].trim());
+        let ty_text = dst.split_whitespace().next().unwrap_or(dst);
+        return Rvalue::Cast(parse_operand(src), Ty::parse(ty_text));
+    }
     if let Some(rest) = t.strip_prefix("const ") {
         return Rvalue::Use(Operand::Const(parse_const(rest)));
     }
     if t.starts_with("copy ") || t.starts_with("move ") {
         return Rvalue::Use(parse_operand(t));
-    }
-    // `cast`: `_1 as usize (IntToInt)`
-    if let Some(i) = t.find(" as ") {
-        let (src, dst) = (t[..i].trim(), t[i + 4..].trim());
-        let ty_text = dst.split_whitespace().next().unwrap_or(dst);
-        return Rvalue::Cast(parse_operand(src), Ty::parse(ty_text));
     }
     // `&_1`, `&mut _1`
     if let Some(r) = t.strip_prefix("&mut ").or_else(|| t.strip_prefix('&')) {

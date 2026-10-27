@@ -1154,12 +1154,16 @@ clamp            verified (3 obligation(s), 0 panic(s) ruled out)
 rate_limit       verified (5 obligation(s), 0 panic(s) ruled out)
 sat_add          verified (4 obligation(s), 0 panic(s) ruled out)
 sat_sub          verified (1 obligation(s), 0 panic(s) ruled out)
+shift_const      verified (1 obligation(s), 0 panic(s) ruled out)
+shift_left       FAILED: panic: attempt to shift left by `{}`, which would overflow — v2:u16 = 16
+sat_shift        verified (1 obligation(s), 0 panic(s) ruled out)
 sat_mul          incomplete (2 reason(s))
       - unmodelled assert condition: attempt to compute `{} * {}`, which would overflow
 unchecked_add    FAILED: panic: attempt to compute `{} + {}`, which would overflow — v1:u16 = 32768, v2:u16 = 32768
 unchecked_sub    FAILED: panic: attempt to compute `{} - {}`, which would overflow — v1:u16 = 0, v2:u16 = 32768
 unchecked_div    FAILED: panic: attempt to divide `{}` by zero — v2:u32 = 0
 unchecked_mul    FAILED: panic: attempt to compute `{} * {}`, which would overflow — v1:u8 = 128, v2:u8 = 128
+off_by_one_guard FAILED: postcondition — v1:u16 = 32768, v2:u16 = 32768
 ```
 
 `unchecked_add` is `fn unchecked_add(a: u16, b: u16) -> u16 { a + b }` — ordinary
@@ -1224,6 +1228,28 @@ at every interesting boundary and proves `(x / y) * y + x % y == x` and
 remainder the dividend) rather than being left as a hole, and rustc's own
 divide-by-zero assert is what turns that case into a reported panic.
 
+A *variable* shift amount needed two things that turned out to be one. The engine
+gained `smt::shift_var`, a barrel shifter of `log2(w)` conditional stages, so
+`x << n` is now in the vocabulary rather than refused. But the frontend also had to
+start *assuming* an assert it had already checked: `Term::Assert` pushed the
+fall-through block with the incoming path unchanged, so `assert(n < 16)` was proved
+(a panic is reported when `n == 16`) and then discarded, and every obligation after
+it was discharged as if `n` could still be 16. That is sound — the guard is checked
+separately — but it is needlessly weak, and it is wrong for a guard the *caller*
+wrote. The fall-through path now carries `satisfied`, which is what lets `sat_shift`
+prove and what makes the modelled shift meaningful.
+
+The shift is only half of it. rustc prints a cast constant as
+`const 3_i32 as u32 (IntToInt)`, and `parse_rvalue` matched the `const ` prefix
+*before* the ` as ` form, so the whole string went to `parse_const`, which read
+`i32 as u32 (IntToInt)` as a type name and produced a constant with no width. Every
+guard written against such a constant — `x << 3`, and the `assert(n < 16)` for a
+`u16` shift — was then unmodelled, which is why a plain constant shift used to come
+back `incomplete`. Checking the cast first fixes both. `tests/shift.rs` checks the
+barrel shifter against Rust's own `<<` and `>>` at the interesting amounts, proves
+it agrees with the constant path symbolically, and requires that a variable shift is
+*not* the identity so a shifter that returned its input cannot pass.
+
 ### What it declines, and why that is the point
 
 The frontend refuses far more than it accepts, and every refusal is reported:
@@ -1232,8 +1258,6 @@ The frontend refuses far more than it accepts, and every refusal is reported:
   makes the path "not modelled", never "proved".
 - **Widened products past 16 bits.** `sat_mul` at `u16` needs a 32-bit product,
   which is the BDD scaling wall. The honest answer is `incomplete`.
-- **Variable shift amounts.** See "Substitution must not walk a shift amount"
-  above; a shift by a symbolic amount is not in the vocabulary.
 - **Anything with a `core::` callee other than a plain function.** Intrinsics and
   trait methods are not modelled.
 - **Aggregates, slices, references.** No pointer model.

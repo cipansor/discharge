@@ -1895,6 +1895,25 @@ pub fn mul_eq(x: Var, y: Var, z: Var) -> Pred {
         Pred(c.cmp(Op::Eq, s, z.0))
     })
 }
+/// The constant value of `v`, when `v` is a literal.
+///
+/// `None` for anything else. The MIR frontend uses this to keep a shift by a
+/// *constant* amount on the cheap `Op::Shl` path instead of paying for a barrel
+/// shifter; both paths agree, but only one of them is free. Gated on `std` because
+/// the frontend that calls it is: without it this is dead code, and the bare-metal
+/// gate builds with warnings denied.
+#[cfg(feature = "std")]
+pub(crate) fn const_of(v: Var) -> Option<u64> {
+    with_ctx(|c| {
+        let n = c.node_of(v.0);
+        if n.op == Op::Const {
+            Some(c.const_value(v.0))
+        } else {
+            None
+        }
+    })
+}
+
 /// `x + y` as a word.
 pub fn add(x: Var, y: Var) -> Var {
     with_ctx(|c| Var(c.bin_word(Op::Add, x.0, y.0)))
@@ -1931,8 +1950,79 @@ pub fn lshr(x: Var, k: u32) -> Var {
 pub fn ashr(x: Var, k: u32) -> Var {
     with_ctx(|c| Var(c.shift(Op::Shr, x.0, k)))
 }
-/// `x` re-typed to `width` bits: low bits kept, high bits zero-filled or dropped.
+
+/// Which shift `x << n` / `x >> n` with a *variable* amount means.
 ///
+/// `Shr` is arithmetic for a signed operand and logical for an unsigned one, and
+/// the bit pattern does not say which, so the caller states it rather than the
+/// engine guessing. The constant-amount functions above are the same three
+/// operations at a fixed amount.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Shift {
+    /// `x << n`. Zero fill from the low end.
+    Left,
+    /// `x >> n` on an unsigned value. Zero fill from the high end.
+    LogicalRight,
+    /// `x >> n` on a signed value. The sign bit is replicated.
+    ArithmeticRight,
+}
+
+/// `x << n`, `x >> n` (logical) or `x >> n` (arithmetic) with a *symbolic* amount.
+///
+/// A barrel shifter: `log2(w)` stages of select, each conditionally shifting by one
+/// power of two, driven by one bit of `n`. `u16` costs 4 stages, `u64` costs 6, and
+/// the cost is linear in the width rather than quadratic, which is what keeps it
+/// inside the BDD arena where a `w`-bit multiplier is not.
+///
+/// # The out-of-range amount
+///
+/// `n >= w` has a *defined* result here — zero for [`Shift::Left`] and
+/// [`Shift::LogicalRight`], sign fill for [`Shift::ArithmeticRight`] — rather than
+/// being left unknown. That is the same choice [`divmod`] makes for `y == 0`, and
+/// for the same reason: rustc guards a variable shift with `assert(n < w)`, so a
+/// path that reaches the shift out of range has already been reported as a panic,
+/// and a value left unknown here would refuse every function that shifts by a
+/// variable rather than by a literal.
+pub fn shift_var(op: Shift, x: Var, n: Var) -> Var {
+    with_ctx(|c| {
+        let w = c.width_of(x.0);
+        let hop = match op {
+            Shift::Left => Op::Shl,
+            Shift::LogicalRight => Op::LShr,
+            Shift::ArithmeticRight => Op::Shr,
+        };
+        let mut acc = x;
+        let mut i = 0u32;
+        while (1u32 << i) < w as u32 {
+            let amt = 1u32 << i;
+            // Bit `i` of `n`, as `(n & 2^i) == 2^i`. Testing the masked value
+            // against the mask avoids needing a bit-extraction primitive.
+            let mask = c.konst(amt as u64, w);
+            let masked = c.bin_word(Op::And, n.0, mask);
+            let bit = c.cmp(Op::Eq, masked, mask);
+            let shifted = c.shift(hop, acc.0, amt);
+            acc = Var(c.mk_term(Node { op: Op::Ite, a: bit.0, b: shifted.0, c: acc.0.0, width: w, hi: 0 }));
+            i += 1;
+        }
+        // The stages above only read the low `ceil(log2(w))` bits of `n`, so an
+        // amount at or above the width -- which sets a higher bit that no stage
+        // covers -- would otherwise come out as the identity. Select the defined
+        // out-of-range value explicitly. Without this, `x << 4` at 4 bits returns
+        // `x`, which is neither the documented value nor anything Rust does;
+        // `tests/shift.rs` pins it.
+        let wt = c.konst(w as u64, w);
+        let in_range = c.cmp(Op::Ult, n.0, wt);
+        let oor = match op {
+            // An arithmetic shift by `w - 1` replicates the sign bit across the
+            // whole word, which is exactly the sign fill.
+            Shift::ArithmeticRight => c.shift(Op::Shr, x.0, (w - 1) as u32),
+            _ => c.konst(0, w),
+        };
+        Var(c.mk_term(Node { op: Op::Ite, a: in_range.0, b: acc.0.0, c: oor.0, width: w, hi: 0 }))
+    })
+}
+
+/// `x` re-typed to `width` bits: low bits kept, high bits zero-filled or dropped.
 /// The one operation in the language that changes a width. It is what makes an
 /// index wider than its address space expressible, which a loop over addresses
 /// needs: see [`crate::mem::Mem::addr_of`].

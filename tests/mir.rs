@@ -51,6 +51,9 @@ fn verify_all() -> Option<verify::FileReport> {
         "rate_limit",
         "sat_add",
         "sat_sub",
+        "shift_const",
+        "shift_left",
+        "sat_shift",
         "sat_mul",
         "unchecked_add",
         "unchecked_sub",
@@ -171,7 +174,17 @@ fn refuses_a_contract_it_cannot_read() {
 #[test]
 fn guarded_functions_verify() {
     let Some(report) = verify_all() else { return };
-    for name in ["clamp", "rate_limit", "sat_add", "sat_sub"] {
+    for name in [
+        "clamp",
+        "rate_limit",
+        "sat_add",
+        "sat_sub",
+        // The three shift shapes: a constant amount, a guarded variable amount,
+        // and an unguarded variable amount (which rustc's own `assert(n < 16)`
+        // rejects, so it belongs with the refuted functions rather than here).
+        "shift_const",
+        "sat_shift",
+    ] {
         let o = outcome(&report, name);
         assert!(
             o.is_verified(),
@@ -184,7 +197,13 @@ fn guarded_functions_verify() {
 #[test]
 fn unchecked_functions_are_refuted() {
     let Some(report) = verify_all() else { return };
-    for name in ["unchecked_add", "unchecked_sub", "unchecked_div", "unchecked_mul"] {
+    for name in [
+        "unchecked_add",
+        "unchecked_sub",
+        "unchecked_div",
+        "unchecked_mul",
+        "shift_left",
+    ] {
         let o = outcome(&report, name);
         assert!(
             matches!(o, FnOutcome::Failed { .. }),
@@ -206,7 +225,15 @@ fn counterexamples_really_panic() {
     std::panic::set_hook(Box::new(|_| {}));
     let mut checked = 0;
     let mut failures: Vec<String> = Vec::new();
-    for name in ["unchecked_add", "unchecked_sub", "unchecked_div", "unchecked_mul"] {
+    for name in [
+        "unchecked_add",
+        "unchecked_sub",
+        "unchecked_div",
+        "unchecked_mul",
+        // The variable shift is modelled now, so its counterexample is a real
+        // one: `n == 16` is exactly what rustc's own `assert(n < 16)` rejects.
+        "shift_left",
+    ] {
         let o = outcome(&report, name);
         let FnOutcome::Failed { detail, .. } = o else {
             continue;
@@ -226,6 +253,7 @@ fn counterexamples_really_panic() {
             "unchecked_sub" => std::panic::catch_unwind(|| unchecked_sub(a as u16, b as u16)).is_err(),
             "unchecked_div" => std::panic::catch_unwind(|| unchecked_div(a as u32, b as u32)).is_err(),
             "unchecked_mul" => std::panic::catch_unwind(|| unchecked_mul(a as u8, b as u8)).is_err(),
+            "shift_left" => std::panic::catch_unwind(|| shift_left(a as u16, b as u16)).is_err(),
             _ => unreachable!(),
         };
         if !panicked {

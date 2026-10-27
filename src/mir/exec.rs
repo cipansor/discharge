@@ -420,7 +420,17 @@ where
                 kind: ObligationKind::Panic { message: msg.clone() },
                 verdict: smt::find_model(bad),
             });
-            work.push(State { block: *target, ..st });
+            // An assert that did *not* fire is an assumption, and the fall-through
+            // path has to carry it. Without this the guard is discarded, which is
+            // merely *imprecise* when the guard is what keeps the code safe, but
+            // still wrong: `x << n` is only meaningful under `n < w`, and a caller
+            // that writes the guard itself expects it to be assumed here too.
+            // Sound because the guard is proved separately above: a path where it
+            // fails is reported as a panic, and assuming it on this path cannot
+            // hide one. Both asserts and `debug_assert`s are lowered to this
+            // terminator, so the guard is assumed for either.
+            let path = smt::and(st.path, satisfied);
+            work.push(State { block: *target, path, ..st });
         }
         Term::SwitchInt { discr, cases, otherwise } => {
             let d = operand(&st.env, discr);
@@ -555,7 +565,10 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
         }
         Rvalue::Binary(op, a, b) => {
             let (x, y) = (operand(env, a), operand(env, b));
-            eval_binary(*op, x, y, dest_w)
+            // The signedness of the *left* operand decides what `Shr` means; the
+            // amount's type is irrelevant and rustc keeps it a distinct `u32`.
+            let signed = operand_is_signed(f, a);
+            eval_binary(*op, x, y, dest_w, signed)
         }
         Rvalue::CheckedBinary(op, a, b) => {
             // The tuple is `(result, overflowed)`. Field 0 gets the wrapped
@@ -569,7 +582,7 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
                 .unwrap_or(64);
             let x = operand(env, a);
             let y = operand(env, b);
-            let res = eval_binary(*op, x, y, Some(w));
+            let res = eval_binary(*op, x, y, Some(w), operand_is_signed(f, a));
             env.set(&Place { local: dest.local, proj: vec![Proj::Field(0)] }, res);
             match overflow_pred(*op, x, y, w) {
                 Some(p) => {
@@ -636,8 +649,34 @@ fn width_of(f: &MirFn, p: &Place) -> Option<u8> {
     }
 }
 
+/// Whether the operand's declared type is a signed integer.
+///
+/// `Shr` is arithmetic for a signed operand and logical for an unsigned one, and
+/// the bit pattern alone does not say which. Guessing would be a wrong answer for
+/// every signed shift, so the type is read rather than assumed.
+fn operand_is_signed(f: &MirFn, o: &Operand) -> bool {
+    match o {
+        Operand::Copy(p) | Operand::Move(p) => {
+            f.ty_of(p.local).map(Ty::is_signed).unwrap_or(false)
+        }
+        Operand::Const(_) => false,
+    }
+}
+
+/// Which of the engine's three shifts a MIR `Shl`/`Shr` means.
+///
+/// The operand's signedness decides what `Shr` means, and the engine needs it
+/// stated rather than guessed, so it is read from the type.
+fn shift_kind(op: BinOp, signed: bool) -> smt::Shift {
+    match (op, signed) {
+        (BinOp::Shl, _) => smt::Shift::Left,
+        (_, true) => smt::Shift::ArithmeticRight,
+        (_, false) => smt::Shift::LogicalRight,
+    }
+}
+
 /// Apply a binary operator, respecting the destination width.
-fn eval_binary(op: BinOp, a: Val, b: Val, width: Option<u8>) -> Val {
+fn eval_binary(op: BinOp, a: Val, b: Val, width: Option<u8>, signed: bool) -> Val {
     match op {
         BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
             let (x, y) = match (a, b) {
@@ -682,10 +721,30 @@ fn eval_binary(op: BinOp, a: Val, b: Val, width: Option<u8>) -> Val {
                 // a reported panic, so the pair is consistent.
                 BinOp::Div => smt::udiv(x, y),
                 BinOp::Rem => smt::urem(x, y),
-                // A *variable* shift amount is still not in the engine's
-                // vocabulary (see "Substitution must not walk a shift amount"
-                // in the README), so shifts are refused rather than guessed at.
-                BinOp::Shl | BinOp::Shr => return Val::Unknown,
+                // A *variable* shift amount is a barrel shifter (see
+                // `smt::shift_var`). rustc guards it with `assert(n < w)`
+                // immediately before, so the amount is in range on every path that
+                // reaches here. A constant amount keeps the cheap `Op::Shl` path,
+                // which is also what makes `x << 3` prove without any guard at all.
+                BinOp::Shl | BinOp::Shr => {
+                    let Some(w) = width else { return Val::Unknown };
+                    match smt::const_of(y) {
+                        // rustc's guard says `k < w`; a constant outside that range
+                        // is a compile error, so this is defensive only.
+                        Some(k) if k < w as u64 => {
+                            let v = match shift_kind(op, signed) {
+                                smt::Shift::Left => smt::shl(x, k as u32),
+                                smt::Shift::LogicalRight => smt::lshr(x, k as u32),
+                                smt::Shift::ArithmeticRight => smt::ashr(x, k as u32),
+                            };
+                            return Val::Sym(v);
+                        }
+                        Some(_) => return Val::Unknown,
+                        None => {
+                            return Val::Sym(smt::shift_var(shift_kind(op, signed), x, y));
+                        }
+                    }
+                }
                 _ => return Val::Unknown,
             })
         }
