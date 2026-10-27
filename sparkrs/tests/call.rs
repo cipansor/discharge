@@ -1229,3 +1229,79 @@ fn a_call_to_a_proc_that_merely_returns_nothing_is_still_total() {
         );
     });
 }
+
+#[test]
+fn an_over_cap_callee_body_makes_the_frame_check_refuse() {
+    // `frame` must reject a callee whose *derived* frame is incomplete, before it even
+    // looks at the declared frame. `writes` records at most `MAX_WRITES` variables and
+    // flags the rest off, so a body writing more than that is unmodelled: the derived
+    // frame is only a prefix, and "declared covers the derived frame" cannot be checked
+    // against a prefix. A caller that declares exactly the 16 recorded writes would
+    // otherwise pass every remaining check while the callee silently overwrites the 17th.
+    smt::with_fresh(|| {
+        let big: Vec<Var> = (0..17).map(|_| var(8)).collect();
+        let binds: Vec<(Var, Var)> = big.iter().map(|v| (*v, smt::word(0, 8))).collect();
+        let body = Stmt::AssignMany { binds: &binds };
+        let proc_ = Proc {
+            name: "big",
+            requires: smt::truth(true),
+            ensures: smt::truth(true),
+            body: &body,
+        };
+        let derived = wp::writes(&body);
+        assert_eq!(derived.len(), MAX_WRITES, "the frame fills to the cap");
+        assert!(!derived.complete(), "17 writes must be flagged incomplete");
+
+        // A declaration naming exactly the recorded prefix, with an image for each.
+        let caller: Vec<Var> = (0..MAX_WRITES).map(|_| var(8)).collect();
+        let actuals: Vec<(Var, Var)> = big[..MAX_WRITES]
+            .iter()
+            .zip(caller.iter())
+            .map(|(g, l)| (*g, *l))
+            .collect();
+        let declared = &big[..MAX_WRITES];
+        assert!(
+            !Stmt::frame(&proc_, &actuals, declared),
+            "an incomplete derived frame must be refused, not checked against its prefix"
+        );
+    });
+}
+
+#[test]
+fn a_call_to_an_over_cap_callee_makes_the_caller_frame_incomplete() {
+    // `collect_written` must propagate the callee's incompleteness upward. A caller whose
+    // body merely *calls* a callee with more than `MAX_WRITES` writes has an incomplete
+    // frame too, even though it directly writes one variable. Without the propagation the
+    // caller's frame looks complete, and the enclosing frame check would accept a
+    // declaration covering only the recorded prefix -- the same hole, one level up.
+    smt::with_fresh(|| {
+        let big: Vec<Var> = (0..17).map(|_| var(8)).collect();
+        let binds: Vec<(Var, Var)> = big.iter().map(|v| (*v, smt::word(0, 8))).collect();
+        let big_body = Stmt::AssignMany { binds: &binds };
+        let big_proc = Proc {
+            name: "big",
+            requires: smt::truth(true),
+            ensures: smt::truth(true),
+            body: &big_body,
+        };
+        assert!(!wp::writes(&big_body).complete());
+
+        // The call names one of the callee's recorded globals, so its image is recorded
+        // -- but the frame is still incomplete, because the callee writes more than the
+        // cap and `collect_written` propagated that.
+        let l = var(8);
+        let actuals = [(big[0], l)];
+        let writes = [big[0]];
+        let call = Stmt::Call {
+            proc_: &big_proc,
+            actuals: &actuals,
+            writes: &writes,
+        };
+        let frame = wp::writes(&call);
+        assert_eq!(frame.len(), 1, "the named image is recorded");
+        assert!(
+            !frame.complete(),
+            "a call to an over-cap callee must make the caller's frame incomplete"
+        );
+    });
+}

@@ -1608,3 +1608,50 @@ fn a_nested_loop_that_leaves_the_measure_alone_still_proves() {
         );
     });
 }
+
+#[test]
+fn an_over_cap_nested_loop_havocs_the_measure_instead_of_leaving_it_alone() {
+    // `writes` records at most `MAX_WRITES` variables and flags the frame *incomplete*
+    // beyond that. The nested-loop arm of `variant_after` must read an incomplete frame as
+    // "the effect is unknown" and havoc the measure -- not fall through to substituting the
+    // recorded prefix, which for a measure *outside* that prefix is a no-op. The no-op is
+    // the old soundness hole: a nested loop whose body can write the measure would look
+    // like it leaves the measure alone, so `V' < V` would be discharged from `V < V`.
+    // The verdict is refuted under both readings here, so only the returned *term*
+    // distinguishes them -- which is exactly what this pins, and why it has to assert on
+    // the term rather than on `is_proved`.
+    smt::with_fresh(|| {
+        let vars: Vec<Var> = (0..20).map(|_| var(4)).collect();
+        let binds: Vec<(Var, Var)> = vars.iter().map(|v| (*v, smt::word(0, 4))).collect();
+        let body = Stmt::AssignMany { binds: &binds };
+        let frame = wp::writes(&body);
+        assert_eq!(frame.len(), 16, "the frame must fill to the cap");
+        assert!(!frame.complete(), "20 writes must be flagged incomplete");
+
+        let nested = Stmt::While {
+            cond: smt::ult_const(vars[18], 100),
+            invariant: smt::truth(true),
+            variant: None,
+            body: &body,
+        };
+        // A measure the truncated frame never recorded. Substituting the prefix leaves it
+        // untouched; the honest answer is a fresh, unconstrained value.
+        let beyond = vars[18];
+        let after = wp::variant_after(&nested, beyond);
+        assert_ne!(
+            after, beyond,
+            "an incomplete frame must havoc the measure, not leave it unchanged"
+        );
+        // And that havoc really does defeat the termination obligation.
+        let ob = wp::termination_obligation(
+            smt::ult_const(beyond, 100),
+            smt::truth(true),
+            beyond,
+            &nested,
+        );
+        assert!(
+            !ob.discharge().is_proved(),
+            "a measure that the nested body may write must not yield a termination proof"
+        );
+    });
+}

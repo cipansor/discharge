@@ -1505,3 +1505,38 @@ in the output" is not "the operator was checked". When a decision is sat/unsat, 
 inputs are the degenerate ones -- tautologies and contradictions -- not the generic ones. If you
 want to know whether a check has teeth, mutate the thing it is supposed to check and confirm it
 fails; if it does not, the sample was decorative.
+
+## Completeness guards that nothing exercised
+
+`wp::writes` derives a statement's write set into a fixed `Frame` of `MAX_WRITES = 16`
+variables and sets `complete = false` when a body writes more. Five places consult that flag,
+and the crate's own comments assert each is load-bearing -- the one in `variant_after` even
+documents the divergence it prevents. Mutation testing said otherwise: blanking two of the five
+guards to `if false` left the whole suite green.
+
+1. `Stmt::frame` returns `false` for an incomplete *derived* frame. Its doc says
+   `under_declaring_the_frame_is_rejected` covers this. It does not: that test builds a
+   2-write body, so the frame is complete and the guard never runs; the test exercises the
+   *declared-covers-derived* check, a different guard two lines down. A body writing 17
+   variables is where the completeness guard is the only thing standing -- without it,
+   "declared covers derived" is checked against a 16-entry prefix and a caller who declares
+   those 16 passes while the callee overwrites the 17th.
+
+2. `collect_written`'s `Call` arm propagates the callee's incompleteness upward. A caller that
+   merely *calls* an over-cap callee directly writes one variable, so its own frame looks
+   complete without the propagation, and the enclosing check accepts a prefix again -- the same
+   hole one level up.
+
+Both are now pinned by tests that fail when the guard is removed: build a 17-write body, check
+the derived frame is `len() == 16 && !complete()`, and assert `frame` refuses / the caller's
+frame is incomplete. The verdict the *program* gets is refuted either way, so the test has to
+assert on the guard's own observable -- `complete()`, or the refusal -- not on a proof failing.
+That is the same lesson as the z3 identity corpus: a guard is only tested if the test observes
+the thing the guard controls, and "this program does not verify" can be true for several
+reasons at once. When a comment claims a named test covers a branch, read the test and check it
+reaches the branch; here the comment was aspirational.
+
+Method note: I found these by mutating each `if !…complete()` to `if false` and running the
+suite, not by reading. Reading confirms a guard is *present*; only mutation shows it is
+*load-bearing*. Both surviving mutants sat behind comments claiming coverage, which is exactly
+where reading is least reliable.
