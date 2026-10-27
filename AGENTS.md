@@ -75,7 +75,7 @@ lowers it to. Five facts about it cost the most time to discover:
    be unique per *call*, not per process, or parallel tests delete each other's
    files.
 
-Two engine consequences worth remembering:
+Three engine consequences worth remembering:
 
 - **Division is now in the engine** (`smt::divmod`, exact, restoring), because a
   frontend reading real code meets `a / b` and must not guess. `y == 0` is a
@@ -83,6 +83,11 @@ Two engine consequences worth remembering:
   what reports the panic. The 1-bit fast path must honour the same `y == 0`
   contract or it disagrees with the general path at exactly that input — a test
   caught this.
+- **A variable shift is a barrel shifter** (`smt::shift_var`), `log2(w)`
+  conditional stages. It is linear in the width, so it fits where a `w`-bit
+  multiplier does not. An out-of-range amount has a defined value (zero, or sign
+  fill for an arithmetic right shift), matching the shift-count-masking choice the
+  differential oracle already pins.
 - **Widened products past 16 bits are declined, not approximated.** `sat_mul` at
   `u16` needs a 32-bit product, which is the BDD wall. A *weaker* overflow
   predicate would be worse than declining, because it would make an overflowing
@@ -96,10 +101,31 @@ Two engine consequences worth remembering:
   fills. The threshold is a time guard, and 16 is where it sits. If you raise it,
   time the demo rather than trusting the fallback's existence.
 
+Three traps that cost time here, all in the frontend rather than the engine:
+
+- **`Term::Assert` must assume the guard it just checked on the fall-through
+  path.** It used to push the success block with the incoming path unchanged, so
+  `assert(n < 16)` was proved and then *discarded*: later obligations were
+  discharged as if `n` could still be 16. That is sound — the guard is checked
+  separately, so no panic is hidden — but it is needlessly weak, and wrong for a
+  guard the *caller* wrote. Carrying `satisfied` is what lets `sat_shift` verify.
+  If a function that clearly cannot panic comes back `failed` or `incomplete`,
+  check whether an assert guard was assumed before blaming the engine.
+- **The parser must check ` as ` before `const `.** rustc prints a cast constant
+  as `const 3_i32 as u32 (IntToInt)`; matching the `const ` prefix first hands the
+  whole string to `parse_const`, which reads `i32 as u32 (IntToInt)` as a type
+  name and yields a constant with *no width*. Every guard written against such a
+  constant then goes unmodelled. This is why even `x << 3` used to be `incomplete`.
+- **The cast's target width is the destination's, not the source's.** `Rvalue::Cast`
+  takes the width from the `as T` type; the operand keeps its own width. A shift
+  amount is a `u32` even for a `u16` shift, and rustc keeps it distinct, so the
+  width used to build the shift is the *left* operand's.
+
 `tests/mir.rs` is the oracle that matters: it feeds each reported counterexample
 back into the *compiled* function and requires the panic. That checks the engine
 against rustc's code generator rather than against another model. `tests/divmod.rs`
-does the same for the divider, against Rust's own `/` and `%`.
+does the same for the divider, against Rust's own `/` and `%`; `tests/shift.rs`
+does it for the barrel shifter, against Rust's own `<<` and `>>`.
 
 ## The imperative layer (`wp.rs`) has three traps
 
