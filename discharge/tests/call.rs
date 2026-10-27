@@ -7,8 +7,8 @@
 //! respected. A modular verifier that only ever says yes would be worthless, so
 //! every positive test here has a matching negative one.
 
-use sparkrs::smt::{self, var, Var, Verdict};
-use sparkrs::wp::{self, Proc, Rule, Stmt, MAX_CALL_ARGS, MAX_WRITES};
+use discharge::smt::{self, var, Var, Verdict};
+use discharge::wp::{self, Proc, Rule, Stmt, MAX_CALL_ARGS, MAX_WRITES};
 
 /// `double`: requires `x <= 100`, ensures `r == x + x`.
 ///

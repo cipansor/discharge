@@ -11,9 +11,9 @@
 //! mean no input falsifies the contract, and a refutation must come with a witness that
 //! really does falsify it.
 
-use sparkrs::prelude::*;
-use sparkrs::smt::{self, var};
-use sparkrs::wp::{verify, Established, Stmt};
+use discharge::prelude::*;
+use discharge::smt::{self, var};
+use discharge::wp::{verify, Established, Stmt};
 
 struct Lcg(u64);
 impl Lcg {

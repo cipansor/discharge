@@ -6,10 +6,10 @@
 //! property is a lemma, it is proved for all inputs; where it is a program, the
 //! program is verified and then executed on concrete data.
 
-use sparkrs::mem::{declare, Mem, MAX_CELLS};
-use sparkrs::prelude::*;
-use sparkrs::smt::{self, var, Verdict};
-use sparkrs::wp::{self, Stmt};
+use discharge::mem::{declare, Mem, MAX_CELLS};
+use discharge::prelude::*;
+use discharge::smt::{self, var, Verdict};
+use discharge::wp::{self, Stmt};
 
 /// A 4-cell, 8-bit memory over a caller-owned buffer.
 fn mem4<'a>(buf: &'a mut [Var; 4]) -> Mem<'a> {

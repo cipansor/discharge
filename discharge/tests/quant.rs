@@ -10,10 +10,10 @@
 //! Every loop is also executed on a real array, so the verified property is
 //! compared against what the code actually does.
 
-use sparkrs::mem::{declare, Mem, MAX_CELLS};
-use sparkrs::quant;
-use sparkrs::smt::{self, var, Var, Verdict};
-use sparkrs::wp::{self, Stmt};
+use discharge::mem::{declare, Mem, MAX_CELLS};
+use discharge::quant;
+use discharge::smt::{self, var, Var, Verdict};
+use discharge::wp::{self, Stmt};
 
 /// A 4-cell, 8-bit memory over a caller-owned buffer.
 fn mem4<'a>(buf: &'a mut [Var; 4]) -> Mem<'a> {

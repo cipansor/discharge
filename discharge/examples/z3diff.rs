@@ -2,8 +2,8 @@
 //
 // Generates random predicates over small bit-vectors, asks the engine, exports the SAME
 // predicate as SMT-LIB2, and asks z3. The two verdicts must agree whenever both decide.
-use sparkrs::smt::{self, Pred, Var, Verdict};
-use sparkrs::smtscript::Query;
+use discharge::smt::{self, Pred, Var, Verdict};
+use discharge::smtscript::Query;
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 

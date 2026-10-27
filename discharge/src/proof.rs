@@ -29,8 +29,8 @@
 //! for its proof is a *compile* error rather than a runtime failure:
 //!
 //! ```compile_fail
-//! use sparkrs::proof::Falsity;
-//! use sparkrs::assert_proof;
+//! use discharge::proof::Falsity;
+//! use discharge::assert_proof;
 //! assert_proof!(Falsity);
 //! ```
 //!
@@ -39,8 +39,8 @@
 //! when `P` and `Q` are, so `Truth => Falsity` must not compile:
 //!
 //! ```compile_fail
-//! use sparkrs::assert_proof;
-//! use sparkrs::proof::{Falsity, Imp, Truth};
+//! use discharge::assert_proof;
+//! use discharge::proof::{Falsity, Imp, Truth};
 //! assert_proof!(Imp<Truth, Falsity>);
 //! ```
 //!
@@ -52,8 +52,8 @@
 //! # A proposition that is proved by the compiler
 //!
 //! ```
-//! use sparkrs::assert_proof;
-//! use sparkrs::proof::{And, Equals, Imp, Truth};
+//! use discharge::assert_proof;
+//! use discharge::proof::{And, Equals, Imp, Truth};
 //! assert_proof!(Truth);
 //! assert_proof!(And<Truth, Imp<Truth, Truth>>);
 //! assert_proof!(Equals<u8, u8>);

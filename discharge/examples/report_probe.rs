@@ -10,9 +10,9 @@
 //
 // Obligations now record the arena generation, and `discharge` returns Unknown when the
 // arena has moved on.
-use sparkrs::prelude::*;
-use sparkrs::smt;
-use sparkrs::wp::{verify, Stmt};
+use discharge::prelude::*;
+use discharge::smt;
+use discharge::wp::{verify, Stmt};
 
 fn main() {
     let report = smt::with_fresh(|| {

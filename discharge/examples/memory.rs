@@ -6,9 +6,9 @@
 //!
 //! Run with: `cargo run --features std --example memory`
 
-use sparkrs::mem::{declare, Mem, MAX_CELLS};
-use sparkrs::smt::{self, var, Verdict};
-use sparkrs::wp::{self, Stmt};
+use discharge::mem::{declare, Mem, MAX_CELLS};
+use discharge::smt::{self, var, Verdict};
+use discharge::wp::{self, Stmt};
 
 fn main() {
     println!("=== a bounded memory: 4 cells of 8 bits ===\n");

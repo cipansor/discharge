@@ -5,10 +5,10 @@
 //! deliberately shaped to feel like language constructs:
 //!
 //! ```
-//! use sparkrs::prelude::*;
-//! use sparkrs::sym::*;
+//! use discharge::prelude::*;
+//! use discharge::sym::*;
 //!
-//! sparkrs::smt::with_fresh(|| {
+//! discharge::smt::with_fresh(|| {
 //!     let x = var(8);
 //!     // `verify!` discharges the predicate or fails loudly with the verdict.
 //!     verify!(x.le_val(255));               // ∀ x:u8. x <= 255
@@ -32,7 +32,7 @@ macro_rules! verify {
         let verdict = $crate::smt::prove($p);
         assert!(
             verdict.is_proved(),
-            "sparkrs: verification obligation failed: {}",
+            "discharge: verification obligation failed: {}",
             verdict
         );
         verdict
@@ -46,7 +46,7 @@ macro_rules! verify_implies {
         let verdict = $crate::smt::prove_implies($pre, $post);
         assert!(
             verdict.is_proved(),
-            "sparkrs: implication failed: {}",
+            "discharge: implication failed: {}",
             verdict
         );
         verdict
@@ -56,8 +56,8 @@ macro_rules! verify_implies {
 /// State a contract with SPARK-like syntax and discharge it.
 ///
 /// ```
-/// use sparkrs::prelude::*;
-/// sparkrs::smt::with_fresh(|| {
+/// use discharge::prelude::*;
+/// discharge::smt::with_fresh(|| {
 ///     let x = var(8);
 ///     let verdict = contract! {
 ///         requires x.lt_val(16),
@@ -83,7 +83,7 @@ macro_rules! proof {
         match $crate::proof::Certificate::discharge($p) {
             ::core::option::Option::Some(c) => c,
             ::core::option::Option::None => {
-                panic!("sparkrs: could not prove the stated proposition")
+                panic!("discharge: could not prove the stated proposition")
             }
         }
     }};
@@ -94,8 +94,8 @@ macro_rules! proof {
 #[macro_export]
 macro_rules! assert_proof {
     ($p:ty) => {{
-        fn _sparkrs_assert_proof<T: $crate::proof::Theorem>() {}
-        _sparkrs_assert_proof::<$p>();
+        fn _discharge_assert_proof<T: $crate::proof::Theorem>() {}
+        _discharge_assert_proof::<$p>();
     }};
 }
 
@@ -112,8 +112,8 @@ macro_rules! check {
 /// counterexample if the property does not hold.
 ///
 /// ```
-/// use sparkrs::prelude::*;
-/// use sparkrs::sym::*;
+/// use discharge::prelude::*;
+/// use discharge::sym::*;
 /// // ∀ a b:u8. (a + b) wraps  <=>  result < a
 /// verify_exhaustive!(a: u8, b: u8 => (a as u16 + b as u16 > 255) == (a.wrapping_add(b) < a));
 /// ```
@@ -131,7 +131,7 @@ macro_rules! verify_exhaustive {
     ($a:ident : u8, $b:ident : u8 => $prop:expr $(,)?) => {{
         match $crate::exhaustive::find_violation_u8_2(|$a, $b| $prop) {
             ::core::option::Option::Some((a, b)) => panic!(
-                "sparkrs: exhaustive verification failed: counterexample {} = {}, {} = {}",
+                "discharge: exhaustive verification failed: counterexample {} = {}, {} = {}",
                 ::core::stringify!($a),
                 a,
                 ::core::stringify!($b),
@@ -143,7 +143,7 @@ macro_rules! verify_exhaustive {
     ($a:ident : u8 => $prop:expr $(,)?) => {{
         match $crate::exhaustive::find_violation_u8(|$a| $prop) {
             ::core::option::Option::Some(a) => panic!(
-                "sparkrs: exhaustive verification failed: counterexample {} = {}",
+                "discharge: exhaustive verification failed: counterexample {} = {}",
                 ::core::stringify!($a),
                 a
             ),
@@ -153,7 +153,7 @@ macro_rules! verify_exhaustive {
     ($a:ident : u16 => $prop:expr $(,)?) => {{
         match $crate::exhaustive::find_violation_u16(|$a| $prop) {
             ::core::option::Option::Some(a) => panic!(
-                "sparkrs: exhaustive verification failed: counterexample {} = {}",
+                "discharge: exhaustive verification failed: counterexample {} = {}",
                 ::core::stringify!($a),
                 a
             ),

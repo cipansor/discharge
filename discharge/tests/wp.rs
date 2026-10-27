@@ -6,9 +6,9 @@
 //! 2. the *rules* are attributed correctly, so a failure points at the right
 //!    clause instead of just reporting `false`.
 
-use sparkrs::prelude::*;
-use sparkrs::smt::{self, var, Verdict};
-use sparkrs::wp::{self, find_counterexample_by_enumeration, verify, Established, Rule, Stmt};
+use discharge::prelude::*;
+use discharge::smt::{self, var, Verdict};
+use discharge::wp::{self, find_counterexample_by_enumeration, verify, Established, Rule, Stmt};
 
 /// A clamp, the canonical safety-critical shape: `y := min(max(x, lo), hi)`.
 /// Written with nested `if`s so the verifier has to consider both branches.

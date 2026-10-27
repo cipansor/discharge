@@ -1,9 +1,9 @@
 [package]
-name = "sparkrs"
+name = "discharge"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-description = "In-code formal verification for Rust: embedded bit-blasting SMT decision procedure, symbolic DSL, contracts and a machine-checked proof kernel. SPARK-like safety, no_std, zero dependencies."
+description = "In-code formal verification for Rust: an embedded bit-blasting SMT decision procedure, a symbolic DSL, contracts and a machine-checked proof kernel. SPARK-inspired, no_std, zero dependencies."
 license = "MIT OR Apache-2.0"
 keywords = ["formal-verification", "smt", "no_std", "safety-critical", "contracts"]
 categories = ["no-std", "embedded", "development-tools::testing"]

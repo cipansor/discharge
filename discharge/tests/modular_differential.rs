@@ -30,8 +30,8 @@
 //! A generator cannot invent the *shape* of a mistake it was not told about, so each
 //! family is biased towards a shape that had already gone wrong.
 
-use sparkrs::smt::{self, var, Var};
-use sparkrs::wp::{self, Proc, Stmt};
+use discharge::smt::{self, var, Var};
+use discharge::wp::{self, Proc, Stmt};
 
 // ---------------------------------------------------------------------------
 // A tiny deterministic generator, so a failure can be re-run.
@@ -1036,7 +1036,7 @@ fn eval_post(post: Post, a: usize, m: [u8; 4]) -> bool {
 fn build_mem_program(
     ops: &[Op],
     a: Var,
-    m: &sparkrs::mem::Mem<'_>,
+    m: &discharge::mem::Mem<'_>,
 ) -> &'static Stmt<'static> {
     fn binds_of(b: &[(Var, Var)]) -> &'static [(Var, Var)] {
         Box::leak(b.to_vec().into_boxed_slice())
@@ -1046,14 +1046,14 @@ fn build_mem_program(
     for op in ops {
         match *op {
             Op::StoreConst { addr, val } => {
-                let mut b = [(Var::SENTINEL, Var::SENTINEL); sparkrs::mem::MAX_CELLS];
+                let mut b = [(Var::SENTINEL, Var::SENTINEL); discharge::mem::MAX_CELLS];
                 let n = m.store_binds(const_addr(addr), smt::word(val as u64, 8), &mut b);
                 stmts.push(Box::leak(Box::new(Stmt::AssignMany {
                     binds: binds_of(&b[..n]),
                 })));
             }
             Op::StoreCopy { dst, src } => {
-                let mut b = [(Var::SENTINEL, Var::SENTINEL); sparkrs::mem::MAX_CELLS];
+                let mut b = [(Var::SENTINEL, Var::SENTINEL); discharge::mem::MAX_CELLS];
                 let n = m.store_binds(const_addr(dst), m.read_const(src), &mut b);
                 stmts.push(Box::leak(Box::new(Stmt::AssignMany {
                     binds: binds_of(&b[..n]),
@@ -1065,19 +1065,19 @@ fn build_mem_program(
                     var: t,
                     expr: m.read_const(x),
                 })));
-                let mut b = [(Var::SENTINEL, Var::SENTINEL); sparkrs::mem::MAX_CELLS];
+                let mut b = [(Var::SENTINEL, Var::SENTINEL); discharge::mem::MAX_CELLS];
                 let n = m.store_binds(const_addr(x), m.read_const(y), &mut b);
                 stmts.push(Box::leak(Box::new(Stmt::AssignMany {
                     binds: binds_of(&b[..n]),
                 })));
-                let mut b = [(Var::SENTINEL, Var::SENTINEL); sparkrs::mem::MAX_CELLS];
+                let mut b = [(Var::SENTINEL, Var::SENTINEL); discharge::mem::MAX_CELLS];
                 let n = m.store_binds(const_addr(y), t, &mut b);
                 stmts.push(Box::leak(Box::new(Stmt::AssignMany {
                     binds: binds_of(&b[..n]),
                 })));
             }
             Op::StoreAtSymbolic { src } => {
-                let mut b = [(Var::SENTINEL, Var::SENTINEL); sparkrs::mem::MAX_CELLS];
+                let mut b = [(Var::SENTINEL, Var::SENTINEL); discharge::mem::MAX_CELLS];
                 let n = m.store_binds(a, m.read_const(src), &mut b);
                 stmts.push(Box::leak(Box::new(Stmt::AssignMany {
                     binds: binds_of(&b[..n]),
@@ -1149,8 +1149,8 @@ fn a_memory_proof_never_outruns_the_array() {
 
         let verdict = smt::with_fresh(|| {
             let mut buf = [Var::SENTINEL; 4];
-            let n = sparkrs::mem::declare(2, 8, &mut buf);
-            let m = sparkrs::mem::Mem::new(&buf[..n], 8);
+            let n = discharge::mem::declare(2, 8, &mut buf);
+            let m = discharge::mem::Mem::new(&buf[..n], 8);
             let a = var(2);
             // The quantifier bound needs a width that can hold `len`, which is one more
             // than the address width; see `Mem::check_addr_width`.
@@ -1238,8 +1238,8 @@ fn the_memory_family_has_teeth() {
 
     let verdict = smt::with_fresh(|| {
         let mut buf = [Var::SENTINEL; 4];
-        let n = sparkrs::mem::declare(2, 8, &mut buf);
-        let m = sparkrs::mem::Mem::new(&buf[..n], 8);
+        let n = discharge::mem::declare(2, 8, &mut buf);
+        let m = discharge::mem::Mem::new(&buf[..n], 8);
 
         // The broken rule: every cell becomes `val`, the address is ignored.
         let binds: &'static [(Var, Var)] = Box::leak(
@@ -1344,11 +1344,11 @@ fn pos_seq(stmts: Vec<&'static Stmt<'static>>) -> &'static Stmt<'static> {
 }
 
 fn pos_store(
-    m: &sparkrs::mem::Mem<'_>,
+    m: &discharge::mem::Mem<'_>,
     addr: Var,
     val: Var,
 ) -> &'static Stmt<'static> {
-    let mut b = [(Var::SENTINEL, Var::SENTINEL); sparkrs::mem::MAX_CELLS];
+    let mut b = [(Var::SENTINEL, Var::SENTINEL); discharge::mem::MAX_CELLS];
     let n = m.store_binds(addr, val, &mut b);
     let binds: &'static [(Var, Var)] = Box::leak(b[..n].to_vec().into_boxed_slice());
     Box::leak(Box::new(Stmt::AssignMany { binds }))
@@ -1363,7 +1363,7 @@ fn pos_assign(v: Var, e: Var) -> &'static Stmt<'static> {
 /// one, for the teeth check.
 fn build_pos(
     p: Pos,
-    m: &sparkrs::mem::Mem<'_>,
+    m: &discharge::mem::Mem<'_>,
     a: Var,
     bound: Var,
     mutate: bool,
@@ -1501,8 +1501,8 @@ fn memory_programs_that_should_verify_do_verify() {
 
         let verdict = smt::with_fresh(|| {
             let mut buf = [Var::SENTINEL; 4];
-            let n = sparkrs::mem::declare(2, 8, &mut buf);
-            let m = sparkrs::mem::Mem::new(&buf[..n], 8);
+            let n = discharge::mem::declare(2, 8, &mut buf);
+            let m = discharge::mem::Mem::new(&buf[..n], 8);
             let a = var(2);
             let bound = var(3);
             let (pre, prog, post) = build_pos(p, &m, a, bound, false);
@@ -1527,8 +1527,8 @@ fn memory_programs_that_should_verify_do_verify() {
         let vacuously_true = matches!(p, Pos::FillBelow { n: 0, .. });
         let mutated = smt::with_fresh(|| {
             let mut buf = [Var::SENTINEL; 4];
-            let n = sparkrs::mem::declare(2, 8, &mut buf);
-            let m = sparkrs::mem::Mem::new(&buf[..n], 8);
+            let n = discharge::mem::declare(2, 8, &mut buf);
+            let m = discharge::mem::Mem::new(&buf[..n], 8);
             let a = var(2);
             let bound = var(3);
             let (pre, prog, post) = build_pos(p, &m, a, bound, true);

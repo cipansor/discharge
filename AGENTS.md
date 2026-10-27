@@ -4,7 +4,7 @@ Repository-level notes for agents working in this workspace.
 
 ## Layout
 
-- `sparkrs/` — a Rust crate (`sparkrs`) that embeds a formal-verification
+- `discharge/` — a Rust crate (`discharge`) that embeds a formal-verification
   engine: a bit-blasting SMT decision procedure, a symbolic DSL, a
   Curry–Howard proof kernel, contracts, and exhaustive verification.
   `no_std`, zero dependencies, allocation-free.
@@ -18,7 +18,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
 ```bash
-cd sparkrs
+cd discharge
 
 # Host build + full test suite (needs the `std` feature for the thread-local arena)
 cargo test --features std
@@ -1321,7 +1321,7 @@ not just along each grammar's own edges -- a base case that hardcodes a depth is
 
 ## A file tree in the docs is a claim about the filesystem, and nothing checks it
 
-The README's "Layout" section drew `sparkrs/` as a tree. It had drifted from the
+The README's "Layout" section drew `discharge/` as a tree. It had drifted from the
 filesystem in three ways at once: `src/lib.rs` was missing, `tests/sym.rs` was missing,
 `examples/report_probe.rs` was missing, and the `examples/` and `scripts/` blocks were
 *drawn* as if each were the last child of the root (two `└──` siblings), so the tree was

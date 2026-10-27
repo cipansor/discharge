@@ -7,9 +7,9 @@
 //!
 //! Run with: `cargo run --features std --example pipeline`
 
-use sparkrs::prelude::*;
-use sparkrs::smt::{self, var, Verdict};
-use sparkrs::wp::{self, Stmt};
+use discharge::prelude::*;
+use discharge::smt::{self, var, Verdict};
+use discharge::wp::{self, Stmt};
 
 /// A bounded accumulator, the shape of loop that shows up in a controller:
 ///

@@ -1,7 +1,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
-//! # sparkrs — in-code formal verification for Rust
+//! # discharge — in-code formal verification for Rust
 //!
 //! SPARK/Ada earns its reputation in safety-critical work because the proof
 //! tooling is *part of the language and part of the artifact*: `gnatprove` sits
@@ -56,11 +56,11 @@
 //! # Example
 //!
 //! ```
-//! use sparkrs::prelude::*;
-//! use sparkrs::sym::*;
+//! use discharge::prelude::*;
+//! use discharge::sym::*;
 //!
 //! // ∀ x:u8. x & 0x0f < 16
-//! let proved = sparkrs::smt::with_fresh(|| {
+//! let proved = discharge::smt::with_fresh(|| {
 //!     let x = var(8);
 //!     (x & 0x0fu64).lt_val(16).prove().is_proved()
 //! });

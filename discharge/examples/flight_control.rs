@@ -7,9 +7,9 @@
 //!
 //! Run with: `cargo run --features std --example flight_control`
 
-use sparkrs::exhaustive::for_all_u16;
-use sparkrs::prelude::*;
-use sparkrs::smt::{self, Verdict};
+use discharge::exhaustive::for_all_u16;
+use discharge::prelude::*;
+use discharge::smt::{self, Verdict};
 
 /// ADC resolution: a 12-bit sensor.
 const ADC_MAX: u32 = 4095;
@@ -118,7 +118,7 @@ fn clamp_holds_for_every_u16() -> bool {
 
 /// The rate limiter's step bound, checked for every pair of 8-bit values.
 fn rate_limit_bound_by_enumeration() -> bool {
-    sparkrs::exhaustive::for_all_u8_2(|c, t| {
+    discharge::exhaustive::for_all_u8_2(|c, t| {
         let next = rate_limit(c as u32, t as u32);
         let delta = next.abs_diff(c as u32);
         delta <= RATE_LIMIT
@@ -128,7 +128,7 @@ fn rate_limit_bound_by_enumeration() -> bool {
 /// Monotonicity of the mapping: a larger reading never produces a smaller
 /// command. Controllers rely on this to argue about stability.
 fn map_is_monotone() -> bool {
-    sparkrs::exhaustive::for_all_u16(|a| {
+    discharge::exhaustive::for_all_u16(|a| {
         // Compare each value against its successor.
         let b = a.wrapping_add(1);
         if b <= a {

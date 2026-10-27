@@ -4,10 +4,10 @@
 //! specification reads like the code it describes:
 //!
 //! ```
-//! use sparkrs::prelude::*;
-//! use sparkrs::sym::*;
+//! use discharge::prelude::*;
+//! use discharge::sym::*;
 //!
-//! sparkrs::smt::with_fresh(|| {
+//! discharge::smt::with_fresh(|| {
 //!     let x = var(32);
 //!     let y = var(32);
 //!     // ∀ x y. x + y == y + x

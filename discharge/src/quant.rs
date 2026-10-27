@@ -46,7 +46,7 @@ use crate::smt::{self, Pred};
 /// that could falsify it.
 ///
 /// ```rust
-/// use sparkrs::{quant, smt};
+/// use discharge::{quant, smt};
 /// smt::with_fresh(|| {
 ///     let cells: Vec<_> = (0..4).map(|_| smt::var(8)).collect();
 ///     // Every cell is below 256, which is trivially true for a u8.
@@ -133,7 +133,7 @@ fn inside(k: usize, bound: smt::Var) -> Pred {
 /// width are treated as outside it, which is the truth rather than a truncation.
 ///
 /// ```rust
-/// use sparkrs::{quant, smt};
+/// use discharge::{quant, smt};
 /// smt::with_fresh(|| {
 ///     let cells: Vec<_> = (0..4).map(|_| smt::var(8)).collect();
 ///     let upto = smt::var(3); // symbolic prefix end

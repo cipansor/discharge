@@ -1,18 +1,26 @@
-# sparkrs — formal verification that lives inside the Rust code
+# discharge — formal verification that lives inside the Rust code
 
 > An experiment: what if Rust could carry its own proof tooling the way
 > SPARK/Ada carries `gnatprove`? Not a plugin, not an external solver, not a
 > nightly feature — a **bit-blasting decision procedure compiled into your
 > artifact**, next to a Curry–Howard proof kernel and a contract vocabulary.
 
+> **Not affiliated with AdaCore or SPARK.** "SPARK" and "SPARK Pro" are
+> AdaCore's; `gnatprove` is their tool. This crate is an independent experiment
+> inspired by the *shape* of that workflow — contracts in the source, proofs
+> discharged by a tool — and it embeds its own decision procedure rather than
+> wrapping theirs. It is not a port, a wrapper, or a supported AdaCore product,
+> and the name was chosen to describe what the crate *does*, not where it comes
+> from.
+
 `no_std`. Zero dependencies. Fixed-size, heap-free arena. `#![forbid(unsafe_op_in_unsafe_fn)]`.
 
 ```rust
-use sparkrs::prelude::*;
-use sparkrs::sym::*;
+use discharge::prelude::*;
+use discharge::sym::*;
 
 // ∀ x:u8. (x & 0x0f) < 16          — proved by the embedded SMT engine
-let proved = sparkrs::smt::with_fresh(|| {
+let proved = discharge::smt::with_fresh(|| {
     let x = var(8);
     (x & 0x0fu32).lt_val(16).prove().is_proved()
 });
@@ -94,9 +102,9 @@ is the part that actually feels like SPARK: you state `requires` and `ensures`,
 describe the body, and read a verdict *per rule*.
 
 ```rust
-use sparkrs::prelude::*;
-use sparkrs::smt::{self, var};
-use sparkrs::wp::{self, Stmt};
+use discharge::prelude::*;
+use discharge::smt::{self, var};
+use discharge::wp::{self, Stmt};
 
 let report = smt::with_fresh(|| {
     let sum = var(4);
@@ -268,7 +276,7 @@ theory that matters most for safety-critical code, without touching the decision
 procedure: a memory of `2^addr_width` cells, each cell an ordinary symbolic word.
 
 ```rust
-use sparkrs::mem::{declare, Mem};
+use discharge::mem::{declare, Mem};
 
 smt::with_fresh(|| {
     let mut buf = [var(8); 4];
@@ -1192,7 +1200,7 @@ is instantaneous while a 12-bit multiplier equality is not.
 ## Layout
 
 ```
-sparkrs/
+discharge/
 ├── src/
 │   ├── lib.rs          crate root: module map, prelude, the three proof routes
 │   ├── smt.rs          the decision procedure (the heart of the crate)
@@ -1258,9 +1266,84 @@ family of predicates it checks that the symbolic prover and brute-force
 execution give the *same* answer, and that any symbolic counterexample really
 does violate the property.
 
+## Where this sits in the Rust ecosystem
+
+The other verification tools for Rust are a different *kind* of thing, and the
+difference is worth stating before the comparison table, because it decides what
+`discharge` can and cannot be used for.
+
+**The established tools verify Rust you already wrote, out of process.** Kani
+(AWS) compiles to CBMC and model-checks; Verus and Creusot and Prusti translate
+Rust (or its MIR) into a logic and hand it to an external SMT solver; `hax`
+extracts Rust into F\*/Coq for other tools to consume; Flux adds refinement
+types checked by a solver. All of them need a bespoke toolchain or a nightly
+compiler, and all of them invoke a solver (usually Z3) as a separate binary.
+
+**`discharge` is a prover that compiles into your artifact.** The decision
+procedure is bit-blasting BDDs in the crate, the proof is a value, and there is
+no external solver, no plugin, no nightly feature. That is a narrower and more
+awkward design point — it buys you a proof that can run where Z3 cannot — and it
+costs you scale, as the limits below say.
+
+The honest split:
+
+| | `discharge` | Kani / Verus / Creusot / Prusti | `contracts` crate |
+|---|---|---|---|
+| What is verified | a model of the program, as an AST you build | the Rust function itself (MIR/IR) | nothing — runtime `assert` |
+| Needs external solver | no | yes (Z3 / CBMC) | no |
+| Toolchain | stable, `no_std`, zero deps | nightly or bespoke driver | stable |
+| Runs on the target | yes (compiled in) | no (host-side) | yes (but unchecked) |
+| Scope | bit-vectors, booleans, bounded quantifiers | first-order + arithmetic + more | — |
+| Maturity | a sketch | industrial | widely used |
+
+Two things follow. First, `discharge` does not compete with Kani or Verus on
+verifying real Rust; it does not read your MIR. It verifies programs written in
+its own `Stmt` AST (see `wp::Stmt`) — except for `exhaustive`, which runs real
+functions over small domains and is the one place a claim is about compiled
+code. Second, the niche it does occupy — a checked contract that can be
+discharged *on the target*, with no solver in the loop — is not one the big
+tools aim at, and it is the same niche a `no_std` flight build actually needs.
+
+### Rust is moving toward contracts
+
+This is the part that makes the design timely rather than idiosyncratic. Rust is
+adding contracts to the language itself: `#[contracts::requires(...)]` and
+`#[contracts::ensures(...)]`, tracked in [rust-lang/rust#128044][track] (open,
+`B-experimental`). The implementation landed in [PR #128045][pr], and its
+description says the intrinsics for evaluating pre- and post-condition
+predicates exist **"for third-party verifiers"**.
+
+[track]: https://github.com/rust-lang/rust/issues/128044
+[pr]: https://github.com/rust-lang/rust/pull/128045
+
+So the language is growing the same contract vocabulary this crate has been
+experimenting with, and it is deliberately leaving a door open for tools like
+this one to sit on top. That cuts both ways, and both ways are worth naming: it
+validates the direction, and it means a home-grown DSL will eventually be
+competing with a blessed, in-tree syntax. The durable contribution here is the
+*engine* — the embedded decision procedure and the proof kernel — not the
+surface syntax, which is the layer most likely to be absorbed.
+
+### Is it useful, and is it a big deal?
+
+Useful, in a narrow band. For safety-critical or embedded Rust where you want
+SPARK-style contracts and a machine-checked discharge with **no external
+toolchain and no solver process** — an MCU, a flight build, a `no_std` target
+where you cannot ship Z3 — this is a working sketch of how to get there, and it
+is checked hard (differential testing against Z3, mutation testing of its own
+guards, a test suite that fails when a soundness guard is removed). The popular
+`contracts` crate does runtime checking only; the gap between "assert at run
+time" and "prove for all inputs" is exactly the gap this crate is about.
+
+A big deal, no — not as a general-purpose verifier. That space belongs to
+Kani and Verus, and this crate does not enter it. Its value is as a *reference
+implementation* of the no-solver, no_std corner, and as evidence that the shape
+works: a prover that is a library, a proof that is a value, a contract that
+compiles into the artifact you ship.
+
 ## The SPARK comparison, stated plainly
 
-| | SPARK/Ada + `gnatprove` | `sparkrs` |
+| | SPARK/Ada + `gnatprove` | `discharge` |
 |---|---|---|
 | Contracts in source | `Pre`, `Post`, `Type_Invariant`, `Assert` | `requires`, `ensures`, `invariant`, `verify!` |
 | Prover location | external tool in the toolchain | **inside the compiled artifact** |
@@ -1269,7 +1352,7 @@ does violate the property.
 | Scaling | industrial, handles large systems | good on masks/bounds/shifts, weak on wide multipliers |
 | Qualification | extensive certification evidence | none |
 
-The interesting part is not that `sparkrs` beats `gnatprove` — it does not, and
+The interesting part is not that `discharge` beats `gnatprove` — it does not, and
 cannot, on scope. The interesting part is the *shape*: a prover that is a
 library, a proof that is a value, and a contract that compiles into the artifact
 you ship. Rust can do that, and this crate is a working sketch of how.

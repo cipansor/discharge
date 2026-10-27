@@ -1,6 +1,6 @@
-use sparkrs::mem;
-use sparkrs::smt;
-use sparkrs::smt::*;
+use discharge::mem;
+use discharge::smt;
+use discharge::smt::*;
 
 #[test]
 fn commutativity_of_add_is_proved() {

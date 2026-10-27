@@ -2,11 +2,11 @@
 //! agree. This is the test that makes the whole approach trustworthy — if the
 //! BDD engine ever disagreed with reality, this file would catch it.
 
-use sparkrs::exhaustive::{for_all_u8, for_all_u8_2, find_violation_u8};
-use sparkrs::prelude::*;
-use sparkrs::smtscript::Query;
-use sparkrs::smt::{self, Verdict};
-use sparkrs::wp;
+use discharge::exhaustive::{for_all_u8, for_all_u8_2, find_violation_u8};
+use discharge::prelude::*;
+use discharge::smtscript::Query;
+use discharge::smt::{self, Verdict};
+use discharge::wp;
 
 /// For a predicate over one 8-bit variable, symbolic proof and enumeration must
 /// give the same answer.
@@ -202,7 +202,7 @@ fn the_evaluator_agrees_with_the_engine_on_every_operator() {
     // first — an oracle that disagrees with the engine would send me chasing bugs in
     // the wrong place. For each operation and every 8-bit input pair, the evaluator's
     // answer must equal what the engine says when both inputs are pinned.
-    use sparkrs::smt::{self, var};
+    use discharge::smt::{self, var};
 
     // Build every operation, then compare per input pair.
     type BinOp = fn(smt::Var, smt::Var) -> smt::Var;
@@ -259,7 +259,7 @@ fn the_evaluator_agrees_with_the_engine_on_every_operator() {
 
 #[test]
 fn the_evaluator_handles_widths_truncation_and_shifts() {
-    use sparkrs::smt::{self, var};
+    use discharge::smt::{self, var};
 
     smt::with_fresh(|| {
         let a = var(8);

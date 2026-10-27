@@ -1,12 +1,12 @@
 //! The proof kernel: propositions as types, proofs as values, and certificates
 //! that compose. If any of this were wrong, the test would not *compile*.
 
-use sparkrs::prelude::*;
-use sparkrs::proof::{
+use discharge::prelude::*;
+use discharge::proof::{
     conj, conj_left, conj_right, id_imp, imp_intro, modus_ponens, truth_proof, And, Equals, Imp,
     Theorem, Truth, TruthProof,
 };
-use sparkrs::smt::{self, Verdict};
+use discharge::smt::{self, Verdict};
 
 #[test]
 fn trivial_propositions_are_provable() {
@@ -155,7 +155,7 @@ fn verified_wrapper_requires_a_certificate() {
 
 // `Falsity` is deliberately uninhabited: there is no `Theorem` impl for it, so
 // `assert_proof!(Falsity)` is a compile error. That is pinned down by the
-// `compile_fail` doctest on the `sparkrs::proof` module, which is the only place
+// `compile_fail` doctest on the `discharge::proof` module, which is the only place
 // `cargo test --doc` actually executes.
 
 #[test]
