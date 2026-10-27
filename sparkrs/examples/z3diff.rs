@@ -130,6 +130,58 @@ fn z3_available() -> bool {
         .unwrap_or(false)
 }
 
+/// A corpus of predicates that are *tautologies by construction*, one or more per operator.
+///
+/// The random sweep above cannot see a well-sorted *semantic* printer bug. It compares only
+/// sat/unsat, and a random predicate over free variables is essentially never a tautology, so
+/// printing `bvsub` as `bvadd` (or `bvmul` as `bvadd`, `bvand` as `bvor`, ...) leaves z3's answer
+/// `sat` either way. Measured, not argued: mutating the exporter's `Op::Sub` to print `bvadd`
+/// left the random sweep at `mismatch=0`, while `bvsub` appeared in 39 of 800 exports, all
+/// decided -- the operator was exercised on every run and never *checked*.
+///
+/// A tautology is the dual, and it is the only shape that is sensitive to a change that preserves
+/// satisfiability. The export asserts `(not p)`, which z3 calls `unsat` exactly when the printed
+/// formula is a tautology too. A faithful printer gives `unsat`; any semantic change to an
+/// operator makes `(not p)` satisfiable and z3 answers `sat`. Each identity is chosen so that at
+/// least one plausible mutation of the operator it names *breaks the tautology* -- the corpus has
+/// teeth for that operator rather than merely mentioning it. `add.comm` would not do for `mul`
+/// (swapping `bvmul` for `bvadd` leaves commutativity true), so `mul` is pinned by `mul.one`.
+///
+/// `w` must be at least 8 for the nibble shifts.
+fn identity_corpus(w: u8, x: Var, y: Var) -> Vec<(&'static str, Pred)> {
+    let zero = smt::word(0, w);
+    let one = smt::word(1, w);
+    let ones = smt::all_ones(w);
+    // Asymmetric low/high nibbles, so a shift-direction swap is visible.
+    let nib_lo = smt::word(0x0F, w);
+    let nib_hi = smt::word(0xF0, w);
+    let p = smt::eq_const(x, 0);
+    let q = smt::eq_const(y, 0);
+    vec![
+        ("add.comm", smt::eq(smt::add(x, y), smt::add(y, x))),
+        ("add.zero", smt::eq(smt::add(x, zero), x)),
+        ("sub.self", smt::eq(smt::sub(x, x), zero)),
+        ("mul.one", smt::eq(smt::mul(x, one), x)),
+        ("mul.zero", smt::eq(smt::mul(x, zero), zero)),
+        ("band.all_ones", smt::eq(smt::band(x, ones), x)),
+        ("bor.zero", smt::eq(smt::bor(x, zero), x)),
+        ("bxor.self", smt::eq(smt::bxor(x, x), zero)),
+        ("shl.double", smt::eq(smt::shl(x, 1), smt::add(x, x))),
+        ("shl.nibble", smt::eq(smt::shl(nib_lo, 4), nib_hi)),
+        ("lshr.nibble", smt::eq(smt::lshr(nib_hi, 4), nib_lo)),
+        ("lshr.shift_back", smt::eq(smt::lshr(smt::shl(x, 1), 1), smt::band(x, smt::lshr(ones, 1)))),
+        ("trunc.narrow", smt::eq(smt::truncate(smt::word(0xAB, 8), 4), smt::word(0xB, 4))),
+        ("trunc.widen", smt::eq(smt::truncate(smt::word(0x0B, 4), 8), smt::word(0x0B, 8))),
+        ("ite.select", smt::iff(p, smt::eq(smt::ite(p, one, zero), one))),
+        ("eq.refl", smt::eq(x, x)),
+        ("ule.refl", smt::ule(x, x)),
+        ("ult.irrefl", smt::not(smt::ult(x, x))),
+        ("ule.alt", smt::iff(smt::ule(x, y), smt::or(smt::ult(x, y), smt::eq(x, y)))),
+        ("demorgan", smt::iff(smt::or(p, q), smt::not(smt::and(smt::not(p), smt::not(q))))),
+        ("xor.self", smt::not(smt::xor(p, p))),
+    ]
+}
+
 fn main() {
     // Refuse to run without the oracle, rather than reporting its absence as a result.
     // A harness that cannot fail is not a harness, and "0 mismatches" from a run that never
@@ -144,6 +196,60 @@ fn main() {
     }
     let mut r = Lcg(0x51ed_2701_9ab3_c4f7);
     let (mut agree, mut mismatch, mut parse_err, mut oracle_err, mut refused, mut undecided) = (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
+
+    // Operator-faithfulness sweep: tautologies by construction, checked against z3.
+    //
+    // This runs *before* the random sweep and exists because the random sweep cannot see a
+    // well-sorted semantic printer bug. See `identity_corpus` for the measurement. Each case is
+    // exported with the same `Query` the random sweep uses, so it also exercises the printer on
+    // the operator it names -- but as a tautology, where any semantic change to that operator
+    // turns z3's `unsat` into `sat`. A tautology we cannot prove is a soundness failure too, so
+    // it is a mismatch in its own right rather than being skipped.
+    let mut identities_checked = 0u32;
+    for w in [8u8, 12] {
+        let texts = smt::with_fresh(|| {
+            let x = smt::var(w);
+            let y = smt::var(w);
+            identity_corpus(w, x, y)
+                .into_iter()
+                .map(|(name, p)| {
+                    let v = smt::prove(p);
+                    (name, Query::new(&[x, y], p).to_smtlib2_string(), v)
+                })
+                .collect::<Vec<_>>()
+        });
+        for (name, text, ours) in texts {
+            identities_checked += 1;
+            if !text.contains("(check-sat)") {
+                mismatch += 1;
+                eprintln!("IDENTITY EXPORT REFUSED {} w={} ours={:?}\n{}", name, w, ours, text);
+                continue;
+            }
+            // The identity must be a tautology to us, and z3 must agree.
+            if !ours.is_proved() {
+                mismatch += 1;
+                eprintln!("IDENTITY NOT PROVED {} w={} ours={:?}\n{}", name, w, ours, text);
+                continue;
+            }
+            match ask_z3(&text) {
+                Z3::Verdict(z) if z == "unsat" => agree += 1,
+                Z3::Verdict(z) => {
+                    mismatch += 1;
+                    eprintln!("IDENTITY MISMATCH {} w={} z3={} (expected unsat: the printed text is not a tautology, so an operator prints wrong)\n{}", name, w, z, text);
+                }
+                Z3::ParseFail(err) => {
+                    parse_err += 1;
+                    eprintln!("IDENTITY PARSE ERR {} w={} stderr={}\n{}", name, w, err, text);
+                }
+                Z3::Error(err) => {
+                    oracle_err += 1;
+                    eprintln!("IDENTITY ORACLE ERR {} w={} {}\n{}", name, w, err, text);
+                }
+                Z3::Unavailable => panic!("z3 became unavailable mid-run"),
+            }
+        }
+    }
+
     let cases: u32 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(800);
     let total: u32 = cases;
     for _ in 0..cases {
@@ -216,8 +322,8 @@ fn main() {
         }
     }
     println!(
-        "total={} agree={} mismatch={} parse_err={} oracle_err={} refused={} undecided={}",
-        total, agree, mismatch, parse_err, oracle_err, refused, undecided
+        "identities={} total={} agree={} mismatch={} parse_err={} oracle_err={} refused={} undecided={}",
+        identities_checked, total, agree, mismatch, parse_err, oracle_err, refused, undecided
     );
     // A mismatch is a soundness disagreement and must fail the run. A parse error means we
     // printed a query z3 will not load, which is the exporter bug the harness exists to

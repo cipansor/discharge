@@ -365,6 +365,21 @@ predicates over 1-, 2-, 3-, 4-, 8- and 12-bit variables, with arithmetic, bitwis
 same predicate; and asks z3. Measured with the current harness: 800 predicates — 0 parse errors,
 0 disagreements, 25 refused, 0 undecided; 3000 predicates — 0 parse errors, 0 disagreements,
 97 refused, 0 undecided.
+
+The random sweep alone was not enough, and the way it fell short is the point. It compares only
+sat/unsat, and a random predicate over free variables is essentially never a tautology, so a
+well-sorted *semantic* printer bug is invisible to it: changing the exporter's `Op::Sub` to print
+`bvadd` instead of `bvsub` left it at `mismatch=0`, even though `bvsub` appeared in 39 of the 800
+exports and every one was decided. The operator was exercised on every run and never *checked*.
+So the harness also carries a corpus of 42 *tautologies by construction* (`sub.self` is
+`x - x == 0`, `mul.one` is `x * 1 == x`, `shl.nibble` is `0x0f << 4 == 0xf0`, and so on, one or
+more per operator), each chosen so that at least one plausible mutation of the operator it names
+breaks the identity. The export asserts `(not p)`, so z3 must answer `unsat`; a wrong operator
+makes it `sat`. That is the dual of the random sweep and the only shape sensitive to a change that
+preserves satisfiability. Measured: 42 identities, 0 mismatches. Teeth verified by mutating the
+printer — `bvsub`→`bvadd`, `bvmul`→`bvadd`, `bvand`→`bvor`, `bvshl`→`bvlshr`, `bvxor`→`bvor`, and
+widening `zero_extend`→`sign_extend` each make the harness exit 1 with the failing identity named.
+
 "Refused" means the engine answered `Unknown` (typically a mixed-width term) and the exporter
 declined to write a query for it, so there is nothing for z3 to contradict. "Undecided" is the
 other way an `Unknown` can arise: the export *is* well formed, but the engine gave no verdict, so

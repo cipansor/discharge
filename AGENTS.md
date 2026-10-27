@@ -1468,3 +1468,40 @@ Lesson: when a comment asserts an invariant ("slot 0 is never a real variable"),
 like any other and deserves a test. If the invariant is load-bearing, make it true and pin it;
 deleting the comment would have hidden a real coupling between `wp`'s buffers and the arena's id
 allocation.
+
+## A differential oracle that could not see a wrong operator
+
+`examples/z3diff.rs` generates random predicates, exports them, and asks z3. It was passing at
+`mismatch=0`, so it looked like the exporter was checked. It was not, in the way that mattered.
+
+The harness compares only sat/unsat. A random predicate over free variables is essentially never a
+tautology, so a *semantic* printing bug that keeps the formula well sorted is invisible: I changed
+the exporter's `Op::Sub` to print `bvadd` instead of `bvsub`, and the random sweep still reported
+`mismatch=0`. A probe showed `bvsub` in 39 of the 800 exports, every one decided -- so the operator
+was exercised on every run and never *checked*. An instrument that is present in the sample but not
+load-bearing in the assertion is the same defect class as the `Var::SENTINEL` comment: it looks
+like coverage and is not.
+
+Why it is invisible: the export asserts `(not p)`, so z3 answers `unsat` exactly when the printed
+`p` is a tautology. For a random `p` z3 answers `sat` both before and after any semantic change that
+preserves satisfiability, and swapping `bvsub` for `bvadd` does. The only predicate shape that
+distinguishes the two is a *tautology*, and the generator makes almost none.
+
+The fix is the dual of the random sweep: a corpus of tautologies by construction, one or more per
+operator, each chosen so that a plausible mutation of the operator it names breaks the identity.
+`sub.self` (`x - x == 0`) is sensitive to `bvsub`→`bvadd`; `mul.one` (`x * 1 == x`) to
+`bvmul`→`bvadd` (note `add.comm` would not be -- commutativity survives the swap, so the identity
+has to be picked against the mutation, not just to mention the operator); `shl.nibble`
+(`0x0f << 4 == 0xf0`) to a shift-direction swap; `trunc.widen` to `zero_extend`→`sign_extend`.
+42 identities across 8- and 12-bit widths, printed with the same `Query` path the random sweep uses.
+
+Teeth, measured by mutating the printer and requiring the harness to fail: `bvsub`→`bvadd`,
+`bvmul`→`bvadd`, `bvand`→`bvor`, `bvshl`→`bvlshr`, `bvxor`→`bvor`, and widening
+`zero_extend`→`sign_extend` each now exit 1 with the failing identity named. Before the corpus, the
+first of those passed silently.
+
+Lesson: a differential test's *generator* determines what it can catch, and "the operator appears
+in the output" is not "the operator was checked". When a decision is sat/unsat, the discriminating
+inputs are the degenerate ones -- tautologies and contradictions -- not the generic ones. If you
+want to know whether a check has teeth, mutate the thing it is supposed to check and confirm it
+fails; if it does not, the sample was decorative.
