@@ -1687,11 +1687,31 @@ Verus facts that cost time to find, all in the generated-file path:
 
 ## GitHub Actions
 
-`.github/workflows/ci.yml` has two jobs. The first runs `scripts/gate.sh` verbatim, so CI and
+`.github/workflows/ci.yml` has three jobs. The first runs `scripts/gate.sh` verbatim, so CI and
 a local run mean the same thing. The other two install Kani (cached) and Verus (latest
 release) and run `kanidiff` and `verusdiff` as hard gates. `gate.sh`'s Kani and Verus steps
 skip when those tools are absent -- reported, not silent -- because both are large downloads;
-CI is where they become mandatory. Gate count is now 7.
+CI is where they become mandatory. Gate count is now 8 (the MIR frontend is the eighth).
+
+Three things about this file are easy to get wrong:
+
+1. **Pin every `uses:` to a full commit SHA, with the tag in a trailing comment.** A tag is
+   movable, so `@v4` lets a retagged or compromised release change what CI runs without any
+   commit in this repository changing. The comment matters too: a bare SHA does not tell a
+   reviewer which version it is, and a pin they cannot identify is a pin they cannot check.
+   Resolve a tag to its commit with
+   `curl -s https://api.github.com/repos/OWNER/REPO/git/ref/tags/TAG` -- for these actions the
+   tag is lightweight, so `object.sha` is the commit directly. Verify it before trusting it.
+2. **A workflow added by a pull request does not run on that pull request.** GitHub only
+   starts `pull_request` runs when the workflow file already exists on the *base* branch, so a
+   PR that introduces `.github/workflows/ci.yml` shows "no checks reported" until it is merged.
+   That is expected, not a broken pipeline: it is why the local `gate.sh` run is the evidence
+   for such a PR, and why the workflow says so rather than looking untested.
+3. **`gh` needs `read:org` for some queries, a classic token may not have it.** `gh pr edit`
+   fails with "The 'login' field requires one of the following scopes: ['read:org']" on a token
+   scoped to `repo` only. The REST API does not need that scope, so update the PR body with
+   `curl -X PATCH .../pulls/N -d @payload.json` instead of reaching for a broader token.
+
 
 ## A fallback engine is only worth its weight if the wall actually moves
 
