@@ -1470,3 +1470,8 @@ you ship. Rust can do that, and this crate is a working sketch of how.
 ## License
 
 MIT OR Apache-2.0.
+
+Copyright 2026 Yayasan Pesantren Cipansor and contributors. Developed with
+contributions from OpenHands agents; the copyright notice in `LICENSE` records
+the foundation and the contributor base together, which is the arrangement the
+project's authorship follows.
