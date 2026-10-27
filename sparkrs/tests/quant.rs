@@ -29,12 +29,22 @@ fn truncate_keeps_the_low_bits_and_zero_fills() {
         let low = smt::truncate(x, 2);
         assert_eq!(smt::bits(low), 2);
         assert_eq!(smt::prove(smt::ult_const(low, 4)), Verdict::Valid);
-        assert_eq!(smt::prove(smt::eq(low, smt::truncate(x, 2))), Verdict::Valid);
+        // The low bits survive, checked on a pinned input. This was
+        // `eq(low, smt::truncate(x, 2))`, which compares `low` with the very call it is
+        // bound to -- a tautology that cannot fail. Pinning `x` makes it a claim the
+        // bit-blaster can get wrong.
+        assert_eq!(
+            smt::prove_implies(smt::eq_const(x, 0b1011), smt::eq_const(low, 0b11)),
+            Verdict::Valid
+        );
 
         // Widening: the value is unchanged, and the new bits are zero.
         let wide = smt::truncate(x, 8);
         assert_eq!(smt::bits(wide), 8);
-        assert_eq!(smt::prove(smt::eq(wide, smt::truncate(x, 8))), Verdict::Valid);
+        assert_eq!(
+            smt::prove_implies(smt::eq_const(x, 0b1011), smt::eq_const(wide, 0b1011)),
+            Verdict::Valid
+        );
         assert_eq!(smt::prove(smt::ult_const(wide, 16)), Verdict::Valid);
 
         // Truncating a constant agrees with the arithmetic.

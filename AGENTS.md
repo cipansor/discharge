@@ -1400,3 +1400,38 @@ Numbers moved (both re-measured): 800 predicates refused 29 -> 25, agree 771 -> 
 Lesson: when a comment or README enumerates what a generator covers, check the generator against
 the enumeration one item at a time. "Covers X in both directions" is a claim about a distribution,
 and a distribution can be narrower than its description without any single run looking wrong.
+
+## An assertion that compared a term with itself
+
+`truncate` is the crate's only width-changing operation, so the tests around it matter. Three of
+them contained the same defect: an `assert!(prove(eq(t, <the call that defines t>)))`.
+
+- `tests/differential.rs`, `widening_through_truncate_agrees_with_the_original_value`:
+  `t = truncate(x, dst)` then `prove(eq(t, truncate(x, dst)))`. Both sides are the same term
+  id, so the equality is a tautology and the assert can never fail -- under a comment that said
+  it checked the widened value "matches the original".
+- `tests/quant.rs`, `truncate_keeps_the_low_bits_and_zero_fills`: `low = truncate(x, 2)` then
+  `prove(eq(low, truncate(x, 2)))`, and `wide = truncate(x, 8)` then
+  `prove(eq(wide, truncate(x, 8)))`. Same shape, twice.
+
+Because the terms are hash-consed, the two sides are literally the same node, so the obligation is
+`eq(v, v)`, which the engine returns `Valid` for without ever touching the bit-blaster. The tests
+were green and proved nothing about truncation. Note the third case in that same test,
+`truncation_through_an_assignment_survives_substitution`, is *not* this defect: it compares
+`after = substitute_word(narrowed, [(x, y)])` against `truncate(y, 2)`, and `after` and that call
+are different nodes, so the check is real. The shape "compare `t` with a call that mentions `x`" is
+fine; the shape "compare `t` with the call `t` is bound to" is vacuous.
+
+Fix: pin the input with `prove_implies(eq_const(x, 0b1011), eq_const(t, <expected>))`, which makes
+the claim falsifiable. For the widening round trip, `prove(eq(truncate(t, src), x))` -- narrow the
+widened value back to `src` and require the original, which is well sorted (both sides `src` bits)
+and is the non-trivial form of "widening preserves the value".
+
+Verified by mutation, not by reading: flipping the bit-blaster's widening zero-fill from `FALSE`
+to `TRUE` (`src/smt.rs`, `Op::Trunc`) makes both fixed tests fail, reporting counterexample
+`x = 11`. Before the fix the same mutation left them green -- which is the whole point: an
+assertion that cannot fail also cannot detect the bug it was written for. Source restored after.
+
+Lesson: a test of an operation must compare the result against something *other than the
+expression that produced it*. When the operands are hash-consed, `eq(t, f(x))` where `t == f(x)` is
+not a weak test, it is no test. Pin an input, or compare against an independently computed value.

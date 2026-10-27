@@ -166,10 +166,15 @@ fn widening_through_truncate_agrees_with_the_original_value() {
                 let x = var(src);
                 let t = smt::truncate(x, dst);
                 assert_eq!(smt::bits(t), dst);
-                // Widening never changes the value, so the result fits in `src`
-                // bits and matches the original.
-                let p = smt::prove(smt::eq(t, smt::truncate(x, dst)));
-                assert!(p.is_proved());
+                // Widening never changes the value, so narrowing the result back to `src`
+                // bits must return the original `x`. This was `eq(t, truncate(x, dst))`,
+                // which compares `t` with itself -- `t` *is* `truncate(x, dst)` -- so it was
+                // a tautology that could not fail, under a comment claiming it checked
+                // "matches the original". The round trip through the opposite width is the
+                // non-trivial form of the same claim, and it is well sorted because both
+                // sides are `src` bits.
+                let p = smt::prove(smt::eq(smt::truncate(t, src), x));
+                assert!(p.is_proved(), "widening lost the original value");
                 let bound = 1u64 << src;
                 let q = smt::prove(smt::ult_const(t, bound));
                 assert!(q.is_proved(), "widened value escaped its source range");
