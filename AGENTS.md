@@ -88,6 +88,13 @@ Two engine consequences worth remembering:
   predicate would be worse than declining, because it would make an overflowing
   function look panic-free. So the code returns "no predicate" and the path is
   reported `incomplete`.
+  This was measured rather than assumed. The engine does have a SAT fallback for
+  when the arena fills, so the tempting fix is to raise the width and let the
+  fallback take it. Raising the threshold from 16 to 32 does not reach the
+  fallback: `mir_demo` on `sat_mul` then runs past 300 s and has to be killed,
+  because the cost is in *building* the 32-bit diagram, before the arena ever
+  fills. The threshold is a time guard, and 16 is where it sits. If you raise it,
+  time the demo rather than trusting the fallback's existence.
 
 `tests/mir.rs` is the oracle that matters: it feeds each reported counterexample
 back into the *compiled* function and requires the panic. That checks the engine
