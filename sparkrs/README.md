@@ -869,9 +869,13 @@ now does two things:
 
 * **Claim-carrying obligations report the drop.** A dropped loop rule or call rule raises
   `Rule::ObligationOverflow`, whose goal is `false`, so `verified` becomes false and the
-  claim shrinks to what was actually checked. Assertions are still dropped quietly, and
-  that is safe: a dropped assertion still poisons the weakest precondition, so the
-  contract obligation catches it.
+  claim shrinks to what was actually checked. Assertions raise the same flag. They were
+  once exempt, on the argument that the backward walk still conjoins a dropped `assert c`
+  into the weakest precondition, so the contract obligation catches it. That is true of
+  `verify`, but it left `wp::obligations`' `complete` flag lying -- it returned `true`
+  while dropping obligations -- and a truncated obligation list is not a fully checked
+  claim, so the report has to shrink here too. See
+  `assertions_beyond_the_cap_are_reported_not_hidden` in `tests/wp.rs`.
 * **The overflow notice itself cannot be dropped.** A `Report` carries one slot more than
   `MAX_OBLIGATIONS`, reserved for a report-level finding. Without that reservation the
   notice would be dropped by the same full buffer that caused it — which is exactly how
@@ -888,7 +892,9 @@ defect `writes` was fixed for. It now returns a third value, `complete`, which i
 only when every side obligation is in the buffer. `verify` already turned the flag into a
 failure; this makes the same information available to a caller inspecting obligations
 directly. `a_complete_obligation_set_reports_itself_complete` and
-`too_many_obligations_is_reported_not_swallowed` pin both directions.
+`too_many_obligations_is_reported_not_swallowed` pin both directions, and
+`assertions_beyond_the_cap_are_reported_not_hidden` pins the assertion case, which was the
+one still returning `true` while dropping.
 
 ## Differential testing: a proof must not outrun reality
 

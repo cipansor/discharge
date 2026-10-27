@@ -781,6 +781,73 @@ fn a_report_that_fits_is_unaffected_by_the_reserved_slot() {
 }
 
 #[test]
+fn assertions_beyond_the_cap_are_reported_not_hidden() {
+    // The assertion arm was the last obligation site still using the silent `push`, on the
+    // argument that a dropped assertion is harmless because the backward walk still
+    // conjoins it into the weakest precondition. That argument is about `verify`'s
+    // *soundness* and it holds -- but `obligations` documents its third return value as
+    // `true` only when every side obligation is in the buffer, and for a program with more
+    // assertions than the buffer holds it returned `true` while dropping them. The flag was
+    // two answers to one question, which is the exact defect the other truncation fixes
+    // removed.
+    //
+    // Both halves are pinned here: the flag must go false, and the report must stop calling
+    // itself verified, because a claim whose obligation list is truncated is not a claim
+    // that was fully checked. Below the cap nothing changes, so the fix cannot pass by
+    // making every assertion-only program fail.
+    smt::with_fresh(|| {
+        // One assertion per slot, right-nested, all true so only the cap can fail them.
+        let build = |n: usize| -> &'static Stmt<'static> {
+            let mut node: &'static Stmt<'static> =
+                Box::leak(Box::new(Stmt::Assert(smt::truth(true))));
+            for _ in 1..n {
+                let leaf: &'static Stmt<'static> =
+                    Box::leak(Box::new(Stmt::Assert(smt::truth(true))));
+                node = Box::leak(Box::new(Stmt::Seq { first: node, second: leaf }));
+            }
+            node
+        };
+
+        // Exactly `MAX_OBLIGATIONS` assertions: the largest set that fits. Complete, and
+        // verified -- the reserved slot costs nothing.
+        let fits = build(wp::MAX_OBLIGATIONS);
+        let mut slots = [None; wp::MAX_OBLIGATIONS + 1];
+        let (_, count, complete) = wp::obligations(fits, smt::truth(true), &mut slots);
+        assert_eq!(count, wp::MAX_OBLIGATIONS);
+        assert!(complete, "a set that fits must report itself complete");
+        assert!(
+            wp::verify(fits, smt::truth(true), smt::truth(true)).is_verified(),
+            "an assertion-only program that fits must still verify"
+        );
+
+        // One more assertion than the buffer holds. The flag must go false and the report
+        // must refuse, rather than counting 16 and calling the rest checked.
+        let over = build(wp::MAX_OBLIGATIONS + 1);
+        let mut slots = [None; wp::MAX_OBLIGATIONS + 1];
+        let (_, count, complete) = wp::obligations(over, smt::truth(true), &mut slots);
+        assert_eq!(count, wp::MAX_OBLIGATIONS, "the buffer below the reserved slot is full");
+        assert!(!complete, "a dropped assertion must make the set incomplete");
+
+        let report = wp::verify(over, smt::truth(true), smt::truth(true));
+        assert!(
+            !report.is_verified(),
+            "a report whose obligation list is truncated must not claim verification"
+        );
+        assert_eq!(report.establishes(), wp::Established::Nothing);
+        let (ob, _) = report.first_failure().expect("the truncation must be reported");
+        assert_eq!(ob.rule, Rule::ObligationOverflow);
+
+        // And the claim really was truncated: the same program padded well past the cap
+        // keeps reporting the truncation instead of saturating quietly.
+        let far_over = build(wp::MAX_OBLIGATIONS + 9);
+        assert!(
+            !wp::verify(far_over, smt::truth(true), smt::truth(true)).is_verified(),
+            "padding far past the cap must not verify either"
+        );
+    });
+}
+
+#[test]
 fn an_unreachable_precondition_is_not_a_proof() {
     // The seventh hole, and the second of the vacuity kind.
     //

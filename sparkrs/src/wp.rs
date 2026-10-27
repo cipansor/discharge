@@ -339,12 +339,14 @@ pub fn obligations<'a>(
     (goal, n, !overflow)
 }
 
-/// [`obligations`], plus whether any claim-carrying obligation had to be dropped.
+/// [`obligations`], plus whether *any* side obligation had to be dropped.
 ///
 /// The flag is the whole point: [`MAX_OBLIGATIONS`] is a fixed-size buffer, and a
 /// program larger than it must not be reported as verified on the strength of the part
 /// that fit. [`verify`] turns a raised flag into a failing [`Rule::ObligationOverflow`]
-/// obligation.
+/// obligation. Assertions count: a dropped one is still caught by the contract
+/// obligation, but the caller's view of the obligation set is truncated, and a
+/// truncated set must not read as a complete one.
 fn obligations_checked<'a>(
     s: &'a Stmt<'a>,
     post: Pred,
@@ -526,7 +528,18 @@ fn collect<'a>(
             // `implies(*cursor, *c)` instead would ask only that `c` hold whenever the
             // *continuation* is satisfiable, which is a weaker claim and not the one an
             // assertion makes.
-            push(out, n, Rule::Assertion, *c);
+            //
+            // Recorded through `push_checked`, not `push`. An assertion dropped by a full
+            // buffer used to be silent, on the argument that the backward walk still
+            // conjoins `c` into the weakest precondition, so the contract obligation
+            // catches it. That is true of *`verify`*, but it left `obligations` lying: its
+            // `complete` flag is documented to be `false` when an obligation was dropped,
+            // and it stayed `true` for a program with more assertions than the buffer
+            // holds. Two answers to one question again, which is the defect this whole
+            // family of flags exists to remove. Raising the flag here makes `verify`
+            // refuse a report whose obligation list is truncated -- the honest reading of
+            // `Rule::ObligationOverflow` -- and makes the flag true to its contract.
+            push_checked(out, n, overflow, Rule::Assertion, *c);
             *cursor = smt::and(*c, *cursor);
         }
         Stmt::If { cond, then_, else_ } => {
@@ -791,13 +804,6 @@ fn guard_range(out: &mut [Option<Obligation>], start: usize, end: usize, context
                 *slot = Some(Obligation::new(ob.rule, smt::implies(context, ob.goal)));
             }
         }
-    }
-}
-
-fn push(out: &mut [Option<Obligation>], n: &mut usize, rule: Rule, goal: Pred) {
-    if *n < program_limit(out) {
-        out[*n] = Some(Obligation::new(rule, goal));
-        *n += 1;
     }
 }
 

@@ -1540,3 +1540,27 @@ Method note: I found these by mutating each `if !…complete()` to `if false` an
 suite, not by reading. Reading confirms a guard is *present*; only mutation shows it is
 *load-bearing*. Both surviving mutants sat behind comments claiming coverage, which is exactly
 where reading is least reliable.
+
+## The assertion arm was the last silent `push`
+
+The obligation cap was fixed once before (commit c786848): claim-carrying obligations went
+through `push_checked` and raised `ObligationOverflow`, but the `Stmt::Assert` arm was left on
+the old silent `push`, deliberately, with the argument that a dropped assertion is harmless
+because the backward walk still conjoins it into the weakest precondition. That argument is
+correct about `verify`'s soundness and wrong about `wp::obligations`: the latter documents its
+third return value as `true` only when every side obligation is in the buffer, and it returned
+`true` for 17..=20 assertions when the buffer holds 16. Two answers to one question, which is
+the exact defect the earlier fix existed to remove.
+
+The gap survived the earlier fix because every existing overflow test used *loops*, not
+assertions -- the pressure family pads with assertions but asserts only on `verify`, never on
+`obligations`' completeness flag, so the flag's assertion case was never observed. Found by
+probe, not by reading: `obligations()` with N assertions for N in {15,16,17,20}.
+
+Fix: `Stmt::Assert` now goes through `push_checked`; `push` is deleted (no callers left).
+`verify` on a truncated assertion set now reports `ObligationOverflow`, and the completeness
+flag goes false. Pinned by `assertions_beyond_the_cap_are_reported_not_hidden` in `tests/wp.rs`,
+which fails when the arm is reverted to a silent drop. Lesson, same as the frame guards: when a
+comment justifies leaving one site different from its siblings, test that site's own observable
+-- here the completeness flag -- not the end-to-end verdict, which stays correct for the wrong
+reason.
