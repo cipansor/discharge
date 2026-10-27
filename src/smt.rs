@@ -584,6 +584,27 @@ impl Ctx {
         }
     }
 
+    /// Record one substitution binding, refusing a width mismatch.
+    ///
+    /// A binding replaces a variable with a term, and the two must agree on
+    /// width. `subst_target` already refuses a non-variable *target*; without the
+    /// matching check on the replacement, an 8-bit variable could be bound to a
+    /// 16-bit word, and the rebuilt expression would read only the low bits. The
+    /// blaster then uses the *comparison's* width and silently discards the high
+    /// bits, so `x == 1` with `x := 257u16` would be proved `Valid` even though
+    /// `257` does not fit in `x`. That is an assignment the source language
+    /// rejects, so accepting it can only produce a wrong answer; the query is
+    /// marked ill-formed instead.
+    fn bind_subst(&mut self, from: Term, to: Term) {
+        let idx = self.subst_target(from);
+        let w_from = self.width_of(from);
+        let w_to = self.width_of(to);
+        if w_from != w_to {
+            self.ill_formed = true;
+        }
+        self.set_subst(idx, to);
+    }
+
     /// Forget every binding and start a new substitution epoch.
     fn clear_subst(&mut self) {
         for i in 0..MAX_VARS {
@@ -1127,10 +1148,17 @@ impl Ctx {
                         // `bit >= sh` is checked first so `bit - sh` cannot wrap.
                         Op::Shl if bit >= sh => a[bit - sh],
                         Op::Shl => FALSE,
-                        Op::LShr if bit + sh < w => a[bit + sh],
+                        // `sh < w - bit`, not `bit + sh < w`. The shift amount is
+                        // a `u32` the user can write as `u32::MAX`; on a 32-bit
+                        // target `bit + sh` overflows there, and a release build
+                        // would then select `a[bit + sh]` -- reading an input bit
+                        // where the result is defined to be zero. Comparing
+                        // against `w - bit` (always in `1..=w`, since `bit < w`)
+                        // keeps both sides small.
+                        Op::LShr if sh < w - bit => a[bit + sh],
                         Op::LShr => FALSE,
                         // Arithmetic right shift replicates the sign bit.
-                        _ if bit + sh < w => a[bit + sh],
+                        _ if sh < w - bit => a[bit + sh],
                         _ => sign,
                     };
                 }
@@ -2206,8 +2234,7 @@ pub fn substitute_word(w: Var, bindings: &[(Var, Var)]) -> Var {
     with_ctx(|c| {
         c.clear_subst();
         for (from, to) in bindings {
-            let idx = c.subst_target(from.0);
-            c.set_subst(idx, to.0);
+            c.bind_subst(from.0, to.0);
         }
         Var(c.subst(w.0))
     })
@@ -2227,8 +2254,7 @@ pub fn substitute(p: Pred, bindings: &[(Var, Var)]) -> Pred {
     with_ctx(|c| {
         c.clear_subst();
         for (from, to) in bindings {
-            let idx = c.subst_target(from.0);
-            c.set_subst(idx, to.0);
+            c.bind_subst(from.0, to.0);
         }
         Pred(c.subst(p.0))
     })
@@ -2263,6 +2289,41 @@ mod subst_tests {
             let p = eq_const(x, 0);
             // `x == 0` with `x := 9` is `9 == 0`, which is false: `Unsat`, not `Valid`.
             let q = substitute(p, &[(x, word(9, 8))]);
+            assert_eq!(prove(q), Verdict::Unsat);
+        });
+    }
+
+    #[test]
+    fn a_binding_whose_width_does_not_match_is_refused() {
+        // An 8-bit variable bound to a 16-bit word. The blaster reads the rebuilt
+        // expression at the *comparison's* width, so binding `x := 257u16` into
+        // `x == 1` would read only the low byte (`1`) and prove `Valid` -- a
+        // theorem about an assignment the source language rejects. The query must
+        // be refused rather than answered.
+        with_fresh(|| {
+            let x = var(8);
+            let p = eq_const(x, 1);
+            let q = substitute(p, &[(x, word(257, 16))]);
+            assert_eq!(
+                prove(q),
+                Verdict::Unknown,
+                "an 8-bit target bound to a 16-bit word must be refused, not proved"
+            );
+        });
+        // The control: the same binding at the right width is decided, so the
+        // refusal is not refusing every binding. `x == 1` with `x := 1` is true.
+        with_fresh(|| {
+            let x = var(8);
+            let p = eq_const(x, 1);
+            let q = substitute(p, &[(x, word(1, 8))]);
+            assert_eq!(prove(q), Verdict::Valid);
+        });
+        // And the wrong *value* at the right width is still refuted, which is the
+        // answer the mismatched binding was wrongly giving.
+        with_fresh(|| {
+            let x = var(8);
+            let p = eq_const(x, 1);
+            let q = substitute(p, &[(x, word(2, 8))]);
             assert_eq!(prove(q), Verdict::Unsat);
         });
     }

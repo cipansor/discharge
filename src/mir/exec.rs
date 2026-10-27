@@ -91,6 +91,57 @@ pub struct Obligation {
     pub verdict: Verdict,
 }
 
+impl Obligation {
+    /// Whether this obligation was discharged.
+    ///
+    /// The polarity is *not* the same for every kind, and reading it as one is a
+    /// soundness hole in either direction:
+    ///
+    /// * A [`ObligationKind::Postcondition`] is discharged when it is `Valid`:
+    ///   the predicate holds for every input. `Unsat` here is the strongest
+    ///   possible failure — the postcondition is false for every input.
+    /// * A [`ObligationKind::Panic`] is discharged only when it is `Unsat`: the
+    ///   query asks "can this panic happen", so `Unsat` means it cannot.
+    ///   `Counterexample` means it can, on the inputs it names; `Valid` means it
+    ///   happens for every input — the worst case, and the one that has no
+    ///   counterexample to show.
+    /// * An [`ObligationKind::Unreachable`] is the same query shape as a panic:
+    ///   `Unsat` proves the `unreachable` is never reached.
+    /// * A [`ObligationKind::VacuousPrecondition`] is discharged when it is
+    ///   *refuted*: some input satisfies the precondition. Its `Unsat` verdict is
+    ///   the finding, not a proof.
+    ///
+    /// `Unknown` is never discharged. A caller that tests only
+    /// [`Verdict::is_proved`] gets the postcondition case right and every other
+    /// case backwards, which is why this method exists.
+    pub fn is_discharged(&self) -> bool {
+        match self.kind {
+            ObligationKind::Postcondition => self.verdict.is_proved(),
+            ObligationKind::Panic { .. } | ObligationKind::Unreachable => {
+                matches!(self.verdict, Verdict::Unsat)
+            }
+            ObligationKind::VacuousPrecondition => {
+                !matches!(self.verdict, Verdict::Unsat | Verdict::Unknown)
+            }
+        }
+    }
+
+    /// A concrete input that falsifies the intent, when one exists.
+    ///
+    /// For a postcondition, a `Counterexample` is a real failing input. For a
+    /// panic or an `unreachable`, the failing case is a `Counterexample` too —
+    /// the inputs on which the panic or the `unreachable` is reached. The one
+    /// failure with no witness is a `Valid` panic query, which means the panic
+    /// happens on *every* input; the caller reports that as a failure without a
+    /// witness rather than pretending the input space is empty.
+    pub fn failure_witness(&self) -> Option<&crate::smt::Cex> {
+        match &self.verdict {
+            Verdict::Counterexample(c) => Some(c),
+            _ => None,
+        }
+    }
+}
+
 /// The result of verifying one function.
 #[derive(Clone, Debug, Default)]
 pub struct MirReport {
@@ -106,24 +157,37 @@ pub struct MirReport {
 }
 
 impl MirReport {
-    /// True when every obligation was proved and no path was left unknown.
+    /// True when every obligation was discharged and no path was left unknown.
+    ///
+    /// "Discharged" is per-kind — see [`Obligation::is_discharged`]. A panic is
+    /// discharged by an `Unsat` query, a postcondition by a `Valid` one, and a
+    /// vacuous-precondition check by a refutation. Testing `is_proved` on every
+    /// obligation instead would count a panic that happens for *every* input as a
+    /// proof, and a postcondition that holds for *no* input as one too.
     pub fn is_proved(&self) -> bool {
-        self.unknown_paths.is_empty() && self.obligations.iter().all(|o| o.verdict.is_proved())
+        self.unknown_paths.is_empty() && self.obligations.iter().all(|o| o.is_discharged())
     }
 
-    /// The first counterexample found, if the function can fail.
+    /// The first obligation that was not discharged, with a witness when there
+    /// is one. A failure outranks incompleteness, so this is the first thing a
+    /// caller should look at.
+    pub fn first_failure(&self) -> Option<(&ObligationKind, Option<&crate::smt::Cex>)> {
+        self.obligations
+            .iter()
+            .find(|o| !o.is_discharged() && !matches!(o.verdict, Verdict::Unknown))
+            .map(|o| (&o.kind, o.failure_witness()))
+    }
+
+    /// The first counterexample found, if any obligation has one to show.
     pub fn counterexample(&self) -> Option<(&ObligationKind, &crate::smt::Cex)> {
-        self.obligations.iter().find_map(|o| match &o.verdict {
-            Verdict::Counterexample(c) => Some((&o.kind, c)),
-            _ => None,
-        })
+        self.obligations.iter().find_map(|o| o.failure_witness().map(|c| (&o.kind, c)))
     }
 
-    /// Panics that were proved impossible.
+    /// Panics that were proved impossible: an `Unsat` "can this panic" query.
     pub fn panics_ruled_out(&self) -> usize {
         self.obligations
             .iter()
-            .filter(|o| matches!(o.kind, ObligationKind::Panic { .. }) && o.verdict.is_proved())
+            .filter(|o| matches!(o.kind, ObligationKind::Panic { .. }) && o.is_discharged())
             .count()
     }
 
@@ -217,6 +281,17 @@ struct Frame {
     ret_target: usize,
     /// The caller place that receives the return value, if any.
     ret_dest: Option<Place>,
+    /// The caller's environment, saved when the call was entered.
+    ///
+    /// Each function numbers its MIR locals from `_0`, so a local index means
+    /// something only inside the function that declared it. Entering a call
+    /// therefore has to build a fresh `Env` for the callee, and the caller's own
+    /// must be put aside: without this, resuming the caller would use the
+    /// callee's locals, so a caller that saved `a` in `_3`, called `g(b)`, and
+    /// returned `_3` would read `g`'s `_3` instead. That made a false
+    /// postcondition provable, which is the failure mode this crate exists to
+    /// avoid.
+    saved_env: Option<Env>,
     /// The caller's frame, or `None` for the root.
     caller: Option<Box<Frame>>,
 }
@@ -241,9 +316,15 @@ struct State {
 /// declared postcondition over the return value, or `None` to check only panic
 /// freedom. Both are built by the caller, which is where the source-level
 /// `#[requires]` / `#[ensures]` attributes become symbolic predicates.
+///
+/// The postcondition is fallible on purpose. An `ensures` the parser cannot read
+/// must not become `true`, because then the function would verify with no
+/// postcondition checked at all -- a false contract passing as a true one. An
+/// error here is turned into an unmodelled path, which is reported rather than
+/// discharged.
 pub fn verify_fn<F>(prog: &MirProgram, f: &MirFn, pre: Option<Pred>, post: Option<F>) -> MirReport
 where
-    F: Fn(Var) -> Pred,
+    F: Fn(Var) -> Result<Pred, String>,
 {
     let mut report = MirReport { function: f.name.clone(), ..Default::default() };
 
@@ -289,7 +370,13 @@ where
     };
 
     let mut work = vec![State {
-        frame: Frame { func: root, ret_target: usize::MAX, ret_dest: None, caller: None },
+        frame: Frame {
+            func: root,
+            ret_target: usize::MAX,
+            ret_dest: None,
+            saved_env: None,
+            caller: None,
+        },
         block: start,
         path: pre.unwrap_or_else(|| smt::truth(true)),
         env,
@@ -305,7 +392,7 @@ where
 
 fn run_state<F>(prog: &MirProgram, mut st: State, post: &Option<F>, report: &mut MirReport, work: &mut Vec<State>)
 where
-    F: Fn(Var) -> Pred,
+    F: Fn(Var) -> Result<Pred, String>,
 {
     let cur = &prog.fns[st.frame.func];
     let block: Block = match cur.block(st.block) {
@@ -354,19 +441,39 @@ where
                     report.returned_paths += 1;
                     if let Some(post) = post {
                         match ret {
-                            Val::Sym(rv) => {
-                                let v = smt::prove_implies(st.path, post(rv));
-                                report.obligations.push(Obligation {
-                                    kind: ObligationKind::Postcondition,
-                                    verdict: v,
-                                });
-                            }
+                            Val::Sym(rv) => match post(rv) {
+                                Ok(p) => {
+                                    let v = smt::prove_implies(st.path, p);
+                                    report.obligations.push(Obligation {
+                                        kind: ObligationKind::Postcondition,
+                                        verdict: v,
+                                    });
+                                }
+                                Err(e) => report
+                                    .unknown_paths
+                                    .push(format!("unreadable `ensures`: {e}")),
+                            },
                             Val::Bool(rp) => {
-                                let v = smt::prove(smt::implies(st.path, rp));
-                                report.obligations.push(Obligation {
-                                    kind: ObligationKind::Postcondition,
-                                    verdict: v,
-                                });
+                                // A `bool` return is a one-bit word, so the
+                                // postcondition is evaluated against that bit.
+                                // Proving `path => rp` alone would check only
+                                // that the returned bool is *true*, which is not
+                                // the contract at all: `ensures: ret == false`
+                                // would be ignored and a false postcondition
+                                // would verify.
+                                let rv = smt::ite(rp, smt::word(1, 1), smt::word(0, 1));
+                                match post(rv) {
+                                    Ok(p) => {
+                                        let v = smt::prove_implies(st.path, p);
+                                        report.obligations.push(Obligation {
+                                            kind: ObligationKind::Postcondition,
+                                            verdict: v,
+                                        });
+                                    }
+                                    Err(e) => report
+                                        .unknown_paths
+                                        .push(format!("unreadable `ensures`: {e}")),
+                                }
                             }
                             _ => report
                                 .unknown_paths
@@ -378,7 +485,13 @@ where
                 // and continue at the call site. This continuation is what makes
                 // an inlined call mean what the real call means.
                 Some(caller) => {
-                    let mut env = st.env;
+                    // Resume in the *caller's* environment, not the callee's. The
+                    // two number their locals independently, so carrying the
+                    // callee's env back would hand the caller the callee's
+                    // values under the caller's local numbers. Only the return
+                    // value crosses the boundary, written to the call's
+                    // destination.
+                    let mut env = caller.saved_env.clone().unwrap_or_else(Env::new);
                     if let Some(dest) = &caller.ret_dest {
                         env.set(dest, ret);
                     }
@@ -514,12 +627,21 @@ where
                 func: st.frame.func,
                 ret_target: *target,
                 ret_dest: Some(dest.clone()),
+                // The caller's locals are put aside here and restored on return.
+                // `env` below is the callee's, freshly built from the arguments.
+                saved_env: Some(st.env.clone()),
                 caller: st.frame.caller.clone(),
             };
             let mut visits = st.visits;
             visits.insert((idx, b0.id), 0);
             work.push(State {
-                frame: Frame { func: idx, ret_target: usize::MAX, ret_dest: None, caller: Some(Box::new(caller)) },
+                frame: Frame {
+                    func: idx,
+                    ret_target: usize::MAX,
+                    ret_dest: None,
+                    saved_env: None,
+                    caller: Some(Box::new(caller)),
+                },
                 block: b0.id,
                 path: st.path,
                 env,

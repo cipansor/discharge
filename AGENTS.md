@@ -1386,8 +1386,9 @@ same total is a silent failure, not a stable result.
 
 ## Gates quoted in prose stop being run; make them one command
 
-The five gates this crate depends on (clippy `-D warnings`, the test suite, the bare-metal
-`no_std` build, the zero-dependency check, the z3 oracle) were five separate commands,
+The gates this crate depends on (clippy `-D warnings`, the test suite, the bare-metal
+`no_std` build, the zero-dependency check, the z3, Kani, MIR and Verus oracles) were
+separate commands,
 written in the README and copied into summaries by hand. That is exactly how a gate quietly
 stops being run: the summary says "all gates green" because the four that were re-run were
 green, and the fifth was recalled rather than executed. `scripts/gate.sh` is now the single
@@ -1807,3 +1808,35 @@ of this feature *claimed* to have broken the wall and had not.
 The pattern is the one the rest of this file keeps finding: a claim about the engine is
 worth only the command that measures it, and a *better-looking* claim is the first thing to
 suspect.
+
+## A verdict is a fact about a query; whether it is *good* depends on the query
+
+The frontend turns each source obligation into an SMT query, and the two commonest
+obligations ask *opposite* questions:
+
+* A postcondition asks "does `path => post` hold for every input". `Valid` is the proof;
+  `Unsat` means the postcondition is false on **every** input, which is the strongest
+  possible failure.
+* A panic (and an `unreachable`) asks "can this happen". `Unsat` is the proof;
+  `Counterexample` is the failing input; `Valid` means it happens on **every** input,
+  which is the worst case and has no witness to show.
+
+The first version tested `verdict.is_proved()` — that is, `Valid` — for every obligation
+regardless of kind. That reads the panic polarity backwards: a panic that fires on every
+input is reported as *ruled out*. It also silently accepted the `Unsat` postcondition,
+because `Unsat` is not `Valid` but the outcome classifier only looked for a
+`Counterexample` and let everything else fall through to `Verified`. Both are the same
+mistake — treating "the engine decided" as "the engine approved" — and both make the
+crate's core claim (a `Verified` line means the obligations hold) false.
+
+The fix is [`Obligation::is_discharged`], which is per-kind on purpose, and a
+[`MirReport::first_failure`] that carries a witness *or* the "holds for every input" case
+so an obligation with no counterexample is still a failure. The regression targets are
+`bool_ret_false` (postcondition `Unsat`), `vacuous_precondition` (unsatisfiable `requires`),
+and `div_by_always_zero` (panic query `Valid`). Each was checked by reverting the fix and
+watching it fail — a test for a polarity bug that passes on the buggy polarity is not a
+test.
+
+The general rule: when one engine answer must be read in two directions, encode the
+direction in the obligation, not in the call site. A bare `is_proved()` on a shared verdict
+type is a coin flip waiting to be read the wrong way.

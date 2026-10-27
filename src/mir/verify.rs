@@ -194,7 +194,31 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     }
 
     // Build the postcondition as a closure over the return value.
+    //
+    // An unreadable `ensures` must not be quietly dropped: folding it into `true`
+    // would verify the function with no postcondition checked. The closure
+    // returns a `Result` for that reason, and `exec` turns an error into an
+    // unmodelled path. The parse is also checked *here*, up front, so that a
+    // function with no reachable `return` cannot leave the error unmentioned.
+    //
+    // The check reuses `arg_vars` and the return local's own index and width, so
+    // it declares exactly the handles the run itself will declare. It must not
+    // reset the arena to get "throwaway" variables: `pre` and `arg_vars` are
+    // already live handles in this context, and a reset would invalidate them,
+    // which would drop the precondition from every path and make the whole run
+    // unsound in the other direction.
     let ensures: Vec<String> = contract.map(|c| c.ensures.clone()).unwrap_or_default();
+    if !ensures.is_empty() {
+        // Local `_0` is the return place; `Ty::width` is `Some` for every type a
+        // contract can name, and the fallback only keeps the probe total.
+        let probe_ret = smt::var_named(0, f.ret_ty.width().unwrap_or(1).clamp(1, 64));
+        if let Some(err) = ensures
+            .iter()
+            .find_map(|e| spec::eval_ensures(e, &arg_vars, probe_ret, &signed, ret_signed).err())
+        {
+            return FnOutcome::Skipped { reason: format!("unreadable `ensures`: {err}") };
+        }
+    }
     let args_for_post = arg_vars.clone();
     let post = if ensures.is_empty() {
         None
@@ -202,22 +226,30 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         Some(move |ret| {
             let mut acc: Option<crate::smt::Pred> = None;
             for e in &ensures {
-                if let Ok(p) = spec::eval_ensures(e, &args_for_post, ret, &signed, ret_signed) {
-                    acc = Some(match acc {
-                        None => p,
-                        Some(prev) => smt::and(prev, p),
-                    });
-                }
+                let p = spec::eval_ensures(e, &args_for_post, ret, &signed, ret_signed)
+                    .map_err(|err| err.to_string())?;
+                acc = Some(match acc {
+                    None => p,
+                    Some(prev) => smt::and(prev, p),
+                });
             }
-            acc.unwrap_or_else(|| smt::truth(true))
+            Ok(acc.unwrap_or_else(|| smt::truth(true)))
         })
     };
 
     let report = exec::verify_fn(prog, f, pre, post);
 
     // A definite failure outranks incompleteness: a counterexample is a result.
-    if let Some((kind, cex)) = report.counterexample() {
-        return FnOutcome::Failed { kind: kind.to_string(), detail: cex.to_string() };
+    // The polarity is per-kind, so this cannot just look for `Counterexample`:
+    // a postcondition fails on a `Counterexample` or an `Unsat`, and a panic
+    // fails on a `Counterexample` or a `Valid` (a panic that happens on *every*
+    // input, which has no witness to show).
+    if let Some((kind, witness)) = report.first_failure() {
+        let detail = match witness {
+            Some(c) => c.to_string(),
+            None => "holds for every input".to_string(),
+        };
+        return FnOutcome::Failed { kind: kind.to_string(), detail };
     }
     if report.undecided() > 0 {
         let mut reasons = report.unknown_paths.clone();
@@ -264,10 +296,21 @@ impl FileReport {
         self.outcomes.iter().filter(|(_, o)| matches!(o, FnOutcome::Incomplete { .. })).count()
     }
 
-    /// True only when nothing failed, nothing was incomplete, and every
-    /// contracted function was found. A skipped function is not a pass either.
+    /// How many functions were skipped outright.
+    pub fn skipped(&self) -> usize {
+        self.outcomes.iter().filter(|(_, o)| matches!(o, FnOutcome::Skipped { .. })).count()
+    }
+
+    /// True only when nothing failed, nothing was incomplete, nothing was
+    /// skipped, and every contracted function was found. A skipped function is
+    /// *not* a pass: it means a contract could not be read, so the function was
+    /// never checked, and counting it as clean would turn an unreadable contract
+    /// into a green report.
     pub fn is_clean(&self) -> bool {
-        self.failed() == 0 && self.incomplete() == 0 && self.missing.is_empty()
+        self.failed() == 0
+            && self.incomplete() == 0
+            && self.skipped() == 0
+            && self.missing.is_empty()
     }
 }
 

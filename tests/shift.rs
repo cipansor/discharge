@@ -153,8 +153,13 @@ fn a_variable_shift_is_not_the_identity() {
     // The direction that keeps the model honest: if the barrel shifter were
     // accidentally returning its input, the law above would still hold for `k == 0`
     // and the frontend would prove things about a shift that does not shift.
-    // `x << n == x` must be *refutable*, and it must be refuted by an actual model
-    // rather than by the engine declining.
+    //
+    // Asking whether `shifted == x` is *satisfiable* has no teeth: an identity
+    // shifter satisfies it on every input, so the query returns a model either
+    // way. The discriminating question is whether `shifted != x` is satisfiable
+    // at all, and whether `shifted == x` is a *theorem*. An identity shifter
+    // makes the first `Unsat` and the second `Valid`, so both must be the other
+    // way round.
     on_big_stack(|| {
         smt::with_fresh(|| {
             let x = smt::var(4);
@@ -164,11 +169,22 @@ fn a_variable_shift_is_not_the_identity() {
             // statement about real shifts and not about the defined out-of-range
             // value.
             let in_range = smt::ult_const(n, 4);
-            let identity = smt::and(in_range, smt::eq(shifted, x));
-            match smt::find_model(identity) {
+            let differs = smt::and(in_range, smt::not(smt::eq(shifted, x)));
+            match smt::find_model(differs) {
                 Verdict::Counterexample(_) => {}
-                other => panic!("`x << n == x` must be refutable, got: {other}"),
+                other => panic!(
+                    "`x << n != x` must have a model; an identity shifter makes it \
+                     unsatisfiable, got: {other}"
+                ),
             }
+            // And the converse: `x << n == x` must not be provable, or the shift
+            // is the identity in disguise.
+            let same = smt::and(in_range, smt::eq(shifted, x));
+            assert_ne!(
+                smt::prove(same),
+                Verdict::Valid,
+                "`x << n == x` must not be a theorem, or the shift does nothing"
+            );
         });
     });
 }

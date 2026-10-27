@@ -83,10 +83,14 @@ pub(crate) fn blast(ctx: &mut Ctx, cnf: &mut Cnf, t: Term, out: &mut [Lit; MAX_B
                     // `bit >= sh` is checked first so `bit - sh` cannot wrap.
                     Op::Shl if bit >= sh => a[bit - sh],
                     Op::Shl => f,
-                    Op::LShr if bit + sh < w => a[bit + sh],
+                    // Same overflow guard as `smt::blast`: `bit + sh` wraps on a
+                    // 32-bit target when `sh` is a wide literal like `u32::MAX`,
+                    // and the wrapped index selects an input bit instead of the
+                    // defined zero. `w - bit` stays small.
+                    Op::LShr if sh < w - bit => a[bit + sh],
                     Op::LShr => f,
                     // Arithmetic right shift replicates the sign bit.
-                    _ if bit + sh < w => a[bit + sh],
+                    _ if sh < w - bit => a[bit + sh],
                     _ => sign,
                 };
             }

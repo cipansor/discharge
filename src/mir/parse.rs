@@ -962,7 +962,17 @@ pub fn parse_program(text: &str) -> MirProgram {
                 if let Some(rest) = t.strip_prefix("debug ") {
                     if let Some((n, p)) = rest.split_once("=>") {
                         if let Some(idx) = parse_local(p.trim().trim_end_matches(';')) {
-                            f.local_names.insert(idx, n.trim().to_string());
+                            // First binding wins, and it must. A `debug` line at
+                            // function level names the *parameter*; a later one
+                            // inside a `scope` block names whatever value has
+                            // since moved into that local (`let s = a;` prints
+                            // `debug s => _1;` inside `scope 1`). Overwriting
+                            // with the scoped alias renames the parameter, so a
+                            // contract that says `requires: a <= 127` would look
+                            // up `a`, find only `s`, and be skipped as unreadable
+                            // -- the function would go unverified because a
+                            // local borrowed the parameter's slot.
+                            f.local_names.entry(idx).or_insert_with(|| n.trim().to_string());
                         }
                     }
                     j += 1;

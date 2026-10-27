@@ -15,7 +15,20 @@
 // exists to check: rewriting `a - b` as `saturating_sub` would delete the very
 // overflow the guard is there to prevent, and "unused function" is the normal
 // state when the verifier rather than the program is the caller.
-#![allow(dead_code, clippy::implicit_saturating_sub, clippy::manual_checked_ops)]
+//
+// The lint allows below are all the same trade. `eq_op` and `erasing_op` fire on
+// the degenerate expressions the regression targets are *built from* -- `a == a`
+// and `d & 0` are exactly the code a verifier must catch, and clippy is right
+// that no human should write them. Rewriting them into lint-clean equivalents
+// would delete the test.
+#![allow(
+    dead_code,
+    clippy::implicit_saturating_sub,
+    clippy::manual_checked_ops,
+    clippy::eq_op,
+    clippy::erasing_op,
+    clippy::identity_op
+)]
 
 // ---------------------------------------------------------------------------
 // Must verify: the guard and the arithmetic agree.
@@ -236,4 +249,107 @@ pub fn unchecked_div(n: u32, d: u32) -> u32 {
 /// requires: true
 pub fn unchecked_mul(a: u8, b: u8) -> u8 {
     a * b
+}
+
+// ---------------------------------------------------------------------------
+// Regression targets for the four bugs the review found in the frontend.
+// ---------------------------------------------------------------------------
+
+/// A helper for the inlining targets. Small, total, and side-effect free.
+pub fn callee_xor1(x: u8) -> u8 {
+    x ^ 1
+}
+
+/// The caller saves its first argument in a local, calls another function, and
+/// returns the saved value.
+///
+/// `requires: true`
+/// `ensures: ret == a`
+///
+/// This must verify: the saved value is the caller's `a`, and the callee cannot
+/// change it. It failed before the caller's environment was restored on return,
+/// because the continuation read the callee's local `_1` — which held `b` — under
+/// the caller's local number.
+/// requires: true
+/// ensures: ret == a
+pub fn inline_saves_arg(a: u8, b: u8) -> u8 {
+    let saved = a;
+    let _ = callee_xor1(b);
+    saved
+}
+
+/// The same shape with a postcondition that is actually false: the function
+/// returns `a`, so `ret == b` cannot hold for every input.
+///
+/// The clobber bug made this verify, because the continuation read the callee's
+/// `_1` (holding `b`) instead of the caller's saved `a`. It must now be refuted.
+/// requires: true
+/// ensures: ret == b
+pub fn inline_clobber_would_pass(a: u8, b: u8) -> u8 {
+    let saved = a;
+    let _ = callee_xor1(b);
+    saved
+}
+
+/// A `bool`-returning function whose postcondition is false.
+///
+/// `a == a` is always `true`, so `ret == false` is false for every input. Before
+/// the fix, a `Val::Bool` return proved only that the returned bit was true and
+/// never evaluated the declared postcondition, so this was reported verified.
+/// requires: true
+/// ensures: ret == false
+pub fn bool_ret_false(a: u8) -> bool {
+    a == a
+}
+
+/// The same function with the postcondition it actually satisfies, so the fix is
+/// not "refuse every boolean return".
+/// requires: true
+/// ensures: ret == true
+pub fn bool_ret_true(a: u8) -> bool {
+    a == a
+}
+
+/// A contract wrapped in a redundant pair of parentheses.
+///
+/// `requires: ((a == 0))` means the same as `requires: (a == 0)`. The lookahead
+/// that decides whether `(` opens a predicate used to test only depth one, so the
+/// comparator at depth two was missed, the contract failed to parse, and the
+/// function was skipped instead of verified.
+/// requires: ((a == 0))
+/// ensures: ret == a
+pub fn nested_parens(a: u8) -> u8 {
+    a
+}
+
+/// A precondition that no input satisfies. The contract proves nothing, and the
+/// report must say so rather than returning `Verified` with a vacuous theorem.
+/// requires: a < 3 && a > 10
+/// ensures: ret == a
+pub fn vacuous_precondition(a: u8) -> u8 {
+    a
+}
+
+/// An add that overflows on *every* input the precondition admits.
+///
+/// The panic query is `a >= 128 && b >= 128 => can_overflow`, and `can_overflow`
+/// is `true` under that guard for all inputs, so the query comes back `Valid`
+/// rather than with a counterexample. That is the worst case, not a proof, and it
+/// must be reported as a failure.
+/// requires: a >= 128 && b >= 128
+pub fn add_always_overflows(a: u8, b: u8) -> u8 {
+    a + b
+}
+
+/// A divide by an expression that is zero on *every* input.
+///
+/// rustc lowers the zero check to `assert(!(divisor == 0))`, so the obligation is
+/// "can the divisor be zero". Here `d & 0` is zero for every `d`, so the query is
+/// `Valid` — the panic fires always. The obligation asks a reachability question,
+/// so `Valid` is the worst answer, not a proof; reading `Valid` as "proved"
+/// reports a function that always panics as verified.
+/// requires: true
+pub fn div_by_always_zero(a: u8, d: u8) -> u8 {
+    let z = d & 0;
+    a / z
 }

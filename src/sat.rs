@@ -8,11 +8,23 @@
 //! table). Safety-critical code is full of wider arithmetic, so a BDD-only prover is
 //! honest but not enough.
 //!
-//! This is the second engine, reached only when the BDD arena fills. It takes the *same*
-//! bit-level circuit the BDD engine already builds -- the ripple adders, the comparators,
-//! the shift networks -- Tseitin-encodes it into CNF, and runs CDCL over it. Both engines
-//! consuming one netlist is deliberate: two separate bit-slicers would drift, and a bug in
-//! the adder would then be caught in only one place.
+//! This is the second engine, reached only when the BDD arena fills. It walks the *same
+//! term graph* the BDD engine reasons about -- the ripple adders, the comparators, the
+//! shift networks, as nodes in [`crate::smt`]'s arena -- and re-derives the gate structure
+//! for each node into CNF, then runs CDCL over it.
+//!
+//! **One term graph, two blasters.** There are two bit-slicing functions,
+//! [`crate::smt`]'s `blast` (which writes BDD node ids) and [`crate::bitblast`]'s `blast`
+//! (which writes [`Lit`]s). They are kept structurally identical node-for-node on purpose:
+//! sharing one term graph means the *arithmetic* is defined once, so a wrong adder is
+//! wrong in both engines. The slicing is duplicated because the two gate arenas are both
+//! `&mut` and cannot be one function without either splitting an arena or hiding a pointer
+//! behind a trait; the divergence that duplication risks is treated as a property to
+//! *check*, not to hope away -- see the header of [`crate::bitblast`], `tests/differential.rs`
+//! and `tests/sat_engine.rs`.
+//!
+//! This is deliberately not the stronger "one bit-slicer" claim: the CNF is rebuilt from
+//! the term graph rather than consumed from a BDD-produced netlist.
 //!
 //! What it buys is bounded, and the bound is honest: adder equivalence now settles at
 //! **64 bits**, where the BDD engine alone returns `Unknown`. Wide *multiplier*
@@ -1138,9 +1150,18 @@ impl Model {
 // in the binary's BSS and is only ever borrowed.
 //
 // Sharing one arena across threads needs a lock, so on `std` the borrow is a `Mutex` guard
-// rather than a `RefCell` borrow. That costs a little performance and is the price of not
-// requiring an allocator. The bare-metal build is single-threaded by contract, exactly as
-// `smt::with_ctx` documents, so it uses the raw statics and no lock.
+// rather than a `RefCell` borrow. The bare-metal build is single-threaded by contract,
+// exactly as `smt::with_ctx` documents, so it uses the raw statics and no lock.
+//
+// The consequence is stated plainly rather than left to be discovered: the `std` build
+// **serializes** every SAT query, including the encoding, because both `Mutex` guards are
+// held for the whole of [`query`]. The BDD engine does not, since `smt::with_ctx` is a
+// `thread_local!` on `std`; so two threads running hard proofs that fall back to SAT run
+// one after the other rather than in parallel. This is a throughput cost, not a
+// correctness one -- the solver is deterministic and the lock is never taken in the other
+// order -- and it is the price of a compile-time-sized arena in BSS with no allocator. A
+// per-thread arena would need either an allocator or a fixed pool, and neither is worth
+// the complexity for the queries this engine is meant to answer.
 #[cfg(feature = "std")]
 static CNF: std::sync::Mutex<Cnf> = std::sync::Mutex::new(Cnf::new());
 #[cfg(feature = "std")]

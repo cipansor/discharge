@@ -323,7 +323,19 @@ impl<'a> Parser<'a> {
 
     /// Whether the `(` at the cursor opens a parenthesized *predicate* rather
     /// than arithmetic. Scans to the matching `)` and looks for a comparator or
-    /// a boolean operator at that level. Only a lookahead -- nothing is consumed.
+    /// a boolean operator *anywhere inside* that group. Only a lookahead --
+    /// nothing is consumed.
+    ///
+    /// The scan must not stop at depth one. `((a == 0))` is a predicate wearing a
+    /// redundant pair of parentheses, and its comparator sits at depth two; a
+    /// depth-one test misses it, the group is then read as arithmetic, the `==`
+    /// cannot be consumed, and the whole contract fails to parse. A contract that
+    /// fails to parse is a function that never gets verified, so the extra pair
+    /// would quietly drop the obligation.
+    ///
+    /// Looking deeper is safe because the scan stops at the matching close: for
+    /// `(a + b) == c` the scan returns at the `)` after `b` and never sees the
+    /// `==`, so the group stays arithmetic.
     fn paren_is_predicate(&self) -> bool {
         let mut depth = 0usize;
         for t in &self.toks[self.pos..] {
@@ -335,9 +347,12 @@ impl<'a> Parser<'a> {
                         return false;
                     }
                 }
-                Tok::Op(o) if depth == 1 && matches!(o.as_str(), "==" | "!=" | "<=" | ">=" | "<" | ">" | "&&" | "||") => {
+                Tok::Op(o)
+                    if matches!(o.as_str(), "==" | "!=" | "<=" | ">=" | "<" | ">" | "&&" | "||") =>
+                {
                     return true
                 }
+                Tok::Ident(n) if n == "true" || n == "false" => return true,
                 _ => {}
             }
         }
@@ -496,7 +511,12 @@ impl<'a> Parser<'a> {
                     return Ok((v, self.ret_signed));
                 }
                 if name == "true" || name == "false" {
-                    return Err(self.err("use a comparison for a boolean contract"));
+                    // A boolean literal is a one-bit word, so a `bool`-returning
+                    // function can write `ensures: ret == false`. It used to be
+                    // an error here, which left such contracts unreadable; the
+                    // width check then refuses a literal compared against a
+                    // wider operand, which is the right refusal.
+                    return Ok((smt::word(u64::from(name == "true"), 1), false));
                 }
                 // `i16::MIN` and friends: the named bound of an integer type,
                 // which is how a contract names the value it must exclude. The

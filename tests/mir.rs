@@ -68,6 +68,14 @@ fn verify_all() -> Option<verify::FileReport> {
         "signed_mul_guarded",
         "signed_mul_negative",
         "checked_neg",
+        "inline_saves_arg",
+        "inline_clobber_would_pass",
+        "bool_ret_false",
+        "bool_ret_true",
+        "nested_parens",
+        "vacuous_precondition",
+        "add_always_overflows",
+        "div_by_always_zero",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -541,4 +549,178 @@ fn parse_cex_pair(detail: &str) -> (Option<u64>, Option<u64>) {
         }
     }
     (first, second)
+}
+
+// ---------------------------------------------------------------------------
+// Regressions for the frontend bugs a review found: caller state clobbered by
+// an inlined call, a boolean return bypassing the postcondition, a redundant
+// parenthesis pair hiding a contract, and a scoped `debug` alias renaming a
+// parameter.
+// ---------------------------------------------------------------------------
+
+/// An inlined call must not hand the caller the callee's locals.
+///
+/// Both functions have the same shape — save an argument, call something, return
+/// the saved value — and differ only in the postcondition. The correct one must
+/// verify and the false one must be refuted. If the caller's environment is not
+/// restored, the continuation reads the callee's `_1` (holding `b`), so both
+/// would verify.
+#[test]
+fn an_inlined_call_does_not_clobber_the_caller() {
+    let Some(report) = verify_all() else { return };
+
+    let good = outcome(&report, "inline_saves_arg");
+    assert!(
+        good.is_verified(),
+        "returning the caller's saved argument must verify, got: {good}"
+    );
+
+    let bad = outcome(&report, "inline_clobber_would_pass");
+    assert!(
+        matches!(bad, FnOutcome::Failed { .. }),
+        "`ret == b` is false for `inline_clobber_would_pass` and must be refuted, got: {bad}"
+    );
+}
+
+/// A `bool` return must be checked against the declared postcondition.
+#[test]
+fn a_boolean_return_is_checked_against_its_postcondition() {
+    let Some(report) = verify_all() else { return };
+
+    let bad = outcome(&report, "bool_ret_false");
+    assert!(
+        matches!(bad, FnOutcome::Failed { .. }),
+        "`ret == false` for a function returning `true` must be refuted, got: {bad}"
+    );
+
+    let good = outcome(&report, "bool_ret_true");
+    assert!(
+        good.is_verified(),
+        "`ret == true` for the same function must verify, got: {good}"
+    );
+}
+
+/// A redundant parenthesis pair must not make a contract unreadable.
+#[test]
+fn nested_predicate_parentheses_parse() {
+    let Some(report) = verify_all() else { return };
+    let o = outcome(&report, "nested_parens");
+    assert!(
+        o.is_verified(),
+        "`requires: ((a == 0))` must parse and verify, got: {o}"
+    );
+}
+
+/// A scoped `debug` alias must not rename a parameter.
+///
+/// `inline_saves_arg` prints `debug a => _1;` at function level and then
+/// `debug saved => _1;` inside `scope 1`, because `let saved = a;` reuses `_1`.
+/// When the later line overwrote the earlier one, the parameter `a` disappeared
+/// and `ensures: ret == a` was skipped as unreadable. The function verifying at
+/// all is the check; this pins the names directly so the failure is legible.
+#[test]
+fn a_scoped_debug_alias_does_not_rename_a_parameter() {
+    let Some(rustc) = rustc() else { return };
+    let mir = verify::emit_mir_with(&rustc, std::path::Path::new(TARGET))
+        .expect("emit MIR for the target file");
+    // The parameter is named `a`, and the `ensures` names it, so the contract
+    // must be readable. A skip here is the bug.
+    let report = verify::verify_file_with(&rustc, std::path::Path::new(TARGET), &[
+        "inline_saves_arg".to_string(),
+    ])
+    .expect("verify");
+    let (_, o) = report.outcomes.first().expect("one outcome");
+    assert!(
+        !matches!(o, FnOutcome::Skipped { .. }),
+        "the contract names the parameter `a` and must be readable, got: {o}"
+    );
+    assert!(mir.contains("debug a => _1;"), "the parameter binding is expected in the dump");
+}
+
+/// An unreadable `ensures` must not be folded into `true`.
+///
+/// The postcondition closure used to swallow a parse error and return `true`, so
+/// a function whose `ensures` could not be read would verify with *nothing*
+/// checked. A skipped outcome is the honest report, and `is_clean` must not call
+/// it clean.
+#[test]
+fn an_unreadable_ensures_is_reported_not_ignored() {
+    let Some(rustc) = rustc() else { return };
+    let dir = std::env::temp_dir().join("discharge_unreadable_ensures");
+    let _ = std::fs::create_dir_all(&dir);
+    let src = dir.join("u.rs");
+    std::fs::write(
+        &src,
+        "/// requires: true\n/// ensures: ret == nonsense_name\npub fn f(a: u8) -> u8 { a }\n",
+    )
+    .expect("write source");
+    let report =
+        verify::verify_file_with(&rustc, &src, &["f".to_string()]).expect("verify");
+    let (_, o) = report.outcomes.first().expect("one outcome");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "an unreadable `ensures` must be reported as skipped, got: {o}"
+    );
+    assert!(
+        !report.is_clean(),
+        "a report with a skipped function must not be clean"
+    );
+}
+
+/// An unsatisfiable precondition is a finding, not a pass.
+///
+/// The implication `pre => post` is vacuously true when `pre` is unsatisfiable,
+/// so a naive discharge reports `Verified`. The frontend adds an explicit
+/// satisfiability obligation for exactly this reason, and it must be a failure.
+#[test]
+fn an_unsatisfiable_precondition_is_a_failure() {
+    let Some(report) = verify_all() else { return };
+    let o = outcome(&report, "vacuous_precondition");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`a < 3 && a > 10` admits no input and must be a failure, got: {o}"
+    );
+    let text = o.to_string();
+    assert!(
+        text.contains("vacuous precondition"),
+        "the failure must name the vacuous precondition, got: {text}"
+    );
+}
+
+/// A panic obligation whose verdict is `Valid` is a failure, not a proof.
+///
+/// This is the case that exposes the inverted polarity directly: the panic query
+/// is `Valid`, and a naive "proved means good" reading counts it as discharged.
+/// The obligation asks "can this panic happen", so `Valid` means it happens on
+/// every input — the worst answer. `div_by_always_zero` divides by `d & 0`, which
+/// is zero for every `d`, so its query is `Valid`.
+#[test]
+fn a_panic_obligation_that_is_valid_is_a_failure() {
+    let Some(report) = verify_all() else { return };
+    let o = outcome(&report, "div_by_always_zero");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "a divide by an always-zero divisor must be a failure, got: {o}"
+    );
+    assert!(
+        o.to_string().contains("panic"),
+        "the failure must name the panic, got: {o}"
+    );
+}
+
+/// A panic that happens on *every* input must be a failure, not a proof.
+///
+/// The obligation for a panic asks "can this panic happen", so `Unsat` is the
+/// good answer and `Valid` is the worst one — the panic fires for every input.
+/// Reading the verdict as "proved means good" inverts the answer, and
+/// `add_always_overflows` is the case that makes it visible: the overflow query
+/// is `Valid`, and the function must be reported as failing.
+#[test]
+fn a_panic_on_every_input_is_a_failure() {
+    let Some(report) = verify_all() else { return };
+    let o = outcome(&report, "add_always_overflows");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "an add that always overflows must be a failure, got: {o}"
+    );
 }

@@ -35,8 +35,26 @@ pub fn ensures(pre: Precondition, post: Pred) -> Contract {
 
 impl Contract {
     /// Prove the contract: `pre => post`, for every input.
+    ///
+    /// This discharges the *implication*, which is the standard Hoare reading: a
+    /// contract whose precondition cannot hold is vacuously true, and
+    /// `discharge` reports it `Valid`. That is deliberate and matches
+    /// [`verify_contract`] and [`invariant`], but it is not the same promise as
+    /// [`crate::wp::verify`], which treats an unsatisfiable precondition as a
+    /// *finding* rather than a proof. If you need the non-vacuous reading, ask
+    /// [`Contract::precondition_is_satisfiable`] as well.
     pub fn discharge(&self) -> Verdict {
         smt::prove_implies(self.pre, self.post)
+    }
+
+    /// Whether some input satisfies the precondition.
+    ///
+    /// `discharge` proves `pre => post`, which is vacuously true when `pre` is
+    /// unsatisfiable. This is the companion question: does the precondition
+    /// describe any input at all? A `false` here means a `Valid` from
+    /// [`Contract::discharge`] says nothing about the postcondition.
+    pub fn precondition_is_satisfiable(&self) -> bool {
+        smt::find_model(self.pre) != Verdict::Unsat
     }
 
     /// The precondition, as a predicate.
@@ -60,6 +78,10 @@ impl Contract {
 }
 
 /// Build and discharge a contract in one call.
+///
+/// Discharges the implication `pre => post`, so an unsatisfiable `pre` makes the
+/// result `Valid` without the postcondition having been checked. See
+/// [`Contract::discharge`] and [`Contract::precondition_is_satisfiable`].
 pub fn verify_contract(pre: Pred, post: Pred) -> Verdict {
     smt::prove_implies(pre, post)
 }
