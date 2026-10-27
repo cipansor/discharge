@@ -130,14 +130,60 @@ impl Obligation {
     ///
     /// For a postcondition, a `Counterexample` is a real failing input. For a
     /// panic or an `unreachable`, the failing case is a `Counterexample` too —
-    /// the inputs on which the panic or the `unreachable` is reached. The one
-    /// failure with no witness is a `Valid` panic query, which means the panic
-    /// happens on *every* input; the caller reports that as a failure without a
-    /// witness rather than pretending the input space is empty.
+    /// the inputs on which the panic or the `unreachable` is reached. The two
+    /// failures with no witness are the *opposite* verdicts of each other, and
+    /// [`Obligation::failure_detail`] is what tells them apart.
     pub fn failure_witness(&self) -> Option<&crate::smt::Cex> {
         match &self.verdict {
             Verdict::Counterexample(c) => Some(c),
             _ => None,
+        }
+    }
+
+    /// A one-line diagnosis of why this obligation was not discharged.
+    ///
+    /// The witness alone is not enough, because the two kinds fail on *opposite*
+    /// verdicts and both leave no counterexample:
+    ///
+    /// * An `Unsat` postcondition holds for **no** input — the strongest failure.
+    /// * A `Valid` panic holds for **every** input — the panic always fires.
+    ///
+    /// Rendering both as "holds for every input" reverses the first: it describes
+    /// an impossible postcondition as a universal truth, which is the opposite of
+    /// the finding. So the string is built per kind and per verdict, and the
+    /// `Unsat` postcondition says what actually happened.
+    pub fn failure_detail(&self) -> String {
+        match &self.verdict {
+            Verdict::Counterexample(c) => c.to_string(),
+            Verdict::Valid => match self.kind {
+                // A panic query is `path => can_happen`; `Valid` means it always
+                // happens, and there is no single witness to name.
+                ObligationKind::Panic { .. } | ObligationKind::Unreachable => {
+                    "holds for every input (the failure fires on all of them)".to_string()
+                }
+                // A postcondition query is `path => post`; `Valid` is the *pass*
+                // case, so reaching here with a non-discharged obligation would be
+                // a classifier bug. Say so rather than guess a diagnosis.
+                ObligationKind::Postcondition | ObligationKind::VacuousPrecondition => {
+                    "invalid: a `Valid` verdict is a discharge for this kind".to_string()
+                }
+            },
+            Verdict::Unsat => match self.kind {
+                // `path => post` false on every input: the postcondition holds for
+                // none of them. This is the case the old shared string got wrong.
+                ObligationKind::Postcondition => {
+                    "the postcondition holds for no input (false on every input)".to_string()
+                }
+                // The good answer for a reachability query, so this is a discharge.
+                ObligationKind::Panic { .. } | ObligationKind::Unreachable => {
+                    "invalid: an `Unsat` verdict is a discharge for this kind".to_string()
+                }
+                // The precondition describes no input, so the contract is vacuous.
+                ObligationKind::VacuousPrecondition => {
+                    "no input satisfies the precondition (the contract is vacuous)".to_string()
+                }
+            },
+            Verdict::Unknown => "the engine could not decide this obligation".to_string(),
         }
     }
 }
@@ -168,14 +214,17 @@ impl MirReport {
         self.unknown_paths.is_empty() && self.obligations.iter().all(|o| o.is_discharged())
     }
 
-    /// The first obligation that was not discharged, with a witness when there
-    /// is one. A failure outranks incompleteness, so this is the first thing a
-    /// caller should look at.
-    pub fn first_failure(&self) -> Option<(&ObligationKind, Option<&crate::smt::Cex>)> {
+    /// The first obligation that was not discharged and that the engine could
+    /// decide, i.e. a definite failure rather than an open one.
+    ///
+    /// Returns the obligation itself so the caller can ask it for the kind, the
+    /// witness, and the diagnosis without re-deriving which obligation it was.
+    /// A failure outranks incompleteness, so this is the first thing a caller
+    /// should look at.
+    pub fn first_failure(&self) -> Option<&Obligation> {
         self.obligations
             .iter()
             .find(|o| !o.is_discharged() && !matches!(o.verdict, Verdict::Unknown))
-            .map(|o| (&o.kind, o.failure_witness()))
     }
 
     /// The first counterexample found, if any obligation has one to show.

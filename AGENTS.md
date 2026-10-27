@@ -1764,9 +1764,19 @@ Three things about this file are easy to get wrong:
 ## A fallback engine is only worth its weight if the wall actually moves
 
 `smt.rs` is a BDD engine; when its arena fills, `query_valid`/`query_model` hand the *same*
-term graph to `sat.rs`, a CDCL SAT solver, via `bitblast.rs`. Both engines consume one
-netlist on purpose: two bit-slicers would drift and an adder bug would then be caught in
-only one place.
+term graph to `sat.rs`, a CDCL SAT solver, via `bitblast.rs`.
+
+Two engines, one term graph, **two blasters** -- and the distinction matters, because the
+first write-up of this said "one netlist" and that was wrong. `smt::blast` writes BDD node
+ids; `bitblast::blast` writes `Lit`s. They cannot be one function: the term arena and the
+gate arena are both `&mut`, so a shared blaster would have to split an arena or hide a
+pointer behind a trait. What the two share is the *term graph*, so the arithmetic is defined
+once and a wrong adder is wrong in both engines; the slicing itself is duplicated. The
+duplication is a real divergence risk, so it is treated as a property to check rather than
+hope away: `tests/differential.rs` requires neither engine's verdict to ever be wrong, and
+`tests/sat_engine.rs` checks the solver against brute-force enumeration with no blaster in
+the picture. A claim of "one bit-slicer" would be the stronger, false version of this; the
+code and `src/sat.rs`'s header say the true one.
 
 The point of recording this here is the measurement discipline, because the first version
 of this feature *claimed* to have broken the wall and had not.
@@ -1836,7 +1846,33 @@ so an obligation with no counterexample is still a failure. The regression targe
 and `div_by_always_zero` (panic query `Valid`). Each was checked by reverting the fix and
 watching it fail — a test for a polarity bug that passes on the buggy polarity is not a
 test.
+### The same mistake in a boolean, and in a failure string
 
-The general rule: when one engine answer must be read in two directions, encode the
-direction in the obligation, not in the call site. A bare `is_proved()` on a shared verdict
-type is a coin flip waiting to be read the wrong way.
+Two follow-on findings were the same error in different clothes, and both are worth naming
+because they are easy to reintroduce.
+
+1. **A satisfiability query has three outcomes, and a `bool` cannot hold three.**
+   `find_model` returns a model, `Unsat`, or `Unknown`. The first
+   `Contract::precondition_is_satisfiable` was `find_model(pre) != Verdict::Unsat`, which
+   folds `Unknown` in with "found a model" and answers `true`. An ill-formed precondition
+   (an equality between an 8-bit and a 16-bit variable, say) then reads as *satisfiable*,
+   so a caller checking `discharge` and the boolean together claims a non-vacuous proof
+   with no evidence the precondition is reachable. The fix adds
+   `Contract::precondition_satisfiability`, returning the verdict, and makes the boolean
+   `true` only for `Valid` or a `Counterexample` -- the two outcomes that *are* a satisfying
+   input. `false` now means "not established", covering both `Unsat` and `Unknown`, and the
+   docs say so. The rule from above applies: three outcomes need a three-valued type, not a
+   boolean with a silent fold.
+
+2. **Two failures with no witness are not the same failure.** `first_failure` returned a
+   kind and an optional witness, and the caller rendered "no witness" as the string "holds
+   for every input". That string is right for a `Valid` panic query (the panic fires on all
+   inputs) and exactly *backwards* for an `Unsat` postcondition (the postcondition holds
+   for **no** input). The detail is now built per kind and per verdict by
+   `Obligation::failure_detail`, and `first_failure` returns the obligation itself so the
+   kind, the witness, and the diagnosis come from one place instead of being re-derived.
+   The regression test asserts the `Unsat` postcondition's detail says "no input" and does
+   *not* contain "holds for every input".
+
+The through-line with the polarity bug: a value that can mean two opposite things, rendered
+or tested without its direction, will eventually be read the wrong way.

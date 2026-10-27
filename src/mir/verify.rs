@@ -244,12 +244,14 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     // a postcondition fails on a `Counterexample` or an `Unsat`, and a panic
     // fails on a `Counterexample` or a `Valid` (a panic that happens on *every*
     // input, which has no witness to show).
-    if let Some((kind, witness)) = report.first_failure() {
-        let detail = match witness {
-            Some(c) => c.to_string(),
-            None => "holds for every input".to_string(),
+    if let Some(ob) = report.first_failure() {
+        // The diagnosis is per-kind: an `Unsat` postcondition holds for *no*
+        // input, while a `Valid` panic fires on *every* input. Both leave no
+        // witness, so the detail cannot be one shared string.
+        return FnOutcome::Failed {
+            kind: ob.kind.to_string(),
+            detail: ob.failure_detail(),
         };
-        return FnOutcome::Failed { kind: kind.to_string(), detail };
     }
     if report.undecided() > 0 {
         let mut reasons = report.unknown_paths.clone();

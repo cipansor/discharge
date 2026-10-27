@@ -42,19 +42,52 @@ impl Contract {
     /// [`verify_contract`] and [`invariant`], but it is not the same promise as
     /// [`crate::wp::verify`], which treats an unsatisfiable precondition as a
     /// *finding* rather than a proof. If you need the non-vacuous reading, ask
-    /// [`Contract::precondition_is_satisfiable`] as well.
+    /// [`Contract::precondition_satisfiability`] (or the `bool` shorthand
+    /// [`Contract::precondition_is_satisfiable`]) as well.
     pub fn discharge(&self) -> Verdict {
         smt::prove_implies(self.pre, self.post)
     }
 
-    /// Whether some input satisfies the precondition.
+    /// Whether some input *definitely* satisfies the precondition.
     ///
     /// `discharge` proves `pre => post`, which is vacuously true when `pre` is
     /// unsatisfiable. This is the companion question: does the precondition
     /// describe any input at all? A `false` here means a `Valid` from
     /// [`Contract::discharge`] says nothing about the postcondition.
+    ///
+    /// A satisfiability query has three outcomes, and this boolean carries only
+    /// two: `true` means the engine *found* an input (a `Counterexample` model)
+    /// or proved the precondition holds for all of them (`Valid`, which is
+    /// trivially satisfiable). `false` covers both `Unsat` and `Unknown` — a
+    /// refutation *and* the engine declining to decide. So `false` is **not**
+    /// "no input exists"; it is "not established that one does". A caller that
+    /// needs the distinction, in particular one that wants to treat an undecided
+    /// precondition as the hazard it is, should ask
+    /// [`Contract::precondition_satisfiability`] for the verdict instead.
     pub fn precondition_is_satisfiable(&self) -> bool {
-        smt::find_model(self.pre) != Verdict::Unsat
+        matches!(
+            self.precondition_satisfiability(),
+            Verdict::Valid | Verdict::Counterexample(_)
+        )
+    }
+
+    /// The precondition's satisfiability as the engine's own verdict.
+    ///
+    /// * [`Verdict::Valid`] — every input satisfies it (satisfiable, trivially).
+    /// * [`Verdict::Counterexample`] — a model was found; the variant names it.
+    /// * [`Verdict::Unsat`] — no input satisfies it, so `discharge` is vacuous.
+    /// * [`Verdict::Unknown`] — the engine could not decide, e.g. an ill-formed
+    ///   precondition such as an equality between an 8-bit and a 16-bit
+    ///   variable. This is *not* a satisfying input and *not* a refutation; a
+    ///   caller that treats `Unknown` as "fine" has no evidence the precondition
+    ///   is reachable, which is exactly the vacuity `discharge` cannot see.
+    ///
+    /// Returning the verdict rather than a `bool` is deliberate: the two-valued
+    /// answer has to fold `Unknown` into one side, and folding it into `true` —
+    /// as this method once did — reports an undecided, possibly vacuous contract
+    /// as non-vacuous.
+    pub fn precondition_satisfiability(&self) -> Verdict {
+        smt::find_model(self.pre)
     }
 
     /// The precondition, as a predicate.
@@ -201,6 +234,72 @@ mod tests {
             c.discharge()
         });
         assert!(v.is_proved());
+    }
+
+    #[test]
+    fn an_undecided_precondition_is_not_reported_satisfiable() {
+        // An ill-formed precondition: `x` is 8 bits, `y` is 16, and the
+        // comparison mixes widths. The engine refuses it, so `find_model`
+        // returns `Unknown` -- the engine has *not* found an input. The boolean
+        // used to fold `Unknown` in with "found a model" and answer `true`,
+        // which reports an undecided, possibly vacuous contract as non-vacuous.
+        let v = smt::with_fresh(|| {
+            let x = smt::var(8);
+            let y = smt::var(16);
+            // An equality between an 8-bit and a 16-bit variable: the engine
+            // refuses a mixed-width comparison, so this is the ill-formed case
+            // the finding names.
+            let pre = smt::eq(x, y);
+            let c = ensures(requires(pre), smt::truth(true));
+            (c.precondition_satisfiability(), c.precondition_is_satisfiable())
+        });
+        // The verdict is `Unknown`, so the boolean must be `false`: no input was
+        // found, and calling it satisfiable would be the false positive.
+        assert!(
+            !v.1,
+            "an undecided precondition must not be reported satisfiable (verdict: {})",
+            v.0
+        );
+    }
+
+    #[test]
+    fn satisfiability_distinguishes_a_model_from_an_undecided_query() {
+        // The three outcomes must be three answers, not two. A satisfiable
+        // precondition names a model; an unsatisfiable one is `Unsat`; and the
+        // boolean is `true` only for the first.
+        let (sat, unsat) = smt::with_fresh(|| {
+            let x = smt::var(8);
+            let good = ensures(requires(smt::ult_const(x, 16)), smt::truth(true));
+            let bad = ensures(requires(smt::and(smt::ult_const(x, 3), smt::ugt_const(x, 10))), smt::truth(true));
+            (good.precondition_satisfiability(), bad.precondition_satisfiability())
+        });
+        assert!(
+            matches!(sat, Verdict::Counterexample(_)) || sat == Verdict::Valid,
+            "a satisfiable precondition must yield a model or `Valid`, got {sat}"
+        );
+        assert_eq!(unsat, Verdict::Unsat, "an unsatisfiable precondition must be `Unsat`");
+    }
+
+    #[test]
+    fn a_vacuous_contract_is_visible_through_the_satisfiability_verdict() {
+        // The companion question `discharge` cannot answer: `discharge` reports
+        // `Valid` for a vacuous contract, and the satisfiability verdict is what
+        // says the precondition describes no input at all.
+        let (discharged, satisfiability) = smt::with_fresh(|| {
+            let x = smt::var(8);
+            // `x < 3 && x > 10` admits nothing, so `pre => post` is vacuously true.
+            let c = ensures(
+                requires(smt::and(smt::ult_const(x, 3), smt::ugt_const(x, 10))),
+                smt::ult_const(x, 100),
+            );
+            (c.discharge(), c.precondition_satisfiability())
+        });
+        assert!(discharged.is_proved(), "the implication is vacuously valid");
+        assert_eq!(
+            satisfiability,
+            Verdict::Unsat,
+            "and the precondition is the reason: no input satisfies it"
+        );
     }
 
     #[test]

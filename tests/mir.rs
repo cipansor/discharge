@@ -724,3 +724,45 @@ fn a_panic_on_every_input_is_a_failure() {
         "an add that always overflows must be a failure, got: {o}"
     );
 }
+
+/// An `Unsat` postcondition must not be described as a universal truth.
+///
+/// A postcondition query is `path => post`. `Unsat` means it is false on *every*
+/// input -- the postcondition holds for none. A `Valid` panic query means the
+/// opposite, that the failure fires on *every* input. Both leave no witness, and
+/// the first version collapsed both to "holds for every input", which describes
+/// an impossible postcondition as a universal truth. The two diagnoses must
+/// differ, and the `Unsat` one must say the postcondition holds for no input.
+#[test]
+fn an_impossible_postcondition_says_so_rather_than_the_opposite() {
+    let Some(report) = verify_all() else { return };
+    let o = outcome(&report, "bool_ret_false");
+    let FnOutcome::Failed { kind, detail } = o else {
+        panic!("`bool_ret_false` must fail, got: {o}");
+    };
+    assert_eq!(kind, "postcondition");
+    assert!(
+        detail.contains("no input"),
+        "an `Unsat` postcondition must be reported as holding for no input, got: {detail}"
+    );
+    assert!(
+        !detail.contains("holds for every input"),
+        "the diagnosis is reversed: an `Unsat` postcondition holds for none, got: {detail}"
+    );
+}
+
+/// The counterpart: a panic query that is `Valid` fires on *every* input, and
+/// its diagnosis must say that rather than borrowing the postcondition wording.
+#[test]
+fn an_always_firing_panic_says_it_fires_on_every_input() {
+    let Some(report) = verify_all() else { return };
+    let o = outcome(&report, "div_by_always_zero");
+    let FnOutcome::Failed { kind, detail } = o else {
+        panic!("`div_by_always_zero` must fail, got: {o}");
+    };
+    assert!(kind.contains("panic"), "the kind must name the panic, got: {kind}");
+    assert!(
+        detail.contains("every input"),
+        "a `Valid` panic query fires on every input and must say so, got: {detail}"
+    );
+}

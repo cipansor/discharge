@@ -1353,12 +1353,21 @@ Honesty matters more than a nice README, so:
    returns `Unknown`, and the test suite asserts exactly that. This is why
    `Unknown` is a first-class verdict: the engine refuses to guess. The wall is
    not removed, only pushed out.
-3. **Two engines, one netlist.** BDDs are canonical and give equivalence
-   checking for free, but they blow up on multipliers. When the BDD arena fills,
-   the *same* bit-level circuit is handed to a CDCL SAT solver (`sat.rs`,
-   `bitblast.rs`) that has no canonical-form wall. Both engines consume one
-   netlist on purpose: two separate bit-slicers would drift, and an adder bug
-   would then be caught in only one place.
+3. **Two engines, one term graph, two blasters.** BDDs are canonical and give
+   equivalence checking for free, but they blow up on multipliers. When the BDD
+   arena fills, the *same* term graph is handed to a CDCL SAT solver (`sat.rs`,
+   `bitblast.rs`) that has no canonical-form wall.
+   The two engines do **not** share a bit-slicer: `smt::blast` writes BDD node
+   ids and `bitblast::blast` writes `Lit`s, and they cannot be one function
+   because both gate arenas are `&mut`. What they share is the term graph, so
+   the *arithmetic* is defined once — a wrong adder is wrong in both engines —
+   and the two slicers are kept structurally identical node-for-node on purpose.
+   The duplication is a divergence risk, and the crate treats it as a property
+   to *check*, not to hope away: `tests/differential.rs` proves a random-formula
+   corpus and requires that neither engine's verdict is ever wrong, and
+   `tests/sat_engine.rs` tests the SAT solver against brute-force enumeration so
+   a solver bug is caught without the blaster in the picture. If the two adders
+   ever disagree, one of those fails.
    The SAT engine is exact but not fast, so it runs under a conflict budget and
    answers `Unknown` when it expires — a verifier that hangs is worse than one
    that declines. The gain is real but specific: `add_comm` at 64 bits is
@@ -1368,6 +1377,13 @@ Honesty matters more than a nice README, so:
    The trade made here is still *no external process, no allocator,
    deterministic memory*. The SAT arena is a `static` in BSS, sized at compile
    time, and a capacity overrun yields `Unknown`, never a wrong verdict.
+   The arena being a `static` also means the `std` build **serializes** every
+   SAT query: both `Mutex` guards are held across the encoding *and* the solve,
+   so two threads whose hard proofs fall back to SAT run one after the other.
+   The BDD engine does not serialize, because its arena is a `thread_local!` on
+   `std`. This is a throughput cost, not a correctness one — the solver is
+   deterministic and the locks are always taken in the same order — and it is
+   the price of a compile-time-sized arena with no allocator.
 4. **`no_std` uses a single static arena**, so the symbolic engine is not
    re-entrant across interrupt contexts. Wrap queries in a critical section, or
    use one context per core. This is documented at the definition site.
