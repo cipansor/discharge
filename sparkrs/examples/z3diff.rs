@@ -26,7 +26,7 @@ fn rand_word(r: &mut Lcg, vars: &[Var], depth: u32) -> Var {
             vars[r.below(vars.len() as u64) as usize]
         };
     }
-    match r.below(9) {
+    match r.below(10) {
         0 => smt::add(rand_word(r, vars, depth - 1), rand_word(r, vars, depth - 1)),
         1 => smt::sub(rand_word(r, vars, depth - 1), rand_word(r, vars, depth - 1)),
         2 => smt::band(rand_word(r, vars, depth - 1), rand_word(r, vars, depth - 1)),
@@ -34,7 +34,25 @@ fn rand_word(r: &mut Lcg, vars: &[Var], depth: u32) -> Var {
         4 => smt::bxor(rand_word(r, vars, depth - 1), rand_word(r, vars, depth - 1)),
         5 => smt::shl(rand_word(r, vars, depth - 1), r.below(w as u64 + 2) as u32),
         6 => smt::lshr(rand_word(r, vars, depth - 1), r.below(w as u64 + 2) as u32),
+        // Narrowing truncate.
         7 => smt::truncate(rand_word(r, vars, depth - 1), 1 + r.below(w as u64) as u8),
+        // Widening truncate, paired with a narrowing back to `w`.
+        //
+        // A bare widening would leave the result wider than `w`, and every other operation
+        // here is width-preserving: the predicates compare two `rand_word`s with `eq`/`ult`,
+        // which are ill-formed across widths, so a widened result would make most of the
+        // generator's output refused rather than checked. The pair keeps the width at `w`
+        // while exercising *both* printer branches: the inner `truncate` (width `wide > w`)
+        // is the `zero_extend` case and the outer one the `extract` case. That matters
+        // because the `zero_extend` branch was itself a bug -- emitting `((_ extract 15 0)
+        // x0_8)`, which z3 rejects as ill-sorted -- and until this case existed the harness
+        // never reached it, so the README's "truncate in both directions" was a claim the
+        // oracle did not test.
+        8 => {
+            let x = rand_word(r, vars, depth - 1);
+            let wide = w + 1 + r.below(8) as u8;
+            smt::truncate(smt::truncate(x, wide), w)
+        }
         _ => smt::ite(rand_pred(r, vars, depth - 1), rand_word(r, vars, depth - 1), rand_word(r, vars, depth - 1)),
     }
 }

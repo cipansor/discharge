@@ -363,8 +363,8 @@ one-bit connectives as `and`/`or`/`xor`/`not`; `Bits` prints comparisons as
 predicates over 1-, 2-, 3-, 4-, 8- and 12-bit variables, with arithmetic, bitwise ops, shifts
 (including over-shifts), `truncate` in both directions, and `ite`; asks the engine; exports the
 same predicate; and asks z3. Measured with the current harness: 800 predicates — 0 parse errors,
-0 disagreements, 29 refused, 0 undecided; 3000 predicates — 0 parse errors, 0 disagreements,
-108 refused, 0 undecided.
+0 disagreements, 25 refused, 0 undecided; 3000 predicates — 0 parse errors, 0 disagreements,
+97 refused, 0 undecided.
 "Refused" means the engine answered `Unknown` (typically a mixed-width term) and the exporter
 declined to write a query for it, so there is nothing for z3 to contradict. "Undecided" is the
 other way an `Unknown` can arise: the export *is* well formed, but the engine gave no verdict, so

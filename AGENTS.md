@@ -1370,3 +1370,33 @@ in the comment. The README's measured line now carries it too. This is the same 
 rest of the crate's findings: a summary that can outrun the run it summarizes. When you
 write `agree += 1`, name the two things that agreed; if one of them was never asked, it is
 not agreement.
+
+## A documented direction the generator never generated
+
+The README said `examples/z3diff.rs` covers "`truncate` in both directions". The generator's
+`truncate` arm was `truncate(x, 1 + r.below(w))`, and `below(w)` is in `0..w-1`, so the result
+width was always `1..=w` -- always *narrowing*. `truncate` accepts a width above the source
+(it is a zero-extend), and the exporter's `zero_extend` branch is the one that used to be a bug
+(`((_ extract 15 0) x0_8)` on an 8-bit vector, ill-sorted and rejected by z3). So the harness
+advertised the direction that exercises the fragile printer path and never generated it. The
+printer branch was covered by a unit test asserting the text, but never by the oracle that exists
+to catch exactly this: a claim about what was tested that the test did not test.
+
+Fix: a widening arm that pairs `truncate(x, wide)` with a narrowing `truncate(.., w)`. The pair
+matters -- a bare widening leaves the result wider than `w`, and every other operation in the
+generator is width-preserving, so the predicates would compare mismatched widths, the term would be
+refused, and the case would never reach z3. Pairing keeps the width at `w` while putting both
+printer branches in one tree.
+
+Verified by instrumentation, not by inference: a temporary counter for `zero_extend` in the
+exported text reported 35 of 800 files, all accepted by z3 (0 parse errors). Without that check
+"agree went up" would only have meant the generator produced *something* different; it would not
+have shown the intended branch was reached. The counter was removed before committing; the
+generator change is the only diff.
+
+Numbers moved (both re-measured): 800 predicates refused 29 -> 25, agree 771 -> 775; 3000 refused
+108 -> 97, agree 2892 -> 2903; mismatch 0 throughout. The README's measured line was updated.
+
+Lesson: when a comment or README enumerates what a generator covers, check the generator against
+the enumeration one item at a time. "Covers X in both directions" is a claim about a distribution,
+and a distribution can be narrower than its description without any single run looking wrong.
