@@ -4,10 +4,11 @@ Repository-level notes for agents working in this workspace.
 
 ## Layout
 
-- `discharge/` — a Rust crate (`discharge`) that embeds a formal-verification
-  engine: a bit-blasting SMT decision procedure, a symbolic DSL, a
-  Curry–Howard proof kernel, contracts, and exhaustive verification.
-  `no_std`, zero dependencies, allocation-free.
+- The repository root *is* the `discharge` crate: a Rust crate that embeds a
+  formal-verification engine — a bit-blasting SMT decision procedure, a symbolic
+  DSL, a Curry–Howard proof kernel, contracts, and exhaustive verification.
+  `no_std`, zero dependencies, allocation-free. (`src/`, `tests/`, `examples/`,
+  `scripts/`, `Cargo.toml` all live at the root.)
 
 ## Build and test commands
 
@@ -18,7 +19,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
 ```bash
-cd discharge
+# Run from the repository root.
 
 # Host build + full test suite (needs the `std` feature for the thread-local arena)
 cargo test --features std

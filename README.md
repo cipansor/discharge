@@ -1212,7 +1212,15 @@ is instantaneous while a 12-bit multiplier equality is not.
 ## Layout
 
 ```
-discharge/
+.
+├── Cargo.toml          the crate manifest (`no_std`, zero dependencies)
+├── Cargo.lock          committed, and a single package: the dependency set is empty
+├── README.md           this file
+├── AGENTS.md           notes for agents, including the traps that cost the most time
+├── LICENSE             MIT OR Apache-2.0
+├── .github/
+│   └── workflows/
+│       └── ci.yml      the gates, plus Kani and Verus as hard-gate jobs
 ├── src/
 │   ├── lib.rs          crate root: module map, prelude, the three proof routes
 │   ├── smt.rs          the decision procedure (the heart of the crate)
@@ -1249,6 +1257,7 @@ discharge/
 │   ├── memory.rs          read/store, the frame condition, and a fill loop
 │   ├── contracts.rs       procedures verified once, calls reasoned about by contract
 │   ├── report_probe.rs    a report's verdict must not depend on the arena it is read in
+│   ├── probe.rs           the scaling wall, printed as a table
 │   ├── z3diff.rs          differential harness: engine vs z3 on the exported text
 │   │                      (needs z3-solver; a development tool, not a dependency)
 │   ├── kanidiff.rs        differential harness: engine vs Kani on compiled Rust
