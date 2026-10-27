@@ -1234,8 +1234,10 @@ discharge/
 │   ├── memory.rs          read/store, the frame condition, and a fill loop
 │   ├── contracts.rs       procedures verified once, calls reasoned about by contract
 │   ├── report_probe.rs    a report's verdict must not depend on the arena it is read in
-│   └── z3diff.rs          differential harness: engine vs z3 on the exported text
-│                          (needs z3-solver; a development tool, not a dependency)
+│   ├── z3diff.rs          differential harness: engine vs z3 on the exported text
+│   │                      (needs z3-solver; a development tool, not a dependency)
+│   └── kanidiff.rs        differential harness: engine vs Kani on compiled Rust
+│                          (needs `cargo kani`; a development tool, not a dependency)
 └── scripts/
     ├── gate.sh            every gate in one command, failing loudly
     └── test-count.sh      the exact passing-test count, only when all pass
@@ -1259,7 +1261,47 @@ cargo build --no-default-features --target thumbv7em-none-eabihf
 `no_std` build, a zero-dependency check, and the z3 differential oracle. It exists because
 the gates were previously five separate commands quoted in prose, which is how a gate
 quietly stops being run. It also refuses to report success when the z3 oracle is not
-installed: an oracle that did not run is not evidence about the exporter.
+installed: an oracle that did not run is not evidence about the exporter. A sixth gate runs
+the Kani differential oracle when `cargo kani` is present and *skips it loudly* when it is
+not, because Kani is a large download (a pinned nightly plus CBMC) that a normal local run
+should not pay for; CI installs it and runs it as a hard gate.
+
+### A second oracle, for the engine instead of the exporter
+
+`z3diff` checks the *exporter*: it prints a query and asks z3 to agree about that text.
+`examples/kanidiff.rs` checks the *engine*: it takes predicates the engine proved, compiles
+each into a real Rust function, and asks **Kani** — AWS's model checker, over CBMC — to
+verify the same property of the compiled code. Kani never sees a symbolic term or an
+SMT-LIB string, so agreement is agreement between two independently built decision
+procedures, which is a stronger claim than agreeing with a printer.
+
+The design detail that matters is that the predicate and the Rust text are *not* generated
+independently. They are two interpretations of one shared IR tree (`WExpr`/`PExpr`), so "the
+same property" is structural rather than hoped for; generating them separately would compare
+unrelated formulas and every disagreement would be noise.
+
+The harness has been checked for teeth by mutation, which is the only way to know it asks a
+real question. Dropping the `+1` from the `Sub` blast (`borrow = TRUE` → `FALSE`) makes the
+engine reject three true identities (`sub_self`, `add_sub_cancel`, `sub_zero`); changing the
+`Eq` blast from `and` to `or` over the per-bit equalities makes it prove false ones, which
+the random sweep catches as `MISMATCH rand_N`. The harness also carries a negative control —
+`a - b == b - a`, false by construction — and fails if either side *proves* it, so a run
+where "everything agreed" because nothing was really asked cannot pass.
+
+Two divergences surfaced while building it, and both are worth stating because they are
+where a plausible harness would have quietly lied. First, the engine defines a shift by
+`k >= width` to be 0 (or the sign bit), the SMT-LIB rule, while Rust's `<<`/`>>` are an
+overflow error there; emitting `x << k` would have compared a different function, so the
+generated crate spells the engine's rule out in `shl_eng`/`lshr_eng`/`ashr_eng`. Second,
+sharing one engine arena across all cases exhausted the node budget after about a dozen
+queries, so later cases came back `Unknown` and the harness reported the engine as weak when
+the *harness* had run the arena dry. Each case now gets its own `with_fresh` arena. Both
+were found by the harness failing, not by reading.
+
+The engine's `Unknown` on `mul_comm` (an 8×8 multiplier) is the documented size wall, not a
+disagreement: Kani proves the identity, so the engine is incomplete there, which the harness
+counts separately (`undecided_identity=1`) and does not fail on. A *refuted* identity is a
+soundness failure and does fail the run.
 
 The `differential` test is the one that makes the approach trustworthy: for a
 family of predicates it checks that the symbolic prover and brute-force

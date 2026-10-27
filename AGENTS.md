@@ -1564,3 +1564,44 @@ which fails when the arm is reverted to a silent drop. Lesson, same as the frame
 comment justifies leaving one site different from its siblings, test that site's own observable
 -- here the completeness flag -- not the end-to-end verdict, which stays correct for the wrong
 reason.
+
+## The Kani oracle: a second verifier, and the bugs building it exposed
+
+`examples/kanidiff.rs` checks the engine against Kani (model checking over CBMC), the same
+way `z3diff` checks the exporter against z3: Kani is a subprocess oracle, never a
+dependency. The predicate and the Rust text it compiles are two interpretations of one
+shared IR tree, not independently generated -- otherwise "the same property" is a hope.
+
+Building it found three bugs, all in the harness, each of which would have made a green run
+mean less than it looked:
+
+1. **Arena sharing.** One `with_fresh` for all cases exhausted the node budget after ~a
+   dozen queries, so later cases came back `Unknown` and the harness reported the engine as
+   weak (`not_proved=27`). The engine was fine; the harness had run the arena dry. Each case
+   now gets its own arena.
+2. **Shift semantics.** The engine defines a shift by `k >= width` to be 0 / sign bit
+   (SMT-LIB rule); Rust `<<`/`>>` are an arithmetic-overflow error there. Emitting `x << k`
+   would have compared a different function. The generated crate now spells the engine's
+   rule out in `shl_eng`/`lshr_eng`/`ashr_eng`.
+3. **The classification matrix.** The first version counted "engine refuted + Kani proved"
+   as agreement. A mutated `Sub` blast then produced `mismatch=0` on the random sweep and
+   was caught only by the curated corpus. Now only `Unknown` is "no claim"; any other
+   engine verdict is a definite claim Kani must not contradict. Found by mutating the
+   engine, not by reading.
+
+Two corpus entries were also wrong (a bare `Not(And(..))` is not De Morgan; `guard <=>
+ite(guard,a,b)==a` fails at `a==b`), which the engine correctly refuted. Lesson that keeps
+recurring: when the harness disagrees, suspect the harness first, but *check* -- here the
+engine was right both times.
+
+Mutation evidence the harness has teeth: `Sub`'s `borrow = TRUE` -> `FALSE` makes the engine
+refuse `sub_self`/`add_sub_cancel`/`sub_zero`; `Eq`'s per-bit `and` -> `or` makes it prove
+false formulas, caught by the random sweep. Negative control `a - b == b - a` fails the run
+if either side proves it.
+
+## GitHub Actions
+
+`.github/workflows/ci.yml` has two jobs. The first runs `scripts/gate.sh` verbatim, so CI and
+a local run mean the same thing. The second installs Kani (cached) and runs `kanidiff` as a
+hard gate. `gate.sh`'s Kani step skips when `cargo kani` is absent -- reported, not silent --
+because Kani is a large download; CI is where it becomes mandatory.
