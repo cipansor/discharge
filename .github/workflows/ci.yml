@@ -79,3 +79,38 @@ jobs:
       - name: Run the Kani oracle
         working-directory: discharge
         run: cargo run -q --features std --example kanidiff -- 64
+
+  verus:
+    name: verus differential oracle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      # Verus ships a self-contained release bundle (its own `z3`, and it needs one pinned
+      # rustc toolchain of its own). We take the latest release rather than pinning a tag,
+      # because the point of this job is "does the engine agree with an *independent*
+      # verifier", and the interesting failures are Verus changing its mind, not ours.
+      - name: Download the Verus release
+        run: |
+          set -e
+          url=$(curl -fsSL https://api.github.com/repos/verus-lang/verus/releases/latest \
+                | python3 -c "import sys,json; print([a['browser_download_url'] for a in json.load(sys.stdin)['assets'] if a['name'].endswith('x86-linux.zip')][0])")
+          curl -fsSL -o verus.zip "$url"
+          python3 -c "import zipfile; zipfile.ZipFile('verus.zip').extractall('.')"
+          chmod +x verus-x86-linux/verus verus-x86-linux/rust_verify verus-x86-linux/z3
+          echo "$PWD/verus-x86-linux" >> "$GITHUB_PATH"
+          # Verus needs its own pinned rustc; install it so the driver can find it.
+          rustup install "$(verus-x86-linux/verus --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-x86_64-unknown-linux-gnu' | head -1)"
+
+      # Hard gate, same as the Kani job: a disagreement, a refuted identity, or a missing
+      # verdict all fail the run.
+      - name: Run the Verus oracle
+        working-directory: discharge
+        env:
+          VERUS_BIN: ${{ github.workspace }}/verus-x86-linux/verus
+        run: cargo run -q --features std --example verusdiff -- 64

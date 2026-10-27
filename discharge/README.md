@@ -1236,8 +1236,12 @@ discharge/
 │   ├── report_probe.rs    a report's verdict must not depend on the arena it is read in
 │   ├── z3diff.rs          differential harness: engine vs z3 on the exported text
 │   │                      (needs z3-solver; a development tool, not a dependency)
-│   └── kanidiff.rs        differential harness: engine vs Kani on compiled Rust
-│                          (needs `cargo kani`; a development tool, not a dependency)
+│   ├── kanidiff.rs        differential harness: engine vs Kani on compiled Rust
+│   │                      (needs `cargo kani`; a development tool, not a dependency)
+│   ├── verusdiff.rs       differential harness: engine vs Verus on a spec fn
+│   │                      (needs the Verus driver; a development tool, not a dependency)
+│   └── support/           the IR the two engine harnesses share, so they check the
+│                          same formulas rather than two drifting corpora
 └── scripts/
     ├── gate.sh            every gate in one command, failing loudly
     └── test-count.sh      the exact passing-test count, only when all pass
@@ -1261,47 +1265,74 @@ cargo build --no-default-features --target thumbv7em-none-eabihf
 `no_std` build, a zero-dependency check, and the z3 differential oracle. It exists because
 the gates were previously five separate commands quoted in prose, which is how a gate
 quietly stops being run. It also refuses to report success when the z3 oracle is not
-installed: an oracle that did not run is not evidence about the exporter. A sixth gate runs
-the Kani differential oracle when `cargo kani` is present and *skips it loudly* when it is
-not, because Kani is a large download (a pinned nightly plus CBMC) that a normal local run
-should not pay for; CI installs it and runs it as a hard gate.
+installed: an oracle that did not run is not evidence about the exporter. Two further gates
+run the Kani and Verus differential oracles when those tools are present and *skip them
+loudly* when they are not, because both are large downloads (Kani: a pinned nightly plus
+CBMC; Verus: a self-contained bundle with its own z3) that a normal local run should not pay
+for; CI installs them and runs them as hard gates.
 
-### A second oracle, for the engine instead of the exporter
+### Two more oracles, for the engine instead of the exporter
 
 `z3diff` checks the *exporter*: it prints a query and asks z3 to agree about that text.
-`examples/kanidiff.rs` checks the *engine*: it takes predicates the engine proved, compiles
-each into a real Rust function, and asks **Kani** — AWS's model checker, over CBMC — to
-verify the same property of the compiled code. Kani never sees a symbolic term or an
-SMT-LIB string, so agreement is agreement between two independently built decision
-procedures, which is a stronger claim than agreeing with a printer.
+`examples/kanidiff.rs` and `examples/verusdiff.rs` check the *engine*. Each takes predicates
+the engine proved, compiles them into real programs, and asks an independent verifier to
+prove the same property of that program:
 
-The design detail that matters is that the predicate and the Rust text are *not* generated
-independently. They are two interpretations of one shared IR tree (`WExpr`/`PExpr`), so "the
-same property" is structural rather than hoped for; generating them separately would compare
-unrelated formulas and every disagreement would be noise.
+* `kanidiff` compiles each case into a Rust function and asks **Kani** (AWS's model checker,
+  over CBMC) to verify it.
+* `verusdiff` compiles each case into a Verus `spec fn` and asks **Verus** (Viper plus SMT,
+  with bit-vector reasoning) to verify it.
 
-The harness has been checked for teeth by mutation, which is the only way to know it asks a
-real question. Dropping the `+1` from the `Sub` blast (`borrow = TRUE` → `FALSE`) makes the
+Neither backend ever sees a symbolic term or an SMT-LIB string, and the two are built on
+different foundations, so agreement is agreement between three independently built decision
+procedures. A blasting bug now has to survive agreement with *both* of them, which is a much
+narrower coincidence than surviving one.
+
+The design detail that matters is that the predicate and the generated program are *not*
+produced independently. They are interpretations of one shared IR tree (`WExpr`/`PExpr`, in
+`examples/support/mod.rs`), so "the same property" is structural rather than hoped for; and
+the two harnesses share that module, so they are checking the same formulas rather than two
+corpora that drift apart. Generating predicate and program separately would compare unrelated
+formulas and every disagreement would be noise.
+
+The harnesses have been checked for teeth by mutation, which is the only way to know they ask
+a real question. Dropping the `+1` from the `Sub` blast (`borrow = TRUE` → `FALSE`) makes the
 engine reject three true identities (`sub_self`, `add_sub_cancel`, `sub_zero`); changing the
-`Eq` blast from `and` to `or` over the per-bit equalities makes it prove false ones, which
-the random sweep catches as `MISMATCH rand_N`. The harness also carries a negative control —
-`a - b == b - a`, false by construction — and fails if either side *proves* it, so a run
-where "everything agreed" because nothing was really asked cannot pass.
+`Eq` blast from `and` to `or` over the per-bit equalities makes it prove false ones. Both
+mutations are caught by both harnesses, the second as `MISMATCH rand_N` on the random sweep.
+Each harness also carries a negative control — `a - b == b - a`, false by construction — and
+fails if either side *proves* it, so a run where "everything agreed" because nothing was
+really asked cannot pass.
 
-Two divergences surfaced while building it, and both are worth stating because they are
-where a plausible harness would have quietly lied. First, the engine defines a shift by
-`k >= width` to be 0 (or the sign bit), the SMT-LIB rule, while Rust's `<<`/`>>` are an
-overflow error there; emitting `x << k` would have compared a different function, so the
-generated crate spells the engine's rule out in `shl_eng`/`lshr_eng`/`ashr_eng`. Second,
-sharing one engine arena across all cases exhausted the node budget after about a dozen
-queries, so later cases came back `Unknown` and the harness reported the engine as weak when
-the *harness* had run the arena dry. Each case now gets its own `with_fresh` arena. Both
-were found by the harness failing, not by reading.
+Four divergences surfaced while building these, and all are worth stating because they are
+where a plausible harness would have quietly lied:
+
+1. **Arena sharing.** One engine arena for all cases exhausted the node budget after about a
+   dozen queries, so later cases came back `Unknown` and the harness reported the engine as
+   weak when the *harness* had run the arena dry. Each case now gets its own arena.
+2. **Shift semantics.** The engine defines a shift by `k >= width` to be 0 (or the sign bit),
+   the SMT-LIB rule, while Rust's `<<`/`>>` are an overflow error there. Emitting `x << k`
+   would have compared a different function, so the generated programs spell the engine's rule
+   out in `shl_eng`/`lshr_eng`/`ashr_eng`.
+3. **The classification matrix.** The first version counted "engine refuted + backend proved"
+   as agreement. A mutated engine then produced `mismatch=0` and was caught only by the
+   curated corpus. Now only the engine's `Unknown` is "no claim"; every other engine verdict
+   is a definite claim the backend must not contradict.
+4. **Verus's arithmetic and its summary counts.** `#[verifier(bit_vector)]` rejects
+   `wrapping_mul` when an operand is a literal, and a constant like `255u8 * 255u8` is a
+   rustc const-eval overflow error that aborts the whole run, so the generated file routes
+   arithmetic through spec helpers that wrap via `as u8`. And Verus's
+   `verification results:: N verified, M errors` counts non-case items such as `main`, so the
+   accounting check is on error *locations*, not on that sum.
+
+Two corpus entries were also wrong — a bare `Not(And(..))` is not De Morgan, and
+`guard <=> ite(guard,a,b)==a` fails at `a==b` — and the engine correctly refuted both. The
+lesson that keeps recurring: when a harness disagrees, suspect the harness first, but *check*.
 
 The engine's `Unknown` on `mul_comm` (an 8×8 multiplier) is the documented size wall, not a
-disagreement: Kani proves the identity, so the engine is incomplete there, which the harness
-counts separately (`undecided_identity=1`) and does not fail on. A *refuted* identity is a
-soundness failure and does fail the run.
+disagreement: both backends prove the identity, so the engine is incomplete there, which the
+harnesses count separately (`undecided_identity=1`) and do not fail on. A *refuted* identity
+is a soundness failure and does fail the run.
 
 The `differential` test is the one that makes the approach trustworthy: for a
 family of predicates it checks that the symbolic prover and brute-force
@@ -1346,6 +1377,15 @@ code. Second, the niche it does occupy — a checked contract that can be
 discharged *on the target*, with no solver in the loop — is not one the big
 tools aim at, and it is the same niche a `no_std` flight build actually needs.
 
+They are not rivals here so much as a second opinion. The crate uses Kani and
+Verus as *differential oracles* in its test suite (`examples/kanidiff.rs`,
+`examples/verusdiff.rs`): the engine's verdict on a predicate is checked against
+each tool's verdict on the equivalent compiled program, so the three decision
+procedures have to agree. They are invoked as subprocesses and are never
+dependencies — the shipped crate still has none — but "an independent verifier
+agrees" is a much stronger claim than "the tests pass", and it is available
+precisely because these tools exist.
+
 ### Rust is moving toward contracts
 
 This is the part that makes the design timely rather than idiosyncratic. Rust is
@@ -1372,8 +1412,9 @@ Useful, in a narrow band. For safety-critical or embedded Rust where you want
 SPARK-style contracts and a machine-checked discharge with **no external
 toolchain and no solver process** — an MCU, a flight build, a `no_std` target
 where you cannot ship Z3 — this is a working sketch of how to get there, and it
-is checked hard (differential testing against Z3, mutation testing of its own
-guards, a test suite that fails when a soundness guard is removed). The popular
+is checked hard: differential testing of the exporter against Z3, differential
+testing of the *engine* against both Kani and Verus, mutation testing of its own
+guards, and a test suite that fails when a soundness guard is removed. The popular
 `contracts` crate does runtime checking only; the gap between "assert at run
 time" and "prove for all inputs" is exactly the gap this crate is about.
 

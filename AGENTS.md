@@ -1599,9 +1599,35 @@ refuse `sub_self`/`add_sub_cancel`/`sub_zero`; `Eq`'s per-bit `and` -> `or` make
 false formulas, caught by the random sweep. Negative control `a - b == b - a` fails the run
 if either side proves it.
 
+## Verus as a third oracle
+
+`examples/verusdiff.rs` checks the engine against Verus the way `kanidiff` checks it against
+Kani. Both harnesses now take their cases and IR from `examples/support/mod.rs`, so they
+check the *same* formulas; giving each its own corpus would make the two agreement claims
+disjoint. Three backends (the engine, Kani, Verus) on different foundations means a blasting
+bug has to survive agreement with both verifiers.
+
+Verus facts that cost time to find, all in the generated-file path:
+
+* `#[verifier(bit_vector)]` is required or Verus uses non-linear arithmetic and fails on
+  bitwise facts. With it, `+ - *` on `u8` wrap.
+* `wrapping_mul(x, 1u8)` is *rejected* in `bit_vector` mode: "expected finite-width integer
+  in `bit_vector` proof, got Int(Nat)". Route arithmetic through spec helpers
+  (`(x * y) as u8`) instead.
+* A constant expression that overflows, e.g. `255u8 * 255u8`, is a rustc const-eval *error*
+  that aborts the whole run -- `#![allow(arithmetic_overflow)]` does not help. The spec-helper
+  form avoids it because operands are already `int`.
+* `verification results:: N verified, M errors` counts non-case items (`main`, helpers), so
+  `verified + errors == cases.len()` is false. Account on error *locations* mapping to cases,
+  and fail on any error that maps to none.
+* Install: download the `x86-linux` release zip (self-contained, own `z3`), extract, chmod +x
+  `verus`/`rust_verify`/`z3`, then `rustup install <the pinned toolchain verus --version
+  prints>`. Point `VERUS_BIN` at the driver.
+
 ## GitHub Actions
 
 `.github/workflows/ci.yml` has two jobs. The first runs `scripts/gate.sh` verbatim, so CI and
-a local run mean the same thing. The second installs Kani (cached) and runs `kanidiff` as a
-hard gate. `gate.sh`'s Kani step skips when `cargo kani` is absent -- reported, not silent --
-because Kani is a large download; CI is where it becomes mandatory.
+a local run mean the same thing. The other two install Kani (cached) and Verus (latest
+release) and run `kanidiff` and `verusdiff` as hard gates. `gate.sh`'s Kani and Verus steps
+skip when those tools are absent -- reported, not silent -- because both are large downloads;
+CI is where they become mandatory. Gate count is now 7.
