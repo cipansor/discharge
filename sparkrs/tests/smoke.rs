@@ -158,6 +158,25 @@ fn a_stale_memory_is_refused_not_misread() {
 }
 
 #[test]
+fn the_sentinel_is_not_a_real_variable() {
+    // `Var::SENTINEL` is the zero-filler for the fixed-size buffers in `wp`, and the
+    // frame computation assumes it can never equal a live handle. That was false: the
+    // sentinel was `Term(0)` and the allocator handed out ids from 0, so
+    // `Var::SENTINEL == var(8)` held -- the opposite of the comment that promised slot 0
+    // "is never a real variable". Every reader happens to be `[..n]`-counted, so nothing
+    // broke, but an invariant a reviewer would rely on was not true. Term id 0 is now
+    // reserved (`smt::TERM_SENTINEL`), and this pins that.
+    smt::with_fresh(|| {
+        let first = var(8);
+        assert_ne!(first, Var::SENTINEL, "the first real variable is not the sentinel");
+        // And no variable declared afterwards collides either.
+        for _ in 0..64 {
+            assert_ne!(var(8), Var::SENTINEL, "no real variable may equal the sentinel");
+        }
+    });
+}
+
+#[test]
 fn fresh_handles_still_decide_normally() {
     // The teeth. A check that refused everything would pass the two tests above and break
     // the crate. Inside one arena, ordinary queries must still be decided.

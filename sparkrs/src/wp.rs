@@ -1203,8 +1203,11 @@ impl Frame {
 /// complete. See [`Frame`] for why completeness has to be part of the result.
 pub fn writes(s: &Stmt<'_>) -> Frame {
     let mut frame = Frame {
-        // Slot 0 is never a real variable: `var()` starts indices at 0, but a
-        // sentinel is all the initialisation needs and it is overwritten before use.
+        // Zero-initialised with the sentinel. The reads below are `[..n]`-counted, so the
+        // filler is never *read*, but it is what `[Var::SENTINEL; MAX_WRITES]` means, and
+        // `Var::SENTINEL` is a reserved term id that no real variable can equal (see
+        // `smt::TERM_SENTINEL`). This comment used to claim slot 0 "is never a real
+        // variable" while the sentinel was in fact `Term(0)`, the first real term.
         vars: [Var::SENTINEL; MAX_WRITES],
         n: 0,
         complete: true,

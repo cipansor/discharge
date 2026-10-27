@@ -38,6 +38,19 @@ pub const ARENA_BYTES: usize =
 /// Maximum number of symbolic variables per thread.
 pub const MAX_VARS: usize = 256;
 
+/// Term id 0 is reserved, never a real term.
+///
+/// [`Var::SENTINEL`] is `Var(Term(TERM_SENTINEL))`, and it has to be distinguishable from
+/// every real term, because the fixed-size buffers in [`crate::wp`] use it as their
+/// "no variable here" filler and rely on it never colliding with a live handle. It did
+/// collide: the allocator handed out ids from 0, so `Term(0)` was the *first* real term,
+/// and `Var::SENTINEL == var(8)` held -- the exact opposite of the comment on
+/// `wp::writes` that promised "slot 0 is never a real variable". The collision was latent
+/// because every reader is `[..n]`-counted, but an invariant a reviewer would lean on was
+/// simply false. Reserving id 0 makes it true, and the reserved slot is one term out of
+/// [`CAP`].
+pub const TERM_SENTINEL: u32 = 0;
+
 /// Maximum number of assignments reported in a counterexample.
 pub const MAX_CEX: usize = 16;
 
@@ -322,7 +335,8 @@ impl Ctx {
     const fn new() -> Self {
         Ctx {
             terms: [Node { op: Op::Const, a: 0, b: 0, c: 0, width: 0, hi: 0 }; CAP],
-            n_terms: 0,
+            // Starts at 1: id 0 is reserved for [`TERM_SENTINEL`]. See its docs.
+            n_terms: TERM_SENTINEL as usize + 1,
             term_key: [u64::MAX; CAP],
             term_val: [0; CAP],
             term_mask: 0,
@@ -361,7 +375,8 @@ impl Ctx {
     /// would materialise a large temporary on the stack (bad on small firmware
     /// stacks) just to throw it away.
     fn reset(&mut self) {
-        self.n_terms = 0;
+        // Id 0 stays reserved for [`TERM_SENTINEL`]; real terms start at 1.
+        self.n_terms = TERM_SENTINEL as usize + 1;
         self.n_nodes = 2;
         self.n_vars = 0;
         self.overflow = false;
@@ -1337,7 +1352,13 @@ impl Var {
     ///
     /// Not a usable variable: comparing against it is a way to say "no variable
     /// here". It exists so that the frame computation needs no allocator.
-    pub const SENTINEL: Var = Var(Term(0));
+    ///
+    /// It is [`crate::smt::TERM_SENTINEL`], a term id the allocator never hands out, so
+    /// it is distinguishable from every real variable. That is not decorative: the
+    /// buffers in [`crate::wp`] are fixed-size and zero-initialised with this, and the
+    /// reads are `[..n]`-counted, but the whole scheme assumes a sentinel cannot equal a
+    /// live handle. When id 0 *was* the first real term, `Var::SENTINEL == var(8)` held.
+    pub const SENTINEL: Var = Var(Term(TERM_SENTINEL));
 }
 
 /// A symbolic boolean predicate (a width-1 term).

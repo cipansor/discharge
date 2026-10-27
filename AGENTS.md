@@ -1435,3 +1435,36 @@ assertion that cannot fail also cannot detect the bug it was written for. Source
 Lesson: a test of an operation must compare the result against something *other than the
 expression that produced it*. When the operands are hash-consed, `eq(t, f(x))` where `t == f(x)` is
 not a weak test, it is no test. Pin an input, or compare against an independently computed value.
+
+## A sentinel that was the first real variable
+
+`wp.rs` had a comment on `writes` that read: "Slot 0 is never a real variable: `var()` starts
+indices at 0, but a sentinel is all the initialisation needs". The buffer it describes is
+`[Var::SENTINEL; MAX_WRITES]`, and `Var::SENTINEL` was `Var(Term(0))`. The term arena allocated ids
+from 0, so `Term(0)` was the *first real term*, and `Var::SENTINEL == var(8)` was true. The
+comment said the opposite of what the code did.
+
+It was latent: every reader of those buffers is `[..n]`-counted, and no code compares a handle
+against `SENTINEL` by value, so nothing was wrong at runtime. But the frame rule's whole design
+leans on the sentinel being distinguishable from a live handle -- `MAX_WRITES` fixed buffers,
+`out[..n]`-counted reads, no allocator -- and the one line a reviewer would check to confirm that
+assumption was false. An invariant that is false and untested is a landmine for the next change
+that does compare, or for anyone who trusts the comment.
+
+Found by reading `SENTINEL`'s definition against `mk_term`, then confirmed by probe: a temporary
+example printed `var(8) == SENTINEL ? true`. The fix is to make the claim true rather than delete
+it: reserve term id 0 (`smt::TERM_SENTINEL`), start `n_terms` at 1 in both `Ctx::new` and `reset`,
+and point `SENTINEL` at it. Cost is one term out of `CAP`. A regression test,
+`the_sentinel_is_not_a_real_variable`, asserts `var(8) != Var::SENTINEL` -- it failed before the
+fix and passes after, so it is not a comment about the fix.
+
+Note the same `Term(0)` also appears as the *overflow* return in `mk_term`, `var_term`, and
+`subst`. Those are deliberate: they poison the handle and set `overflow`/`stale`, and `prove`
+checks the flag before answering, so a bogus `Term(0)` never reaches a verdict -- `smoke.rs`
+documents measuring exactly that. Reserving id 0 leaves those paths alone; they return the reserved
+id, which is still not a valid node, and the flag is still what refuses the query.
+
+Lesson: when a comment asserts an invariant ("slot 0 is never a real variable"), it is a claim
+like any other and deserves a test. If the invariant is load-bearing, make it true and pin it;
+deleting the comment would have hidden a real coupling between `wp`'s buffers and the arena's id
+allocation.
