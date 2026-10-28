@@ -2282,6 +2282,28 @@ Traps that cost time, in the order they cost it:
   dies with `cannot open shared object file`. `build.rs` bakes `-Wl,-rpath,$(rustc --print
   sysroot)/lib` in, using the `RUSTC` cargo is building with. `run.sh` sets both `RUSTC` (what
   cargo builds *with*) and `DISCHARGE_RUSTC` (what the frontend *runs*) to the same nightly.
+* **`rustc-dev` alone is not enough: `llvm-tools-preview` is required too, and the error
+  misreports the cause.** `rustc` links `libLLVM`, and cargo puts
+  `<sysroot>/lib/rustlib/<target>/lib` on the build script's `LD_LIBRARY_PATH`. A bare
+  toolchain keeps `libLLVM` in `<sysroot>/lib`; it reaches `rustlib/<target>/lib` only via
+  `llvm-tools-preview`. That directory *takes precedence* over the `$ORIGIN/../lib` RUNPATH in
+  the `rustc` binary, so with only `rustc-dev` the `build.rs` cannot even start
+  `rustc --print sysroot` — and the visible symptom is the *linker* failing with `unable to
+  find library -lLLVM-...`, two steps later. A `-L <sysroot>/lib` flag cannot fix it (the
+  failure is `rustc` failing to start, not `ld`), so `build.rs` now panics naming the
+  component instead of returning quietly. Install
+  `rustup component add rustc-dev llvm-tools-preview --toolchain nightly`.
+* **`cargo clippy` ignores `RUSTC` when choosing its driver.** `RUSTC=<nightly> cargo clippy`
+  still runs the *default* toolchain's `clippy-driver`, so it checks a `rustc_private` crate
+  with the stable driver and reports `can't find crate for rustc_driver` — which reads like a
+  missing component and is not. Use `cargo +nightly clippy`, and install `clippy` onto the
+  nightly (a `--profile minimal` toolchain does not ship it). `cargo build` and `cargo test`
+  *do* honor `RUSTC`, so only the lint step needs this.
+* **`cargo install` is not idempotent, which makes a warm cache a trap.** The Kani job cached
+  `~/.cargo/bin/cargo-kani` and then ran `cargo install` unconditionally; `cargo install`
+  refuses to overwrite (`binary cargo-kani already exists in destination`), so the job could
+  only pass on a cold cache. Guard the install on the binary being absent, and version the
+  cache key so a cache left in the broken state is dropped.
 * **The crate is `exclude`d from the workspace, not a member.** A member would make
   `cargo build --workspace` require a nightly, which breaks the stable zero-dependency build
   that is the whole point of the crate. `exclude = ["tools/mir-oracle"]` plus `cargo build`
@@ -2296,5 +2318,6 @@ The oracle has teeth and it was checked: flipping one arm of `PanicKind::from_te
 and their two panic lists printed. A tool that can only say "agree" is not evidence.
 
 Exit codes are three-way on purpose: `0` agree, `1` a shape disagreed, `2` the oracle could
-not run (no nightly / no `rustc-dev`). Gate 9 skips on `2` and fails on anything else, so
-"the toolchain is missing" is never reported as a parser failure nor as a pass.
+not run (no nightly, or a missing `rustc-dev` / `llvm-tools-preview` component). Gate 9 skips
+on `2` and fails on anything else, so "the toolchain is missing" is never reported as a parser
+failure nor as a pass.
