@@ -1,0 +1,1736 @@
+//! Hoare logic: weakest preconditions, and automatic verification-condition
+//! generation from a small imperative language.
+//!
+//! [`crate::vc`] lets you write a verification condition by hand. This module
+//! *derives* it from the program, the way SPARK does: you state the precondition
+//! and the postcondition, describe the body, and the engine computes what has to
+//! be proved.
+//!
+//! The interesting rule is assignment. Hoare's axiom is
+//!
+//! ```text
+//! wp(x := e, Q) = Q[x := e]
+//! ```
+//!
+//! so `wp` rewrites the postcondition by substitution. That substitution must be
+//! *simultaneous* and bottom-up: `x, y := y, x` has to swap, and a naive top-down
+//! walk captures the wrong variable and proves a falsehood. `tests/wp.rs` checks
+//! this against execution on concrete inputs.
+//!
+//! Everything is `no_std` and allocation-free. A program is a tree of [`Stmt`]
+//! built on the stack; intermediate predicates live in the same arena as
+//! everything else in [`crate::smt`].
+
+use crate::smt::{self, Pred, Var, Verdict};
+
+/// A procedure: a body together with the contract it must satisfy.
+///
+/// The body and the contract live in one value because a call is only sound when
+/// both are known: the *contract* is what the caller may assume, and the *body* is
+/// what has to be verified once. Keeping them together makes it impossible to
+/// assume a postcondition nobody ever proved — the mistake that turns modular
+/// verification into a way of proving anything you like.
+#[derive(Debug, Clone, Copy)]
+pub struct Proc<'a> {
+    /// The name, used in diagnostics.
+    pub name: &'static str,
+    /// The callee's precondition. A call discharges an obligation to establish it.
+    pub requires: Pred,
+    /// The callee's postcondition. A call may assume it, and the body must
+    /// establish it.
+    pub ensures: Pred,
+    /// The body. Verified by [`verify_proc`].
+    pub body: &'a Stmt<'a>,
+}
+
+/// One statement of the imperative fragment.
+///
+/// Branches and loops are references, not indices, so nesting is expressed
+/// directly and `wp` can recurse without any bookkeeping about token ranges.
+/// A [`Stmt::Call`] refers to a [`Proc`], which carries its own contract, so a
+/// program is a tree of statements plus the procedures they call.
+#[derive(Debug, Clone, Copy)]
+pub enum Stmt<'a> {
+    /// `var := expr`
+    Assign {
+        /// The variable written.
+        var: Var,
+        /// The expression assigned to it.
+        expr: Var,
+    },
+    /// A simultaneous multi-assignment, `v1, v2, ... := e1, e2, ...`.
+    ///
+    /// Every right-hand side is read in the *old* state, so this is a parallel
+    /// assignment, not a sequence of single ones. It exists so that a memory write
+    /// composes with verification-condition generation: [`crate::mem::Mem::store_binds`]
+    /// produces the binding list for a store, and handing it here makes the write
+    /// part of the program the engine reasons about.
+    AssignMany {
+        /// The `(target, expression)` pairs. Targets must be distinct; a repeated
+        /// target would make the semantics depend on evaluation order, which is
+        /// exactly what a simultaneous assignment is meant to rule out.
+        binds: &'a [(Var, Var)],
+    },
+    /// Assume `cond`: only states satisfying it continue. This is how a
+    /// precondition or a successful earlier check enters the reasoning.
+    Assume(Pred),
+    /// `assert cond`: an obligation at this point, and an assumption after it.
+    Assert(Pred),
+    /// `if cond { then_ } else { else_ }`
+    If {
+        /// The branch condition.
+        cond: Pred,
+        /// The then-branch.
+        then_: &'a Stmt<'a>,
+        /// The else-branch.
+        else_: &'a Stmt<'a>,
+    },
+    /// `while cond { body }` annotated with a loop invariant, and optionally
+    /// with a variant to prove termination.
+    ///
+    /// The invariant is not optional and not inferred: an unannotated loop
+    /// cannot be verified, which is the same deal SPARK offers. The variant is
+    /// optional, and its absence is exactly the difference between partial and
+    /// total correctness.
+    While {
+        /// The loop guard.
+        cond: Pred,
+        /// The claimed invariant.
+        invariant: Pred,
+        /// An expression, in loop-head terms, that must strictly decrease on
+        /// every iteration. Supplying one turns partial correctness into
+        /// termination as well.
+        ///
+        /// The value after one iteration is computed symbolically by the engine,
+        /// so you write the measure once, not twice.
+        variant: Option<Var>,
+        /// The loop body.
+        body: &'a Stmt<'a>,
+    },
+    /// A call to a procedure, reasoned about through its contract.
+    ///
+    /// The body is *not* re-verified here. Instead the call is sound only if the
+    /// caller has proved the callee's precondition at the point of the call, and
+    /// after the call the caller may assume the callee's postcondition. That is
+    /// what makes verification modular: a procedure is checked once against its
+    /// contract, and every call site costs only the two implications.
+    ///
+    /// [`Stmt::frame`] must hold for the call to be sound at all; the constructor
+    /// checks it.
+    Call {
+        /// The procedure being called.
+        proc_: &'a Proc<'a>,
+        /// `(global, local)` pairs. The callee's `requires` is evaluated over
+        /// `local`, so a call *renames* the procedure's variables to the caller's
+        /// arguments.
+        ///
+        /// The caller's variables that are *not* listed are treated as unchanged
+        /// by the call, which is sound only when the callee cannot touch them. See
+        /// [`Stmt::frame`] for the discipline that makes that true.
+        actuals: &'a [(Var, Var)],
+        /// Variables the callee may modify, in the callee's own names.
+        ///
+        /// `Stmt::frame` is derived from this list, so it does not have to be
+        /// written out by hand and cannot drift from it.
+        writes: &'a [Var],
+    },
+    /// `s1; s2`
+    Seq {
+        /// The first statement.
+        first: &'a Stmt<'a>,
+        /// The second statement.
+        second: &'a Stmt<'a>,
+    },
+    /// `skip`
+    Skip,
+}
+
+/// Which rule generated an obligation. A failure is reported with its rule, so
+/// you know whether the precondition, the body, a loop invariant, or an
+/// assertion is at fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rule {
+    /// `pre => wp(body, post)`: the contract as a whole.
+    ///
+    /// A loop's *entry* condition is discharged here, as part of the enclosing
+    /// context, which is how a backward calculus naturally accounts for it.
+    Body,
+    /// The invariant is preserved by one iteration, under the guard:
+    /// `I && c => wp(body, I)`.
+    LoopPreserve,
+    /// The invariant together with the negated guard implies what the rest of
+    /// the program needs: `I && !c => Q`.
+    LoopExit,
+    /// The variant strictly decreases on every iteration: `I && c => V' < V`.
+    ///
+    /// For an unsigned measure this is the whole rule: a strictly decreasing
+    /// sequence in a well-founded order cannot be infinite. Because the measure
+    /// is a bit-vector expression evaluated with wrapping, a measure that wraps
+    /// around is caught here rather than silently accepted.
+    LoopVariant,
+    /// An in-body assertion holds whenever control reaches it:
+    /// `pre => wp(prefix, c)`, where `prefix` is the code before the assertion.
+    Assertion,
+    /// A call site establishes the callee's precondition:
+    /// `wp(rest, post) => requires[actuals]`.
+    ///
+    /// Failing this means the caller is asking the callee to work in a state the
+    /// callee does not accept. It is *not* a fault in the callee.
+    CallRequires,
+    /// A call could not be modelled at all: the callee may write a variable the
+    /// caller did not name, so the caller's state after the call is unknown.
+    ///
+    /// This is not a proof failure but a modelling one, and it is reported rather
+    /// than asserted so that a whole program can be checked in one run.
+    CallFrame,
+    /// The program has more side obligations than the report can hold, so some were
+    /// not checked.
+    ///
+    /// This exists because silently dropping them is unsound. The cap is
+    /// [`MAX_OBLIGATIONS`], and a dropped obligation is one nobody looked at — so a
+    /// program could report `Total` while a failing `LoopExit` sat in the part that did
+    /// not fit. Reporting the overflow as a *failure* is the only honest answer: the
+    /// claim has to shrink to what was actually checked. See `obligations` for where the
+    /// flag is raised, and `too_many_obligations_is_reported_not_swallowed` in
+    /// `tests/wp.rs`.
+    ObligationOverflow,
+    /// The precondition cannot hold, so the contract is *vacuously* true.
+    ///
+    /// `pre => wp(body, post)` is a theorem when `pre` is unsatisfiable, whatever the
+    /// body and postcondition say. Every obligation discharges, so `is_verified()` would
+    /// return `true` and `establishes()` would say `Total` — for a specification that
+    /// constrains nothing, because no run can reach it. This is the vacuity twin of the
+    /// truncation defects: the first five let a summary outrun its evidence; this one
+    /// gives a proof with no evidence at all.
+    ///
+    /// Reported as a *failure*, for the same reason [`Rule::ObligationOverflow`] is: the
+    /// honest reading is "nothing was proved", not "the contract holds". Reachable
+    /// preconditions are a precondition of the verification, not an assumption about it,
+    /// and nothing else in the tool checks it. `verify_proc` rarely needs the check, since
+    /// a callee's `requires` is normally reachable — but the obligation is generated
+    /// whether or not the caller can reach it, so `CallRequires` still reports a real
+    /// problem on an unreachable path. The gap is `verify` with a hand-written
+    /// precondition, which is the case the probe hit. See
+    /// `an_unreachable_precondition_is_not_a_proof` in `tests/wp.rs`.
+    VacuousPrecondition,
+    /// An [`Stmt::Assume`] cannot hold, so everything after it is unreachable and every
+    /// obligation that follows is vacuously true.
+    ///
+    /// The same failure as [`Rule::VacuousPrecondition`], one level down: the precondition
+    /// is reachable, but a *statement inside the body* cuts the path off. `Assume(false);
+    /// y := 0` with postcondition `y == 99` used to come back `verified` / `Total`, because
+    /// `false => wp(y := 0, y == 99)` is a theorem. The proof constrains nothing, because
+    /// no run reaches the code it is supposed to be about.
+    ///
+    /// A reachable `Assume` is fine and common -- it is how a callee guard or a
+    /// case-analysis split is written -- so this is not "Assume is suspicious", it is
+    /// "this Assume is unsatisfiable". Reported as a *failure*, like the other vacuity
+    /// findings: the honest reading is "nothing was proved", not "the contract holds".
+    /// See `an_unreachable_assume_is_not_a_proof` in `tests/wp.rs`.
+    ///
+    /// The check is *local*: it asks whether the condition can hold at all, not whether it
+    /// can hold on the path that reaches it. `Assume(y < 10)` under a precondition that
+    /// already forces `y >= 10` cuts the path but is individually satisfiable, so it is not
+    /// flagged. That is a limit, not an unsoundness -- the report is still sound, just less
+    /// informative in that case. A per-path check would need the path predicate threaded
+    /// into `collect`, which is the natural next step if this proves too weak in practice.
+    VacuousAssume,
+    /// A call is made to a procedure whose postcondition cannot hold, so the callee never
+    /// returns.
+    ///
+    /// A `Call` is modelled as "assume `ensures`; continue". When `ensures` is
+    /// unsatisfiable that assumption is `false`, so the *continuation* becomes vacuous --
+    /// `false => Q` is a theorem -- and every claim after the call discharges for free.
+    /// A report that also had no loops would then say `verified` / `Total` about a program
+    /// that cannot reach its postcondition, because it never gets past the call. This is
+    /// the call analogue of [`Rule::VacuousAssume`]: a statement inside the body cuts the
+    /// path off, and everything downstream is vacuously true.
+    ///
+    /// Reported as a *failure*, like the other vacuity findings: the honest reading is
+    /// "nothing was proved", not "the contract holds". The callee itself is separately
+    /// unverified -- `verify_proc` on a body of `skip` with `ensures false` fails its own
+    /// contract -- so this finding is about the *caller*, which was trusting a contract
+    /// that no run can satisfy. See `a_call_to_a_never_returning_proc_is_not_total` in
+    /// `tests/call.rs`.
+    DivergentCall,
+}
+
+/// A verification condition, attributed to the rule that produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Obligation {
+    /// The rule this obligation comes from.
+    pub rule: Rule,
+    /// The predicate that must hold for every input.
+    pub goal: Pred,
+    /// The arena generation this obligation was built in. `goal` is a term id, and a
+    /// reset recycles ids, so a report that outlived its arena would otherwise discharge
+    /// an id that now names a different formula — a failing report could read as
+    /// verified. Private: callers should not construct one by hand.
+    generation: u32,
+}
+
+impl Obligation {
+    fn new(rule: Rule, goal: Pred) -> Obligation {
+        Obligation { rule, goal, generation: smt::generation() }
+    }
+
+    /// True if this obligation still refers to the arena that produced it.
+    pub fn is_current(&self) -> bool {
+        self.generation == smt::generation()
+    }
+
+    /// Discharge this obligation with the embedded decision procedure.
+    ///
+    /// Returns [`Verdict::Unknown`] if the arena has been reset since the obligation was
+    /// recorded: the goal is a recycled id and no longer names the formula that was
+    /// generated, so nothing can be concluded. `Unknown` rather than a verdict is the
+    /// honest answer, and it is also the safe one — a stale report reports failure rather
+    /// than success.
+    pub fn discharge(&self) -> Verdict {
+        if !self.is_current() {
+            return Verdict::Unknown;
+        }
+        smt::prove(self.goal)
+    }
+}
+
+/// Collect the side obligations of `s` — loop rules and assertions — and return
+/// the predicate that must hold before `s`, given that `post` must hold after it.
+///
+/// Nothing is discharged here, so the caller can inspect each obligation with the
+/// rule that produced it. The returned predicate is the weakest precondition.
+///
+/// # A subtlety worth stating
+///
+/// The cursor — the predicate required after a statement — is rewritten by the
+/// assignments that dominate it, because it describes the *actual* state. The
+/// obligations recorded along the way are mostly left alone, and that asymmetry
+/// is deliberate:
+///
+/// * An assertion `assert c` is checked in the context of the state that reaches
+///   it, so the dominating assignments *do* apply, and the walk applies them.
+/// * A loop's preservation and exit conditions are universally quantified over
+///   the loop-head state: `I && c => wp(body, I)` has to hold for *every* state
+///   satisfying the invariant, not merely for the states the program can reach.
+///   Rewriting them with the dominating assignments would make them vacuously
+///   true whenever the initialisation pins the variables, which is exactly the
+///   bug that turns a broken invariant into a green check. They are therefore
+///   recorded in loop-head terms and left alone.
+/// * The loop's *entry* condition is not a separate obligation: it is the
+///   contract's own `pre => apply(dominators, I)`, which the cursor produces for
+///   free once the walk continues past the initialisation.
+///
+/// # The returned count can be a prefix, so completeness is returned too
+///
+/// `out` is a fixed-size buffer. A program with more side obligations than `out` holds
+/// gets a *prefix* of them, and a bare count of `MAX_OBLIGATIONS` then means either
+/// "there were exactly that many" or "there were more and some were dropped" — two
+/// different facts with one number. That is the same defect [`writes`] had, and it is
+/// the same fix: the third element of the result is `true` only when every side
+/// obligation of `s` is in `out`. [`verify`] is the safe entry point and turns a `false`
+/// here into a failing [`Rule::ObligationOverflow`]; this function is for a caller who
+/// wants the obligations themselves, and it now says when it could not hand them all over.
+pub fn obligations<'a>(
+    s: &'a Stmt<'a>,
+    post: Pred,
+    out: &mut [Option<Obligation>],
+) -> (Pred, usize, bool) {
+    let (goal, n, overflow, _, _) = obligations_checked(s, post, out);
+    (goal, n, !overflow)
+}
+
+/// [`obligations`], plus whether *any* side obligation had to be dropped.
+///
+/// The flag is the whole point: [`MAX_OBLIGATIONS`] is a fixed-size buffer, and a
+/// program larger than it must not be reported as verified on the strength of the part
+/// that fit. [`verify`] turns a raised flag into a failing [`Rule::ObligationOverflow`]
+/// obligation. Assertions count: a dropped one is still caught by the contract
+/// obligation, but the caller's view of the obligation set is truncated, and a
+/// truncated set must not read as a complete one.
+fn obligations_checked<'a>(
+    s: &'a Stmt<'a>,
+    post: Pred,
+    out: &mut [Option<Obligation>],
+) -> (Pred, usize, bool, bool, bool) {
+    let mut n = 0;
+    let mut overflow = false;
+    let mut vacuous = false;
+    let mut divergent = false;
+    let mut cursor = post;
+    collect(s, &mut cursor, out, 0, &mut n, &mut overflow, &mut vacuous, &mut divergent);
+    (cursor, n, overflow, vacuous, divergent)
+}
+
+/// Walk `s` backwards, appending loop and assertion obligations to `out`.
+///
+/// `cursor` is the predicate required at the current program point *after* the
+/// statement, so the walk starts from the postcondition and ends with the weakest
+/// precondition. This is the direction Hoare logic runs in, and getting it
+/// backwards is the classic way to generate a vacuous verification condition.
+///
+/// `start` is the first slot of `out` that belongs to this statement. An
+/// assignment rewrites only the slots in `start..*n`, which keeps a branch's
+/// assignments from reaching into the sibling branch's obligations while still
+/// letting the enclosing assignments rewrite both.
+#[allow(clippy::too_many_arguments)]
+fn collect<'a>(
+    s: &'a Stmt<'a>,
+    cursor: &mut Pred,
+    out: &mut [Option<Obligation>],
+    start: usize,
+    n: &mut usize,
+    overflow: &mut bool,
+    vacuous: &mut bool,
+    divergent: &mut bool,
+) {
+    match s {
+        Stmt::Seq { first, second } => {
+            // Backwards: handle the second statement first, then the first.
+            collect(second, cursor, out, start, n, overflow, vacuous, divergent);
+            collect(first, cursor, out, start, n, overflow, vacuous, divergent);
+        }
+        Stmt::Assign { var, expr } => {
+            *cursor = smt::substitute(*cursor, &[(*var, *expr)]);
+            // Assertions recorded to the right are reached only after this
+            // assignment, so it dominates them and must be substituted in. Bounded by
+            // `program_limit` so the reserved notice slot is never rewritten here.
+            let stop = (*n).min(program_limit(out));
+            for slot in out[start..stop].iter_mut() {
+                if let Some(ob) = slot {
+                    if ob.rule == Rule::Assertion || ob.rule == Rule::CallRequires {
+                        *slot = Some(Obligation::new(
+                            ob.rule,
+                            smt::substitute(ob.goal, &[(*var, *expr)]),
+                        ));
+                    }
+                }
+            }
+        }
+        Stmt::AssignMany { binds } => {
+            debug_assert!(distinct_targets(binds), "AssignMany targets must be distinct");
+            *cursor = smt::substitute(*cursor, binds);
+            for slot in out[start..*n].iter_mut() {
+                if let Some(ob) = slot {
+                    if ob.rule == Rule::Assertion || ob.rule == Rule::CallRequires {
+                        *slot = Some(Obligation::new(
+                            ob.rule,
+                            smt::substitute(ob.goal, binds),
+                        ));
+                    }
+                }
+            }
+        }
+        Stmt::Call { proc_, actuals, writes } => {
+            // Claims already recorded to the right of this call are dominated by it; they
+            // are rewritten at the end of this arm.
+            let entry_n = *n;
+            if !Stmt::frame(proc_, actuals, writes) {
+                // Unmodelled, not merely unproved. Report it as an obligation that
+                // can never hold, rather than asserting and aborting: a verifier
+                // that panics on a bad input is a verifier you cannot run on a
+                // program you do not yet trust.
+                push_checked(out, n, overflow, Rule::CallFrame, smt::truth(false));
+                *cursor = smt::truth(false);
+                return;
+            }
+            // `requires[actuals]` is what the caller must establish *at this
+            // point*, so it is recorded like an assertion: the assignments that
+            // dominate it rewrite it, and `verify` wraps it with the precondition.
+            // The rename is simultaneous, so `requires` and `ensures` are
+            // substituted independently.
+            push_checked(
+                out,
+                n,
+                overflow,
+                Rule::CallRequires,
+                smt::substitute(proc_.requires, actuals),
+            );
+            // After the call, `ensures[actuals]` may be *assumed*. Assumption in a
+            // backward calculus is implication: `ensures => Q`, not `ensures && Q`.
+            // Conjoining would demand that the callee's result satisfy the caller's
+            // postcondition on its own, which is not the rule and makes every
+            // interesting call unprovable.
+            //
+            // The written variables are *havoced* first: each caller-side target is
+            // renamed to a fresh variable, in both the assumption and the
+            // continuation. Without this the two sides share a name, and then the
+            // value the variable held *before* the call is mistaken for the value it
+            // holds after — so `c := 99; c := bump(a)` would "prove" `c == 99`. The
+            // fresh name is universally quantified by the prover, which is exactly
+            // the right reading: the caller must be correct for *every* result the
+            // contract permits.
+            let renamed_ensures = smt::substitute(proc_.ensures, actuals);
+            let (havoc, n_havoc) = havoc_writes(actuals, writes);
+            let renamed_ensures = smt::substitute(renamed_ensures, &havoc[..n_havoc]);
+            let continuation = smt::substitute(*cursor, &havoc[..n_havoc]);
+            // A postcondition that cannot hold means the callee never returns, so the
+            // `implies(renamed_ensures, ...)` below is `false => ...` -- a theorem. Every
+            // claim after the call discharges for free and, with no loops in the program,
+            // the report says `verified` / `Total` about a program that cannot get past the
+            // call. Record it here, where the cut is, exactly as an unsatisfiable `Assume`
+            // is recorded. `prove(not ensures)` is a definite answer, and an `Unknown`
+            // leaves the report alone -- the same conservative choice the `Assume` arm
+            // makes.
+            if smt::prove(smt::not(renamed_ensures)).is_proved() {
+                *divergent = true;
+            }
+            // A claim to the *right* of the call is only made for the states the call can
+            // produce, so it must be checked under the assumption the call makes:
+            // `ensures[actuals] => goal`, with the written targets havoced so the pre-call
+            // values are not confused with the post-call ones. Without this the claim was
+            // checked in the pre-call state, and `a := 5; c := double(a); assert c == 10`
+            // was refuted with `c = 1` even though the callee's own contract guarantees
+            // `c == 10`. This is the call analogue of the `if` and `while` rewrites above,
+            // and the third construct to need it.
+            //
+            // Both halves of the transformation are required, unlike the `if` and `while`
+            // cases: those describe the entry state in the *same* variables, but the call
+            // renames every written target, so the goal must be havoced too. Wrapping the
+            // goal without substituting would leave `implies(v == a + a, c == 10)` --
+            // `c` free, hence still refuted -- and the fix would look right while changing
+            // nothing. `guard_range` cannot do this, so the loop is written out.
+            if entry_n > start {
+                for slot in out[start..entry_n].iter_mut() {
+                    if let Some(ob) = slot {
+                        if ob.rule == Rule::Assertion || ob.rule == Rule::CallRequires {
+                            let goal = smt::substitute(ob.goal, &havoc[..n_havoc]);
+                            *slot = Some(Obligation::new(
+                                ob.rule,
+                                smt::implies(renamed_ensures, goal),
+                            ));
+                        }
+                    }
+                }
+            }
+            *cursor = smt::implies(renamed_ensures, continuation);
+        }
+        Stmt::Assume(c) => {
+            // An `Assume` that cannot hold makes every obligation after it vacuous, and
+            // `is_verified` cannot see that: `false => Q` is a theorem for any `Q`. Record
+            // the finding at the Assume itself, where the cut is, rather than letting the
+            // report claim a proof of unreachable code. `prove(not c)` is a definite
+            // answer; an `Unknown` here leaves the report alone.
+            if smt::prove(smt::not(*c)).is_proved() {
+                *vacuous = true;
+            }
+            // A dominating `assume` is part of the context for every claim to its right:
+            // `assume k; assert c` is the obligation `k => c`, not `c`. The backward walk
+            // reaches the `assume` *after* the claims it dominates, so they are all in
+            // `start..*n` by now.
+            guard_range(out, start, *n, *c);
+            *cursor = smt::implies(*c, *cursor);
+        }
+        Stmt::Assert(c) => {
+            // The claim is `c`, in the state that reaches the assertion. That state is
+            // fixed by the assignments that dominate it (applied later, as substitutions)
+            // and by the guards, invariants and assumes that dominate it (applied here, as
+            // context, by `guard_range` at the enclosing construct). Recording
+            // `implies(*cursor, *c)` instead would ask only that `c` hold whenever the
+            // *continuation* is satisfiable, which is a weaker claim and not the one an
+            // assertion makes.
+            //
+            // Recorded through `push_checked`, not `push`. An assertion dropped by a full
+            // buffer used to be silent, on the argument that the backward walk still
+            // conjoins `c` into the weakest precondition, so the contract obligation
+            // catches it. That is true of *`verify`*, but it left `obligations` lying: its
+            // `complete` flag is documented to be `false` when an obligation was dropped,
+            // and it stayed `true` for a program with more assertions than the buffer
+            // holds. Two answers to one question again, which is the defect this whole
+            // family of flags exists to remove. Raising the flag here makes `verify`
+            // refuse a report whose obligation list is truncated -- the honest reading of
+            // `Rule::ObligationOverflow` -- and makes the flag true to its contract.
+            push_checked(out, n, overflow, Rule::Assertion, *c);
+            *cursor = smt::and(*c, *cursor);
+        }
+        Stmt::If { cond, then_, else_ } => {
+            let after = *cursor;
+            // The claims already recorded to the *right* of this `if` are dominated by it,
+            // so its effect has to reach them: a claim `g` after `if c then A else B` is
+            // only made for the states the `if` can produce, i.e. `wp(if, g)`. Without
+            // this, `if x == 1 { x := 1 } else { x := 2 }; assert x == 1 || x == 2` was
+            // reported as a failure even though the contract obligation proved it -- the
+            // assertion was checked as if the `if` were not there.
+            let entry_n = *n;
+            // Each branch is walked in its own slot range so its assignments do
+            // not rewrite the sibling's obligations.
+            let then_start = *n;
+            let mut then_cursor = after;
+            collect(then_, &mut then_cursor, out, *n, n, overflow, vacuous, divergent);
+            let then_end = *n;
+            let else_start = *n;
+            let mut else_cursor = after;
+            collect(else_, &mut else_cursor, out, *n, n, overflow, vacuous, divergent);
+            let else_end = *n;
+            // A claim in a branch is only made for the states that reach it, so each
+            // branch's claims are checked under its guard. The guard is in the state at
+            // the `if`, and the branch's own assignments have already been applied to the
+            // claims, so wrapping here (rather than substituting the guard in) is what
+            // keeps the guard about the *entry* state.
+            guard_range(out, then_start, then_end, *cond);
+            guard_range(out, else_start, else_end, smt::not(*cond));
+            // Now the dominated claims, using the same branch-conditional shape the cursor
+            // gets. `wp_of` is the pure calculus, so this records nothing new.
+            for slot in out[start..entry_n].iter_mut() {
+                if let Some(ob) = slot {
+                    if ob.rule == Rule::Assertion || ob.rule == Rule::CallRequires {
+                        let goal = ite_pred(*cond, wp_of(then_, ob.goal), wp_of(else_, ob.goal));
+                        *slot = Some(Obligation::new(ob.rule, goal));
+                    }
+                }
+            }
+            *cursor = ite_pred(*cond, then_cursor, else_cursor);
+        }
+        Stmt::While { cond, invariant, variant, body } => {
+            let inv = *invariant;
+            let q = *cursor;
+            // Slots recorded before this arm ran are claims to the *right* of the loop, and
+            // they are dominated by it; see the rewrite at the end of this arm.
+            let entry_n = *n;
+            // Preservation, universally quantified over the loop-head state.
+            push_checked(
+                out,
+                n,
+                overflow,
+                Rule::LoopPreserve,
+                smt::implies(smt::and(inv, *cond), wp(inv, body)),
+            );
+            // Termination, when a variant was supplied. The measure after one
+            // iteration is computed by symbolic evaluation of the body, so the
+            // obligation is `I && c => V' < V` with `V'` derived, not restated.
+            if let Some(v) = variant {
+                let after = variant_after(body, *v);
+                push_checked(
+                    out,
+                    n,
+                    overflow,
+                    Rule::LoopVariant,
+                    smt::implies(smt::and(inv, *cond), smt::ult(after, *v)),
+                );
+            }
+            // Exit: the invariant and the failed guard must satisfy whatever the
+            // rest of the program needs.
+            push_checked(
+                out,
+                n,
+                overflow,
+                Rule::LoopExit,
+                smt::implies(smt::and(inv, smt::not(*cond)), q),
+            );
+            // Obligations inside the body are checked under the invariant and the
+            // guard, which is the context every iteration begins from. The invariant and
+            // guard describe the loop-head state, so they are attached as context after
+            // the body's assignments have been applied, never substituted through them.
+            let body_start = *n;
+            let mut body_cursor = inv;
+            collect(body, &mut body_cursor, out, *n, n, overflow, vacuous, divergent);
+            let body_end = *n;
+            guard_range(out, body_start, body_end, smt::and(inv, *cond));
+            // A claim *after* the loop is only made for the states the loop can produce, so
+            // it is checked under the loop's exit condition, `invariant && !guard`. This is
+            // the loop analogue of the `if` rewrite above, and it was missing for the same
+            // reason: the claim was checked in the *pre-loop* state. `while x < 3 inv x <= 3
+            // { x := x + 1 }; assert x >= 3` was reported as a failure even though the
+            // loop's own `LoopExit` obligation proves the claim at every state the loop can
+            // leave. `LoopExit` is deliberately not touched here: it is `inv && !cond => q`
+            // and already carries its own context, so wrapping it again would only weaken it.
+            if entry_n > start {
+                let exit = smt::and(inv, smt::not(*cond));
+                guard_range(out, start, entry_n, exit);
+            }
+            // All a caller may assume after the loop is the invariant.
+            *cursor = inv;
+        }
+        Stmt::Skip => {}
+    }
+}
+
+/// Fresh variables standing for the caller-side targets a call may write.
+///
+/// Returns a `(target, fresh)` substitution. Applying it to both the assumed
+/// postcondition and the continuation keeps the pre-call and post-call values of a
+/// written variable apart, which is what makes the call rule sound; see the comment
+/// in [`collect`].
+fn havoc_writes(actuals: &[(Var, Var)], writes: &[Var]) -> ([(Var, Var); MAX_CALL_ARGS], usize) {
+    let mut out = [(Var::SENTINEL, Var::SENTINEL); MAX_CALL_ARGS];
+    let mut n = 0;
+    for w in writes.iter() {
+        let Some((_, local)) = actuals.iter().find(|(g, _)| g == w) else {
+            continue;
+        };
+        if out[..n].iter().any(|(t, _)| t == local) {
+            continue;
+        }
+        if n < MAX_CALL_ARGS {
+            out[n] = (*local, smt::var(smt::bits(*local)));
+            n += 1;
+        }
+    }
+    (out, n)
+}
+
+impl<'a> Stmt<'a> {
+    /// Whether a call can be justified: every variable the callee may write must
+    /// appear in the caller's `actuals`, so that the write has somewhere to land.
+    ///
+    /// This is the frame condition of a call, and it is the whole reason a call is
+    /// sound to reason about locally. If the callee could write a variable the
+    /// caller did not name, the caller would go on believing that variable's value
+    /// — and no amount of proof about the callee's own contract would catch it.
+    ///
+    /// Returning `false` means the call is unmodelled, not merely unproved, so
+    /// [`verify`] reports it as a failure rather than silently assuming the frame.
+    ///
+    /// # What the check rules out, and why each one is needed
+    ///
+    /// 0. **`writes` must be complete.** This is the one that matters most, and it
+    ///    was missing at first. The declared frame is compared against the frame
+    ///    *derived from the body* by [`writes`], and every derived write must be
+    ///    declared. Without this, a caller could declare an empty frame for a callee
+    ///    that clobbers a variable, and the engine would happily prove that the
+    ///    variable survived — a proof about a program that does not exist. See
+    ///    `under_declaring_the_frame_is_rejected` in `tests/call.rs`.
+    ///
+    /// 1. **Every write must have a target.** Otherwise the callee writes a
+    ///    variable the caller does not name, the caller's state after the call is
+    ///    unknown, and any proof built on it is unsound.
+    /// 2. **The rename must be a function.** A repeated global would make the
+    ///    substitution depend on which pair the engine happened to see last.
+    /// 3. **No two writes may land on the same variable.** That is an
+    ///    order-dependent simultaneous assignment, which is exactly what a
+    ///    simultaneous rename is supposed to exclude.
+    /// 4. **A write may not land on a variable the call also reads.** This one is
+    ///    not obvious, and it is a genuine soundness hole rather than tidiness.
+    ///    `ensures` is *assumed* after the call, so with `x -> a, r -> a` the
+    ///    assumption becomes `a == a + a`, which silently forces `a == 0` on the
+    ///    caller. The engine then proves anything at all about `a`. In-place
+    ///    update is not expressible by a rename: the caller must capture the old
+    ///    value into a temporary first, exactly as it must for a memory swap
+    ///    (`oi := m[i]`). `tests/call.rs` pins this.
+    ///
+    /// # What is still trusted
+    ///
+    /// The *rename* is not checked for meaning. A caller who maps the callee's
+    /// result onto the wrong variable passes every check here and still proves
+    /// nonsense about the variable it actually reads. Likewise a contract whose body
+    /// never established it will be believed by every caller. Neither is fixable by
+    /// a smarter check: the remedy is [`verify_proc`] on every body, and the
+    /// limitation is stated here rather than left to be discovered.
+    pub fn frame(proc_: &Proc<'_>, actuals: &[(Var, Var)], declared: &[Var]) -> bool {
+        // 0. The derived frame must be *complete*, and the declared frame must cover
+        //    it. Both halves are soundness requirements rather than tidiness ones. An
+        //    under-declared frame lets the caller assume a variable survived a call that
+        //    overwrote it; an *incomplete* derived frame is worse, because it makes that
+        //    first check pass when it should not. A body writing more than `MAX_WRITES`
+        //    variables is therefore unmodelled, not partially modelled.
+        let derived = writes(proc_.body);
+        if !derived.complete() {
+            return false;
+        }
+        if !derived.vars().iter().all(|w| declared.contains(w)) {
+            return false;
+        }
+        // Everything below is about the *shape* of the rename, which the derived
+        // frame above already relies on to be meaningful.
+        let writes = declared;
+        // 1. Every write has a target in the caller.
+        if !writes
+            .iter()
+            .all(|w| actuals.iter().any(|(global, _)| *global == *w))
+        {
+            return false;
+        }
+        // 2. The rename is a function.
+        if !actuals
+            .iter()
+            .enumerate()
+            .all(|(i, (g, _))| !actuals[..i].iter().any(|(earlier, _)| earlier == g))
+        {
+            return false;
+        }
+        // Split the images: written variables against read-only ones.
+        let image = |g: &Var| actuals.iter().find(|(global, _)| global == g).map(|(_, l)| *l);
+        let mut written: [Option<Var>; MAX_CALL_ARGS] = [None; MAX_CALL_ARGS];
+        let mut n_written = 0;
+        for w in writes {
+            let Some(l) = image(w) else { return false };
+            // 3. No two writes land on the same variable.
+            if written[..n_written].iter().flatten().any(|prev| *prev == l) {
+                return false;
+            }
+            if n_written < MAX_CALL_ARGS {
+                written[n_written] = Some(l);
+                n_written += 1;
+            } else {
+                return false;
+            }
+        }
+        // 4. No write lands on a variable the call also reads.
+        for (global, local) in actuals {
+            if writes.contains(global) {
+                continue;
+            }
+            if written[..n_written].iter().flatten().any(|prev| prev == local) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// The last slot of a report's buffer is reserved for a report-level finding, so the
+/// program's own obligations never fill it. See [`push_notice`].
+fn program_limit(out: &[Option<Obligation>]) -> usize {
+    out.len().saturating_sub(1)
+}
+
+/// Record an obligation about the program, if there is room below the reserved slot.
+///
+/// Used for assertions, where dropping one is not a soundness problem: a dropped
+/// assertion still poisons the weakest precondition, so the contract obligation catches
+/// it. Claim-carrying obligations use [`push_checked`], which reports the drop.
+/// Strengthen the state claims in `out[start..end]` with the context that reaches them.
+///
+/// An assertion and a call's precondition are claims about the state at a point, and that
+/// state is reached only under the guards, invariants and assumes that dominate the point.
+/// Attaching the context turns `c` into `context => c`. Without it a correct program such
+/// as `if x == 1 { assert x == 1 }` was reported as a failure, because the assertion was
+/// checked against every `x` rather than the `x` the guard admits. Loop obligations are
+/// deliberately not touched: they are universally quantified over the loop-head state and
+/// carry their own context.
+fn guard_range(out: &mut [Option<Obligation>], start: usize, end: usize, context: Pred) {
+    for slot in out[start..end].iter_mut() {
+        if let Some(ob) = slot {
+            if ob.rule == Rule::Assertion || ob.rule == Rule::CallRequires {
+                *slot = Some(Obligation::new(ob.rule, smt::implies(context, ob.goal)));
+            }
+        }
+    }
+}
+
+/// Record a report-level finding in the reserved trailing slot.
+///
+/// The distinction matters: an overflow notice that is itself dropped by the full buffer
+/// is worse than useless, because the report then looks clean. A finding is therefore never
+/// dropped -- if the reserved slot is already taken, the newer finding replaces it.
+///
+/// There is exactly one reserved slot and up to three findings, so the calls are ordered
+/// from least to most severe: the slot is overwritten by each later call, and the most
+/// severe finding survives. `Rule::VacuousPrecondition` is last and therefore wins, which
+/// is the documented precedence -- a contract that was never about anything is the stronger
+/// statement than "some obligations did not fit".
+fn push_notice(out: &mut [Option<Obligation>], n: &mut usize, rule: Rule, goal: Pred) {
+    if *n < out.len() {
+        out[*n] = Some(Obligation::new(rule, goal));
+        *n += 1;
+    } else {
+        let last = out.len() - 1;
+        out[last] = Some(Obligation::new(rule, goal));
+    }
+}
+
+/// Like [`push`], but records that an obligation was dropped when the buffer is full.
+///
+/// Used for the obligations that carry a *claim*: a dropped loop rule or call rule is a
+/// missing proof, and the report has to say so. Dropping one silently would let
+/// `verified` mean "the obligations that fit were fine", which is not what a reader
+/// takes it to mean.
+fn push_checked(
+    out: &mut [Option<Obligation>],
+    n: &mut usize,
+    overflow: &mut bool,
+    rule: Rule,
+    goal: Pred,
+) {
+    if *n < program_limit(out) {
+        out[*n] = Some(Obligation::new(rule, goal));
+        *n += 1;
+    } else {
+        *overflow = true;
+    }
+}
+
+/// The weakest precondition of `post` under `s`.
+///
+/// This is the textbook definition, written as recursion on the syntax:
+///
+/// ```text
+/// wp(skip, Q)          = Q
+/// wp(x := e, Q)        = Q[x := e]
+/// wp(assume c, Q)      = c => Q
+/// wp(assert c, Q)      = c && Q
+/// wp(s1; s2, Q)        = wp(s1, wp(s2, Q))
+/// wp(if c then A else B, Q) = (c && wp(A,Q)) || (!c && wp(B,Q))
+/// wp(while c inv I { B }, Q) = I        (with the three loop conditions
+///                                        checked separately, see `obligations`)
+/// wp(call p(a), Q)     = ensures[a]' => Q'   (with the written targets havoced;
+///                                        `false` if the frame is not modelled)
+/// ```
+///
+/// For `while` the returned predicate is the invariant, because that is all the
+/// weakest-precondition calculus can conclude without a variant to show
+/// termination. The obligations that make the invariant sound — preservation and
+/// exit — are produced by [`obligations`], and by [`verify`], which runs them.
+///
+/// A call applies the *same* rule as [`obligations`], including the frame check
+/// [`Stmt::frame`]. There is no report here to carry a failure, so an unmodelled call
+/// returns `false`: nothing is guaranteed about the state after a call whose writes the
+/// caller did not name. Skipping the check would make `wp` assume that every variable the
+/// callee writes kept its old value, which is how `wp(call, g == 7)` once proved that a
+/// callee which zeroes `g` had not.
+pub fn wp(post: Pred, s: &Stmt<'_>) -> Pred {
+    wp_of(s, post)
+}
+
+fn wp_of(s: &Stmt<'_>, post: Pred) -> Pred {
+    match s {
+        Stmt::Skip => post,
+        Stmt::Assign { var, expr } => smt::substitute(post, &[(*var, *expr)]),
+        Stmt::AssignMany { binds } => smt::substitute(post, binds),
+        Stmt::Call { proc_, actuals, writes } => {
+            // Same rule as `collect`, including the havoc *and the frame check*; see the
+            // comment there. The frame check is not optional: without it this rule
+            // silently assumes the caller's variables that the callee writes keep their
+            // old values, and `wp(call, Q)` comes out true for a `Q` the call cannot
+            // establish. `collect` reports the bad frame as an obligation; here there is
+            // no report to report to, so the honest weakest precondition of an unmodelled
+            // call is `false` -- nothing is guaranteed about the state after it.
+            if !Stmt::frame(proc_, actuals, writes) {
+                return smt::truth(false);
+            }
+            let renamed = smt::substitute(proc_.ensures, actuals);
+            let (havoc, n_havoc) = havoc_writes(actuals, writes);
+            let renamed = smt::substitute(renamed, &havoc[..n_havoc]);
+            let post = smt::substitute(post, &havoc[..n_havoc]);
+            smt::implies(renamed, post)
+        }
+        Stmt::Assume(cond) => smt::implies(*cond, post),
+        Stmt::Assert(cond) => smt::and(*cond, post),
+        Stmt::Seq { first, second } => {
+            let after_second = wp_of(second, post);
+            wp_of(first, after_second)
+        }
+        Stmt::If { cond, then_, else_ } => {
+            let t = wp_of(then_, post);
+            let e = wp_of(else_, post);
+            ite_pred(*cond, t, e)
+        }
+        Stmt::While { invariant, .. } => *invariant,
+    }
+}
+
+/// `c ? t : e` as a predicate.
+pub fn ite_pred(c: Pred, t: Pred, e: Pred) -> Pred {
+    smt::or(smt::and(c, t), smt::and(smt::not(c), e))
+}
+
+/// Whether every target in a simultaneous assignment is distinct.
+///
+/// A repeated target would make the result depend on evaluation order, which is
+/// the one thing a simultaneous assignment is supposed to rule out. This is
+/// quadratic, but only runs under `debug_assertions` and the lists are short.
+fn distinct_targets(binds: &[(Var, Var)]) -> bool {
+    for (i, (target, _)) in binds.iter().enumerate() {
+        for (other, _) in binds.iter().skip(i + 1) {
+            if target == other {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The value of the expression `e` after executing `s`, as a symbolic word.
+///
+/// This is symbolic evaluation, not the weakest-precondition calculus: it builds
+/// an expression rather than a predicate, so a conditional yields `ite` instead
+/// of a conjunction. It is what lets a loop variant be written once and have its
+/// next-iteration value derived.
+///
+/// * `Assign { var, expr }` substitutes, so `e` is read in the new state.
+/// * `If` produces `ite(cond, then_value, else_value)`.
+/// * `Seq` composes in the order the statements run.
+/// * `Assume` and `Assert` do not change the state, so the value passes through.
+pub fn variant_after(s: &Stmt<'_>, e: Var) -> Var {
+    match s {
+        Stmt::Skip | Stmt::Assume(_) | Stmt::Assert(_) => e,
+        // A measure over a variable the call does not write survives it, because the
+        // derived frame is complete. A measure over one the call *does* write has an
+        // unknown value afterwards, so it is havoced: the resulting obligation then
+        // mentions a fresh variable and cannot be discharged, which is the honest
+        // answer — a call that writes the measure makes termination unprovable.
+        Stmt::Call { actuals, writes, .. } => {
+            let (havoc, n_havoc) = havoc_writes(actuals, writes);
+            smt::substitute_word(e, &havoc[..n_havoc])
+        }
+        Stmt::Assign { var, expr } => smt::substitute_word(e, &[(*var, *expr)]),
+        Stmt::AssignMany { binds } => smt::substitute_word(e, binds),
+        Stmt::Seq { first, second } => variant_after(first, variant_after(second, e)),
+        Stmt::If { cond, then_, else_ } => {
+            let t = variant_after(then_, e);
+            let el = variant_after(else_, e);
+            smt::ite(*cond, t, el)
+        }
+        // A nested loop's effect on the measure is *not* a no-op, and treating it as one
+        // was a soundness hole in the termination claim. `while i < 100 { i := i + 1;
+        // while i != 0 { i := 0 } }` diverges -- the inner loop resets the counter every
+        // iteration -- but with the inner loop read as "leaves `i` alone", the outer
+        // obligation `100 - i' < 100 - i` came back `Valid` and the report claimed `Total`
+        // for a program that never halts.
+        //
+        // The honest reading is that after a nested loop, every variable its body can
+        // write has an *unknown* value: the loop runs an unknown number of times, so the
+        // value is the result of applying the body some non-negative number of times. So
+        // havoc exactly those variables. A measure that does not mention them survives
+        // untouched, which is what makes the common shape (an inner scan over `j`, an
+        // outer measure over `i`) still provable. A measure that *does* mention them
+        // becomes an obligation about a fresh variable, which cannot be discharged --
+        // the caller must then supply a measure that accounts for the inner loop, which
+        // is the real obligation when nesting loops.
+        Stmt::While { body, .. } => {
+            let frame = writes(body);
+            if !frame.complete {
+                // The write set is not the truth, so the effect is unknown outright.
+                return smt::var(smt::bits(e));
+            }
+            let mut binds = [(Var::SENTINEL, Var::SENTINEL); MAX_WRITES];
+            let mut n = 0;
+            for v in frame.vars[..frame.n].iter() {
+                binds[n] = (*v, smt::var(smt::bits(*v)));
+                n += 1;
+            }
+            smt::substitute_word(e, &binds[..n])
+        }
+    }
+}
+
+/// Check a loop for termination by an explicit variant, returning the obligation.
+///
+/// `variant` is the measure in loop-head terms; `body` is the loop body. The
+/// obligation is `invariant && guard => variant_after(body) < variant`, which for
+/// an unsigned measure is both necessary and sufficient for the loop to make
+/// progress.
+pub fn termination_obligation(
+    guard: Pred,
+    invariant: Pred,
+    variant: Var,
+    body: &Stmt<'_>,
+) -> Obligation {
+    Obligation::new(
+        Rule::LoopVariant,
+        smt::implies(smt::and(invariant, guard), smt::ult(variant_after(body, variant), variant)),
+    )
+}
+
+/// How many obligations [`verify`] can report at once.
+///
+/// A [`Report`] actually carries one more slot than this, so that a report-level finding
+/// such as [`Rule::ObligationOverflow`] always has somewhere to go. Without that extra
+/// slot the overflow notice would itself be dropped by the full buffer — which is exactly
+/// how this was missed the first time.
+pub const MAX_OBLIGATIONS: usize = 16;
+
+/// The most arguments a call may pass, so the frame check needs no allocator.
+pub const MAX_CALL_ARGS: usize = 16;
+
+/// The most variables one procedure may write.
+///
+/// Deliberately equal to [`MAX_CALL_ARGS`]: `unchanged_vars` maps a complete derived
+/// frame into a `changed` buffer sized by `MAX_CALL_ARGS`, and the mapping is only total
+/// when every write has room. A complete frame has at most `MAX_WRITES` entries and
+/// `frame` admits at most `MAX_CALL_ARGS` writes, so equality is what makes the two fit.
+/// The relation is checked at compile time rather than left to whoever changes one of the
+/// constants.
+pub const MAX_WRITES: usize = 16;
+
+/// `MAX_WRITES <= MAX_CALL_ARGS`, enforced by the compiler.
+///
+/// Not a style preference: if `MAX_WRITES` grew past `MAX_CALL_ARGS`, a complete frame
+/// would have more writes than `unchanged_vars` can record as changed, and a variable the
+/// call *does* write could be reported as unchanged — the very hole the frame rule exists
+/// to close. `frame` currently refuses any call with more than `MAX_CALL_ARGS` writes, so
+/// the invariant holds today; this makes breaking it a build error instead of a quiet
+/// soundness bug.
+const _: () = assert!(MAX_WRITES <= MAX_CALL_ARGS);
+
+/// The caller's variables a call is guaranteed to leave unchanged.
+///
+/// This is the two-state story, and it turns out to need no `old` operator. A
+/// variable the callee cannot write has the same value before and after the call, so
+/// `old(v)` and `v` are the same thing — *provided* the frame is honest, which
+/// [`Stmt::frame`] now checks. What was missing was not a way to write `old(v)` but a
+/// way to **ask** whether `v` survives, because the engine was already assuming it
+/// silently.
+///
+/// So this is a query, not an assumption. For a variable the callee does write, no
+/// query can help: the caller must capture the entry value into a temporary before
+/// the call, exactly as for a memory swap. `two_state_specs_via_a_caller_snapshot`
+/// in `tests/call.rs` runs that pattern end to end.
+///
+/// The answer is computed from the *derived* frame, not the declared one, so a caller
+/// cannot talk this query into a wrong answer.
+///
+/// The result is in the **caller's** names, which is what a caller can act on: the
+/// arguments the call names but does not write. A caller variable the call never names
+/// is also unchanged, by completeness of the derived frame; the query cannot enumerate
+/// those, because it has never seen the caller's variable set.
+pub fn unchanged_vars<'a>(
+    proc_: &Proc<'_>,
+    actuals: &[(Var, Var)],
+    out: &'a mut [Var; MAX_CALL_ARGS],
+) -> &'a [Var] {
+    // The caller-side images of everything the body may write.
+    let derived = writes(proc_.body);
+    // An incomplete frame means the body writes more than the buffer holds, so "this
+    // variable is not written" cannot be concluded for any variable. Returning nothing
+    // is the honest answer: no caller variable is known to survive.
+    if !derived.complete() {
+        return &out[..0];
+    }
+    let mut n_changed = 0;
+    let mut changed = [Var::SENTINEL; MAX_CALL_ARGS];
+    for g in derived.vars().iter() {
+        if let Some((_, l)) = actuals.iter().find(|(global, _)| global == g) {
+            if !changed[..n_changed].contains(l) {
+                // `frame` admits at most `MAX_CALL_ARGS` writes, so this cannot fill up
+                // on a modelled call; the compile-time check `MAX_WRITES_FITS_CALL_ARGS`
+                // keeps it that way. Bail out rather than truncate if it ever does, since
+                // a dropped image would make a written variable look unchanged.
+                if n_changed == MAX_CALL_ARGS {
+                    return &out[..0];
+                }
+                changed[n_changed] = *l;
+                n_changed += 1;
+            }
+        }
+    }
+    let mut k = 0;
+    for (_, local) in actuals {
+        // A variable the call names is unchanged exactly when its image is not
+        // written. A caller variable the call does not name is unchanged because the
+        // derived frame is complete, and `frame` refuses to model a call whose
+        // declared frame disagrees with its body.
+        if !changed[..n_changed].contains(local) && k < MAX_CALL_ARGS {
+            out[k] = *local;
+            k += 1;
+        }
+    }
+    &out[..k]
+}
+
+/// Whether a call is guaranteed to leave the caller's variable `g` unchanged.
+///
+/// `g` is a **caller** variable, and it may be named by the call or not; both cases
+/// are answered from the derived frame. See [`unchanged_vars`] for why this needs no
+/// `old` operator.
+///
+/// The declared frame is deliberately *not* an argument. The answer comes from the
+/// body, so a caller cannot talk the query into a wrong answer — and
+/// [`Stmt::frame`] has already refused to model a call whose declared frame disagrees
+/// with its body.
+pub fn unchanged(proc_: &Proc<'_>, actuals: &[(Var, Var)], g: Var) -> bool {
+    let derived = writes(proc_.body);
+    // An incomplete frame cannot support this conclusion; see `unchanged_vars`.
+    if !derived.complete() {
+        return false;
+    }
+    !derived.vars().iter().any(|w| {
+        actuals
+            .iter()
+            .any(|(global, local)| global == w && *local == g)
+    })
+}
+
+/// The variables a statement may write, derived from its syntax.
+///
+/// This is the *real* frame of a statement, as opposed to the frame its author
+/// claims. The distinction is the whole point: a caller that under-declares what a
+/// callee writes can make the engine believe a variable survived a call that
+/// clobbered it, which is unsound. [`Stmt::frame`] therefore compares the two.
+///
+/// A write inside a branch or a loop still counts. The frame rule is conservative
+/// by construction — "may write" is what matters, not "does write on this path" —
+/// because a caller cannot know which path was taken.
+///
+/// A nested call contributes the caller-side images of its callee's writes, mapped
+/// through that call's `actuals`.
+///
+/// # Completeness is part of the answer
+///
+/// The set is capped at [`MAX_WRITES`], and truncating it is a soundness hole rather than
+/// an inconvenience: an under-complete "real" frame is exactly the condition the frame
+/// rule exists to reject. So the result is not a bare slice and count. If a body writes
+/// more than [`MAX_WRITES`] variables, [`Frame::complete`] is `false` and every consumer
+/// must treat the program as unmodelled. In particular [`Stmt::frame`] returns `false`,
+/// so a truncated frame cannot slip past the check.
+///
+/// Returning `(array, count)` hid this: a count that stops at the cap is
+/// indistinguishable from a body that writes exactly that many, so the completeness check
+/// passed on a frame that was only a prefix. `MAX_WRITES` is not merely small — the probe
+/// that found this had a callee writing 17 variables, and the caller then "proved" that
+/// the 17th survived the call.
+#[derive(Debug, Clone, Copy)]
+pub struct Frame {
+    vars: [Var; MAX_WRITES],
+    n: usize,
+    /// `false` when the body writes more than [`MAX_WRITES`] variables, so `vars` is a
+    /// prefix of the truth rather than all of it.
+    complete: bool,
+}
+
+impl Frame {
+    /// The written variables. A *prefix* of the truth when [`Frame::complete`] is false.
+    pub fn vars(&self) -> &[Var] {
+        &self.vars[..self.n]
+    }
+
+    /// How many were recorded. Stops at [`MAX_WRITES`].
+    pub fn len(&self) -> usize {
+        self.n
+    }
+
+    /// True when nothing is written.
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    /// Whether this set is the whole truth. `false` means the body writes more than
+    /// [`MAX_WRITES`] variables, so this must not be trusted as a frame.
+    pub fn complete(&self) -> bool {
+        self.complete
+    }
+
+    /// Whether the recorded set contains `v`.
+    pub fn contains(&self, v: &Var) -> bool {
+        self.vars[..self.n].contains(v)
+    }
+}
+
+/// The variables `s` may write, as a [`Frame`] that also says whether the set is
+/// complete. See [`Frame`] for why completeness has to be part of the result.
+pub fn writes(s: &Stmt<'_>) -> Frame {
+    let mut frame = Frame {
+        // Zero-initialised with the sentinel. The reads below are `[..n]`-counted, so the
+        // filler is never *read*, but it is what `[Var::SENTINEL; MAX_WRITES]` means, and
+        // `Var::SENTINEL` is a reserved term id that no real variable can equal (see
+        // `smt::TERM_SENTINEL`). This comment used to claim slot 0 "is never a real
+        // variable" while the sentinel was in fact `Term(0)`, the first real term.
+        vars: [Var::SENTINEL; MAX_WRITES],
+        n: 0,
+        complete: true,
+    };
+    collect_written(s, &mut frame);
+    frame
+}
+
+fn note_written(frame: &mut Frame, v: Var) {
+    if frame.vars[..frame.n].contains(&v) {
+        return;
+    }
+    if frame.n < MAX_WRITES {
+        frame.vars[frame.n] = v;
+        frame.n += 1;
+    } else {
+        // Past the cap the set is no longer the truth, and saying so is the only safe
+        // answer. Dropping the write silently is what made this a soundness hole.
+        frame.complete = false;
+    }
+}
+
+fn collect_written(s: &Stmt<'_>, frame: &mut Frame) {
+    match s {
+        Stmt::Assign { var, .. } => note_written(frame, *var),
+        Stmt::AssignMany { binds } => {
+            for (v, _) in binds.iter() {
+                note_written(frame, *v);
+            }
+        }
+        Stmt::Seq { first, second } => {
+            collect_written(first, frame);
+            collect_written(second, frame);
+        }
+        Stmt::If { then_, else_, .. } => {
+            collect_written(then_, frame);
+            collect_written(else_, frame);
+        }
+        Stmt::While { body, .. } => collect_written(body, frame),
+        Stmt::Call { proc_, actuals, .. } => {
+            // The callee's writes land on whichever caller variables its `actuals`
+            // name. A callee write with no image in the caller is dropped here, and
+            // the *enclosing* frame check is what rejects that situation.
+            let inner = writes(proc_.body);
+            if !inner.complete() {
+                // The nested frame is already only a prefix, so this one is too.
+                frame.complete = false;
+            }
+            for g in inner.vars() {
+                if let Some((_, l)) = actuals.iter().find(|(global, _)| global == g) {
+                    note_written(frame, *l);
+                }
+            }
+        }
+        Stmt::Assume(_) | Stmt::Assert(_) | Stmt::Skip => {}
+    }
+}
+
+/// The result of verifying a program: every obligation, in the order the rules
+/// were applied, plus the verdict of the contract as a whole.
+#[derive(Debug, Clone, Copy)]
+pub struct Report {
+    /// Loop, assertion and call obligations, in the order generated, plus one spare
+    /// slot at the end for a report-level finding. See [`MAX_OBLIGATIONS`].
+    pub obligations: [Option<Obligation>; MAX_OBLIGATIONS + 1],
+    /// How many entries of `obligations` are set.
+    pub count: usize,
+    /// The overall contract condition, `pre => wp(body, post)`.
+    pub contract: Obligation,
+}
+
+impl Report {
+    /// The first obligation that did not hold, or `None` when everything did.
+    pub fn first_failure(&self) -> Option<(Obligation, Verdict)> {
+        for i in 0..self.count {
+            if let Some(ob) = self.obligations[i] {
+                let v = ob.discharge();
+                if !v.is_proved() {
+                    return Some((ob, v));
+                }
+            }
+        }
+        let v = self.contract.discharge();
+        if v.is_proved() {
+            None
+        } else {
+            Some((self.contract, v))
+        }
+    }
+
+    /// True when every obligation, including the contract itself, was proved.
+    pub fn is_verified(&self) -> bool {
+        self.first_failure().is_none()
+    }
+
+    /// True when every loop in the program carried a variant **that was proved to
+    /// decrease**.
+    ///
+    /// Without a variant, a verified report only means *partial* correctness: correct
+    /// if the program terminates. With a discharged variant for each loop, progress is
+    /// proved too. A program with no loops counts as terminating, since there is
+    /// nothing that could diverge.
+    ///
+    /// The variant obligations must be *discharged*, not merely present. A variant that
+    /// is supplied but does not decrease proves nothing, so a report is `Total` only
+    /// when each one was established. This was a real defect: counting variants instead
+    /// of discharging them let a report call itself `Total` on the strength of a measure
+    /// it had failed to justify. `a_variant_that_does_not_decrease_is_not_termination`
+    /// in `tests/wp.rs` pins it.
+    pub fn has_termination_proof(&self) -> bool {
+        let mut loops = 0;
+        let mut variants = 0;
+        for ob in self.obligations[..self.count].iter().flatten() {
+            match ob.rule {
+                Rule::LoopPreserve => loops += 1,
+                // Present *and* proved: an obligation that did not discharge is not
+                // evidence of progress.
+                Rule::LoopVariant if ob.discharge().is_proved() => variants += 1,
+                // A call to a never-returning procedure is a termination finding, not a
+                // loop one, so it has to be checked here too. Without this, a program
+                // whose only divergence is a divergent call has `loops == variants == 0`
+                // and this method would report progress on the strength of the loops it
+                // does not have. `establishes` already refuses it via `is_verified`, but
+                // `correctness` asks this question alone, and the answer has to be right
+                // on its own.
+                Rule::DivergentCall => return false,
+                _ => {}
+            }
+        }
+        loops == variants
+    }
+
+    /// What a verified report actually establishes.
+    ///
+    /// `Total` means every loop carried a variant that was proved to decrease, so
+    /// termination is established as well as the contract. `Partial` means the contract
+    /// holds for any run that terminates, but divergence is not ruled out.
+    ///
+    /// For a report that *is* verified, this is the honest classification. For one that
+    /// is not, read it as the best case: it classifies what the obligations would
+    /// establish if they all held. Check [`Report::is_verified`] first, or use
+    /// [`Report::establishes`], which asks both questions at once.
+    pub fn correctness(&self) -> Correctness {
+        if self.has_termination_proof() {
+            Correctness::Total
+        } else {
+            Correctness::Partial
+        }
+    }
+
+    /// The single question a caller usually means to ask: what, if anything, did this
+    /// report actually establish?
+    ///
+    /// [`Report::is_verified`] and [`Report::correctness`] answer two halves of that
+    /// question, and asking only one of them is easy to get wrong — a `Total` claim
+    /// from an unverified report is worth nothing. This asks both, so the answer cannot
+    /// be read off the wrong half.
+    pub fn establishes(&self) -> Established {
+        if !self.is_verified() {
+            Established::Nothing
+        } else if self.has_termination_proof() {
+            Established::Total
+        } else {
+            Established::Partial
+        }
+    }
+}
+
+/// What a [`Report`] actually established, as one value.
+///
+/// [`Report::establishes`] produces this. It exists because "is it verified?" and
+/// "does it cover termination?" are two questions whose answers are only useful
+/// together, and a caller who reads one of them in isolation can conclude the wrong
+/// thing from a report that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Established {
+    /// Nothing: the report was not verified, so no claim was established. The other two
+    /// variants say nothing about a report in this state, which is why this one exists.
+    Nothing,
+    /// The contract holds for any run that terminates; divergence is not ruled out.
+    Partial,
+    /// The contract holds and every loop was proved to make progress.
+    Total,
+}
+
+/// How much a verified [`Report`] establishes.
+///
+/// This is the distinction between Hoare logic and total correctness, made
+/// explicit in the type system rather than left to the reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Correctness {
+    /// The contract holds whenever the program terminates. Divergent loops are
+    /// not ruled out, because no loop carried a variant.
+    Partial,
+    /// The contract holds and every loop makes progress, so the program does
+    /// terminate.
+    Total,
+}
+
+/// Verify a program against a contract: for every input satisfying `pre`,
+/// executing `s` establishes `post`.
+///
+/// This discharges the loop obligations *and* the body condition, and reports the
+/// first failure with the rule that produced it.
+pub fn verify(s: &Stmt<'_>, pre: Pred, post: Pred) -> Report {
+    let mut slots: [Option<Obligation>; MAX_OBLIGATIONS + 1] = [None; MAX_OBLIGATIONS + 1];
+    let (goal, mut count, overflow, vacuous, divergent) = obligations_checked(s, post, &mut slots);
+
+    // An assertion's recorded goal has already been rewritten by the assignments
+    // that dominate it, so it is `wp(prefix, c)`. The obligation to discharge is
+    // that the precondition establishes it: `pre => wp(prefix, c)`. Loop goals are
+    // deliberately left alone; see `obligations` for why.
+    for slot in slots[..count].iter_mut() {
+        if let Some(ob) = slot {
+            if ob.rule == Rule::Assertion || ob.rule == Rule::CallRequires {
+                *slot = Some(Obligation::new(ob.rule, smt::implies(pre, ob.goal)));
+            }
+        }
+    }
+
+    // A dropped obligation is a claim that was never checked. Record it as a failure
+    // rather than letting `verified` mean "the ones that fit were fine": the report has
+    // to shrink to what was actually proved. `false` is the goal because the obligation
+    // is not about the program's state — it is about the report's own completeness.
+    // Least severe first; each call may overwrite the single reserved slot, so the most
+    // severe finding is the one that survives.
+    if vacuous {
+        push_notice(&mut slots, &mut count, Rule::VacuousAssume, smt::truth(false));
+    }
+    if overflow {
+        push_notice(&mut slots, &mut count, Rule::ObligationOverflow, smt::truth(false));
+    }
+
+    // A precondition that cannot hold makes every obligation vacuously true, so the
+    // report would say `verified` / `Total` about a specification that constrains
+    // nothing. Checked *after* the overflow notice so that a report which is both
+    // overflowing and vacuous still fits: the vacuity finding then overwrites the
+    // reserved slot, which is the right precedence — vacuity is the stronger statement,
+    // since it says the contract was never about anything.
+    if smt::prove(smt::not(pre)).is_proved() {
+        push_notice(&mut slots, &mut count, Rule::VacuousPrecondition, smt::truth(false));
+    }
+
+    // A call to a procedure whose postcondition cannot hold never returns, so every claim
+    // after it is vacuously true. Same precedence argument as the two findings above:
+    // recorded last, in the reserved slot, because "the program cannot get past this call"
+    // is the strongest statement the report can make about it.
+    if divergent {
+        push_notice(&mut slots, &mut count, Rule::DivergentCall, smt::truth(false));
+    }
+
+    Report {
+        obligations: slots,
+        count,
+        contract: Obligation::new(Rule::Body, smt::implies(pre, goal)),
+    }
+}
+
+/// Verify one procedure against its own contract: for every input satisfying
+/// `p.requires`, executing `p.body` establishes `p.ensures`.
+///
+/// This is the "once" half of modular verification. Do it for every procedure in
+/// the program, then [`verify_modular`] can reason about the calls without looking
+/// at any body again.
+///
+/// It is deliberately thin. `verify_proc` and [`verify`] differ only in which
+/// predicate they take as the precondition, and that is the point: a procedure is
+/// nothing more than a body with a contract attached, so it must not need a
+/// different prover.
+pub fn verify_proc(p: &Proc<'_>) -> Report {
+    verify(p.body, p.requires, p.ensures)
+}
+
+/// The report for a program, with the *call obligations* attached to the
+/// procedures they belong to.
+///
+/// [`verify`] checks a program's own loops and assertions. A call adds two things:
+/// the obligation that the caller establishes the callee's precondition (checked
+/// here), and the right to assume the callee's postcondition (which is sound only
+/// if someone verified the callee's body — see [`verify_proc`]).
+///
+/// The obligation to establish a precondition is attached to the *caller*, not the
+/// callee, because that is whose fault a failure is. This function returns the
+/// caller's report; the callee's obligations come from [`verify_proc`].
+pub fn verify_modular(s: &Stmt<'_>, pre: Pred, post: Pred) -> Report {
+    verify(s, pre, post)
+}
+
+/// Convenience: verify and return just the overall verdict, treating a loop
+/// failure as a failure of the contract.
+pub fn verify_contract(s: &Stmt<'_>, pre: Pred, post: Pred) -> Verdict {
+    match verify(s, pre, post).first_failure() {
+        None => Verdict::Valid,
+        Some((_, v)) => v,
+    }
+}
+
+/// The size of a `bits`-wide unsigned input domain: every value of an unsigned `bits`-bit
+/// integer, i.e. `0..2^bits`.
+///
+/// Exists so that the domain size is *derived* from the input width rather than typed by
+/// hand. The width has to match the symbolic width anyway, and a hand-written `256` is one
+/// transposition away from `26` — which is the eighth defect in miniature.
+///
+/// Panics for `bits == 0` or `bits > 63`, where a full domain cannot be enumerated.
+pub fn domain_of_bits(bits: u32) -> u64 {
+    assert!(
+        (1..=63).contains(&bits),
+        "domain_of_bits: {} bits is not enumerable (want 1..=63)",
+        bits
+    );
+    1u64 << bits
+}
+
+/// What an exhaustive search found.
+///
+/// The distinction is the whole point. An `Option<u64>` conflates "swept the entire domain
+/// and found nothing" with "stopped early and found nothing", and a caller reading `None`
+/// as "no counterexample exists" is then wrong for the second case. That is the eighth
+/// defect: an ambiguous negative, in the function used to *certify* the rest of the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Search {
+    /// An input that satisfies `pre` and violates `post` after `body` runs.
+    Witness(u64),
+    /// Every input in the searched domain that satisfies `pre` also satisfies `post`.
+    ///
+    /// This is only as strong as the domain that was searched. It is a statement about
+    /// `0..domain`, not about every possible input, so the caller must pass the *whole*
+    /// domain — [`domain_of_bits`] for an unsigned input of known width.
+    NoWitness,
+}
+
+impl Search {
+    /// The witness, if the search found one.
+    pub fn witness(self) -> Option<u64> {
+        match self {
+            Search::Witness(v) => Some(v),
+            Search::NoWitness => None,
+        }
+    }
+
+    /// True when the domain was swept and nothing violated `post`.
+    ///
+    /// Named for what it is: a statement about the searched domain, not about the program.
+    pub fn is_clean_over_domain(self) -> bool {
+        matches!(self, Search::NoWitness)
+    }
+}
+
+/// Independent check by execution: the first input in `0..domain` that satisfies `pre` but
+/// violates `post` after `body` runs, if any.
+///
+/// This is the differential counterpart of the symbolic proof: if the symbolic engine says
+/// `Valid` and this finds a witness, one of them is wrong.
+///
+/// `domain` is the size of the input space, not a search budget. There is no separate
+/// budget: the domain *is* the search. Passing a prefix of the domain makes `NoWitness`
+/// mean "no counterexample in the part I looked at", which is not what a caller wants to
+/// hear, so pass the whole thing — [`domain_of_bits`] when the input is an unsigned value
+/// of known width. The return type keeps the two cases apart instead of collapsing them
+/// into `None`; see [`Search`].
+pub fn find_counterexample_by_enumeration(
+    domain: u64,
+    pre: impl Fn(u64) -> bool,
+    body: impl Fn(u64) -> u64,
+    post: impl Fn(u64, u64) -> bool,
+) -> Search {
+    let mut v = 0;
+    while v < domain {
+        if pre(v) && !post(v, body(v)) {
+            return Search::Witness(v);
+        }
+        v += 1;
+    }
+    Search::NoWitness
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::smt::var;
+
+    #[test]
+    fn assignment_substitutes_into_the_postcondition() {
+        smt::with_fresh(|| {
+            let x = var(8);
+            let y = var(8);
+            // Pre: x < 10. Body: y := x + 1. Post: y <= 10.
+            let body = Stmt::Assign { var: y, expr: x + 1u32 };
+            let v = verify_contract(&body, x.lt_val(10), y.le_val(10));
+            assert!(v.is_proved(), "got {}", v);
+        });
+    }
+
+    #[test]
+    fn a_weak_postcondition_is_refuted() {
+        smt::with_fresh(|| {
+            let x = var(8);
+            let y = var(8);
+            let body = Stmt::Assign { var: y, expr: x + 1u32 };
+            let v = verify_contract(&body, x.lt_val(10), y.le_val(5));
+            assert!(!v.is_proved(), "should have been refuted");
+        });
+    }
+
+    #[test]
+    fn substitution_swaps_simultaneously() {
+        smt::with_fresh(|| {
+            let x = var(8);
+            let y = var(8);
+            // `x, y := y, x` must exchange the two variables.
+            let q = smt::eq(x, y);
+            let swapped = smt::substitute(q, &[(x, y), (y, x)]);
+            assert!(smt::prove(smt::iff(swapped, q)).is_proved());
+            // And a genuine (non-symmetric) predicate must be affected.
+            let r = smt::ult(x, y);
+            let swapped_r = smt::substitute(r, &[(x, y), (y, x)]);
+            assert!(smt::prove(smt::iff(swapped_r, smt::ult(y, x))).is_proved());
+        });
+    }
+
+    #[test]
+    fn both_branches_are_considered() {
+        smt::with_fresh(|| {
+            let x = var(8);
+            let y = var(8);
+            // if x < 100 { y := x } else { y := 100 }  ;  post: y <= 100
+            let then_ = Stmt::Assign { var: y, expr: x };
+            let else_ = Stmt::Assign { var: y, expr: smt::word(100, 8) };
+            let body = Stmt::If {
+                cond: x.lt_val(100),
+                then_: &then_,
+                else_: &else_,
+            };
+            let v = verify_contract(&body, smt::truth(true), y.le_val(100));
+            assert!(v.is_proved(), "got {}", v);
+        });
+    }
+
+    #[test]
+    fn loop_invariant_is_checked_rule_by_rule() {
+        smt::with_fresh(|| {
+            let i = var(8);
+            // while i < 10 { i := i + 1 }  invariant: i <= 10
+            let step = Stmt::Assign { var: i, expr: i + 1u32 };
+            let body = Stmt::While {
+                cond: i.lt_val(10),
+                invariant: i.le_val(10),
+                variant: Some(smt::sub(smt::word(10, 8), i)),
+                body: &step,
+            };
+            // The invariant must hold on entry, so the precondition has to
+            // establish it: `pre = true` would fail for a free u8.
+            let r = verify(&body, i.le_val(10), i.le_val(10));
+            // A loop contributes three side obligations when a variant is
+            // given: preservation, exit, and the variant decrease. Its entry
+            // condition is the contract's own `pre => I`, so it is discharged as
+            // part of `contract`, not as a separate rule.
+            assert_eq!(r.count, 3, "expected preserve, exit and variant");
+            assert!(r
+                .obligations
+                .iter()
+                .flatten()
+                .any(|ob| ob.rule == Rule::LoopVariant));
+            assert!(r.is_verified(), "loop should verify");
+        });
+    }
+
+    #[test]
+    fn a_bad_invariant_is_reported_with_its_rule() {
+        smt::with_fresh(|| {
+            let i = var(8);
+            // Same loop, but the invariant claims i <= 5, which is not
+            // preserved: from i == 5 and the guard, i + 1 is 6, breaking it.
+            let step = Stmt::Assign { var: i, expr: i + 1u32 };
+            let body = Stmt::While {
+                cond: i.lt_val(10),
+                invariant: i.le_val(5),
+                variant: None,
+                body: &step,
+            };
+            let r = verify(&body, smt::truth(true), i.le_val(10));
+            let (ob, _v) = r.first_failure().expect("invariant is false");
+            assert_eq!(ob.rule, Rule::LoopPreserve);
+        });
+    }
+
+    #[test]
+    fn sequential_composition_composes() {
+        smt::with_fresh(|| {
+            let x = var(8);
+            let y = var(8);
+            let z = var(8);
+            // x := x + 1; y := x + 1; z := y + 1. Starting from x == 7 the
+            // final z is 10. Note the postcondition mentions only `z`: `x` has
+            // been reassigned, so a postcondition about `x` would be about the
+            // *new* x, which is the classic mistake this rule prevents.
+            let s1 = Stmt::Assign { var: x, expr: x + 1u32 };
+            let s2 = Stmt::Assign { var: y, expr: x + 1u32 };
+            let s3 = Stmt::Assign { var: z, expr: y + 1u32 };
+            let body = Stmt::Seq {
+                first: &s1,
+                second: &Stmt::Seq { first: &s2, second: &s3 },
+            };
+            let v = verify_contract(&body, x.eq_val(7), z.eq_val(10));
+            assert!(v.is_proved(), "got {}", v);
+        });
+    }
+
+    #[test]
+    fn assert_generates_an_obligation() {
+        smt::with_fresh(|| {
+            let x = var(8);
+            // assert x < 200 with no precondition must fail.
+            let body = Stmt::Assert(x.lt_val(200));
+            let v = verify_contract(&body, smt::truth(true), smt::truth(true));
+            assert!(!v.is_proved(), "the assertion should not hold for all x");
+        });
+    }
+}

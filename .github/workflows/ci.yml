@@ -1,0 +1,113 @@
+# CI for the `discharge` crate.
+#
+# Two jobs on purpose. The first runs `scripts/gate.sh` -- the same script a human runs --
+# so "the gates are green" means the same thing locally and in CI, and there is no second
+# copy of the commands to drift. The second installs Kani and runs the Kani differential
+# oracle as a hard gate, because Kani is a large download (a pinned nightly plus CBMC) that
+# a normal `gate.sh` run should not pay for, but that CI can.
+#
+# Neither job adds a dependency to the crate: z3 and Kani are oracles, invoked as
+# subprocesses, and `gate.sh`'s zero-dependency check would fail if that ever changed.
+
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: gates (clippy, tests, no_std, zero deps, z3 oracle)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable) and the bare-metal target
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add thumbv7em-none-eabihf
+
+      # `gate.sh` treats an absent z3 as a failure, on purpose: an oracle that did not run
+      # is not evidence about the exporter. setup-python gives a pip that is not externally
+      # managed, so `pip install z3-solver` works without --break-system-packages.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install the z3 oracle
+        run: python3 -m pip install z3-solver
+
+      - name: Run scripts/gate.sh
+        run: sh scripts/gate.sh
+
+  kani:
+    name: kani differential oracle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      # Cache the Kani install: `cargo kani setup` fetches a pinned nightly and CBMC, and
+      # re-downloading them on every run is most of the job's wall time.
+      - name: Cache Kani's toolchain download
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: kani-${{ runner.os }}-0.68.0
+
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier
+          cargo kani setup
+
+      # The oracle is a hard gate here: if it disagrees with the engine, CI fails. It exits
+      # non-zero on any mismatch, on a refuted identity, or on a harness that produced no
+      # verdict, so a green run means every generated case was actually checked.
+      - name: Run the Kani oracle
+        run: cargo run -q --features std --example kanidiff -- 64
+
+  verus:
+    name: verus differential oracle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      # Verus ships a self-contained release bundle (its own `z3`, and it needs one pinned
+      # rustc toolchain of its own). We take the latest release rather than pinning a tag,
+      # because the point of this job is "does the engine agree with an *independent*
+      # verifier", and the interesting failures are Verus changing its mind, not ours.
+      - name: Download the Verus release
+        run: |
+          set -e
+          url=$(curl -fsSL https://api.github.com/repos/verus-lang/verus/releases/latest \
+                | python3 -c "import sys,json; print([a['browser_download_url'] for a in json.load(sys.stdin)['assets'] if a['name'].endswith('x86-linux.zip')][0])")
+          curl -fsSL -o verus.zip "$url"
+          python3 -c "import zipfile; zipfile.ZipFile('verus.zip').extractall('.')"
+          chmod +x verus-x86-linux/verus verus-x86-linux/rust_verify verus-x86-linux/z3
+          echo "$PWD/verus-x86-linux" >> "$GITHUB_PATH"
+          # Verus needs its own pinned rustc; install it so the driver can find it.
+          rustup install "$(verus-x86-linux/verus --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-x86_64-unknown-linux-gnu' | head -1)"
+
+      # Hard gate, same as the Kani job: a disagreement, a refuted identity, or a missing
+      # verdict all fail the run.
+      - name: Run the Verus oracle
+        env:
+          VERUS_BIN: ${{ github.workspace }}/verus-x86-linux/verus
+        run: cargo run -q --features std --example verusdiff -- 64
