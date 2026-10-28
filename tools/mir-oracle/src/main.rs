@@ -57,7 +57,7 @@ use std::path::Path;
 use rustc_public::mir::{AssertMessage, Body, TerminatorKind};
 use rustc_public::CrateDef;
 
-use discharge::mir::shape::{FnShape, PanicKind};
+use discharge::mir::shape::{AssertShape, FnShape, PanicKind, Polarity};
 
 /// The shape of one function, computed from `rustc`'s own typed MIR.
 ///
@@ -70,13 +70,33 @@ fn shape_of_body(body: &Body) -> FnShape {
         // overflow flag plus an `Assert` terminator that consumes it; the
         // terminator carries the `AssertMessage`, so walking terminators alone
         // finds every panic guard, in the same block order the text dump prints.
-        if let TerminatorKind::Assert { msg, .. } = &block.terminator.kind {
-            panics.push(classify(msg));
+        //
+        // `expected` is the value of `cond` for which control *continues*: `true`
+        // for `assert(cond, …)`, `false` for `assert(!cond, …)`. It is the typed
+        // side's copy of the text dump's leading `!`, and it is compared, because
+        // the message alone does not distinguish an overflow guard from its
+        // inverse -- a printer change that flipped a `!` used to leave the shape
+        // identical and the oracle silent.
+        if let TerminatorKind::Assert { msg, expected, .. } = &block.terminator.kind {
+            panics.push(AssertShape {
+                kind: classify(msg),
+                polarity: polarity_of(*expected),
+            });
         }
     }
     FnShape {
         blocks: body.blocks.len(),
         panics,
+    }
+}
+
+/// `expected` is the condition value for which control continues, so it is the
+/// inverse of the text dump's leading `!`.
+fn polarity_of(expected: bool) -> Polarity {
+    if expected {
+        Polarity::True
+    } else {
+        Polarity::Negated
     }
 }
 
@@ -105,15 +125,19 @@ fn classify(msg: &AssertMessage) -> PanicKind {
     }
 }
 
-/// The shapes of every function with a body, keyed by bare name.
-fn typed_shapes(args: &[String]) -> Result<BTreeMap<String, FnShape>, String> {
-    let mut out = BTreeMap::new();
+/// The shapes of every function with a body, grouped by bare name.
+///
+/// Grouped, not keyed one-to-one: a bare name is not unique (`A::check` and
+/// `B::check` both reduce to `check`), and a single-slot map kept only the last,
+/// so the oracle checked one method and could not see a regression in the other.
+fn typed_shapes(args: &[String]) -> Result<BTreeMap<String, Vec<FnShape>>, String> {
+    let mut out: BTreeMap<String, Vec<FnShape>> = BTreeMap::new();
     let result = rustc_public::run!(args, || -> ControlFlow<()> {
         for item in rustc_public::all_local_items() {
             if let Some(body) = item.body() {
                 let name = item.name();
                 let bare = name.rsplit("::").next().unwrap_or(&name).to_string();
-                out.insert(bare, shape_of_body(&body));
+                out.entry(bare).or_default().push(shape_of_body(&body));
             }
         }
         ControlFlow::Continue(())
@@ -125,32 +149,38 @@ fn typed_shapes(args: &[String]) -> Result<BTreeMap<String, FnShape>, String> {
 /// One function where the two sides disagree.
 struct Diff {
     name: String,
-    text: FnShape,
-    typed: FnShape,
+    text: Vec<FnShape>,
+    typed: Vec<FnShape>,
 }
 
 /// Compare the text-side and typed-side shapes, returning the functions that
 /// disagree.
 ///
-/// Only functions both sides saw are compared. The typed side can miss an item
-/// the text side prints (a generic item with no monomorphised body, for one),
-/// and that is a coverage gap rather than a parser bug, so it is not a
-/// disagreement. A function the *text* side is missing entirely, however, is a
-/// parser failure and is reported as a disagreement with an empty text shape —
-/// silence about a dropped function is the failure mode this whole tool exists
-/// to prevent.
+/// A bare name can cover several methods, so each group is compared as a
+/// **multiset**: sorted and compared element-wise. Order is not a property worth
+/// asserting — the two sides enumerate functions in different orders — but the
+/// set of shapes under a name is exactly what a lost or altered method changes.
+///
+/// Only names the typed side saw are compared. The typed side can miss an item
+/// the text side prints (a generic item with no monomorphised body, for one), and
+/// that is a coverage gap rather than a parser bug, so it is not a disagreement.
+/// A function the *text* side is missing entirely, however, is a parser failure
+/// and is reported as a disagreement with an empty text group — silence about a
+/// dropped function is the failure mode this whole tool exists to prevent.
 fn compare(
-    text: &BTreeMap<String, FnShape>,
-    typed: &BTreeMap<String, FnShape>,
+    text: &BTreeMap<String, Vec<FnShape>>,
+    typed: &BTreeMap<String, Vec<FnShape>>,
 ) -> (usize, Vec<Diff>) {
     let mut agree = 0usize;
     let mut differ = Vec::new();
     for (name, want) in typed {
-        let got = text.get(name).cloned().unwrap_or(FnShape {
-            blocks: 0,
-            panics: Vec::new(),
-        });
-        if &got == want {
+        let empty: Vec<FnShape> = Vec::new();
+        let got = text.get(name).cloned().unwrap_or(empty);
+        let mut got_sorted = got.clone();
+        got_sorted.sort();
+        let mut want_sorted = want.clone();
+        want_sorted.sort();
+        if got_sorted == want_sorted {
             agree += 1;
         } else {
             differ.push(Diff {
@@ -161,6 +191,18 @@ fn compare(
         }
     }
     (agree, differ)
+}
+
+/// Render a group of shapes for the difference report.
+fn fmt_group(group: &[FnShape]) -> String {
+    if group.is_empty() {
+        return "(absent)".to_string();
+    }
+    group
+        .iter()
+        .map(|s| format!("{} blocks, panics {:?}", s.blocks, s.panics))
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 fn main() {
@@ -214,17 +256,16 @@ fn main() {
     let (agree, differ) = compare(&text_shapes, &typed_shapes);
 
     let name = target.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let typed_fns: usize = typed_shapes.values().map(Vec::len).sum();
+    let text_fns: usize = text_shapes.values().map(Vec::len).sum();
     println!(
-        "{name}: {} functions typed, {} text, {} agree, {} differ",
-        typed_shapes.len(),
-        text_shapes.len(),
-        agree,
+        "{name}: {typed_fns} functions typed, {text_fns} text, {agree} agree, {} differ",
         differ.len()
     );
     for d in &differ {
         println!("\n  {}:", d.name);
-        println!("    text : {} blocks, panics {:?}", d.text.blocks, d.text.panics);
-        println!("    typed: {} blocks, panics {:?}", d.typed.blocks, d.typed.panics);
+        println!("    text : {}", fmt_group(&d.text));
+        println!("    typed: {}", fmt_group(&d.typed));
     }
 
     if differ.is_empty() {
@@ -285,28 +326,88 @@ mod tests {
         let _ = op;
     }
 
-    /// The comparison has teeth: identical shapes agree, and a single differing
+    /// The typed side's polarity is the inverse of the text dump's `!`: `expected`
+    /// is the value for which control continues. Getting this backwards would make
+    /// every arithmetic guard disagree, so it is pinned directly.
+    #[test]
+    fn expected_maps_to_polarity_inversely() {
+        // `assert(cond, …)`: control continues when the condition holds.
+        assert_eq!(polarity_of(true), Polarity::True);
+        // `assert(!cond, …)`: control continues when the condition does *not* hold,
+        // which is how rustc prints the arithmetic guards.
+        assert_eq!(polarity_of(false), Polarity::Negated);
+    }
+
+    /// The comparison has teeth: identical groups agree, and a single differing
     /// panic kind — or a dropped function — is reported. Without this the tool
     /// could "agree" by comparing nothing.
     #[test]
     fn compare_reports_disagreement_and_absence() {
-        let shape = |blocks: usize, panics: Vec<PanicKind>| FnShape { blocks, panics };
+        let shape = |blocks: usize, panics: Vec<AssertShape>| FnShape { blocks, panics };
+        let guard = |kind: PanicKind| AssertShape {
+            kind,
+            polarity: Polarity::Negated,
+        };
         let mut text = BTreeMap::new();
-        text.insert("a".to_string(), shape(3, vec![PanicKind::OverflowAdd]));
-        text.insert("b".to_string(), shape(5, vec![PanicKind::DivByZero]));
+        text.insert("a".to_string(), vec![shape(3, vec![guard(PanicKind::OverflowAdd)])]);
+        text.insert("b".to_string(), vec![shape(5, vec![guard(PanicKind::DivByZero)])]);
 
         let mut typed = BTreeMap::new();
-        typed.insert("a".to_string(), shape(3, vec![PanicKind::OverflowAdd]));
-        typed.insert("b".to_string(), shape(5, vec![PanicKind::RemByZero])); // differs
-        typed.insert("c".to_string(), shape(2, vec![])); // absent from text
+        typed.insert("a".to_string(), vec![shape(3, vec![guard(PanicKind::OverflowAdd)])]);
+        typed.insert("b".to_string(), vec![shape(5, vec![guard(PanicKind::RemByZero)])]); // differs
+        typed.insert("c".to_string(), vec![shape(2, vec![])]); // absent from text
 
         let (agree, differ) = compare(&text, &typed);
         assert_eq!(agree, 1, "only `a` agrees");
         let names: Vec<&str> = differ.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, vec!["b", "c"]);
-        // `c` is reported as an empty text shape, not skipped.
+        // `c` is reported as an empty text group, not skipped.
         let c = differ.iter().find(|d| d.name == "c").unwrap();
-        assert_eq!(c.text.blocks, 0);
-        assert!(c.text.panics.is_empty());
+        assert!(c.text.is_empty(), "an absent function reports an empty group");
+    }
+
+    /// Flipping only the polarity of a guard must be a disagreement. This is the
+    /// regression the polarity field exists to catch: the same message, the
+    /// opposite program.
+    #[test]
+    fn an_inverted_guard_is_a_disagreement() {
+        let mut text = BTreeMap::new();
+        text.insert(
+            "f".to_string(),
+            vec![FnShape {
+                blocks: 2,
+                panics: vec![AssertShape {
+                    kind: PanicKind::OverflowAdd,
+                    polarity: Polarity::Negated,
+                }],
+            }],
+        );
+        let mut typed = text.clone();
+        typed.get_mut("f").unwrap()[0].panics[0].polarity = Polarity::True;
+
+        let (agree, differ) = compare(&text, &typed);
+        assert_eq!(agree, 0, "the polarity differs, so the shapes must not agree");
+        assert_eq!(differ.len(), 1);
+    }
+
+    /// Two methods sharing a bare name are compared as a group, so a regression in
+    /// either one is caught. The old single-slot map kept only the last.
+    #[test]
+    fn same_named_methods_are_compared_as_a_group() {
+        let a = FnShape { blocks: 2, panics: vec![] };
+        let b = FnShape { blocks: 7, panics: vec![] };
+        let mut text = BTreeMap::new();
+        text.insert("check".to_string(), vec![a.clone(), b.clone()]);
+        let mut typed = BTreeMap::new();
+        typed.insert("check".to_string(), vec![a.clone(), b.clone()]);
+
+        assert_eq!(compare(&text, &typed).0, 1, "the group matches");
+
+        // Now drop one method on the text side, as a parser regression would.
+        let mut lossy = BTreeMap::new();
+        lossy.insert("check".to_string(), vec![b.clone()]);
+        let (agree, differ) = compare(&lossy, &typed);
+        assert_eq!(agree, 0, "losing a same-named method must be reported");
+        assert_eq!(differ.len(), 1);
     }
 }

@@ -111,40 +111,94 @@ impl PanicKind {
     }
 }
 
+/// Which way round an assert's condition is: whether the panic fires on the
+/// condition being *true* or *false*.
+///
+/// This is a separate field from [`PanicKind`] because the two are independent
+/// and both are load-bearing. `PanicKind` says *what* the guard is about — an
+/// addition overflow, a zero divisor — and the polarity says whether `rustc`
+/// printed the condition or its negation. rustc prints
+/// `assert(!move _3, "…")` for the arithmetic guards, so the *same* message with
+/// the `!` flipped describes the opposite program: one reports an overflowing add
+/// as a panic, the other reports every non-overflowing add as a panic and misses
+/// the overflowing one.
+///
+/// Recording only the message let a printer change that flipped a leading `!`
+/// leave both block count and panic kind identical, so the oracle agreed while
+/// the frontend checked the opposite guard. The frontend's parser has always
+/// carried this (`Term::Assert { negated, … }`); the shape did not, which is
+/// exactly the gap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Polarity {
+    /// `assert(cond, …)`: the panic fires when `cond` is false.
+    True,
+    /// `assert(!cond, …)`: the panic fires when `cond` is true.
+    Negated,
+}
+
+impl Polarity {
+    /// The polarity for a parsed leading `!`.
+    pub const fn from_negated(negated: bool) -> Self {
+        if negated {
+            Polarity::Negated
+        } else {
+            Polarity::True
+        }
+    }
+}
+
+/// One panic guard: what it guards against, and which way round its condition is.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AssertShape {
+    /// The condition `rustc` is guarding, normalised.
+    pub kind: PanicKind,
+    /// Whether the panic fires on the condition being true or false.
+    pub polarity: Polarity,
+}
+
 /// The comparable summary of one function.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FnShape {
     /// How many basic blocks the function lowered to.
     pub blocks: usize,
-    /// The panic guards `rustc` inserted, in `(block, order within block)` order.
-    pub panics: Vec<PanicKind>,
+    /// The panic guards `rustc` inserted, in `(block, order within block)` order,
+    /// each with its polarity.
+    pub panics: Vec<AssertShape>,
 }
 
-/// The summary of every function in a text MIR dump, keyed by bare name.
+/// The summaries of every function in a text MIR dump, grouped by bare name.
 ///
 /// The key is the last path segment (`actuator::clamp` and `clamp` both key as
 /// `clamp`) because the two MIR sources spell the path differently and the point
 /// is to compare the functions, not their qualified names.
-pub fn of_text_mir(mir: &str) -> BTreeMap<String, FnShape> {
+///
+/// The value is a **list**, not one shape, because a bare name is not unique:
+/// `impl A { fn check(…) }` and `impl B { fn check(…) }` in one file both key as
+/// `check`. A single-slot map silently kept whichever came last, so a regression
+/// in the dropped method was invisible. Keeping every shape and comparing the
+/// groups as multisets is what makes a lost or altered method show up, and it
+/// does not depend on the two sides agreeing about qualified names or about the
+/// order the functions appear in.
+pub fn of_text_mir(mir: &str) -> BTreeMap<String, Vec<FnShape>> {
     let program = parse::parse_program(mir);
-    let mut out = BTreeMap::new();
+    let mut out: BTreeMap<String, Vec<FnShape>> = BTreeMap::new();
     for f in &program.fns {
         let mut panics = Vec::new();
         // `blocks` is in dump order, and each block's statements and terminator
         // are in order, so the panic list is deterministic.
         for block in &f.blocks {
-            if let Term::Assert { msg, .. } = &block.term {
-                panics.push(PanicKind::from_text_message(msg));
+            if let Term::Assert { msg, negated, .. } = &block.term {
+                panics.push(AssertShape {
+                    kind: PanicKind::from_text_message(msg),
+                    polarity: Polarity::from_negated(*negated),
+                });
             }
         }
         let key = f.name.rsplit("::").next().unwrap_or(&f.name).to_string();
-        out.insert(
-            key,
-            FnShape {
-                blocks: f.blocks.len(),
-                panics,
-            },
-        );
+        out.entry(key).or_default().push(FnShape {
+            blocks: f.blocks.len(),
+            panics,
+        });
     }
     out
 }
@@ -212,7 +266,85 @@ fn simple(_1: u32, _2: u32) -> u32 {
 ";
         let shapes = of_text_mir(dump);
         let s = shapes.get("simple").expect("function parsed");
-        assert_eq!(s.blocks, 3);
-        assert!(s.panics.is_empty());
+        assert_eq!(s.len(), 1, "one function named `simple`");
+        assert_eq!(s[0].blocks, 3);
+        assert!(s[0].panics.is_empty());
+    }
+
+    /// The polarity is carried and is separate from the kind. A dump whose guard
+    /// is `assert(!…)` must not shape the same as one whose guard is `assert(…)`
+    /// with the same message, because they describe opposite programs.
+    #[test]
+    fn polarity_is_recorded_and_distinguishes_inverted_guards() {
+        let dump = |cond: &str| {
+            format!(
+                "\
+fn checked(_1: u32, _2: u32) -> u32 {{
+    let mut _0: u32;
+    let mut _3: bool;
+
+    bb0: {{
+        _3 = AddWithOverflow(_1, _2);
+        assert({cond}move (_3.1: bool), \"attempt to compute `{{}} + {{}}`, which would overflow\") -> [success: bb1, unwind continue];
+    }}
+
+    bb1: {{
+        _0 = _1;
+        return;
+    }}
+}}
+"
+            )
+        };
+        let normal = of_text_mir(&dump(""));
+        let inverted = of_text_mir(&dump("!"));
+
+        let n = &normal.get("checked").unwrap()[0];
+        let i = &inverted.get("checked").unwrap()[0];
+        assert_eq!(n.panics.len(), 1);
+        assert_eq!(n.panics[0].kind, PanicKind::OverflowAdd);
+        assert_eq!(i.panics[0].kind, PanicKind::OverflowAdd);
+        assert_eq!(n.panics[0].polarity, Polarity::True);
+        assert_eq!(i.panics[0].polarity, Polarity::Negated);
+        assert_ne!(
+            n, i,
+            "flipping the `!` must change the shape, or the oracle cannot see it"
+        );
+    }
+
+    /// Two methods with the same bare name must both survive. The old single-slot
+    /// map kept only the last, so a regression in the dropped one was invisible.
+    #[test]
+    fn same_named_functions_are_both_kept() {
+        let dump = "\
+fn check(_1: u32, _2: u32) -> u32 {
+    let mut _0: u32;
+
+    bb0: {
+        _0 = _1;
+        return;
+    }
+}
+
+fn check(_1: u32) -> u32 {
+    let mut _0: u32;
+    let mut _2: u32;
+
+    bb0: {
+        _0 = _1;
+        return;
+    }
+
+    bb1: {
+        return;
+    }
+}
+";
+        let shapes = of_text_mir(dump);
+        let group = shapes.get("check").expect("both methods present");
+        assert_eq!(group.len(), 2, "both `check`s must be kept, not overwritten");
+        let mut blocks: Vec<usize> = group.iter().map(|s| s.blocks).collect();
+        blocks.sort_unstable();
+        assert_eq!(blocks, vec![1, 2], "each shape is kept distinctly");
     }
 }
