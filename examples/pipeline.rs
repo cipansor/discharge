@@ -33,7 +33,13 @@ use discharge::wp::{self, Stmt};
 fn main() {
     println!("=== verification conditions for a bounded accumulator ===\n");
 
-    let (report, text) = smt::with_fresh(|| {
+    // The whole obligation — build, discharge, print — stays inside the arena scope.
+    // A `Report` holds term ids, and its verdicts are only meaningful against the arena
+    // that produced them: `Obligation::discharge` answers `Unknown` once the arena has
+    // been reset. Reading one after the next `with_fresh` would be reading a stale
+    // handle, so the report is discharged and consumed here, and only the SMT-LIB2 text
+    // (which is self-contained) escapes.
+    let text = smt::with_fresh(|| {
         let sum = var(4);
         let i = var(4);
         let n = var(4);
@@ -65,34 +71,33 @@ fn main() {
         let post = sum.le(smt::mul(n, step));
         let report = wp::verify(&prog, pre, post);
 
+        println!("obligations generated: {}", report.count);
+        for (idx, ob) in report.obligations.iter().take(report.count).flatten().enumerate() {
+            println!("  [{}] {:?}: {}", idx + 1, ob.rule, short(&ob.discharge()));
+        }
+        println!(
+            "  [contract] {:?}: {}",
+            report.contract.rule,
+            short(&report.contract.discharge())
+        );
+        println!();
+        if report.is_verified() {
+            println!("all obligations discharged by the embedded engine");
+            println!(
+                "correctness: {:?} (every loop carried a variant)\n",
+                report.correctness()
+            );
+        } else {
+            println!("engine did not discharge everything\n");
+        }
+
         // Export the contract obligation for an independent solver. Declaring the
         // variables matters: without them the text would be unreadable and
         // unusable, which is the whole point of the export.
         let vars = [sum, i, n, step];
         let q = Query::new(&vars, report.contract.goal);
-        let text = q.to_smtlib2_string();
-        (report, text)
+        q.to_smtlib2_string()
     });
-
-    println!("obligations generated: {}", report.count);
-    for (idx, ob) in report.obligations.iter().take(report.count).flatten().enumerate() {
-        println!("  [{}] {:?}: {}", idx + 1, ob.rule, short(&ob.discharge()));
-    }
-    println!(
-        "  [contract] {:?}: {}",
-        report.contract.rule,
-        short(&report.contract.discharge())
-    );
-    println!();
-    if report.is_verified() {
-        println!("all obligations discharged by the embedded engine");
-        println!(
-            "correctness: {:?} (every loop carried a variant)\n",
-            report.correctness()
-        );
-    } else {
-        println!("engine did not discharge everything\n");
-    }
 
     println!("the contract as SMT-LIB2, for independent checking:\n");
     for line in text.lines() {
@@ -105,7 +110,9 @@ fn main() {
     // ---------------------------------------------------------------------
     println!("=== the same loop with a too-weak invariant ===\n");
 
-    let bad = smt::with_fresh(|| {
+    // Same rule as above: the report is discharged inside the arena that produced it,
+    // and only the self-contained SMT-LIB2 text escapes.
+    let bad_text = smt::with_fresh(|| {
         let sum = var(4);
         let i = var(4);
         let n = var(4);
@@ -133,29 +140,31 @@ fn main() {
         let post = sum.le(smt::mul(n, step));
         let report = wp::verify(&prog, pre, post);
 
-        let text = {
-            let vars = [sum, i, n, step];
-            let q = Query::new(&vars, report.contract.goal);
-            q.to_smtlib2_string()
-        };
-        (report, text)
-    });
-
-    let (bad_report, bad_text) = bad;
-    match bad_report.first_failure() {
-        None => println!("unexpectedly verified"),
-        Some((ob, verdict)) => {
-            println!("failed rule: {:?}", ob.rule);
-            println!("verdict: {}", verdict);
-            println!(
-                "correctness: {:?} (the variant is still proved, but the exit condition is not)",
-                bad_report.correctness()
-            );
-            if let Verdict::Counterexample(c) = verdict {
-                println!("witness: {}", c);
+        match report.first_failure() {
+            None => println!("unexpectedly verified"),
+            Some((ob, verdict)) => {
+                println!("failed rule: {:?}", ob.rule);
+                println!("verdict: {}", verdict);
+                // This loop was written with `variant: None`, so there is no termination
+                // obligation to discharge and the report is `Partial` for that reason alone
+                // -- not because a variant was supplied and proved. The earlier wording
+                // claimed the latter, which this loop cannot support: `correctness` never saw
+                // a variant. Say what was actually checked.
+                println!(
+                    "correctness: {:?} (no variant was supplied, and the exit condition failed)",
+                    report.correctness()
+                );
+                if let Verdict::Counterexample(c) = verdict {
+                    println!("witness: {}", c);
+                }
             }
         }
-    }
+
+        let vars = [sum, i, n, step];
+        let q = Query::new(&vars, report.contract.goal);
+        q.to_smtlib2_string()
+    });
+
     println!("\nand the obligation a solver would be handed:\n");
     for line in bad_text.lines() {
         println!("  {}", line);

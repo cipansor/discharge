@@ -51,21 +51,60 @@ pub const fn rate_limit(current: u32, target: u32) -> u32 {
 // Symbolic proofs
 // ---------------------------------------------------------------------------
 
+/// Whether `raw * 1000` can exceed 4 095 000 at `width` bits -- that is, whether
+/// the width can represent the bound the proof below claims.
+///
+/// This is the vacuity guard, factored out so a regression test can reach it. It
+/// asks for a *model* of the unclamped product: at 22 bits `raw = 4096` is a
+/// witness, at 16 bits the product tops out at 65 535 and the query is `Unsat`.
+/// The predicate is over the raw product, not the clamped one, because the
+/// clamped value is at most 4 095 000 and `scaled > 4 095 000` is therefore false
+/// at every width -- a guard on `scaled` would pass whether or not the width can
+/// hold the bound, and would assert nothing.
+///
+/// It queries in the *caller's* arena rather than opening its own. A nested
+/// [`smt::with_fresh`] resets the arena and invalidates the terms the caller has
+/// already built, so calling it from inside [`prove_output_bound`] would make the
+/// proof below come back `Unknown` -- the scope hazard this crate documents.
+pub fn the_bound_is_refutable_at(width: u8) -> bool {
+    let raw = var(width);
+    matches!(
+        smt::find_model((raw * 1000u32).gt_val(4_095_000)),
+        Verdict::Counterexample(_)
+    )
+}
+
 /// ∀ raw:u16. map_reading(raw) <= PWM_MAX
 ///
-/// Modelled at 16 bits so the BDD stays small, which is the honest way to use
-/// this engine: prove the arithmetic fact at the width you can, and cover the
-/// concrete function exhaustively in [`proofs_by_enumeration`].
+/// The arithmetic is modelled at 22 bits, not 16, and the width is load-bearing.
+/// `clamped * 1000` needs 22 bits: `clamped <= 4095`, so the product reaches
+/// 4 095 000, and `2^22 = 4 194 304` is the first width that holds it. At 16 bits
+/// the product wraps to 16 bits before the comparison, so `scaled <= 4 095 000`
+/// is true for *every* 16-bit value (the maximum is 65 535) and the implication
+/// holds no matter what the precondition says -- a proof whose evidence is empty.
+/// Widening keeps the claim the one intended: the scaled value, computed without
+/// overflow, is inside the actuator's range.
 fn prove_output_bound() -> Verdict {
     smt::with_fresh(|| {
-        let raw = var(16);
-        let max = word(ADC_MAX as u64, 16);
+        let raw = var(22);
+        let max = word(ADC_MAX as u64, 22);
         let clamped = ite(raw.gt(max), max, raw);
         // out = 1000 + clamped * 1000 / 4095. Integer division is not in the
         // symbolic vocabulary, so we prove the stronger, division-free bound
         // that the *scaled* value cannot exceed PWM_MAX before division.
         let scaled = clamped * 1000u32;
-        // clamped <= 4095  =>  clamped * 1000 <= 4095000
+        // The proof is only meaningful if the width can represent the bound at
+        // all. At 16 bits the product wraps before the comparison, so
+        // `scaled <= 4 095 000` is true for every value and the implication would
+        // hold for any antecedent -- a proof whose evidence is empty. Asserting
+        // that the unclamped product *can* exceed the bound is what makes a
+        // future narrowing of the model fail loudly instead of passing vacuously.
+        assert!(
+            the_bound_is_refutable_at(22),
+            "the bound is vacuous at 22 bits: the unclamped product cannot exceed \
+             4 095 000, so the implication carries no information"
+        );
+        // clamped <= 4095  =>  clamped * 1000 <= 4095000, with no overflow at 22 bits.
         prove_implies(clamped.le(max), scaled.le_val(4_095_000))
     })
 }

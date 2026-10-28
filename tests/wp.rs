@@ -1722,3 +1722,34 @@ fn an_over_cap_nested_loop_havocs_the_measure_instead_of_leaving_it_alone() {
         );
     });
 }
+
+#[test]
+fn a_report_is_only_valid_in_the_arena_that_built_it() {
+    // `Report` holds term ids, and a term id is meaningful only against the generation
+    // that created it. Reading a report after the arena has been reset must fail safe
+    // (`Unknown`, so `is_verified` is false) rather than answer about whatever term now
+    // occupies the recorded slot. `examples/pipeline.rs` used to read a report after a
+    // second `with_fresh`; it worked only because no reset intervened, which is luck
+    // rather than a guarantee. This pins the guarantee.
+    let report = smt::with_fresh(|| {
+        let x = var(8);
+        let y = var(8);
+        // Pre: x < 10, body: y := x + 1, post: y <= 200 -- true for every x.
+        let body = Stmt::Assign { var: y, expr: x + 1u32 };
+        let r = verify(&body, x.lt_val(10), y.le_val(200));
+        assert!(r.is_verified(), "the contract holds in its own arena");
+        r
+    });
+
+    // Reset the arena, exactly as the next `with_fresh` in the example does.
+    smt::with_fresh(|| {
+        let _ = var(8);
+    });
+
+    assert!(
+        !report.is_verified(),
+        "a report read after a reset must not claim verification: its ids name terms \
+         from an arena that no longer exists"
+    );
+    assert_eq!(report.contract.discharge(), Verdict::Unknown);
+}
