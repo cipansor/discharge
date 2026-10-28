@@ -5,16 +5,29 @@
 //! [`crate::smt`]'s blaster writes BDD node ids; this one writes [`crate::sat::Lit`]s.
 //! They could have been one generic function, but the term arena and the gate arena are
 //! both `&mut`, and threading one `Gates` trait through would either split the arena or
-//! hide a pointer behind it. So they are two functions -- and the divergence risk that
-//! creates is treated as a property to *check*, not to hope away:
+//! hide a pointer behind it. So they are two functions, and each writes its own adder,
+//! subtractor, multiplier and comparator circuit. The *arithmetic is not shared code*: the
+//! two circuits can diverge, and a divergence here is the worst kind, because the SAT
+//! blaster only runs when the BDD arena has already filled, which is exactly where a
+//! hand-checked example is least likely to look.
 //!
-//! * `tests/differential.rs` proves a corpus of random formulas and requires that a
-//!   verdict is never wrong, whichever engine produced it.
+//! So the agreement is treated as a property to *check*, not to hope away:
+//!
+//! * The `tests` module below blasts each operation with *this* blaster and asks the
+//!   solver whether the resulting circuit can differ from Rust's own wrapping arithmetic
+//!   on any input. It is exhaustive over widths 1..=4, and it is the only test that
+//!   exercises this blaster at widths where the BDD engine also finishes -- so the
+//!   oracle does not depend on the engine under test.
+//! * `tests/differential.rs` proves a corpus of random formulas through the public API
+//!   and requires that a verdict is never wrong, whichever engine produced it.
 //! * `tests/sat_engine.rs` tests the SAT solver on its own against a brute-force
 //!   enumeration of raw CNFs, so a solver bug is caught without the bit-blaster in the
 //!   picture.
 //!
-//! If the two adders ever disagree, one of those two fails.
+//! The first of those is load-bearing: a mutation that drops the carry-generate term from
+//! this file's adder (making it compute `xor`) survives `tests/differential.rs`, the full
+//! `cargo test` run *and* the z3 oracle, because none of them reach this blaster -- the
+//! BDD engine decides every query they make. The exhaustive test below is what fails.
 //!
 //! The bit-level structure is deliberately identical to `smt::blast`: same ripple adders,
 //! same borrow chain, same shift rule, same ripple comparator. A reader comparing the two
@@ -195,5 +208,205 @@ pub(crate) fn blast(ctx: &mut Ctx, cnf: &mut Cnf, t: Term, out: &mut [Lit; MAX_B
                 *slot = if bit < src { a[bit] } else { f };
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The oracle for *this* blaster.
+    //!
+    //! Every other test in the crate reaches this file only when the BDD arena has already
+    //! filled, which no test at a small width does. So a bug in these circuits would sit
+    //! behind the fallback, invisible until a user's wide query hit it. This module drives
+    //! `blast` directly, forces the inputs, and asks the solver whether the circuit can
+    //! differ from Rust's own wrapping arithmetic -- an oracle that shares no code with the
+    //! blaster. The widths are small so the check is exhaustive over every input pair.
+
+    use super::*;
+    use crate::sat::{self, Sat};
+    use crate::smt;
+
+    fn mask(w: u8) -> u64 {
+        if w >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << w) - 1
+        }
+    }
+
+    /// Blast `build(x, y)` with this blaster, force `x = a` and `y = b`, and ask whether the
+    /// circuit's low `res_w` bits can differ from `want`. `true` means the blaster is wrong.
+    ///
+    /// The query is "can the circuit output differ", so the good answer is `Unsat`: no input
+    /// makes them differ. `Sat` names a divergence, and `Unknown` is treated as a divergence
+    /// too, because an encoding that cannot be decided is not evidence that it is right.
+    fn circuit_can_differ(
+        w: u8,
+        res_w: u8,
+        build: impl Fn(smt::Var, smt::Var) -> smt::Term,
+        a: u64,
+        b: u64,
+        want: u64,
+    ) -> bool {
+        smt::with_fresh(|| {
+            // Explicit indices so the forced inputs below are the same variables the
+            // blaster reads for `Op::Var`.
+            let x = smt::var_named(0, w);
+            let y = smt::var_named(1, w);
+            let t = build(x, y);
+            smt::with_ctx(|ctx| {
+                sat::query(|cnf| {
+                    let mut out = [cnf.false_lit(); MAX_BITS];
+                    blast(ctx, cnf, t, &mut out);
+                    for (idx, val) in [(0u32, a), (1u32, b)] {
+                        for bit in 0..w {
+                            let lit = cnf.input_bit(idx, bit as u32);
+                            let one = (val >> bit) & 1 == 1;
+                            cnf.add_clause(&[if one { lit } else { lit.not() }]);
+                        }
+                    }
+                    let mut diff = cnf.false_lit();
+                    for (bit, lit) in out.iter().enumerate().take(res_w as usize) {
+                        let one = (want >> bit) & 1 == 1;
+                        let mism = if one { lit.not() } else { *lit };
+                        diff = cnf.or(diff, mism);
+                    }
+                    diff
+                })
+            })
+            .0 != Sat::Unsat
+        })
+    }
+
+    /// A word-valued operation, checked against Rust on every input pair at 1..=4 bits.
+    fn word_op(
+        w: u8,
+        name: &str,
+        build: impl Fn(smt::Var, smt::Var) -> smt::Term,
+        rust: impl Fn(u64, u64) -> u64,
+    ) {
+        let m = mask(w);
+        for a in 0..=m {
+            for b in 0..=m {
+                let want = rust(a, b) & m;
+                assert!(
+                    !circuit_can_differ(w, w, &build, a, b, want),
+                    "{name} at {w} bits: the SAT blaster disagrees with Rust on a={a} b={b} (want {want})"
+                );
+            }
+        }
+    }
+
+    /// A predicate-valued operation; the circuit writes its answer to `out[0]`.
+    fn cmp_op(
+        w: u8,
+        name: &str,
+        build: impl Fn(smt::Var, smt::Var) -> smt::Term,
+        rust: impl Fn(u64, u64) -> bool,
+    ) {
+        let m = mask(w);
+        for a in 0..=m {
+            for b in 0..=m {
+                let want = u64::from(rust(a, b));
+                assert!(
+                    !circuit_can_differ(w, 1, &build, a, b, want),
+                    "{name} at {w} bits: the SAT blaster disagrees with Rust on a={a} b={b} (want {want})"
+                );
+            }
+        }
+    }
+
+    /// Sign-extend a `w`-bit value, for the arithmetic shift's oracle.
+    fn sign_extend(v: u64, w: u8) -> i64 {
+        let v = v & mask(w);
+        if w < 64 && (v >> (w - 1)) & 1 == 1 {
+            (v | !mask(w)) as i64
+        } else {
+            v as i64
+        }
+    }
+
+    #[test]
+    fn the_sat_adder_matches_rust() {
+        for w in 1..=4 {
+            word_op(w, "add", |x, y| smt::add(x, y).0, |a, b| a.wrapping_add(b));
+        }
+    }
+
+    #[test]
+    fn the_sat_subtractor_matches_rust() {
+        for w in 1..=4 {
+            word_op(w, "sub", |x, y| smt::sub(x, y).0, |a, b| a.wrapping_sub(b));
+        }
+    }
+
+    #[test]
+    fn the_sat_multiplier_matches_rust() {
+        for w in 1..=4 {
+            word_op(w, "mul", |x, y| smt::mul(x, y).0, |a, b| a.wrapping_mul(b));
+        }
+    }
+
+    #[test]
+    fn the_sat_bitwise_ops_match_rust() {
+        for w in 1..=4 {
+            word_op(w, "and", |x, y| smt::band(x, y).0, |a, b| a & b);
+            word_op(w, "or", |x, y| smt::bor(x, y).0, |a, b| a | b);
+            word_op(w, "xor", |x, y| smt::bxor(x, y).0, |a, b| a ^ b);
+        }
+    }
+
+    #[test]
+    fn the_sat_comparators_match_rust() {
+        for w in 1..=4 {
+            cmp_op(w, "eq", |x, y| smt::eq(x, y).0, |a, b| a == b);
+            cmp_op(w, "ult", |x, y| smt::ult(x, y).0, |a, b| a < b);
+            cmp_op(w, "ule", |x, y| smt::ule(x, y).0, |a, b| a <= b);
+        }
+    }
+
+    #[test]
+    fn the_sat_shifters_match_rust() {
+        // `k < w` only: the engine zero-fills past the width, while Rust's `wrapping_shl`
+        // takes `k mod w`. The two are meant to differ there, so that range is not the
+        // blaster's to get right.
+        for w in 1..=4u8 {
+            for k in 0..w {
+                word_op(w, "shl", |x, _| smt::shl(x, k as u32).0, |a, _| a << k);
+                word_op(w, "lshr", |x, _| smt::lshr(x, k as u32).0, |a, _| a >> k);
+                word_op(
+                    w,
+                    "shr",
+                    |x, _| smt::ashr(x, k as u32).0,
+                    |a, _| (sign_extend(a, w) >> k) as u64,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_divergence_check_has_teeth() {
+        // The helper above reports "no divergence" by asserting `Unsat`. If it were
+        // returning `false` for every query -- a typo in the goal, a forgotten clause --
+        // every test in this module would pass while checking nothing. So ask it a
+        // question whose answer is `true` on purpose: `add(x, y)` cannot always equal
+        // `xor(x, y)`, so a single input pair must be reported as differing.
+        let m = mask(4);
+        let mut found = false;
+        for a in 0..=m {
+            for b in 0..=m {
+                let xor = a ^ b;
+                let add = a.wrapping_add(b) & m;
+                if xor != add
+                    && circuit_can_differ(4, 4, |x, y| smt::bxor(x, y).0, a, b, add)
+                {
+                    found = true;
+                }
+            }
+        }
+        assert!(
+            found,
+            "the divergence check never reported a difference, so it cannot be detecting any"
+        );
     }
 }

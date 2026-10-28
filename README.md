@@ -1357,17 +1357,23 @@ Honesty matters more than a nice README, so:
    equivalence checking for free, but they blow up on multipliers. When the BDD
    arena fills, the *same* term graph is handed to a CDCL SAT solver (`sat.rs`,
    `bitblast.rs`) that has no canonical-form wall.
-   The two engines do **not** share a bit-slicer: `smt::blast` writes BDD node
-   ids and `bitblast::blast` writes `Lit`s, and they cannot be one function
+   The two engines share **no** circuit: `smt::blast` writes BDD node ids and
+   `bitblast::blast` writes `Lit`s, and each writes its *own* ripple adder,
+   subtractor, multiplier and comparator loop. They cannot be one function
    because both gate arenas are `&mut`. What they share is the term graph, so
-   the *arithmetic* is defined once — a wrong adder is wrong in both engines —
-   and the two slicers are kept structurally identical node-for-node on purpose.
-   The duplication is a divergence risk, and the crate treats it as a property
-   to *check*, not to hope away: `tests/differential.rs` proves a random-formula
-   corpus and requires that neither engine's verdict is ever wrong, and
-   `tests/sat_engine.rs` tests the SAT solver against brute-force enumeration so
-   a solver bug is caught without the blaster in the picture. If the two adders
-   ever disagree, one of those fails.
+   each operation is *named* once — its operands and width are fixed when the
+   node is built — but the bit-level circuit for it is written twice, so the two
+   can diverge. That is why the agreement is treated as a property to *check*
+   rather than to assert away, and the check has to be aimed at the right
+   blaster: the differential corpus (`tests/differential.rs`) and the z3 oracle
+   run at widths the BDD engine finishes, so they exercise `smt::blast` and
+   never reach `bitblast::blast` at all. The oracle that pins *this* blaster is
+   the `tests` module in `bitblast.rs`, which drives `blast` directly, forces
+   every input pair at 1–4 bits, and asks the solver whether the circuit can
+   differ from Rust's own wrapping arithmetic. It is exhaustive, and it is
+   load-bearing: dropping the carry-generate term from the adder there (making
+   it compute `xor`) survives `tests/differential.rs`, the whole `cargo test`
+   run and the z3 oracle, and only that module fails.
    The SAT engine is exact but not fast, so it runs under a conflict budget and
    answers `Unknown` when it expires — a verifier that hangs is worse than one
    that declines. The gain is real but specific: `add_comm` at 64 bits is
@@ -1427,7 +1433,7 @@ is instantaneous while a 12-bit multiplier equality is not.
 ├── src/
 │   ├── lib.rs          crate root: module map, prelude, the three proof routes
 │   ├── smt.rs          the decision procedure (the heart of the crate)
-│   ├── bitblast.rs     bit-level circuit -> CNF, shared by both engines
+│   ├── bitblast.rs     bit-level term graph -> CNF, for the SAT fallback
 │   ├── sat.rs          CDCL SAT solver: the fallback when the BDD arena fills
 │   ├── sym.rs          symbolic DSL via operator overloading
 │   ├── logic.rs        verified arithmetic + Q16.16 fixed point

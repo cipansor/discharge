@@ -15,13 +15,19 @@
 //!
 //! **One term graph, two blasters.** There are two bit-slicing functions,
 //! [`crate::smt`]'s `blast` (which writes BDD node ids) and [`crate::bitblast`]'s `blast`
-//! (which writes [`Lit`]s). They are kept structurally identical node-for-node on purpose:
-//! sharing one term graph means the *arithmetic* is defined once, so a wrong adder is
-//! wrong in both engines. The slicing is duplicated because the two gate arenas are both
-//! `&mut` and cannot be one function without either splitting an arena or hiding a pointer
-//! behind a trait; the divergence that duplication risks is treated as a property to
-//! *check*, not to hope away -- see the header of [`crate::bitblast`], `tests/differential.rs`
-//! and `tests/sat_engine.rs`.
+//! (which writes [`Lit`]s). They are kept structurally identical node-for-node on purpose.
+//! What the two engines share is the *term graph*, so each operation is named once -- its
+//! operands and width are fixed when the node is built -- but each blaster writes its own
+//! adder, subtractor, multiplier and comparator circuit. The arithmetic is therefore *not*
+//! shared code and the two circuits could diverge. The slicing is duplicated because the two
+//! gate arenas are both `&mut` and cannot be one function without either splitting an arena
+//! or hiding a pointer behind a trait; the divergence that duplication risks is treated as a
+//! property to *check*, not to hope away -- see the header of [`crate::bitblast`],
+//! `tests/differential.rs` and `tests/sat_engine.rs`. Of those, only [`crate::bitblast`]'s own
+//! `tests` module actually reaches the SAT blaster: the differential corpus and the z3 oracle
+//! run at widths the BDD engine finishes, so they exercise `smt::blast` and never call
+//! `bitblast::blast`. A differential test between two engines proves nothing about the engine
+//! that never runs.
 //!
 //! This is deliberately not the stronger "one bit-slicer" claim: the CNF is rebuilt from
 //! the term graph rather than consumed from a BDD-produced netlist.

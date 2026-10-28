@@ -17,7 +17,7 @@
 //! | Module | What it gives you |
 //! |---|---|
 //! | [`smt`] | The decision procedure: BDDs, with a CDCL SAT fallback past the BDD wall. `no_std`, zero dependencies, fixed-size arena. |
-//! | [`bitblast`] | The bit-level netlist -> CNF lowering both engines share. |
+//! | [`bitblast`] | The bit-level term graph -> CNF lowering, used by the SAT fallback. |
 //! | [`sat`] | The CDCL SAT solver used as the fallback. |
 //! | [`sym`] | A symbolic DSL: `(x + y).eq(y + x).prove()`. |
 //! | [`logic`] | Verified arithmetic and Q16.16 fixed point, with proofs attached. |

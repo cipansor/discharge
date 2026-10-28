@@ -1770,13 +1770,39 @@ Two engines, one term graph, **two blasters** -- and the distinction matters, be
 first write-up of this said "one netlist" and that was wrong. `smt::blast` writes BDD node
 ids; `bitblast::blast` writes `Lit`s. They cannot be one function: the term arena and the
 gate arena are both `&mut`, so a shared blaster would have to split an arena or hide a
-pointer behind a trait. What the two share is the *term graph*, so the arithmetic is defined
-once and a wrong adder is wrong in both engines; the slicing itself is duplicated. The
-duplication is a real divergence risk, so it is treated as a property to check rather than
-hope away: `tests/differential.rs` requires neither engine's verdict to ever be wrong, and
-`tests/sat_engine.rs` checks the solver against brute-force enumeration with no blaster in
-the picture. A claim of "one bit-slicer" would be the stronger, false version of this; the
-code and `src/sat.rs`'s header say the true one.
+pointer behind a trait. What the two share is the *term graph*, so each operation is named
+once -- operands and width are decided when the node is built -- but each blaster writes its
+own adder, subtractor, multiplier and comparator circuit. So "the arithmetic is defined once"
+is itself too strong: the *operations* are defined once, the *circuits* are not, and the two
+circuits could diverge. That is a real risk, so it is treated as a property to check rather
+than hope away. "One bit-slicer" and "one netlist" are both the stronger, false version of
+this; the code and `src/sat.rs`'s header say the true one.
+
+### The check has to be aimed at the blaster it is about
+
+The first fix for the wording above kept the sentence "if the two adders ever disagree, one
+of those fails", naming `tests/differential.rs` and the z3 oracle. That was measured and it
+is **false**. Both run at widths where the BDD engine finishes (the z3 corpus sweeps 8 and 12
+bits; the differential corpus pins every op at 1--4 bits *precisely so the BDD can finish*),
+so every query they make is decided by `smt::blast`. `bitblast::blast` only runs once the BDD
+arena has already filled, which is 64 bits for an adder and 8 for a multiplier -- nothing in
+the suite reaches it.
+
+The measurement: delete the carry-generate term (`a & b`) from `bitblast.rs`'s adder so it
+computes `xor`, and drop a carry term from its multiplier. Then run the lot. `cargo test`
+passes, `tests/differential.rs` passes, the z3 oracle reports `mismatch=0`, and the probe
+still prints `add_comm 64b valid`. A query that *does* force the SAT path and is sensitive to
+the bug (`add(x, y) == xor(x, y)`, or `(x+y)-x == y` at 64 bits) comes back `Valid` and
+`Counterexample` -- that is, an unsound proof and a spurious witness, from a suite that is
+green.
+
+The fix is the `tests` module in `bitblast.rs`: drive `blast` directly, force both inputs,
+and ask the solver whether the circuit can differ from Rust's wrapping arithmetic, exhaustive
+over every input pair at 1--4 bits. It catches both mutants, and its own teeth are checked
+(the helper is made to answer "no divergence" unconditionally and the teeth test fails). The
+lesson is not "add a differential test"; it is that a differential test *between two engines*
+proves nothing about the engine that never runs. The oracle has to reach the code under test,
+and the way to know it does is to break that code and watch the test fail.
 
 The point of recording this here is the measurement discipline, because the first version
 of this feature *claimed* to have broken the wall and had not.
