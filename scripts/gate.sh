@@ -11,17 +11,38 @@ cd "$(dirname "$0")/.."
 fail() { echo "GATE FAILED: $1" >&2; exit 1; }
 
 echo "== 1/8 clippy (all targets, std) =="
-cargo clippy --features std --all-targets -- -D warnings || fail "clippy"
+cargo clippy --workspace --features std --all-targets -- -D warnings || fail "clippy"
 
 echo "== 2/8 tests (std), with a count that fails on failure =="
 sh scripts/test-count.sh || fail "tests"
 
 echo "== 3/8 no_std bare-metal build =="
+# Both crates must build for the target a flight computer actually is. The parent is
+# built without its `std` feature; the arithmetic crate has no features at all, so its
+# default build *is* the bare-metal one.
 cargo build -q --no-default-features --target thumbv7em-none-eabihf || fail "bare-metal build"
+cargo build -q -p discharge-arithmetic --target thumbv7em-none-eabihf \
+  || fail "bare-metal build of discharge-arithmetic"
 
-echo "== 4/8 zero dependencies =="
-deps=$(cargo tree --features std | wc -l)
-[ "$deps" -eq 1 ] || fail "crate has dependencies: cargo tree lists $deps lines"
+echo "== 4/8 no external dependencies =="
+# The property is not "the tree has one line" any more -- the arithmetic primitives were
+# split into a sibling crate in this repository, so `discharge` legitimately depends on
+# `discharge-arithmetic`. The property that must not change is that *nothing from outside
+# the repository* is linked: no registry crate, no git crate, nothing from crates.io.
+#
+# `discharge-arithmetic` must still be a leaf: one line, itself, no dependencies at all.
+arith_deps=$(cargo tree -p discharge-arithmetic -e normal | wc -l)
+[ "$arith_deps" -eq 1 ] || fail "discharge-arithmetic has dependencies: cargo tree lists $arith_deps lines"
+
+# `discharge` may depend on exactly the one sibling, and it must be a *path* dependency.
+discharge_deps=$(cargo tree -p discharge -e normal | wc -l)
+[ "$discharge_deps" -eq 2 ] || fail "discharge has dependencies beyond the in-repo sibling: cargo tree lists $discharge_deps lines"
+cargo tree -p discharge -e normal --prefix none | tail -n +2 | grep -q 'discharge-arithmetic v0.1.0 (' \
+  || fail "the one dependency of discharge is not the in-repo discharge-arithmetic path crate"
+# A registry or git dependency would print a `(https://...)` or `(registry+...)` suffix.
+if cargo tree -p discharge -e normal --prefix none | tail -n +2 | grep -qE '\((https?://|git\+|registry\+)'; then
+  fail "an external (registry or git) dependency has appeared in the tree"
+fi
 
 echo "== 5/8 z3 differential oracle =="
 # This one needs the oracle. If `z3` is absent it exits 2 and says so; that is a failure

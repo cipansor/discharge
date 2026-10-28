@@ -1,115 +1,21 @@
-//! Drop-in integer operations whose central safety property is *proved*.
+//! The symbolic **oracle** for the proved `safe_*` operations and `Bounded`.
 //!
-//! In C, `a + b` on `unsigned` silently wraps and on `signed` is undefined
-//! behaviour; in Ada with `-gnato` it traps, and SPARK can prove statically that
-//! the trap never fires. Rust's `+` panics in debug and wraps in release, which
-//! is arguably the worst of both worlds for flight software. These primitives
-//! take the total-function route: they return an `Option`, and the accompanying
-//! `verify_*` functions prove that the `None` case is exactly the overflow case,
-//! so a caller can either handle it or prove it away.
+//! The runtime half — [`safe_add`], [`safe_sub`], [`safe_mul`], [`safe_div`],
+//! [`safe_rem`], and the refinement-typed [`Bounded`] — now lives in the
+//! standalone `discharge-arithmetic` crate, which proves its own properties by
+//! exhaustive enumeration without the `smt` engine. Those items are re-exported
+//! here unchanged.
 //!
-//! The `Bounded` type carries a compile-time range, and the proofs show that
-//! addition and subtraction of in-range values cannot leave a stated envelope —
-//! the check a control law needs before it writes to an actuator.
+//! What stays is the symbolic second opinion. The `verify_*` functions below
+//! state the same obligations at widths enumeration cannot reach, and
+//! `tests/oracle.rs` cross-checks the two engines against each other.
 
 use crate::smt::{self, Verdict};
 
-/// `a + b`, or `None` on overflow.
-pub const fn safe_add(a: u32, b: u32) -> Option<u32> {
-    a.checked_add(b)
-}
-
-/// `a - b`, or `None` on underflow.
-pub const fn safe_sub(a: u32, b: u32) -> Option<u32> {
-    a.checked_sub(b)
-}
-
-/// `a * b`, or `None` on overflow.
-pub const fn safe_mul(a: u32, b: u32) -> Option<u32> {
-    a.checked_mul(b)
-}
-
-/// `a / b`, or `None` when `b == 0`. Division is *defined* for every nonzero
-/// divisor, so the only failure mode is the one made explicit here.
-pub const fn safe_div(a: u32, b: u32) -> Option<u32> {
-    a.checked_div(b)
-}
-
-/// `a % b`, or `None` when `b == 0`.
-pub const fn safe_rem(a: u32, b: u32) -> Option<u32> {
-    a.checked_rem(b)
-}
-
-/// A value known at compile time to lie in `[MIN, MAX]`.
-///
-/// The constructor is the only way in, so `Bounded<MIN, MAX>` is a
-/// refinement-typed integer: the invariant cannot be broken by construction.
-///
-/// Both constructors, [`new`](Self::new) and [`clamp`](Self::clamp), refuse an *empty*
-/// range: when `MIN > MAX` no `u64` satisfies `MIN <= v <= MAX`, so neither can produce a
-/// value. `clamp` used to return `MIN` in that case, which is outside `[LOW, HIGH]` and
-/// so broke the very invariant the type exists to carry; see
-/// `an_empty_bounded_range_admits_nothing` in the tests below.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Bounded<const MIN: u64, const MAX: u64>(u64);
-
-impl<const MIN: u64, const MAX: u64> Bounded<MIN, MAX> {
-    /// The inclusive lower bound.
-    pub const LOW: u64 = MIN;
-    /// The inclusive upper bound.
-    pub const HIGH: u64 = MAX;
-
-    /// Construct, or `None` when the value is outside the range.
-    pub const fn new(v: u64) -> Option<Self> {
-        if MIN <= v && v <= MAX {
-            Some(Bounded(v))
-        } else {
-            None
-        }
-    }
-
-    /// The raw value. Always within `[MIN, MAX]` by construction.
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-
-    /// Clamp an arbitrary value into the range, or `None` when the range is empty.
-    ///
-    /// `MIN > MAX` is an empty range: no `u64` satisfies `MIN <= v <= MAX`, so there is
-    /// no value to return. Returning `MIN` (the old behaviour) produced a `Bounded` whose
-    /// `get()` is outside its own `[LOW, HIGH]`, which breaks the invariant the type
-    /// exists to carry -- `Bounded<100, 10>::clamp(50)` gave `100`, and `100 <= 10` is
-    /// false. [`new`](Self::new) already returns `None` for the same range, so the two
-    /// constructors now agree: an empty range admits nothing.
-    pub const fn clamp(v: u64) -> Option<Self> {
-        if MIN > MAX {
-            return None;
-        }
-        Some(if v < MIN {
-            Bounded(MIN)
-        } else if v > MAX {
-            Bounded(MAX)
-        } else {
-            Bounded(v)
-        })
-    }
-
-    /// Add, or `None` if the sum leaves the range.
-    pub const fn add(self, other: Self) -> Option<Self> {
-        match self.0.checked_add(other.0) {
-            Some(s) if MIN <= s && s <= MAX => Some(Bounded(s)),
-            _ => None,
-        }
-    }
-
-    /// Subtract, or `None` if the difference leaves the range.
-    pub const fn sub(self, other: Self) -> Option<Self> {
-        match self.0.checked_sub(other.0) {
-            Some(d) if MIN <= d && d <= MAX => Some(Bounded(d)),
-            _ => None,
-        }
-    }
-}
+// The runtime primitives, unchanged, now owned by the standalone crate.
+pub use discharge_arithmetic::bounded::{
+    safe_add, safe_div, safe_mul, safe_rem, safe_sub, Bounded,
+};
 
 // ---------------------------------------------------------------------------
 // Proofs

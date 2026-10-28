@@ -1,66 +1,30 @@
-//! Verified arithmetic primitives, the "library" half of the SPARK story.
+//! The symbolic **oracle** for the proved arithmetic primitives.
 //!
-//! These are the operations that safety-critical code reaches for constantly,
-//! and each one carries an executable proof of its central property:
+//! The runtime half of this module — [`checked_add`], [`saturating_add`],
+//! [`mul_div`], [`Fixed`] — now lives in the standalone `discharge-arithmetic`
+//! crate, which is `no_std`, `#![forbid(unsafe_code)]`, has no dependencies, and
+//! proves its own properties by exhaustive enumeration *without* the `smt`
+//! engine. Those items are re-exported here unchanged, so this crate's public
+//! surface and every caller of `discharge::logic` are unaffected by the split.
 //!
-//! * [`checked_add`], [`checked_sub`], [`checked_mul`] — total functions. They
-//!   *cannot* overflow, so the caller never inherits a panic or a wrap-around.
-//! * [`saturating_add`], [`saturating_sub`] — clamp instead of wrapping, with
-//!   proofs of the two bounds that matter.
-//! * [`mul_div`] — multiply-then-divide without the intermediate overflow that
-//!   makes the naive form wrong for PID-style controllers.
-//! * [`Fixed`] — a Q16.16 fixed-point type with proved scaling behaviour, for
-//!   the sensor/actuator code that must avoid floating point.
+//! What stays in this module is the second opinion. The `verify_*` functions
+//! state the **same** obligations symbolically, at widths the enumeration cannot
+//! reach, and [`crate::smt`] discharges them. `tests/oracle.rs` then cross-checks
+//! the two engines against each other: where both decide, they must agree, and
+//! where only one can (the 32-bit two-variable domains) the symbolic engine is
+//! the one that answers.
 //!
-//! Every `verify_*` function in this module returns a [`crate::smt::Verdict`],
-//! and the module's tests assert that they are `Valid`. Run them with
-//! `cargo test --features std`.
+//! This is the same division of labour as the MIR frontend: the crate owns a
+//! self-contained mechanism, and the heavier external one is only ever an
+//! oracle. See `README.md`, "Two engines, one obligation".
 
 use crate::smt::{self, Verdict};
 
-// ---------------------------------------------------------------------------
-// Checked arithmetic
-// ---------------------------------------------------------------------------
-
-/// `a + b`, or `None` on overflow. Total: no panic, no wrap-around.
-pub const fn checked_add(a: u32, b: u32) -> Option<u32> {
-    a.checked_add(b)
-}
-
-/// `a - b`, or `None` on underflow.
-pub const fn checked_sub(a: u32, b: u32) -> Option<u32> {
-    a.checked_sub(b)
-}
-
-/// `a * b`, or `None` on overflow.
-pub const fn checked_mul(a: u32, b: u32) -> Option<u32> {
-    a.checked_mul(b)
-}
-
-/// `a + b`, clamped to the type's maximum.
-pub const fn saturating_add(a: u32, b: u32) -> u32 {
-    a.saturating_add(b)
-}
-
-/// `a - b`, clamped at zero.
-pub const fn saturating_sub(a: u32, b: u32) -> u32 {
-    a.saturating_sub(b)
-}
-
-/// `a * b / d` without overflow in the intermediate product, using a 64-bit
-/// widening. Returns `None` when `d == 0` or the true quotient exceeds `u32`.
-pub const fn mul_div(a: u32, b: u32, d: u32) -> Option<u32> {
-    if d == 0 {
-        return None;
-    }
-    let wide = (a as u64) * (b as u64);
-    let q = wide / (d as u64);
-    if q > u32::MAX as u64 {
-        None
-    } else {
-        Some(q as u32)
-    }
-}
+// The runtime primitives, unchanged, now owned by the standalone crate.
+pub use discharge_arithmetic::checked::{
+    checked_add, checked_mul, checked_sub, mul_div, saturating_add, saturating_sub,
+};
+pub use discharge_arithmetic::fixed::Fixed;
 
 // ---------------------------------------------------------------------------
 // Symbolic proofs about the primitives
@@ -193,107 +157,6 @@ pub fn hard_multiplier_query() -> Verdict {
         let right = smt::mul(a, smt::mul(b, c));
         smt::prove(smt::eq(left, right))
     })
-}
-
-// ---------------------------------------------------------------------------
-// Q16.16 fixed point
-// ---------------------------------------------------------------------------
-
-/// A Q16.16 fixed-point number: 16 integer bits, 16 fractional bits.
-///
-/// This is the workhorse representation in flight control and motor control:
-/// deterministic, no floating point, no soft-float dependency. The crate proves
-/// the properties that make it safe to add and scale.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Fixed(pub i32);
-
-impl Fixed {
-    /// The scaling factor, `2^16`.
-    pub const SCALE: i32 = 1 << 16;
-    /// One, as Q16.16.
-    pub const ONE: Fixed = Fixed(Self::SCALE);
-    /// Zero.
-    pub const ZERO: Fixed = Fixed(0);
-    /// The largest representable value.
-    pub const MAX: Fixed = Fixed(i32::MAX);
-    /// The smallest representable value.
-    pub const MIN: Fixed = Fixed(i32::MIN);
-
-    /// From an integer, saturating.
-    ///
-    /// The range of Q16.16 in `i32` is `[-32768, 32767]` integers, so `v << 16` silently
-    /// wraps for `|v| >= 32768`: `from_int(32768)` used to give `-32768`. A shift is a
-    /// total function, which is exactly why the wrap is invisible. Saturating keeps this
-    /// module's promise that no primitive overflows without saying so.
-    pub const fn from_int(v: i32) -> Fixed {
-        if v > i32::MAX >> 16 {
-            Fixed(i32::MAX)
-        } else if v < i32::MIN >> 16 {
-            Fixed(i32::MIN)
-        } else {
-            Fixed(v << 16)
-        }
-    }
-
-    /// The integer part, truncated toward zero.
-    ///
-    /// Truncation toward zero is not `self.0 >> 16` for negative values: an arithmetic
-    /// shift is a floor, so `-0.5 >> 16` gives `-1`, not `0`. That one-bit bias on every
-    /// negative fractional input is the kind of error a control law cannot see. The
-    /// magnitude is truncated and the sign restored, which is `as i32` behaviour.
-    pub const fn to_int(self) -> i32 {
-        if self.0 >= 0 {
-            self.0 >> 16
-        } else {
-            -((self.0.unsigned_abs() >> 16) as i32)
-        }
-    }
-
-    /// Construct from raw bits.
-    pub const fn from_bits(bits: i32) -> Fixed {
-        Fixed(bits)
-    }
-
-    /// The raw bits.
-    pub const fn to_bits(self) -> i32 {
-        self.0
-    }
-
-    /// Saturating addition.
-    pub const fn saturating_add(self, other: Fixed) -> Fixed {
-        Fixed(self.0.saturating_add(other.0))
-    }
-
-    /// Saturating subtraction.
-    pub const fn saturating_sub(self, other: Fixed) -> Fixed {
-        Fixed(self.0.saturating_sub(other.0))
-    }
-
-    /// Multiply by an integer, saturating.
-    pub const fn saturating_mul_int(self, k: i32) -> Fixed {
-        match self.0.checked_mul(k) {
-            Some(v) => Fixed(v),
-            None => {
-                if (self.0 < 0) ^ (k < 0) {
-                    Fixed(i32::MIN)
-                } else {
-                    Fixed(i32::MAX)
-                }
-            }
-        }
-    }
-
-    /// Truncating division by an integer. `None` when `k == 0`, and also when the quotient
-    /// is not representable -- the single overflowing case, `i32::MIN / -1`, whose true
-    /// result `2^31` is one past `i32::MAX`. `checked_div` reports both, so this returns
-    /// `None` for either rather than wrapping to `i32::MIN`; the doc used to name only the
-    /// zero divisor, which read as if that were the only failure mode.
-    pub const fn checked_div_int(self, k: i32) -> Option<Fixed> {
-        match self.0.checked_div(k) {
-            Some(v) => Some(Fixed(v)),
-            None => None,
-        }
-    }
 }
 
 /// Adding two non-negative Q16.16 values cannot overflow a signed 16-bit sum when

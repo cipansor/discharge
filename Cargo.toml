@@ -1,13 +1,26 @@
+[workspace]
+members = ["discharge-arithmetic"]
+resolver = "2"
+
 [package]
 name = "discharge"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-description = "In-code formal verification for Rust: an embedded bit-blasting SMT decision procedure, a symbolic DSL, contracts and a machine-checked proof kernel. SPARK-inspired, no_std, zero dependencies."
+description = "In-code formal verification for Rust: an embedded bit-blasting SMT decision procedure, a symbolic DSL, contracts and a machine-checked proof kernel. SPARK-inspired, no_std, no external dependencies."
 authors = ["Yayasan Pesantren Cipansor and contributors <halo@cipansor.or.id>"]
 license = "Apache-2.0"
 keywords = ["formal-verification", "smt", "no_std", "safety-critical", "contracts"]
 categories = ["no-std", "embedded", "development-tools::testing"]
+
+[dependencies]
+# The only dependency, and it is a sibling in this repository, not a registry
+# crate: the proved integer primitives, which are `no_std`, `#![forbid(unsafe_code)]`
+# and dependency-free themselves. The point of the split is that the *runtime*
+# arithmetic a safety build ships links `core` and nothing else, while this crate
+# keeps the symbolic `smt` engine that cross-checks those proofs. Gate 4 of
+# `scripts/gate.sh` enforces that no *external* crate ever joins this list.
+discharge-arithmetic = { path = "discharge-arithmetic" }
 
 [features]
 # No default features: the crate is `no_std` + zero-dependency out of the box,

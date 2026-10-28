@@ -5,3 +5,10 @@ version = 3
 [[package]]
 name = "discharge"
 version = "0.1.0"
+dependencies = [
+ "discharge-arithmetic",
+]
+
+[[package]]
+name = "discharge-arithmetic"
+version = "0.1.0"
