@@ -1,5 +1,13 @@
 [workspace]
+# `discharge` and the proved-arithmetic sibling. The `tools/mir-oracle` crate is
+# deliberately *not* a member: it links rustc internals behind
+# `#![feature(rustc_private)]`, so it builds only on a nightly with `rustc-dev`.
+# Making it a member would make `cargo build --workspace` require a nightly, which
+# is exactly what a stable, zero-dependency crate must not do. It is built by name
+# (`cargo build -p mir-oracle`) with the oracle toolchain, and `exclude` keeps
+# cargo from trying to pull it in through the `tools/` glob.
 members = ["discharge-arithmetic"]
+exclude = ["tools/mir-oracle"]
 resolver = "2"
 
 [package]

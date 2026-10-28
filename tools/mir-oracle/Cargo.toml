@@ -1,0 +1,21 @@
+[package]
+name = "mir-oracle"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "A `rustc_public` oracle that checks the `discharge` text-MIR frontend against rustc's own typed MIR. Never a dependency of `discharge`."
+
+# This crate is a *tool*, not a library anyone links. It is the one place in the
+# repository that links rustc internals, and it does so behind
+# `#![feature(rustc_private)]`, which means it builds only on a nightly with the
+# `rustc-dev` component. That is the entire reason it is a separate crate: the
+# `discharge` crate must build on stable with no dependencies, and
+# `rustc_private` is neither stable nor dependency-free.
+#
+# It is a workspace member so `cargo build --workspace` sees it, but nothing
+# depends on it and it depends on `discharge` only through the path dependency
+# below -- the arrow points *from* the oracle *to* the crate under test, so the
+# oracle can never become part of what ships.
+
+[dependencies]
+discharge = { path = "../..", features = ["std"] }

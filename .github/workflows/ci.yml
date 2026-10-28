@@ -1,6 +1,6 @@
 # CI for the `discharge` crate.
 #
-# Three jobs on purpose. The first runs `scripts/gate.sh` -- the same script a human runs --
+# Four jobs on purpose. The first runs `scripts/gate.sh` -- the same script a human runs --
 # so "the gates are green" means the same thing locally and in CI, and there is no second
 # copy of the commands to drift. The other two install Kani and Verus and run their
 # differential oracles as hard gates, because both are large downloads (a pinned nightly
@@ -130,3 +130,42 @@ jobs:
         env:
           VERUS_BIN: ${{ github.workspace }}/verus-x86-linux/verus
         run: cargo run -q --features std --example verusdiff -- 64
+
+  mir-oracle:
+    name: rustc_public MIR oracle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # This job is the whole reason `tools/mir-oracle` exists: it links `rustc_public`,
+      # which needs a nightly plus the `rustc-dev` component. Neither may leak into
+      # `discharge` -- the crate builds on stable with no dependencies -- so the oracle is a
+      # separate, excluded workspace member and only this job pays for the nightly.
+      - name: Install Rust (stable + nightly with rustc-dev)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup toolchain install nightly --profile minimal --no-self-update
+          rustup component add rustc-dev --toolchain nightly
+          rustup default stable
+
+      # The frontend reads *textual* MIR; this checks that reading against rustc's own typed
+      # MIR, function by function. A rustc release that reprints the dump would otherwise
+      # break the parser silently, because the parser is the only thing that reads the dump.
+      # `run.sh` exits 2 if the toolchain is missing and 1 on a real disagreement; only the
+      # latter should fail CI, so a missing nightly is surfaced by the component step above
+      # rather than being swallowed here.
+      - name: Run the MIR oracle
+        run: |
+          DISCHARGE_RUSTC="$(rustup which --toolchain nightly rustc)"
+          export DISCHARGE_RUSTC
+          sh tools/mir-oracle/run.sh
+
+      - name: Run the oracle's own tests
+        run: |
+          cd tools/mir-oracle
+          RUSTC="$(rustup which --toolchain nightly rustc)" cargo test
+
+      - name: Lint the oracle
+        run: |
+          cd tools/mir-oracle
+          RUSTC="$(rustup which --toolchain nightly rustc)" cargo clippy --all-targets -- -D warnings

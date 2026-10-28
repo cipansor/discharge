@@ -2252,3 +2252,49 @@ the call (it fails on the pre-fix code), and `an_inlined_call_does_not_rescue_a_
 requires the same loop with `ensures: ret == 0` to still be refuted. Restoring the cut must
 restore the proof the invariant actually carries, not resurrect one that was never there.
 
+
+## The `rustc_public` oracle: what the text parser is checked against, and why it is a separate crate
+
+The MIR frontend reads the **textual** `--emit=mir` dump. That is the crate's stated gap 2:
+a rustc release that reprints the dump can break the parser, and the parser is the only thing
+that reads the dump, so nothing else notices. `tools/mir-oracle` closes that loop by asking
+`rustc_public` — the compiler's own public API — for the same programs' **typed** MIR and
+comparing a per-function *shape*: block count plus the panic guards `rustc` inserted, in block
+order. Structural, not textual, because the two dumps are not byte-identical (the typed one
+omits `copy` qualifiers, prints `let  _4` with different spacing, and nests `scope` blocks),
+so a text diff fails on cosmetics and proves nothing.
+
+Traps that cost time, in the order they cost it:
+
+* **`rustc_private` needs four `extern crate`s, not one.** `extern crate rustc_public;` alone
+  fails to link; `rustc_driver`, `rustc_interface` and `rustc_middle` must be declared too,
+  because the `run!` macro expands to code naming all three. The error is `cannot find module
+  or crate rustc_middle in this scope` pointing at the macro invocation, which reads as a
+  missing dependency rather than a missing `extern crate`.
+* **`run!` wants `&args`, and argv[0] is the program name.** `run!(&args, …)`, not
+  `run!(args, …)`. Passing a `Vec<String>` is a type error against `&[String]`; passing a
+  slice with the file first (no program name) makes rustc read the file as the program name.
+* **`--out-dir` is mandatory.** `rustc_public` runs a real rustc; without `--out-dir` it drops
+  `lib<stem>.rlib` next to the source file, so every oracle run litters the repository. The
+  oracle points it at a temp directory. This is easy to miss because the run still *succeeds*.
+* **The binary needs the sysroot on its runtime path.** A `rustc_private` binary links
+  `librustc_driver-*.so` but cargo does not add the sysroot to its rpath, so it builds and then
+  dies with `cannot open shared object file`. `build.rs` bakes `-Wl,-rpath,$(rustc --print
+  sysroot)/lib` in, using the `RUSTC` cargo is building with. `run.sh` sets both `RUSTC` (what
+  cargo builds *with*) and `DISCHARGE_RUSTC` (what the frontend *runs*) to the same nightly.
+* **The crate is `exclude`d from the workspace, not a member.** A member would make
+  `cargo build --workspace` require a nightly, which breaks the stable zero-dependency build
+  that is the whole point of the crate. `exclude = ["tools/mir-oracle"]` plus `cargo build`
+  from inside `tools/mir-oracle`. `cargo metadata` lists exactly `discharge` and
+  `discharge-arithmetic`, so gate 4 still sees a two-line tree.
+* **`rustc_public::mir::body` is private but glob-re-exported.** Import from
+  `rustc_public::mir::{…}`, not `rustc_public::mir::body::{…}`. `Local` is `pub type Local =
+  usize`, not a tuple struct, so `Local(0)` does not compile — use `Place::from(0usize)`.
+
+The oracle has teeth and it was checked: flipping one arm of `PanicKind::from_text_message`
+(Add -> Mul) makes the run exit 1 with 7 actuator functions and 4 realistic functions named
+and their two panic lists printed. A tool that can only say "agree" is not evidence.
+
+Exit codes are three-way on purpose: `0` agree, `1` a shape disagreed, `2` the oracle could
+not run (no nightly / no `rustc-dev`). Gate 9 skips on `2` and fails on anything else, so
+"the toolchain is missing" is never reported as a parser failure nor as a pass.

@@ -1378,7 +1378,10 @@ says "I could not decide" is worth more than one that guesses.
 2. **The dump is textual.** The frontend parses `--emit=mir` output rather than
    linking `rustc-dev`. That keeps the dependency count at zero and makes the
    input inspectable, but it means a rustc release that changes the pretty-printer
-   can break the parser. It fails closed when that happens.
+   can break the parser. It fails closed when that happens, and the
+   `rustc_public` oracle in `tools/mir-oracle` (gate 9) checks the parser's
+   reading against rustc's own typed MIR, so the breakage is caught by CI rather
+   than by a user.
 3. **Contracts are checked at entry and exit only.** A loop invariant written as a
    contract is not an invariant; it is an assertion at two points.
 4. **The verifier is not inside the artifact.** `gnatprove` and this crate's own
@@ -1498,7 +1501,7 @@ is instantaneous while a 12-bit multiplier equality is not.
 ├── SECURITY.md         how to report a vulnerability (GitHub private advisories)
 ├── .github/
 │   └── workflows/
-│       └── ci.yml      the gates, plus Kani and Verus as hard-gate jobs
+│       └── ci.yml      the gates, plus Kani, Verus and the MIR oracle as jobs
 ├── src/
 │   ├── lib.rs          crate root: module map, prelude, the three proof routes
 │   ├── smt.rs          the decision procedure (the heart of the crate)
@@ -1521,6 +1524,7 @@ is instantaneous while a 12-bit multiplier equality is not.
 │       ├── parse.rs    rustc's textual MIR -> a small IR, failing closed
 │       ├── exec.rs     symbolic execution of that IR, with a frame stack for calls
 │       ├── intrinsics.rs  the `checked_*`/`saturating_*`/`wrapping_*` model
+│       ├── shape.rs    per-function summary the rustc_public oracle compares
 │       ├── spec.rs     contract scanner + the small contract-expression grammar
 │       └── verify.rs   driver: emit MIR, extract contracts, discharge, report
 ├── tests/
@@ -1556,6 +1560,10 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   ├── mir_demo.rs        verifies real Rust read from MIR, end to end
 │   └── mir_targets/
 │       └── actuator.rs    the Rust under verification; imports no `discharge`
+├── tools/
+│   └── mir-oracle/     the `rustc_public` oracle: checks the text-MIR frontend
+│                       against rustc's own typed MIR. Nightly + `rustc-dev`,
+│                       its own workspace, and never a dependency of `discharge`.
 └── scripts/
     ├── gate.sh            every gate in one command, failing loudly
     └── test-count.sh      the exact passing-test count, only when all pass
@@ -1579,11 +1587,30 @@ cargo build --no-default-features --target thumbv7em-none-eabihf
 `no_std` build, a zero-dependency check, and the z3 differential oracle. It exists because
 the gates were previously five separate commands quoted in prose, which is how a gate
 quietly stops being run. It also refuses to report success when the z3 oracle is not
-installed: an oracle that did not run is not evidence about the exporter. Two further gates
-run the Kani and Verus differential oracles when those tools are present and *skip them
-loudly* when they are not, because both are large downloads (Kani: a pinned nightly plus
-CBMC; Verus: a self-contained bundle with its own z3) that a normal local run should not pay
-for; CI installs them and runs them as hard gates.
+installed: an oracle that did not run is not evidence about the exporter. Three further gates
+run the Kani and Verus differential oracles and the `rustc_public` MIR oracle when those
+tools are present and *skip them loudly* when they are not, because all three are large
+downloads (Kani: a pinned nightly plus CBMC; Verus: a self-contained bundle with its own z3;
+the MIR oracle: a nightly with the `rustc-dev` component) that a normal local run should not
+pay for; CI installs them and runs them as hard gates.
+
+### The third oracle: rustc's own MIR, against the parser
+
+`z3diff` checks the exporter and `kanidiff`/`verusdiff` check the engine. The MIR frontend
+has a third failure mode, and it is the one gap 2 below names: it reads rustc's *textual*
+`--emit=mir` dump, so a rustc release that changes the pretty-printer can break the parser,
+and the parser is the only thing that would notice. `tools/mir-oracle` closes that loop. It
+asks `rustc_public` — the compiler's own public API, which needs a nightly and the
+`rustc-dev` component — for the same programs' **typed** MIR, reduces each function to a
+small comparable shape (how many basic blocks it lowered to, and which panic guards `rustc`
+inserted, in block order), and fails if that disagrees with what the frontend's parser read
+out of the text. The comparison is structural on purpose: the two dumps are not
+byte-identical (the typed one omits `copy` qualifiers and nests `scope` blocks), and
+comparing text would fail on cosmetics and prove nothing. The oracle lives in
+`tools/mir-oracle`, outside the workspace, so the nightly and the `rustc_private` feature
+never touch a crate that must build on stable with zero dependencies; the dependency arrow
+points one way, from the oracle to `discharge`. Gate 9 of `scripts/gate.sh` runs it, and the
+`mir-oracle` CI job makes it a hard gate.
 
 ### Two more oracles, for the engine instead of the exporter
 

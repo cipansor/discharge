@@ -82,5 +82,6 @@
 pub(crate) mod exec;
 pub(crate) mod intrinsics;
 pub(crate) mod parse;
+pub mod shape;
 pub mod spec;
 pub mod verify;
