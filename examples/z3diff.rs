@@ -179,6 +179,58 @@ fn identity_corpus(w: u8, x: Var, y: Var) -> Vec<(&'static str, Pred)> {
         ("ule.alt", smt::iff(smt::ule(x, y), smt::or(smt::ult(x, y), smt::eq(x, y)))),
         ("demorgan", smt::iff(smt::or(p, q), smt::not(smt::and(smt::not(p), smt::not(q))))),
         ("xor.self", smt::not(smt::xor(p, p))),
+
+        // --- signed operators -------------------------------------------------
+        // Every one of these is false if the signed operator is secretly the
+        // unsigned one, so they give the oracle teeth for the split. `slt` and
+        // friends are exported as predicates, and z3 sees `bvslt`/`bvsle`; a
+        // printer that emitted `bvult` instead would make `slt.neg` satisfiable.
+        ("slt.neg", smt::slt(ones, smt::word(0x01, w))),
+        ("slt.same", smt::iff(
+            smt::slt(x, y),
+            smt::or(
+                smt::and(smt::negative(x), smt::not(smt::negative(y))),
+                smt::and(
+                    smt::iff(smt::negative(x), smt::negative(y)),
+                    smt::ult(x, y),
+                ),
+            ),
+        )),
+        ("slt.irrefl", smt::not(smt::slt(x, x))),
+        ("sle.refl", smt::sle(x, x)),
+        ("sle.alt", smt::iff(smt::sle(x, y), smt::or(smt::slt(x, y), smt::eq(x, y)))),
+        ("sgt.is.slt", smt::iff(smt::sgt(x, y), smt::slt(y, x))),
+        ("sge.is.sle", smt::iff(smt::sge(x, y), smt::sle(y, x))),
+        ("slt.totality", smt::or(smt::slt(x, y), smt::sle(y, x))),
+        // Sign extension: widening `-1` gives all ones, not `0x0F`.
+        ("sext.neg_one", smt::eq(smt::sign_extend(smt::word(0xFF, 8), w), smt::all_ones(w))),
+        ("sext.positive", smt::eq(smt::sign_extend(smt::word(0x0B, 8), w), smt::word(0x0B, w))),
+        ("sext.top_bit", smt::eq(
+            smt::sign_extend(smt::word(0x80, 8), w),
+            smt::sub(zero, smt::word(0x80, w)),
+        )),
+        // Signed division: `-6 / 2` is `-3`, and the remainder takes the
+        // dividend's sign.
+        ("sdiv.neg", smt::eq(
+            smt::sdiv(smt::word(0xFA, 8), smt::word(2, 8)),
+            smt::word(0xFD, 8),
+        )),
+        ("srem.neg", smt::eq(
+            smt::srem(smt::word(0xF9, 8), smt::word(3, 8)),
+            smt::word(0xFF, 8),
+        )),
+        // The division identity on *constants*, so the query is decidable
+        // quickly. The symbolic form is exercised by the engine's own
+        // `tests/signed.rs`; a symbolic `bvsdiv` feeding a multiply is a hard
+        // query for any solver and would turn this gate into a timeout rather
+        // than a check.
+        ("sdiv.identity.const", smt::eq(
+            smt::add(
+                smt::mul(smt::sdiv(smt::word(0xFA, 8), smt::word(3, 8)), smt::word(3, 8)),
+                smt::srem(smt::word(0xFA, 8), smt::word(3, 8)),
+            ),
+            smt::word(0xFA, 8),
+        )),
     ]
 }
 

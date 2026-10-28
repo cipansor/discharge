@@ -539,6 +539,10 @@ impl Ctx {
     fn mk_term(&mut self, n: Node) -> Term {
         let key = Self::hash_node(&n);
         let mut i = (key as u32) & self.term_mask;
+        // See `mk_node`: a table with no empty slot left must be detected by the
+        // probe count, because the capacity test sits inside the empty-slot
+        // branch and would otherwise never be reached.
+        let mut probes = 0usize;
         loop {
             let k = self.term_key[i as usize];
             if k == u64::MAX {
@@ -564,6 +568,11 @@ impl Ctx {
                 {
                     return Term::pack(self.term_val[i as usize], self.generation);
                 }
+            }
+            probes += 1;
+            if probes > self.term_mask as usize {
+                self.overflow = true;
+                return Term(0);
             }
             i = (i + 1) & self.term_mask;
         }
@@ -642,6 +651,27 @@ impl Ctx {
             }
             self.subst_val[idx as usize] = with.0;
         }
+    }
+
+    /// Record one substitution binding, refusing a width mismatch.
+    ///
+    /// A binding replaces a variable with a term, and the two must agree on
+    /// width. `subst_target` already refuses a non-variable *target*; without the
+    /// matching check on the replacement, an 8-bit variable could be bound to a
+    /// 16-bit word, and the rebuilt expression would read only the low bits. The
+    /// blaster then uses the *comparison's* width and silently discards the high
+    /// bits, so `x == 1` with `x := 257u16` would be proved `Valid` even though
+    /// `257` does not fit in `x`. That is an assignment the source language
+    /// rejects, so accepting it can only produce a wrong answer; the query is
+    /// marked ill-formed instead.
+    fn bind_subst(&mut self, from: Term, to: Term) {
+        let idx = self.subst_target(from);
+        let w_from = self.width_of(from);
+        let w_to = self.width_of(to);
+        if w_from != w_to {
+            self.ill_formed = true;
+        }
+        self.set_subst(idx, to);
     }
 
     /// Forget every binding and start a new substitution epoch.
@@ -914,6 +944,12 @@ impl Ctx {
         }
         let key = ((var as u64) << 32) | ((lo as u64) << 16) | (hi as u64);
         let mut i = (key as u32) & self.uniq_mask;
+        // Open addressing over a table that cannot grow. If every slot is taken
+        // no probe sequence can ever find `u64::MAX`, so the capacity check
+        // below -- which lives *inside* that branch -- would never run and the
+        // loop would spin forever. Bounding the probe makes a full table report
+        // the budget instead.
+        let mut probes = 0usize;
         loop {
             let k = self.uniq_key[i as usize];
             if k == u64::MAX {
@@ -932,6 +968,11 @@ impl Ctx {
             }
             if k == key {
                 return self.uniq_val[i as usize];
+            }
+            probes += 1;
+            if probes > self.uniq_mask as usize {
+                self.overflow = true;
+                return FALSE;
             }
             i = (i + 1) & self.uniq_mask;
         }
@@ -977,6 +1018,9 @@ impl Ctx {
             _ => {
                 let key = (a as u64) << 1;
                 let mut i = (key as u32) & self.uniq_mask;
+                // Bounded like the other probes: a full cache is a miss, and the
+                // complement is recomputed and re-stored below.
+                let mut probes = 0usize;
                 loop {
                     let k = self.not_key[i as usize];
                     if k == u64::MAX {
@@ -985,6 +1029,10 @@ impl Ctx {
                     if k == key {
                         return self.not_val[i as usize];
                     }
+                    probes += 1;
+                    if probes > self.uniq_mask as usize {
+                        break;
+                    }
                     i = (i + 1) & self.uniq_mask;
                 }
                 let v = self.var[a as usize];
@@ -992,10 +1040,15 @@ impl Ctx {
                 let hi = self.neg(self.hi[a as usize]);
                 let r = self.mk_node(v, lo, hi);
                 let mut j = (key as u32) & self.uniq_mask;
+                let mut probes = 0usize;
                 loop {
                     if self.not_key[j as usize] == u64::MAX || self.not_key[j as usize] == key {
                         self.not_key[j as usize] = key;
                         self.not_val[j as usize] = r;
+                        break;
+                    }
+                    probes += 1;
+                    if probes > self.uniq_mask as usize {
                         break;
                     }
                     j = (j + 1) & self.uniq_mask;
@@ -1066,6 +1119,10 @@ impl Ctx {
             _ => (&self.xor_key, &self.xor_val),
         };
         let mut i = (key as u32) & self.uniq_mask;
+        // These caches memoise `apply2`; they are not a source of truth, so a
+        // full table is a *miss* and the answer is recomputed. Bounding the
+        // probe keeps that true when no empty slot is left.
+        let mut probes = 0usize;
         loop {
             let k = keys[i as usize];
             if k == u64::MAX {
@@ -1073,6 +1130,10 @@ impl Ctx {
             }
             if k == key {
                 return Some(vals[i as usize]);
+            }
+            probes += 1;
+            if probes > self.uniq_mask as usize {
+                return None;
             }
             i = (i + 1) & self.uniq_mask;
         }
@@ -1085,11 +1146,18 @@ impl Ctx {
             _ => (&mut self.xor_key, &mut self.xor_val),
         };
         let mut i = (key as u32) & self.uniq_mask;
+        // A full table drops the entry. Losing a memo costs time, never an
+        // answer, and it must not become an unbounded probe.
+        let mut probes = 0usize;
         loop {
             let k = keys[i as usize];
             if k == u64::MAX || k == key {
                 keys[i as usize] = key;
                 vals[i as usize] = val;
+                return;
+            }
+            probes += 1;
+            if probes > self.uniq_mask as usize {
                 return;
             }
             i = (i + 1) & self.uniq_mask;
@@ -1206,10 +1274,17 @@ impl Ctx {
                         // `bit >= sh` is checked first so `bit - sh` cannot wrap.
                         Op::Shl if bit >= sh => a[bit - sh],
                         Op::Shl => FALSE,
-                        Op::LShr if bit + sh < w => a[bit + sh],
+                        // `sh < w - bit`, not `bit + sh < w`. The shift amount is
+                        // a `u32` the user can write as `u32::MAX`; on a 32-bit
+                        // target `bit + sh` overflows there, and a release build
+                        // would then select `a[bit + sh]` -- reading an input bit
+                        // where the result is defined to be zero. Comparing
+                        // against `w - bit` (always in `1..=w`, since `bit < w`)
+                        // keeps both sides small.
+                        Op::LShr if sh < w - bit => a[bit + sh],
                         Op::LShr => FALSE,
                         // Arithmetic right shift replicates the sign bit.
-                        _ if bit + sh < w => a[bit + sh],
+                        _ if sh < w - bit => a[bit + sh],
                         _ => sign,
                     };
                 }
@@ -1849,6 +1924,38 @@ pub fn ult(x: Var, y: Var) -> Pred {
 pub fn ule(x: Var, y: Var) -> Pred {
     with_ctx(|c| Pred(c.cmp(Op::Ule, x.0, y.0)))
 }
+/// The sign bit of `x` as a predicate: true when the top bit is set, which is
+/// what "negative" means in two's complement.
+pub fn negative(x: Var) -> Pred {
+    let w = bits(x);
+    // `x >= 2^(w-1)` is exactly "the top bit is set".
+    uge_const(x, 1u64 << (w - 1))
+}
+/// `x < y` (signed, two's complement).
+///
+/// The unsigned comparison next to this one is *wrong* for a signed operand, and
+/// wrong in the direction that hides bugs: it calls `-1` larger than `1`. The
+/// sign bits settle it -- equal signs mean the unsigned order is the signed
+/// order, and differing signs mean the negative one is smaller -- so the
+/// unsigned primitive is reused rather than a second ordering circuit built.
+pub fn slt(x: Var, y: Var) -> Pred {
+    let sx = negative(x);
+    let sy = negative(y);
+    let same = iff(sx, sy);
+    or(and(same, ult(x, y)), and(not(same), sx))
+}
+/// `x <= y` (signed)
+pub fn sle(x: Var, y: Var) -> Pred {
+    not(slt(y, x))
+}
+/// `x > y` (signed)
+pub fn sgt(x: Var, y: Var) -> Pred {
+    slt(y, x)
+}
+/// `x >= y` (signed)
+pub fn sge(x: Var, y: Var) -> Pred {
+    not(slt(x, y))
+}
 /// `x < k`
 pub fn ult_const(x: Var, k: u64) -> Pred {
     with_ctx(|c| {
@@ -1895,6 +2002,137 @@ pub fn uge_const(x: Var, k: u64) -> Pred {
         Pred(c.cmp(Op::Ule, kt, x.0))
     })
 }
+/// `x / y` and `x % y`, unsigned, as a *restoring divider* built from the
+/// operators the engine already has.
+///
+/// Division used to be absent from the vocabulary, which meant a frontend reading
+/// real code had to refuse `a / b` -- and the MIR frontend does refuse what it
+/// cannot model. But division is not actually out of reach: a restoring divider
+/// is nothing but shifts by constants, a subtract, a compare and a select, all of
+/// which are here. Building it costs `w` steps and `O(w)` terms, and it is exact,
+/// so a proof that goes through it is a real proof about `a / b`.
+///
+/// Two cases, and the split is what keeps it sound. If `y` has its top bit set
+/// then `x < 2^w <= 2y`, so the quotient is 0 or 1 and the remainder is `x` or
+/// `x - y`. Otherwise `y < 2^(w-1)`, so a running remainder that stays below `y`
+/// can be doubled without losing its top bit -- which is exactly what the
+/// restoring loop needs, and exactly what would break if the wide case were run
+/// through the same loop.
+///
+/// `y == 0` is given a defined result rather than being left as a trap: the
+/// quotient is all ones and the remainder is `x`. That keeps the function total,
+/// which matters because an undefined operation in a verifier is a hole. Callers
+/// that want Rust's panic on division by zero must state `y != 0` -- and the MIR
+/// frontend does, because `rustc` emits that assert for them.
+pub fn divmod(x: Var, y: Var) -> (Var, Var) {
+    let w = bits(x);
+    if w == 1 {
+        // 1-bit: for a nonzero divisor the quotient is `x & y` and the remainder
+        // is `x & !y`. The `y == 0` case still has to go through the same
+        // definition as every other width, or this fast path would disagree with
+        // the general one at exactly the input the contract calls out.
+        let y_zero = eq_const(y, 0);
+        let q = ite(y_zero, all_ones(1), band(x, y));
+        let r = ite(y_zero, x, band(x, bxor(y, all_ones(1))));
+        return (q, r);
+    }
+    let zero = word(0, w);
+    let one = word(1, w);
+    // Does `y` have its top bit set?
+    let top = word(1u64 << (w - 1), w);
+    let y_top_set = not(eq_const(band(y, top), 0));
+    let y_zero = eq_const(y, 0);
+
+    // Wide divisor: quotient is 0 or 1.
+    let ge = ule(y, x);
+    let q_wide = ite(ge, one, zero);
+    let r_wide = ite(ge, sub(x, y), x);
+
+    // Narrow divisor: the restoring loop. The remainder stays below `y`, so
+    // `rem << 1` cannot lose a bit.
+    let mut rem = zero;
+    let mut quot = zero;
+    let mut i = w;
+    while i > 0 {
+        i -= 1;
+        let bit = band(lshr(x, i as u32), one);
+        rem = bor(shl(rem, 1), bit);
+        let enough = ule(y, rem);
+        rem = ite(enough, sub(rem, y), rem);
+        quot = ite(enough, bor(quot, word(1u64 << i, w)), quot);
+    }
+
+    let q = ite(y_zero, all_ones(w), ite(y_top_set, q_wide, quot));
+    let r = ite(y_zero, x, ite(y_top_set, r_wide, rem));
+    (q, r)
+}
+
+/// `x / y`, unsigned. See [`divmod`] for the semantics, including `y == 0`.
+pub fn udiv(x: Var, y: Var) -> Var {
+    divmod(x, y).0
+}
+
+/// `x % y`, unsigned. See [`divmod`] for the semantics, including `y == 0`.
+pub fn urem(x: Var, y: Var) -> Var {
+    divmod(x, y).1
+}
+
+/// `x / y` and `x % y`, *signed*, two's complement, truncating toward zero.
+///
+/// The unsigned divider computes a non-negative quotient from non-negative
+/// operands, so the signed case reduces to it once the operands are made
+/// non-negative and the signs of the results are put back. Rust truncates toward
+/// zero, so the remainder takes the *dividend's* sign.
+///
+/// The overflow case, `MIN / -1`, is given a defined value -- `MIN`, matching the
+/// wrapping result Rust would produce if the operation were unchecked -- rather
+/// than being left as a hole. rustc guards it with its own `assert`, so a path
+/// that reaches the division with that pair is already a reported panic; defining
+/// it keeps the function total, exactly as `y == 0` is handled. `-1` is a
+/// nonzero divisor here, so the two holes are independent.
+pub fn sdivmod(x: Var, y: Var) -> (Var, Var) {
+    let w = bits(x);
+    let zero = word(0, w);
+    let nx = negative(x);
+    let ny = negative(y);
+    // Magnitudes as unsigned values. Negating `MIN` wraps back to `MIN`, whose
+    // bit pattern *is* the magnitude `2^(w-1)`, so the plain wrapping subtract
+    // is already the right magnitude for every input.
+    let ax = ite(nx, sub(zero, x), x);
+    let ay = ite(ny, sub(zero, y), y);
+    let (q, r) = divmod(ax, ay);
+    // Truncation toward zero: the quotient is negative when the signs differ,
+    // and the remainder takes the *dividend's* sign. Getting the remainder's
+    // sign backwards is a wrong value, not a weak proof -- `-127 % 3` is `-1`,
+    // and `1` is a different number.
+    let q = ite(iff(nx, ny), q, sub(zero, q));
+    let r = ite(nx, sub(zero, r), r);
+    // `y == 0` is given the same defined value as the unsigned divider: the
+    // quotient is all ones and the remainder is the dividend. The unsigned
+    // `divmod` already does that, but its inputs here are *magnitudes*, so the
+    // remainder would come back as `|x|` and the sign fixup above would turn it
+    // into `-x`. Overriding both explicitly keeps the signed zero case equal to
+    // the unsigned one rather than one sign away from it.
+    let is_zero = eq(y, zero);
+    let q = ite(is_zero, all_ones(w), q);
+    let r = ite(is_zero, x, r);
+    // `MIN / -1` wraps to `MIN` with remainder 0; select it explicitly.
+    let min = word(1u64 << (w - 1), w);
+    let minus_one = all_ones(w);
+    let overflow = and(eq(x, min), eq(y, minus_one));
+    (ite(overflow, min, q), ite(overflow, zero, r))
+}
+
+/// `x / y`, signed. See [`sdivmod`].
+pub fn sdiv(x: Var, y: Var) -> Var {
+    sdivmod(x, y).0
+}
+
+/// `x % y`, signed. See [`sdivmod`].
+pub fn srem(x: Var, y: Var) -> Var {
+    sdivmod(x, y).1
+}
+
 /// `x + y == z`
 pub fn add_eq(x: Var, y: Var, z: Var) -> Pred {
     with_ctx(|c| {
@@ -1916,6 +2154,25 @@ pub fn mul_eq(x: Var, y: Var, z: Var) -> Pred {
         Pred(c.cmp(Op::Eq, s, z.0))
     })
 }
+/// The constant value of `v`, when `v` is a literal.
+///
+/// `None` for anything else. The MIR frontend uses this to keep a shift by a
+/// *constant* amount on the cheap `Op::Shl` path instead of paying for a barrel
+/// shifter; both paths agree, but only one of them is free. Gated on `std` because
+/// the frontend that calls it is: without it this is dead code, and the bare-metal
+/// gate builds with warnings denied.
+#[cfg(feature = "std")]
+pub(crate) fn const_of(v: Var) -> Option<u64> {
+    with_ctx(|c| {
+        let n = c.node_of(v.0);
+        if n.op == Op::Const {
+            Some(c.const_value(v.0))
+        } else {
+            None
+        }
+    })
+}
+
 /// `x + y` as a word.
 pub fn add(x: Var, y: Var) -> Var {
     with_ctx(|c| Var(c.bin_word(Op::Add, x.0, y.0)))
@@ -1940,6 +2197,23 @@ pub fn bor(x: Var, y: Var) -> Var {
 pub fn bxor(x: Var, y: Var) -> Var {
     with_ctx(|c| Var(c.bin_word(Op::Xor, x.0, y.0)))
 }
+/// `x` widened to `wide` bits by replicating its sign bit.
+///
+/// A *value* operation, unlike [`truncate`], which zero-fills. The difference is
+/// the whole of signed multiplication: zero-extending `-1` to 16 bits gives `255`
+/// rather than `65535`, and a product computed from the wrong magnitude is a
+/// product that misses its overflow. Built from shifts the engine already has:
+/// move the `w` significant bits to the top of the wide word, then bring them
+/// back with the sign fill.
+pub fn sign_extend(x: Var, wide: u8) -> Var {
+    let w = bits(x);
+    if wide <= w {
+        return truncate(x, wide);
+    }
+    let sh = (wide - w) as u32;
+    ashr(shl(truncate(x, wide), sh), sh)
+}
+
 /// `x << k`
 pub fn shl(x: Var, k: u32) -> Var {
     with_ctx(|c| Var(c.shift(Op::Shl, x.0, k)))
@@ -1952,8 +2226,79 @@ pub fn lshr(x: Var, k: u32) -> Var {
 pub fn ashr(x: Var, k: u32) -> Var {
     with_ctx(|c| Var(c.shift(Op::Shr, x.0, k)))
 }
-/// `x` re-typed to `width` bits: low bits kept, high bits zero-filled or dropped.
+
+/// Which shift `x << n` / `x >> n` with a *variable* amount means.
 ///
+/// `Shr` is arithmetic for a signed operand and logical for an unsigned one, and
+/// the bit pattern does not say which, so the caller states it rather than the
+/// engine guessing. The constant-amount functions above are the same three
+/// operations at a fixed amount.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Shift {
+    /// `x << n`. Zero fill from the low end.
+    Left,
+    /// `x >> n` on an unsigned value. Zero fill from the high end.
+    LogicalRight,
+    /// `x >> n` on a signed value. The sign bit is replicated.
+    ArithmeticRight,
+}
+
+/// `x << n`, `x >> n` (logical) or `x >> n` (arithmetic) with a *symbolic* amount.
+///
+/// A barrel shifter: `log2(w)` stages of select, each conditionally shifting by one
+/// power of two, driven by one bit of `n`. `u16` costs 4 stages, `u64` costs 6, and
+/// the cost is linear in the width rather than quadratic, which is what keeps it
+/// inside the BDD arena where a `w`-bit multiplier is not.
+///
+/// # The out-of-range amount
+///
+/// `n >= w` has a *defined* result here — zero for [`Shift::Left`] and
+/// [`Shift::LogicalRight`], sign fill for [`Shift::ArithmeticRight`] — rather than
+/// being left unknown. That is the same choice [`divmod`] makes for `y == 0`, and
+/// for the same reason: rustc guards a variable shift with `assert(n < w)`, so a
+/// path that reaches the shift out of range has already been reported as a panic,
+/// and a value left unknown here would refuse every function that shifts by a
+/// variable rather than by a literal.
+pub fn shift_var(op: Shift, x: Var, n: Var) -> Var {
+    with_ctx(|c| {
+        let w = c.width_of(x.0);
+        let hop = match op {
+            Shift::Left => Op::Shl,
+            Shift::LogicalRight => Op::LShr,
+            Shift::ArithmeticRight => Op::Shr,
+        };
+        let mut acc = x;
+        let mut i = 0u32;
+        while (1u32 << i) < w as u32 {
+            let amt = 1u32 << i;
+            // Bit `i` of `n`, as `(n & 2^i) == 2^i`. Testing the masked value
+            // against the mask avoids needing a bit-extraction primitive.
+            let mask = c.konst(amt as u64, w);
+            let masked = c.bin_word(Op::And, n.0, mask);
+            let bit = c.cmp(Op::Eq, masked, mask);
+            let shifted = c.shift(hop, acc.0, amt);
+            acc = Var(c.mk_term(Node { op: Op::Ite, a: bit.0, b: shifted.0, c: acc.0.0, width: w, hi: 0 }));
+            i += 1;
+        }
+        // The stages above only read the low `ceil(log2(w))` bits of `n`, so an
+        // amount at or above the width -- which sets a higher bit that no stage
+        // covers -- would otherwise come out as the identity. Select the defined
+        // out-of-range value explicitly. Without this, `x << 4` at 4 bits returns
+        // `x`, which is neither the documented value nor anything Rust does;
+        // `tests/shift.rs` pins it.
+        let wt = c.konst(w as u64, w);
+        let in_range = c.cmp(Op::Ult, n.0, wt);
+        let oor = match op {
+            // An arithmetic shift by `w - 1` replicates the sign bit across the
+            // whole word, which is exactly the sign fill.
+            Shift::ArithmeticRight => c.shift(Op::Shr, x.0, (w - 1) as u32),
+            _ => c.konst(0, w),
+        };
+        Var(c.mk_term(Node { op: Op::Ite, a: in_range.0, b: acc.0.0, c: oor.0, width: w, hi: 0 }))
+    })
+}
+
+/// `x` re-typed to `width` bits: low bits kept, high bits zero-filled or dropped.
 /// The one operation in the language that changes a width. It is what makes an
 /// index wider than its address space expressible, which a loop over addresses
 /// needs: see [`crate::mem::Mem::addr_of`].
@@ -2032,8 +2377,7 @@ pub fn substitute_word(w: Var, bindings: &[(Var, Var)]) -> Var {
     with_ctx(|c| {
         c.clear_subst();
         for (from, to) in bindings {
-            let idx = c.subst_target(from.0);
-            c.set_subst(idx, to.0);
+            c.bind_subst(from.0, to.0);
         }
         Var(c.subst(w.0))
     })
@@ -2053,8 +2397,7 @@ pub fn substitute(p: Pred, bindings: &[(Var, Var)]) -> Pred {
     with_ctx(|c| {
         c.clear_subst();
         for (from, to) in bindings {
-            let idx = c.subst_target(from.0);
-            c.set_subst(idx, to.0);
+            c.bind_subst(from.0, to.0);
         }
         Pred(c.subst(p.0))
     })
@@ -2089,6 +2432,41 @@ mod subst_tests {
             let p = eq_const(x, 0);
             // `x == 0` with `x := 9` is `9 == 0`, which is false: `Unsat`, not `Valid`.
             let q = substitute(p, &[(x, word(9, 8))]);
+            assert_eq!(prove(q), Verdict::Unsat);
+        });
+    }
+
+    #[test]
+    fn a_binding_whose_width_does_not_match_is_refused() {
+        // An 8-bit variable bound to a 16-bit word. The blaster reads the rebuilt
+        // expression at the *comparison's* width, so binding `x := 257u16` into
+        // `x == 1` would read only the low byte (`1`) and prove `Valid` -- a
+        // theorem about an assignment the source language rejects. The query must
+        // be refused rather than answered.
+        with_fresh(|| {
+            let x = var(8);
+            let p = eq_const(x, 1);
+            let q = substitute(p, &[(x, word(257, 16))]);
+            assert_eq!(
+                prove(q),
+                Verdict::Unknown,
+                "an 8-bit target bound to a 16-bit word must be refused, not proved"
+            );
+        });
+        // The control: the same binding at the right width is decided, so the
+        // refusal is not refusing every binding. `x == 1` with `x := 1` is true.
+        with_fresh(|| {
+            let x = var(8);
+            let p = eq_const(x, 1);
+            let q = substitute(p, &[(x, word(1, 8))]);
+            assert_eq!(prove(q), Verdict::Valid);
+        });
+        // And the wrong *value* at the right width is still refuted, which is the
+        // answer the mismatched binding was wrongly giving.
+        with_fresh(|| {
+            let x = var(8);
+            let p = eq_const(x, 1);
+            let q = substitute(p, &[(x, word(2, 8))]);
             assert_eq!(prove(q), Verdict::Unsat);
         });
     }

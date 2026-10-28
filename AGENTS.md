@@ -36,10 +36,117 @@ cargo build --no-default-features --target thumbv7em-none-eabihf
 
 # The flagship demo
 cargo run --features std --example flight_control
+
+# The MIR frontend: verify real Rust, reading the MIR rustc lowers it to.
+# `--emit=mir` needs nightly, and the compiler is named separately from RUSTC
+# so that pointing this at a nightly does not disturb the cargo building it.
+DISCHARGE_RUSTC="$(rustup which --toolchain nightly rustc)" \
+  cargo run --features std --example mir_demo
+DISCHARGE_RUSTC="$(rustup which --toolchain nightly rustc)" \
+  cargo test --features std --test mir
 ```
 
 `clippy` was installed with `rustup component add clippy`; the bare-metal target
 with `rustup target add thumbv7em-none-eabihf`.
+
+## Verifying real Rust: the MIR frontend (`src/mir/`)
+
+The rest of the crate proves things about *models*: a formula, or a `wp` program.
+`src/mir/` proves things about the code itself, by reading the MIR that `rustc`
+lowers it to. Five facts about it cost the most time to discover:
+
+1. **A MIR dump carries no attributes and no doc comments.** So contracts cannot
+   come from MIR; they are scanned out of the *source* text, while bodies come
+   from MIR. That split is the design, not a limitation to work around.
+2. **`rustc` prints the failing polarity of its arithmetic asserts:**
+   `assert(!move (_5.1: bool), "attempt to compute ...")`. Dropping the `!`
+   inverts every overflow, underflow and divide-by-zero check, and the tool then
+   reports safe code as broken. The flag is carried through the IR and pinned by
+   a parser unit test.
+3. **A checked binary writes a tuple, and the tuple has no width.** `_3 =
+   AddWithOverflow(a, b)` makes `_3` a `(uN, bool)`. Reading the operand width
+   from `_3` gives 64 for every type, which silently mis-sizes the overflow test.
+   The width comes from `_3.0`.
+4. **`smt::truncate` zero-extends when the target is wider.** That is what makes
+   the multiplication-overflow predicate exact: compute at `2w`, test the top
+   `w` bits against zero.
+5. **The output path matters.** `-o /dev/stdout` makes rustc try to create a temp
+   directory in `/dev` and fail; the MIR goes to a unique temp file. The name must
+   be unique per *call*, not per process, or parallel tests delete each other's
+   files.
+
+Three engine consequences worth remembering:
+
+- **Division is now in the engine** (`smt::divmod`, exact, restoring), because a
+  frontend reading real code meets `a / b` and must not guess. `y == 0` is a
+  *defined* value rather than a hole, and rustc's own divide-by-zero assert is
+  what reports the panic. The 1-bit fast path must honour the same `y == 0`
+  contract or it disagrees with the general path at exactly that input — a test
+  caught this.
+- **A variable shift is a barrel shifter** (`smt::shift_var`), `log2(w)`
+  conditional stages. It is linear in the width, so it fits where a `w`-bit
+  multiplier does not. An out-of-range amount has a defined value (zero, or sign
+  fill for an arithmetic right shift), matching the shift-count-masking choice the
+  differential oracle already pins.
+- **Widened products past 16 bits are declined, not approximated.** `sat_mul` at
+  `u16` needs a 32-bit product, which is the BDD wall. A *weaker* overflow
+  predicate would be worse than declining, because it would make an overflowing
+  function look panic-free. So the code returns "no predicate" and the path is
+  reported `incomplete`.
+  This was measured rather than assumed. The engine does have a SAT fallback for
+  when the arena fills, so the tempting fix is to raise the width and let the
+  fallback take it. Raising the threshold from 16 to 32 does not reach the
+  fallback: `mir_demo` on `sat_mul` then runs past 300 s and has to be killed,
+  because the cost is in *building* the 32-bit diagram, before the arena ever
+  fills. The threshold is a time guard, and 16 is where it sits. If you raise it,
+  time the demo rather than trusting the fallback's existence.
+
+- **Signedness is part of the *value*, not a display detail.** The engine's
+  arithmetic is bit-vector arithmetic, so every operation has one bit-pattern
+  answer; signedness decides which *question* a comparison asks. `-1 < 1` is
+  `false` read unsigned and `true` read signed, `-7 / 2` is `-3` signed and a huge
+  positive number unsigned, and a signed add's overflow is not the unsigned
+  carry. The frontend therefore reads signedness off the declared type and picks
+  `smt::slt`/`sle`/`sgt`/`sge` and `smt::sdiv`/`srem` rather than the unsigned
+  forms. The contract evaluator does the same, because a contract's `<` is the
+  same comparison as the code's. Two consequences worth remembering:
+  - `MIN` is *not* zero. `parse_const` used to return `0` for both `MIN` and
+    `MAX`, so `a != i8::MIN` meant `a != 0` and a signed negation guarded by it
+    was reported panic-free. `MIN` of a signed type is the top bit alone.
+  - The overflow rules are not the unsigned ones. For a signed add it is "the
+    operands agree in sign and the result disagrees"; for a subtract, "the
+    operands differ and the result takes the subtrahend's sign". The unsigned
+    carry test happens to fire on `127 + 1` but also fires on `-1 + 1`, which is
+    not an overflow. For a signed multiply the test is rustc's own: the
+    sign-extended product equals the sign-extension of the wrapped result.
+    `smt::sign_extend` exists for exactly this, because `truncate` zero-fills and
+    a zero-extended `-1` has the wrong magnitude.
+
+Three traps that cost time here, all in the frontend rather than the engine:
+
+- **`Term::Assert` must assume the guard it just checked on the fall-through
+  path.** It used to push the success block with the incoming path unchanged, so
+  `assert(n < 16)` was proved and then *discarded*: later obligations were
+  discharged as if `n` could still be 16. That is sound — the guard is checked
+  separately, so no panic is hidden — but it is needlessly weak, and wrong for a
+  guard the *caller* wrote. Carrying `satisfied` is what lets `sat_shift` verify.
+  If a function that clearly cannot panic comes back `failed` or `incomplete`,
+  check whether an assert guard was assumed before blaming the engine.
+- **The parser must check ` as ` before `const `.** rustc prints a cast constant
+  as `const 3_i32 as u32 (IntToInt)`; matching the `const ` prefix first hands the
+  whole string to `parse_const`, which reads `i32 as u32 (IntToInt)` as a type
+  name and yields a constant with *no width*. Every guard written against such a
+  constant then goes unmodelled. This is why even `x << 3` used to be `incomplete`.
+- **The cast's target width is the destination's, not the source's.** `Rvalue::Cast`
+  takes the width from the `as T` type; the operand keeps its own width. A shift
+  amount is a `u32` even for a `u16` shift, and rustc keeps it distinct, so the
+  width used to build the shift is the *left* operand's.
+
+`tests/mir.rs` is the oracle that matters: it feeds each reported counterexample
+back into the *compiled* function and requires the panic. That checks the engine
+against rustc's code generator rather than against another model. `tests/divmod.rs`
+does the same for the divider, against Rust's own `/` and `%`; `tests/shift.rs`
+does it for the barrel shifter, against Rust's own `<<` and `>>`.
 
 ## The imperative layer (`wp.rs`) has three traps
 
@@ -1356,8 +1463,9 @@ same total is a silent failure, not a stable result.
 
 ## Gates quoted in prose stop being run; make them one command
 
-The five gates this crate depends on (clippy `-D warnings`, the test suite, the bare-metal
-`no_std` build, the zero-dependency check, the z3 oracle) were five separate commands,
+The gates this crate depends on (clippy `-D warnings`, the test suite, the bare-metal
+`no_std` build, the zero-dependency check, the z3, Kani, MIR and Verus oracles) were
+separate commands,
 written in the README and copied into summaries by hand. That is exactly how a gate quietly
 stops being run: the summary says "all gates green" because the four that were re-run were
 green, and the fifth was recalled rather than executed. `scripts/gate.sh` is now the single
@@ -1704,18 +1812,74 @@ Verus facts that cost time to find, all in the generated-file path:
 
 ## GitHub Actions
 
-`.github/workflows/ci.yml` has two jobs. The first runs `scripts/gate.sh` verbatim, so CI and
+`.github/workflows/ci.yml` has three jobs. The first runs `scripts/gate.sh` verbatim, so CI and
 a local run mean the same thing. The other two install Kani (cached) and Verus (latest
 release) and run `kanidiff` and `verusdiff` as hard gates. `gate.sh`'s Kani and Verus steps
 skip when those tools are absent -- reported, not silent -- because both are large downloads;
-CI is where they become mandatory. Gate count is now 7.
+CI is where they become mandatory. Gate count is now 8 (the MIR frontend is the eighth).
+
+Three things about this file are easy to get wrong:
+
+1. **Pin every `uses:` to a full commit SHA, with the tag in a trailing comment.** A tag is
+   movable, so `@v4` lets a retagged or compromised release change what CI runs without any
+   commit in this repository changing. The comment matters too: a bare SHA does not tell a
+   reviewer which version it is, and a pin they cannot identify is a pin they cannot check.
+   Resolve a tag to its commit with
+   `curl -s https://api.github.com/repos/OWNER/REPO/git/ref/tags/TAG` -- for these actions the
+   tag is lightweight, so `object.sha` is the commit directly. Verify it before trusting it.
+2. **A workflow added by a pull request does not run on that pull request.** GitHub only
+   starts `pull_request` runs when the workflow file already exists on the *base* branch, so a
+   PR that introduces `.github/workflows/ci.yml` shows "no checks reported" until it is merged.
+   That is expected, not a broken pipeline: it is why the local `gate.sh` run is the evidence
+   for such a PR, and why the workflow says so rather than looking untested.
+3. **`gh` needs `read:org` for some queries, a classic token may not have it.** `gh pr edit`
+   fails with "The 'login' field requires one of the following scopes: ['read:org']" on a token
+   scoped to `repo` only. The REST API does not need that scope, so update the PR body with
+   `curl -X PATCH .../pulls/N -d @payload.json` instead of reaching for a broader token.
+
 
 ## A fallback engine is only worth its weight if the wall actually moves
 
 `smt.rs` is a BDD engine; when its arena fills, `query_valid`/`query_model` hand the *same*
-term graph to `sat.rs`, a CDCL SAT solver, via `bitblast.rs`. Both engines consume one
-netlist on purpose: two bit-slicers would drift and an adder bug would then be caught in
-only one place.
+term graph to `sat.rs`, a CDCL SAT solver, via `bitblast.rs`.
+
+Two engines, one term graph, **two blasters** -- and the distinction matters, because the
+first write-up of this said "one netlist" and that was wrong. `smt::blast` writes BDD node
+ids; `bitblast::blast` writes `Lit`s. They cannot be one function: the term arena and the
+gate arena are both `&mut`, so a shared blaster would have to split an arena or hide a
+pointer behind a trait. What the two share is the *term graph*, so each operation is named
+once -- operands and width are decided when the node is built -- but each blaster writes its
+own adder, subtractor, multiplier and comparator circuit. So "the arithmetic is defined once"
+is itself too strong: the *operations* are defined once, the *circuits* are not, and the two
+circuits could diverge. That is a real risk, so it is treated as a property to check rather
+than hope away. "One bit-slicer" and "one netlist" are both the stronger, false version of
+this; the code and `src/sat.rs`'s header say the true one.
+
+### The check has to be aimed at the blaster it is about
+
+The first fix for the wording above kept the sentence "if the two adders ever disagree, one
+of those fails", naming `tests/differential.rs` and the z3 oracle. That was measured and it
+is **false**. Both run at widths where the BDD engine finishes (the z3 corpus sweeps 8 and 12
+bits; the differential corpus pins every op at 1--4 bits *precisely so the BDD can finish*),
+so every query they make is decided by `smt::blast`. `bitblast::blast` only runs once the BDD
+arena has already filled, which is 64 bits for an adder and 8 for a multiplier -- nothing in
+the suite reaches it.
+
+The measurement: delete the carry-generate term (`a & b`) from `bitblast.rs`'s adder so it
+computes `xor`, and drop a carry term from its multiplier. Then run the lot. `cargo test`
+passes, `tests/differential.rs` passes, the z3 oracle reports `mismatch=0`, and the probe
+still prints `add_comm 64b valid`. A query that *does* force the SAT path and is sensitive to
+the bug (`add(x, y) == xor(x, y)`, or `(x+y)-x == y` at 64 bits) comes back `Valid` and
+`Counterexample` -- that is, an unsound proof and a spurious witness, from a suite that is
+green.
+
+The fix is the `tests` module in `bitblast.rs`: drive `blast` directly, force both inputs,
+and ask the solver whether the circuit can differ from Rust's wrapping arithmetic, exhaustive
+over every input pair at 1--4 bits. It catches both mutants, and its own teeth are checked
+(the helper is made to answer "no divergence" unconditionally and the teeth test fails). The
+lesson is not "add a differential test"; it is that a differential test *between two engines*
+proves nothing about the engine that never runs. The oracle has to reach the code under test,
+and the way to know it does is to break that code and watch the test fail.
 
 The point of recording this here is the measurement discipline, because the first version
 of this feature *claimed* to have broken the wall and had not.
@@ -1757,3 +1921,334 @@ of this feature *claimed* to have broken the wall and had not.
 The pattern is the one the rest of this file keeps finding: a claim about the engine is
 worth only the command that measures it, and a *better-looking* claim is the first thing to
 suspect.
+
+## A verdict is a fact about a query; whether it is *good* depends on the query
+
+The frontend turns each source obligation into an SMT query, and the two commonest
+obligations ask *opposite* questions:
+
+* A postcondition asks "does `path => post` hold for every input". `Valid` is the proof;
+  `Unsat` means the postcondition is false on **every** input, which is the strongest
+  possible failure.
+* A panic (and an `unreachable`) asks "can this happen". `Unsat` is the proof;
+  `Counterexample` is the failing input; `Valid` means it happens on **every** input,
+  which is the worst case and has no witness to show.
+
+The first version tested `verdict.is_proved()` — that is, `Valid` — for every obligation
+regardless of kind. That reads the panic polarity backwards: a panic that fires on every
+input is reported as *ruled out*. It also silently accepted the `Unsat` postcondition,
+because `Unsat` is not `Valid` but the outcome classifier only looked for a
+`Counterexample` and let everything else fall through to `Verified`. Both are the same
+mistake — treating "the engine decided" as "the engine approved" — and both make the
+crate's core claim (a `Verified` line means the obligations hold) false.
+
+The fix is [`Obligation::is_discharged`], which is per-kind on purpose, and a
+[`MirReport::first_failure`] that carries a witness *or* the "holds for every input" case
+so an obligation with no counterexample is still a failure. The regression targets are
+`bool_ret_false` (postcondition `Unsat`), `vacuous_precondition` (unsatisfiable `requires`),
+and `div_by_always_zero` (panic query `Valid`). Each was checked by reverting the fix and
+watching it fail — a test for a polarity bug that passes on the buggy polarity is not a
+test.
+### The same mistake in a boolean, and in a failure string
+
+Two follow-on findings were the same error in different clothes, and both are worth naming
+because they are easy to reintroduce.
+
+1. **A satisfiability query has three outcomes, and a `bool` cannot hold three.**
+   `find_model` returns a model, `Unsat`, or `Unknown`. The first
+   `Contract::precondition_is_satisfiable` was `find_model(pre) != Verdict::Unsat`, which
+   folds `Unknown` in with "found a model" and answers `true`. An ill-formed precondition
+   (an equality between an 8-bit and a 16-bit variable, say) then reads as *satisfiable*,
+   so a caller checking `discharge` and the boolean together claims a non-vacuous proof
+   with no evidence the precondition is reachable. The fix adds
+   `Contract::precondition_satisfiability`, returning the verdict, and makes the boolean
+   `true` only for `Valid` or a `Counterexample` -- the two outcomes that *are* a satisfying
+   input. `false` now means "not established", covering both `Unsat` and `Unknown`, and the
+   docs say so. The rule from above applies: three outcomes need a three-valued type, not a
+   boolean with a silent fold.
+
+2. **Two failures with no witness are not the same failure.** `first_failure` returned a
+   kind and an optional witness, and the caller rendered "no witness" as the string "holds
+   for every input". That string is right for a `Valid` panic query (the panic fires on all
+   inputs) and exactly *backwards* for an `Unsat` postcondition (the postcondition holds
+   for **no** input). The detail is now built per kind and per verdict by
+   `Obligation::failure_detail`, and `first_failure` returns the obligation itself so the
+   kind, the witness, and the diagnosis come from one place instead of being re-derived.
+   The regression test asserts the `Unsat` postcondition's detail says "no input" and does
+   *not* contain "holds for every input".
+
+The through-line with the polarity bug: a value that can mean two opposite things, rendered
+or tested without its direction, will eventually be read the wrong way.
+
+## A guard can be load-bearing and still invisible to a verdict
+
+The second oracle of the same shape as "a harness covers only what it reaches", and the
+sharper one, because the code *is* reached. `Solver::reduce_db` runs at every 2000
+conflicts, and a 64-bit adder equivalence crosses that interval 15 times, so nothing here is
+dead code. Yet deleting the loop that marks every clause currently justifying a trail
+literal as `keep` left the entire suite green -- `cargo test`, `tests/sat_engine.rs`,
+`tests/differential.rs`, the z3 corpus, and the Kani oracle.
+
+The reason a verdict-level test cannot see it is the point. Dropping a reason does not
+usually change the answer: `compact` remaps `reason[v]` to `NO_CLAUSE`, the literal becomes
+indistinguishable from a decision, and `analyze` stops early and learns a *weaker* clause.
+The solver still finds the right verdict, just more slowly. Instrumenting the guard showed
+it rescuing 650 clause-reasons across those 15 calls, and with the guard removed 426 trail
+assignments lost their justification while the verdict stayed `Unsat`. Correct verdict,
+corrupt proof state.
+
+So the oracle has to assert the invariant, not the outcome: each decision level holds
+exactly one reason-free literal, at the front. That check fails on the mutant at level 4,
+which is the only evidence the teeth are real. And it drives `reduce_db` on a hand-built
+trail rather than searching for a hard instance, because a test that needs a 2000-conflict
+search is a test that runs in minutes and whose teeth depend on the search happening to
+reach the guard. Build the state the guard protects, then remove the guard and watch the
+assertion fire.
+
+Two mechanical notes worth keeping. A `Solver` is 2.2 MB, so a fixture that owns one
+overflows the 2 MB test-thread stack -- use the shared static, and take the lock's
+`MutexGuard`. And with every clause at the same activity, `reduce_db`'s stable sort keeps
+the low ids, so the guard looks unnecessary by accident; set the activities explicitly so
+the removable clauses really are the ones that get removed.
+
+## A test that skips itself still reports `ok`
+
+The sharpest instance of the "a harness covers only what it reaches" rule, because nothing
+here was dead or wrong. `Obligation::is_discharged` in `src/mir/exec.rs` decides whether an
+obligation is discharged, and the answer is *per kind*: an `Unsat` verdict **discharges** a
+panic query ("it cannot happen") and **refutes** a postcondition ("it holds for no input").
+Collapsing that match into `self.verdict.is_proved()` is the natural single-polarity reading,
+and it is a soundness hole in both directions at once.
+
+That mutant survives `cargo test` completely. The reason is not that the logic is unreached;
+it is that the only tests for it live in `tests/mir.rs`, which needs `DISCHARGE_RUSTC`
+pointing at a nightly, and **skips itself when it is absent** with a bare
+`let Some(report) = verify_all() else { return };`. A skipped test reports `ok`. So the suite
+count is *identical* whether the MIR frontend ran or not: 325 with the nightly, 325 without.
+CI never set `DISCHARGE_RUSTC`, so in the one place that gates a merge, the polarity had no
+teeth at all. A green suite said nothing about it.
+
+Two fixes, and both are needed. First, an in-module oracle in `src/mir/exec.rs` that runs
+*ungated*: it enumerates the whole truth table over the four kinds and four verdicts, so it
+does not need a compiler or a model -- `Valid`, `Unsat` and `Unknown` are unit variants, and
+a real `Cex` comes from `find_model` on a satisfiable-but-not-valid query. Verified by
+mutation: collapsing the match, treating a `Valid` panic as ruled out, and discharging every
+vacuity check each fail the oracle on a stable-only machine. Second, CI now installs the
+nightly and points `DISCHARGE_RUSTC` at it, so the end-to-end tests actually run. That
+variable must be a *path*, not a toolchain name: the frontend runs it with `Command::new`.
+
+The lesson to carry: a test that can silently become a no-op is not a test. When a harness
+skips on a missing tool, the count that "proves" the suite is green has to be checked
+against the count with the tool present. If the two are equal, the tool is not being used.
+
+## Pin a remap by what it points at, not by where it points
+
+A related trap in the same style, from the `reduce_db` oracle. `compact` renumbers clauses,
+so it remaps `reason[v]` from the old id to the new one. The first version of the oracle
+asserted only `reason[v] < n_clauses` -- "the reason names a live clause". That check passes
+for *any* surviving clause, including one that has nothing to do with the literal it is
+supposed to justify, so a remap that pointed every reason at clause 0 would have slipped
+through. The oracle now compares the clause's literal *set* against the expected one, and a
+mutant that remaps reasons to an unrelated live clause fails it.
+
+The same fixture had a second hole worth naming. It left each reason clause's other literal
+unassigned, so `clause_justifies` was never really exercised: the clause could not be shown
+to be unit. The fixture now decides the other literal, so the reason clause is genuinely unit
+on the propagated literal -- `(x2 | ¬x6)` with `x6` true -- which is what makes it a real
+propagation justification rather than a clause that merely mentions the variable.
+
+## An arena budget is not a time budget
+
+The MIR frontend hung. `count_evens` -- `while i < n { if i % 2 == 0 { c += 1; } i += 1; }`
+with `requires: n <= 8` -- ran for minutes and printed nothing, so the tool reported *no
+verdict at all*, which is worse than any verdict. The first three explanations were wrong,
+and each one was falsified by measurement rather than by reading:
+
+1. **"The open-addressing tables filled up."** Plausible: `mk_node`, `mk_term`, and the
+   three `apply2` caches probe with `i = (i + 1) & mask` and no termination test, and the
+   capacity check sits *inside* the `k == u64::MAX` branch -- so a table with no empty slot
+   left can never reach it. That is a real latent bug and it is fixed, but it was not this
+   hang: instrumentation showed `overflow == false` and `nodes == 53` at 24 million
+   `apply2` calls.
+2. **"The BDD blew up."** Also plausible, and also wrong: 24M calls producing 53 nodes is
+   the signature of recomputation, not of a growing diagram.
+3. **"It is in `apply2`."** Wrong: instrumenting `apply2`, `blast_bool`, and `model` showed
+   `model()` completing in 7 iterations, then silence.
+
+What found it was printing the frontend's own state. The worklist was visiting `bb1`..`bb7`
+in a cycle forever, with `visits` growing by one per round. So it was not an infinite loop
+and not a deadlock: it was a **path explosion**, slow enough to look like a hang. Every
+branch inside an unwound loop multiplies the path count, and each path's BDD is larger than
+the last, so the cost is super-linear in the path count. Measured: 200 paths took 16s, 2000
+paths were still running after 90s.
+
+The fix is `DEFAULT_PATH_BUDGET` in `src/mir/exec.rs`. `DEFAULT_UNWIND` bounds each loop;
+nothing bounded the *number of paths*, and that is the missing guard. It is set to 64
+because the measurement says a larger value buys no coverage -- the corpus scoreboard is
+4 of 14 at 64 paths and 4 of 14 with no bound at all -- only latency.
+
+Two lessons. First, **a bound on one resource is not a bound on the others**: this engine
+had an arena budget and a loop budget, and still had no termination guarantee. When a tool
+promises "never loop forever", that promise needs a guard on *time* or *steps*, not just on
+memory. Second, **instrument before you theorise**. Three plausible root causes were wrong
+here; the one that was right came from printing the loop's own counters, not from reasoning
+about which data structure "must" be the problem.
+
+The regression test is `a_branching_loop_reports_a_path_budget_rather_than_running_forever`
+in `src/mir/exec.rs`. It embeds the real `rustc -O` MIR for `count_evens` so it runs on
+stable, and it is *verified to hang without the fix* -- which is the only thing that makes
+it a regression test rather than a test that happens to pass. Two details matter: it must go
+through `verify_function` with a postcondition, because the postcondition is what makes each
+path cost more than the last; and it runs on a 64 MB thread, because the harness's default
+stack is smaller than the main thread's and the workload overflows it.
+
+## Cutting a loop at its invariant: the header must havoc what the loop writes
+
+Loop invariants landed in the MIR frontend, and the first version was **unsound**. It
+verified a postcondition that is false. This is worth recording in full, because the
+mistake is the natural one and the symptom is a *success*.
+
+The shape was the obvious one for a CFG. On every edge into the loop header, assert the
+invariant; on an edge from a back edge, assert it and stop rather than re-enter. That
+closes the induction with no unwinding: the assertion at the back edge is the step, the
+assertion on the entry edge is the base case. Measured, it worked -- `count_evens` went
+from *path budget exhausted* in 2.8 s to *verified* in 0.06 s, and the realistic corpus
+went from 4 of 14 decided to 7 of 14.
+
+It was wrong. `sum_to` with the deliberately weakened invariant `i <= n` -- which is true
+on entry and preserved, but says nothing relating the accumulator to the counter -- came
+back **verified**, while the loop plainly returns a value that violates `ret <= 8` for
+`n = 8`. The tool had proved a false statement.
+
+The cause is what the exit edge carries. `advance` asserted the invariant and then
+continued into the header with the path the path *arrived* with. For the entry edge that
+is the pre-loop state, so the guard is evaluated there: `0 < n` gives `n >= 1`, and
+`!(0 < n)` gives `n == 0` with the counter still `0`. The exit edge is therefore only
+ever walked from the state of the *first* iteration. Everything the loop does on its
+second pass and later -- including writing the return value -- was never seen. A proof
+that only inspects the first iteration is not a proof of the loop.
+
+The fix is the standard rule, and it is a rule precisely because this is the trap. At the
+header, **havoc** the locals the loop can write -- replace each with a fresh variable --
+and only then assume the invariant. What the exit edge carries is then `I && !guard` over
+*arbitrary* values satisfying `I`, which is what the invariant is a claim about. The
+`havoc` set is an over-approximation (reachability from the header over the whole
+function), which is the safe direction: havocing a local the loop never writes loses
+information and can turn a proof into an open obligation, never the reverse. `_0`, the
+return place, must be in the set; leaving it out is the specific way the hole reappeared,
+since `s` in `sum_to` *is* `_0`.
+
+Two things made this findable rather than a silent false positive:
+
+* **A mutation test, not a reading.** The weakened invariant was checked by hand against
+  the corpus before being trusted. Reading the `advance` code did not reveal the bug; the
+  two-word diff that changed `s == i` to `s == 0`-equivalent did.
+* **A regression test that fails without the fix.** `an_invariant_too_weak_for_the_
+  postcondition_is_not_a_proof` asserts only "not verified" -- a counterexample or an open
+  obligation both satisfy it -- and it was confirmed to *pass* on the unsound version and
+  fail once havoc was disabled with `if true { continue; }`. A test written after the fix
+  that only pins the happy path would have missed this entirely.
+
+A smaller trap sits next to it. Classifying the edges needs care: the block *before* the
+header also jumps into it, and that edge is the entry, not the latch. The test that gets
+this right is `to <= from` -- strictly earlier targets are the entry, equal-or-later ones
+are the latch, and a header that loops to itself is a latch. A "cleaner" two-pass version
+that collected every block edging into the header from later in the layout classified the
+entry edge as a latch, cut the loop before it was entered, and reported a proof of a false
+postcondition again. The mutation tests caught it in seconds; a green suite after the
+change would not have, which is why they assert the *negative*.
+
+The general lesson: for a loop, an invariant is not a predicate to *check at the edges*,
+it is a predicate to *assume over the whole state space it describes*. Asserting it at the
+back edge is necessary and not sufficient; the header has to forget what it cannot know.
+
+## A call to `core` made the whole path unknown, and modelling it needed a tag that is a term
+
+The MIR frontend's biggest coverage gap was not a parser shape or a width wall: it was that
+any call into `core` was unmodelled, so `a.checked_add(b)` — the idiomatic way to write
+arithmetic that must not panic — made every obligation downstream of it `incomplete`. The
+corpus scoreboard said so in one line, `is_nonzero_after  incomplete  call to unmodelled
+function ...checked_add`, and that line is why the scoreboard exists.
+
+The fix is `src/mir/intrinsics.rs`: `checked_*`, `saturating_*` and `wrapping_*` are computed
+from their operands rather than refused. Three things about it are worth carrying forward.
+
+**The refusals are the design, not a limitation.** Only `checked_div`/`checked_rem` may model
+division. `saturating_div` and `wrapping_div` *panic* on a zero divisor, and modelling a
+panicking operation as total would hide a panic — the one thing this frontend must never do.
+The shifts are refused because the families genuinely disagree: `wrapping_shl` reduces the
+amount modulo the width, the engine's variable shift saturates to zero, and `checked_shl`
+returns `None` past the width. Three behaviours under one name is not something to guess at,
+and a wrong guess is not a weaker proof, it is a false one. So refusal happens at two layers
+and a test pins both: a name whose operator is unknown does not `classify` at all, while a
+name that classifies (`saturating_div`) is refused by `is_modelled`/`eval`. The first draft of
+that test asserted `saturating_div` does not classify, and the failure was the useful kind — it
+showed the two layers were real and the test was naming the wrong one.
+
+**A `checked_*` result is an `Option`, and its tag is a *term*.** This is the part that made
+the plumbing non-trivial. `checked_add` on a `u8` is `Option<u8>`: rustc lowers the consuming
+`match` to a `switchInt` on `discriminant(_2)`, and reads the payload through a
+`Proj::Downcast(Some)` place. A tag modelled as a constant would take one arm always. It has
+to be `ite(fails, 0, 1)`, where `fails` is the same overflow predicate the `assert` reads, so
+the `switchInt` goes the right way on each path. The payload is recorded *unconditionally*
+under the `Some` projection, and that is sound precisely because rustc emits the downcast read
+only inside the arm where the tag is `1` — the path condition is the gate, so no extra gate is
+needed. The width is the *operand* width, not the destination's: sizing the payload from the
+`Option<u8>` local would ask the engine for a 64-bit overflow test.
+
+Three smaller traps fell out of the same work, each a place where a plausible reading is wrong:
+
+* `Rvalue::Discriminant` was sizing the tag from the dump's `isize` rather than from the
+  payload width, and returning `Unknown` when no tag was recorded instead of `Val::Unknown`
+  for an unknown *tag*. A modelled `Option` local has no `locals` entry — its value *is* its
+  tag — so `Env::get` needed a fallback to the `discriminants` map, or `discriminant(_2)` and
+  `move _2` both came back unknown.
+* The downcast payload read `((_2 as Some).0)` is *one* step, not two: the projection loop
+  consumed the `Downcast` and then processed the trailing `Field(0)`, which looked the payload
+  up in the tuple map and overwrote a good value with `Unknown`. The loop now consumes both.
+* `parse_rvalue` matched the ` as ` cast form before trying a `copy`/`move` of a place, so a
+  downcast place did not parse. Checking the place form first fixes it — the same shape of
+  ordering bug as the earlier `const ... as ...` case, in the opposite direction.
+
+**The oracle is Rust itself, enumerated.** The model claims to implement `core`'s definition,
+so the unit tests in `src/mir/intrinsics.rs` compare against the real `u8::checked_add` and
+its family over *all* of `u8` and all of `i8` — 65536 pairs per case, cheap because the term is
+built once and walked per pair rather than reset per pair. That is what pins the signed rules,
+which no unsigned test can see: `-1 + 1` does not overflow, but the unsigned carry test fires
+on it, so an unsigned-only model would report a panic that is not there. `i8::MIN / -1` and the
+width limits are checked the same way. The terms are read back with `smt::evaluate`, which is
+the concrete semantics of the symbolic language, so the test compares *values* and not just
+`Some`/`None`.
+
+The scoreboard moved from 4 of 14 decided to 10 of 14, and the remaining four each name
+themselves in the `detail` column — an unreadable `requires` (`c.lo <= c.hi`, `xs.len() > 0`)
+and a tuple-returning `ensures` (`ret.0 <= a`). Those are the next gaps, and they are parser
+gaps rather than engine ones, which the scoreboard says without being asked.
+
+## An inlined call must restore the caller's loop cut, or the caller unwinds a loop it had cut
+
+Cutting a loop at its invariant is a property of a *function*: the `Cut` names the header and
+back edges of one loop in one function's CFG. Entering an inlined callee therefore clears
+`cut`, correctly — the caller's invariant says nothing about the callee's locals. The return
+path then copied the callee's `cut` into the resumed caller, which is the bug: a callee that
+returns from a function with no loop leaves `cut` as `None`, so the caller resumed *inside its
+own loop* with no cut. The next edge into the header was unwound rather than checked against
+the invariant, and once the loop passed `DEFAULT_UNWIND` the function was reported
+`Incomplete` — a valid proof discarded, not a false one, but a defect all the same.
+
+The frame already had the fix's shape: `saved_env` is set aside at call entry and restored on
+return, for the same reason. `saved_cut` follows it exactly. Restoring the cut is the whole
+change; the callee's own cut is dropped because the callee has returned.
+
+What made this reachable *now* is the exact-name lookup. Before it, a user function named
+`wrapping_add` was answered by `intrinsics` as `a + b`, a leaf that never entered a frame, so
+the caller's cut was never disturbed. Sending such a function through the inliner — the right
+fix for the false proof it caused — exposed the return path's missing restore. A change that
+fixes one defect can activate another that was latent behind it.
+
+The teeth are two tests, and the second matters as much as the first:
+`an_invariant_survives_an_inlined_call_on_the_loop_edge` requires the loop to verify across
+the call (it fails on the pre-fix code), and `an_inlined_call_does_not_rescue_a_weak_invariant`
+requires the same loop with `ensures: ret == 0` to still be refuted. Restoring the cut must
+restore the proof the invariant actually carries, not resurrect one that was never there.
+

@@ -1,13 +1,18 @@
 # CI for the `discharge` crate.
 #
-# Two jobs on purpose. The first runs `scripts/gate.sh` -- the same script a human runs --
+# Three jobs on purpose. The first runs `scripts/gate.sh` -- the same script a human runs --
 # so "the gates are green" means the same thing locally and in CI, and there is no second
-# copy of the commands to drift. The second installs Kani and runs the Kani differential
-# oracle as a hard gate, because Kani is a large download (a pinned nightly plus CBMC) that
-# a normal `gate.sh` run should not pay for, but that CI can.
+# copy of the commands to drift. The other two install Kani and Verus and run their
+# differential oracles as hard gates, because both are large downloads (a pinned nightly
+# plus CBMC, and a self-contained bundle with its own z3) that a normal `gate.sh` run should
+# not pay for, but that CI can.
 #
-# Neither job adds a dependency to the crate: z3 and Kani are oracles, invoked as
+# No job adds a dependency to the crate: z3, Kani and Verus are oracles, invoked as
 # subprocesses, and `gate.sh`'s zero-dependency check would fail if that ever changed.
+#
+# Every third-party action is pinned to a full commit SHA, not a movable tag, so a
+# compromised or retagged release cannot change what CI runs. The tag is kept in a trailing
+# comment because a bare SHA does not tell a reader which version it is.
 
 name: CI
 
@@ -24,31 +29,45 @@ jobs:
     name: gates (clippy, tests, no_std, zero deps, z3 oracle)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Rust (stable) and the bare-metal target
+      # The nightly is not for building this crate; it is what `gate.sh` step 7 points
+      # `DISCHARGE_RUSTC` at, because `rustc --emit=mir` needs a nightly. Without it every
+      # test in `tests/mir.rs` skips itself -- and a skipped test still reports `ok`, so the
+      # suite count is identical whether the MIR frontend was exercised or not. That is how
+      # the per-kind discharge polarity (`Obligation::is_discharged`) came to have no teeth
+      # in CI. The in-module oracle in `src/mir/exec.rs` covers that logic ungated; this
+      # makes the end-to-end tests run too.
+      - name: Install Rust (stable, nightly, bare-metal target)
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
+          rustup toolchain install nightly --profile minimal --no-self-update
           rustup default stable
           rustup target add thumbv7em-none-eabihf
 
       # `gate.sh` treats an absent z3 as a failure, on purpose: an oracle that did not run
       # is not evidence about the exporter. setup-python gives a pip that is not externally
       # managed, so `pip install z3-solver` works without --break-system-packages.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.x'
       - name: Install the z3 oracle
         run: python3 -m pip install z3-solver
 
+      # `DISCHARGE_RUSTC` must be a path to a `rustc`, not a toolchain name: the frontend
+      # runs it as a subprocess (`Command::new(rustc)`), so a bare `nightly` would look for
+      # a binary by that name and fail.
       - name: Run scripts/gate.sh
-        run: sh scripts/gate.sh
+        run: |
+          DISCHARGE_RUSTC="$(rustup which --toolchain nightly rustc)"
+          export DISCHARGE_RUSTC
+          sh scripts/gate.sh
 
   kani:
     name: kani differential oracle
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust (stable)
         run: |
@@ -58,7 +77,7 @@ jobs:
       # Cache the Kani install: `cargo kani setup` fetches a pinned nightly and CBMC, and
       # re-downloading them on every run is most of the job's wall time.
       - name: Cache Kani's toolchain download
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/bin/cargo-kani
@@ -82,7 +101,7 @@ jobs:
     name: verus differential oracle
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust (stable)
         run: |
