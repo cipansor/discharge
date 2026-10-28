@@ -80,6 +80,28 @@ fn saturating_add_is_monotone() {
 }
 
 // ---------------------------------------------------------------------------
+// The enumerations run optimised, but with the checks still on
+// ---------------------------------------------------------------------------
+
+/// `[profile.test]` raises `opt-level` to 2 because an unoptimised `2^32` walk
+/// takes ~21 s against ~2.6 s optimised, and one such obligation stalled the gate.
+/// The speed must not have been bought by turning off `debug-assertions` or
+/// `overflow-checks`: this is an arithmetic crate, and the tests that exercise
+/// `checked_*` and `saturating_*` are exactly where a silent wrap would hide.
+///
+/// The profile sets only `opt-level`, which leaves both at their test-profile
+/// defaults. This pins the debug assertions, so that a later change that "saves
+/// more time" by disabling them fails here rather than silently removing a class
+/// of check from every arithmetic test.
+#[test]
+fn the_test_profile_is_optimised_without_losing_its_checks() {
+    // Bound to a `let` so this is the build's actual configuration rather than an
+    // assertion on a literal, which clippy rightly rejects.
+    let checks_on: bool = cfg!(debug_assertions);
+    assert!(checks_on, "the test profile must keep debug assertions on");
+}
+
+// ---------------------------------------------------------------------------
 // The proofs have teeth: drop the load-bearing ingredient and they must fail
 // ---------------------------------------------------------------------------
 

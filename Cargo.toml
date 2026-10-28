@@ -39,3 +39,17 @@ std = []
 
 [profile.release]
 opt-level = 2
+
+# The exhaustive enumerations in `discharge-arithmetic`'s proofs are tight integer
+# loops, and an unoptimised build runs them roughly eight times slower than
+# `prove::ENUM_BUDGET`'s comment assumes. A `2^32` walk costs ~21 s in the default
+# test profile and ~2.6 s with `opt-level = 2`, which is the difference between a
+# gate that stalls on one obligation and one that finishes the suite.
+#
+# `debug-assertions` and `overflow-checks` are left **on** deliberately. This is an
+# arithmetic crate: the tests that exercise `checked_*` and `saturating_*` are
+# exactly where a silent wrap would hide, so the speed must not be bought by
+# turning off the checks that would catch it. Optimising while keeping them on is
+# the trade that costs nothing.
+[profile.test]
+opt-level = 2

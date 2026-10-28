@@ -37,9 +37,16 @@
 
 /// The largest number of cases one obligation will enumerate.
 ///
-/// `2^32` is about two seconds of tight loop, and it is the point past which the
-/// method stops being usable in a test suite. A domain above it is not attempted;
-/// the verdict is [`Verdict::Unknown`].
+/// `2^32` is the point past which the method stops being usable in a test suite,
+/// and the figure is measured rather than guessed: such a walk costs about 2.6 s
+/// in the optimised test profile and about 21 s unoptimised, which is why
+/// `[profile.test]` sets `opt-level = 2` (with the debug assertions left on). A
+/// domain above the budget is not attempted; the verdict is [`Verdict::Unknown`].
+///
+/// The budget is a *count of cases*, so it does not bound the wall-clock cost on
+/// its own — an obligation that does more work per case, or one built without
+/// optimisation, is slower for the same count. `ENUM_BUDGET` is the count; the
+/// profile is what keeps the count affordable.
 pub const ENUM_BUDGET: u64 = 1 << 32;
 
 /// The outcome of an obligation.

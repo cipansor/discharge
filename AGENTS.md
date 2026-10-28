@@ -2332,6 +2332,24 @@ mistake: reducing a function to a summary that is not injective, then comparing 
   getting it backwards makes 21 actuator and 6 realistic functions disagree, which is how it
   was checked. A useful side effect: the real asymmetry shows up, that `Bounds` is `True` while
   every arithmetic guard is `Negated`.
+* **The gate's cost was the test profile, not the algorithm.** `prove::ENUM_BUDGET`
+  is documented as "about two seconds of tight loop", but that figure is a *release*
+  calibration. Cargo's default test profile is unoptimised, and the enumerations are
+  tight integer loops, so the same `2^32` walk cost ~21 s in the gate against ~2.6 s
+  optimised — and three sibling tests did it. The fix is `[profile.test] opt-level = 2`
+  in the workspace root, which took `scripts/test-count.sh` from 1m50s to 15.5 s
+  without touching a single proof. Two things to keep in mind: `[profile.test]` only
+  takes effect in the workspace root manifest (a profile in a member is ignored, and
+  cargo does not warn), and it applies to the *library* the integration tests link,
+  which is where the hot loop actually lives. Do not buy the speed with
+  `debug-assertions = false` — this is an arithmetic crate, and the `checked_*` tests
+  are where a silent wrap would hide; `the_test_profile_is_optimised_without_losing_its_checks`
+  fails if someone tries.
+* **A budget in cases is not a budget in seconds.** `ENUM_BUDGET` bounds the *count*
+  of cases, not the wall-clock cost. An obligation that does more work per case, or a
+  build without optimisation, is slower for the same count. Calibrating a case budget
+  in release and enforcing it in debug is exactly how a "2 second" bound became a
+  20 second gate.
 * **A coverage check that compared first counterexamples.** `fixed_add_no_overflow`
   skips the points its precondition rejects, which is only sound if the rectangle it
   walks is *exactly* the precondition's set. The first version of the check ran both
