@@ -169,3 +169,55 @@ jobs:
         run: |
           cd tools/mir-oracle
           RUSTC="$(rustup which --toolchain nightly rustc)" cargo clippy --all-targets -- -D warnings
+
+  lean:
+    name: lean differential oracle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      # Lean via elan, the official installer. It is pinned to a release rather than
+      # tracking latest because `bv_decide` and `native_decide` are the interface this job
+      # depends on, and a nightly that renames or moves them would look like a disagreement
+      # with the engine rather than a toolchain change. Bumping this pin is the deliberate
+      # act of moving the oracle.
+      - name: Install Lean 4 (elan)
+        run: |
+          set -e
+          curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            -o elan-init.sh
+          sh elan-init.sh -y --default-toolchain leanprover/lean4:v4.35.0
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      # Hard gate, same as Kani and Verus: a disagreement, a refuted identity, a missing
+      # verdict, or a case Lean could not decide all fail the run.
+      - name: Run the Lean oracle
+        run: cargo run -q --features std --example leandiff -- 64
+
+  coq:
+    name: coq differential oracle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      # Coq from the distribution rather than opam: the oracle needs only `coqc` and the
+      # standard library, and the apt package is a fraction of an opam switch's install time.
+      - name: Install Coq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends coq
+
+      # Hard gate. This one enumerates the 8-bit domain, so it takes a selected subset of
+      # the corpus (see `SELECTED` in examples/coqdiff.rs) and is the slowest job here.
+      - name: Run the Coq oracle
+        run: cargo run -q --features std --example coqdiff

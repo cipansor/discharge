@@ -1555,7 +1555,11 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   │                      (needs `cargo kani`; a development tool, not a dependency)
 │   ├── verusdiff.rs       differential harness: engine vs Verus on a spec fn
 │   │                      (needs the Verus driver; a development tool, not a dependency)
-│   ├── support/           the IR the two engine harnesses share, so they check the
+│   ├── leandiff.rs        differential harness: engine vs Lean 4's `bv_decide`
+│   │                      (needs Lean via elan; a development tool, not a dependency)
+│   ├── coqdiff.rs         differential harness: engine vs Coq's kernel, by enumeration
+│   │                      (needs `coqc`; a development tool, not a dependency)
+│   ├── support/           the IR the engine harnesses share, so they check the
 │   │                      same formulas rather than two drifting corpora
 │   ├── mir_demo.rs        verifies real Rust read from MIR, end to end
 │   └── mir_targets/
@@ -1587,8 +1591,8 @@ cargo build --no-default-features --target thumbv7em-none-eabihf
 `no_std` build, a zero-dependency check, and the z3 differential oracle. It exists because
 the gates were previously five separate commands quoted in prose, which is how a gate
 quietly stops being run. It also refuses to report success when the z3 oracle is not
-installed: an oracle that did not run is not evidence about the exporter. Three further gates
-run the Kani and Verus differential oracles and the `rustc_public` MIR oracle when those
+installed: an oracle that did not run is not evidence about the exporter. Five further gates
+run the Kani, Verus, Lean and Coq differential oracles and the `rustc_public` MIR oracle when those
 tools are present and *skip them loudly* when they are not, because all three are large
 downloads (Kani: a pinned nightly plus CBMC; Verus: a self-contained bundle with its own z3;
 the MIR oracle: a nightly with the `rustc-dev` component) that a normal local run should not
@@ -1612,21 +1616,35 @@ never touch a crate that must build on stable with zero dependencies; the depend
 points one way, from the oracle to `discharge`. Gate 9 of `scripts/gate.sh` runs it, and the
 `mir-oracle` CI job makes it a hard gate.
 
-### Two more oracles, for the engine instead of the exporter
+### Four more oracles, for the engine instead of the exporter
 
 `z3diff` checks the *exporter*: it prints a query and asks z3 to agree about that text.
-`examples/kanidiff.rs` and `examples/verusdiff.rs` check the *engine*. Each takes predicates
-the engine proved, compiles them into real programs, and asks an independent verifier to
-prove the same property of that program:
+`examples/kanidiff.rs`, `examples/verusdiff.rs`, `examples/leandiff.rs` and
+`examples/coqdiff.rs` check the *engine*. Each takes predicates the engine proved, compiles
+them into a real program or goal, and asks an independent verifier to establish the same
+property:
 
 * `kanidiff` compiles each case into a Rust function and asks **Kani** (AWS's model checker,
   over CBMC) to verify it.
 * `verusdiff` compiles each case into a Verus `spec fn` and asks **Verus** (Viper plus SMT,
   with bit-vector reasoning) to verify it.
+* `leandiff` compiles each case into a Lean 4 theorem and asks **`bv_decide`** to prove it.
+  This is the strongest of the four, and for a structural reason: `bv_decide` bit-blasts the
+  goal, runs a SAT solver, and then *replays the solver's refutation as a Lean proof term that
+  the kernel type-checks*. The verdict is not "a solver said so", it is a machine-checked
+  theorem about the same 8-bit words this crate blasts.
+* `coqdiff` asks **Coq's kernel** to check a different thing from the other three: not "does
+  the engine decide this formula the same way" but "does the engine's arithmetic, transcribed
+  into `Z` with explicit masks, evaluate to the same truth value on every point of the 8-bit
+  domain". Coq has no machine word in its standard library, so the generator spells every
+  operator out over `Z` and the harness enumerates the domain with `vm_compute`. That makes it
+  the only oracle that checks the *transcription* rather than the verdict, and it is the
+  slowest by a wide margin (three variables is 16.7M evaluations), so it runs a selected
+  subset of the corpus — see `SELECTED` in `examples/coqdiff.rs`.
 
-Neither backend ever sees a symbolic term or an SMT-LIB string, and the two are built on
-different foundations, so agreement is agreement between three independently built decision
-procedures. A blasting bug now has to survive agreement with *both* of them, which is a much
+No backend ever sees a symbolic term or an SMT-LIB string, and the four are built on
+different foundations, so agreement is agreement between five independently built decision
+procedures. A blasting bug now has to survive agreement with all four, which is a much
 narrower coincidence than surviving one.
 
 The design detail that matters is that the predicate and the generated program are *not*
@@ -1639,13 +1657,21 @@ formulas and every disagreement would be noise.
 The harnesses have been checked for teeth by mutation, which is the only way to know they ask
 a real question. Dropping the `+1` from the `Sub` blast (`borrow = TRUE` → `FALSE`) makes the
 engine reject three true identities (`sub_self`, `add_sub_cancel`, `sub_zero`); changing the
-`Eq` blast from `and` to `or` over the per-bit equalities makes it prove false ones. Both
-mutations are caught by both harnesses, the second as `MISMATCH rand_N` on the random sweep.
+`Eq` blast from `and` to `or` over the per-bit equalities makes it prove false ones. The
+first of those is caught by `kanidiff` and `verusdiff`; the second by both as `MISMATCH
+rand_N` on the random sweep. `leandiff` and `coqdiff` were checked against a mutation of
+their own — the `Sub` blast wired to `Op::Add` instead, a blasting bug the engine then
+*blesses* rather than rejects — and both catch it: the negative control flips from refuted to
+proved (`control_ok=false`), and each reports `refuted_identity=2` plus three `MISMATCH`
+lines naming `sub_self`, `add_sub_cancel` and the control. So every harness here has been
+observed to fail on a broken engine, which is the only evidence that a green run means
+anything.
+
 Each harness also carries a negative control — `a - b == b - a`, false by construction — and
 fails if either side *proves* it, so a run where "everything agreed" because nothing was
 really asked cannot pass.
 
-Four divergences surfaced while building these, and all are worth stating because they are
+Eight divergences surfaced while building these, and all are worth stating because they are
 where a plausible harness would have quietly lied:
 
 1. **Arena sharing.** One engine arena for all cases exhausted the node budget after about a
@@ -1665,6 +1691,34 @@ where a plausible harness would have quietly lied:
    arithmetic through spec helpers that wrap via `as u8`. And Verus's
    `verification results:: N verified, M errors` counts non-case items such as `main`, so the
    accounting check is on error *locations*, not on that sum.
+5. **Lean's `setWidth` changes the type.** `setWidth 4` on a `BitVec 8` returns a `BitVec 4`,
+   and `==` is homogeneous, so a bare truncation cannot be compared against a `BitVec 8` at
+   all. The first `lean_word` emitted exactly that and every masked case came back as a
+   `Type mismatch` rather than a verdict — a harness bug that would have read as "the engine
+   and Lean disagree about masking" if the harness had counted non-verdicts as disagreement.
+   Widening back with `.setWidth 8` is the engine's `truncate`-then-widen `Mask`.
+6. **Lean diagnostics are multi-line, and the line number is the second-to-last field.**
+   `bv_decide` and `native_decide` report a refutation in two different wordings
+   ("The prover found a counterexample" vs "the proposition … is false"), and the second
+   only appears on a continuation line — so the classifier has to collect the whole
+   diagnostic block before it can judge it. Reading the first line alone called every
+   `native_decide` refutation "hard", i.e. unverifiable. The line number itself is the field
+   *before* the column, not the last one; taking the last one attributed every verdict to the
+   wrong case and produced 47 spurious mismatches against a correct engine.
+7. **`first | bv_decide | decide` does not work, and the failure is silent.** `first` commits
+   to the first tactic that produces a proof *or an error*, and `bv_decide` reporting a
+   counterexample counts as an error — so `decide` then runs on every refuted goal, including
+   the wide arithmetic ones, where it exceeds the heartbeat limit. The case is then reported
+   as undecidable rather than refuted, which is a *lost* verdict rather than a wrong one, but
+   it makes the oracle look weaker than it is. `native_decide` compiles the decision instead
+   of reducing in the kernel and finishes those in under a second. The trade is real and
+   stated in the harness: `native_decide` is Lean's trusted-native escape hatch, so the
+   fallback verdicts are trusted rather than kernel-checked, which is why `bv_decide` is tried
+   first and applies to all but the out-of-fragment handful.
+8. **Coq applies by juxtaposition, not by comma.** `add_eng(a, b)` is a type error —
+   `add_eng` has type `Z -> Z -> Z` but is applied to a single argument — and every case
+   failed to compile until the generator emitted `add_eng a b`. The harness refused to read
+   the failed compile as a set of verdicts, which is the behaviour that made it visible.
 
 Two corpus entries were also wrong — a bare `Not(And(..))` is not De Morgan, and
 `guard <=> ite(guard,a,b)==a` fails at `a==b` — and the engine correctly refuted both. The
@@ -1722,10 +1776,10 @@ discharged *on the target*, with no solver in the loop — is not one the big
 tools aim at, and it is the same niche a `no_std` flight build actually needs.
 
 They are not rivals here so much as a second opinion. The crate uses Kani and
-Verus as *differential oracles* in its test suite (`examples/kanidiff.rs`,
-`examples/verusdiff.rs`): the engine's verdict on a predicate is checked against
-each tool's verdict on the equivalent compiled program, so the three decision
-procedures have to agree. They are invoked as subprocesses and are never
+Verus, Lean and Coq as *differential oracles* in its test suite (`examples/kanidiff.rs`,
+`examples/verusdiff.rs`, `examples/leandiff.rs`, `examples/coqdiff.rs`): the engine's verdict
+on a predicate is checked against each tool's verdict on the equivalent compiled program or
+goal, so the five decision procedures have to agree. They are invoked as subprocesses and are never
 dependencies — the shipped crate still has none — but "an independent verifier
 agrees" is a much stronger claim than "the tests pass", and it is available
 precisely because these tools exist.

@@ -10,13 +10,13 @@ cd "$(dirname "$0")/.."
 
 fail() { echo "GATE FAILED: $1" >&2; exit 1; }
 
-echo "== 1/9 clippy (all targets, std) =="
+echo "== 1/11 clippy (all targets, std) =="
 cargo clippy --workspace --features std --all-targets -- -D warnings || fail "clippy"
 
-echo "== 2/9 tests (std), with a count that fails on failure =="
+echo "== 2/11 tests (std), with a count that fails on failure =="
 sh scripts/test-count.sh || fail "tests"
 
-echo "== 3/9 no_std bare-metal build =="
+echo "== 3/11 no_std bare-metal build =="
 # Both crates must build for the target a flight computer actually is. The parent is
 # built without its `std` feature; the arithmetic crate has no features at all, so its
 # default build *is* the bare-metal one.
@@ -24,7 +24,7 @@ cargo build -q --no-default-features --target thumbv7em-none-eabihf || fail "bar
 cargo build -q -p discharge-arithmetic --target thumbv7em-none-eabihf \
   || fail "bare-metal build of discharge-arithmetic"
 
-echo "== 4/9 no external dependencies =="
+echo "== 4/11 no external dependencies =="
 # The property is not "the tree has one line" any more -- the arithmetic primitives were
 # split into a sibling crate in this repository, so `discharge` legitimately depends on
 # `discharge-arithmetic`. The property that must not change is that *nothing from outside
@@ -44,12 +44,12 @@ if cargo tree -p discharge -e normal --prefix none | tail -n +2 | grep -qE '\((h
   fail "an external (registry or git) dependency has appeared in the tree"
 fi
 
-echo "== 5/9 z3 differential oracle =="
+echo "== 5/11 z3 differential oracle =="
 # This one needs the oracle. If `z3` is absent it exits 2 and says so; that is a failure
 # here too, because "the oracle did not run" is not evidence about the exporter.
 cargo run -q --features std --example z3diff || fail "z3 differential oracle"
 
-echo "== 6/9 kani differential oracle (skipped if kani is absent) =="
+echo "== 6/11 kani differential oracle (skipped if kani is absent) =="
 # Kani is an oracle, not a dependency, and installing it is a large download plus a nightly
 # toolchain plus CBMC. Unlike z3 it is genuinely optional for a normal build, so an absent
 # Kani is *reported and skipped* here rather than failed -- the CI job that installs Kani is
@@ -60,7 +60,7 @@ else
   echo "   (kani not installed; skipped -- 'cargo install --locked kani-verifier && cargo kani setup')"
 fi
 
-echo "== 7/9 MIR frontend, on real rustc MIR (skipped if no nightly is named) =="
+echo "== 7/11 MIR frontend, on real rustc MIR (skipped if no nightly is named) =="
 # The MIR frontend shells out to `rustc --emit=mir`, which needs nightly. It takes the
 # compiler from DISCHARGE_RUSTC rather than RUSTC so that pointing it at a nightly does
 # not disturb the cargo that is building these tests. Without a nightly named, the
@@ -72,7 +72,7 @@ else
   echo "   (DISCHARGE_RUSTC not set; skipped -- set it to 'rustup which --toolchain nightly rustc')"
 fi
 
-echo "== 8/9 verus differential oracle (skipped if verus is absent) =="
+echo "== 8/11 verus differential oracle (skipped if verus is absent) =="
 # Same rule as Kani. Verus ships a self-contained bundle, so a run that wants this gate
 # unpacks a release and points VERUS_BIN at the driver.
 if command -v "${VERUS_BIN:-verus}" >/dev/null 2>&1; then
@@ -81,7 +81,7 @@ else
   echo "   (verus not installed; skipped -- set VERUS_BIN to the Verus release driver)"
 fi
 
-echo "== 9/9 rustc_public MIR oracle (skipped if no nightly/rustc-dev) =="
+echo "== 9/11 rustc_public MIR oracle (skipped if no nightly/rustc-dev) =="
 # The frontend reads *textual* MIR, so a rustc release that reprints the dump can
 # break the parser and nothing else would notice. This gate asks `rustc_public`
 # for the same programs' typed MIR and compares the per-function shape -- block
@@ -96,6 +96,41 @@ else
     echo "   (no nightly with rustc-dev; skipped -- 'rustup component add rustc-dev --toolchain nightly')"
   else
     fail "rustc_public MIR oracle"
+  fi
+fi
+
+echo "== 10/11 lean differential oracle (skipped if lean is absent) =="
+# Lean is the strongest of the four backends here: `bv_decide` bit-blasts and then replays
+# the SAT refutation as a Lean proof term the kernel checks, so agreement is with a
+# machine-checked theorem rather than with a solver's word. It is still an oracle, not a
+# dependency -- `lean` is a subprocess and the crate builds with zero dependencies -- so an
+# absent Lean is reported and skipped, exactly like Kani and Verus. `LEAN_BIN` names the
+# binary when elan's `~/.elan/bin` is not on PATH.
+if cargo run -q --features std --example leandiff -- 64; then
+  :
+else
+  code=$?
+  if [ "$code" -eq 2 ]; then
+    echo "   (no lean on PATH; skipped -- install with elan, or set LEAN_BIN)"
+  else
+    fail "lean differential oracle"
+  fi
+fi
+
+echo "== 11/11 coq differential oracle (skipped if coqc is absent) =="
+# Coq checks a different thing from the other three: not "does the engine decide this the
+# same way" but "does the engine's arithmetic, transcribed into `Z` with explicit masks,
+# evaluate to the same truth value on every point of the 8-bit domain". It enumerates, so it
+# is the slowest oracle and takes a selected subset of the corpus (see `SELECTED` in
+# examples/coqdiff.rs). Absent `coqc` is reported and skipped, like Kani and Verus.
+if cargo run -q --features std --example coqdiff; then
+  :
+else
+  code=$?
+  if [ "$code" -eq 2 ]; then
+    echo "   (no coqc on PATH; skipped -- install Coq, or set COQC_BIN)"
+  else
+    fail "coq differential oracle"
   fi
 fi
 
