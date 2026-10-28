@@ -351,3 +351,139 @@ fn bounded_sub_rejects_a_difference_below_min() {
     let b = R::new(10).unwrap();
     assert_eq!(a.sub(b), None, "1 is below min = 10");
 }
+
+// ---------------------------------------------------------------------------
+// A width of zero is refused, not enumerated
+// ---------------------------------------------------------------------------
+
+/// A zero-bit integer is not a word width, but `1u64 << 0` is `1`, so the
+/// enumeration would visit the fabricated point `(0, 0)` and answer `Valid` for a
+/// proposition about a type that does not exist. Every width-dependent entry point
+/// must refuse instead of certifying an invalid domain.
+#[test]
+fn a_zero_width_domain_is_unknown_not_valid() {
+    assert_eq!(prove::safe_add_is_exact(0), Verdict::Unknown);
+    assert_eq!(prove::sub_self_is_zero(0), Verdict::Unknown);
+    assert_eq!(prove::accumulator_no_overflow(0, 0), Verdict::Unknown);
+    assert_eq!(prove::saturating_add_monotone(0, 1), Verdict::Unknown);
+    assert_eq!(prove::restricted_enumeration_agrees(0, 1, 1), Verdict::Unknown);
+    // The one-bit domain is real, so the same guard must not swallow it.
+    assert!(prove::safe_add_is_exact(1).is_proved(), "a 1-bit domain is a domain");
+}
+
+// ---------------------------------------------------------------------------
+// The restricted enumeration is the same question, checked and not assumed
+// ---------------------------------------------------------------------------
+
+/// `fixed_add_no_overflow` enumerates the `2^28` in-range pairs rather than the
+/// `2^32` pairs of the whole 16-bit domain, which is what made it the slowest test
+/// in the gate. Skipping the out-of-range points is only sound if the rectangle is
+/// *exactly* the precondition's set, so that equivalence is checked here rather
+/// than assumed. The goal is refuted inside the rectangle, so this is not two
+/// `Valid`s agreeing vacuously.
+#[test]
+fn the_restricted_enumeration_asks_the_same_question() {
+    assert!(prove::restricted_enumeration_agrees(8, 200, 200).is_proved());
+    assert!(prove::restricted_enumeration_agrees(6, 50, 50).is_proved());
+}
+
+/// Teeth: enumerate a *different* rectangle and the agreement must break. This is
+/// what makes the check above evidence rather than decoration — if
+/// `forall_pair_bounded` ignored its bound and walked the whole domain, the wrong
+/// rectangle would agree too.
+#[test]
+fn a_wrong_rectangle_is_caught() {
+    assert_eq!(
+        prove::restricted_enumeration_agrees(8, 200, 60),
+        Verdict::Counterexample(Witness { a: 0, b: 0, len: 2 }),
+        "a rectangle narrower than the precondition must not agree with the guarded walk"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The statements and the runtime primitives are tied together
+// ---------------------------------------------------------------------------
+
+/// The obligations above are stated at 8 and 16 bits, because that is the largest
+/// domain enumeration can exhaust, while the primitives they are *about* are
+/// `u32`. The widths cannot be reconciled by calling the primitive from the
+/// obligation: two 8-bit values added as `u32` never overflow, so the obligation
+/// would be proved for the wrong reason. Instead this test checks each primitive at
+/// the `u32` points where the property its obligation states is observable, so a
+/// regression in a primitive has to survive this as well as the verdicts.
+#[test]
+fn runtime_ops_match_their_proved_statements() {
+    // `checked_add_is_total`: the overflow flag is exact, so `checked_add` returns
+    // `None` exactly when the wrapped sum fell below an operand.
+    for (a, b) in [
+        (0u32, 0u32),
+        (1, 1),
+        (200, 55),
+        (1000, 1000),
+        (1 << 31, 1 << 31),
+        (u32::MAX, 0),
+        (u32::MAX, 1),
+        (u32::MAX, u32::MAX),
+    ] {
+        let wrapped = a.wrapping_add(b);
+        assert_eq!(
+            wrapped < a,
+            wrapped < b,
+            "the two overflow tests must agree at ({a}, {b})"
+        );
+        assert_eq!(
+            checked_add(a, b).is_none(),
+            wrapped < a,
+            "checked_add must report overflow exactly when the sum wraps at ({a}, {b})"
+        );
+        assert_eq!(safe_add(a, b), checked_add(a, b), "safe_add at ({a}, {b})");
+    }
+
+    // `saturating_add_bounds`: the saturating sum is never below an operand, and it
+    // equals the true sum whenever that sum did not wrap.
+    for (a, b) in [
+        (0u32, 0u32),
+        (200, 55),
+        (1000, 1000),
+        (1 << 31, 1 << 31),
+        (u32::MAX, 1),
+    ] {
+        let sat = saturating_add(a, b);
+        assert!(sat >= a && sat >= b, "sat below an operand at ({a}, {b})");
+        match checked_add(a, b) {
+            Some(sum) => assert_eq!(sat, sum, "without overflow sat must be the sum at ({a}, {b})"),
+            None => assert_eq!(sat, u32::MAX, "overflow must clamp to MAX at ({a}, {b})"),
+        }
+    }
+
+    // `sub_self_is_zero`: cancellation, at the boundaries where it could fail.
+    for x in [0u32, 1, 1000, 1 << 31, u32::MAX] {
+        assert_eq!(safe_sub(x, x), Some(0), "x - x must be 0 at {x}");
+        assert_eq!(checked_sub(x, x), Some(0));
+    }
+
+    // `scale_identity` / `fixed_roundtrip`: the Q16.16 round-trip is lossless over
+    // the integer range the type holds, and it saturates outside that range.
+    for k in [0i32, 1, -1, 32767, -32768] {
+        assert_eq!(
+            Fixed::from_int(k).to_int(),
+            k,
+            "the round-trip must be lossless at {k}"
+        );
+    }
+    assert_eq!(Fixed::from_int(32768), Fixed::MAX, "from_int saturates at the top");
+    assert_eq!(Fixed::from_int(-32769), Fixed::MIN, "and at the bottom");
+
+    // `mul_div`: the widening is load-bearing. `100_000 * 100_000` wraps a `u32`
+    // but not the `u64` intermediate, so the naive product reports the wrong
+    // quotient. This is the property `mul_div`'s doc points at.
+    assert_eq!(mul_div(100_000, 100_000, 1000), Some(10_000_000));
+    assert_eq!(mul_div(1000, 1000, 8), Some(125_000));
+    assert_eq!(mul_div(1, 1, 0), None, "a zero divisor is the only failure mode");
+    let naive = 100_000u32.wrapping_mul(100_000) / 1000;
+    assert_ne!(
+        mul_div(100_000, 100_000, 1000),
+        Some(naive),
+        "the widening must change the answer, or it is not load-bearing"
+    );
+}

@@ -13,6 +13,19 @@
 //! therefore stated at widths the enumeration can *finish*, and the parent's
 //! symbolic engine proves the same statements at the wider ones.
 //!
+//! # The obligations and the runtime primitives sit at different widths
+//!
+//! The runtime operations ([`crate::checked_add`], [`crate::safe_add`], …) are
+//! `u32`-typed, and these obligations are stated at 8 or 16 bits because that is
+//! the largest domain enumeration can exhaust. That gap is deliberate and is not
+//! hidden: an obligation at 8 bits *cannot* call a `u32` primitive and observe an
+//! 8-bit overflow through it, because `u32` addition of two 8-bit values never
+//! overflows. So the obligations model the arithmetic rather than calling it, and
+//! a separate test (`runtime_ops_match_their_proved_statements`) ties each
+//! primitive to the property at the `u32` boundary points where the property is
+//! observable. A regression in a primitive has to survive that test as well as
+//! the verdicts, which is the point of stating it.
+//!
 //! # Why this is a proof and not a test
 //!
 //! A test that samples inputs shows the property holds for the inputs it tried.
@@ -80,8 +93,13 @@ impl Witness {
 /// Walk every pair of `w`-bit values, when `2^(2w)` fits the budget. This is the
 /// general entry point for the two-variable obligations at a caller-chosen
 /// width.
+///
+/// `w == 0` is refused rather than enumerated: a zero-bit integer is not a word
+/// width, and `1u64 << 0` is `1`, so the loop below would visit the fabricated
+/// point `(0, 0)` and answer `Valid` for a proposition about a type that does not
+/// exist. `Unknown` is the honest answer for a domain that is not a domain.
 fn forall_pair(w: u8, p: impl Fn(u64, u64) -> bool) -> Verdict {
-    if w > 16 {
+    if w == 0 || w > 16 {
         return Verdict::Unknown;
     }
     let domain = 1u64 << w;
@@ -102,9 +120,53 @@ fn forall_pair(w: u8, p: impl Fn(u64, u64) -> bool) -> Verdict {
     Verdict::Valid
 }
 
+/// Walk every pair of `w`-bit values *that satisfy a bound precondition*: the
+/// rectangle `[0, bound] x [0, bound]`, when that fits the budget.
+///
+/// This exists because the guarded form of an obligation — quantify over the
+/// whole `2^(2w)` domain and write `!pre || goal` — makes the points outside the
+/// rectangle trivially true, so visiting them is pure cost. At width 16 with
+/// `bound = 2^14 - 1` that is 4 294 967 296 iterations to check 268 435 456
+/// points, and it was the single slowest thing in the test gate.
+///
+/// Skipping them is sound only if the rectangle is *exactly* the set where `pre`
+/// holds. That is not self-evident, so it is not assumed: the obligation keeps
+/// its `!pre ||` guard (the statement is unchanged), and
+/// [`restricted_enumeration_agrees`] checks the equivalence between this and the
+/// full-domain enumeration directly.
+fn forall_pair_bounded(w: u8, bound: u64, p: impl Fn(u64, u64) -> bool) -> Verdict {
+    if w == 0 || w > 16 {
+        return Verdict::Unknown;
+    }
+    // A bound at or past the domain would silently enumerate the whole thing, or
+    // worse, claim to restrict a domain it does not. Refuse instead.
+    if bound >= (1u64 << w) {
+        return Verdict::Unknown;
+    }
+    let side = bound + 1;
+    if side.checked_mul(side).map_or(true, |c| c > ENUM_BUDGET) {
+        return Verdict::Unknown;
+    }
+    let mut a = 0u64;
+    while a <= bound {
+        let mut b = 0u64;
+        while b <= bound {
+            if !p(a, b) {
+                return Verdict::Counterexample(Witness::two(a, b));
+            }
+            b += 1;
+        }
+        a += 1;
+    }
+    Verdict::Valid
+}
+
 /// Walk every `w`-bit value. Returns [`Verdict::Unknown`] past `2^ENUM_BUDGET`.
+///
+/// `w == 0` is refused for the same reason as in [`forall_pair`]: the fabricated
+/// point `0` is not an element of a zero-bit domain.
 fn forall_one(w: u8, p: impl Fn(u64) -> bool) -> Verdict {
-    if w > 32 {
+    if w == 0 || w > 32 {
         return Verdict::Unknown;
     }
     let domain = 1u64 << w;
@@ -119,6 +181,40 @@ fn forall_one(w: u8, p: impl Fn(u64) -> bool) -> Verdict {
         x += 1;
     }
     Verdict::Valid
+}
+
+/// Check that [`forall_pair_bounded`] and the full-domain guarded enumeration
+/// agree, so the restricted enumeration is a *sound* shortcut rather than a
+/// different question.
+///
+/// `pre_bound` is the bound the precondition tests and `rect_bound` is the bound
+/// the rectangle enumerates. The obligation is `Valid` exactly when the two
+/// strategies return the same verdict, including the same witness. The goal used
+/// here is refuted *inside* the rectangle, so agreement is not the vacuous
+/// agreement of two `Valid`s, and passing `rect_bound != pre_bound` breaks it —
+/// which is what the teeth test does.
+pub fn restricted_enumeration_agrees(w: u8, pre_bound: u64, rect_bound: u64) -> Verdict {
+    if w == 0 || w > 16 {
+        return Verdict::Unknown;
+    }
+    let mask = (1u64 << w) - 1;
+    // Refuted for small `a`: `3a + b` exceeds `pre_bound` well before the domain
+    // does, so the guarded enumeration finds a counterexample inside the
+    // rectangle and the two strategies must name the same one.
+    let goal = |a: u64, b: u64| (a.wrapping_mul(3).wrapping_add(b)) & mask <= pre_bound;
+    let guarded = forall_pair(w, |a, b| {
+        let pre = a <= pre_bound && b <= pre_bound;
+        !pre || goal(a, b)
+    });
+    let restricted = forall_pair_bounded(w, rect_bound, goal);
+    if guarded == restricted {
+        Verdict::Valid
+    } else {
+        // The disagreement is the finding; a witness of `0` is a marker, not a
+        // claim about an input, because the witness that matters is the verdict
+        // pair itself and that is printed by the caller's assertion.
+        Verdict::Counterexample(Witness::two(0, 0))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -226,11 +322,14 @@ pub fn product_of_bounded_fits() -> Verdict {
 /// `2^15 - 1`, and at the inclusive bound `2^14` the sum `2^14 + 2^14` is exactly
 /// `2^15`, which sets the sign bit and reads as `-32768`.
 ///
-/// Enumerated over all `2^32` pairs of 16-bit values — the one obligation here
-/// that runs at the full budget.
+/// Enumerated over the `2^28` pairs that satisfy the precondition, not the
+/// `2^32` pairs of the whole 16-bit domain. The statement is unchanged — it still
+/// carries the `!pre ||` guard — but [`forall_pair_bounded`] visits only the
+/// points where the guard can matter. The shortcut is checked by
+/// [`restricted_enumeration_agrees`] rather than trusted.
 pub fn fixed_add_no_overflow() -> Verdict {
     let bound = (1u64 << 14) - 1;
-    forall_pair(16, |a, b| {
+    forall_pair_bounded(16, bound, |a, b| {
         let pre = a <= bound && b <= bound;
         let sum = (a + b) & 0xFFFF;
         !pre || sum < (1u64 << 15)
