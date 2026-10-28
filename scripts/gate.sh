@@ -86,14 +86,15 @@ echo "== 9/11 rustc_public MIR oracle (skipped if no nightly/rustc-dev) =="
 # break the parser and nothing else would notice. This gate asks `rustc_public`
 # for the same programs' typed MIR and compares the per-function shape -- block
 # count and panic inventory -- so a printer change is caught. It needs a nightly
-# with `rustc-dev`; `run.sh` exits 2 when that is absent, which is reported and
-# skipped here rather than failed, exactly like Kani and Verus.
+# with `rustc-dev` *and* `llvm-tools-preview`; `run.sh` exits 2 when those are
+# absent, which is reported and skipped here rather than failed, exactly like
+# Kani and Verus.
 if sh tools/mir-oracle/run.sh; then
   :
 else
   code=$?
   if [ "$code" -eq 2 ]; then
-    echo "   (no nightly with rustc-dev; skipped -- 'rustup component add rustc-dev --toolchain nightly')"
+    echo "   (no nightly with rustc-dev/llvm-tools-preview; skipped -- 'rustup component add rustc-dev llvm-tools-preview --toolchain nightly')"
   else
     fail "rustc_public MIR oracle"
   fi

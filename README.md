@@ -1595,7 +1595,7 @@ installed: an oracle that did not run is not evidence about the exporter. Five f
 run the Kani, Verus, Lean and Coq differential oracles and the `rustc_public` MIR oracle when those
 tools are present and *skip them loudly* when they are not, because all three are large
 downloads (Kani: a pinned nightly plus CBMC; Verus: a self-contained bundle with its own z3;
-the MIR oracle: a nightly with the `rustc-dev` component) that a normal local run should not
+the MIR oracle: a nightly with the `rustc-dev` and `llvm-tools-preview` components) that a normal local run should not
 pay for; CI installs them and runs them as hard gates.
 
 ### The third oracle: rustc's own MIR, against the parser
@@ -1604,8 +1604,8 @@ pay for; CI installs them and runs them as hard gates.
 has a third failure mode, and it is the one gap 2 below names: it reads rustc's *textual*
 `--emit=mir` dump, so a rustc release that changes the pretty-printer can break the parser,
 and the parser is the only thing that would notice. `tools/mir-oracle` closes that loop. It
-asks `rustc_public` — the compiler's own public API, which needs a nightly and the
-`rustc-dev` component — for the same programs' **typed** MIR, reduces each function to a
+asks `rustc_public` — the compiler's own public API, which needs a nightly with the
+`rustc-dev` and `llvm-tools-preview` components — for the same programs' **typed** MIR, reduces each function to a
 small comparable shape (how many basic blocks it lowered to, and which panic guards `rustc`
 inserted, in block order), and fails if that disagrees with what the frontend's parser read
 out of the text. The comparison is structural on purpose: the two dumps are not

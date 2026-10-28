@@ -7,7 +7,8 @@
 #
 #   0  every function shape agreed
 #   1  a shape disagreed -- the text parser and rustc's typed MIR are out of step
-#   2  the oracle could not run (no nightly, no rustc-dev) -- *not* evidence
+#   2  the oracle could not run (no nightly, or a missing rustc-dev /
+#      llvm-tools-preview component) -- *not* evidence
 #
 # Exit 2 is deliberately distinct: a missing toolchain must never be reported as
 # a parser failure, nor as a pass.
@@ -28,7 +29,14 @@ if [ -z "$RUSTC_BIN" ]; then
   exit 2
 fi
 
-if ! "$RUSTC_BIN" -vV 2>/dev/null | grep -q nightly; then
+if ! version="$("$RUSTC_BIN" -vV 2>&1)"; then
+  echo "mir-oracle: cannot run $RUSTC_BIN: $version" >&2
+  echo "            this is usually the missing 'llvm-tools-preview' component, which ships" >&2
+  echo "            the libLLVM rustc needs to start: rustup component add llvm-tools-preview --toolchain nightly" >&2
+  exit 2
+fi
+
+if ! printf '%s' "$version" | grep -q nightly; then
   echo "mir-oracle: $RUSTC_BIN is not a nightly; rustc_private needs one" >&2
   exit 2
 fi
@@ -36,9 +44,15 @@ fi
 # `RUSTC` here is what cargo *builds with*; `DISCHARGE_RUSTC` is what the frontend
 # *runs*. Both must be the nightly, and they are, because `rustc-dev` is a
 # property of the toolchain.
+#
+# `llvm-tools-preview` must be installed as well: it ships the `libLLVM` that
+# `rustc` needs to start, and without it the oracle's `build.rs` cannot read the
+# sysroot and the link fails with `unable to find library -lLLVM-...`. That reads
+# like a broken toolchain, so name the component here instead.
 cd tools/mir-oracle
 RUSTC="$RUSTC_BIN" cargo build -q 2>&1 || {
-  echo "mir-oracle: build failed (is the 'rustc-dev' component installed?)" >&2
+  echo "mir-oracle: build failed. This needs the 'rustc-dev' *and* 'llvm-tools-preview'" >&2
+  echo "            components on the nightly: rustup component add rustc-dev llvm-tools-preview --toolchain nightly" >&2
   exit 2
 }
 cd ../..
