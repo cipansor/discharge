@@ -2332,6 +2332,21 @@ mistake: reducing a function to a summary that is not injective, then comparing 
   getting it backwards makes 21 actuator and 6 realistic functions disagree, which is how it
   was checked. A useful side effect: the real asymmetry shows up, that `Bounds` is `True` while
   every arithmetic guard is `Negated`.
+* **A coverage check that compared first counterexamples.** `fixed_add_no_overflow`
+  skips the points its precondition rejects, which is only sound if the rectangle it
+  walks is *exactly* the precondition's set. The first version of the check ran both
+  walks on one goal and compared their verdicts — but a walk stops at its **first**
+  counterexample, and two different rectangles can share one. At width 8, bounds 200
+  and 199 both fail first at `(1, 198)`, so the check passed while the 199 rectangle
+  omitted every pair containing 200 that the precondition admits. Coverage is a
+  property of the *domains*, so it has to be checked on the domains, with no goal in
+  sight. The replacement compares the two bounds directly and is O(1): for a square
+  precondition (`a <= k && b <= k`) the two sets are equal exactly when the bounds
+  are equal, since neither can be a proper subset of the other. The general lesson is
+  the same one the shape gaps taught: a check whose verdict depends on the thing it
+  is checking is not a check. A brute-force sweep of the domain was written first,
+  agreed with the O(1) version everywhere, and was thrown away — it cost 11 s and
+  added no evidence.
 * **Bare names were treated as unique keys.** `impl A { fn check }` and `impl B { fn check }`
   in one file both reduce to `check`, and both sides used a single-slot map, so the first was
   silently replaced by the second. Dropping it from the text parser produced *zero*

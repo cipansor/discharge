@@ -132,8 +132,8 @@ fn forall_pair(w: u8, p: impl Fn(u64, u64) -> bool) -> Verdict {
 /// Skipping them is sound only if the rectangle is *exactly* the set where `pre`
 /// holds. That is not self-evident, so it is not assumed: the obligation keeps
 /// its `!pre ||` guard (the statement is unchanged), and
-/// [`restricted_enumeration_agrees`] checks the equivalence between this and the
-/// full-domain enumeration directly.
+/// [`restricted_domain_matches`] checks that the two predicates select the same
+/// points, over the whole domain, before the shortcut is used.
 fn forall_pair_bounded(w: u8, bound: u64, p: impl Fn(u64, u64) -> bool) -> Verdict {
     if w == 0 || w > 16 {
         return Verdict::Unknown;
@@ -183,37 +183,111 @@ fn forall_one(w: u8, p: impl Fn(u64) -> bool) -> Verdict {
     Verdict::Valid
 }
 
-/// Check that [`forall_pair_bounded`] and the full-domain guarded enumeration
-/// agree, so the restricted enumeration is a *sound* shortcut rather than a
-/// different question.
+/// Check that the rectangle [`forall_pair_bounded`] walks is *exactly* the set the
+/// precondition selects, so the restricted enumeration is the same question and
+/// not a smaller one.
 ///
-/// `pre_bound` is the bound the precondition tests and `rect_bound` is the bound
-/// the rectangle enumerates. The obligation is `Valid` exactly when the two
-/// strategies return the same verdict, including the same witness. The goal used
-/// here is refuted *inside* the rectangle, so agreement is not the vacuous
-/// agreement of two `Valid`s, and passing `rect_bound != pre_bound` breaks it —
-/// which is what the teeth test does.
-pub fn restricted_enumeration_agrees(w: u8, pre_bound: u64, rect_bound: u64) -> Verdict {
+/// This compares the two **domains** and never runs a goal, which is the whole
+/// point. The first version of this check got it wrong in a way worth recording:
+/// it ran both walks on one goal and compared their verdicts, but a walk stops at
+/// its *first* counterexample and two different rectangles can share one. At width
+/// 8, bounds 200 and 199 both fail first at `(1, 198)`, so the verdicts matched and
+/// the check passed — while the 199 rectangle silently omitted every pair
+/// containing 200 that the precondition admits. Coverage is a property of the
+/// domains, so it has to be checked on the domains.
+///
+/// The check is **exact, not sampled**, and that is possible because the
+/// precondition is a square: `pre` holds at `(a, b)` iff `a <= pre_bound` *and*
+/// `b <= pre_bound`, and the walk visits `(a, b)` iff `a <= rect_bound` *and*
+/// `b <= rect_bound`. Two such sets are equal exactly when the bounds are equal —
+/// neither can be a proper subset of the other while both are squares of that
+/// shape — so comparing the bounds decides the question completely. A brute-force
+/// sweep of the domain would reach the same verdict for every input, at `2^32`
+/// cost; it was tried, it agreed, and it made the gate slower for no more evidence.
+///
+/// If the precondition ever stops being a square, this function stops being exact
+/// and must be replaced — that is the assumption to re-check, not the bounds.
+///
+/// Returns [`Verdict::Counterexample`] naming a pair in exactly one of the sets,
+/// or [`Verdict::Unknown`] if the width or a bound makes the question ill-formed.
+pub fn restricted_domain_matches(w: u8, pre_bound: u64, rect_bound: u64) -> Verdict {
     if w == 0 || w > 16 {
         return Verdict::Unknown;
     }
-    let mask = (1u64 << w) - 1;
-    // Refuted for small `a`: `3a + b` exceeds `pre_bound` well before the domain
-    // does, so the guarded enumeration finds a counterexample inside the
-    // rectangle and the two strategies must name the same one.
-    let goal = |a: u64, b: u64| (a.wrapping_mul(3).wrapping_add(b)) & mask <= pre_bound;
-    let guarded = forall_pair(w, |a, b| {
-        let pre = a <= pre_bound && b <= pre_bound;
-        !pre || goal(a, b)
-    });
-    let restricted = forall_pair_bounded(w, rect_bound, goal);
-    if guarded == restricted {
-        Verdict::Valid
+    let domain = 1u64 << w;
+    // A bound at or past the domain is not a restriction of it, and the walk
+    // refuses such a bound, so the question is ill-formed rather than answered.
+    if pre_bound >= domain || rect_bound >= domain {
+        return Verdict::Unknown;
+    }
+    if pre_bound == rect_bound {
+        return Verdict::Valid;
+    }
+    // Name a point in exactly one of the sets: the first value of `b` above the
+    // smaller bound is admitted by the larger one and not the smaller one. Both
+    // bounds are below the domain here, so the point is a real input.
+    let witness = if pre_bound > rect_bound {
+        (0, rect_bound + 1)
     } else {
-        // The disagreement is the finding; a witness of `0` is a marker, not a
-        // claim about an input, because the witness that matters is the verdict
-        // pair itself and that is printed by the caller's assertion.
-        Verdict::Counterexample(Witness::two(0, 0))
+        (0, pre_bound + 1)
+    };
+    Verdict::Counterexample(Witness::two(witness.0, witness.1))
+}
+
+/// Check that [`forall_pair_bounded`] visits *exactly* its rectangle, edges
+/// included — the implementation half of the soundness argument, which
+/// [`restricted_domain_matches`] does not cover (that one is about the bounds, this
+/// one is about the walk).
+///
+/// Two tripwires, both independent of any real obligation:
+///
+/// * a goal false at one chosen point must produce *that* witness, for every corner
+///   and edge midpoint, so an off-by-one on any side is caught;
+/// * a goal false everywhere *outside* the rectangle must come back `Valid`, since
+///   a walk that strayed outside would find a counterexample there.
+pub fn bounded_walk_covers_its_rectangle(w: u8, bound: u64) -> Verdict {
+    if w == 0 || w > 16 {
+        return Verdict::Unknown;
+    }
+    if bound >= (1u64 << w) {
+        return Verdict::Unknown;
+    }
+    let mid = bound / 2;
+    let must_visit = [
+        (0, 0),
+        (bound, 0),
+        (0, bound),
+        (bound, bound),
+        (mid, 0),
+        (mid, bound),
+        (0, mid),
+        (bound, mid),
+    ];
+    // Each tripwire re-walks the rectangle, so this check costs a constant factor
+    // more than the walk it inspects; the budget applies to the total, and the
+    // factor is read off `must_visit` so it cannot drift from the loop below.
+    let side = bound + 1;
+    let walks = must_visit.len() as u64 + 1;
+    if side
+        .checked_mul(side)
+        .and_then(|c| c.checked_mul(walks))
+        .map_or(true, |c| c > ENUM_BUDGET)
+    {
+        return Verdict::Unknown;
+    }
+    for (pa, pb) in must_visit {
+        // False only at `(pa, pb)`, so the walk must return exactly that witness.
+        let tripwire = forall_pair_bounded(w, bound, |a, b| !(a == pa && b == pb));
+        match tripwire {
+            Verdict::Counterexample(wi) if wi.a == pa && wi.b == pb => {}
+            _ => return Verdict::Counterexample(Witness::two(pa, pb)),
+        }
+    }
+    // True exactly on the rectangle, so `Valid` means the walk never left it.
+    let inside = |a: u64, b: u64| a <= bound && b <= bound;
+    match forall_pair_bounded(w, bound, inside) {
+        Verdict::Valid => Verdict::Valid,
+        _ => Verdict::Counterexample(Witness::two(bound, bound)),
     }
 }
 
@@ -314,21 +388,27 @@ pub fn product_of_bounded_fits() -> Verdict {
     })
 }
 
-/// Adding two non-negative Q16.16 values cannot overflow a signed 16-bit sum
-/// when each is bounded by `2^14 - 1`. This is the guard a controller uses
-/// before summing terms.
+/// The bound [`fixed_add_no_overflow`]'s precondition and rectangle both use.
 ///
-/// The bound is `2^14 - 1`, not `2^14`: a signed 16-bit value tops out at
-/// `2^15 - 1`, and at the inclusive bound `2^14` the sum `2^14 + 2^14` is exactly
-/// `2^15`, which sets the sign bit and reads as `-32768`.
+/// `pub` so the test that checks the rectangle *is* the precondition's set can
+/// check this value rather than a copy of it that could drift.
+///
+/// It is `2^14 - 1`, not `2^14`: a signed 16-bit value tops out at `2^15 - 1`, and
+/// at the inclusive bound `2^14` the sum `2^14 + 2^14` is exactly `2^15`, which
+/// sets the sign bit and reads as `-32768`.
+pub const FIXED_ADD_BOUND: u64 = (1u64 << 14) - 1;
+
+/// Adding two non-negative Q16.16 values cannot overflow a signed 16-bit sum
+/// when each is bounded by [`FIXED_ADD_BOUND`]. This is the guard a controller
+/// uses before summing terms.
 ///
 /// Enumerated over the `2^28` pairs that satisfy the precondition, not the
 /// `2^32` pairs of the whole 16-bit domain. The statement is unchanged — it still
 /// carries the `!pre ||` guard — but [`forall_pair_bounded`] visits only the
 /// points where the guard can matter. The shortcut is checked by
-/// [`restricted_enumeration_agrees`] rather than trusted.
+/// [`restricted_domain_matches`] rather than trusted.
 pub fn fixed_add_no_overflow() -> Verdict {
-    let bound = (1u64 << 14) - 1;
+    let bound = FIXED_ADD_BOUND;
     forall_pair_bounded(16, bound, |a, b| {
         let pre = a <= bound && b <= bound;
         let sum = (a + b) & 0xFFFF;

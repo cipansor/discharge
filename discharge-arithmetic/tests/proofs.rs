@@ -366,7 +366,8 @@ fn a_zero_width_domain_is_unknown_not_valid() {
     assert_eq!(prove::sub_self_is_zero(0), Verdict::Unknown);
     assert_eq!(prove::accumulator_no_overflow(0, 0), Verdict::Unknown);
     assert_eq!(prove::saturating_add_monotone(0, 1), Verdict::Unknown);
-    assert_eq!(prove::restricted_enumeration_agrees(0, 1, 1), Verdict::Unknown);
+    assert_eq!(prove::restricted_domain_matches(0, 1, 1), Verdict::Unknown);
+    assert_eq!(prove::bounded_walk_covers_its_rectangle(0, 1), Verdict::Unknown);
     // The one-bit domain is real, so the same guard must not swallow it.
     assert!(prove::safe_add_is_exact(1).is_proved(), "a 1-bit domain is a domain");
 }
@@ -375,29 +376,73 @@ fn a_zero_width_domain_is_unknown_not_valid() {
 // The restricted enumeration is the same question, checked and not assumed
 // ---------------------------------------------------------------------------
 
-/// `fixed_add_no_overflow` enumerates the `2^28` in-range pairs rather than the
-/// `2^32` pairs of the whole 16-bit domain, which is what made it the slowest test
-/// in the gate. Skipping the out-of-range points is only sound if the rectangle is
-/// *exactly* the precondition's set, so that equivalence is checked here rather
-/// than assumed. The goal is refuted inside the rectangle, so this is not two
-/// `Valid`s agreeing vacuously.
+/// `fixed_add_no_overflow` enumerates the precondition's rectangle rather than the
+/// whole 16-bit domain, which is what made it the slowest test in the gate. That is
+/// only sound if the rectangle is *exactly* the set the precondition selects, and
+/// this checks it on the **domains** rather than by running a goal.
 #[test]
-fn the_restricted_enumeration_asks_the_same_question() {
-    assert!(prove::restricted_enumeration_agrees(8, 200, 200).is_proved());
-    assert!(prove::restricted_enumeration_agrees(6, 50, 50).is_proved());
+fn the_restricted_domain_matches_the_precondition() {
+    assert!(prove::restricted_domain_matches(8, 200, 200).is_proved());
+    assert!(prove::restricted_domain_matches(6, 50, 50).is_proved());
+    // The bound `fixed_add_no_overflow` actually uses, read from the obligation
+    // rather than copied, so the check cannot pass against a stale number.
+    assert!(
+        prove::restricted_domain_matches(16, prove::FIXED_ADD_BOUND, prove::FIXED_ADD_BOUND)
+            .is_proved(),
+        "the obligation's own rectangle must be the precondition's set"
+    );
 }
 
-/// Teeth: enumerate a *different* rectangle and the agreement must break. This is
-/// what makes the check above evidence rather than decoration — if
-/// `forall_pair_bounded` ignored its bound and walked the whole domain, the wrong
-/// rectangle would agree too.
+/// The regression the first version of this check missed. It compared the two
+/// walks' *verdicts*, and both stop at their first counterexample — so bounds 200
+/// and 199, which fail first at the same `(1, 198)`, looked like the same question
+/// even though 199 omits every pair containing 200 that the precondition admits.
+/// Comparing the domains catches it in both directions.
 #[test]
-fn a_wrong_rectangle_is_caught() {
+fn a_rectangle_that_omits_admitted_inputs_is_caught() {
+    // 199 omits inputs the precondition (<= 200) admits: 200 itself. The scan runs
+    // `a` outer, `b` inner, so the first pair the two classify differently is
+    // `(0, 200)` — in the precondition, outside the rectangle.
     assert_eq!(
-        prove::restricted_enumeration_agrees(8, 200, 60),
-        Verdict::Counterexample(Witness { a: 0, b: 0, len: 2 }),
-        "a rectangle narrower than the precondition must not agree with the guarded walk"
+        prove::restricted_domain_matches(8, 200, 199),
+        Verdict::Counterexample(Witness { a: 0, b: 200, len: 2 }),
+        "a rectangle narrower than the precondition must be reported"
     );
+    // And the other direction: a rectangle that admits inputs the precondition
+    // excludes is equally wrong, because the walk would check points the
+    // obligation's guard never intends to cover.
+    assert_eq!(
+        prove::restricted_domain_matches(8, 199, 200),
+        Verdict::Counterexample(Witness { a: 0, b: 200, len: 2 }),
+        "a rectangle wider than the precondition must be reported too"
+    );
+}
+
+/// A bound at or past the domain is not a restriction of it, and the walk refuses
+/// such a bound; the domain check must refuse it too rather than compare nonsense.
+#[test]
+fn a_bound_past_the_domain_is_refused() {
+    assert_eq!(prove::restricted_domain_matches(8, 256, 256), Verdict::Unknown);
+    assert_eq!(prove::restricted_domain_matches(8, 255, 300), Verdict::Unknown);
+    // 255 is the last real 8-bit value, so this one is well-formed.
+    assert!(prove::restricted_domain_matches(8, 255, 255).is_proved());
+}
+
+/// The walk half of the argument: `forall_pair_bounded` must visit its rectangle
+/// exactly, corners and edges included, and must not stray outside it. This is
+/// checked with tripwire goals that do not depend on any real obligation, so it
+/// stays a statement about the enumerator.
+#[test]
+fn the_bounded_walk_covers_its_rectangle() {
+    for bound in [0u64, 1, 2, 3, 7, 50, 199, 200, 255] {
+        assert!(
+            prove::bounded_walk_covers_its_rectangle(8, bound).is_proved(),
+            "the walk must cover exactly [0, {}]^2, edges included",
+            bound
+        );
+    }
+    // A narrower width exercises the same code with a different domain size.
+    assert!(prove::bounded_walk_covers_its_rectangle(4, 9).is_proved());
 }
 
 // ---------------------------------------------------------------------------
