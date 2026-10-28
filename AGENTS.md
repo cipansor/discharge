@@ -1902,3 +1902,34 @@ because they are easy to reintroduce.
 
 The through-line with the polarity bug: a value that can mean two opposite things, rendered
 or tested without its direction, will eventually be read the wrong way.
+
+## A guard can be load-bearing and still invisible to a verdict
+
+The second oracle of the same shape as "a harness covers only what it reaches", and the
+sharper one, because the code *is* reached. `Solver::reduce_db` runs at every 2000
+conflicts, and a 64-bit adder equivalence crosses that interval 15 times, so nothing here is
+dead code. Yet deleting the loop that marks every clause currently justifying a trail
+literal as `keep` left the entire suite green -- `cargo test`, `tests/sat_engine.rs`,
+`tests/differential.rs`, the z3 corpus, and the Kani oracle.
+
+The reason a verdict-level test cannot see it is the point. Dropping a reason does not
+usually change the answer: `compact` remaps `reason[v]` to `NO_CLAUSE`, the literal becomes
+indistinguishable from a decision, and `analyze` stops early and learns a *weaker* clause.
+The solver still finds the right verdict, just more slowly. Instrumenting the guard showed
+it rescuing 650 clause-reasons across those 15 calls, and with the guard removed 426 trail
+assignments lost their justification while the verdict stayed `Unsat`. Correct verdict,
+corrupt proof state.
+
+So the oracle has to assert the invariant, not the outcome: each decision level holds
+exactly one reason-free literal, at the front. That check fails on the mutant at level 4,
+which is the only evidence the teeth are real. And it drives `reduce_db` on a hand-built
+trail rather than searching for a hard instance, because a test that needs a 2000-conflict
+search is a test that runs in minutes and whose teeth depend on the search happening to
+reach the guard. Build the state the guard protects, then remove the guard and watch the
+assertion fire.
+
+Two mechanical notes worth keeping. A `Solver` is 2.2 MB, so a fixture that owns one
+overflows the 2 MB test-thread stack -- use the shared static, and take the lock's
+`MutexGuard`. And with every clause at the same activity, `reduce_db`'s stable sort keeps
+the low ids, so the guard looks unnecessary by accident; set the activities explicitly so
+the removable clauses really are the ones that get removed.

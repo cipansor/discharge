@@ -1250,3 +1250,161 @@ pub fn query(f: impl FnOnce(&mut Cnf) -> Lit) -> (Sat, Model) {
     }
 }
 
+#[cfg(all(test, feature = "std"))]
+mod reduce_db_tests {
+    //! The oracle for [`Solver::reduce_db`]'s soundness guard.
+    //!
+    //! The rest of the crate reaches `reduce_db` only through a search hard enough to
+    //! cross the 2000-conflict reduction interval. `tests/sat_engine.rs` uses 1..=6
+    //! variable CNFs, which decide in a handful of conflicts, and the BDD-backed tests
+    //! never touch this file at all. So the only checks on the reduction path were
+    //! incidental: deleting the guard entirely left every test green.
+    //!
+    //! The guard is the loop that marks every clause currently justifying a trail
+    //! assignment as `keep`. Without it `compact` removes a clause that a trail entry
+    //! points at, `reason[v]` remaps to `NO_CLAUSE`, and a propagated literal becomes
+    //! indistinguishable from a decision. The verdict usually stays correct, which is
+    //! exactly why a verdict-level test cannot see the damage: `analyze` then stops at a
+    //! reason-less literal and learns a weaker clause than it should.
+    //!
+    //! So the oracle asserts the *invariant* the guard exists to preserve -- each decision
+    //! level holds exactly one reason-free literal, at the front -- and drives
+    //! `reduce_db` directly so it does not depend on a search reaching it.
+
+    use super::*;
+
+    /// Each decision level must hold exactly one reason-free literal (its decision), and
+    /// that literal must be the first entry of the level.
+    ///
+    /// Returns the first level that breaks the rule, with how many reason-free literals it
+    /// held, or `None` when the trail is well formed.
+    fn first_bad_level(s: &Solver) -> Option<(usize, usize)> {
+        for lvl in 1..=s.n_levels {
+            let lo = s.trail_lim[lvl] as usize;
+            let hi = if lvl < s.n_levels {
+                s.trail_lim[lvl + 1] as usize
+            } else {
+                s.trail_n
+            };
+            let mut reasonless = 0usize;
+            let mut first_is_reasonless = false;
+            for t in lo..hi {
+                let v = Lit(s.trail[t]).var().0 as usize;
+                if s.reason[v] == NO_CLAUSE {
+                    reasonless += 1;
+                    if t == lo {
+                        first_is_reasonless = true;
+                    }
+                }
+            }
+            if reasonless != 1 || !first_is_reasonless {
+                return Some((lvl, reasonless));
+            }
+        }
+        None
+    }
+
+    /// Fill the shared solver with two learnt clauses on the trail as reasons, plus enough
+    /// removable learnt clauses that `reduce_db` passes its `m < 4` early return and
+    /// actually compacts.
+    ///
+    /// The state is built by hand rather than searched for, so the test is fast and its
+    /// teeth do not depend on a particular seed or conflict count. The solver comes from
+    /// the shared static: a `Solver` is 2.2 MB, which overflows the test thread's stack.
+    fn solver_with_learnt_reasons() -> std::sync::MutexGuard<'static, Solver> {
+        let mut s = SOLVER.lock().unwrap_or_else(|p| p.into_inner());
+        s.reset();
+        s.n_vars = 8;
+
+        // Original clause 0: (x0 | x1). Never removed (not learnt).
+        let _ = s.add_clause(&[Lit::pos(Var(0)).0, Lit::pos(Var(1)).0], false);
+        // Six learnt clauses that nothing points at, with *high* activity so `reduce_db`'s
+        // "keep the more active half" rule keeps them and drops the two reasons below.
+        // Activity is set explicitly rather than left to chance: with every clause at the
+        // same activity the sort is stable by id, the low ids survive, and the guard would
+        // look unnecessary.
+        for v in 0..6u32 {
+            let a = Lit::pos(Var(10 + v));
+            let b = Lit::pos(Var(11 + v));
+            let id = s.add_clause(&[a.0, b.0], true);
+            s.c_act[id as usize] = 100.0 + v as f32;
+        }
+        // Learnt clause: justifies x2. Low activity, so only the guard can save it.
+        let reason_x2 = s.add_clause(&[Lit::pos(Var(2)).0, Lit::pos(Var(3)).0], true);
+        s.c_act[reason_x2 as usize] = 1.0;
+        // Learnt clause: justifies x4. Low activity likewise.
+        let reason_x4 = s.add_clause(&[Lit::pos(Var(4)).0, Lit::pos(Var(5)).0], true);
+        s.c_act[reason_x4 as usize] = 1.0;
+        s.build_occ();
+
+        // Two decision levels, laid out the way `solve` lays them out: `trail_lim[lvl]` is
+        // the index of the first trail entry at `lvl`, and the decision is that entry.
+        // Level 1's decision is x6; level 2's decision is x7. x2 and x4 sit at level 2 as
+        // propagated literals, justified by the learnt clauses above.
+        s.n_levels = 1;
+        s.trail_lim[1] = 0;
+        s.enqueue(Lit::pos(Var(6)), NO_CLAUSE);
+        s.n_levels = 2;
+        s.trail_lim[2] = s.trail_n as u32;
+        s.enqueue(Lit::pos(Var(7)), NO_CLAUSE);
+        s.enqueue(Lit::pos(Var(2)), reason_x2);
+        s.enqueue(Lit::pos(Var(4)), reason_x4);
+        s.qhead = s.trail_n;
+
+        s
+    }
+
+    #[test]
+    fn a_hand_built_trail_is_well_formed_before_reduction() {
+        let s = solver_with_learnt_reasons();
+        assert_eq!(
+            first_bad_level(&s),
+            None,
+            "the fixture itself must satisfy the invariant, or the test proves nothing"
+        );
+    }
+
+    #[test]
+    fn reduce_db_keeps_every_clause_that_justifies_a_trail_literal() {
+        let mut s = solver_with_learnt_reasons();
+        assert_ne!(s.reason[2], NO_CLAUSE);
+        assert_ne!(s.reason[4], NO_CLAUSE);
+
+        s.reduce_db();
+
+        // Both reasons must still name a live clause. `compact` remaps ids, so compare
+        // against the remapped value: what must not happen is the reason becoming
+        // `NO_CLAUSE`, which is how a dropped clause shows up.
+        assert_ne!(
+            s.reason[2], NO_CLAUSE,
+            "reduce_db dropped the clause justifying x2"
+        );
+        assert_ne!(
+            s.reason[4], NO_CLAUSE,
+            "reduce_db dropped the clause justifying x4"
+        );
+        assert_eq!(
+            first_bad_level(&s),
+            None,
+            "reduce_db left a propagated literal looking like a decision"
+        );
+    }
+
+    #[test]
+    fn compact_remaps_the_reasons_it_keeps_to_the_new_ids() {
+        let mut s = solver_with_learnt_reasons();
+        s.reduce_db();
+        // A remapped reason must point at a clause that exists. A stale id (>= n_clauses)
+        // would read a neighbour's clause, and `analyze` would resolve against the wrong
+        // literals.
+        for v in [2usize, 4] {
+            let r = s.reason[v];
+            assert_ne!(r, NO_CLAUSE);
+            assert!(
+                (r as usize) < s.n_clauses,
+                "reason for x{v} is clause {r}, but only {} clauses survive",
+                s.n_clauses
+            );
+        }
+    }
+}
