@@ -158,7 +158,11 @@ pub fn count_evens(n: u8) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
-// Gap 3: `core` is not modelled, so a call makes the path unknown.
+// `core::num` intrinsics: modelled directly rather than through their bodies.
+//
+// These were the "a call to `core` makes the path unknown" gap. `checked_*`,
+// `saturating_*` and `wrapping_*` are now computed in the frontend from their
+// operands, so the paths below are decided without `core`'s MIR being available.
 // ---------------------------------------------------------------------------
 
 /// `checked_add` is the idiomatic way to write this, and it is a `core` call.

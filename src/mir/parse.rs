@@ -123,6 +123,15 @@ impl Ty {
 pub enum Proj {
     Field(u32),
     Index(u64),
+    /// An enum downcast, e.g. the `(_2 as Some)` in `((_2 as Some).0)`.
+    ///
+    /// The payload of a modelled `Option`-returning call lives here, under the
+    /// *variant index* (`Some` is 1). Keeping it separate from `Field` is what
+    /// stops a payload from colliding with a tuple field of the same enum local,
+    /// and it is what lets a read be gated on the discriminant: reading `.0` on a
+    /// path where the enum is `None` must not hand back a payload that does not
+    /// exist.
+    Downcast(u32),
 }
 
 /// A place: a local plus a projection path.
@@ -228,6 +237,10 @@ pub enum Rvalue {
     Ref(Place),
     /// `Len(place)` — array length.
     Len(Place),
+    /// `discriminant(place)` — the enum tag. Only modelled for the `Option`s
+    /// this frontend synthesises for `checked_*`, where the tag is `0` for
+    /// `None` and `1` for `Some`.
+    Discriminant(Place),
     /// Something this frontend does not model.
     Unknown(String),
 }
@@ -424,9 +437,34 @@ fn parse_local(s: &str) -> Option<LocalIdx> {
     rest.parse::<LocalIdx>().ok()
 }
 
+/// The discriminant rustc gives a variant of a two-variant enum.
+///
+/// `Option` is laid out as `None = 0, Some = 1` and `Result` as `Ok = 0,
+/// Err = 1`, in declaration order. Only those two shapes are modelled, so
+/// anything else returns `None` and the place stays unparsed -- which surfaces
+/// as an unmodelled read rather than a wrong tag.
+fn variant_index(name: &str) -> Option<u32> {
+    match name.rsplit("::").next().unwrap_or(name) {
+        "None" | "Ok" => Some(0),
+        "Some" | "Err" => Some(1),
+        _ => None,
+    }
+}
+
 /// Parse a place like `_3.1` or `_2` or `_1.0[0]`.
 fn parse_place(s: &str) -> Option<Place> {
     let s = strip_annot(s).trim();
+    // `(base as Variant)` — an enum downcast. It can appear as a whole place or
+    // as a prefix, so the inner place is parsed and the tail projection is
+    // appended to it.
+    if let Some(rest) = s.strip_prefix('(') {
+        let close = rest.find(')')?;
+        let inner = rest[..close].trim();
+        let (base, variant) = inner.rsplit_once(" as ")?;
+        let mut place = parse_place(base.trim())?;
+        place.proj.push(Proj::Downcast(variant_index(variant.trim())?));
+        return push_projs(place, rest.get(close + 1..)?);
+    }
     // A bare local.
     if let Some(idx) = parse_local(s) {
         return Some(Place::new(idx));
@@ -441,8 +479,11 @@ fn parse_place(s: &str) -> Option<Place> {
         i += 1;
     }
     let local = s[1..i].parse::<LocalIdx>().ok()?;
-    let mut place = Place::new(local);
-    let mut rest = &s[i..];
+    push_projs(Place::new(local), &s[i..])
+}
+
+/// Append a run of `.N`, `[N]` and `(base as Variant)` projections to a place.
+fn push_projs(mut place: Place, mut rest: &str) -> Option<Place> {
     while !rest.is_empty() {
         if let Some(r) = rest.strip_prefix('.') {
             let n: String = r.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -451,6 +492,15 @@ fn parse_place(s: &str) -> Option<Place> {
             }
             place.proj.push(Proj::Field(n.parse().ok()?));
             rest = &r[n.len()..];
+        } else if let Some(r) = rest.strip_prefix('(') {
+            // `(_2 as Some)`, and then `.0` continues the loop. rustc prints the
+            // downcast as a parenthesised step in the middle of a place, so it
+            // has to be consumed here rather than at the front of the string.
+            let close = r.find(')')?;
+            let inner = r[..close].trim();
+            let (_, variant) = inner.rsplit_once(" as ")?;
+            place.proj.push(Proj::Downcast(variant_index(variant.trim())?));
+            rest = r.get(close + 1..)?;
         } else {
             // `?` on `strip_prefix` is the same `None` the old `else { return
             // None }` produced, and it is what lets the index parse fail closed.
@@ -703,6 +753,20 @@ fn parse_rvalue(s: &str) -> Rvalue {
     let t = s.trim();
     // A call is handled by the caller (it is a terminator).
     //
+    // `copy`/`move` of a place is tried *before* the cast check, because a
+    // downcast place contains the word `as`: `copy ((_2 as Some).0: u8)` has an
+    // ` as ` inside its parentheses, and matching the cast first would read it as
+    // a cast of `copy ((_2` and throw the payload away. A real cast does not
+    // parse as a place -- `_1 as u32 (IntToInt)` fails at the ` as ` -- so the
+    // place attempt is the discriminator, and the cast check below is the
+    // fallback for exactly the strings that fail it.
+    if t.starts_with("copy ") || t.starts_with("move ") {
+        if let Some(rest) = t.split_once(' ').map(|(_, r)| r) {
+            if parse_place(rest).is_some() {
+                return Rvalue::Use(parse_operand(t));
+            }
+        }
+    }
     // The cast check has to come *before* the `const ` check, because rustc prints
     // a cast constant as `const 3_i32 as u32 (IntToInt)`. Matching `const ` first
     // hands the whole string to `parse_const`, which reads `i32 as u32 (IntToInt)`
@@ -728,6 +792,11 @@ fn parse_rvalue(s: &str) -> Rvalue {
     if let Some(rest) = t.strip_prefix("Len(") {
         if let Some(p) = parse_place(rest.trim_end_matches(')')) {
             return Rvalue::Len(p);
+        }
+    }
+    if let Some(rest) = t.strip_prefix("discriminant(") {
+        if let Some(p) = parse_place(rest.trim_end_matches(')')) {
+            return Rvalue::Discriminant(p);
         }
     }
     // An operator call: `Name(args)`.

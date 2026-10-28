@@ -3,10 +3,12 @@
 //! This is deliberately **not** a gate. `scripts/gate.sh` asserts verdicts on
 //! `examples/mir_targets/actuator.rs`, a regression corpus where every function
 //! is expected to be decided. This example measures the opposite: it runs the
-//! frontend over `examples/mir_targets/realistic.rs`, where most functions are
-//! *not* decided yet, and prints the tally. A roadmap that says "widen real-Rust
-//! support" is unfalsifiable; a number that moves from 2 to 12 is not. So the
-//! scoreboard is the roadmap's evidence, and it exits 0 whatever it finds.
+//! frontend over `examples/mir_targets/realistic.rs`, a corpus of ordinary Rust
+//! that is *not* curated to be decidable, and prints the tally. A roadmap that
+//! says "widen real-Rust support" is unfalsifiable; a number that moves from 2 to
+//! 12 is not. So the scoreboard is the roadmap's evidence, and it exits 0
+//! whatever it finds. The remainder it does not decide are the *next* gaps, and
+//! each one names itself in the `detail` column rather than being summarised.
 //!
 //! Run it with a nightly named, or it says so and stops:
 //!
@@ -16,10 +18,10 @@
 //! function             outcome      detail
 //! halve_guarded        verified     2 obl, 1 panic
 //! pick_from            skipped      unreadable `requires`: unknown name `c` ...
-//! sum_to               incomplete   loop unwound past 9 at bb2 of sum_to ...
-//! is_nonzero_after     incomplete   call to unmodelled function `...checked_add`
+//! sum_to               verified     5 obl, 2 panic
+//! is_nonzero_after     verified     3 obl, 0 panic
 //! ...
-//! decided 2 of 12
+//! decided 10 of 14
 //! ```
 //!
 //! An unrecognised argument is treated as a path, so a new corpus can be

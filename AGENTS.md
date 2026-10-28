@@ -2084,3 +2084,66 @@ change would not have, which is why they assert the *negative*.
 The general lesson: for a loop, an invariant is not a predicate to *check at the edges*,
 it is a predicate to *assume over the whole state space it describes*. Asserting it at the
 back edge is necessary and not sufficient; the header has to forget what it cannot know.
+
+## A call to `core` made the whole path unknown, and modelling it needed a tag that is a term
+
+The MIR frontend's biggest coverage gap was not a parser shape or a width wall: it was that
+any call into `core` was unmodelled, so `a.checked_add(b)` — the idiomatic way to write
+arithmetic that must not panic — made every obligation downstream of it `incomplete`. The
+corpus scoreboard said so in one line, `is_nonzero_after  incomplete  call to unmodelled
+function ...checked_add`, and that line is why the scoreboard exists.
+
+The fix is `src/mir/intrinsics.rs`: `checked_*`, `saturating_*` and `wrapping_*` are computed
+from their operands rather than refused. Three things about it are worth carrying forward.
+
+**The refusals are the design, not a limitation.** Only `checked_div`/`checked_rem` may model
+division. `saturating_div` and `wrapping_div` *panic* on a zero divisor, and modelling a
+panicking operation as total would hide a panic — the one thing this frontend must never do.
+The shifts are refused because the families genuinely disagree: `wrapping_shl` reduces the
+amount modulo the width, the engine's variable shift saturates to zero, and `checked_shl`
+returns `None` past the width. Three behaviours under one name is not something to guess at,
+and a wrong guess is not a weaker proof, it is a false one. So refusal happens at two layers
+and a test pins both: a name whose operator is unknown does not `classify` at all, while a
+name that classifies (`saturating_div`) is refused by `is_modelled`/`eval`. The first draft of
+that test asserted `saturating_div` does not classify, and the failure was the useful kind — it
+showed the two layers were real and the test was naming the wrong one.
+
+**A `checked_*` result is an `Option`, and its tag is a *term*.** This is the part that made
+the plumbing non-trivial. `checked_add` on a `u8` is `Option<u8>`: rustc lowers the consuming
+`match` to a `switchInt` on `discriminant(_2)`, and reads the payload through a
+`Proj::Downcast(Some)` place. A tag modelled as a constant would take one arm always. It has
+to be `ite(fails, 0, 1)`, where `fails` is the same overflow predicate the `assert` reads, so
+the `switchInt` goes the right way on each path. The payload is recorded *unconditionally*
+under the `Some` projection, and that is sound precisely because rustc emits the downcast read
+only inside the arm where the tag is `1` — the path condition is the gate, so no extra gate is
+needed. The width is the *operand* width, not the destination's: sizing the payload from the
+`Option<u8>` local would ask the engine for a 64-bit overflow test.
+
+Three smaller traps fell out of the same work, each a place where a plausible reading is wrong:
+
+* `Rvalue::Discriminant` was sizing the tag from the dump's `isize` rather than from the
+  payload width, and returning `Unknown` when no tag was recorded instead of `Val::Unknown`
+  for an unknown *tag*. A modelled `Option` local has no `locals` entry — its value *is* its
+  tag — so `Env::get` needed a fallback to the `discriminants` map, or `discriminant(_2)` and
+  `move _2` both came back unknown.
+* The downcast payload read `((_2 as Some).0)` is *one* step, not two: the projection loop
+  consumed the `Downcast` and then processed the trailing `Field(0)`, which looked the payload
+  up in the tuple map and overwrote a good value with `Unknown`. The loop now consumes both.
+* `parse_rvalue` matched the ` as ` cast form before trying a `copy`/`move` of a place, so a
+  downcast place did not parse. Checking the place form first fixes it — the same shape of
+  ordering bug as the earlier `const ... as ...` case, in the opposite direction.
+
+**The oracle is Rust itself, enumerated.** The model claims to implement `core`'s definition,
+so the unit tests in `src/mir/intrinsics.rs` compare against the real `u8::checked_add` and
+its family over *all* of `u8` and all of `i8` — 65536 pairs per case, cheap because the term is
+built once and walked per pair rather than reset per pair. That is what pins the signed rules,
+which no unsigned test can see: `-1 + 1` does not overflow, but the unsigned carry test fires
+on it, so an unsigned-only model would report a panic that is not there. `i8::MIN / -1` and the
+width limits are checked the same way. The terms are read back with `smt::evaluate`, which is
+the concrete semantics of the symbolic language, so the test compares *values* and not just
+`Some`/`None`.
+
+The scoreboard moved from 4 of 14 decided to 10 of 14, and the remaining four each name
+themselves in the `detail` column — an unreadable `requires` (`c.lo <= c.hi`, `xs.len() > 0`)
+and a tuple-returning `ensures` (`ret.0 <= a`). Those are the next gaps, and they are parser
+gaps rather than engine ones, which the scoreboard says without being asked.

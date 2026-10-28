@@ -80,6 +80,7 @@
 //! front door is a host program.
 
 pub(crate) mod exec;
+pub(crate) mod intrinsics;
 pub(crate) mod parse;
 pub mod spec;
 pub mod verify;

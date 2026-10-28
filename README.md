@@ -1287,6 +1287,45 @@ barrel shifter against Rust's own `<<` and `>>` at the interesting amounts, prov
 it agrees with the constant path symbolically, and requires that a variable shift is
 *not* the identity so a shifter that returned its input cannot pass.
 
+### `core::num` is modelled rather than called
+
+The `checked_*`, `saturating_*` and `wrapping_*` families are how real Rust writes
+arithmetic that must not panic, and a call the frontend cannot model makes the
+whole *path* unknown. So these are computed from their operands instead of being
+refused. `src/mir/intrinsics.rs` holds the model:
+
+- `wrapping_*` is the plain operator, because the plain operator already takes the
+  result modulo `2^w`. The term is the *same term* `a + b` produces, not a second
+  definition that could drift from it.
+- `saturating_*` is `ite(fails, bound, plain)`, where `fails` is the very predicate
+  rustc's own `assert` reads and `bound` is the sign of the overflow. A function
+  written with `saturating_add` and one written with a hand-rolled guard are decided
+  by one rule.
+- `checked_*` is an `Option<T>`: the tag is `1` where the operation is defined and
+  `0` where it is not, and the payload is the result. The tag is a *term*, not a
+  constant, so the `switchInt` on it takes the right arm on each path. rustc emits
+  the downcast payload read only inside the `Some` arm, which is what makes
+  recording the payload unconditionally sound.
+
+The refusals matter as much as the model, and each has a reason. Only `checked_div`
+and `checked_rem` may model division: the `saturating_` and `wrapping_` forms *panic*
+on a zero divisor, and modelling a panicking operation as total would hide a panic,
+which is the one thing this frontend must never do. The shifts are refused because
+the three families disagree about the amount — `wrapping_shl` reduces it modulo the
+width, the engine's variable shift saturates to zero, and `checked_shl` returns
+`None` past the width — and three behaviours under one name is not something to
+guess at. `unchecked_*` is undefined behaviour, and a proof about UB is not a proof.
+A name that is not in the table does not classify, and a name that classifies but
+whose shape is past a width limit is refused by `eval`, which leaves the path
+unknown rather than slow.
+
+`src/mir/intrinsics.rs`'s unit tests are the oracle: every case is compared against
+the real `core` call, over all of `u8` and all of `i8`, so the model is checked on
+*every* input rather than on the ones that happened to be tried. That is what pins
+the signed rules, which the unsigned tests cannot see — `-1 + 1` does not overflow,
+but the unsigned carry test fires on it. The widths past the limits, the refused
+names, and `i8::MIN / -1` are checked too.
+
 ### What it declines, and why that is the point
 
 The frontend refuses far more than it accepts, and every refusal is reported:
@@ -1295,8 +1334,10 @@ The frontend refuses far more than it accepts, and every refusal is reported:
   makes the path "not modelled", never "proved".
 - **Widened products past 16 bits.** `sat_mul` at `u16` needs a 32-bit product,
   which is the BDD scaling wall. The honest answer is `incomplete`.
-- **Anything with a `core::` callee other than a plain function.** Intrinsics and
-  trait methods are not modelled.
+- **`core::num` operations other than the modelled families.** `checked_*`,
+  `saturating_*` and `wrapping_*` for `add`/`sub`/`mul`/`div`/`rem` and the
+  bitwise ops are computed from their operands (see below). Every other
+  intrinsic, and every trait method, is still a call the frontend cannot model.
 - **Aggregates, slices, references.** No pointer model.
 
 ### Signedness is a value question, not a display one
@@ -1478,6 +1519,7 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   └── mir/            the real-Rust frontend (`std` only)
 │       ├── parse.rs    rustc's textual MIR -> a small IR, failing closed
 │       ├── exec.rs     symbolic execution of that IR, with a frame stack for calls
+│       ├── intrinsics.rs  the `checked_*`/`saturating_*`/`wrapping_*` model
 │       ├── spec.rs     contract scanner + the small contract-expression grammar
 │       └── verify.rs   driver: emit MIR, extract contracts, discharge, report
 ├── tests/

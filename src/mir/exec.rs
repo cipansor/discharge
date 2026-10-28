@@ -23,6 +23,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::mir::intrinsics::{self, Outcome};
 use crate::mir::parse::{
     BinOp, Block, Callee, Const, MirFn, MirProgram, Operand, Place, Proj, Rvalue, Stmt, Term, Ty, UnOp,
 };
@@ -334,23 +335,70 @@ struct Env {
     elems: BTreeMap<(u32, u64), Val>,
     /// Tuple fields, keyed by (local, field).
     fields: BTreeMap<(u32, u32), Val>,
+    /// Enum payloads, keyed by (local, variant), with the payload's width.
+    /// Written by the `checked_*` model and read through a `Proj::Downcast`.
+    payloads: BTreeMap<(u32, u32), (Val, u8)>,
+    /// Enum tags, keyed by local, as symbolic values: `1` where the operation is
+    /// defined and `0` where it is not. Not a constant, because whether
+    /// `checked_add` returns `Some` depends on the operands.
+    discriminants: BTreeMap<u32, Val>,
 }
 
 impl Env {
     fn new() -> Env {
-        Env { locals: BTreeMap::new(), elems: BTreeMap::new(), fields: BTreeMap::new() }
+        Env {
+            locals: BTreeMap::new(),
+            elems: BTreeMap::new(),
+            fields: BTreeMap::new(),
+            payloads: BTreeMap::new(),
+            discriminants: BTreeMap::new(),
+        }
     }
 
     fn get(&self, p: &Place) -> Val {
         let mut cur = match self.locals.get(&p.local) {
             Some(v) => *v,
-            None => return Val::Unknown,
+            // A modelled `Option` local has no entry in `locals`: its value is
+            // its tag, which lives in `discriminants`. Without this fallback a
+            // read of the bare local `_2` -- which is exactly what
+            // `discriminant(_2)` and `move _2` lower to -- would come back
+            // unknown and the `switchInt` on the tag would go unmodelled.
+            None => match self.discriminants.get(&p.local) {
+                Some(v) => *v,
+                None => return Val::Unknown,
+            },
         };
-        for pr in &p.proj {
-            cur = match pr {
-                Proj::Field(i) => *self.fields.get(&(p.local, *i)).unwrap_or(&Val::Unknown),
-                Proj::Index(i) => *self.elems.get(&(p.local, *i)).unwrap_or(&Val::Unknown),
+        // A downcast read is a read of the variant's payload. rustc emits the
+        // downcast only inside the `switchInt` arm that already matched the
+        // variant, so the path condition forces the tag here and no extra gate
+        // is needed. What is needed is that the payload *exists*: an enum this
+        // frontend did not build has no entry, and answering `Unknown` there is
+        // what keeps a stale or invented payload out of the result.
+        let modelled = self.discriminants.contains_key(&p.local);
+        let mut i = 0;
+        while i < p.proj.len() {
+            cur = match &p.proj[i] {
+                Proj::Field(f) => *self.fields.get(&(p.local, *f)).unwrap_or(&Val::Unknown),
+                Proj::Index(k) => *self.elems.get(&(p.local, *k)).unwrap_or(&Val::Unknown),
+                Proj::Downcast(v) => {
+                    if !modelled {
+                        return Val::Unknown;
+                    }
+                    // The downcast *and* the payload field it addresses are one
+                    // step: `((_2 as Some).0)`. Both projections are consumed
+                    // here, so the loop must skip the `Field(0)` as well --
+                    // letting it run would look the payload up in the tuple map
+                    // and replace a good value with `Unknown`. Anything other
+                    // than a lone payload field is a shape the model does not
+                    // produce, so it reads as unknown rather than walking on.
+                    if !matches!(p.proj.get(i + 1), Some(Proj::Field(0)) | None) {
+                        return Val::Unknown;
+                    }
+                    i += 1;
+                    self.payloads.get(&(p.local, *v)).map(|(val, _)| *val).unwrap_or(Val::Unknown)
+                }
             };
+            i += 1;
         }
         cur
     }
@@ -367,11 +415,37 @@ impl Env {
             [Proj::Index(i)] => {
                 self.elems.insert((p.local, *i), v);
             }
+            [Proj::Downcast(variant), Proj::Field(0)] | [Proj::Downcast(variant)] => {
+                self.payloads.insert((p.local, *variant), (v, 0));
+            }
             // A nested projection would need a place tree. Modelling it
             // approximately would be a soundness hole, so it is dropped and a
             // later read of that place yields `Unknown`.
             _ => {}
         }
+    }
+
+    /// Record the payload of a modelled `Option`, with its width.
+    ///
+    /// The width is what `discriminant` and the payload read are sized by. It is
+    /// the operand width, because `checked_add` on a `u8` produces a `u8`
+    /// payload: sizing it from the destination would size it from the
+    /// `Option<u8>` local.
+    fn set_payload(&mut self, local: u32, variant: u32, v: Val, width: u8) {
+        self.payloads.insert((local, variant), (v, width));
+    }
+
+    /// The width of a modelled `Option` local, from its payload.
+    fn option_width(&self, local: u32) -> Option<u8> {
+        self.payloads
+            .iter()
+            .find(|((l, _), _)| *l == local)
+            .map(|(_, (_, w))| *w)
+    }
+
+    /// Record an enum tag for a local.
+    fn set_discriminant(&mut self, local: u32, tag: Val) {
+        self.discriminants.insert(local, tag);
     }
 }
 
@@ -803,6 +877,72 @@ fn advance(
     work.push(State { block: target, ..st });
 }
 
+/// Answer a modelled `core::num` call, if the callee is one.
+///
+/// `None` means the callee is not a modelled intrinsic, and the caller falls
+/// through to the same-dump inliner. `Some(Err(..))` means it *is* one but this
+/// call is outside what the model covers -- an unknown operand, a width past
+/// [`intrinsics::DIV_MAX_WIDTH`] -- and the path is reported unknown. The
+/// distinction matters: refusing to model a call and refusing to inline it are
+/// different answers, and only the first is a coverage gap in `intrinsics`.
+fn try_intrinsic(
+    prog: &MirProgram,
+    func: usize,
+    name: &str,
+    args: &[Operand],
+    dest: &Place,
+    env: &mut Env,
+) -> Option<Result<(), String>> {
+    let op = intrinsics::classify(name)?;
+    let cur = &prog.fns[func];
+    // The operand width, from the first argument's declared type. It is not the
+    // destination's: `checked_add` on a `u8` writes an `Option<u8>`, and taking
+    // the width from there would ask the engine for a 64-bit overflow test.
+    let first = args.first()?;
+    let w = operand_width(cur, first)?;
+    let signed = operand_is_signed(cur, first);
+    let x = match operand(env, first) {
+        Val::Sym(v) => v,
+        // A `bool` operand has no bit-vector to hand the model, and an unknown
+        // one has no value at all. Either way there is nothing to compute with.
+        _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
+    };
+    let y = match args.get(1) {
+        Some(a) => match operand(env, a) {
+            Val::Sym(v) => v,
+            _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
+        },
+        // The unary family (`checked_neg`, `wrapping_abs`, …) is not modelled,
+        // so every modelled name takes two operands. Reaching here means the
+        // dump had a shape the model does not cover.
+        None => return Some(Err(format!("unmodelled arity for `{name}`"))),
+    };
+    let Some(outcome) = intrinsics::eval(op, x, y, w, signed) else {
+        return Some(Err(format!("`{name}` past what the model covers at {w} bits")));
+    };
+    match outcome {
+        Outcome::Value(v) => env.set(dest, Val::Sym(v)),
+        Outcome::Option { tag, payload } => {
+            // The payload is recorded under the `Some` projection with the
+            // operand width, and the tag alongside it. rustc reads the payload
+            // only inside the arm where the tag is `1`, so recording it now is
+            // sound; the width is what keeps the read from being mis-sized.
+            env.set_discriminant(dest.local, Val::Sym(tag));
+            env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(payload), w);
+        }
+    }
+    Some(Ok(()))
+}
+
+/// The declared bit width of an operand, when it has one.
+fn operand_width(f: &MirFn, o: &Operand) -> Option<u8> {
+    match o {
+        Operand::Copy(p) | Operand::Move(p) => width_of(f, p),
+        Operand::Const(Const::UInt(_, ty)) => ty.as_ref().and_then(|t| t.width()),
+        Operand::Const(_) => None,
+    }
+}
+
 fn run_state<F>(prog: &MirProgram, mut st: State, post: &Option<F>, report: &mut MirReport, work: &mut Vec<State>)
 where
     F: Fn(Var) -> Result<Pred, String>,
@@ -1017,6 +1157,20 @@ where
                 report.unknown_paths.push("indirect call not modelled".into());
                 return;
             };
+            // A modelled `core::num` operation is answered here, before the
+            // same-dump lookup, because there is no body in the dump to inline:
+            // the definition is in `intrinsics`, and it is exact.
+            if let Some(done) = try_intrinsic(prog, st.frame.func, name, args, dest, &mut st.env) {
+                let next = match done {
+                    Ok(()) => State { block: *target, ..st },
+                    Err(e) => {
+                        report.unknown_paths.push(e);
+                        return;
+                    }
+                };
+                advance(prog, next, *target, report, work);
+                return;
+            }
             if st.depth + 1 >= DEFAULT_INLINE_DEPTH {
                 report.unknown_paths.push(format!("call depth limit reached at `{name}`"));
                 return;
@@ -1179,6 +1333,21 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
             Val::Agg
         }
         Rvalue::Ref(_) | Rvalue::Len(_) | Rvalue::Unknown(_) => Val::Unknown,
+        Rvalue::Discriminant(p) => match env.discriminants.get(&p.local) {
+            // The tag's width is the payload's, not the dump's `isize`. The
+            // `switchInt` compares it against the small variant constants, so
+            // the width only has to be wide enough to hold them; taking it from
+            // the payload keeps `discriminant` and the payload in one width.
+            Some(Val::Sym(tag)) => {
+                let w = env.option_width(p.local).unwrap_or(64);
+                Val::Sym(smt::truncate(*tag, w))
+            }
+            Some(v) => *v,
+            // No modelled call wrote a tag here. An enum this frontend did not
+            // build has an unknown tag, not tag zero -- guessing `None` would
+            // send every path down the wrong arm.
+            None => Val::Unknown,
+        },
     }
 }
 
@@ -1189,6 +1358,11 @@ fn width_of(f: &MirFn, p: &Place) -> Option<u8> {
         ty = match (pr, &ty) {
             (Proj::Field(i), Ty::Tuple(ts)) => ts.get(*i as usize)?.clone(),
             (Proj::Index(_), Ty::Array(inner, _)) => (**inner).clone(),
+            // A downcast yields the payload, whose type the dump does not print
+            // here. Reading it as the base type would mis-size the value: the
+            // `u8` inside `Option<u8>` is not the `Option<u8>` local. The caller
+            // supplies the width from the operator instead, so this declines.
+            (Proj::Downcast(_), _) => return None,
             _ => return None,
         };
     }
