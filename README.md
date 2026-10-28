@@ -1494,7 +1494,8 @@ is instantaneous while a 12-bit multiplier equality is not.
 ├── Cargo.lock          committed, and a single package: the dependency set is empty
 ├── README.md           this file
 ├── AGENTS.md           notes for agents, including the traps that cost the most time
-├── LICENSE             MIT OR Apache-2.0
+├── LICENSE             Apache-2.0
+├── SECURITY.md         how to report a vulnerability (GitHub private advisories)
 ├── .github/
 │   └── workflows/
 │       └── ci.yml      the gates, plus Kani and Verus as hard-gate jobs
@@ -1758,9 +1759,15 @@ you ship. Rust can do that, and this crate is a working sketch of how.
 
 ## License
 
-MIT OR Apache-2.0.
+Apache-2.0. The full text is in [`LICENSE`](LICENSE).
 
 Copyright 2026 Yayasan Pesantren Cipansor and contributors. Developed with
 contributions from OpenHands agents; the copyright notice in `LICENSE` records
 the foundation and the contributor base together, which is the arrangement the
 project's authorship follows.
+
+This project was previously offered under `MIT OR Apache-2.0`. It is now
+Apache-2.0 only, which is the single license the `LICENSE` file has always
+carried; the dual-license option in the manifest and this section is what was
+removed. Recipients of a prior release keep the rights that release granted
+them; Apache-2.0 is the license for this version and every version after it.
