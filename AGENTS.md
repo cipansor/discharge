@@ -965,6 +965,19 @@ bound is refutable there before proving the implication, so a future narrowing o
 fails loudly instead of passing vacuously. When a proof states a claim about an operation that
 can overflow, check the modelled width can represent the result the claim names.
 
+The *guard* that establishes this is itself a place to be vacuous, and was. It first read
+`!prove(scaled.gt_val(4_095_000)).is_proved()`, but `scaled` is the **clamped** product, which
+is at most 4 095 000 at every width: the predicate is `Unsat` at 22 bits *and* at 16, so the
+negated `is_proved()` was true in both cases and the guard could not detect the narrowing it
+existed to detect. The guard has to be stated over the **unclamped** product —
+`find_model((raw * 1000u32).gt_val(4_095_000))`, requiring a `Counterexample` — which is
+satisfiable at 22 bits (`raw = 4096`) and unsatisfiable at 16. Two lessons: a guard's predicate
+must be over the quantity whose range the guard is about, not over a value already constrained
+to be in that range; and `!is_proved()` is the wrong way to say "refutable", because it also
+accepts `Unsat` and `Unknown`. The tests `the_vacuity_guard_{accepts,rejects}_...` pin both
+widths, and `a_clamped_product_is_never_above_the_bound_at_any_width` records the fact that
+made the old form vacuous.
+
 ## The harness must cover every module, or it certifies only the covered ones
 
 The differential harness had three families -- calls, loops-with-calls, obligation pressure
