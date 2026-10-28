@@ -1979,3 +1979,48 @@ unassigned, so `clause_justifies` was never really exercised: the clause could n
 to be unit. The fixture now decides the other literal, so the reason clause is genuinely unit
 on the propagated literal -- `(x2 | ¬x6)` with `x6` true -- which is what makes it a real
 propagation justification rather than a clause that merely mentions the variable.
+
+## An arena budget is not a time budget
+
+The MIR frontend hung. `count_evens` -- `while i < n { if i % 2 == 0 { c += 1; } i += 1; }`
+with `requires: n <= 8` -- ran for minutes and printed nothing, so the tool reported *no
+verdict at all*, which is worse than any verdict. The first three explanations were wrong,
+and each one was falsified by measurement rather than by reading:
+
+1. **"The open-addressing tables filled up."** Plausible: `mk_node`, `mk_term`, and the
+   three `apply2` caches probe with `i = (i + 1) & mask` and no termination test, and the
+   capacity check sits *inside* the `k == u64::MAX` branch -- so a table with no empty slot
+   left can never reach it. That is a real latent bug and it is fixed, but it was not this
+   hang: instrumentation showed `overflow == false` and `nodes == 53` at 24 million
+   `apply2` calls.
+2. **"The BDD blew up."** Also plausible, and also wrong: 24M calls producing 53 nodes is
+   the signature of recomputation, not of a growing diagram.
+3. **"It is in `apply2`."** Wrong: instrumenting `apply2`, `blast_bool`, and `model` showed
+   `model()` completing in 7 iterations, then silence.
+
+What found it was printing the frontend's own state. The worklist was visiting `bb1`..`bb7`
+in a cycle forever, with `visits` growing by one per round. So it was not an infinite loop
+and not a deadlock: it was a **path explosion**, slow enough to look like a hang. Every
+branch inside an unwound loop multiplies the path count, and each path's BDD is larger than
+the last, so the cost is super-linear in the path count. Measured: 200 paths took 16s, 2000
+paths were still running after 90s.
+
+The fix is `DEFAULT_PATH_BUDGET` in `src/mir/exec.rs`. `DEFAULT_UNWIND` bounds each loop;
+nothing bounded the *number of paths*, and that is the missing guard. It is set to 64
+because the measurement says a larger value buys no coverage -- the corpus scoreboard is
+4 of 14 at 64 paths and 4 of 14 with no bound at all -- only latency.
+
+Two lessons. First, **a bound on one resource is not a bound on the others**: this engine
+had an arena budget and a loop budget, and still had no termination guarantee. When a tool
+promises "never loop forever", that promise needs a guard on *time* or *steps*, not just on
+memory. Second, **instrument before you theorise**. Three plausible root causes were wrong
+here; the one that was right came from printing the loop's own counters, not from reasoning
+about which data structure "must" be the problem.
+
+The regression test is `a_branching_loop_reports_a_path_budget_rather_than_running_forever`
+in `src/mir/exec.rs`. It embeds the real `rustc -O` MIR for `count_evens` so it runs on
+stable, and it is *verified to hang without the fix* -- which is the only thing that makes
+it a regression test rather than a test that happens to pass. Two details matter: it must go
+through `verify_function` with a postcondition, because the postcondition is what makes each
+path cost more than the last; and it runs on a 64 MB thread, because the harness's default
+stack is smaller than the main thread's and the workload overflows it.

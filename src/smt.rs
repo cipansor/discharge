@@ -478,6 +478,10 @@ impl Ctx {
     fn mk_term(&mut self, n: Node) -> Term {
         let key = Self::hash_node(&n);
         let mut i = (key as u32) & self.term_mask;
+        // See `mk_node`: a table with no empty slot left must be detected by the
+        // probe count, because the capacity test sits inside the empty-slot
+        // branch and would otherwise never be reached.
+        let mut probes = 0usize;
         loop {
             let k = self.term_key[i as usize];
             if k == u64::MAX {
@@ -504,6 +508,11 @@ impl Ctx {
                 {
                     return Term(self.term_val[i as usize]);
                 }
+            }
+            probes += 1;
+            if probes > self.term_mask as usize {
+                self.overflow = true;
+                return Term(0);
             }
             i = (i + 1) & self.term_mask;
         }
@@ -868,6 +877,12 @@ impl Ctx {
         }
         let key = ((var as u64) << 32) | ((lo as u64) << 16) | (hi as u64);
         let mut i = (key as u32) & self.uniq_mask;
+        // Open addressing over a table that cannot grow. If every slot is taken
+        // no probe sequence can ever find `u64::MAX`, so the capacity check
+        // below -- which lives *inside* that branch -- would never run and the
+        // loop would spin forever. Bounding the probe makes a full table report
+        // the budget instead.
+        let mut probes = 0usize;
         loop {
             let k = self.uniq_key[i as usize];
             if k == u64::MAX {
@@ -886,6 +901,11 @@ impl Ctx {
             }
             if k == key {
                 return self.uniq_val[i as usize];
+            }
+            probes += 1;
+            if probes > self.uniq_mask as usize {
+                self.overflow = true;
+                return FALSE;
             }
             i = (i + 1) & self.uniq_mask;
         }
@@ -931,6 +951,9 @@ impl Ctx {
             _ => {
                 let key = (a as u64) << 1;
                 let mut i = (key as u32) & self.uniq_mask;
+                // Bounded like the other probes: a full cache is a miss, and the
+                // complement is recomputed and re-stored below.
+                let mut probes = 0usize;
                 loop {
                     let k = self.not_key[i as usize];
                     if k == u64::MAX {
@@ -939,6 +962,10 @@ impl Ctx {
                     if k == key {
                         return self.not_val[i as usize];
                     }
+                    probes += 1;
+                    if probes > self.uniq_mask as usize {
+                        break;
+                    }
                     i = (i + 1) & self.uniq_mask;
                 }
                 let v = self.var[a as usize];
@@ -946,10 +973,15 @@ impl Ctx {
                 let hi = self.neg(self.hi[a as usize]);
                 let r = self.mk_node(v, lo, hi);
                 let mut j = (key as u32) & self.uniq_mask;
+                let mut probes = 0usize;
                 loop {
                     if self.not_key[j as usize] == u64::MAX || self.not_key[j as usize] == key {
                         self.not_key[j as usize] = key;
                         self.not_val[j as usize] = r;
+                        break;
+                    }
+                    probes += 1;
+                    if probes > self.uniq_mask as usize {
                         break;
                     }
                     j = (j + 1) & self.uniq_mask;
@@ -1020,6 +1052,10 @@ impl Ctx {
             _ => (&self.xor_key, &self.xor_val),
         };
         let mut i = (key as u32) & self.uniq_mask;
+        // These caches memoise `apply2`; they are not a source of truth, so a
+        // full table is a *miss* and the answer is recomputed. Bounding the
+        // probe keeps that true when no empty slot is left.
+        let mut probes = 0usize;
         loop {
             let k = keys[i as usize];
             if k == u64::MAX {
@@ -1027,6 +1063,10 @@ impl Ctx {
             }
             if k == key {
                 return Some(vals[i as usize]);
+            }
+            probes += 1;
+            if probes > self.uniq_mask as usize {
+                return None;
             }
             i = (i + 1) & self.uniq_mask;
         }
@@ -1039,11 +1079,18 @@ impl Ctx {
             _ => (&mut self.xor_key, &mut self.xor_val),
         };
         let mut i = (key as u32) & self.uniq_mask;
+        // A full table drops the entry. Losing a memo costs time, never an
+        // answer, and it must not become an unbounded probe.
+        let mut probes = 0usize;
         loop {
             let k = keys[i as usize];
             if k == u64::MAX || k == key {
                 keys[i as usize] = key;
                 vals[i as usize] = val;
+                return;
+            }
+            probes += 1;
+            if probes > self.uniq_mask as usize {
                 return;
             }
             i = (i + 1) & self.uniq_mask;

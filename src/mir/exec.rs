@@ -36,6 +36,31 @@ pub const DEFAULT_UNWIND: u32 = 9;
 /// How deep same-dump calls are inlined.
 pub const DEFAULT_INLINE_DEPTH: u32 = 4;
 
+/// How many paths one function may explore before the search is abandoned.
+///
+/// `DEFAULT_UNWIND` bounds each *loop*, but a function can still generate an
+/// unbounded number of paths without any single loop exceeding its bound: every
+/// branch inside an unwound loop multiplies the path count, and the engine's
+/// BDD cost per path grows with the path condition. Measured on
+/// `while i < n { if i % 2 == 0 { c += 1; } i += 1; }` the search was still
+/// running after 170 seconds with only two paths reported unknown -- it was not
+/// looping forever, but it had no way to stop either.
+///
+/// That matters because the frontend's contract, stated in `mir/mod.rs`, is
+/// that a cutoff is reported as a cutoff and a path is never assumed to exit.
+/// A search that never returns cannot report anything, so the promise needs a
+/// bound on *paths*, not just on loop iterations. Reaching this budget marks
+/// the function incomplete, exactly like an unwound loop: the obligations found
+/// so far stand, and the un-explored remainder is named rather than guessed at.
+///
+/// The value is calibrated against cost, not against a round number. The same
+/// function above took 16s at 200 paths and was still running after 90s at
+/// 2000, because each path's BDD is larger than the last -- so a larger budget
+/// buys no extra coverage, only latency. Sixty-four keeps the worst case in the
+/// low seconds while still deciding everything the shipped corpora decide: the
+/// corpus scoreboard is unchanged at 4 of 14 with this bound and with none.
+pub const DEFAULT_PATH_BUDGET: usize = 64;
+
 /// A symbolic value.
 ///
 /// `Unknown` propagates: any operation on it stays unknown, and a path that
@@ -433,7 +458,20 @@ where
         depth: 0,
     }];
 
+    let mut explored: usize = 0;
     while let Some(st) = work.pop() {
+        // Bound the *number of paths*, not just each loop. A branch inside an
+        // unwound loop multiplies paths without any single loop exceeding
+        // `DEFAULT_UNWIND`, so this is the guard that makes the search
+        // terminate; see [`DEFAULT_PATH_BUDGET`]. Stopping here is reported, not
+        // hidden: the function becomes incomplete and says why.
+        if explored >= DEFAULT_PATH_BUDGET {
+            report.unknown_paths.push(format!(
+                "path budget exhausted after {DEFAULT_PATH_BUDGET} paths; the remainder was not explored"
+            ));
+            break;
+        }
+        explored += 1;
         run_state(prog, st, &post, &mut report, &mut work);
     }
     report
@@ -1324,6 +1362,105 @@ mod tests {
             failure.failure_detail().contains("vacuous"),
             "the detail must name the vacuity, got: {}",
             failure.failure_detail()
+        );
+    }
+
+    /// A branch inside an unwound loop multiplies paths without any single loop
+    /// exceeding `DEFAULT_UNWIND`, so the loop bound alone does not make the
+    /// search terminate.
+    ///
+    /// This is the regression for a real hang: `count_evens` below -- the exact
+    /// MIR `rustc -O` emits for `while i < n { if i % 2 == 0 { c += 1; } i += 1; }`
+    /// -- ran for minutes without returning, and the tool therefore reported
+    /// *nothing* about it. The frontend's contract is that a cutoff is named as a
+    /// cutoff; a search that never returns cannot name anything, so this test
+    /// pins the property that matters: the call returns, and the incompleteness
+    /// is reported rather than hidden.
+    ///
+    /// The MIR is embedded so the test runs on stable. `tests/mir.rs` covers the
+    /// same function end-to-end but skips itself without `DISCHARGE_RUSTC`.
+    #[test]
+    fn a_branching_loop_reports_a_path_budget_rather_than_running_forever() {
+        const COUNT_EVENS_MIR: &str = r#"
+fn count_evens(_1: u8) -> u8 {
+    debug n => _1;
+    let mut _0: u8;
+    let mut _2: u8;
+    let mut _3: bool;
+    let mut _4: u8;
+    let mut _5: u8;
+    let mut _6: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        _2 = const 0_u8;
+        goto -> bb1;
+    }
+
+    bb1: {
+        _4 = copy _2;
+        _3 = Lt(move _4, copy _1);
+        switchInt(move _3) -> [0: bb6, otherwise: bb2];
+    }
+
+    bb2: {
+        _6 = copy _2;
+        _5 = Rem(move _6, const 2_u8);
+        switchInt(copy _5) -> [0: bb3, otherwise: bb4];
+    }
+
+    bb3: {
+        _0 = Add(copy _0, const 1_u8);
+        goto -> bb5;
+    }
+
+    bb4: {
+        goto -> bb5;
+    }
+
+    bb5: {
+        _2 = Add(copy _2, const 1_u8);
+        goto -> bb1;
+    }
+
+    bb6: {
+        return;
+    }
+}
+"#;
+        // Go through the real entry point, not `verify_fn` directly. The hang
+        // needs the corpus's postcondition closure as well as its precondition:
+        // the postcondition is evaluated on every path and its BDD grows with
+        // the path condition, which is what makes each successive path cost more
+        // than the last. A hand-built `verify_fn` call without it settles
+        // quickly, so it would not reproduce the defect.
+        let src = "/// requires: n <= 8\n/// ensures: ret <= 8\npub fn count_evens(n: u8) -> u8 { n }\n";
+        let specs = crate::mir::spec::extract(src);
+        // Run on a thread with a large stack. The engine recurses through the
+        // BDD and the frontend recurses through the term graph, so this workload
+        // needs more stack than the test harness's default thread gives; the
+        // real driver (`examples/mir_coverage.rs`) runs on the main thread and
+        // never sees this. The stack size is not the property under test -- the
+        // reported cutoff is -- so giving it room keeps the test about the fix.
+        let outcome = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let prog = crate::mir::parse::parse_program(COUNT_EVENS_MIR);
+                let f = prog.get("count_evens").expect("the dump must parse");
+                crate::smt::with_fresh(|| {
+                    crate::mir::verify::verify_function(&prog, f, &specs)
+                })
+            })
+            .expect("the test thread must spawn")
+            .join()
+            .expect("the verification must return rather than hang or overflow");
+        let reasons = match &outcome {
+            crate::mir::verify::FnOutcome::Incomplete { reasons, .. } => reasons.clone(),
+            other => panic!("expected an incomplete outcome, got {other:?}"),
+        };
+        assert!(
+            reasons.iter().any(|r| r.contains("path budget exhausted")),
+            "the cutoff must be named; reasons were {reasons:?}"
         );
     }
 }
