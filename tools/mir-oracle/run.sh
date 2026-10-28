@@ -7,11 +7,18 @@
 #
 #   0  every function shape agreed
 #   1  a shape disagreed -- the text parser and rustc's typed MIR are out of step
-#   2  the oracle could not run (no nightly, or a missing rustc-dev /
-#      llvm-tools-preview component) -- *not* evidence
+#   2  the oracle could not run: the toolchain lacks a component it needs
+#      (no nightly, or a missing rustc-dev / llvm-tools-preview) -- *not* evidence
+#   3  the oracle could not be *built* -- a real failure, and deliberately not 2
 #
 # Exit 2 is deliberately distinct: a missing toolchain must never be reported as
-# a parser failure, nor as a pass.
+# a parser failure, nor as a pass. Exit 3 exists for the mirror-image reason. A
+# build failure and a missing component both surface as a failing `cargo build`,
+# so mapping every build failure to 2 let a compile error in the oracle be
+# reported as "toolchain missing" -- and the local gate, which skips on 2, then
+# reported success without having built the oracle at all. The components are
+# probed for directly below, so 2 means "genuinely absent" and any build failure
+# that survives the probe is 3.
 set -eu
 cd "$(dirname "$0")/../.."
 
@@ -41,6 +48,27 @@ if ! printf '%s' "$version" | grep -q nightly; then
   exit 2
 fi
 
+# The sysroot and host of the compiler we are about to build with, so the
+# component probe below checks *this* toolchain rather than whichever one
+# `rustup` calls `nightly`.
+sysroot="$("$RUSTC_BIN" --print sysroot)"
+host="$(printf '%s' "$version" | sed -n 's/^host: //p')"
+libdir="$sysroot/lib/rustlib/$host/lib"
+
+# The two components the oracle needs, probed by their artifacts rather than by
+# `rustup component list` (which answers for a *named* toolchain, and
+# `DISCHARGE_RUSTC` may point at one that is not named `nightly`):
+#
+#   rustc-dev            -> librustc_driver-*.so
+#   llvm-tools-preview   -> libLLVM-*
+#
+# Both live in the same `rustlib/<host>/lib` directory, which is also the
+# directory cargo puts on the build script's `LD_LIBRARY_PATH` and rustc passes
+# to the linker as `-L`.
+components_present() {
+  [ -e "$libdir"/librustc_driver-*.so ] && [ -e "$libdir"/libLLVM-* ]
+}
+
 # `RUSTC` here is what cargo *builds with*; `DISCHARGE_RUSTC` is what the frontend
 # *runs*. Both must be the nightly, and they are, because `rustc-dev` is a
 # property of the toolchain.
@@ -51,8 +79,19 @@ fi
 # like a broken toolchain, so name the component here instead.
 cd tools/mir-oracle
 RUSTC="$RUSTC_BIN" cargo build -q 2>&1 || {
-  echo "mir-oracle: build failed. This needs the 'rustc-dev' *and* 'llvm-tools-preview'" >&2
-  echo "            components on the nightly: rustup component add rustc-dev llvm-tools-preview --toolchain nightly" >&2
+  # A build failure is *either* a missing component *or* a real error in the
+  # oracle, and the two must not be conflated. Probe for the components directly:
+  # if they are present, the failure is real and is reported as 3, so the gate
+  # fails rather than skipping. `2` must mean "genuinely absent".
+  if components_present; then
+    echo "mir-oracle: build failed, but rustc-dev and llvm-tools-preview are present" >&2
+    echo "            on $RUSTC_BIN -- this is a real failure in the oracle, not a" >&2
+    echo "            missing component" >&2
+    exit 3
+  fi
+  echo "mir-oracle: build failed, and $libdir is missing one of the components" >&2
+  echo "            the oracle needs. Install both on the nightly:" >&2
+  echo "              rustup component add rustc-dev llvm-tools-preview --toolchain nightly" >&2
   exit 2
 }
 cd ../..

@@ -2317,7 +2317,34 @@ The oracle has teeth and it was checked: flipping one arm of `PanicKind::from_te
 (Add -> Mul) makes the run exit 1 with 7 actuator functions and 4 realistic functions named
 and their two panic lists printed. A tool that can only say "agree" is not evidence.
 
-Exit codes are three-way on purpose: `0` agree, `1` a shape disagreed, `2` the oracle could
-not run (no nightly, or a missing `rustc-dev` / `llvm-tools-preview` component). Gate 9 skips
-on `2` and fails on anything else, so "the toolchain is missing" is never reported as a parser
-failure nor as a pass.
+### Two things the first version of the shape could not see
+
+Both were gaps in the *checker*, which is the worst place for one, and both are the same
+mistake: reducing a function to a summary that is not injective, then comparing summaries.
+
+* **The shape recorded a guard's kind but not its polarity.** `assert(!move _3, "…overflow")`
+  and `assert(move _3, "…overflow")` shaped identically, though they describe opposite
+  programs. A printer change that flipped a leading `!` therefore passed. The parser had
+  always carried `negated`; the shape — the thing compared — did not. `FnShape.panics` is now
+  `Vec<AssertShape>` with `AssertShape { kind, polarity }`. On the typed side the source is the
+  `Assert` terminator's `expected` flag, which is the value for which control *continues*, so
+  it is the **inverse** of the text side's `!` — `polarity_of` is a one-line function and
+  getting it backwards makes 21 actuator and 6 realistic functions disagree, which is how it
+  was checked. A useful side effect: the real asymmetry shows up, that `Bounds` is `True` while
+  every arithmetic guard is `Negated`.
+* **Bare names were treated as unique keys.** `impl A { fn check }` and `impl B { fn check }`
+  in one file both reduce to `check`, and both sides used a single-slot map, so the first was
+  silently replaced by the second. Dropping it from the text parser produced *zero*
+  differences. Both sides now keep a `Vec<FnShape>` per name and compare it sorted, as a
+  multiset: the enumeration order differs between the two sources and is not worth asserting,
+  but the set of shapes under a name is exactly what a lost method changes.
+
+Exit codes are four-way on purpose: `0` agree, `1` a shape disagreed, `2` the oracle could
+not run (no nightly, or a missing `rustc-dev` / `llvm-tools-preview` component), `3` the
+oracle could not be *built* though the components are present. Gate 9 skips only on `2` and
+fails on everything else, so "the toolchain is missing" is never reported as a parser failure
+nor as a pass — and, the mirror-image bug, a compile error in the oracle is never reported as
+a missing toolchain and quietly skipped. `run.sh` decides between 2 and 3 by probing for
+`librustc_driver-*.so` and `libLLVM-*` in `$sysroot/lib/rustlib/$host/lib` directly, rather
+than by asking `rustup component list` (which answers for a toolchain *named* `nightly`, and
+`DISCHARGE_RUSTC` may point elsewhere).

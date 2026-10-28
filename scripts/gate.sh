@@ -86,18 +86,21 @@ echo "== 9/11 rustc_public MIR oracle (skipped if no nightly/rustc-dev) =="
 # break the parser and nothing else would notice. This gate asks `rustc_public`
 # for the same programs' typed MIR and compares the per-function shape -- block
 # count and panic inventory -- so a printer change is caught. It needs a nightly
-# with `rustc-dev` *and* `llvm-tools-preview`; `run.sh` exits 2 when those are
-# absent, which is reported and skipped here rather than failed, exactly like
-# Kani and Verus.
-if sh tools/mir-oracle/run.sh; then
+# with `rustc-dev` *and* `llvm-tools-preview`; `run.sh` exits 2 only when those
+# are genuinely absent, which is reported and skipped here rather than failed,
+# exactly like Kani and Verus. Exit 3 means the components are present and the
+# oracle still would not build -- a real failure, so it fails the gate.
+code=0
+sh tools/mir-oracle/run.sh || code=$?
+if [ "$code" -eq 0 ]; then
   :
+elif [ "$code" -eq 2 ]; then
+  echo "   (nightly lacks rustc-dev/llvm-tools-preview; skipped --"
+  echo "    'rustup component add rustc-dev llvm-tools-preview --toolchain nightly')"
 else
-  code=$?
-  if [ "$code" -eq 2 ]; then
-    echo "   (no nightly with rustc-dev/llvm-tools-preview; skipped -- 'rustup component add rustc-dev llvm-tools-preview --toolchain nightly')"
-  else
-    fail "rustc_public MIR oracle"
-  fi
+  # 1 is a shape disagreement; 3 is a build failure with the components present.
+  # Neither is a missing toolchain, so both fail the gate.
+  fail "rustc_public MIR oracle (exit $code)"
 fi
 
 echo "== 10/11 lean differential oracle (skipped if lean is absent) =="
