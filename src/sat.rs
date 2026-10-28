@@ -1267,9 +1267,18 @@ mod reduce_db_tests {
     //! exactly why a verdict-level test cannot see the damage: `analyze` then stops at a
     //! reason-less literal and learns a weaker clause than it should.
     //!
-    //! So the oracle asserts the *invariant* the guard exists to preserve -- each decision
-    //! level holds exactly one reason-free literal, at the front -- and drives
-    //! `reduce_db` directly so it does not depend on a search reaching it.
+    //! So the oracle drives `reduce_db` on a hand-built trail and asserts two things the
+    //! verdict cannot show:
+    //!
+    //! * every surviving reason clause is a *real justification* -- it contains the
+    //!   literal it propagated and every other literal in it is false; and
+    //! * `compact` remaps a reason to the *same clause*, compared by literal content,
+    //!   not merely to some in-range id.
+    //!
+    //! The second point is the one that is easy to get wrong. Checking `reason[v] <
+    //! n_clauses` passes as long as *any* clause survives, so it would accept a remap
+    //! that pointed at an unrelated clause. Comparing the literal set is what pins the
+    //! clause's identity across the renumbering.
 
     use super::*;
 
@@ -1304,13 +1313,80 @@ mod reduce_db_tests {
         None
     }
 
-    /// Fill the shared solver with two learnt clauses on the trail as reasons, plus enough
-    /// removable learnt clauses that `reduce_db` passes its `m < 4` early return and
-    /// actually compacts.
+    /// Whether clause `id` really justifies assigning the literal `l` to true: it must
+    /// contain `l`, and every *other* literal in it must be false under the current
+    /// assignment. That is the unit-propagation condition, and it is the whole content of
+    /// "this clause is the reason for that assignment".
+    fn clause_justifies(s: &Solver, id: u32, l: u32) -> bool {
+        let start = s.c_start[id as usize] as usize;
+        let len = s.c_len[id as usize] as usize;
+        let mut found = false;
+        for j in 0..len {
+            let m = s.lits[start + j];
+            if m == l {
+                found = true;
+                continue;
+            }
+            // `assign[v]` is 1 for true and 2 for false. A positive literal is false when
+            // its variable is false; a negative literal is false when its variable is true.
+            let a = s.assign[Lit(m).var().0 as usize];
+            let is_false = if Lit(m).sign() { a == 1 } else { a == 2 };
+            if !is_false {
+                return false;
+            }
+        }
+        found
+    }
+
+    /// Whether clause `id`'s literals are exactly `expected`, order aside. This is the
+    /// clause-identity check: a remap must land on the same clause, not just a live one.
+    fn clause_is(s: &Solver, id: u32, expected: &[u32]) -> bool {
+        let start = s.c_start[id as usize] as usize;
+        let len = s.c_len[id as usize] as usize;
+        if len != expected.len() {
+            return false;
+        }
+        (0..len).all(|j| expected.contains(&s.lits[start + j]))
+    }
+
+    /// Every trail literal with a reason must be justified by that clause.
+    fn first_unjustified(s: &Solver) -> Option<usize> {
+        for t in 0..s.trail_n {
+            let l = s.trail[t];
+            let v = Lit(l).var().0 as usize;
+            let r = s.reason[v];
+            if r == NO_CLAUSE {
+                continue;
+            }
+            if !clause_justifies(s, r, l) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    // The literal sets of the two reason clauses, so a remap can be compared by content.
+    // Derived from `Lit` rather than written as raw bit patterns, because a hand-computed
+    // encoding is exactly the kind of constant that drifts silently.
+    fn reason_x2_lits() -> [u32; 2] {
+        [Lit::pos(Var(2)).0, Lit::neg(Var(6)).0] // (x2 | ¬x6)
+    }
+    fn reason_x4_lits() -> [u32; 2] {
+        [Lit::pos(Var(4)).0, Lit::neg(Var(7)).0] // (x4 | ¬x7)
+    }
+
+    /// Fill the shared solver with a trail whose two propagated literals are justified by
+    /// genuine unit clauses, plus enough removable learnt clauses that `reduce_db` passes
+    /// its `m < 4` early return and actually compacts.
     ///
     /// The state is built by hand rather than searched for, so the test is fast and its
     /// teeth do not depend on a particular seed or conflict count. The solver comes from
     /// the shared static: a `Solver` is 2.2 MB, which overflows the test thread's stack.
+    ///
+    /// The two reason clauses carry *low* activity so that, with the guard removed, the
+    /// "keep the more active half" rule drops them and the damage is real rather than
+    /// hidden behind a lucky tie. With every clause at the same activity the sort is
+    /// stable by id, the low ids survive, and the guard would look unnecessary.
     fn solver_with_learnt_reasons() -> std::sync::MutexGuard<'static, Solver> {
         let mut s = SOLVER.lock().unwrap_or_else(|p| p.into_inner());
         s.reset();
@@ -1318,29 +1394,29 @@ mod reduce_db_tests {
 
         // Original clause 0: (x0 | x1). Never removed (not learnt).
         let _ = s.add_clause(&[Lit::pos(Var(0)).0, Lit::pos(Var(1)).0], false);
-        // Six learnt clauses that nothing points at, with *high* activity so `reduce_db`'s
-        // "keep the more active half" rule keeps them and drops the two reasons below.
-        // Activity is set explicitly rather than left to chance: with every clause at the
-        // same activity the sort is stable by id, the low ids survive, and the guard would
-        // look unnecessary.
+
+        // Six learnt clauses that nothing points at, with high activity so the
+        // "keep the more active half" rule prefers them.
         for v in 0..6u32 {
             let a = Lit::pos(Var(10 + v));
             let b = Lit::pos(Var(11 + v));
             let id = s.add_clause(&[a.0, b.0], true);
             s.c_act[id as usize] = 100.0 + v as f32;
         }
-        // Learnt clause: justifies x2. Low activity, so only the guard can save it.
-        let reason_x2 = s.add_clause(&[Lit::pos(Var(2)).0, Lit::pos(Var(3)).0], true);
+
+        // (x2 | x6): with x6 false this is unit on x2, so it is a real reason for x2.
+        let reason_x2 = s.add_clause(&reason_x2_lits(), true);
         s.c_act[reason_x2 as usize] = 1.0;
-        // Learnt clause: justifies x4. Low activity likewise.
-        let reason_x4 = s.add_clause(&[Lit::pos(Var(4)).0, Lit::pos(Var(5)).0], true);
+        // (x4 | x7): likewise for x4 with x7 false.
+        let reason_x4 = s.add_clause(&reason_x4_lits(), true);
         s.c_act[reason_x4 as usize] = 1.0;
         s.build_occ();
 
         // Two decision levels, laid out the way `solve` lays them out: `trail_lim[lvl]` is
         // the index of the first trail entry at `lvl`, and the decision is that entry.
-        // Level 1's decision is x6; level 2's decision is x7. x2 and x4 sit at level 2 as
-        // propagated literals, justified by the learnt clauses above.
+        // Level 1 decides x6 true; level 2 decides x7 true and then propagates x2 and x4.
+        // With x6 true the `¬x6` in `(x2 | ¬x6)` is false, so the clause is unit on x2 and
+        // is a genuine reason for it; likewise x7 for x4.
         s.n_levels = 1;
         s.trail_lim[1] = 0;
         s.enqueue(Lit::pos(Var(6)), NO_CLAUSE);
@@ -1355,12 +1431,17 @@ mod reduce_db_tests {
     }
 
     #[test]
-    fn a_hand_built_trail_is_well_formed_before_reduction() {
+    fn a_hand_built_trail_is_well_formed_and_justified_before_reduction() {
         let s = solver_with_learnt_reasons();
         assert_eq!(
             first_bad_level(&s),
             None,
             "the fixture itself must satisfy the invariant, or the test proves nothing"
+        );
+        assert_eq!(
+            first_unjustified(&s),
+            None,
+            "the fixture's reason clauses must genuinely justify their literals"
         );
     }
 
@@ -1372,9 +1453,10 @@ mod reduce_db_tests {
 
         s.reduce_db();
 
-        // Both reasons must still name a live clause. `compact` remaps ids, so compare
-        // against the remapped value: what must not happen is the reason becoming
-        // `NO_CLAUSE`, which is how a dropped clause shows up.
+        // Both reasons must still name a live clause, and it must still be a real
+        // justification: the clause contains the propagated literal and every other
+        // literal in it is false. A dropped reason shows up as `NO_CLAUSE`, which turns the
+        // propagated literal into a phantom decision.
         assert_ne!(
             s.reason[2], NO_CLAUSE,
             "reduce_db dropped the clause justifying x2"
@@ -1384,6 +1466,11 @@ mod reduce_db_tests {
             "reduce_db dropped the clause justifying x4"
         );
         assert_eq!(
+            first_unjustified(&s),
+            None,
+            "reduce_db left a trail literal whose reason clause no longer justifies it"
+        );
+        assert_eq!(
             first_bad_level(&s),
             None,
             "reduce_db left a propagated literal looking like a decision"
@@ -1391,20 +1478,51 @@ mod reduce_db_tests {
     }
 
     #[test]
-    fn compact_remaps_the_reasons_it_keeps_to_the_new_ids() {
+    fn compact_remaps_a_reason_to_the_same_clause_not_just_a_live_one() {
         let mut s = solver_with_learnt_reasons();
         s.reduce_db();
-        // A remapped reason must point at a clause that exists. A stale id (>= n_clauses)
-        // would read a neighbour's clause, and `analyze` would resolve against the wrong
-        // literals.
-        for v in [2usize, 4] {
+        // The reason must point at *the same clause*, identified by its literals. Checking
+        // only `reason < n_clauses` would pass for any surviving clause, including one that
+        // says nothing about the literal it is supposed to justify.
+        for (v, expected) in [(2usize, reason_x2_lits()), (4usize, reason_x4_lits())] {
             let r = s.reason[v];
-            assert_ne!(r, NO_CLAUSE);
+            assert_ne!(r, NO_CLAUSE, "the reason for x{v} was dropped");
             assert!(
                 (r as usize) < s.n_clauses,
                 "reason for x{v} is clause {r}, but only {} clauses survive",
                 s.n_clauses
             );
+            assert!(
+                clause_is(&s, r, &expected),
+                "reason for x{v} remapped to a different clause (id {r})"
+            );
         }
+    }
+
+    /// A remap that lands on a live but *wrong* clause must be caught. This is the case
+    /// the range check alone cannot see, so the test pins it directly by asking whether the
+    /// identity check distinguishes two clauses that are both alive.
+    #[test]
+    fn the_clause_identity_check_distinguishes_two_live_clauses() {
+        let s = solver_with_learnt_reasons();
+        let r2 = s.reason[2];
+        let r4 = s.reason[4];
+        assert_ne!(r2, r4, "the fixture's two reasons must be different clauses");
+        assert!(
+            clause_is(&s, r2, &reason_x2_lits()),
+            "clause {r2} should be the x2 reason"
+        );
+        assert!(
+            !clause_is(&s, r2, &reason_x4_lits()),
+            "clause {r2} must not also look like the x4 reason"
+        );
+        assert!(
+            clause_is(&s, r4, &reason_x4_lits()),
+            "clause {r4} should be the x4 reason"
+        );
+        assert!(
+            !clause_is(&s, r4, &reason_x2_lits()),
+            "clause {r4} must not also look like the x2 reason"
+        );
     }
 }

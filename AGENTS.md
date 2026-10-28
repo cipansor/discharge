@@ -1933,3 +1933,49 @@ overflows the 2 MB test-thread stack -- use the shared static, and take the lock
 `MutexGuard`. And with every clause at the same activity, `reduce_db`'s stable sort keeps
 the low ids, so the guard looks unnecessary by accident; set the activities explicitly so
 the removable clauses really are the ones that get removed.
+
+## A test that skips itself still reports `ok`
+
+The sharpest instance of the "a harness covers only what it reaches" rule, because nothing
+here was dead or wrong. `Obligation::is_discharged` in `src/mir/exec.rs` decides whether an
+obligation is discharged, and the answer is *per kind*: an `Unsat` verdict **discharges** a
+panic query ("it cannot happen") and **refutes** a postcondition ("it holds for no input").
+Collapsing that match into `self.verdict.is_proved()` is the natural single-polarity reading,
+and it is a soundness hole in both directions at once.
+
+That mutant survives `cargo test` completely. The reason is not that the logic is unreached;
+it is that the only tests for it live in `tests/mir.rs`, which needs `DISCHARGE_RUSTC`
+pointing at a nightly, and **skips itself when it is absent** with a bare
+`let Some(report) = verify_all() else { return };`. A skipped test reports `ok`. So the suite
+count is *identical* whether the MIR frontend ran or not: 325 with the nightly, 325 without.
+CI never set `DISCHARGE_RUSTC`, so in the one place that gates a merge, the polarity had no
+teeth at all. A green suite said nothing about it.
+
+Two fixes, and both are needed. First, an in-module oracle in `src/mir/exec.rs` that runs
+*ungated*: it enumerates the whole truth table over the four kinds and four verdicts, so it
+does not need a compiler or a model -- `Valid`, `Unsat` and `Unknown` are unit variants, and
+a real `Cex` comes from `find_model` on a satisfiable-but-not-valid query. Verified by
+mutation: collapsing the match, treating a `Valid` panic as ruled out, and discharging every
+vacuity check each fail the oracle on a stable-only machine. Second, CI now installs the
+nightly and points `DISCHARGE_RUSTC` at it, so the end-to-end tests actually run. That
+variable must be a *path*, not a toolchain name: the frontend runs it with `Command::new`.
+
+The lesson to carry: a test that can silently become a no-op is not a test. When a harness
+skips on a missing tool, the count that "proves" the suite is green has to be checked
+against the count with the tool present. If the two are equal, the tool is not being used.
+
+## Pin a remap by what it points at, not by where it points
+
+A related trap in the same style, from the `reduce_db` oracle. `compact` renumbers clauses,
+so it remaps `reason[v]` from the old id to the new one. The first version of the oracle
+asserted only `reason[v] < n_clauses` -- "the reason names a live clause". That check passes
+for *any* surviving clause, including one that has nothing to do with the literal it is
+supposed to justify, so a remap that pointed every reason at clause 0 would have slipped
+through. The oracle now compares the clause's literal *set* against the expected one, and a
+mutant that remaps reasons to an unrelated live clause fails it.
+
+The same fixture had a second hole worth naming. It left each reason clause's other literal
+unassigned, so `clause_justifies` was never really exercised: the clause could not be shown
+to be unit. The fixture now decides the other literal, so the reason clause is genuinely unit
+on the propagated literal -- `(x2 | ¬x6)` with `x6` true -- which is what makes it a real
+propagation justification rather than a clause that merely mentions the variable.

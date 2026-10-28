@@ -31,9 +31,17 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Rust (stable) and the bare-metal target
+      # The nightly is not for building this crate; it is what `gate.sh` step 7 points
+      # `DISCHARGE_RUSTC` at, because `rustc --emit=mir` needs a nightly. Without it every
+      # test in `tests/mir.rs` skips itself -- and a skipped test still reports `ok`, so the
+      # suite count is identical whether the MIR frontend was exercised or not. That is how
+      # the per-kind discharge polarity (`Obligation::is_discharged`) came to have no teeth
+      # in CI. The in-module oracle in `src/mir/exec.rs` covers that logic ungated; this
+      # makes the end-to-end tests run too.
+      - name: Install Rust (stable, nightly, bare-metal target)
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
+          rustup toolchain install nightly --profile minimal --no-self-update
           rustup default stable
           rustup target add thumbv7em-none-eabihf
 
@@ -46,8 +54,14 @@ jobs:
       - name: Install the z3 oracle
         run: python3 -m pip install z3-solver
 
+      # `DISCHARGE_RUSTC` must be a path to a `rustc`, not a toolchain name: the frontend
+      # runs it as a subprocess (`Command::new(rustc)`), so a bare `nightly` would look for
+      # a binary by that name and fail.
       - name: Run scripts/gate.sh
-        run: sh scripts/gate.sh
+        run: |
+          DISCHARGE_RUSTC="$(rustup which --toolchain nightly rustc)"
+          export DISCHARGE_RUSTC
+          sh scripts/gate.sh
 
   kani:
     name: kani differential oracle

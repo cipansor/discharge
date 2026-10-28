@@ -1062,3 +1062,268 @@ fn overflow_pred(op: BinOp, a: Val, b: Val, w: u8, signed: bool) -> Option<Pred>
         _ => return None,
     })
 }
+#[cfg(test)]
+mod tests {
+    //! The oracle for the per-kind discharge polarity, and for the report
+    //! aggregation built on it.
+    //!
+    //! Every other check on this logic lives in `tests/mir.rs`, which needs
+    //! `DISCHARGE_RUSTC` pointing at a nightly compiler and *skips itself* without
+    //! one. A skipped test still reports `ok`, so the suite count is the same
+    //! whether the polarity is exercised or not: 325 with the nightly, 325
+    //! without. On a stable-only machine the rule below had no teeth at all.
+    //!
+    //! The rule is also the kind of thing a single-polarity reading gets wrong in
+    //! both directions. An `Unsat` answer *discharges* a panic query ("it cannot
+    //! happen") and *refutes* a postcondition ("it holds for no input"). Collapsing
+    //! the match into `verdict.is_proved()` -- which is what a caller reaching for
+    //! `Verdict::is_proved` would write -- left the whole nightly suite green until
+    //! `tests/mir.rs` was run with the compiler present, and it is exactly the
+    //! soundness hole this method exists to close.
+    //!
+    //! So the oracle enumerates the whole truth table rather than sampling it, and
+    //! asserts the cross-kind asymmetry that no single-polarity reading can satisfy.
+
+    use super::*;
+    use crate::smt;
+
+    /// A real counterexample. A `Cex` has private fields and only the engine can
+    /// build one, so this asks for a satisfiable-but-not-valid query rather than
+    /// fabricating a witness.
+    fn counterexample() -> Verdict {
+        smt::with_fresh(|| {
+            let x = smt::var(8);
+            // `x < 3` has models (0, 1, 2) and is not valid, so `find_model`
+            // refutes it and hands back one of them.
+            smt::find_model(smt::ult_const(x, 3))
+        })
+    }
+
+    fn panic_kind() -> ObligationKind {
+        ObligationKind::Panic { message: "attempt to compute overflow".into() }
+    }
+
+    fn ob(kind: ObligationKind, verdict: Verdict) -> Obligation {
+        Obligation { kind, verdict }
+    }
+
+    /// The truth table for `is_discharged`, written out rather than derived from
+    /// the implementation, so the test states the intended semantics instead of
+    /// echoing the code.
+    ///
+    /// The interesting rows are the ones that differ by kind at a fixed verdict:
+    /// `Unsat` discharges a panic and refutes a postcondition; `Counterexample`
+    /// refutes a postcondition and discharges a vacuity check.
+    #[test]
+    fn discharge_polarity_is_per_kind_not_per_verdict() {
+        let cex = counterexample();
+        assert!(
+            matches!(cex, Verdict::Counterexample(_)),
+            "the fixture needs a real counterexample, got {cex}"
+        );
+
+        // (kind, verdict, discharged)
+        let table = [
+            // A postcondition is discharged only by `Valid`: it must hold for all
+            // inputs. `Unsat` is the strongest failure, not a pass.
+            (ObligationKind::Postcondition, Verdict::Valid, true),
+            (ObligationKind::Postcondition, Verdict::Unsat, false),
+            (ObligationKind::Postcondition, cex, false),
+            (ObligationKind::Postcondition, Verdict::Unknown, false),
+            // A panic is discharged only by `Unsat`: the query is "can it happen",
+            // so `Unsat` is the good answer and `Valid` is the worst case.
+            (panic_kind(), Verdict::Valid, false),
+            (panic_kind(), Verdict::Unsat, true),
+            (panic_kind(), cex, false),
+            (panic_kind(), Verdict::Unknown, false),
+            // An `unreachable` is the same query shape as a panic.
+            (ObligationKind::Unreachable, Verdict::Valid, false),
+            (ObligationKind::Unreachable, Verdict::Unsat, true),
+            (ObligationKind::Unreachable, cex, false),
+            (ObligationKind::Unreachable, Verdict::Unknown, false),
+            // A vacuity check is discharged when it is *refuted*: some input
+            // satisfies the precondition. `Unsat` here is the finding.
+            (ObligationKind::VacuousPrecondition, Verdict::Valid, true),
+            (ObligationKind::VacuousPrecondition, Verdict::Unsat, false),
+            (ObligationKind::VacuousPrecondition, cex, true),
+            (ObligationKind::VacuousPrecondition, Verdict::Unknown, false),
+        ];
+
+        for (kind, verdict, expected) in table {
+            let o = ob(kind.clone(), verdict);
+            assert_eq!(
+                o.is_discharged(),
+                expected,
+                "{} with verdict `{verdict}`: expected discharged={expected}",
+                kind
+            );
+        }
+    }
+
+    /// The asymmetry the truth table rests on, stated on its own so a regression
+    /// names the exact confusion rather than one row of a table.
+    #[test]
+    fn the_same_verdict_is_opposite_for_a_panic_and_a_postcondition() {
+        let panic = ob(panic_kind(), Verdict::Unsat);
+        let post = ob(ObligationKind::Postcondition, Verdict::Unsat);
+
+        assert!(
+            panic.is_discharged(),
+            "an `Unsat` panic query means the panic cannot happen: a discharge"
+        );
+        assert!(
+            !post.is_discharged(),
+            "an `Unsat` postcondition holds for no input: the strongest failure"
+        );
+    }
+
+    /// `Unknown` is never a discharge, for any kind. This is the one rule that is
+    /// shared, and it is the reason the engine may decline to answer safely.
+    #[test]
+    fn an_undecided_obligation_is_never_discharged() {
+        for kind in [
+            ObligationKind::Postcondition,
+            panic_kind(),
+            ObligationKind::Unreachable,
+            ObligationKind::VacuousPrecondition,
+        ] {
+            let o = ob(kind.clone(), Verdict::Unknown);
+            assert!(!o.is_discharged(), "{kind} must not be discharged on `Unknown`");
+        }
+    }
+
+    /// The two failures that leave no witness are opposite findings, and both
+    /// render with no counterexample. The detail string has to tell them apart:
+    /// a shared "holds for every input" describes an impossible postcondition as
+    /// a universal truth, which is the reverse of what happened.
+    #[test]
+    fn the_two_witnessless_failures_are_told_apart() {
+        let post = ob(ObligationKind::Postcondition, Verdict::Unsat);
+        let panic = ob(panic_kind(), Verdict::Valid);
+
+        assert!(post.failure_witness().is_none(), "an `Unsat` postcondition has no witness");
+        assert!(panic.failure_witness().is_none(), "an always-firing panic has no witness");
+
+        let post_detail = post.failure_detail();
+        let panic_detail = panic.failure_detail();
+
+        assert!(
+            post_detail.contains("no input"),
+            "an `Unsat` postcondition holds for NO input; detail was: {post_detail}"
+        );
+        assert!(
+            panic_detail.contains("every input"),
+            "a `Valid` panic fires on EVERY input; detail was: {panic_detail}"
+        );
+        assert_ne!(
+            post_detail, panic_detail,
+            "opposite findings must not share a diagnosis"
+        );
+        assert!(
+            !post_detail.contains("every input") || post_detail.contains("no input"),
+            "the postcondition detail must not read as a universal truth: {post_detail}"
+        );
+    }
+
+    /// The classifier sentinels: a non-discharged obligation whose verdict is the
+    /// discharge case for its kind would be a bug in `is_discharged`, so the
+    /// detail says so instead of inventing a diagnosis.
+    #[test]
+    fn a_non_discharged_obligation_in_its_discharge_case_says_it_is_invalid() {
+        // `Valid` is the pass case for a postcondition, so reaching the failure
+        // path with it means the classifier disagreed with itself.
+        let post = ob(ObligationKind::Postcondition, Verdict::Valid);
+        assert!(
+            post.failure_detail().contains("invalid"),
+            "expected the invalid-classifier sentinel, got: {}",
+            post.failure_detail()
+        );
+
+        // `Unsat` is the discharge case for a panic query, likewise.
+        let panic = ob(panic_kind(), Verdict::Unsat);
+        assert!(
+            panic.failure_detail().contains("invalid"),
+            "expected the invalid-classifier sentinel, got: {}",
+            panic.failure_detail()
+        );
+    }
+
+    /// A cutoff is not a proof, however many obligations passed.
+    #[test]
+    fn a_report_with_an_unknown_path_is_never_proved() {
+        let report = MirReport {
+            function: "f".into(),
+            obligations: vec![ob(ObligationKind::Postcondition, Verdict::Valid)],
+            unknown_paths: vec!["loop budget exhausted".into()],
+            returned_paths: 1,
+        };
+        assert!(
+            !report.is_proved(),
+            "an unexplored path means the verification is incomplete"
+        );
+    }
+
+    /// A decided failure outranks an undecided obligation, and the undecided one
+    /// is counted separately rather than folded into the failure.
+    #[test]
+    fn a_decided_failure_outranks_an_undecided_obligation() {
+        let cex = counterexample();
+        let report = MirReport {
+            function: "f".into(),
+            obligations: vec![
+                ob(ObligationKind::Postcondition, Verdict::Unknown),
+                ob(panic_kind(), cex),
+            ],
+            unknown_paths: vec![],
+            returned_paths: 1,
+        };
+
+        let failure = report
+            .first_failure()
+            .expect("a decided failure must be reported even when an earlier obligation is undecided");
+        assert!(
+            matches!(failure.kind, ObligationKind::Panic { .. }),
+            "the panic is the decided failure, not the undecided postcondition"
+        );
+        assert_eq!(report.undecided(), 1, "the `Unknown` obligation is still counted");
+        assert!(!report.is_proved(), "a failure means the function is not proved");
+    }
+
+    /// `panics_ruled_out` counts discharged panic obligations only: not other
+    /// kinds, and not panics that were refuted.
+    #[test]
+    fn panics_ruled_out_counts_only_discharged_panics() {
+        let cex = counterexample();
+        let report = MirReport {
+            function: "f".into(),
+            obligations: vec![
+                ob(panic_kind(), Verdict::Unsat),
+                ob(panic_kind(), cex),
+                ob(ObligationKind::Postcondition, Verdict::Valid),
+            ],
+            unknown_paths: vec![],
+            returned_paths: 1,
+        };
+        assert_eq!(report.panics_ruled_out(), 1);
+    }
+
+    /// A vacuous precondition is a finding, and it must not read as a clean
+    /// report: the obligation is not discharged, so the function is not proved.
+    #[test]
+    fn a_vacuous_precondition_is_a_finding_not_a_pass() {
+        let report = MirReport {
+            function: "f".into(),
+            obligations: vec![ob(ObligationKind::VacuousPrecondition, Verdict::Unsat)],
+            unknown_paths: vec![],
+            returned_paths: 1,
+        };
+        assert!(!report.is_proved(), "an unsatisfiable precondition proves nothing");
+        let failure = report.first_failure().expect("the vacuity is a decided failure");
+        assert_eq!(failure.kind, ObligationKind::VacuousPrecondition);
+        assert!(
+            failure.failure_detail().contains("vacuous"),
+            "the detail must name the vacuity, got: {}",
+            failure.failure_detail()
+        );
+    }
+}
