@@ -32,21 +32,30 @@
 //!
 //! # What is checked
 //!
-//! Three families of obligation, all on the real MIR:
+//! Four families of obligation, all on the real MIR:
 //!
 //! 1. **Panic freedom.** Every `assert` rustc emits — overflow on `+`, division
 //!    by zero, shift past the width, index out of bounds — is a reachable
 //!    failure if the negated condition is satisfiable under the path condition.
 //!    A violation comes back as a counterexample, not as a vague failure.
 //! 2. **Postcondition.** At each `return`, `requires ∧ path ⇒ ensures`.
-//! 3. **Reachability.** An `unreachable` that is reachable, and a `requires`
+//! 3. **Loop invariant.** An `invariant:` clause is proved by induction: it must
+//!    hold on entry to the loop head, and one iteration must leave it true. A
+//!    loop with an invariant is *not* unwound, which is what lets a loop with a
+//!    symbolic trip count be decided rather than cut off. The head havocs the
+//!    locals the loop can write before assuming the invariant, so the exit edge
+//!    carries `invariant ∧ ¬guard` over every state the loop can leave — see
+//!    `exec::Cut`, and the section in `AGENTS.md` on why omitting that havoc
+//!    proves false postconditions.
+//! 4. **Reachability.** An `unreachable` that is reachable, and a `requires`
 //!    that no input can satisfy, are both reported rather than silently passed.
 //!
 //! # Bounded, and honest about it
 //!
-//! This is a *bounded* model checker, like Kani. Loops are unwound to a bound
-//! (`exec::DEFAULT_UNWIND`); a path that needs more is reported `Unknown`,
-//! never `Valid`. Calls into the same dump are inlined to a depth
+//! This is a *bounded* model checker, like Kani. A loop with no declared
+//! invariant is unwound to a bound (`exec::DEFAULT_UNWIND`); a path that needs
+//! more is reported `Unknown`, never `Valid`. Calls into the same dump are
+//! inlined to a depth
 //! (`exec::DEFAULT_INLINE_DEPTH`). A call to something the frontend does not
 //! model — an unknown intrinsic, a trait method, anything outside this dump —
 //! makes the *path* unknown rather than assuming a convenient result. An

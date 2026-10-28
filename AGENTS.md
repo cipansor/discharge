@@ -2024,3 +2024,63 @@ it a regression test rather than a test that happens to pass. Two details matter
 through `verify_function` with a postcondition, because the postcondition is what makes each
 path cost more than the last; and it runs on a 64 MB thread, because the harness's default
 stack is smaller than the main thread's and the workload overflows it.
+
+## Cutting a loop at its invariant: the header must havoc what the loop writes
+
+Loop invariants landed in the MIR frontend, and the first version was **unsound**. It
+verified a postcondition that is false. This is worth recording in full, because the
+mistake is the natural one and the symptom is a *success*.
+
+The shape was the obvious one for a CFG. On every edge into the loop header, assert the
+invariant; on an edge from a back edge, assert it and stop rather than re-enter. That
+closes the induction with no unwinding: the assertion at the back edge is the step, the
+assertion on the entry edge is the base case. Measured, it worked -- `count_evens` went
+from *path budget exhausted* in 2.8 s to *verified* in 0.06 s, and the realistic corpus
+went from 4 of 14 decided to 7 of 14.
+
+It was wrong. `sum_to` with the deliberately weakened invariant `i <= n` -- which is true
+on entry and preserved, but says nothing relating the accumulator to the counter -- came
+back **verified**, while the loop plainly returns a value that violates `ret <= 8` for
+`n = 8`. The tool had proved a false statement.
+
+The cause is what the exit edge carries. `advance` asserted the invariant and then
+continued into the header with the path the path *arrived* with. For the entry edge that
+is the pre-loop state, so the guard is evaluated there: `0 < n` gives `n >= 1`, and
+`!(0 < n)` gives `n == 0` with the counter still `0`. The exit edge is therefore only
+ever walked from the state of the *first* iteration. Everything the loop does on its
+second pass and later -- including writing the return value -- was never seen. A proof
+that only inspects the first iteration is not a proof of the loop.
+
+The fix is the standard rule, and it is a rule precisely because this is the trap. At the
+header, **havoc** the locals the loop can write -- replace each with a fresh variable --
+and only then assume the invariant. What the exit edge carries is then `I && !guard` over
+*arbitrary* values satisfying `I`, which is what the invariant is a claim about. The
+`havoc` set is an over-approximation (reachability from the header over the whole
+function), which is the safe direction: havocing a local the loop never writes loses
+information and can turn a proof into an open obligation, never the reverse. `_0`, the
+return place, must be in the set; leaving it out is the specific way the hole reappeared,
+since `s` in `sum_to` *is* `_0`.
+
+Two things made this findable rather than a silent false positive:
+
+* **A mutation test, not a reading.** The weakened invariant was checked by hand against
+  the corpus before being trusted. Reading the `advance` code did not reveal the bug; the
+  two-word diff that changed `s == i` to `s == 0`-equivalent did.
+* **A regression test that fails without the fix.** `an_invariant_too_weak_for_the_
+  postcondition_is_not_a_proof` asserts only "not verified" -- a counterexample or an open
+  obligation both satisfy it -- and it was confirmed to *pass* on the unsound version and
+  fail once havoc was disabled with `if true { continue; }`. A test written after the fix
+  that only pins the happy path would have missed this entirely.
+
+A smaller trap sits next to it. Classifying the edges needs care: the block *before* the
+header also jumps into it, and that edge is the entry, not the latch. The test that gets
+this right is `to <= from` -- strictly earlier targets are the entry, equal-or-later ones
+are the latch, and a header that loops to itself is a latch. A "cleaner" two-pass version
+that collected every block edging into the header from later in the layout classified the
+entry edge as a latch, cut the loop before it was entered, and reported a proof of a false
+postcondition again. The mutation tests caught it in seconds; a green suite after the
+change would not have, which is why they assert the *negative*.
+
+The general lesson: for a loop, an invariant is not a predicate to *check at the edges*,
+it is a predicate to *assume over the whole state space it describes*. Asserting it at the
+back edge is necessary and not sufficient; the header has to forget what it cannot know.

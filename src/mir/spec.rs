@@ -66,6 +66,19 @@ pub struct FnContract {
     pub requires: Vec<String>,
     /// Raw text of each `#[ensures(...)]`, in source order.
     pub ensures: Vec<String>,
+    /// Raw text of each loop `invariant:`, in source order.
+    ///
+    /// A loop invariant is not inferred. `wp` already made that call for its own
+    /// frontend (`Stmt::While::invariant` is not optional), and for the same
+    /// reason: the invariant is the induction hypothesis, and guessing it means
+    /// guessing the proof. A loop with no invariant is unwound and reported
+    /// incomplete, which is what happened here before this field existed.
+    ///
+    /// The text is not tied to a loop in the source. A function with one loop has
+    /// one invariant; a function with several loops and several `invariant:`
+    /// lines is refused rather than guessed at, because attaching the wrong
+    /// invariant to the wrong loop would be unsound.
+    pub invariants: Vec<String>,
     /// Line number of the `fn` item, for diagnostics.
     pub line: usize,
 }
@@ -126,6 +139,8 @@ pub fn extract(source: &str) -> Specs {
                 pending.requires.push(r.trim().to_string());
             } else if let Some(r) = t.strip_prefix("ensures:") {
                 pending.ensures.push(r.trim().to_string());
+            } else if let Some(r) = t.strip_prefix("invariant:") {
+                pending.invariants.push(r.trim().to_string());
             }
             continue;
         }
@@ -134,7 +149,10 @@ pub fn extract(source: &str) -> Specs {
         // exactly "the functions that carry a claim" rather than "every function
         // in the file".
         if let Some(name) = fn_name(line) {
-            if !pending.requires.is_empty() || !pending.ensures.is_empty() {
+            if !pending.requires.is_empty()
+                || !pending.ensures.is_empty()
+                || !pending.invariants.is_empty()
+            {
                 pending.line = lineno + 1;
                 specs.by_fn.insert(name, std::mem::take(&mut pending));
             }
@@ -210,6 +228,27 @@ pub fn eval_ensures(
     ret_signed: bool,
 ) -> Result<Pred, SpecError> {
     let mut p = Parser::new(text, args, Some(ret), signed, ret_signed);
+    let pred = p.parse_or()?;
+    p.expect_end()?;
+    Ok(pred)
+}
+
+/// Turn a loop `invariant:` into a predicate over the function's locals.
+///
+/// `names` maps a source-level name to the variable standing for that local at
+/// the loop head. It is the same expression language as `requires` / `ensures`,
+/// but the identifiers resolve against locals (`s`, `i`) rather than only
+/// parameters, because a loop invariant is usually about the accumulator.
+///
+/// A name that resolves to nothing is an error rather than a fresh variable:
+/// a typo in an invariant must not become an unconstrained unknown that makes
+/// the induction hypothesis vacuous.
+pub fn eval_invariant(
+    text: &str,
+    names: &BTreeMap<String, Var>,
+    signed: &BTreeSet<String>,
+) -> Result<Pred, SpecError> {
+    let mut p = Parser::new(text, names, None, signed, false);
     let pred = p.parse_or()?;
     p.expect_end()?;
     Ok(pred)

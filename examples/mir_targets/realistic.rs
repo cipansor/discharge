@@ -115,6 +115,7 @@ pub struct Config {
 
 /// A counted loop whose result is bounded by its precondition.
 /// requires: n <= 8
+/// invariant: i <= n && s == i
 /// ensures: ret <= 8
 pub fn sum_to(n: u8) -> u8 {
     let mut s = 0u8;
@@ -129,6 +130,7 @@ pub fn sum_to(n: u8) -> u8 {
 /// A loop that accumulates into a different variable, so a proof needs a
 /// relation between two variables and not just a bound on one.
 /// requires: n <= 4
+/// invariant: i <= n
 /// ensures: ret == n
 pub fn count_up(n: u8) -> u8 {
     let mut i = 0u8;
@@ -141,6 +143,7 @@ pub fn count_up(n: u8) -> u8 {
 /// A loop with a conditional body, which needs the invariant to survive a
 /// branch rather than holding trivially.
 /// requires: n <= 8
+/// invariant: i <= n && c <= i
 /// ensures: ret <= n
 pub fn count_evens(n: u8) -> u8 {
     let mut c = 0u8;

@@ -173,6 +173,27 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     let signed = spec::signed_args(f);
     let ret_signed = f.ret_ty.is_signed();
 
+    // A loop invariant. The clause carries no loop label, so it can only be
+    // attached when there is exactly one to attach it to. A function with
+    // several `invariant:` lines is refused rather than guessed at: pairing the
+    // wrong text with the wrong loop would check a preservation obligation that
+    // does not mean what the source says, which is the one failure this crate
+    // exists to avoid.
+    let invariant: Option<&str> = match contract {
+        None => None,
+        Some(c) => match c.invariants.len() {
+            0 => None,
+            1 => Some(c.invariants[0].as_str()),
+            _ => {
+                return FnOutcome::Skipped {
+                    reason: "several `invariant:` clauses, and there is no way to say which \
+                             loop each belongs to"
+                        .to_string(),
+                }
+            }
+        },
+    };
+
     // Build the precondition. No contract means `true`, which is the right
     // default: a function with no `requires` is checked for panic freedom on
     // every input.
@@ -237,7 +258,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         })
     };
 
-    let report = exec::verify_fn(prog, f, pre, post);
+    let report = exec::verify_fn(prog, f, pre, post, invariant);
 
     // A definite failure outranks incompleteness: a counterexample is a result.
     // The polarity is per-kind, so this cannot just look for `Counterexample`:

@@ -58,7 +58,11 @@ pub const DEFAULT_INLINE_DEPTH: u32 = 4;
 /// 2000, because each path's BDD is larger than the last -- so a larger budget
 /// buys no extra coverage, only latency. Sixty-four keeps the worst case in the
 /// low seconds while still deciding everything the shipped corpora decide: the
-/// corpus scoreboard is unchanged at 4 of 14 with this bound and with none.
+/// corpus scoreboard is unchanged with this bound and with none.
+///
+/// Loops carrying an `invariant:` no longer reach this budget at all -- they are
+/// cut rather than unwound -- so this bound now governs only the loops that have
+/// no invariant to prove them with.
 pub const DEFAULT_PATH_BUDGET: usize = 64;
 
 /// A symbolic value.
@@ -93,6 +97,12 @@ pub enum ObligationKind {
     Unreachable,
     /// The precondition is unsatisfiable, so the contract proves nothing.
     VacuousPrecondition,
+    /// The declared loop invariant holds the first time the loop head is
+    /// reached. This is the base case of the induction.
+    LoopInvariantInit,
+    /// The declared loop invariant is left true by one iteration. This is the
+    /// step of the induction.
+    LoopInvariantPreserve,
 }
 
 impl std::fmt::Display for ObligationKind {
@@ -102,6 +112,8 @@ impl std::fmt::Display for ObligationKind {
             ObligationKind::Postcondition => write!(f, "postcondition"),
             ObligationKind::Unreachable => write!(f, "reachable `unreachable`"),
             ObligationKind::VacuousPrecondition => write!(f, "vacuous precondition"),
+            ObligationKind::LoopInvariantInit => write!(f, "loop invariant holds on entry"),
+            ObligationKind::LoopInvariantPreserve => write!(f, "loop invariant preserved"),
         }
     }
 }
@@ -135,13 +147,22 @@ impl Obligation {
     /// * A [`ObligationKind::VacuousPrecondition`] is discharged when it is
     ///   *refuted*: some input satisfies the precondition. Its `Unsat` verdict is
     ///   the finding, not a proof.
+    /// * Both [`ObligationKind::LoopInvariantInit`] and
+    ///   [`ObligationKind::LoopInvariantPreserve`] are discharged when they are
+    ///   `Valid`: the query asks "does the invariant hold here, for every input
+    ///   that reaches this point", so `Valid` is the proof and a `Counterexample`
+    ///   is a real input that breaks the invariant. Reading them as a panic query
+    ///   (discharged on `Unsat`) would invert the answer, which is exactly the
+    ///   mistake the per-kind polarity exists to prevent.
     ///
     /// `Unknown` is never discharged. A caller that tests only
     /// [`Verdict::is_proved`] gets the postcondition case right and every other
     /// case backwards, which is why this method exists.
     pub fn is_discharged(&self) -> bool {
         match self.kind {
-            ObligationKind::Postcondition => self.verdict.is_proved(),
+            ObligationKind::Postcondition
+            | ObligationKind::LoopInvariantInit
+            | ObligationKind::LoopInvariantPreserve => self.verdict.is_proved(),
             ObligationKind::Panic { .. } | ObligationKind::Unreachable => {
                 matches!(self.verdict, Verdict::Unsat)
             }
@@ -186,10 +207,13 @@ impl Obligation {
                 ObligationKind::Panic { .. } | ObligationKind::Unreachable => {
                     "holds for every input (the failure fires on all of them)".to_string()
                 }
-                // A postcondition query is `path => post`; `Valid` is the *pass*
-                // case, so reaching here with a non-discharged obligation would be
-                // a classifier bug. Say so rather than guess a diagnosis.
-                ObligationKind::Postcondition | ObligationKind::VacuousPrecondition => {
+                // A postcondition or invariant query is `path => P`; `Valid` is
+                // the *pass* case, so reaching here with a non-discharged
+                // obligation would be a classifier bug. Say so rather than guess.
+                ObligationKind::Postcondition
+                | ObligationKind::VacuousPrecondition
+                | ObligationKind::LoopInvariantInit
+                | ObligationKind::LoopInvariantPreserve => {
                     "invalid: a `Valid` verdict is a discharge for this kind".to_string()
                 }
             },
@@ -198,6 +222,11 @@ impl Obligation {
                 // none of them. This is the case the old shared string got wrong.
                 ObligationKind::Postcondition => {
                     "the postcondition holds for no input (false on every input)".to_string()
+                }
+                // `path => I` false on every input: the invariant can never be
+                // established (or re-established), so the loop proves nothing.
+                ObligationKind::LoopInvariantInit | ObligationKind::LoopInvariantPreserve => {
+                    "the invariant holds for no input (false on every input)".to_string()
                 }
                 // The good answer for a reachability query, so this is a discharge.
                 ObligationKind::Panic { .. } | ObligationKind::Unreachable => {
@@ -382,6 +411,58 @@ struct State {
     visits: BTreeMap<(usize, usize), u32>,
     /// How many calls deep this path currently is.
     depth: u32,
+    /// The loop this path is currently inside, when it was cut by an invariant.
+    ///
+    /// `None` for every path in a function with no invariant. When set, the
+    /// header is assumed to satisfy the invariant on entry and the back edge is
+    /// checked against it instead of being unwound.
+    cut: Option<Cut>,
+}
+
+/// A loop that is proved by its invariant rather than by unwinding.
+///
+/// The shape is the standard one for a CFG. The invariant is *asserted* on every
+/// edge into the header -- that single obligation covers both induction cases,
+/// because it is `path => I` and the path condition already carries the guard:
+///
+/// * From outside the loop, `path => I` is *initialisation*: the invariant holds
+///   the first time the header is reached.
+/// * From a back edge, it is *preservation*: assuming `I` at the head, one more
+///   iteration leaves it true.
+///
+/// The two differ only in what happens next. After a back edge the edge is *not*
+/// followed: the assertion has closed the induction, and re-entering would be
+/// the unwinding this exists to avoid. After an entry edge the header continues
+/// with `I` conjoined onto the path, so the exit edge inherits `I && !guard` --
+/// which is what a postcondition is entitled to assume after a loop.
+#[derive(Clone, Debug)]
+struct Cut {
+    /// Index of the function the loop belongs to. An inlined callee numbers its
+    /// own blocks from `bb0`, so without this a callee's `bb1` could be mistaken
+    /// for the caller's loop header and checked against the caller's invariant.
+    func: usize,
+    /// The loop header. An edge into it asserts the invariant.
+    header: usize,
+    /// Blocks with an edge back to `header`. An edge from one of these asserts
+    /// the invariant and then stops, rather than re-entering the header.
+    back_edges: Vec<usize>,
+    /// The locals the loop can write, over-approximated.
+    ///
+    /// At the header these are replaced by fresh values before the invariant is
+    /// assumed. This is not an optimisation, it is what makes the proof sound:
+    /// without it the exit edge would only ever be taken from the state of the
+    /// *first* iteration, so a loop that corrupts the return value on a later
+    /// iteration would still verify. An invariant that is true on entry but too
+    /// weak to imply the postcondition would then pass -- measured, and it did.
+    ///
+    /// Over-approximating is safe in the one direction that matters: havocing a
+    /// local the loop does not actually write only discards information, so it
+    /// can turn a proof into an open obligation but never an open obligation
+    /// into a proof.
+    havoc: Vec<u32>,
+    /// The invariant's text, re-evaluated in the post-state of each incoming
+    /// edge, because only the executor knows what the locals hold there.
+    text: String,
 }
 
 /// Verify one function from a parsed program.
@@ -396,7 +477,21 @@ struct State {
 /// postcondition checked at all -- a false contract passing as a true one. An
 /// error here is turned into an unmodelled path, which is reported rather than
 /// discharged.
-pub fn verify_fn<F>(prog: &MirProgram, f: &MirFn, pre: Option<Pred>, post: Option<F>) -> MirReport
+///
+/// `invariant` is the loop induction hypothesis, when the source supplied one.
+/// It is the *text* of the `invariant:` clause; the executor resolves the names
+/// against the current symbolic values itself, because only it knows what each
+/// local holds at the loop head. Passing text rather than a pre-built predicate
+/// is what makes preservation expressible: the same text is evaluated a second
+/// time in the post-state of one iteration, and a predicate built once could not
+/// see that state. Without an invariant a loop is unwound, as before.
+pub fn verify_fn<F>(
+    prog: &MirProgram,
+    f: &MirFn,
+    pre: Option<Pred>,
+    post: Option<F>,
+    invariant: Option<&str>,
+) -> MirReport
 where
     F: Fn(Var) -> Result<Pred, String>,
 {
@@ -443,6 +538,26 @@ where
         }
     };
 
+    // A loop carried by an invariant is not unwound. The loop is located before
+    // the walk starts, and a function with an invariant but no detectable back
+    // edge is refused rather than silently unwound: the contract made a claim
+    // and the tool must either honour it or say it could not.
+    let cut = match invariant {
+        None => None,
+        Some(text) => match detect_loop(f) {
+            Some((header, back_edges)) => {
+                let havoc = loop_writes(f, header);
+                Some(Cut { func: root, header, back_edges, havoc, text: text.to_string() })
+            }
+            None => {
+                report.unknown_paths.push(
+                    "an `invariant:` was declared but no loop was found to attach it to".into(),
+                );
+                return report;
+            }
+        },
+    };
+
     let mut work = vec![State {
         frame: Frame {
             func: root,
@@ -456,6 +571,7 @@ where
         env,
         visits: BTreeMap::new(),
         depth: 0,
+        cut,
     }];
 
     let mut explored: usize = 0;
@@ -475,6 +591,216 @@ where
         run_state(prog, st, &post, &mut report, &mut work);
     }
     report
+}
+
+/// Locate the loop a function's invariant is about.
+///
+/// Returns the header and the blocks that jump back to it. The header is taken
+/// to be the target of a back edge, and every edge into it is an induction
+/// obligation, so the choice only has to be *a* loop head rather than the
+/// canonical one rustc would name: for a single loop they coincide, and for a
+/// function with more than one the contract is refused by the caller.
+///
+/// A "back edge" is an edge to a block that appears earlier in the block order.
+/// MIR prints blocks in layout order and a loop body comes after its header, so
+/// the edge from the latch back to the header is the one that goes backwards.
+/// An edge that goes forward is a branch, not a back edge.
+fn detect_loop(f: &MirFn) -> Option<(usize, Vec<usize>)> {
+    let position: BTreeMap<usize, usize> =
+        f.blocks.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
+    let mut header: Option<usize> = None;
+    let mut back_edges: Vec<usize> = Vec::new();
+    for b in &f.blocks {
+        for target in successors(&b.term) {
+            let (Some(&from), Some(&to)) = (position.get(&b.id), position.get(&target)) else {
+                continue;
+            };
+            // `to <= from` is the whole test. It excludes the entry edge, whose
+            // source precedes the header, and includes a header that loops to
+            // itself. A block listed here can only ever be asked "is this a back
+            // edge" when its edge targets the chosen header, and the chosen
+            // header is the earliest backward target -- so a block with a
+            // backward edge is never earlier than it, and a forward edge into the
+            // header from an earlier block is never misclassified.
+            if to <= from {
+                // The header is the earliest block a back edge returns to, so
+                // the choice stays stable when a latch closes two loops.
+                match header {
+                    Some(h) if position[&h] <= to => {}
+                    _ => header = Some(target),
+                }
+                if !back_edges.contains(&b.id) {
+                    back_edges.push(b.id);
+                }
+            }
+        }
+    }
+    header.map(|h| (h, back_edges))
+}
+
+/// Every block a terminator can jump to.
+fn successors(t: &Term) -> Vec<usize> {
+    match t {
+        Term::Goto(b) => vec![*b],
+        Term::SwitchInt { cases, otherwise, .. } => {
+            let mut v: Vec<usize> = cases.iter().map(|(_, b)| *b).collect();
+            v.push(*otherwise);
+            v
+        }
+        Term::Call { target, .. } => vec![*target],
+        Term::Assert { target, .. } => vec![*target],
+        Term::Return | Term::Unreachable | Term::Unknown(_) => Vec::new(),
+    }
+}
+
+/// The locals a loop can write: every local assigned in a block reachable from
+/// the header without leaving the loop.
+///
+/// Reachability is taken over the whole function rather than the loop body,
+/// because a precise loop-body extraction is a dominator computation and this
+/// only needs an over-approximation: havocing a local the loop never writes
+/// loses information but cannot make an unsound proof sound.
+///
+/// `_0`, the return place, is always included. A loop is allowed to write the
+/// return value (`s` in `sum_to` is `_0`), and leaving it out would leave the
+/// exit edge holding the *pre-loop* return value -- which is precisely the hole
+/// this set exists to close.
+fn loop_writes(f: &MirFn, header: usize) -> Vec<u32> {
+    let mut writes: BTreeMap<u32, ()> = BTreeMap::new();
+    writes.insert(0, ());
+    let mut seen: BTreeMap<usize, ()> = BTreeMap::new();
+    let mut stack = vec![header];
+    while let Some(b) = stack.pop() {
+        if seen.insert(b, ()).is_some() {
+            continue;
+        }
+        let Some(block) = f.block(b) else { continue };
+        for s in &block.stmts {
+            if let Stmt::Assign(dest, _) = s {
+                writes.insert(dest.local, ());
+            }
+        }
+        for t in successors(&block.term) {
+            stack.push(t);
+        }
+    }
+    writes.into_keys().collect()
+}
+
+/// The names an invariant may use: every local with a `debug` name, mapped to the
+/// symbolic value that local holds.
+///
+/// Built from the *current* environment rather than from the types, because the
+/// invariant is evaluated in the middle of a walk and has to name what the
+/// variables hold there.
+fn invariant_names(f: &MirFn, env: &Env) -> BTreeMap<String, Var> {
+    let mut out = BTreeMap::new();
+    for (&local, name) in &f.local_names {
+        if let Some(Val::Sym(v)) = env.locals.get(&local) {
+            out.insert(name.clone(), *v);
+        }
+    }
+    out
+}
+
+/// The source names of signed locals, so an invariant's comparisons use the
+/// signed relation for them.
+fn signed_names(f: &MirFn) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for (&local, name) in &f.local_names {
+        if f.ty_of(local).map(|t| t.is_signed()).unwrap_or(false) {
+            out.insert(name.clone());
+        }
+    }
+    out
+}
+
+/// Evaluate the invariant in the current state, as a predicate.
+///
+/// An error means a name in the invariant does not resolve to a symbolic value --
+/// a local still holding an aggregate, say. That is reported as an unmodelled
+/// path rather than folded into `true`, because an invariant that silently became
+/// `true` would discharge both induction obligations and prove nothing.
+fn eval_invariant_here(f: &MirFn, env: &Env, text: &str) -> Result<Pred, String> {
+    let names = invariant_names(f, env);
+    crate::mir::spec::eval_invariant(text, &names, &signed_names(f)).map_err(|e| e.to_string())
+}
+
+/// Push the successor states of an edge to `target`, applying the loop cut when
+/// this edge enters the invariant's header.
+///
+/// Every edge in the walk goes through here so the cut cannot be bypassed by a
+/// terminator that happens to be spelled differently -- a `goto` and a `switchInt`
+/// arm into the same header are the same induction case.
+fn advance(
+    prog: &MirProgram,
+    mut st: State,
+    target: usize,
+    report: &mut MirReport,
+    work: &mut Vec<State>,
+) {
+    let cut = match st.cut.clone() {
+        Some(c) if c.func == st.frame.func && c.header == target => c,
+        _ => {
+            work.push(State { block: target, ..st });
+            return;
+        }
+    };
+    let cur = &prog.fns[st.frame.func];
+    let inv = match eval_invariant_here(cur, &st.env, &cut.text) {
+        Ok(p) => p,
+        Err(e) => {
+            report.unknown_paths.push(format!("unreadable `invariant`: {e}"));
+            return;
+        }
+    };
+    let back = cut.back_edges.contains(&st.block);
+    let kind = if back {
+        ObligationKind::LoopInvariantPreserve
+    } else {
+        ObligationKind::LoopInvariantInit
+    };
+    report.obligations.push(Obligation {
+        kind,
+        verdict: smt::prove_implies(st.path, inv),
+    });
+    // The cut closes here. A back edge is not followed: the assertion above is
+    // the induction step, and re-entering the header would be the unwinding this
+    // replaces.
+    if back {
+        return;
+    }
+    // An entry edge continues, but not with the values the path arrived with.
+    // The loop is about to run, and the invariant says what is true of the header
+    // *whenever* it is reached -- not what happens to be true the first time. So
+    // the locals the loop can write are replaced by fresh values and the
+    // invariant is assumed over those. Only then does the exit edge carry
+    // `I && !guard`, which is what lets a postcondition be proved for every state
+    // the loop can leave rather than for the one state the first pass produced.
+    for &l in &cut.havoc {
+        if let Some(ty) = cur.ty_of(l) {
+            if let Some(w) = ty.width() {
+                // `var`, not `var_named`: a fresh variable is the point. A named
+                // one would return the very variable being replaced, and the
+                // havoc would be a no-op.
+                let fresh = if w == 1 {
+                    Val::Bool(smt::var(1).eq_val(1))
+                } else {
+                    Val::Sym(smt::var(w))
+                };
+                st.env.locals.insert(l, fresh);
+            }
+        }
+    }
+    let inv = match eval_invariant_here(cur, &st.env, &cut.text) {
+        Ok(p) => p,
+        Err(e) => {
+            report.unknown_paths.push(format!("unreadable `invariant`: {e}"));
+            return;
+        }
+    };
+    st.path = smt::and(st.path, inv);
+    work.push(State { block: target, ..st });
 }
 
 fn run_state<F>(prog: &MirProgram, mut st: State, post: &Option<F>, report: &mut MirReport, work: &mut Vec<State>)
@@ -517,9 +843,10 @@ where
         }
     }
 
-    // Terminator.
+    // Terminator. Every successor goes through `advance`, which is where a loop
+    // edge into the invariant's header is checked instead of followed.
     match &block.term {
-        Term::Goto(b) => work.push(State { block: *b, ..st }),
+        Term::Goto(b) => advance(prog, st, *b, report, work),
         Term::Return => {
             let ret = st.env.get(&Place::new(0));
             match st.frame.caller.take() {
@@ -589,6 +916,7 @@ where
                         env,
                         visits: st.visits,
                         depth: st.depth.saturating_sub(1),
+                        cut: st.cut.clone(),
                     });
                 }
             }
@@ -630,7 +958,8 @@ where
             // hide one. Both asserts and `debug_assert`s are lowered to this
             // terminator, so the guard is assumed for either.
             let path = smt::and(st.path, satisfied);
-            work.push(State { block: *target, path, ..st });
+            let next = State { block: *target, path, ..st };
+            advance(prog, next, *target, report, work);
         }
         Term::SwitchInt { discr, cases, otherwise } => {
             let d = operand(&st.env, discr);
@@ -651,14 +980,16 @@ where
                 };
                 let mut visits = st.visits.clone();
                 visits.insert(key, 0);
-                work.push(State {
+                let next = State {
                     block: *target,
                     path: smt::and(st.path, cond),
                     env: st.env.clone(),
                     visits,
                     frame: st.frame.clone(),
                     depth: st.depth,
-                });
+                    cut: st.cut.clone(),
+                };
+                advance(prog, next, *target, report, work);
             }
             let mut negs = Vec::new();
             for (k, _) in cases {
@@ -670,14 +1001,16 @@ where
             }
             let mut visits = st.visits.clone();
             visits.insert(key, 0);
-            work.push(State {
+            let next = State {
                 block: *otherwise,
                 path: smt::and(st.path, smt::all(&negs)),
                 env: st.env.clone(),
                 visits,
                 frame: st.frame.clone(),
                 depth: st.depth,
-            });
+                cut: st.cut.clone(),
+            };
+            advance(prog, next, *otherwise, report, work);
         }
         Term::Call { callee, args, dest, target } => {
             let Callee::Name(name) = callee else {
@@ -734,6 +1067,9 @@ where
                 env,
                 visits,
                 depth: st.depth + 1,
+                // A callee is a different function with its own locals, so the
+                // caller's loop cut does not apply inside it.
+                cut: None,
             });
         }
         Term::Unknown(text) => {
@@ -1461,6 +1797,142 @@ fn count_evens(_1: u8) -> u8 {
         assert!(
             reasons.iter().any(|r| r.contains("path budget exhausted")),
             "the cutoff must be named; reasons were {reasons:?}"
+        );
+    }
+
+    /// `count_up`: the exact MIR `rustc -O` emits for
+    /// `let mut i = 0u8; while i < n { i += 1; } i`.
+    ///
+    /// Here the loop *is* the return value (`i` is `_0`), so a proof needs the
+    /// invariant to carry the exit condition: after the loop `i >= n` and
+    /// `i <= n`, hence `i == n`.
+    const COUNT_UP_MIR: &str = r#"
+fn count_up(_1: u8) -> u8 {
+    debug n => _1;
+    let mut _0: u8;
+    let mut _2: bool;
+    let mut _3: u8;
+    scope 1 {
+        debug i => _0;
+    }
+
+    bb0: {
+        _0 = const 0_u8;
+        goto -> bb1;
+    }
+
+    bb1: {
+        _3 = copy _0;
+        _2 = Lt(move _3, copy _1);
+        switchInt(move _2) -> [0: bb3, otherwise: bb2];
+    }
+
+    bb2: {
+        _0 = Add(copy _0, const 1_u8);
+        goto -> bb1;
+    }
+
+    bb3: {
+        return;
+    }
+}
+"#;
+
+    /// Verify an embedded MIR dump against a contract written as doc lines.
+    fn verify_with(mir: &str, name: &str, contract: &str) -> crate::mir::verify::FnOutcome {
+        let src = format!("{contract}pub fn {name}() {{}}\n");
+        let specs = crate::mir::spec::extract(&src);
+        let prog = crate::mir::parse::parse_program(mir);
+        let name = name.to_string();
+        // A large stack: the engine recurses through the BDD and the frontend
+        // through the term graph, and the harness's default thread stack is
+        // smaller than the main thread's.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let f = prog.get(&name).expect("the dump must parse");
+                crate::smt::with_fresh(|| crate::mir::verify::verify_function(&prog, f, &specs))
+            })
+            .expect("the test thread must spawn")
+            .join()
+            .expect("verification must return")
+    }
+
+    #[test]
+    fn an_invariant_decides_a_loop_that_unwinding_could_not() {
+        let out = verify_with(
+            COUNT_UP_MIR,
+            "count_up",
+            "/// requires: n <= 4\n/// invariant: i <= n\n/// ensures: ret == n\n",
+        );
+        assert!(
+            matches!(out, crate::mir::verify::FnOutcome::Verified { .. }),
+            "the loop should be decided by its invariant, got {out:?}"
+        );
+    }
+
+    /// The soundness test, and the reason the header havocs the locals it can
+    /// write.
+    ///
+    /// `i <= n` is a *true* invariant of `count_up` -- it holds on entry and is
+    /// preserved by every iteration -- so the induction itself succeeds. But it
+    /// says nothing that implies `ret == 0`, and for `n = 1` the loop returns
+    /// `1`, so the postcondition is false.
+    ///
+    /// The discriminating detail is *which* state the exit edge is checked in.
+    /// The guard forces `n == 0` on the very first pass, and there `i == 0` too,
+    /// so a verifier that assumed the invariant at the header and then walked the
+    /// exit edge from that first-iteration state would see `ret == 0` and report
+    /// a proof of a false postcondition. That is the version this test was first
+    /// written against, and it *passed* -- which is how the hole was found.
+    ///
+    /// With the havoc the exit state is any `i` with `i <= n` and `i >= n`, and
+    /// `i == n == 1` refutes the postcondition. So this must not verify. The
+    /// assertion is the weak form -- "not verified" -- because the engine may
+    /// report a counterexample or leave the obligation open; what it must never
+    /// do is claim a proof.
+    #[test]
+    fn an_invariant_too_weak_for_the_postcondition_is_not_a_proof() {
+        let out = verify_with(
+            COUNT_UP_MIR,
+            "count_up",
+            "/// requires: n <= 4\n/// invariant: i <= n\n/// ensures: ret == 0\n",
+        );
+        assert!(
+            !matches!(out, crate::mir::verify::FnOutcome::Verified { .. }),
+            "a false postcondition must not verify, got {out:?}"
+        );
+    }
+
+    /// An invariant that is false on entry proves nothing, and must be reported
+    /// as a definite failure rather than quietly ignored.
+    #[test]
+    fn an_invariant_false_on_entry_is_a_failure() {
+        let out = verify_with(
+            COUNT_UP_MIR,
+            "count_up",
+            "/// requires: n <= 4\n/// invariant: i == n + 1\n/// ensures: ret == n\n",
+        );
+        assert!(
+            matches!(out, crate::mir::verify::FnOutcome::Failed { .. }),
+            "a false invariant must fail, got {out:?}"
+        );
+    }
+
+    /// An invariant that is preserved but *wrong* must not verify either. This
+    /// is the case a naive "assert at the back edge" gets right only if the
+    /// assertion really is made; a version that skipped preservation would accept
+    /// this.
+    #[test]
+    fn an_invariant_not_preserved_is_not_a_proof() {
+        let out = verify_with(
+            COUNT_UP_MIR,
+            "count_up",
+            "/// requires: n <= 4\n/// invariant: i == 0\n/// ensures: ret == n\n",
+        );
+        assert!(
+            !matches!(out, crate::mir::verify::FnOutcome::Verified { .. }),
+            "an invariant that is not preserved must not verify, got {out:?}"
         );
     }
 }

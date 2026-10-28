@@ -1205,11 +1205,38 @@ pub fn clamp(x: u32, lo: u32, hi: u32) -> u32 {
 }
 ```
 
-The scanner is deliberately strict. A `requires:` or `ensures:` that sits before a
+A loop is proved by an `invariant:` line rather than by unwinding. It is the
+induction hypothesis: true on entry to the loop head, and left true by one
+iteration. Naming it is what makes a loop with a symbolic trip count decidable
+instead of cut off at an unwind bound:
+
+```rust,ignore
+/// requires: n <= 8
+/// invariant: i <= n && s == i
+/// ensures: ret <= 8
+pub fn sum_to(n: u8) -> u8 {
+    let mut s = 0u8;
+    let mut i = 0u8;
+    while i < n { s += 1; i += 1; }
+    s
+}
+```
+
+An invariant may name any local, not just the parameters. It is checked twice —
+once on entry to the head, once across an iteration — and at the head the locals
+the loop can write are replaced by fresh values before the invariant is assumed,
+so the state after the loop is *any* state satisfying the invariant and the exit
+condition, not the state of the first pass. Omitting that step would prove false
+postconditions; `AGENTS.md` records the measured case.
+
+The scanner is deliberately strict. A `requires:`, `ensures:` or `invariant:` that sits before a
 `const`, a `struct` or a module comment is *not* attached to the next function, so
 a misplaced contract is dropped rather than silently applied to the wrong item.
 A contract expression outside the small grammar — a function call, a cast, an
-unknown name — is refused rather than approximated.
+unknown name — is refused rather than approximated. An `invariant:` clause
+carries no loop label, so a function may have at most one; a second is refused
+rather than guessed at, since pairing the wrong text with the wrong loop would
+check an obligation that does not mean what the source says.
 
 ### What is read from where, and why
 
