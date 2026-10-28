@@ -754,6 +754,16 @@ fn loop_writes(f: &MirFn, header: usize) -> Vec<u32> {
                 writes.insert(dest.local, ());
             }
         }
+        // A call writes its destination too, and that write is not a statement:
+        // rustc spells `x = f(..)` as a `Call` terminator whose `dest` is `x`. Reading
+        // only `Stmt::Assign` missed it, so a counter advanced by a call
+        // (`i = i.wrapping_add(1)`) stayed out of the havoc set and kept the value it
+        // had when the header was first entered. The induction step then proved the
+        // invariant for that one value rather than for the loop, and a postcondition
+        // that only holds on the first iteration came back `Verified`.
+        if let Term::Call { dest, .. } = &block.term {
+            writes.insert(dest.local, ());
+        }
         for t in successors(&block.term) {
             stack.push(t);
         }
@@ -1157,31 +1167,51 @@ where
                 report.unknown_paths.push("indirect call not modelled".into());
                 return;
             };
-            // A modelled `core::num` operation is answered here, before the
-            // same-dump lookup, because there is no body in the dump to inline:
-            // the definition is in `intrinsics`, and it is exact.
-            if let Some(done) = try_intrinsic(prog, st.frame.func, name, args, dest, &mut st.env) {
-                let next = match done {
-                    Ok(()) => State { block: *target, ..st },
-                    Err(e) => {
-                        report.unknown_paths.push(e);
-                        return;
-                    }
-                };
-                advance(prog, next, *target, report, work);
-                return;
+            // The same-dump lookup runs *first*, and on the full name. A `core::num`
+            // name is only an intrinsic when the dump has no body for it: the model in
+            // `intrinsics` is a definition of `core`'s function, and a user function
+            // that happens to be called `wrapping_add` is a different function.
+            // Answering from `intrinsics` first let such a function shadow the
+            // intrinsic, so a `wrapping_add` that returns `0` had its *actual* body
+            // ignored and was modelled as `a + b` -- a false proof of `ret == 3` for
+            // `a == 1, b == 2`.
+            //
+            // Matching the full name, not the suffix, is what keeps the other
+            // direction honest too. rustc prints the intrinsic as the qualified path
+            // `core::num::<impl u8>::wrapping_add`, which never equals a plain
+            // same-dump name, so a user `wrapping_add` and `u8::wrapping_add` can
+            // coexist: the first is inlined by the exact match, the second falls
+            // through to the model.
+            let exact = prog.fns.iter().position(|g| g.name == *name);
+            if exact.is_none() {
+                if let Some(done) =
+                    try_intrinsic(prog, st.frame.func, name, args, dest, &mut st.env)
+                {
+                    let next = match done {
+                        Ok(()) => State { block: *target, ..st },
+                        Err(e) => {
+                            report.unknown_paths.push(e);
+                            return;
+                        }
+                    };
+                    advance(prog, next, *target, report, work);
+                    return;
+                }
             }
             if st.depth + 1 >= DEFAULT_INLINE_DEPTH {
                 report.unknown_paths.push(format!("call depth limit reached at `{name}`"));
                 return;
             }
             // Only same-dump calls can be inlined. Assuming a return value for
-            // anything else would be assuming the conclusion, so it is unknown.
-            let Some(idx) = prog
-                .fns
-                .iter()
-                .position(|g| g.name == *name || g.name.rsplit("::").next() == Some(name.as_str()))
-            else {
+            // anything else would be assuming the conclusion, so it is unknown. The
+            // suffix match is the fallback for a name rustc prints with a path prefix
+            // (`module::f`); an exact match above already took the unambiguous case.
+            let inline_idx = exact.or_else(|| {
+                prog.fns
+                    .iter()
+                    .position(|g| g.name.rsplit("::").next() == Some(name.as_str()))
+            });
+            let Some(idx) = inline_idx else {
                 report.unknown_paths.push(format!("call to unmodelled function `{name}`"));
                 return;
             };
@@ -2075,6 +2105,131 @@ fn count_up(_1: u8) -> u8 {
         assert!(
             !matches!(out, crate::mir::verify::FnOutcome::Verified { .. }),
             "a false postcondition must not verify, got {out:?}"
+        );
+    }
+
+    /// The same loop, but the counter is advanced by a *call* rather than by an
+    /// `Add` statement.
+    ///
+    /// This is the shape `rustc` emits for `i = i.wrapping_add(1)`: the write to
+    /// `i` is the `Call` terminator's destination, not a `Stmt::Assign`. The
+    /// havoc set is built from the loop body's writes, and reading only
+    /// `Stmt::Assign` missed the call destination -- so `i` kept the value it had
+    /// on the first entry, the induction step was checked against that one value,
+    /// and the same false postcondition as above came back `Verified`.
+    ///
+    /// The fixture keeps the counter on `_2` (not `_0`) so the call destination is
+    /// the only write to it inside the loop, which is what isolates the hole: with
+    /// `Add` instead of the call, `an_invariant_too_weak_for_the_postcondition_is_not_a_proof`
+    /// already covers the statement form.
+    const COUNT_VIA_CALL_MIR: &str = r#"
+fn count_via_call(_1: u8) -> u8 {
+    debug n => _1;
+    let mut _0: u8;
+    let mut _2: u8;
+    let mut _3: bool;
+    let mut _4: u8;
+    scope 1 {
+        debug i => _2;
+    }
+
+    bb0: {
+        _2 = const 0_u8;
+        goto -> bb1;
+    }
+
+    bb1: {
+        _4 = copy _2;
+        _3 = Lt(move _4, copy _1);
+        switchInt(move _3) -> [0: bb3, otherwise: bb2];
+    }
+
+    bb2: {
+        _2 = core::num::<impl u8>::wrapping_add(move _2, const 1_u8) -> [return: bb4, unwind continue];
+    }
+
+    bb4: {
+        goto -> bb1;
+    }
+
+    bb3: {
+        _0 = copy _2;
+        return;
+    }
+}
+"#;
+
+    /// A counter written only by a call must still be havoced at the loop header.
+    #[test]
+    fn a_call_written_counter_is_havoced_like_an_assigned_one() {
+        let out = verify_with(
+            COUNT_VIA_CALL_MIR,
+            "count_via_call",
+            "/// requires: n <= 4\n/// invariant: i <= n\n/// ensures: ret == 0\n",
+        );
+        assert!(
+            !matches!(out, crate::mir::verify::FnOutcome::Verified { .. }),
+            "a call-written counter must not escape the havoc, got {out:?}"
+        );
+    }
+
+    /// And the sound direction: the same loop with the invariant that actually
+    /// decides it must still verify, so the fix to the havoc set did not simply
+    /// make every call-carrying loop unknown.
+    #[test]
+    fn a_call_written_counter_is_still_decidable() {
+        let out = verify_with(
+            COUNT_VIA_CALL_MIR,
+            "count_via_call",
+            "/// requires: n <= 4\n/// invariant: i <= n\n/// ensures: ret == n\n",
+        );
+        assert!(
+            matches!(out, crate::mir::verify::FnOutcome::Verified { .. }),
+            "the call-written loop should still be decided by its invariant, got {out:?}"
+        );
+    }
+
+    /// A user function that happens to be named `wrapping_add` must be *inlined*,
+    /// not modelled as the `core` intrinsic.
+    ///
+    /// `intrinsics::classify` matches the method name after the last `::`, so a
+    /// plain `wrapping_add` classified as the intrinsic. Dispatching on the
+    /// intrinsic *before* the same-dump lookup then ignored the user's body
+    /// entirely: this `wrapping_add` returns `0` whatever it is given, but the
+    /// caller's `ret == 3` for `a == 1, b == 2` came back `Verified` -- a proof of
+    /// a false statement, which is the one failure this crate exists to prevent.
+    const SHADOWED_INTRINSIC_MIR: &str = r#"
+fn wrapping_add(_1: u8, _2: u8) -> u8 {
+    let mut _0: u8;
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn caller(_1: u8, _2: u8) -> u8 {
+    debug a => _1;
+    debug b => _2;
+    let mut _0: u8;
+    bb0: {
+        _0 = wrapping_add(copy _1, copy _2) -> [return: bb1, unwind continue];
+    }
+    bb1: {
+        return;
+    }
+}
+"#;
+
+    #[test]
+    fn a_user_function_named_like_an_intrinsic_is_inlined_not_modelled() {
+        let out = verify_with(
+            SHADOWED_INTRINSIC_MIR,
+            "caller",
+            "/// requires: a == 1 && b == 2\n/// ensures: ret == 3\n",
+        );
+        assert!(
+            !matches!(out, crate::mir::verify::FnOutcome::Verified { .. }),
+            "a user `wrapping_add` returning 0 must not be modelled as `a + b`, got {out:?}"
         );
     }
 
