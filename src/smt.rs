@@ -51,6 +51,32 @@ pub const MAX_VARS: usize = 256;
 /// [`CAP`].
 pub const TERM_SENTINEL: u32 = 0;
 
+/// Bits of a term id that name a slot in the arena.
+///
+/// [`CAP`] is `1 << 14`, so 14 bits address every slot. The remaining bits of the id
+/// carry the generation that created it.
+const TERM_SLOT_BITS: u32 = 14;
+
+/// Mask selecting the slot half of a packed term id.
+const TERM_SLOT_MASK: u32 = (1 << TERM_SLOT_BITS) - 1;
+
+/// Bits of a term id that carry the creating generation.
+const TERM_GEN_BITS: u32 = u32::BITS - TERM_SLOT_BITS;
+
+/// Mask selecting the generation half of a packed term id.
+const TERM_GEN_MASK: u32 = u32::MAX << TERM_SLOT_BITS;
+
+/// The largest generation a packed id can name.
+///
+/// A term id carries its generation so that a *recycled slot* cannot validate a stale
+/// handle. The count of generations an arena has lived through is far smaller than
+/// [`CAP`], so 18 bits is not a real limit: it would take that many `with_fresh` calls
+/// on one thread while still holding a handle from the first, which the no-nesting
+/// contract already forbids. It is documented rather than asserted because a wrapping
+/// generation would only mean "a very old handle may match again", and the alternative
+/// (a `usize` id) would double the size of every handle in the crate.
+const TERM_GEN_MAX: u32 = (1 << TERM_GEN_BITS) - 1;
+
 /// Maximum number of assignments reported in a counterexample.
 pub const MAX_CEX: usize = 16;
 
@@ -197,8 +223,38 @@ impl fmt::Display for Verdict {
 // Terms
 // ---------------------------------------------------------------------------
 
+/// A packed term id: the low [`TERM_SLOT_BITS`] bits name a slot in the arena, the rest
+/// carry the generation that created it.
+///
+/// The generation is *inside the handle* rather than in a side table indexed by slot.
+/// Stamping a side table (`term_gen[slot] = generation`) cannot detect a recycled slot,
+/// because the reset that recycles the slot rewrites the stamp the stale handle would
+/// have been checked against: a predicate saved from one arena, looked up in the next,
+/// found a *current* stamp on whatever term now occupied its slot and was reported
+/// `Valid` when it was false. Packing the generation into the id makes the comparison
+/// against the handle's own bits, which no later allocation can rewrite.
+///
+/// Child references in a [`Node`] hold a packed id verbatim in `a`/`b`/`c`, so
+/// `Term(n.a)` reconstructs the same handle and the traversal code needs no change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Term(pub(crate) u32);
+
+impl Term {
+    /// The arena slot this id names.
+    fn slot(self) -> usize {
+        (self.0 & TERM_SLOT_MASK) as usize
+    }
+
+    /// The generation bits of this id.
+    fn gen_bits(self) -> u32 {
+        self.0 & TERM_GEN_MASK
+    }
+
+    /// Pack a slot and a generation into an id.
+    fn pack(slot: u32, generation: u32) -> Term {
+        Term((slot & TERM_SLOT_MASK) | (generation << TERM_SLOT_BITS))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Op {
@@ -310,11 +366,12 @@ pub(crate) struct Ctx {
     /// one arena can name a different term in the next. `epoch` cannot serve here: it is
     /// about the substitution memo, and it is also bumped by `clear_subst` within a single
     /// arena. This counter changes only when the arena is wiped.
+    ///
+    /// It is stored *inside each handle* (see [`Term`]) rather than in a per-slot table,
+    /// because a per-slot table is rewritten by the very reset that recycles the slot and
+    /// so cannot detect a stale handle. Always kept non-zero so the sentinel's generation
+    /// bits never match a live arena.
     generation: u32,
-    /// The generation that created each term id. A handle is stale when its id's stamp is
-    /// not the current generation. Deliberately *not* cleared by `reset`: remembering the
-    /// old stamps is what makes staleness detectable.
-    term_gen: [u32; CAP],
     /// Set when a stale handle is touched. Sticky until the next reset, and treated exactly
     /// like `overflow`: the query refuses to answer rather than answer about the wrong term.
     stale: bool,
@@ -374,7 +431,6 @@ impl Ctx {
             subst_epoch: [0; CAP],
             epoch: 1,
             generation: 1,
-            term_gen: [0; CAP],
             stale: false,
             ill_formed: false,
             _not_shared: core::marker::PhantomData,
@@ -413,22 +469,27 @@ impl Ctx {
         // A fresh epoch invalidates every memo entry without touching the array.
         // It must be bumped, not reset: see `bump_epoch`.
         self.bump_epoch();
-        // Term ids restart at 0, so every handle from the previous arena now names a
-        // different term. Bumping the generation is what lets a handle say which arena
-        // justified it, and be rejected in any other. Must be bumped, never reset to a
-        // constant: a repeated generation would validate a stale handle.
+        // Term ids are packed from a slot and the generation, and the slot numbering
+        // restarts here, so every handle from the previous arena carries a generation the
+        // new arena will not hand out. Bumping is what makes a stale handle reject itself
+        // -- the check compares the handle's own bits, which nothing here rewrites.
         self.generation = self.generation.wrapping_add(1);
-        if self.generation == 0 {
-            // The counter wrapped, so the old stamps would match again. Clear them; the
-            // stamp for anything still live is rewritten by `mk_term`.
-            for i in 0..CAP {
-                self.term_gen[i] = u32::MAX;
-            }
+        if self.generation == 0 || self.generation > TERM_GEN_MAX {
+            // Keep the generation inside the bits a handle can hold, and never let it be
+            // zero: zero is the sentinel's generation, and a live term must never look
+            // like the sentinel. Wrapping to 1 after the maximum is the only case where an
+            // extremely old handle could match again, and holding one across 2^18 resets
+            // is already outside the no-nesting contract.
             self.generation = 1;
         }
         self.stale = false;
         self.ill_formed = false;
         self.ensure_ready();
+    }
+
+    /// The generation as it appears in a handle's bits.
+    fn gen_masked(&self) -> u32 {
+        self.generation << TERM_SLOT_BITS
     }
 
     /// Lazily compute the open-addressing masks. Must run before any arena use;
@@ -488,10 +549,9 @@ impl Ctx {
                 let id = self.n_terms as u32;
                 self.n_terms += 1;
                 self.terms[id as usize] = n;
-                self.term_gen[id as usize] = self.generation;
                 self.term_key[i as usize] = key;
                 self.term_val[i as usize] = id;
-                return Term(id);
+                return Term::pack(id, self.generation);
             }
             if k == key {
                 let e = self.terms[self.term_val[i as usize] as usize];
@@ -502,7 +562,7 @@ impl Ctx {
                     && e.width == n.width
                     && e.hi == n.hi
                 {
-                    return Term(self.term_val[i as usize]);
+                    return Term::pack(self.term_val[i as usize], self.generation);
                 }
             }
             i = (i + 1) & self.term_mask;
@@ -513,7 +573,7 @@ impl Ctx {
     /// `Var`, `Pred`, and anything else that carries a term id — the caller does not have
     /// to remember to look.
     pub(crate) fn is_current_term(&mut self, t: Term) -> bool {
-        if self.term_gen[t.0 as usize] != self.generation {
+        if t.gen_bits() != self.gen_masked() {
             self.stale = true;
             false
         } else {
@@ -522,14 +582,14 @@ impl Ctx {
     }
 
     fn note_if_stale(&mut self, t: Term) {
-        if self.term_gen[t.0 as usize] != self.generation {
+        if t.gen_bits() != self.gen_masked() {
             self.stale = true;
         }
     }
 
     fn node_of(&mut self, t: Term) -> Node {
         self.note_if_stale(t);
-        self.terms[t.0 as usize]
+        self.terms[t.slot()]
     }
 
     /// The variable index a binding target names, refusing anything that is not a variable.
@@ -556,14 +616,14 @@ impl Ctx {
 
     pub(crate) fn width_of(&mut self, t: Term) -> u8 {
         self.note_if_stale(t);
-        self.terms[t.0 as usize].width
+        self.terms[t.slot()].width
     }
 
     /// Read a term's node. Exposed to the crate so the SMT-LIB exporter can walk
     /// the same IR the solver reasons about, instead of re-deriving it.
     pub(crate) fn node_pub(&mut self, t: Term) -> Node {
         self.note_if_stale(t);
-        self.terms[t.0 as usize]
+        self.terms[t.slot()]
     }
 
     // ------------------------- substitution -------------------------
@@ -616,7 +676,7 @@ impl Ctx {
     /// variable that is also being replaced (the classic `x, y := y, x` case).
     /// Doing it top-down would capture those variables and prove the wrong thing.
     fn subst(&mut self, t: Term) -> Term {
-        if self.stale || self.term_gen[t.0 as usize] != self.generation {
+        if self.stale || t.gen_bits() != self.gen_masked() {
             self.stale = true;
             return Term(0);
         }
@@ -633,7 +693,7 @@ impl Ctx {
             Op::Const => t,
             _ => {
                 // Memo keyed by term id, valid only within the current epoch.
-                let key = t.0 as usize;
+                let key = t.slot();
                 if self.subst_epoch[key] == self.epoch {
                     return Term(self.subst_memo[key]);
                 }
@@ -707,7 +767,7 @@ impl Ctx {
 
     /// Whether `t` carries a stale generation stamp.
     pub(crate) fn is_stale(&self, t: Term) -> bool {
-        self.stale || self.term_gen[t.0 as usize] != self.generation
+        self.stale || t.gen_bits() != self.gen_masked()
     }
 
     /// Poison the traversal, exactly as `blast` does on a stale touch.
@@ -715,14 +775,21 @@ impl Ctx {
         self.stale = true;
     }
 
+    /// Mark the query ill-formed, so it answers `Unknown`. Used by the SAT blaster for the
+    /// same reason the BDD one sets the flag directly: a width the blaster cannot represent
+    /// must refuse the query rather than index past its buffer.
+    pub(crate) fn mark_ill_formed(&mut self) {
+        self.ill_formed = true;
+    }
+
     /// Read a term node without the stale check; the caller has already done it.
     pub(crate) fn peek(&self, t: Term) -> Node {
-        self.terms[t.0 as usize]
+        self.terms[t.slot()]
     }
 
     /// The constant payload of a `Const` term, without the stale check.
     pub(crate) fn const_of(&self, t: Term) -> u64 {
-        let n = self.terms[t.0 as usize];
+        let n = self.terms[t.slot()];
         (n.a as u64) | ((n.hi as u64) << 32)
     }
 
@@ -1077,13 +1144,25 @@ impl Ctx {
         // read a stale node and then *build* a current node that refers back to the stale
         // id, so the graph contains a cycle whose every node is current. Stopping the
         // whole traversal on the first stale touch is what breaks it.
-        if self.stale || self.term_gen[t.0 as usize] != self.generation {
+        if self.stale || t.gen_bits() != self.gen_masked() {
             self.stale = true;
             out.fill(FALSE);
             return;
         }
         let n = self.node_of(t);
         let w = n.width as usize;
+        // The output buffer is `[u32; 64]`, so a term wider than a word cannot be
+        // represented. `var`/`word`/`truncate` all bound their width, but a term reached
+        // through a path that did not (or a future constructor that forgets) must be
+        // *refused*, not allowed to index past the buffer: an out-of-range slice here
+        // panicked inside the solver, which turns a malformed specification into an
+        // unwind rather than an `Unknown`. Marking the query ill-formed keeps the
+        // failure an answer.
+        if w == 0 || w > 64 {
+            self.ill_formed = true;
+            out.fill(FALSE);
+            return;
+        }
         match n.op {
             Op::Var => {
                 let idx = n.a;
@@ -1344,7 +1423,9 @@ impl Ctx {
             }
             bits[0].not()
         });
-        if enc_overflow {
+        // `ill_formed` is checked here too: the SAT blaster refuses an unrepresentable
+        // width by marking the query, and a refusal has to outrank the verdict it produced.
+        if enc_overflow || self.stale || self.ill_formed || self.var_overflow {
             return Verdict::Unknown;
         }
         match sat {
@@ -1366,7 +1447,7 @@ impl Ctx {
             }
             bits[0]
         });
-        if enc_overflow {
+        if enc_overflow || self.stale || self.ill_formed || self.var_overflow {
             return Verdict::Unknown;
         }
         match sat {
@@ -1427,11 +1508,17 @@ pub fn with_fresh<R>(f: impl FnOnce() -> R) -> R {
 //
 // This used to be a warning only, and the warning was accurate about the symptom:
 // reusing a stale handle was "use-after-free in the term arena, typically unbounded
-// recursion rather than a clean panic". It is now enforced. Every term id records the
-// generation that created it (`term_gen`), the term accessors note a mismatch, and
-// `blast`/`subst`/`eval_term` refuse to traverse a stale handle. A query that touches
-// one returns `Unknown`, so nesting `with_fresh` degrades to "no answer" rather than
-// "an answer about the wrong term" or a stack overflow.
+// recursion rather than a clean panic". It is now enforced. Every term id *packs* the
+// generation that created it into its high bits (see `Term`), the term accessors note a
+// mismatch, and `blast`/`subst`/`eval_term` refuse to traverse a stale handle. A query
+// that touches one returns `Unknown`, so nesting `with_fresh` degrades to "no answer"
+// rather than "an answer about the wrong term" or a stack overflow.
+//
+// The generation lives *in the handle*, not in a side table keyed by slot. A side table
+// cannot detect a recycled slot: the reset that recycles the slot is the same event that
+// rewrites the stamp, so a stale handle would read a *current* stamp and be discharged as
+// if it named its own term. Packing makes the comparison against the handle's own bits,
+// which no later allocation can rewrite.
 //
 // The check lives in the arena rather than in each handle type on purpose: `Var`,
 // `Pred`, `Mem`, `Query` and the rest all carry term ids, and a per-type stamp is one
@@ -1645,8 +1732,17 @@ pub fn index(v: Var) -> u32 {
 /// `x + 44`. `eq_const` already refuses an out-of-range constant; this marks the term
 /// instead, so the query answers `Unknown` rather than a verdict about a constant that was
 /// never written. [`all_ones`] and [`truncate`] remain the ways to say "wrap on purpose".
+///
+/// `width` must be `1..=64`, like [`var`]. A wider one used to be accepted and to build a
+/// term the blaster could not represent: the bit-blaster's buffers are `[u32; 64]`, so
+/// `word(1, 65)` indexed `out[64]` and panicked *inside the solver* rather than being
+/// refused. Marking the query ill-formed keeps the failure an answer (`Unknown`) instead
+/// of an unwind, which is what every other malformed term in this crate does.
 pub fn word(v: u64, width: u8) -> Var {
     with_ctx(|c| {
+        if !(1..=64).contains(&width) {
+            c.ill_formed = true;
+        }
         if !fits(v, width) {
             c.ill_formed = true;
         }
@@ -2097,5 +2193,80 @@ mod word_tests {
         with_fresh(|| {
             assert_eq!(prove(eq_const(all_ones(8), 255)), Verdict::Valid);
         });
+    }
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+
+    /// A handle from one arena must never be validated by a *recycled slot*.
+    ///
+    /// The staleness check used to be a per-slot table, `term_gen[slot]`, written by
+    /// `mk_term` and compared against the current generation. A reset restarts slot
+    /// numbering at 1 and the next `mk_term` rewrites that slot's stamp, so a predicate
+    /// saved from an earlier arena found a *current* stamp on whatever term now occupied
+    /// its slot and was discharged as if it were itself. A predicate that is false for
+    /// every input (`x == 1 && x == 2`) came back `Valid` once enough terms were built to
+    /// land a true term on its slot -- a proof of a false statement.
+    ///
+    /// The generation is now packed into the handle, so the comparison is against bits
+    /// nothing later can rewrite. This sweeps the filler count that reproduced it.
+    #[test]
+    fn a_recycled_slot_does_not_validate_a_stale_handle() {
+        let saved: Pred = with_fresh(|| {
+            let x = var(8);
+            and(x.eq_val(1), x.eq_val(2))
+        });
+        for filler in 0..48u64 {
+            let out = with_fresh(|| {
+                for j in 0..filler {
+                    let _ = word(j, 8);
+                }
+                saved.prove()
+            });
+            assert_ne!(
+                out,
+                Verdict::Valid,
+                "a false predicate from an earlier arena was proved (filler = {filler})"
+            );
+        }
+    }
+
+    /// And the fix must not refuse everything: a handle in its own arena still proves.
+    #[test]
+    fn a_current_handle_still_discharges() {
+        with_fresh(|| {
+            let x = var(8);
+            assert_eq!(implies(x.lt_val(16), x.lt_val(32)).prove(), Verdict::Valid);
+        });
+    }
+
+    /// A width the blaster cannot represent must be refused, not panicked on.
+    ///
+    /// `word` bounds its width, but a term reached another way (or built by a future
+    /// constructor that forgets) still has to be refused at blast time: the blaster's
+    /// buffers are `[u32; 64]`, so a 65-bit term indexed `out[64]` and panicked inside the
+    /// solver, turning a malformed specification into an unwind rather than an `Unknown`.
+    #[test]
+    fn an_unrepresentable_width_is_refused_not_panicked_on() {
+        // `word` refuses the width up front.
+        for w in [0u8, 65, 100, 255] {
+            with_fresh(|| {
+                let c = word(1, w);
+                assert_eq!(
+                    prove(eq(c, c)),
+                    Verdict::Unknown,
+                    "word(1, {w}) must be refused"
+                );
+            });
+        }
+        // In-range widths are unaffected.
+        for w in [1u8, 8, 16, 64] {
+            with_fresh(|| {
+                let c = word(1, w);
+                assert_eq!(prove(eq(c, c)), Verdict::Valid, "word(1, {w}) must hold");
+            });
+        }
     }
 }

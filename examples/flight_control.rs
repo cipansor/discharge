@@ -53,19 +53,32 @@ pub const fn rate_limit(current: u32, target: u32) -> u32 {
 
 /// ∀ raw:u16. map_reading(raw) <= PWM_MAX
 ///
-/// Modelled at 16 bits so the BDD stays small, which is the honest way to use
-/// this engine: prove the arithmetic fact at the width you can, and cover the
-/// concrete function exhaustively in [`proofs_by_enumeration`].
+/// The arithmetic is modelled at 22 bits, not 16, and the width is load-bearing.
+/// `clamped * 1000` needs 22 bits: `clamped <= 4095`, so the product reaches
+/// 4 095 000, and `2^22 = 4 194 304` is the first width that holds it. At 16 bits
+/// the product wraps to 16 bits before the comparison, so `scaled <= 4 095 000`
+/// is true for *every* 16-bit value (the maximum is 65 535) and the implication
+/// holds no matter what the precondition says -- a proof whose evidence is empty.
+/// Widening keeps the claim the one intended: the scaled value, computed without
+/// overflow, is inside the actuator's range.
 fn prove_output_bound() -> Verdict {
     smt::with_fresh(|| {
-        let raw = var(16);
-        let max = word(ADC_MAX as u64, 16);
+        let raw = var(22);
+        let max = word(ADC_MAX as u64, 22);
         let clamped = ite(raw.gt(max), max, raw);
         // out = 1000 + clamped * 1000 / 4095. Integer division is not in the
         // symbolic vocabulary, so we prove the stronger, division-free bound
         // that the *scaled* value cannot exceed PWM_MAX before division.
         let scaled = clamped * 1000u32;
-        // clamped <= 4095  =>  clamped * 1000 <= 4095000
+        // The bound has to be refutable at this width, or the implication above would
+        // hold for any precondition and prove nothing. `scaled <= 4 095 000` is false
+        // for a large enough `scaled`, so the claim is sensitive to its antecedent.
+        assert!(
+            !prove(scaled.gt_val(4_095_000)).is_proved(),
+            "the bound is vacuous at 22 bits: `scaled <= 4 095 000` holds for every value, \
+             so the implication carries no information"
+        );
+        // clamped <= 4095  =>  clamped * 1000 <= 4095000, with no overflow at 22 bits.
         prove_implies(clamped.le(max), scaled.le_val(4_095_000))
     })
 }

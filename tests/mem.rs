@@ -344,12 +344,7 @@ fn a_bound_the_same_width_as_the_address_is_rejected() {
         // 2 bits, the address width: cannot hold `len`, so it is refused.
         let narrow = var(2);
         let r = std::panic::catch_unwind(|| {
-            smt::with_fresh(|| {
-                let mut buf = [var(8); 4];
-                let m = mem4(&mut buf);
-                let narrow = var(2);
-                let _ = m.forall_below(narrow, |cell| smt::eq_const(cell, 0));
-            })
+            let _ = m.forall_below(narrow, |cell| smt::eq_const(cell, 0));
         });
         assert!(
             r.is_err(),

@@ -39,6 +39,14 @@ pub(crate) fn blast(ctx: &mut Ctx, cnf: &mut Cnf, t: Term, out: &mut [Lit; MAX_B
     }
     let n = ctx.peek(t);
     let w = n.width as usize;
+    // Same refusal as the BDD blaster: the buffer is `[Lit; 64]`, so a term wider than a
+    // word is ill-formed rather than something to index past. See `smt::Ctx::blast`.
+    if w == 0 || w > MAX_BITS {
+        ctx.mark_ill_formed();
+        let f = cnf.false_lit();
+        out.fill(f);
+        return;
+    }
     match n.op {
         Op::Var => {
             let idx = n.a;

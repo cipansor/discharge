@@ -305,6 +305,61 @@ Two general lessons, both about handles.
    *safety* unless something enforces it. When a comment says "do not do X or Y happens", ask
    whether Y is caught or merely described.
 
+## A stamp that the reset rewrites cannot detect a reset
+
+The generation check above was itself defeated by the table it lived in. `term_gen[slot]`
+recorded the generation that created the term in `slot`, and staleness was
+`term_gen[slot] != generation`. But `reset()` is exactly the event that both recycles slot
+numbering *and* leaves `term_gen` in place, so the next `mk_term` writes a *current* stamp
+onto whatever term lands on a stale handle's slot. A `Pred` saved from one arena was then
+discharged against a term it had never seen:
+
+  `x == 1 && x == 2` (false for every `x`), saved in arena A
+  arena B: build enough terms to reach A's slot
+  `saved.prove()` in arena B : `Valid`          <- a proof of a false statement
+
+The check compared the *slot's* stamp, which the recycling event rewrites; it had to compare
+something the recycling event cannot touch. The generation is now packed into the id itself
+(`Term::pack(slot, generation)`), so `is_stale` compares the handle's own bits. The lesson
+generalises: an id that can be recycled needs its generation *inside the id*, because a side
+table indexed by the recycled key is written by the same event that invalidates the handle.
+`reset()` also keeps the generation non-zero and inside the bits a handle can hold, so the
+sentinel's generation never matches a live arena.
+
+The general auditing question, alongside "is the conclusion true" and "is the premise
+reachable": **does the thing that invalidates the handle also rewrite the evidence used to
+detect the invalidation?** If so, the check cannot fire.
+
+## A refusal has to outrank the verdict it produced
+
+Guarding a malformed term at the point of construction is not enough when a second entry
+point can reach the same term. `word(1, 65)` built a term the bit-blaster's `[u32; 64]`
+buffers could not hold; the blaster indexed `out[64]` and *panicked inside the solver*, so a
+malformed specification became an unwind rather than an `Unknown`. Two fixes, both needed:
+the width is refused where the term is built (`word`), and refused again at the blaster's
+entry (`smt::Ctx::blast` and `bitblast::blast` mark the query ill-formed). The second matters
+because a term can arrive by a path that skipped the first — a future constructor, or a
+deserialised term — and the buffer bound is the invariant, not any single constructor.
+
+The subtlety is that the SAT blaster marks the query and *returns*, and the caller had already
+computed a verdict from the (now-meaningless) CNF. So the query layer had to check
+`ill_formed` (and `stale`, and `var_overflow`) *before* reading the verdict: a refusal is only
+a refusal if it wins. When adding a "mark and continue" path anywhere, check that every reader
+of the result consults the mark.
+
+## A report is valid only in the arena that produced it
+
+`wp::Report` holds `Obligation`s, and an `Obligation` is a term id plus the generation that
+created it. `Obligation::discharge` answers `Unknown` once the arena has moved on, so a report
+that outlives its `with_fresh` scope *fails safe* — but it fails, and the example
+`examples/pipeline.rs` was reading a report built in one scope after a second `with_fresh` had
+already reset the arena. It happened to work only because no reset intervened before the read;
+one more statement would have flipped every verdict to `Unknown`. The example now discharges
+each report inside the scope that built it and lets only the self-contained SMT-LIB2 text
+escape. The rule for callers: if a value holds a term id (`Report`, `Certificate`,
+`Implication`, `Query`), consume it before the next `with_fresh`, or carry the generation and
+re-check — never assume the arena is still the one you built in.
+
 ## The abstraction is where the claim lives
 
 The eleventh hole was `Verified<T>`: it documented itself as "a machine-checked claim that the
@@ -900,6 +955,15 @@ Two auditing questions to add to the three above:
 That is what the memory positive family does: templates correct by construction, each with a
 mutated twin that must be refuted. 140 proved, 134 mutations refuted, and the six survivors
 are the `n: 0` boundary, asserted to be vacuous on purpose.
+
+The trap also hides in the *width a claim is stated at*, not just in a bound. The
+`flight_control` example proved `clamped <= 4095 => clamped * 1000 <= 4 095 000` at 16 bits,
+where the product wraps to 16 bits: `scaled <= 4 095 000` is then true for every value (the
+maximum is 65 535), so the implication holds for *any* antecedent and constrains nothing. The
+example now models it at 22 bits — the first width that holds 4 095 000 — and asserts the
+bound is refutable there before proving the implication, so a future narrowing of the model
+fails loudly instead of passing vacuously. When a proof states a claim about an operation that
+can overflow, check the modelled width can represent the result the claim names.
 
 ## The harness must cover every module, or it certifies only the covered ones
 
