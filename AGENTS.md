@@ -2147,3 +2147,31 @@ The scoreboard moved from 4 of 14 decided to 10 of 14, and the remaining four ea
 themselves in the `detail` column — an unreadable `requires` (`c.lo <= c.hi`, `xs.len() > 0`)
 and a tuple-returning `ensures` (`ret.0 <= a`). Those are the next gaps, and they are parser
 gaps rather than engine ones, which the scoreboard says without being asked.
+
+## An inlined call must restore the caller's loop cut, or the caller unwinds a loop it had cut
+
+Cutting a loop at its invariant is a property of a *function*: the `Cut` names the header and
+back edges of one loop in one function's CFG. Entering an inlined callee therefore clears
+`cut`, correctly — the caller's invariant says nothing about the callee's locals. The return
+path then copied the callee's `cut` into the resumed caller, which is the bug: a callee that
+returns from a function with no loop leaves `cut` as `None`, so the caller resumed *inside its
+own loop* with no cut. The next edge into the header was unwound rather than checked against
+the invariant, and once the loop passed `DEFAULT_UNWIND` the function was reported
+`Incomplete` — a valid proof discarded, not a false one, but a defect all the same.
+
+The frame already had the fix's shape: `saved_env` is set aside at call entry and restored on
+return, for the same reason. `saved_cut` follows it exactly. Restoring the cut is the whole
+change; the callee's own cut is dropped because the callee has returned.
+
+What made this reachable *now* is the exact-name lookup. Before it, a user function named
+`wrapping_add` was answered by `intrinsics` as `a + b`, a leaf that never entered a frame, so
+the caller's cut was never disturbed. Sending such a function through the inliner — the right
+fix for the false proof it caused — exposed the return path's missing restore. A change that
+fixes one defect can activate another that was latent behind it.
+
+The teeth are two tests, and the second matters as much as the first:
+`an_invariant_survives_an_inlined_call_on_the_loop_edge` requires the loop to verify across
+the call (it fails on the pre-fix code), and `an_inlined_call_does_not_rescue_a_weak_invariant`
+requires the same loop with `ensures: ret == 0` to still be refuted. Restoring the cut must
+restore the proof the invariant actually carries, not resurrect one that was never there.
+

@@ -469,6 +469,21 @@ struct Frame {
     /// postcondition provable, which is the failure mode this crate exists to
     /// avoid.
     saved_env: Option<Env>,
+    /// The loop cut that was active in the *caller* when this frame made the
+    /// call, put aside for the same reason `saved_env` is.
+    ///
+    /// A loop cut belongs to the function whose loop it describes, so entering a
+    /// callee must clear it -- the caller's loop invariant says nothing about the
+    /// callee's locals. But the cut has to come back on return: the resumed
+    /// caller is still inside its loop, and the next edge into its header must be
+    /// checked against the invariant rather than unwound. Clearing `cut` for the
+    /// callee and never restoring it left the caller unwinding a loop it had
+    /// already cut, so a loop whose step is a same-dump call was reported as a
+    /// cutoff once it exceeded `DEFAULT_UNWIND`, even though its invariant was
+    /// sufficient. That is an incompleteness, not an unsoundness -- the report is
+    /// `Incomplete`, never a false proof -- but it silently discards a valid
+    /// proof, which is the failure this crate treats as a defect.
+    saved_cut: Option<Cut>,
     /// The caller's frame, or `None` for the root.
     caller: Option<Box<Frame>>,
 }
@@ -638,6 +653,7 @@ where
             ret_target: usize::MAX,
             ret_dest: None,
             saved_env: None,
+            saved_cut: None,
             caller: None,
         },
         block: start,
@@ -1059,6 +1075,15 @@ where
                     if let Some(dest) = &caller.ret_dest {
                         env.set(dest, ret);
                     }
+                    // Restore the caller's loop cut, which entering the callee
+                    // cleared. Without this the resumed caller has no cut, so the
+                    // next edge into its loop header is unwound rather than
+                    // checked against the invariant -- and a loop whose step is a
+                    // same-dump call is reported as a cutoff once it passes
+                    // `DEFAULT_UNWIND`, even when the invariant was sufficient.
+                    // The callee's `cut` is discarded: it named the callee's loop,
+                    // if any, and the callee has returned.
+                    let cut = caller.saved_cut.clone();
                     work.push(State {
                         block: caller.ret_target,
                         frame: *caller,
@@ -1066,7 +1091,7 @@ where
                         env,
                         visits: st.visits,
                         depth: st.depth.saturating_sub(1),
-                        cut: st.cut.clone(),
+                        cut,
                     });
                 }
             }
@@ -1234,6 +1259,10 @@ where
                 // The caller's locals are put aside here and restored on return.
                 // `env` below is the callee's, freshly built from the arguments.
                 saved_env: Some(st.env.clone()),
+                // The caller's loop cut is put aside for the same reason: it
+                // describes the caller's loop, and the caller is still inside it
+                // when this call returns.
+                saved_cut: st.cut.clone(),
                 caller: st.frame.caller.clone(),
             };
             let mut visits = st.visits;
@@ -1244,6 +1273,7 @@ where
                     ret_target: usize::MAX,
                     ret_dest: None,
                     saved_env: None,
+                    saved_cut: None,
                     caller: Some(Box::new(caller)),
                 },
                 block: b0.id,
@@ -2262,6 +2292,99 @@ fn caller(_1: u8, _2: u8) -> u8 {
         assert!(
             !matches!(out, crate::mir::verify::FnOutcome::Verified { .. }),
             "an invariant that is not preserved must not verify, got {out:?}"
+        );
+    }
+
+    /// The same-dump helper the loop below calls, so the *inliner* is selected
+    /// rather than the `core` intrinsic. Its body is `a + b`, the wrapped sum for
+    /// a `u8`, but the point is only that the call is inlined.
+    const HELPER_CALL_MIR: &str = r#"
+fn wrapping_add(_1: u8, _2: u8) -> u8 {
+    debug a => _1;
+    debug b => _2;
+    let mut _0: u8;
+    bb0: {
+        _0 = Add(copy _1, copy _2);
+        return;
+    }
+}
+
+fn count_via_helper(_1: u8) -> u8 {
+    debug n => _1;
+    let mut _0: u8;
+    let mut _2: u8;
+    let mut _3: bool;
+    let mut _4: u8;
+    scope 1 {
+        debug i => _2;
+    }
+
+    bb0: {
+        _2 = const 0_u8;
+        goto -> bb1;
+    }
+
+    bb1: {
+        _4 = copy _2;
+        _3 = Lt(move _4, copy _1);
+        switchInt(move _3) -> [0: bb3, otherwise: bb2];
+    }
+
+    bb2: {
+        _2 = wrapping_add(move _2, const 1_u8) -> [return: bb4, unwind continue];
+    }
+
+    bb4: {
+        goto -> bb1;
+    }
+
+    bb3: {
+        _0 = copy _2;
+        return;
+    }
+}
+"#;
+
+    /// A loop whose step is a same-dump call must keep its invariant across the
+    /// inlined call, so it is decided by the invariant rather than unwound.
+    ///
+    /// Entering a callee clears `cut` -- the caller's loop invariant says nothing
+    /// about the callee's locals -- but the return path used to copy the callee's
+    /// (empty) cut into the resumed caller instead of restoring the caller's. The
+    /// resumed caller was then inside a loop it had no cut for, so the next edge
+    /// into its header was unwound. `n <= 10` needs more iterations than
+    /// [`DEFAULT_UNWIND`], so the loop was reported as a cutoff even though its
+    /// invariant decides it exactly.
+    ///
+    /// This is the shape the exact-name lookup now sends a user-defined
+    /// `wrapping_add` through, which is why a loop that previously modelled the
+    /// call as an intrinsic (and so kept its cut) began to lose it.
+    #[test]
+    fn an_invariant_survives_an_inlined_call_on_the_loop_edge() {
+        let out = verify_with(
+            HELPER_CALL_MIR,
+            "count_via_helper",
+            "/// requires: n <= 10\n/// invariant: i <= n\n/// ensures: ret == n\n",
+        );
+        assert!(
+            matches!(out, crate::mir::verify::FnOutcome::Verified { .. }),
+            "the loop should be decided by its invariant across the inlined call, got {out:?}"
+        );
+    }
+
+    /// And the fix must not *weaken* the check: the same call-carrying loop with
+    /// an invariant too weak for the postcondition must still be refuted, so
+    /// restoring the cut did not restore a proof that was never there.
+    #[test]
+    fn an_inlined_call_does_not_rescue_a_weak_invariant() {
+        let out = verify_with(
+            HELPER_CALL_MIR,
+            "count_via_helper",
+            "/// requires: n <= 10\n/// invariant: i <= n\n/// ensures: ret == 0\n",
+        );
+        assert!(
+            !matches!(out, crate::mir::verify::FnOutcome::Verified { .. }),
+            "a weak invariant must not be rescued by the restored cut, got {out:?}"
         );
     }
 }
