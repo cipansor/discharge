@@ -669,3 +669,116 @@ pub fn signed_slice_element_tripwire(xs: &[i8]) -> i8 {
         0
     }
 }
+
+/// A struct literal builds a value whose *fields* the body can read back.
+///
+/// `Config { lo: 7, hi: 9 }` lowers to a struct-literal rvalue, which this
+/// frontend used to leave `Unknown`: the literal's operands were parsed as an
+/// array/tuple `Aggregate` and written under `Proj::Index`, while a field read
+/// (`_1.0`) consults the *field* store. The two never met, so `c.lo` read
+/// unknown and the contract was unreadable. The fields are printed in
+/// declaration order, which is the order the `Field(N)` projections count in, so
+/// the literal's `lo` is field `0`.
+/// requires: true
+/// ensures: ret == 7
+pub fn struct_literal_reads_its_field() -> u8 {
+    let c = Config { lo: 7, hi: 9 };
+    c.lo
+}
+
+/// A struct literal's fields are read back by *declaration* order, not by the
+/// order they were written in the source.
+///
+/// The literal is written `hi` first, but rustc prints the fields in declaration
+/// order (`lo`, then `hi`), which is the order the `Field(N)` projections index.
+/// The contract names `lo` and claims the constant, so it holds only if `lo` is
+/// the first operand.
+/// requires: true
+/// ensures: ret == 7
+pub fn struct_literal_order(a: u8) -> u8 {
+    let c = Config { lo: 7, hi: a };
+    c.lo
+}
+
+/// The tripwire for the struct-literal field *order*.
+///
+/// Same body as [`struct_literal_order`], but the contract claims the `hi`
+/// operand. That is what `lo` would read if the parser keyed the operands by the
+/// order they were *written* rather than by declaration order, so a reversed
+/// model would prove this false contract. It must FAIL, with a witness in which
+/// `a` is not `7`.
+/// requires: true
+/// ensures: ret == a
+pub fn struct_literal_order_tripwire(a: u8) -> u8 {
+    let c = Config { lo: 7, hi: a };
+    c.lo
+}
+
+/// A reference to an argument is read back through the reference.
+///
+/// `let r = &a; *r` lowers to `_2 = &_1; _0 = copy (*_2)`. The deref is of a
+/// local the run itself created, not of a `&T` argument, so the argument-only
+/// `deref_ok` path did not apply and the read came back unknown. Modelling
+/// `&place` as the place it addresses is what makes `*r` read `a`.
+/// requires: a == 5
+/// ensures: ret == 5
+pub fn reference_reads_through(a: u8) -> u8 {
+    let r = &a;
+    *r
+}
+
+/// A reference *write* is seen by the target, so the borrow is not a copy.
+///
+/// `r` addresses `a`, and the write through `r` must be visible in `a`. If the
+/// reference were modelled as a snapshot of `a`'s value rather than as the place
+/// `a`, the read after the write would return the pre-write value and this
+/// contract would be refuted. It must verify.
+/// requires: true
+/// ensures: ret == 7
+pub fn reference_write_reaches_target() -> u8 {
+    let mut a = 5u8;
+    let r = &mut a;
+    *r = 7;
+    a
+}
+
+/// The tripwire for the reference-write direction.
+///
+/// Same body as [`reference_write_reaches_target`], but the contract claims the
+/// value the target held *before* the write. That is the answer a snapshot model
+/// gives, so this false contract is proved by exactly the bug. It must FAIL.
+/// requires: true
+/// ensures: ret == 5
+pub fn reference_write_tripwire() -> u8 {
+    let mut a = 5u8;
+    let r = &mut a;
+    *r = 7;
+    a
+}
+
+/// `.len()` on an array argument is the length in its type.
+///
+/// `a.len()` on `a: [u8; 4]` lowers to `_3 = &_1; _2 = _3 as &[u8];
+/// PtrMetadata(_2)`: the array is unsized to a slice and its metadata read. The
+/// length is the type's constant, so it is exactly `4` and the contract has
+/// something to agree with. Before this, the `PtrMetadata` named the slice local
+/// with no `indexed` entry and read unknown.
+/// requires: true
+/// ensures: ret == 4
+pub fn array_len_is_the_type_constant() -> usize {
+    let a = [1u8, 2, 3, 4];
+    a.len()
+}
+
+/// A struct argument reassigned wholesale carries its *fields* across.
+///
+/// `c = d` copies a value the frontend models as its parts, so the copy has to
+/// move the fields or `c.lo` afterwards reads nothing. This is the readable half
+/// of [`struct_reassign_then_field_read`]: the contract names `d.lo`, which is
+/// what `c.lo` is after the assignment.
+/// requires: d.lo == 3
+/// ensures: ret == 3
+pub fn struct_reassign_reads_new_field(mut c: Config, d: Config) -> u8 {
+    c = d;
+    c.lo
+}

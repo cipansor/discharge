@@ -1175,6 +1175,65 @@ fn a_write_cannot_prove_a_stale_contract() {
     );
 }
 
+/// Stage 2: the newly modelled rvalues, each with its tripwire.
+///
+/// These four shapes -- a struct literal, a reference to a place, `.len()` on an
+/// array, and a whole-struct reassignment -- were all `Unknown` before, so their
+/// contracts were unreadable rather than checked. Each pair below is a true
+/// contract that must now verify and a false one that a wrong model would prove.
+/// The tripwires are the point: verifying the true half alone would not show the
+/// model is right, only that it is present.
+#[test]
+fn stage_two_rvalues_are_modelled_and_their_tripwires_refuted() {
+    let verified = [
+        "struct_literal_reads_its_field",
+        "struct_literal_order",
+        "reference_reads_through",
+        "reference_write_reaches_target",
+        "array_len_is_the_type_constant",
+        "struct_reassign_reads_new_field",
+    ];
+    let refuted = [
+        // Written in reverse order; a positional-by-write-order model proves it.
+        "struct_literal_order_tripwire",
+        // The pre-write value; a snapshot model of `&mut` proves it.
+        "reference_write_tripwire",
+    ];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { .. } = o else {
+            panic!("`{name}` is a false contract that must be refuted, got: {o}");
+        };
+    }
+}
+
+/// The struct-literal tripwire's counterexample is the `hi` operand, not `lo`.
+///
+/// [`struct_literal_order_tripwire`] writes `lo: 7` and `hi: a` and claims
+/// `ret == a`. Refuting it is not enough on its own: a wrong model could refute
+/// it for the wrong reason. What makes the refutation *evidence* is the witness,
+/// which must be `a == 0` -- the value that differs from `lo`'s `7`. A model that
+/// read the fields in write order would have *proved* this contract instead, so
+/// reaching a witness at all is the proof the order is declaration order.
+#[test]
+fn a_struct_literal_reads_fields_in_declaration_order() {
+    let Some(report) = verify_realistic(&["struct_literal_order_tripwire"]) else { return };
+    let o = outcome(&report, "struct_literal_order_tripwire");
+    let FnOutcome::Failed { detail, .. } = o else {
+        panic!("`struct_literal_order_tripwire` must be refuted, got: {o}");
+    };
+    assert!(
+        detail.contains("= 0"),
+        "the witness must be `a == 0`, the value that is not `lo` (7); got: {detail}"
+    );
+}
+
 /// A postcondition can name a component of a tuple return.
 ///
 /// `split` returns `(u8, u8)` and claims `ret.0 <= a`. The return place is an

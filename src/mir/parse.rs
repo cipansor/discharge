@@ -265,6 +265,15 @@ pub enum Rvalue {
     Cast(Operand, Ty),
     /// An array or tuple literal.
     Aggregate(Vec<Operand>),
+    /// A struct literal: `Config { lo: const 7_u8, hi: const 9_u8 }`.
+    ///
+    /// Kept apart from [`Rvalue::Aggregate`] because the two write to different
+    /// stores: a tuple component is read back as `_1.0` and a struct field as
+    /// `_1.0`, but a struct's fields are a *declared layout* while a tuple's are
+    /// positional, and the contract language can name one but not the other.
+    /// The operands are in the order rustc printed them, which is declaration
+    /// order -- the same order the `Field(N)` projections index.
+    Struct(Vec<Operand>),
     /// `&place`
     Ref(Place),
     /// `Len(place)` — array length.
@@ -394,6 +403,35 @@ impl MirProgram {
 // Text helpers
 // ---------------------------------------------------------------------------
 
+/// Split a struct-literal field `name: value` at the first top-level `:`, and
+/// return `(name, value)`.
+///
+/// A `::` inside the value (a path in a constant, say) is not the separator, so
+/// the scan skips a `:` that is immediately followed or preceded by another `:`.
+/// Returns `None` when there is no separator at all, which is a shape the
+/// printer does not produce for a struct literal.
+fn split_field_name(field: &str) -> Option<(&str, &str)> {
+    let bytes = field.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' | b'<' => depth += 1,
+            b')' | b']' | b'}' | b'>' => depth -= 1,
+            b':' if depth == 0 => {
+                let prev_is_colon = i > 0 && bytes[i - 1] == b':';
+                let next_is_colon = bytes.get(i + 1) == Some(&b':');
+                if !prev_is_colon && !next_is_colon {
+                    return Some((&field[..i], &field[i + 1..]));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Split `s` on `sep`, ignoring separators nested in `()`, `[]`, `{}`, `<…>` or
 /// string literals.
 pub fn split_top_level(s: &str, sep: char) -> Vec<String> {
@@ -448,6 +486,15 @@ fn strip_annot(s: &str) -> &str {
         let inner = &t[1..t.len() - 1];
         if let Some(i) = find_top_level_colon(inner) {
             return inner[..i].trim();
+        }
+        // `(*_2)` is a bare dereference, not an annotated place. Stripping the
+        // parentheses here would leave `*_2`, which no place parser reads -- the
+        // deref arm matches the `(*` prefix and the parens are part of it -- so a
+        // whole-place deref would parse as `None` and the read become unknown.
+        // The parens are kept for that shape and stripped for every other, which
+        // is what `parse_place` expects.
+        if inner.trim_start().starts_with('*') {
+            return t;
         }
         return inner.trim();
     }
@@ -868,6 +915,39 @@ fn parse_rvalue(s: &str) -> Rvalue {
             return Rvalue::Discriminant(p);
         }
     }
+    // A struct literal: `Config { lo: const 7_u8, hi: const 9_u8 }`.
+    //
+    // This arm is *before* the `Name(args)` arm and guarded on a closing brace,
+    // because a struct literal's fields are operands and an operand is a place
+    // or a constant -- never a call -- so a `(` inside one would be a shape this
+    // frontend does not produce. Matching on the brace keeps the two apart.
+    //
+    // The fields are printed in declaration order, so their printed *position* is
+    // the `Field(N)` index the reads use: `_1.0` is the first operand here. That
+    // is what makes a positional store sound -- the order is not a convention
+    // this parser is inventing, it is the same order the index projections count
+    // in. (rustc does not reorder the fields for layout here; the field indices
+    // are declaration indices even when the layout does reorder the bytes.)
+    if t.ends_with('}') {
+        if let Some(open) = t.find('{') {
+            let inner = &t[open + 1..t.len() - 1];
+            let mut args = Vec::new();
+            for field in split_top_level(inner, ',') {
+                let field = field.trim();
+                if field.is_empty() {
+                    continue;
+                }
+                // `lo: const 7_u8` -> `const 7_u8`. The name is an identifier,
+                // so the first top-level `:` separates it from the value; a `::`
+                // inside the value is not that separator.
+                let Some((_, val)) = split_field_name(field) else {
+                    return Rvalue::Unknown(t.to_string());
+                };
+                args.push(parse_operand(val));
+            }
+            return Rvalue::Struct(args);
+        }
+    }
     // An operator call: `Name(args)`.
     if let Some(open) = t.find('(') {
         if t.ends_with(')') {
@@ -1284,3 +1364,4 @@ fn add(_1: u32, _2: u32) -> u32 {
         }
     }
 }
+

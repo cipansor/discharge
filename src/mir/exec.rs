@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::mir::intrinsics::{self, Outcome};
 use crate::mir::parse::{
     BinOp, Block, Callee, Const, MirFn, MirProgram, Operand, Place, Proj, Rvalue, Stmt, Term, Ty,
-    UnOp,
+    UnOp, USIZE_WIDTH,
 };
 use crate::smt::{self, Pred, Var, Verdict};
 
@@ -420,6 +420,18 @@ struct Env {
     /// such backing, and a deref of it reads `Unknown` rather than inventing a
     /// value.
     deref_ok: BTreeMap<u32, ()>,
+    /// The place a reference local addresses: `_2 = &_1` records `2 -> _1`, and
+    /// `_3 = &_1.0` records `3 -> _1.0`.
+    ///
+    /// This is what lets `*_2` read what `_2` addresses. The frontend does not
+    /// track aliasing (see the module docs on scope), so a reference is modelled
+    /// as the *single* place it was created from, not as a value that could be
+    /// pointed anywhere: `let r = &c; r.lo` reads `c.lo`, which is sound for the
+    /// shape rustc lowers a local borrow to, and `_2 = &_1; _2 = &_3` overwrites
+    /// the mapping rather than keeping both. A reference this store has no entry
+    /// for reads `Unknown`, which is the honest answer for a pointer whose
+    /// target the run never saw.
+    addressed: BTreeMap<u32, Place>,
     /// Values addressed by an index, with a length: slice arguments (`&[T]`) and
     /// array arguments (`[T; N]`), keyed by the local the argument lives in.
     ///
@@ -487,6 +499,7 @@ impl Env {
             payloads: BTreeMap::new(),
             discriminants: BTreeMap::new(),
             deref_ok: BTreeMap::new(),
+            addressed: BTreeMap::new(),
             indexed: BTreeMap::new(),
             indexed_writes: BTreeSet::new(),
         }
@@ -589,7 +602,106 @@ impl Env {
         })
     }
 
+    /// Rewrite a place whose head is a dereference of an addressed local, so
+    /// `_2 = &_1; *_2` reads `_1`.
+    ///
+    /// The rewrite is a *substitution*, not a copy of the value: `*_2` becomes
+    /// the place `_2` addresses, so a later write through the reference and a
+    /// later read of the target meet in one store, which is the whole point of
+    /// borrowing. `_2 = &_1.0; (*_2)` becomes `_1.0`, and a reference to a
+    /// reference (`_4 = &(*_2)`) resolves again, which the loop allows for. The
+    /// bound is the same shape as the other unwind bounds: a chain longer than
+    /// this is a shape the frontend does not produce, and stopping leaves the
+    /// deref to read `Unknown` rather than looping.
+    ///
+    /// A deref of a local that is *not* in `addressed` is left alone, so the
+    /// `deref_ok` argument case (`_1: &[u8]`, `*_1`) still reaches `get`'s own
+    /// `Proj::Deref` arm.
+    fn resolve(&self, p: &Place) -> Place {
+        let mut cur = p.clone();
+        for _ in 0..8 {
+            if !matches!(cur.proj.first(), Some(Proj::Deref)) {
+                break;
+            }
+            let Some(target) = self.addressed.get(&cur.local) else { break };
+            let mut proj = target.proj.clone();
+            proj.extend_from_slice(&cur.proj[1..]);
+            cur = Place { local: target.local, proj };
+        }
+        cur
+    }
+
+    /// Follow one level of *value* indirection: the place a pointer local's
+    /// value addresses.
+    ///
+    /// This is the step `resolve` deliberately does not take. `resolve` rewrites
+    /// an explicit `*_2`; `pointee` answers "where does `_2` point", which is what
+    /// `PtrMetadata(_2)` asks -- the metadata belongs to the pointee, not to the
+    /// pointer. A local with no recorded address is returned unchanged, so the
+    /// `&[T]` argument case (`_1` is the slice) falls through to `indexed`.
+    fn pointee(&self, p: &Place) -> Place {
+        let r = self.resolve(p);
+        match (r.proj.is_empty(), self.addressed.get(&r.local)) {
+            (true, Some(t)) => self.resolve(t),
+            _ => r,
+        }
+    }
+
+    /// Copy every derived part of `src`'s local onto `dst`, and report whether the
+    /// source had any.
+    ///
+    /// A whole-struct assignment (`c = d`) copies a value the frontend models as
+    /// its *parts*: `d`'s fields live in `fields`, not in `locals`, and `d` itself
+    /// is a struct with no bit-vector meaning. Copying only the local would move an
+    /// `Unknown` and leave `c.lo` reading nothing, which is why
+    /// `c = d; c.lo` stayed unreadable. Copying the parts is what makes the
+    /// assignment mean what it says.
+    ///
+    /// The destination's own parts are dropped first: a whole-value assignment
+    /// replaces all of them, so a field the source does not carry must not survive
+    /// from the destination's previous value -- that stale field is a *wrong*
+    /// value, and it is the failure mode this store guards against everywhere else.
+    fn copy_parts(&mut self, src: &Place, dst: u32) -> bool {
+        let src = self.resolve(src);
+        if !src.proj.is_empty() || src.local == dst {
+            return false;
+        }
+        let s = src.local;
+        let fields: Vec<(u32, Val)> =
+            self.fields.iter().filter(|((l, _), _)| *l == s).map(|((_, k), v)| (*k, *v)).collect();
+        let elems: Vec<(u64, Val)> =
+            self.elems.iter().filter(|((l, _), _)| *l == s).map(|((_, k), v)| (*k, *v)).collect();
+        let payloads: Vec<(u32, (Val, u8))> =
+            self.payloads.iter().filter(|((l, _), _)| *l == s).map(|((_, k), v)| (*k, *v)).collect();
+        let disc = self.discriminants.get(&s).copied();
+        let indexed = self.indexed.get(&s).cloned();
+        let any = !fields.is_empty()
+            || !elems.is_empty()
+            || !payloads.is_empty()
+            || disc.is_some()
+            || indexed.is_some();
+        self.forget_parts(dst);
+        for (k, v) in fields {
+            self.fields.insert((dst, k), v);
+        }
+        for (k, v) in elems {
+            self.elems.insert((dst, k), v);
+        }
+        for (k, v) in payloads {
+            self.payloads.insert((dst, k), v);
+        }
+        if let Some(d) = disc {
+            self.discriminants.insert(dst, d);
+        }
+        if let Some(ix) = indexed {
+            self.indexed.insert(dst, ix);
+        }
+        any
+    }
+
     fn get(&self, p: &Place) -> Val {
+        let resolved = self.resolve(p);
+        let p = &resolved;
         let mut cur = match self.locals.get(&p.local) {
             Some(v) => *v,
             // A modelled `Option` local has no entry in `locals`: its value is
@@ -714,6 +826,11 @@ impl Env {
     }
 
     fn set(&mut self, p: &Place, v: Val) {
+        // A write through a reference (`(*_2).0 = v`) belongs to the place `_2`
+        // addresses, not to `_2`; resolving here is what makes the write and the
+        // read of the target meet in one store.
+        let resolved = self.resolve(p);
+        let p = &resolved;
         if p.proj.is_empty() {
             // A whole-place assignment replaces the value *and* every part of it
             // the environment holds separately. The field, element, payload and
@@ -1876,6 +1993,10 @@ where
 fn operand(env: &mut Env, o: &Operand) -> Val {
     match o {
         Operand::Copy(p) | Operand::Move(p) => {
+            // A dereference of an addressed local names the place it addresses,
+            // so `_2 = &_1; *_2` reads `_1` -- including through a subscript,
+            // which is why the rewrite comes before `read_indexed`.
+            let p = &env.resolve(p);
             // A slice element is created on first read, so it goes through the
             // mutable path before the ordinary one.
             if let Some(v) = env.read_indexed(p) {
@@ -1923,7 +2044,19 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
                     return Val::Sym(smt::word(*v as u64, w), sign);
                 }
             }
-            operand(env, o)
+            let v = operand(env, o);
+            // A whole-struct copy (`c = d`) carries the value's *parts* across, so
+            // `c.lo` afterwards reads `d.lo`. `Val::Agg` is returned when parts
+            // moved, which is what tells `set` not to clear the parts just copied
+            // -- the same convention an aggregate literal uses.
+            if dest.proj.is_empty() {
+                if let Operand::Copy(q) | Operand::Move(q) = o {
+                    if env.copy_parts(q, dest.local) {
+                        return Val::Agg;
+                    }
+                }
+            }
+            v
         }
         Rvalue::Binary(op, a, b) => {
             // The signedness of the *left* operand decides what `Shr` means and
@@ -1986,6 +2119,21 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
             }
         }
         Rvalue::Cast(o, ty) => {
+            // A cast between reference types (`&[u8; 4]` to `&[u8]`) does not
+            // change *what* is addressed, only how it is described. The address
+            // mapping is therefore carried across, which is what makes
+            // `let r = &a; r.len()` on an array read the array's own length: the
+            // `PtrMetadata` after the cast names the slice local, and only the
+            // carried mapping gets it back to the array. A cast whose target is
+            // not a reference is a numeric cast and carries nothing.
+            if matches!(ty, Ty::Ref(_)) {
+                if let Operand::Copy(q) | Operand::Move(q) = o {
+                    let target = env.resolve(q);
+                    if let Some(p) = env.addressed.get(&target.local).cloned() {
+                        env.addressed.insert(dest.local, p);
+                    }
+                }
+            }
             let v = operand(env, o);
             // The cast's *result* has the target type, so its sign is the
             // target's. The source's sign comes out of the value, which is what
@@ -2025,16 +2173,60 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
             }
             Val::Agg
         }
-        Rvalue::Ref(_) | Rvalue::Len(_) | Rvalue::Unknown(_) => Val::Unknown,
+        Rvalue::Struct(ops) => {
+            // A struct literal writes *fields*, not elements. The two are
+            // different stores on purpose: a contract names a struct field
+            // (`c.lo`) and never a tuple component by name, and a field read
+            // (`_1.0`) consults `fields` first. Storing these under `Index` would
+            // leave the read looking in a store the literal never wrote, which is
+            // how `let c = Config { lo: 7, .. }; c.lo` stayed unknown.
+            //
+            // The printed order is declaration order, which is the order the
+            // `Field(N)` projections index, so position `i` here is field `i`.
+            for (i, o) in ops.iter().enumerate() {
+                let v = operand(env, o);
+                env.set(&Place { local: dest.local, proj: vec![Proj::Field(i as u32)] }, v);
+            }
+            Val::Agg
+        }
+        Rvalue::Ref(p) => {
+            // `&place` addresses `place`. The local itself is not a modelled
+            // value -- a pointer has no bit-vector meaning here -- so it reads
+            // `Unknown`; what the reference *is* for this frontend is the mapping
+            // `resolve` consults, and that is recorded here, at the one place a
+            // reference is created.
+            //
+            // The place is stored as written, so `&_1.0` keeps its projection and
+            // `(*_2)` later reads `_1.0` rather than the whole of `_1`.
+            env.addressed.insert(dest.local, p.clone());
+            Val::Unknown
+        }
+        Rvalue::Len(_) | Rvalue::Unknown(_) => Val::Unknown,
         // `PtrMetadata(_1)` — for a `&[T]` this is the slice's length. Modelled
         // only when the local is a slice the frontend bound a length for; any
         // other pointer has metadata this model cannot express, and answering
         // `Unknown` there is what keeps an invented length out of a proof.
-        Rvalue::PtrMetadata(p) => match env.indexed.get(&p.local) {
-            // A length is a `usize`, so it is unsigned.
-            Some(s) => Val::Sym(s.len, Sign::Unsigned),
-            None => Val::Unknown,
-        },
+        Rvalue::PtrMetadata(p) => {
+            // The place is followed to its pointee first, so `_2 = _3 as &[u8]`
+            // after `_3 = &_1` names `_1` here -- the place whose length is
+            // actually wanted.
+            let p = env.pointee(p);
+            match env.indexed.get(&p.local) {
+                // A slice argument, whose length is a symbolic input.
+                // A length is a `usize`, so it is unsigned.
+                Some(s) => Val::Sym(s.len, Sign::Unsigned),
+                // An *array* has its length in its type, not in `indexed`, so an
+                // unsized `&[T; N]` would otherwise read unknown. The length is
+                // the type's constant -- not a guess, and not a fresh variable:
+                // `[T; N]` coerces to a slice of exactly `N`, so the two are the
+                // same number and a contract that writes `a.len() == 4` on an
+                // `a: [u8; 4]` has something to agree with.
+                None => match type_of_place(f, &p) {
+                    Some(Ty::Array(_, n)) => Val::Sym(smt::word(n, USIZE_WIDTH), Sign::Unsigned),
+                    _ => Val::Unknown,
+                },
+            }
+        }
         Rvalue::Discriminant(p) => match env.discriminants.get(&p.local) {
             // The tag's width is the payload's, not the dump's `isize`. The
             // `switchInt` compares it against the small variant constants, so

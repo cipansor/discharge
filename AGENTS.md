@@ -2800,27 +2800,64 @@ element-side case: `i8::MIN` is the most negative `i8` and the largest `u8`, so
 (`a_comparison_on_an_unprinted_sign_is_refused`) pins the refusal directly.
 
 **Stage 2 — close the remaining `Rvalue` gaps, one at a time, each with a
-tripwire.** In rough order of how often real Rust hits them:
+tripwire.** The list below was written from reading the `Rvalue` enum, before
+measuring which variants real rustc actually *prints*. Measuring first changed it:
+two of the six items were not gaps at all, and the real ones were smaller and
+differently shaped than the enum suggested. The lesson is the same one the
+signedness round taught -- a gap list inferred from a type is a hypothesis, and
+the corpus is the experiment that tests it. (`examples/mir_coverage` takes an
+optional file argument, which is what made the measurement cheap.)
 
-* **`Rvalue::Cast` to `bool`** (`a != 0` written as `(a as bool)`), and
-  `char`/`bool` in general. Small, and the `Cast` arm is now the place to add it.
-* **`Rvalue::Unary(Not)` on a `bool` operand of the wrong width** is handled, but
-  `!x` for a *word* operand is `all_ones ^ x` only when the width is right; assert
-  the width rather than trusting `dest_w`.
-* **`Rvalue::Aggregate` for a struct literal** (`Config { lo, hi }`). The arm
-  already stores by `Proj::Index`; a struct needs the *field* indices, which means
-  the frontend must know the struct's field order from the source, the way it
-  already reads field *types*. This is the shape behind `struct_reassign_then_field_read`
-  staying incomplete.
-* **`Rvalue::Ref`/`Len`** return `Unknown`. `Len` on a fixed array is a type
-  constant and should be `N`; on a slice it is the bound length. `Ref` is the
-  `&x` rvalue, which the model reads through — refusing is right, but the refusal
-  should be *named* so coverage shows why.
-* **`Rvalue::Discriminant` and `Downcast` for a real enum match.** Both are
-  currently incomplete (`unmodelled switch discriminant`). This is the largest
-  single shape: a `match` on a two-variant enum is ordinary Rust. It needs a tag
-  variable per enum local and a `switchInt` that reads it, and the *tripwire* is a
-  `match` whose arms are swapped, which must fail.
+* **`Rvalue::Cast` to `bool` — not a gap.** `a as bool` does not compile
+  (`E0054`: `cannot cast u8 as bool`); the idiom is `a != 0`, which lowers to
+  `Ne`, already modelled. Nothing to do, and the item was removed rather than
+  implemented.
+* **`Rvalue::Len` — not a gap.** Modern rustc does not print `Len(` at all: a
+  `.len()` lowers to `PtrMetadata`, and `grep -c 'Len('` over a full dump is `0`.
+  The real work was in `PtrMetadata`, below, not in the variant the enum names.
+* **`Rvalue::Struct` for a struct literal — DONE.** `Config { lo, hi }` is a
+  *struct-literal* rvalue, not an array/tuple `Aggregate`. The two write different
+  stores: an aggregate writes `Proj::Index` (tuple components, which a contract
+  cannot name) and a struct literal writes `Proj::Field` (which a contract *does*
+  name, as `c.lo`). The fields are printed in **declaration** order, which is the
+  order the `Field(N)` projections count in, so a positional store is sound -- and
+  the tripwire pins exactly that: `struct_literal_order_tripwire` writes `hi`
+  first and must be refuted with a witness that is the `hi` operand, not `lo`.
+* **`Rvalue::Ref` and dereference — DONE.** `&place` records the place it
+  addresses, and `Env::resolve` rewrites a `*_2` whose `_2` is addressed into that
+  place. This is a *substitution*, so a write through the reference and a read of
+  the target meet in one store: `reference_write_reaches_target` verifies because
+  the write is seen, and `reference_write_tripwire` fails because a snapshot model
+  would have proved it. The same store fixed a parser bug: `strip_annot` stripped
+  the parentheses off a bare `(*_2)`, leaving `*_2`, which no place parser reads.
+* **`PtrMetadata` of an unsized array — DONE.** `a.len()` on `a: [u8; 4]` lowers
+  to `_3 = &_1; _2 = _3 as &[u8]; PtrMetadata(_2)`. The reference-to-reference
+  cast carries the address across, and `PtrMetadata` follows it to the array,
+  whose length is the *type's constant* -- not a fresh variable, so `a.len() == 4`
+  has something to agree with. `Env::pointee` is the one-level value step that
+  `resolve` deliberately does not take, because metadata belongs to the pointee,
+  not the pointer.
+* **A whole-struct reassignment — DONE.** `c = d` copies a value the frontend
+  models as its *parts*, so `Env::copy_parts` moves the field/element/payload/tag
+  maps. It reports whether anything moved, which is what lets `set` keep the parts
+  (the same `Val::Agg` convention an aggregate literal uses) instead of clearing
+  them. `struct_reassign_then_field_read` moved from *incomplete* to **refuted**:
+  the false contract is now a counterexample, not a shrug.
+* **`Rvalue::Discriminant` and `Downcast` for a real enum match — STILL OPEN.**
+  `enum_match` is still `incomplete` (`unmodelled switch discriminant`). This is
+  the largest remaining single shape: a `match` on a two-variant enum is ordinary
+  Rust. It needs a tag variable per enum local and a `switchInt` that reads it;
+  the *tripwire* is a `match` whose arms are swapped, which must fail. The model
+  exists for the synthesised `Option`s of `checked_*` and does not generalise,
+  because a real enum's tag comes from a `switchInt` the frontend never built.
+* **`Rvalue::Unary(Not)` on a word operand** is handled, but `!x` is
+  `all_ones ^ x` only when `dest_w` is the operand's width; assert the width
+  rather than trusting `dest_w`. Small, and not yet measured against the corpus.
+
+Corpus coverage went from 33/51 to 38/58 decided across this round; the new
+entries are `struct_literal_reads_its_field`, `struct_literal_order` (+ its
+tripwire), `reference_reads_through`, `reference_write_reaches_target` (+ its
+tripwire), `array_len_is_the_type_constant` and `struct_reassign_reads_new_field`.
 
 **Stage 3 — the contract language's two deliberate refusals.** `xs[i]` with a
 symbolic `i` on a *slice*, and `a[k]` where `k` is a local rather than an
