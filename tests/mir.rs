@@ -1192,12 +1192,23 @@ fn stage_two_rvalues_are_modelled_and_their_tripwires_refuted() {
         "reference_write_reaches_target",
         "array_len_is_the_type_constant",
         "struct_reassign_reads_new_field",
+        "enum_match_is_bounded",
+        "enum_match_selects_by_tag",
+        "enum_payload_reads_through",
+        "enum_constructed_locally",
+        "enum_constructed_payload_reads_through",
     ];
     let refuted = [
         // Written in reverse order; a positional-by-write-order model proves it.
         "struct_literal_order_tripwire",
         // The pre-write value; a snapshot model of `&mut` proves it.
         "reference_write_tripwire",
+        // Claims every arm returns `2`; only a constant tag proves it.
+        "enum_match_tripwire",
+        // Claims the `Off` arm ran for a value built as `Mode::Idle`; a model
+        // that resolved the variant to the wrong index (or to a symbolic tag)
+        // would prove it.
+        "enum_constructed_locally_tripwire",
     ];
     let Some(report) = verify_realistic(&verified) else { return };
     for name in verified {
@@ -1792,4 +1803,77 @@ pub fn chain_must_be_read(a: [u8; 4], i: usize) -> u8 {
         other => panic!("`chain_must_be_read` must FAIL (ret <= 9 is false), got: {other}"),
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Stage 2, enums: a `match` is a `switchInt` on a symbolic tag.
+///
+/// A `match` lowers to `_2 = discriminant(_1); switchInt(move _2) -> [...]`, so
+/// the tag is an input. Before this it was read as unknown and every `match` was
+/// `incomplete` with `unmodelled switch discriminant`. The tag's domain is the
+/// enum's arity, which is a fact about the *type*, so assuming it is sound and is
+/// what makes the `otherwise` arm -- lowered to `unreachable` -- genuinely
+/// unreachable rather than a spurious panic.
+///
+/// The tripwire is what makes this evidence rather than a claim: a constant tag
+/// (or one read as zero) would prove `enum_match_tripwire`, which is false.
+#[test]
+fn an_enum_match_is_a_switch_on_a_symbolic_tag() {
+    let Some(report) = verify_realistic(&["enum_match_is_bounded"]) else { return };
+    let o = outcome(&report, "enum_match_is_bounded");
+    assert!(o.is_verified(), "`enum_match_is_bounded` must verify, got: {o}");
+}
+
+/// A variant payload is read through the downcast and is a symbolic input.
+///
+/// `Msg::Data(x)` lowers to `_3 = copy ((_1 as Data).0)`, so the payload is field
+/// 0 of variant 1. The contract's `m.Data` is bound to the same variable the
+/// downcast reads, so `ret == m.Data` on that arm is a claim about one value.
+#[test]
+fn an_enum_payload_is_read_through_the_downcast() {
+    let Some(report) = verify_realistic(&["enum_payload_reads_through"]) else { return };
+    let o = outcome(&report, "enum_payload_reads_through");
+    assert!(o.is_verified(), "`enum_payload_reads_through` must verify, got: {o}");
+}
+
+/// A locally constructed variant has a *known* tag, so its `match` decides.
+///
+/// `let m = Mode::Idle;` lowers to `_1 = Mode::Idle;`, a bare path constant with
+/// no `const ` prefix, and `Mode::Idle` resolves to the enum's declaration index.
+/// The tag is therefore a constant, only the `Idle` arm is reachable, and the
+/// contract is decided rather than left as a coverage gap. The companion
+/// tripwire claims the `Off` arm ran, which the same model must refute.
+#[test]
+fn a_locally_constructed_variant_has_a_known_tag() {
+    let Some(report) = verify_realistic(&["enum_constructed_locally"]) else { return };
+    let o = outcome(&report, "enum_constructed_locally");
+    assert!(o.is_verified(), "`enum_constructed_locally` must verify, got: {o}");
+}
+
+/// A constructed variant's payload is written where the downcast reads it.
+///
+/// `Msg::Data(9)` lowers to `_1 = Msg::Data(const 9_u8);`, so the tag is `1` and
+/// the payload is field 0 of that variant. The match's `Data(x)` arm reads
+/// `((_1 as Data).0: u8)`, which is the same field, so `ret == 9` is a claim
+/// about the value the construction wrote -- not about a fresh input.
+#[test]
+fn a_constructed_variants_payload_is_read_through_the_downcast() {
+    let Some(report) = verify_realistic(&["enum_constructed_payload_reads_through"]) else { return };
+    let o = outcome(&report, "enum_constructed_payload_reads_through");
+    assert!(o.is_verified(), "`enum_constructed_payload_reads_through` must verify, got: {o}");
+}
+
+/// A unit variant has no payload, so naming one is refused rather than bound.
+///
+/// `m.Ping` is a unit variant. There is no value to read, so the contract must be
+/// refused -- a model that bound every variant to the same payload would prove
+/// this false contract. The refusal is `Skipped`, which is reported, not a
+/// silent pass.
+#[test]
+fn a_unit_variant_has_no_payload_to_name() {
+    let Some(report) = verify_realistic(&["enum_payload_tripwire"]) else { return };
+    let o = outcome(&report, "enum_payload_tripwire");
+    assert!(
+        !o.is_verified(),
+        "`enum_payload_tripwire` names a unit variant's payload and must be refused, got: {o}"
+    );
 }

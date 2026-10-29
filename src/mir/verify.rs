@@ -174,7 +174,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     // Fields of struct-typed arguments, bound to their own symbolic inputs. The
     // same bindings are handed to the executor as seeds, so `c.lo` in a contract
     // and `((*_1).0)` in the body name one variable.
-    let mut fields = spec::field_env(f, &specs.structs);
+    let mut fields = spec::field_env(f, &specs.structs, &specs.enums);
     // Slice element references a contract names, bound before the rewrite runs so
     // each `xs[k]` has a binding to rewrite to. Done here, once, rather than on
     // demand, because the postcondition is evaluated inside a closure that cannot
@@ -393,6 +393,8 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
             lens: fields.len_seeds.clone(),
             array_lens: fields.array_lens.clone(),
             elems: fields.elem_seeds.clone(),
+            tags: fields.tag_seeds.clone(),
+            payload_seeds: fields.payload_seeds.clone(),
         },
     );
 
@@ -493,7 +495,7 @@ pub fn verify_file_with(
         .map_err(|e| format!("could not read {}: {e}", source.display()))?;
     let specs = spec::extract(&text);
     let mir = emit_mir_with(rustc, source)?;
-    let prog = parse::parse_program(&mir);
+    let prog = parse::parse_program_with(&mir, &enum_layouts(&specs));
 
     let mut report = FileReport { source: source.to_path_buf(), ..Default::default() };
 
@@ -521,13 +523,32 @@ pub fn verify_file_with(
     Ok(report)
 }
 
+/// The executor's view of each enum: names in declaration order, so a
+/// `(base as Variant)` downcast resolves to the discriminant the `switchInt`
+/// compares against.
+///
+/// The spec reader carries payload types the parser has no use for, so only the
+/// names cross over. Both views are read from the same source in the same pass,
+/// which is what keeps a downcast's index and a contract's `Enum::Variant`
+/// constant in step by construction rather than by convention.
+fn enum_layouts(specs: &Specs) -> BTreeMap<String, parse::EnumLayout> {
+    specs
+        .enums
+        .iter()
+        .map(|(name, def)| {
+            let variants = def.variants.iter().map(|(v, _)| v.clone()).collect();
+            (name.clone(), parse::EnumLayout { variants })
+        })
+        .collect()
+}
+
 /// Verify a whole MIR dump, using contracts from a companion source file.
 pub fn verify_mir_text(
     mir: &str,
     specs: &Specs,
     only: &[String],
 ) -> Result<FileReport, String> {
-    let prog = parse::parse_program(mir);
+    let prog = parse::parse_program_with(mir, &enum_layouts(specs));
     let mut report = FileReport::default();
     for name in specs.by_fn.keys() {
         if prog.get(name).is_none() {

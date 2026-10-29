@@ -239,6 +239,20 @@ pub struct Config {
     pub hi: u8,
 }
 
+/// A fieldless enum, for the `match` shapes at the end of the file.
+///
+/// Its variants are declared in one line, which is the shape a one-line reader
+/// has to handle: the discriminants are `0`, `1` and `2` in declaration order,
+/// and a `match` on it lowers to `switchInt(discriminant(m))` over those.
+pub enum Mode { Off, Idle, Run }
+
+/// An enum with a payload, for the downcast shapes.
+///
+/// `Msg::Data(u8)` puts a `u8` in variant `1`, so the `match` arm reads it back
+/// as `((_1 as Data).0)`. The other two variants are unit variants with no
+/// payload to read, which is what the payload tripwire relies on.
+pub enum Msg { Ping, Data(u8), Stop }
+
 /// A struct with *signed* fields, for the signed-comparison shapes.
 ///
 /// `Config`'s fields are `u8`, so a contract that needs `i8::MIN` cannot use it:
@@ -781,4 +795,137 @@ pub fn array_len_is_the_type_constant() -> usize {
 pub fn struct_reassign_reads_new_field(mut c: Config, d: Config) -> u8 {
     c = d;
     c.lo
+}
+
+/// A `match` on an enum lowers to `switchInt(discriminant(m))`, and the tag is
+/// an input this frontend now models.
+///
+/// `discriminant` reads a symbolic tag whose domain is the enum's arity, so the
+/// three arms are reachable exactly as the type says and the `otherwise` arm --
+/// which rustc lowers to `unreachable` for an exhaustive `match` -- is genuinely
+/// unreachable. Every arm returns a value at most `2`, so the bound holds.
+/// requires: true
+/// ensures: ret <= 2
+pub fn enum_match_is_bounded(m: Mode) -> u8 {
+    match m {
+        Mode::Off => 0,
+        Mode::Idle => 1,
+        Mode::Run => 2,
+    }
+}
+
+/// The tag is the *only* thing a `match` reads, so a precondition on it selects
+/// the arm.
+///
+/// This is the readable half of [`enum_match_tripwire`]: `m == Mode::Run` pins the
+/// tag to `2`, which is the arm that returns `2`. A model that guessed the tag
+/// (or read it as zero) would send every input down the `Off` arm and refute
+/// this contract.
+/// requires: m == Mode::Run
+/// ensures: ret == 2
+pub fn enum_match_selects_by_tag(m: Mode) -> u8 {
+    match m {
+        Mode::Off => 0,
+        Mode::Idle => 1,
+        Mode::Run => 2,
+    }
+}
+
+/// The tripwire for the enum tag: an unconditional claim that only one arm's
+/// value can satisfy.
+///
+/// Same body as [`enum_match_is_bounded`], but the contract claims the return is
+/// always `2`. The `Off` and `Idle` arms make that false, so it must be refuted
+/// -- and the witness must name the tag, which is the evidence the tag is
+/// genuinely symbolic rather than a constant the model picked.
+/// requires: true
+/// ensures: ret == 2
+pub fn enum_match_tripwire(m: Mode) -> u8 {
+    match m {
+        Mode::Off => 0,
+        Mode::Idle => 1,
+        Mode::Run => 2,
+    }
+}
+
+/// A variant *payload* is a symbolic input, read through the downcast.
+///
+/// `Msg::Data(x)` lowers to `_3 = copy ((_1 as Data).0)`, so the payload is read
+/// as field 0 of variant 1. The contract names `m.Data`, which is bound to the
+/// same variable, so `ret == m.Data` on the `Data` arm is a claim about one value
+/// and not two that look alike.
+/// requires: m == Msg::Data
+/// ensures: ret == m.Data
+pub fn enum_payload_reads_through(m: Msg) -> u8 {
+    match m {
+        Msg::Ping => 0,
+        Msg::Data(x) => x,
+        Msg::Stop => 255,
+    }
+}
+
+/// The tripwire for the payload: the *wrong* variant's payload.
+///
+/// `m.Ping` is a unit variant, so it has no payload to read. The contract must be
+/// refused rather than bound to a fabricated value -- a model that bound every
+/// variant to the same payload would prove this false contract.
+/// requires: true
+/// ensures: ret == m.Ping
+pub fn enum_payload_tripwire(m: Msg) -> u8 {
+    match m {
+        Msg::Ping => 0,
+        Msg::Data(x) => x,
+        Msg::Stop => 255,
+    }
+}
+
+/// A *locally constructed* variant has a known tag, so its `match` is decided
+/// rather than symbolic.
+///
+/// `let m = Mode::Idle;` lowers to `_1 = Mode::Idle; _2 = discriminant(_1)`, and
+/// `Mode::Idle` is a path constant. Resolving it to the enum's declaration index
+/// is what makes the tag a *constant* `1` here, so only the `Idle` arm is
+/// reachable and the contract is decided rather than left as a coverage gap.
+/// requires: true
+/// ensures: ret == 1
+pub fn enum_constructed_locally() -> u8 {
+    let m = Mode::Idle;
+    match m {
+        Mode::Off => 0,
+        Mode::Idle => 1,
+        Mode::Run => 2,
+    }
+}
+
+/// The tripwire for construction: the wrong variant's arm.
+///
+/// Same body as [`enum_constructed_locally`], but the contract claims the
+/// `Off` arm ran. A model that resolved `Mode::Idle` to `Off` -- or to a
+/// symbolic tag -- would prove this, so refuting it is the evidence the
+/// discriminant is the declaration index and not a guess.
+/// requires: true
+/// ensures: ret == 0
+pub fn enum_constructed_locally_tripwire() -> u8 {
+    let m = Mode::Idle;
+    match m {
+        Mode::Off => 0,
+        Mode::Idle => 1,
+        Mode::Run => 2,
+    }
+}
+
+/// A constructed variant's payload is read through the downcast.
+///
+/// `Msg::Data(9)` lowers to a construction of tag `1` with payload `9` written
+/// into field 0, and the match's `Data(x)` arm reads that field. The contract
+/// names the constant, so it is decided.
+/// requires: true
+/// ensures: ret == 9
+pub fn enum_constructed_payload_reads_through() -> u8 {
+    let m = Msg::Data(9);
+    match m {
+        Msg::Ping => 0,
+        Msg::Data(x) => x,
+        Msg::Stop => 255,
+    }
 }

@@ -2843,21 +2843,69 @@ optional file argument, which is what made the measurement cheap.)
   (the same `Val::Agg` convention an aggregate literal uses) instead of clearing
   them. `struct_reassign_then_field_read` moved from *incomplete* to **refuted**:
   the false contract is now a counterexample, not a shrug.
-* **`Rvalue::Discriminant` and `Downcast` for a real enum match — STILL OPEN.**
-  `enum_match` is still `incomplete` (`unmodelled switch discriminant`). This is
-  the largest remaining single shape: a `match` on a two-variant enum is ordinary
-  Rust. It needs a tag variable per enum local and a `switchInt` that reads it;
-  the *tripwire* is a `match` whose arms are swapped, which must fail. The model
-  exists for the synthesised `Option`s of `checked_*` and does not generalise,
-  because a real enum's tag comes from a `switchInt` the frontend never built.
+* **`Rvalue::Discriminant` and `Downcast` for a real enum match — DONE.**
+  A `match` on an enum lowers to `_2 = discriminant(_1); switchInt(move _2)`,
+  so the tag is a symbolic input whose *domain is the enum's arity*. That bound
+  is a fact about the type, not an assumption about the caller, so the run may
+  assume it -- and it is what makes the `otherwise` arm (lowered to
+  `unreachable` for an exhaustive `match`) genuinely unreachable instead of a
+  spurious panic. Three pieces make it work:
+  - `spec::EnumDef` / `EnumLayout` read the variants in **declaration order**
+    from the same source pass as the contracts, so a `(base as Variant)`
+    downcast's index and a contract's `Mode::Run` constant agree by
+    construction rather than by convention. A one-line body
+    (`pub enum E { A, B }`) and a multi-line one are read by the same
+    top-level-comma split, so the numbering cannot drift between them.
+  - `FieldEnv::bind_enum` binds the argument's own name to the tag, so a
+    contract writes `m == Mode::Run`; each variant's first payload is bound
+    separately, so `m.Data` names the same variable the body's
+    `((_1 as Data).0)` downcast reads.
+  - `Seeds::tags` seeds the tag and `Seeds::payload_seeds` the payloads, and the
+    run conjoins `tag < arity` onto the initial path.
+  The tripwires pin the model rather than its presence: `enum_match_tripwire`
+  claims every arm returns `2` and must be refuted with the tag in the witness
+  (a constant tag would prove it), and `enum_payload_tripwire` names a *unit*
+  variant's payload, which is refused rather than bound to a fabricated value.
+  A variant with no payload is refused with a message naming the variant.
+* **A locally constructed variant has a *known* tag — DONE.** `let m = Mode::Idle;`
+  lowers to `_1 = Mode::Idle;`, a bare path constant with **no `const ` prefix**,
+  which the rvalue parser did not recognise: it fell through to `Rvalue::Unknown`
+  and the tag was never written, so `let m = Mode::Idle; match m` stayed
+  `incomplete` even once a tag read from an *argument* worked. Two changes close
+  it. `parse_rvalue` recognises a bare `Enum::Variant` path as a constant, and
+  `eval_rvalue::Use` resolves it against the program's enum layouts -- the same
+  table a `match`'s downcast reads -- writing a *constant* tag rather than
+  seeding a symbolic one. The tag's width is the enum's arity, taken from the
+  destination's type, not the dump's `isize`: `Env::tag_widths` records it so
+  `discriminant` reads the tag back at the width the contract's comparison was
+  checked at. A payload construction (`Msg::Data(9)`) is `Rvalue::Variant`: the
+  tag is the declaration index and the operands are written as the variant's
+  fields, so the match's `((_1 as Data).0)` downcast reads what the construction
+  wrote. `enum_constructed_locally` verifies and
+  `enum_constructed_locally_tripwire` is refuted; the payload case
+  (`enum_constructed_payload_reads_through`) verifies.
+* **`// MIR FOR CTFE` is a copy, not a second function — DONE.** Building a
+  tuple-variant constructor in a `let` (`Msg::Data(9)`) makes rustc print a
+  *second*, `// MIR FOR CTFE`-marked body for the constructor. It is a copy of an
+  item already printed above it, and the typed MIR has one body per item, so
+  parsing it made the text side count 69 functions where `rustc_public` counted
+  68 -- a `rustc_public` MIR-oracle failure (gate 9) over a function that is
+  really there once. The parser now skips a `// MIR FOR CTFE` marker and the body
+  that follows it. This is exactly the class of printer change gate 9 exists to
+  catch: the frontend's own verdicts were unaffected, and only the oracle
+  noticed.
 * **`Rvalue::Unary(Not)` on a word operand** is handled, but `!x` is
   `all_ones ^ x` only when `dest_w` is the operand's width; assert the width
   rather than trusting `dest_w`. Small, and not yet measured against the corpus.
 
-Corpus coverage went from 33/51 to 38/58 decided across this round; the new
+Corpus coverage went from 33/51 to 44/67 decided across this round; the new
 entries are `struct_literal_reads_its_field`, `struct_literal_order` (+ its
 tripwire), `reference_reads_through`, `reference_write_reaches_target` (+ its
-tripwire), `array_len_is_the_type_constant` and `struct_reassign_reads_new_field`.
+tripwire), `array_len_is_the_type_constant`, `struct_reassign_reads_new_field`,
+the five enum entries (`enum_match_is_bounded`, `enum_match_selects_by_tag`,
+`enum_payload_reads_through` and their tripwires) and the two construction
+entries (`enum_constructed_locally` + tripwire,
+`enum_constructed_payload_reads_through`).
 
 **Stage 3 — the contract language's two deliberate refusals.** `xs[i]` with a
 symbolic `i` on a *slice*, and `a[k]` where `k` is a local rather than an

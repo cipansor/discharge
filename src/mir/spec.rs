@@ -56,7 +56,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::mir::parse::{Ty, USIZE_WIDTH};
+use crate::mir::parse::{split_top_level, Ty, USIZE_WIDTH};
 use crate::smt::{self, Pred, Var};
 
 /// How long an array may be before a symbolic subscript is refused.
@@ -108,6 +108,49 @@ pub struct Specs {
     /// construction. A struct with no entry here has no readable fields, and a
     /// contract naming one is refused rather than guessed.
     pub structs: BTreeMap<String, StructDef>,
+    /// Enum layouts read from the same source, keyed by enum name.
+    ///
+    /// An enum argument has no width of its own, but its *tag* does, and the
+    /// `switchInt` a `match` lowers to compares that tag against the variant
+    /// indices. Those indices are not in the MIR dump -- it prints `_2 =
+    /// discriminant(_1)` and `switchInt(move _2) -> [0: bb4, 1: bb3, 2: bb2]`,
+    /// which is a number per arm and no name at all. So the same reasoning as
+    /// [`Specs::structs`] applies: the layout has to come from the source, and a
+    /// contract naming a variant is refused rather than guessed at when it is not
+    /// there.
+    pub enums: BTreeMap<String, EnumDef>,
+}
+
+/// An enum's variants, in declaration order.
+///
+/// The index in this vector *is* the discriminant, which is what makes the
+/// layout useful: `variant 0` is the first variant written, and rustc numbers
+/// them the same way unless the source gives explicit discriminants (which this
+/// reader does not model, and which a contract naming a variant then refuses).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnumDef {
+    /// `(name, payload types)` per variant. A unit variant has an empty payload;
+    /// a struct variant records no payload types, so a contract naming one of its
+    /// fields is refused rather than bound to the wrong thing.
+    pub variants: Vec<(String, Vec<Ty>)>,
+}
+
+impl EnumDef {
+    /// The discriminant for `name`, or `None` if the enum has no such variant.
+    pub fn index_of(&self, name: &str) -> Option<u32> {
+        self.variants.iter().position(|(n, _)| n == name).map(|i| i as u32)
+    }
+
+    /// How many variants the enum has, which bounds the tag's domain.
+    ///
+    /// A value of an `N`-variant enum always has a tag below `N`; that is a
+    /// property of the *type*, not an assumption about the caller, so the run may
+    /// assume it (see `exec::verify_fn`). Without it the `otherwise` arm of an
+    /// exhaustive `match` -- which rustc lowers to `unreachable` -- would look
+    /// reachable and every `match` would report a spurious panic.
+    pub fn arity(&self) -> u64 {
+        self.variants.len() as u64
+    }
 }
 
 /// A struct's fields, in declaration order.
@@ -154,6 +197,10 @@ pub fn extract(source: &str) -> Specs {
     // `c.lo <= c.hi` has no way to learn that `lo` is field 0 of width 8 unless
     // the layout is read here.
     let mut cur_struct: Option<(String, StructDef)> = None;
+    // Enum layouts, read in the same pass. An enum body is a list of variants
+    // rather than a list of fields, so it needs its own cursor; a struct and an
+    // enum cannot be open at once, so the two cursors never interleave.
+    let mut cur_enum: Option<(String, EnumDef)> = None;
 
     for (lineno, raw_line) in source.lines().enumerate() {
         let line = raw_line.trim();
@@ -166,6 +213,20 @@ pub fn extract(source: &str) -> Specs {
         if line.starts_with("/*") {
             if !line.contains("*/") {
                 in_block_comment = true;
+            }
+            continue;
+        }
+        // Inside an enum body: read variants until the closing brace.
+        if cur_enum.is_some() {
+            if line.starts_with('}') {
+                let (name, def) = cur_enum.take().unwrap();
+                specs.enums.insert(name, def);
+                continue;
+            }
+            if let Some((vname, payload)) = enum_variant(line) {
+                if let Some((_, def)) = cur_enum.as_mut() {
+                    def.variants.push((vname, payload));
+                }
             }
             continue;
         }
@@ -185,6 +246,16 @@ pub fn extract(source: &str) -> Specs {
         }
         if let Some(name) = struct_head(line) {
             cur_struct = Some((name, StructDef::default()));
+            continue;
+        }
+        if let Some((name, inline)) = enum_head(line) {
+            match inline {
+                // A one-line body is complete already; it needs no cursor.
+                Some(variants) => {
+                    specs.enums.insert(name, EnumDef { variants });
+                }
+                None => cur_enum = Some((name, EnumDef::default())),
+            }
             continue;
         }
         // Inner doc comments (`//!`) and ordinary comments are not contracts.
@@ -352,6 +423,33 @@ pub struct FieldEnv {
     /// in a contract and `xs[0]` in the body are one value, not two that look
     /// alike.
     pub elem_seeds: Vec<(u32, u64, Var, bool)>,
+    /// `(local, tag variable, tag width, arity)` for each enum-typed argument.
+    ///
+    /// An enum argument has no bit width of its own, but its *tag* does, and the
+    /// tag is the only thing a contract can say about an enum without naming a
+    /// variant. It is a symbolic input whose domain is `0..arity`, because a value
+    /// of an `N`-variant enum always has a tag below `N` -- a fact about the type,
+    /// so the run may assume it. Seeding it here is what makes the contract's `m`
+    /// and the body's `discriminant(_1)` one variable.
+    pub tag_seeds: Vec<(u32, Var, u8, u64)>,
+    /// `(local, variant, variable, width, signed)` for each variant payload.
+    ///
+    /// A payload is a symbolic input like any other: the frontend cannot know what
+    /// the caller put in it, so assuming a relation would be unsound. Seeding it
+    /// means the body's `((_1 as Data).0)` and a contract's `m.Data` name one
+    /// variable rather than two that look alike.
+    pub payload_seeds: Vec<(u32, u32, Var, u8, bool)>,
+    /// `Enum::Variant` → `(discriminant, tag width)`, so a contract can write
+    /// `m == Mode::Idle` and have it mean the tag equals that variant's index.
+    /// A name not in here is refused, which keeps a misspelled variant from being
+    /// read as an unrelated integer.
+    pub variant_consts: BTreeMap<String, (u64, u8)>,
+    /// `arg.Variant` → the mangled payload name, so a contract can name a payload
+    /// the way the body's downcast reads it.
+    pub payload_paths: BTreeMap<String, String>,
+    /// The names of enum-typed arguments, for diagnostics: a contract naming
+    /// `m.Nope` where `Nope` is not a variant gets a message about the variant.
+    pub enum_args: BTreeSet<String>,
     /// Indexed arguments (slices and arrays): name → (local, element width, the
     /// array's fixed length if it is one), so a contract's `xs.len()` and `xs[0]`
     /// can be bound without the IR's `Ty` in hand.
@@ -468,6 +566,84 @@ impl FieldEnv {
         }
         self.paths.insert(format!("{arg}.{field}"), mangled);
         self.known_args.insert(arg.to_string());
+        Some(())
+    }
+
+    /// Bind an enum-typed argument: its tag, and each variant's payloads.
+    ///
+    /// The tag is the only thing a contract can compare against a variant, so it
+    /// is always bound when the enum's layout is known. The payloads are bound
+    /// too, so `m.Data` in a contract names the same input the body's downcast
+    /// reads. A payload whose type has no bit width (a nested enum, a reference)
+    /// is skipped, and a contract naming it is then refused rather than bound to
+    /// a fabricated word.
+    ///
+    /// The tag's width is the arity's, not the dump's `isize`: the `switchInt`
+    /// compares it against the small variant constants, so the width only has to
+    /// hold them. Using the arity keeps the tag and the payload in a width that
+    /// `discriminant` reads back consistently.
+    pub fn bind_enum(
+        &mut self,
+        local: u32,
+        arg: &str,
+        enum_name: &str,
+        def: &EnumDef,
+    ) -> Option<()> {
+        let arity = def.arity();
+        if arity == 0 {
+            return None;
+        }
+        // The tag needs `ceil(log2(arity))` bits, and at least one. `N` variants
+        // need to be distinguishable, which is `N - 1` as a maximum index.
+        let width = (64 - (arity - 1).leading_zeros()).max(1) as u8;
+        let tag_slot = self.base + self.next_slot;
+        if tag_slot as usize >= crate::smt::MAX_VARS {
+            return None;
+        }
+        let tag_name = format!("{arg}__tag");
+        if !self.name_is_free(&tag_name) {
+            return None;
+        }
+        self.next_slot += 1;
+        let tag = smt::var_named(tag_slot, width);
+        self.vars.insert(tag_name, tag);
+        // The argument's own name is the tag, so `m == Mode::Idle` reads the tag
+        // without a projection. Bound after the tag variable exists so the two are
+        // the same word.
+        self.vars.insert(arg.to_string(), tag);
+        self.tag_seeds.push((local, tag, width, arity));
+        self.enum_args.insert(arg.to_string());
+        for (i, (vname, payload)) in def.variants.iter().enumerate() {
+            let i = i as u32;
+            // The variant name is a constant of the tag's width. Keyed by the
+            // *enum's* name, because that is what a contract writes
+            // (`m == Mode::Idle`); the argument's name is also accepted, so
+            // `m::Idle` works for a contract that prefers it.
+            self.variant_consts.insert(format!("{enum_name}::{vname}"), (i as u64, width));
+            self.variant_consts.insert(format!("{arg}::{vname}"), (i as u64, width));
+            // A payload: `m.Data` is field 0 of variant `Data`. Only the first
+            // payload is bound, because the MIR downcast this frontend models
+            // reads `.0`; a second field would need a tuple projection the
+            // executor does not carry for payloads.
+            let Some(first) = payload.first() else { continue };
+            let Some(w) = first.width() else { continue };
+            let slot = self.base + self.next_slot;
+            if slot as usize >= crate::smt::MAX_VARS {
+                continue;
+            }
+            let mangled = format!("{arg}__v{i}_0");
+            if !self.name_is_free(&mangled) {
+                continue;
+            }
+            self.next_slot += 1;
+            let v = smt::var_named(slot, w);
+            self.vars.insert(mangled.clone(), v);
+            self.payload_seeds.push((local, i, v, w, first.is_signed()));
+            if first.is_signed() {
+                self.signed.insert(mangled.clone());
+            }
+            self.payload_paths.insert(format!("{arg}.{vname}"), mangled);
+        }
         Some(())
     }
 }
@@ -822,7 +998,13 @@ pub fn named_ret_components(texts: &[String]) -> BTreeSet<u32> {
 }
 
 fn rewrite_fields(text: &str, fields: &FieldEnv) -> Result<String, SpecError> {
-    if fields.paths.is_empty() && fields.known_args.is_empty() {
+    // A payload path is a rewrite target too, so an enum-only contract must not
+    // take the early return: `m.Data` would be left spelled as a field access the
+    // parser cannot reduce.
+    if fields.paths.is_empty()
+        && fields.known_args.is_empty()
+        && fields.payload_paths.is_empty()
+    {
         return Ok(text.to_string());
     }
     let chars: Vec<char> = text.chars().collect();
@@ -844,6 +1026,32 @@ fn rewrite_fields(text: &str, fields: &FieldEnv) -> Result<String, SpecError> {
                     j += 1;
                 }
                 let field: String = chars[dot + 1..j].iter().collect();
+                // An enum payload: `m.Data`. It is rewritten to the mangled
+                // payload name the executor seeds, so the contract's `m.Data` and
+                // the body's `((_1 as Data).0)` are one variable.
+                if let Some(mangled) = fields.payload_paths.get(&format!("{ident}.{field}")) {
+                    out.push_str(mangled);
+                    i = j;
+                    continue;
+                }
+                // A variant of an enum argument that has *no* payload (a unit
+                // variant, or a struct variant whose fields are not modelled).
+                // There is nothing to bind, so this is refused with a message
+                // that names the variant rather than left for the parser to
+                // report as a missing comparison operator. Refusing is the
+                // honest answer: binding a fabricated value would let a false
+                // contract about a payload that does not exist be proved.
+                if fields.enum_args.contains(&ident)
+                    && fields.variant_consts.contains_key(&format!("{ident}::{field}"))
+                {
+                    return Err(SpecError {
+                        text: text.to_string(),
+                        reason: format!(
+                            "`{field}` is a variant of `{ident}` with no payload to read; \
+                             compare the tag instead (`{ident} == ...`)"
+                        ),
+                    });
+                }
                 // `xs.len()` — the slice length. The parens are required, so a
                 // bare `xs.len` (a field named `len`) is not silently accepted.
                 let is_call = chars.get(j) == Some(&'(');
@@ -947,6 +1155,8 @@ pub fn eval_requires(
     let mut sgn = signed.clone();
     sgn.extend(fields.signed.iter().cloned());
     let mut p = Parser::new(&text, &names, None, &sgn, false);
+    p.variant_consts = fields.variant_consts.clone();
+    p.enum_args = fields.enum_args.clone();
     let pred = p.parse_or().map_err(|e| e.about(orig))?;
     p.expect_end().map_err(|e| e.about(orig))?;
     Ok(pred)
@@ -983,6 +1193,8 @@ pub fn eval_ensures(
     sgn.extend(fields.signed.iter().cloned());
     let mut p = Parser::new(&text, &names, ret, &sgn, ret_signed);
     p.ret_absent = ret_absent;
+    p.variant_consts = fields.variant_consts.clone();
+    p.enum_args = fields.enum_args.clone();
     let pred = p.parse_or().map_err(|e| e.about(orig))?;
     p.expect_end().map_err(|e| e.about(orig))?;
     Ok(pred)
@@ -1031,6 +1243,14 @@ struct Parser<'a> {
     /// one -- a scalar return reported as an aggregate sends the reader looking
     /// for a tuple that is not there.
     ret_absent: &'static str,
+    /// `Enum::Variant` → `(discriminant, tag width)`. Empty outside a contract
+    /// evaluation, which is what makes `eval_invariant` (which has no enum
+    /// layouts in hand) refuse such a name rather than guess a constant.
+    variant_consts: BTreeMap<String, (u64, u8)>,
+    /// The enum-typed argument names, so a variant name that is *not* in
+    /// `variant_consts` can be reported as a bad variant rather than an unknown
+    /// constant.
+    enum_args: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1102,6 +1322,8 @@ impl<'a> Parser<'a> {
             text: s.to_string(),
             signed,
             ret_signed,
+            variant_consts: BTreeMap::new(),
+            enum_args: BTreeSet::new(),
             ret_absent: "`ret` is only meaningful in `ensures`",
         }
     }
@@ -1469,6 +1691,20 @@ impl<'a> Parser<'a> {
                     None
                 };
                 if let Some((ty, a)) = assoc {
+                    // `Mode::Idle` — an enum variant named in a contract, which is
+                    // a constant of the tag's width. Checked before `type_bound`
+                    // because a variant name is not an integer bound, and the two
+                    // spellings (`i8::MIN`, `Mode::Idle`) are distinguished by
+                    // which table has the name.
+                    let key = format!("{ty}::{a}");
+                    if let Some((k, w)) = self.variant_consts.get(&key).copied() {
+                        return Ok((smt::word(k, w), false));
+                    }
+                    if self.enum_args.contains(&ty) {
+                        return Err(self.err(format!(
+                            "`{ty}` has no variant `{a}` (or its layout was not readable)"
+                        )));
+                    }
                     if let Some((k, w)) = type_bound(&ty, &a) {
                         // The bound is built at the width of the type it *names*,
                         // not at the widest name in scope. `i8::MIN` is the bit
@@ -1550,6 +1786,96 @@ fn struct_field(line: &str) -> Option<(String, String)> {
     }
     Some((name.to_string(), ty.to_string()))
 }
+/// The parsed head of an `enum` declaration: its name, and its variants when the
+/// body is on the same line.
+type EnumHead = (String, Option<Vec<(String, Vec<Ty>)>>);
+
+
+/// Pull the enum name out of a `pub enum Name {` head line.
+///
+/// Only a *braced* enum is recognised, and only when the body opens on the same
+/// line. An enum whose variants are all written inline on the head line
+/// (`pub enum E { A, B }`) is not read: the variants would have to be split out of
+/// the head text, and getting that wrong would number the variants wrongly, which
+/// is the one thing this layout must not do. A missing layout makes a contract
+/// naming a variant a refusal, which is the safe direction.
+fn enum_head(line: &str) -> Option<EnumHead> {
+    let t = line.trim_start_matches("pub(crate) ").trim_start_matches("pub ").trim();
+    let rest = t.strip_prefix("enum ")?;
+    // A generic enum (`enum E<T>`) is read for its name, but a variant payload
+    // naming `T` has no bit width and is skipped downstream.
+    let name = rest.split(|c: char| c == '{' || c == '<' || c.is_whitespace()).next()?;
+    if name.is_empty() {
+        return None;
+    }
+    let open = rest.find('{')?;
+    let after = &rest[open + 1..];
+    // A one-line body (`pub enum E { A, B }`): the variants are split out of the
+    // head text itself. Splitting on top-level commas is exactly what the
+    // multi-line reader does per line, so the two agree on numbering by
+    // construction.
+    if let Some(close) = after.rfind('}') {
+        let inner = &after[..close];
+        let variants = split_top_level(inner, ',')
+            .iter()
+            .filter_map(|v| enum_variant(v))
+            .collect();
+        return Some((name.to_string(), Some(variants)));
+    }
+    // A multi-line body: the brace must end the line, so nothing but the brace
+    // follows it.
+    if !after.trim().is_empty() {
+        return None;
+    }
+    Some((name.to_string(), None))
+}
+
+/// Pull one variant out of a line of an enum body.
+///
+/// The line looks like `Off,`, `Idle,`, `Data(u8),` or `Pair { x: u8, y: u8 },`.
+/// A unit variant and a tuple variant are both modelled; a *struct* variant
+/// records no payload types, so a contract naming one of its fields is refused
+/// rather than bound to a wrong index. A line that is not a variant (a nested
+/// item, an attribute, a comment) is skipped, which loses a variant rather than
+/// inventing one -- and a lost variant shifts every discriminant after it, so the
+/// skip is restricted to lines that clearly are not variants.
+fn enum_variant(line: &str) -> Option<(String, Vec<Ty>)> {
+    let t = line.trim().trim_end_matches(',').trim();
+    if t.is_empty() || t.starts_with("//") || t.starts_with('#') || t.starts_with("}") {
+        return None;
+    }
+    let t = t.trim_start_matches("pub(crate) ").trim_start_matches("pub ").trim();
+    // The variant name is the leading identifier.
+    let name: String = t.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+    if name.is_empty() || !name.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false)
+    {
+        return None;
+    }
+    let after = t[name.len()..].trim_start();
+    // A unit variant: nothing follows the name.
+    if after.is_empty() {
+        return Some((name, Vec::new()));
+    }
+    // A tuple variant: `Name(u8, u16)`. The payload types are what a `match` arm's
+    // downcast reads, so they are recorded even though the tag does not need them.
+    if let Some(rest) = after.strip_prefix('(') {
+        let close = rest.find(')')?;
+        let inner = rest[..close].trim();
+        let tys = if inner.is_empty() {
+            Vec::new()
+        } else {
+            split_top_level(inner, ',').iter().map(|t| Ty::parse(t.trim())).collect()
+        };
+        return Some((name, tys));
+    }
+    // A struct variant: the fields are not modelled, but the *variant* is, so it
+    // still takes its discriminant. Recording it with no payload types keeps the
+    // numbering right for every variant after it.
+    if after.starts_with('{') {
+        return Some((name, Vec::new()));
+    }
+    None
+}
 
 /// Bind every field of every struct-typed argument to a symbolic variable.
 ///
@@ -1566,6 +1892,7 @@ fn struct_field(line: &str) -> Option<(String, String)> {
 pub fn field_env(
     f: &crate::mir::parse::MirFn,
     structs: &BTreeMap<String, StructDef>,
+    enums: &BTreeMap<String, EnumDef>,
 ) -> FieldEnv {
     // `base` is one past the highest local the function declares. Every local is
     // seeded at its own index before any field variable is read, so starting here
@@ -1606,6 +1933,14 @@ pub fn field_env(
             continue;
         }
         let Ty::Other(name) = base else { continue };
+        // An enum argument: its tag is a symbolic input with the enum's arity as
+        // its domain, and each variant's payload is its own input. Checked before
+        // the struct path because an enum name is an `Other` too, and binding it
+        // as a struct with no fields would silently lose the tag.
+        if let Some(def) = enums.get(name) {
+            env.bind_enum(l, &arg, name, def);
+            continue;
+        }
         // Recorded whether or not a layout was found, so a contract naming a field
         // gets a message about the field even when the struct's definition was not
         // readable.

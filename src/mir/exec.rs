@@ -25,8 +25,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::mir::intrinsics::{self, Outcome};
 use crate::mir::parse::{
-    BinOp, Block, Callee, Const, MirFn, MirProgram, Operand, Place, Proj, Rvalue, Stmt, Term, Ty,
-    UnOp, USIZE_WIDTH,
+    BinOp, Block, Callee, Const, EnumLayout, MirFn, MirProgram, Operand, Place, Proj, Rvalue, Stmt,
+    Term, Ty, UnOp, USIZE_WIDTH,
 };
 use crate::smt::{self, Pred, Var, Verdict};
 
@@ -451,6 +451,19 @@ struct Env {
     /// element there is a wrong value, not a missing one. This set is how the
     /// return path learns that a callee wrote.
     indexed_writes: BTreeSet<u32>,
+    /// The program's enum layouts, so a variant *construction* constant
+    /// (`Mode::Idle`) resolves to its discriminant.
+    ///
+    /// Carried by value rather than borrowed: the map is small, and a borrow
+    /// would put a lifetime on `Env` for every call site of `operand` -- a table
+    /// read once per constant is not worth that.
+    enums: BTreeMap<String, EnumLayout>,
+    /// The width of each modelled enum tag, keyed by local.
+    ///
+    /// A tag's width is the arity's, not the dump's `isize`. Recording it here
+    /// keeps `discriminant` reading the tag back at the width the contract's
+    /// comparison was checked at, instead of widening a 2-bit tag to 64.
+    tag_widths: BTreeMap<u32, u8>,
 }
 
 /// A modelled value with a length and elements: a slice or an array.
@@ -502,7 +515,14 @@ impl Env {
             addressed: BTreeMap::new(),
             indexed: BTreeMap::new(),
             indexed_writes: BTreeSet::new(),
+            enums: BTreeMap::new(),
+            tag_widths: BTreeMap::new(),
         }
+    }
+
+    /// Same as [`Env::new`], with the program's enum layouts attached.
+    fn with_enums(enums: &BTreeMap<String, EnumLayout>) -> Env {
+        Env { enums: enums.clone(), ..Env::new() }
     }
 
     /// The element variable for `index` of an indexed value (slice or array)
@@ -910,6 +930,7 @@ impl Env {
         self.elems.retain(|(l, _), _| *l != local);
         self.payloads.retain(|(l, _), _| *l != local);
         self.discriminants.remove(&local);
+        self.tag_widths.remove(&local);
         if let Some(s) = self.indexed.get_mut(&local) {
             s.elems.clear();
             // The seeded elements are gone, so a later read must not find them.
@@ -964,6 +985,14 @@ impl Env {
         self.payloads.insert((local, variant), (v, width));
     }
 
+    /// The width of a modelled enum tag, when one was seeded for `local`.
+    ///
+    /// A seeded tag knows its own width (the arity's); a synthesised `Option`
+    /// tag does not and falls back to the payload's width.
+    fn tag_width(&self, local: u32) -> Option<u8> {
+        self.tag_widths.get(&local).copied()
+    }
+
     /// The width of a modelled `Option` local, from its payload.
     fn option_width(&self, local: u32) -> Option<u8> {
         self.payloads
@@ -974,6 +1003,13 @@ impl Env {
 
     /// Record an enum tag for a local.
     fn set_discriminant(&mut self, local: u32, tag: Val) {
+        // The width is taken from the tag's own value, so a seeded tag keeps the
+        // arity width its contract was checked at and a synthesised `Option` tag
+        // keeps the operand's. Deriving it here rather than at each read site is
+        // what keeps `discriminant` and the payload in one width.
+        if let Val::Sym(v, _) = tag {
+            self.tag_widths.insert(local, smt::bits(v));
+        }
         self.discriminants.insert(local, tag);
     }
 }
@@ -1114,6 +1150,19 @@ pub struct Seeds {
     pub array_lens: Vec<(u32, u64)>,
     /// `(local, index, variable, signed)` for each element a contract names.
     pub elems: Vec<(u32, u64, Var, bool)>,
+    /// `(local, tag variable, tag width, arity)` for each enum-typed argument a
+    /// contract names a variant of.
+    ///
+    /// The tag is a symbolic input whose domain is `0..arity`, because an `N`-variant
+    /// value always has a tag below `N` -- a property of the type, not an assumption
+    /// about the caller. The run assumes that bound on the initial path, which is
+    /// what makes the `otherwise` arm of an exhaustive `match` (which rustc lowers
+    /// to `unreachable`) genuinely unreachable instead of a spurious panic.
+    pub tags: Vec<(u32, Var, u8, u64)>,
+    /// `(local, variant, variable, width, signed)` for each variant payload a
+    /// contract names, so `m.Data` in a contract and `((_1 as Data).0)` in the
+    /// body name one variable rather than two that look alike.
+    pub payload_seeds: Vec<(u32, u32, Var, u8, bool)>,
 }
 
 /// Verify one function from a parsed program.
@@ -1171,7 +1220,7 @@ where
         }
     };
 
-    let mut env = Env::new();
+    let mut env = Env::with_enums(&prog.enums);
     for &l in &f.arg_locals {
         let ty = f.ty_of(l).cloned().unwrap_or(Ty::Other("?".into()));
         let v = match ty.width() {
@@ -1211,6 +1260,30 @@ where
     for &(local, index, v, _) in &seeds.elems {
         if let Some(s) = env.indexed.get_mut(&local) {
             s.elems.insert(index, v);
+        }
+    }
+    // Enum tags a contract names a variant of. The tag is seeded so the body's
+    // `discriminant(_1)` reads the same variable the contract's `m` does, and the
+    // payloads are seeded so a downcast read names the same one too.
+    for &(local, tag, width, _) in &seeds.tags {
+        env.set_discriminant(local, Val::Sym(smt::truncate(tag, width), Sign::Unsigned));
+    }
+    for &(local, variant, v, width, signed) in &seeds.payload_seeds {
+        env.set_payload(local, variant, Val::Sym(v, Sign::of_bool(signed)), width);
+    }
+    // The tag's domain is `0..arity`. Assuming it is sound because it is a fact
+    // about the *type*: a value of an `N`-variant enum cannot have a tag outside
+    // that range, so no caller could falsify it. It is also necessary: without it
+    // the `otherwise` arm of an exhaustive `match` looks reachable, and since
+    // rustc lowers that arm to `unreachable`, every `match` would report a panic.
+    let mut pre = pre;
+    for &(_, tag, width, arity) in &seeds.tags {
+        if arity > 0 && arity <= (1u64 << width.min(63)) {
+            let bound = smt::ult_const(tag, arity);
+            pre = Some(match pre {
+                None => bound,
+                Some(p) => smt::and(p, bound),
+            });
         }
     }
 
@@ -1917,7 +1990,7 @@ where
                 report.unknown_paths.push(format!("callee `{name}` has no body"));
                 return;
             };
-            let mut env = Env::new();
+            let mut env = Env::with_enums(&prog.enums);
             // Which caller locals were handed over through a reference, so the
             // return path knows whose store the callee's post-state belongs to.
             let mut by_ref_indexed: Vec<(u32, u32)> = Vec::new();
@@ -2021,7 +2094,19 @@ fn operand(env: &mut Env, o: &Operand) -> Val {
                 None => Val::Unknown,
             },
             Const::Bool(b) => Val::Bool(smt::truth(*b)),
-            Const::Unit | Const::Other(_) => Val::Unknown,
+            // An enum variant *construction*: `Mode::Idle`. The dump prints it as
+            // a path constant, and it is the one place a tag is a *known* value
+            // rather than an input -- a locally built enum then has a constant
+            // discriminant, which is what lets `let m = Mode::Idle; match m`
+            // decide instead of leaving the switch unmodelled. The variant's index
+            // is read from the program's enum layouts, the same table a downcast
+            // resolves against, so the construction and the match agree by
+            // construction.
+            // A variant construction whose destination `eval_rvalue` could not
+            // resolve (it has no enum layout) stays unknown; the well-typed path
+            // is in `eval_rvalue::Use`, where the destination's width is known.
+            Const::Other(_) => Val::Unknown,
+            Const::Unit => Val::Unknown,
         },
     }
 }
@@ -2045,6 +2130,25 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
                 }
             }
             let v = operand(env, o);
+            // An enum variant *construction*: `_1 = Mode::Idle`. It is a
+            // constant with no width of its own -- the enum's tag width is the
+            // arity's, which only the destination's enum layout knows -- so it
+            // is resolved here, against the destination, rather than in
+            // `operand`. Getting the width right is what lets the tag be
+            // `discriminant`-ed and compared against the arm constants.
+            if let Operand::Const(Const::Other(name)) = o {
+                if let Some(i) = crate::mir::parse::variant_index(name, &env.enums) {
+                    // The arity's width wins over `dest_w`: the dump declares
+                    // an enum local as `isize`, so `dest_w` is 64 and would put
+                    // a locally built tag in a different width from a seeded
+                    // one. The arity width is the tag's real domain.
+                    let w = enum_tag_width(f, dest, &env.enums)
+                        .or(dest_w)
+                        .unwrap_or(64);
+                    env.set_discriminant(dest.local, Val::Sym(smt::word(u64::from(i), w), Sign::Unsigned));
+                    return Val::Agg;
+                }
+            }
             // A whole-struct copy (`c = d`) carries the value's *parts* across, so
             // `c.lo` afterwards reads `d.lo`. `Val::Agg` is returned when parts
             // moved, which is what tells `set` not to clear the parts just copied
@@ -2166,6 +2270,25 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
                 _ => Val::Unknown,
             }
         }
+        Rvalue::Variant(name, ops) => {
+            // An enum variant construction with a payload. The tag is the
+            // variant's declaration index -- resolved against the program's enum
+            // layouts, the same table a `match`'s downcast reads -- and the
+            // operands are written as the variant's fields, so the downcast read
+            // finds what the construction wrote.
+            let Some(variant) = crate::mir::parse::variant_index(name, &env.enums) else {
+                return Val::Unknown;
+            };
+            let w = enum_tag_width(f, dest, &env.enums).or(dest_w).unwrap_or(64);
+            env.set_discriminant(dest.local, Val::Sym(smt::word(u64::from(variant), w), Sign::Unsigned));
+            for (i, o) in ops.iter().enumerate() {
+                let v = operand(env, o);
+                let pw = operand_width(f, o).unwrap_or(0);
+                env.set_payload(dest.local, variant, v, pw);
+                env.set(&Place { local: dest.local, proj: vec![Proj::Field(i as u32)] }, v);
+            }
+            Val::Agg
+        }
         Rvalue::Aggregate(ops) => {
             for (i, o) in ops.iter().enumerate() {
                 let v = operand(env, o);
@@ -2233,7 +2356,14 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
             // the width only has to be wide enough to hold them; taking it from
             // the payload keeps `discriminant` and the payload in one width.
             Some(Val::Sym(tag, _)) => {
-                let w = env.option_width(p.local).unwrap_or(64);
+                // A seeded enum tag carries its own width; a synthesised
+                // `Option` tag takes the payload's. Reading a seeded tag at the
+                // dump's `isize` width would truncate nothing but would also
+                // widen a 2-bit tag to 64, and `eq_const` then compares a
+                // 64-bit word against the `u8`-typed place's expectations --
+                // keeping the tag's own width is what the contract's `m ==
+                // Mode::Run` was checked at.
+                let w = env.tag_width(p.local).or_else(|| env.option_width(p.local)).unwrap_or(64);
                 // A discriminant is an unsigned integer.
                 Val::Sym(smt::truncate(*tag, w), Sign::Unsigned)
             }
@@ -2244,6 +2374,24 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
             None => Val::Unknown,
         },
     }
+}
+
+/// The tag width for a place whose type is an enum: the arity's, matching what
+/// `spec::FieldEnv::bind_enum` binds a contract's tag to.
+///
+/// The dump declares an enum local as `isize`, but the tag's *domain* is the
+/// variant count, so the arity's width is the one that can hold every
+/// discriminant and no more. Using it here keeps a locally built enum's tag in
+/// the same width as a seeded one, which is what makes `discriminant` read both
+/// back consistently.
+fn enum_tag_width(f: &MirFn, p: &Place, enums: &BTreeMap<String, EnumLayout>) -> Option<u8> {
+    let Ty::Other(name) = type_of_place(f, p)? else { return None };
+    let def = enums.get(&name)?;
+    let arity = def.variants.len() as u64;
+    if arity == 0 {
+        return None;
+    }
+    Some((64 - (arity - 1).leading_zeros()).max(1) as u8)
 }
 
 /// The declared width of a place, following one level of tuple/array projection.

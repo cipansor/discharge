@@ -287,6 +287,14 @@ pub enum Rvalue {
     /// this frontend synthesises for `checked_*`, where the tag is `0` for
     /// `None` and `1` for `Some`.
     Discriminant(Place),
+    /// An enum variant construction with a payload: `Msg::Data(const 9_u8)`.
+    ///
+    /// Kept apart from [`Rvalue::Aggregate`] because the operands are the
+    /// *payloads* of one variant, not the elements of a sequence: the tag is the
+    /// variant's declaration index and the operands are written as the variant's
+    /// fields. A model that stored them as elements would leave the match's
+    /// downcast read looking in a store the construction never wrote.
+    Variant(String, Vec<Operand>),
     /// Something this frontend does not model.
     Unknown(String),
 }
@@ -387,6 +395,30 @@ impl MirFn {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MirProgram {
     pub fns: Vec<MirFn>,
+    /// Enum layouts from the source, so a `(base as Variant)` downcast can be
+    /// resolved to the discriminant the `switchInt` compares against. Empty when
+    /// the caller had no source (the MIR-only entry points), in which case only
+    /// the built-in `Option`/`Result` numbering resolves.
+    pub enums: BTreeMap<String, EnumLayout>,
+}
+
+/// A variant's name and discriminant, for resolving a downcast.
+///
+/// Distinct from `spec::EnumDef` on purpose: the executor needs only
+/// name → index, and the spec reader also carries payload *types* that are of no
+/// use here. Keeping the executor's view narrow means the parser has no reason to
+/// reach for the contract reader.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnumLayout {
+    /// Variant names in declaration order; the position is the discriminant.
+    pub variants: Vec<String>,
+}
+
+impl EnumLayout {
+    /// The discriminant for a variant name.
+    pub fn index_of(&self, name: &str) -> Option<u32> {
+        self.variants.iter().position(|n| n == name).map(|i| i as u32)
+    }
 }
 
 impl MirProgram {
@@ -538,25 +570,52 @@ fn strip_copy(s: &str) -> &str {
 /// Err = 1`, in declaration order. Only those two shapes are modelled, so
 /// anything else returns `None` and the place stays unparsed -- which surfaces
 /// as an unmodelled read rather than a wrong tag.
-fn variant_index(name: &str) -> Option<u32> {
-    match name.rsplit("::").next().unwrap_or(name) {
-        "None" | "Ok" => Some(0),
-        "Some" | "Err" => Some(1),
-        _ => None,
+pub fn variant_index(name: &str, enums: &BTreeMap<String, EnumLayout>) -> Option<u32> {
+    let short = name.rsplit("::").next().unwrap_or(name);
+    // `Option` and `Result` have a fixed, well-known numbering that no source file
+    // declares, so they resolve without a layout. Every other enum's numbering is
+    // declaration order, which only the source has.
+    match short {
+        "None" | "Ok" => return Some(0),
+        "Some" | "Err" => return Some(1),
+        _ => {}
     }
+    // A qualified name prints the enum before the variant (`Mode::Idle`); the enum
+    // is what the layout is keyed by. A bare variant name is looked up in every
+    // layout, which is ambiguous only if two enums share a variant name -- and
+    // then the qualified form, which rustc prints, resolves it.
+    if let Some((qual, _)) = name.rsplit_once("::") {
+        if let Some(l) = enums.get(qual.rsplit("::").next().unwrap_or(qual)) {
+            if let Some(i) = l.index_of(short) {
+                return Some(i);
+            }
+        }
+    }
+    let mut found = None;
+    for l in enums.values() {
+        if let Some(i) = l.index_of(short) {
+            // Two layouts claiming the same variant name is a genuine ambiguity;
+            // refusing is the only answer that cannot pick the wrong arm.
+            if found.is_some() {
+                return None;
+            }
+            found = Some(i);
+        }
+    }
+    found
 }
 
 /// Parse a place like `_3.1` or `_2` or `_1.0[0]`.
-fn parse_place(s: &str) -> Option<Place> {
+fn parse_place(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Option<Place> {
     let s = strip_annot(s).trim();
     // `(*_1)` — a pointer dereference. Like the downcast below it can appear as a
     // whole place or as a prefix (`(*_1).0`), so the inner place is parsed and the
     // `Deref` step is pushed before the tail projections.
     if let Some(rest) = s.strip_prefix("(*") {
         let close = rest.find(')')?;
-        let mut place = parse_place(&rest[..close])?;
+        let mut place = parse_place(&rest[..close], enums)?;
         place.proj.push(Proj::Deref);
-        return push_projs(place, rest.get(close + 1..)?);
+        return push_projs(place, rest.get(close + 1..)?, enums);
     }
     // `(base as Variant)` — an enum downcast. It can appear as a whole place or
     // as a prefix, so the inner place is parsed and the tail projection is
@@ -565,9 +624,9 @@ fn parse_place(s: &str) -> Option<Place> {
         let close = rest.find(')')?;
         let inner = rest[..close].trim();
         let (base, variant) = inner.rsplit_once(" as ")?;
-        let mut place = parse_place(base.trim())?;
-        place.proj.push(Proj::Downcast(variant_index(variant.trim())?));
-        return push_projs(place, rest.get(close + 1..)?);
+        let mut place = parse_place(base.trim(), enums)?;
+        place.proj.push(Proj::Downcast(variant_index(variant.trim(), enums)?));
+        return push_projs(place, rest.get(close + 1..)?, enums);
     }
     // A bare local.
     if let Some(idx) = parse_local(s) {
@@ -583,11 +642,15 @@ fn parse_place(s: &str) -> Option<Place> {
         i += 1;
     }
     let local = s[1..i].parse::<LocalIdx>().ok()?;
-    push_projs(Place::new(local), &s[i..])
+    push_projs(Place::new(local), &s[i..], enums)
 }
 
 /// Append a run of `.N`, `[N]` and `(base as Variant)` projections to a place.
-fn push_projs(mut place: Place, mut rest: &str) -> Option<Place> {
+fn push_projs(
+    mut place: Place,
+    mut rest: &str,
+    enums: &BTreeMap<String, EnumLayout>,
+) -> Option<Place> {
     while !rest.is_empty() {
         if let Some(r) = rest.strip_prefix('.') {
             let n: String = r.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -603,7 +666,7 @@ fn push_projs(mut place: Place, mut rest: &str) -> Option<Place> {
             let close = r.find(')')?;
             let inner = r[..close].trim();
             let (_, variant) = inner.rsplit_once(" as ")?;
-            place.proj.push(Proj::Downcast(variant_index(variant.trim())?));
+            place.proj.push(Proj::Downcast(variant_index(variant.trim(), enums)?));
             rest = r.get(close + 1..)?;
         } else {
             // `?` on `strip_prefix` is the same `None` the old `else { return
@@ -715,19 +778,19 @@ fn type_in_impl_path(s: &str) -> Option<Ty> {
 }
 
 /// Parse an operand: `copy _1`, `move _2.0`, `const 3_u32`, or a bare place.
-fn parse_operand(s: &str) -> Operand {
+fn parse_operand(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Operand {
     let t = s.trim();
     if let Some(r) = t.strip_prefix("copy ") {
-        return Operand::Copy(parse_place(r).unwrap_or(Place::new(u32::MAX)));
+        return Operand::Copy(parse_place(r, enums).unwrap_or(Place::new(u32::MAX)));
     }
     if let Some(r) = t.strip_prefix("move ") {
-        return Operand::Move(parse_place(r).unwrap_or(Place::new(u32::MAX)));
+        return Operand::Move(parse_place(r, enums).unwrap_or(Place::new(u32::MAX)));
     }
     if let Some(r) = t.strip_prefix("const ") {
         return Operand::Const(parse_const(r));
     }
     // A bare place, e.g. inside `switchInt(_1)`.
-    match parse_place(t) {
+    match parse_place(t, enums) {
         Some(p) => Operand::Copy(p),
         None => Operand::Const(Const::Other(t.to_string())),
     }
@@ -808,7 +871,10 @@ fn matching_paren(s: &str, open: usize) -> Option<usize> {
 
 /// Parse the body of an `assert(...)` terminator, given everything after
 /// `assert(`.
-fn parse_assert(rest: &str) -> Option<(Operand, bool, String, Vec<Operand>, usize)> {
+fn parse_assert(
+    rest: &str,
+    enums: &BTreeMap<String, EnumLayout>,
+) -> Option<(Operand, bool, String, Vec<Operand>, usize)> {
     let (inner, after) = take_until_close(rest)?;
     let parts = split_top_level(inner, ',');
     if parts.is_empty() {
@@ -816,8 +882,8 @@ fn parse_assert(rest: &str) -> Option<(Operand, bool, String, Vec<Operand>, usiz
     }
     let raw_cond = parts[0].trim();
     let (negated, cond) = match raw_cond.strip_prefix('!') {
-        Some(r) => (true, parse_operand(r)),
-        None => (false, parse_operand(raw_cond)),
+        Some(r) => (true, parse_operand(r, enums)),
+        None => (false, parse_operand(raw_cond, enums)),
     };
     let mut msg = String::new();
     let mut args = Vec::new();
@@ -825,7 +891,7 @@ fn parse_assert(rest: &str) -> Option<(Operand, bool, String, Vec<Operand>, usiz
         let raw = parts[1].trim();
         msg = unquote(raw);
         for p in &parts[2..] {
-            args.push(parse_operand(p));
+            args.push(parse_operand(p, enums));
         }
     }
     let target = parse_success_target(after)?;
@@ -860,7 +926,7 @@ fn parse_bb_ref(s: &str) -> Option<usize> {
 }
 
 /// Parse an rvalue appearing after `place = `.
-fn parse_rvalue(s: &str) -> Rvalue {
+fn parse_rvalue(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Rvalue {
     let t = s.trim();
     // A call is handled by the caller (it is a terminator).
     //
@@ -873,8 +939,8 @@ fn parse_rvalue(s: &str) -> Rvalue {
     // fallback for exactly the strings that fail it.
     if t.starts_with("copy ") || t.starts_with("move ") {
         if let Some(rest) = t.split_once(' ').map(|(_, r)| r) {
-            if parse_place(rest).is_some() {
-                return Rvalue::Use(parse_operand(t));
+            if parse_place(rest, enums).is_some() {
+                return Rvalue::Use(parse_operand(t, enums));
             }
         }
     }
@@ -886,32 +952,32 @@ fn parse_rvalue(s: &str) -> Rvalue {
     if let Some(i) = t.find(" as ") {
         let (src, dst) = (t[..i].trim(), t[i + 4..].trim());
         let ty_text = dst.split_whitespace().next().unwrap_or(dst);
-        return Rvalue::Cast(parse_operand(src), Ty::parse(ty_text));
+        return Rvalue::Cast(parse_operand(src, enums), Ty::parse(ty_text));
     }
     if let Some(rest) = t.strip_prefix("const ") {
         return Rvalue::Use(Operand::Const(parse_const(rest)));
     }
     if t.starts_with("copy ") || t.starts_with("move ") {
-        return Rvalue::Use(parse_operand(t));
+        return Rvalue::Use(parse_operand(t, enums));
     }
     // `&_1`, `&mut _1`
     if let Some(r) = t.strip_prefix("&mut ").or_else(|| t.strip_prefix('&')) {
-        if let Some(p) = parse_place(r) {
+        if let Some(p) = parse_place(r, enums) {
             return Rvalue::Ref(p);
         }
     }
     if let Some(rest) = t.strip_prefix("Len(") {
-        if let Some(p) = parse_place(strip_copy(rest.trim_end_matches(')'))) {
+        if let Some(p) = parse_place(strip_copy(rest.trim_end_matches(')')), enums) {
             return Rvalue::Len(p);
         }
     }
     if let Some(rest) = t.strip_prefix("PtrMetadata(") {
-        if let Some(p) = parse_place(strip_copy(rest.trim_end_matches(')'))) {
+        if let Some(p) = parse_place(strip_copy(rest.trim_end_matches(')')), enums) {
             return Rvalue::PtrMetadata(p);
         }
     }
     if let Some(rest) = t.strip_prefix("discriminant(") {
-        if let Some(p) = parse_place(rest.trim_end_matches(')')) {
+        if let Some(p) = parse_place(rest.trim_end_matches(')'), enums) {
             return Rvalue::Discriminant(p);
         }
     }
@@ -943,7 +1009,7 @@ fn parse_rvalue(s: &str) -> Rvalue {
                 let Some((_, val)) = split_field_name(field) else {
                     return Rvalue::Unknown(t.to_string());
                 };
-                args.push(parse_operand(val));
+                args.push(parse_operand(val, enums));
             }
             return Rvalue::Struct(args);
         }
@@ -953,7 +1019,7 @@ fn parse_rvalue(s: &str) -> Rvalue {
         if t.ends_with(')') {
             let name = t[..open].trim();
             let inner = &t[open + 1..t.len() - 1];
-            let args: Vec<Operand> = split_top_level(inner, ',').iter().map(|a| parse_operand(a)).collect();
+            let args: Vec<Operand> = split_top_level(inner, ',').iter().map(|a| parse_operand(a, enums)).collect();
             // A tuple/array literal, printed as a bare list.
             if name.is_empty() {
                 return Rvalue::Aggregate(args);
@@ -981,12 +1047,19 @@ fn parse_rvalue(s: &str) -> Rvalue {
             if name == "Neg" && args.len() == 1 {
                 return Rvalue::Unary(UnOp::Neg, args[0].clone());
             }
+            // An enum variant construction with a payload. The `::` is what
+            // separates it from a plain call; the executor resolves the variant
+            // against the program's enum layouts, which is the only place the
+            // declaration order is known.
+            if name.contains("::") && !name.contains(' ') {
+                return Rvalue::Variant(name.to_string(), args);
+            }
         }
     }
     // An array literal: `[const 1_u32, const 2_u32]`
     if t.starts_with('[') && t.ends_with(']') {
         let inner = &t[1..t.len() - 1];
-        let args: Vec<Operand> = split_top_level(inner, ',').iter().map(|a| parse_operand(a)).collect();
+        let args: Vec<Operand> = split_top_level(inner, ',').iter().map(|a| parse_operand(a, enums)).collect();
         return Rvalue::Aggregate(args);
     }
     // A tuple literal: `(move _5, move _4)`
@@ -994,17 +1067,26 @@ fn parse_rvalue(s: &str) -> Rvalue {
         let inner = &t[1..t.len() - 1];
         if !inner.trim().is_empty() {
             let args: Vec<Operand> =
-                split_top_level(inner, ',').iter().map(|a| parse_operand(a)).collect();
+                split_top_level(inner, ',').iter().map(|a| parse_operand(a, enums)).collect();
             if args.len() > 1 {
                 return Rvalue::Aggregate(args);
             }
         }
     }
+    // An enum variant *construction*, printed as a bare path: `_1 = Mode::Idle;`.
+    // Unlike an integer constant it carries no `const ` prefix, so without this
+    // arm it fell through to `Rvalue::Unknown` and the local's tag was never
+    // written -- which is why `let m = Mode::Idle; match m` stayed unmodelled
+    // even once a tag read from an argument worked. A `::` with no spaces or
+    // parens is the shape; the discriminant is resolved by the executor, which
+    // is the only place the enum's layout is known.
+    if t.contains("::") && !t.contains(' ') && !t.contains('(') {
+        return Rvalue::Use(Operand::Const(Const::Other(t.to_string())));
+    }
     Rvalue::Unknown(t.to_string())
 }
-
 /// Parse one statement or terminator line.
-fn parse_stmt_or_term(line: &str) -> Result<Stmt, Term> {
+fn parse_stmt_or_term(line: &str, enums: &BTreeMap<String, EnumLayout>) -> Result<Stmt, Term> {
     let t = line.trim().trim_end_matches(';').trim();
     if t.is_empty() || t == "nop" {
         return Ok(Stmt::Nop);
@@ -1030,7 +1112,7 @@ fn parse_stmt_or_term(line: &str) -> Result<Stmt, Term> {
         let Some((inner, after)) = take_until_close(r) else {
             return Err(Term::Unknown(t.to_string()));
         };
-        let discr = parse_operand(inner);
+        let discr = parse_operand(inner, enums);
         let lb = match after.find('[') {
             Some(i) => i,
             None => return Err(Term::Unknown(t.to_string())),
@@ -1058,7 +1140,7 @@ fn parse_stmt_or_term(line: &str) -> Result<Stmt, Term> {
         return Err(Term::SwitchInt { discr, cases, otherwise });
     }
     if let Some(r) = t.strip_prefix("assert(") {
-        return Err(match parse_assert(r) {
+        return Err(match parse_assert(r, enums) {
             Some((cond, negated, msg, msg_args, target)) => {
                 Term::Assert { cond, negated, msg, msg_args, target }
             }
@@ -1072,13 +1154,13 @@ fn parse_stmt_or_term(line: &str) -> Result<Stmt, Term> {
         if let Some(eq) = lhs.find(" = ") {
             let dest_text = lhs[..eq].trim();
             let call = lhs[eq + 3..].trim();
-            let dest = parse_place(dest_text).unwrap_or(Place::new(u32::MAX));
+            let dest = parse_place(dest_text, enums).unwrap_or(Place::new(u32::MAX));
             if let Some(open) = call.find('(') {
                 if call.ends_with(')') {
                     let name = call[..open].trim();
                     let inner = &call[open + 1..call.len() - 1];
                     let args: Vec<Operand> =
-                        split_top_level(inner, ',').iter().map(|a| parse_operand(a)).collect();
+                        split_top_level(inner, ',').iter().map(|a| parse_operand(a, enums)).collect();
                     let callee = if name.is_empty() {
                         Callee::Indirect(dest.clone())
                     } else {
@@ -1099,8 +1181,8 @@ fn parse_stmt_or_term(line: &str) -> Result<Stmt, Term> {
     if let Some(eq) = find_assign_eq(t) {
         let dest_text = t[..eq].trim();
         let rhs = t[eq + 1..].trim();
-        if let Some(place) = parse_place(dest_text) {
-            return Ok(Stmt::Assign(place, parse_rvalue(rhs)));
+        if let Some(place) = parse_place(dest_text, enums) {
+            return Ok(Stmt::Assign(place, parse_rvalue(rhs, enums)));
         }
     }
     Ok(Stmt::Unknown(t.to_string()))
@@ -1135,11 +1217,43 @@ fn find_assign_eq(s: &str) -> Option<usize> {
 
 /// Parse a whole MIR dump.
 pub fn parse_program(text: &str) -> MirProgram {
+    parse_program_with(text, &BTreeMap::new())
+}
+
+/// [`parse_program`] with the enum layouts from the source.
+///
+/// A `match` lowers to `(base as Variant)` downcasts whose *variant names* the
+/// MIR dump prints and whose *discriminants* it does not. Resolving a name to its
+/// index needs the declaration order, which lives in the source rather than the
+/// dump, so it is passed in. An empty map is the old behaviour: `Option`/`Result`
+/// resolve from their built-in numbering and every other enum refuses a downcast.
+pub fn parse_program_with(text: &str, enums: &BTreeMap<String, EnumLayout>) -> MirProgram {
     let lines: Vec<&str> = text.lines().collect();
-    let mut prog = MirProgram::default();
+    let mut prog = MirProgram { enums: enums.clone(), ..MirProgram::default() };
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
+        // rustc prints a second, `// MIR FOR CTFE`-marked body for an item it
+        // const-evaluates -- a tuple-variant constructor called in a `let`, for
+        // one. It is a *copy* of an item already printed above it, and the typed
+        // MIR has one body per item, so parsing it as well would count the
+        // function twice and leave `MirProgram::get` with two candidates for one
+        // name. The marker names the copy, so it is skipped together with its
+        // body.
+        if line.trim() == "// MIR FOR CTFE" {
+            let mut k = i + 1;
+            while k < lines.len() && lines[k].trim().is_empty() {
+                k += 1;
+            }
+            if k < lines.len() && parse_fn_header(lines[k]).is_some() {
+                let mut m = k + 1;
+                while m < lines.len() && !lines[m].starts_with('}') {
+                    m += 1;
+                }
+                i = m + 1;
+                continue;
+            }
+        }
         if let Some((name, args, ret_ty)) = parse_fn_header(line) {
             let mut f = MirFn {
                 name,
@@ -1226,7 +1340,7 @@ pub fn parse_program(text: &str) -> MirProgram {
                 }
                 // A statement or terminator.
                 if let Some(b) = cur_block.as_mut() {
-                    match parse_stmt_or_term(t) {
+                    match parse_stmt_or_term(t, enums) {
                         Ok(s) => b.stmts.push(s),
                         Err(term) => {
                             b.term = term;
@@ -1281,6 +1395,24 @@ fn add(_1: u32, _2: u32) -> u32 {
         assert_eq!(f.ret_ty, Ty::U32);
         assert_eq!(f.name_of(1), "a");
         assert_eq!(f.blocks.len(), 2);
+    }
+
+    /// A `// MIR FOR CTFE` body is a copy, and must not be parsed as a second
+    /// function.
+    ///
+    /// rustc prints one for an item it const-evaluates -- a tuple-variant
+    /// constructor called in a `let`, for one. The typed MIR has one body per
+    /// item, so counting the copy makes the text side disagree with the oracle
+    /// over a function that is really there once.
+    #[test]
+    fn a_ctfe_copy_is_not_a_second_function() {
+        let dump = format!(
+            "{DUMP}
+// MIR FOR CTFE
+{DUMP}"
+        );
+        let prog = parse_program(&dump);
+        assert_eq!(prog.fns.len(), 1, "the CTFE copy is the same function, not a second one");
     }
 
     #[test]
