@@ -1,0 +1,31 @@
+# CriticalUp manifest for the Ferrocene *qualified* toolchain.
+#
+# This file is what `tools/ferrocene/run.sh` and the optional `ferrocene` CI job read to
+# install a qualified toolchain without naming a download URL: CriticalUp finds this
+# manifest by scanning the working directory and its parents, resolves the release against
+# the customer portal, and installs the listed packages into its own state directory.
+#
+# The release and package names are taken verbatim from the Ferrocene documentation's
+# `criticalup.toml` reference (CriticalUp User Documentation 9.1). `rust-std` for the
+# bare-metal target is listed alongside the host packages because the gate cross-compiles
+# to `thumbv7em-none-eabihf`, and the target's own page (Ferrocene User Manual 15.2) names
+# `rust-std-thumbv7em-none-eabihf` as the archive that target needs.
+#
+# Ferrocene is commercial: installing this requires a subscription and an authenticated
+# CriticalUp (`criticalup auth set`). Nothing in the crate depends on it -- this manifest is
+# inert until a run points `FERROCENE_RUSTC` at the toolchain it installs, and the
+# zero-dependency gate in `scripts/gate.sh` is unaffected either way.
+manifest-version = 1
+
+[products.ferrocene]
+release = "stable-25.02.0"
+packages = [
+  "cargo-${rustc-host}",
+  "rustc-${rustc-host}",
+  "clippy-${rustc-host}",
+  "rust-std-${rustc-host}",
+  "rust-std-thumbv7em-none-eabihf",
+  "rustfmt-${rustc-host}",
+  "llvm-tools-${rustc-host}",
+  "rust-src",
+]

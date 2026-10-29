@@ -1937,11 +1937,37 @@ compiles into the artifact you ship.
 | Memory model | pointer/aliasing analysis | none |
 | Scaling | industrial, handles large systems | good on masks/bounds/shifts, weak on wide multipliers |
 | Qualification | extensive certification evidence | none |
+| Qualified compiler | AdaCore's qualified toolchain | **Ferrocene**, checked in CI |
 
 The interesting part is not that `discharge` beats `gnatprove` — it does not, and
 cannot, on scope. The interesting part is the *shape*: a prover that is a
 library, a proof that is a value, and a contract that compiles into the artifact
 you ship. Rust can do that, and this crate is a working sketch of how.
+
+### The qualified toolchain
+
+Rust's answer to AdaCore's qualified toolchain is [Ferrocene], qualified to
+ISO 26262 ASIL D, IEC 61508 SIL 3, EN 50128 and IEC 62304. This repository builds
+its `no_std` crates with Ferrocene for `thumbv7em-none-eabihf` — a target
+Ferrocene itself qualifies — so the qualified compiler is exercised against the
+same sources this crate ships. That is gate 3 of `scripts/gate.sh` and the
+`ferrocene` job in CI; `tools/ferrocene/` has the manifest and the script.
+
+Be precise about what that does and does not buy, because the distinction is the
+whole point of this section. It checks that the *qualified compiler accepts the
+sources unchanged*. It does not qualify `discharge` itself: a qualified compiler
+is not a qualified verifier, and this crate's decision procedure is not in
+Ferrocene's scope. The README's own statement still stands — no qualification
+evidence, no DO-178C tool qualification — and building with Ferrocene does not
+change it.
+
+Ferrocene is commercial, and its archives require a customer-portal token that
+does not allow programmatic access, so the gate reports and skips when the
+toolchain is absent rather than passing in silence — the same convention Kani,
+Verus, Lean and Coq follow here. A skipped oracle is not evidence, and the gate
+says so.
+
+[Ferrocene]: https://ferrocene.dev/
 
 ## License
 

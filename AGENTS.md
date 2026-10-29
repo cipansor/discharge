@@ -49,6 +49,13 @@ DISCHARGE_RUSTC="$(rustup which --toolchain nightly rustc)" \
 `clippy` was installed with `rustup component add clippy`; the bare-metal target
 with `rustup target add thumbv7em-none-eabihf`.
 
+```bash
+# The qualified-toolchain gate, in isolation. Exits 0 on a build, 1 on a real
+# failure, 2 when no Ferrocene toolchain is present (which `gate.sh` reports and
+# skips). See `tools/ferrocene/README.md`.
+FERROCENE_RUSTC=/path/to/ferrocene/bin/rustc sh tools/ferrocene/run.sh
+```
+
 ## Verifying real Rust: the MIR frontend (`src/mir/`)
 
 The rest of the crate proves things about *models*: a formula, or a `wp` program.
@@ -1476,6 +1483,37 @@ This is the same lesson as the two tooling defects above, one level up: **a gate
 not run is not a gate you passed**, and the only way to keep that honest is to make "run
 all the gates" a single command whose exit code is the claim. A summary that says "gates
 green" should quote that command's output, not a memory of running the pieces.
+
+## A skipped oracle is not a passed oracle: the Ferrocene gate
+
+The crate's whole pitch is the safety-critical corner -- a `no_std`, no-solver prover you
+can ship on an MCU. The one piece of that pitch that cannot be self-certified is the
+*compiler*: SPARK's story rests on a qualified toolchain, and Rust's is Ferrocene (ISO
+26262 ASIL D, IEC 61508 SIL 3, EN 50128, IEC 62304). So `scripts/gate.sh` builds both
+crates with Ferrocene for `thumbv7em-none-eabihf` -- a target Ferrocene itself qualifies --
+in gate 3, and CI has a matching `ferrocene` job.
+
+Three things had to be true for that gate to be honest, and each is a rule worth keeping:
+
+- **It must not become a dependency.** Ferrocene is invoked as a subprocess through
+  `RUSTC=...`, exactly like Kani, Verus, Lean and Coq, so gate 5's zero-external-dependency
+  check still passes when it runs. A qualified *toolchain* that leaked into `Cargo.toml`
+  would defeat the point of a zero-dependency crate.
+- **"Absent" and "failed" must be different exit codes.** `tools/ferrocene/run.sh` exits
+  `2` when no toolchain is found and `1` on a real build failure; `gate.sh` skips on `2` and
+  fails on anything else. The mirror-image trap is the one gate 10's comment already names:
+  conflate them and a broken install reads as "skipped", which reads as green.
+- **A skip must be *visible*.** Ferrocene is commercial -- a subscription plus a
+  customer-portal token whose archives "don't allow programmatic access" (User Manual
+  3.2.1) -- so a public CI job genuinely cannot install it. The gate prints the skip and the
+  CI job raises a warning annotation, so "Ferrocene did not run" is on the run summary
+  rather than being an absence nobody notices.
+
+What the gate buys is narrow and worth stating plainly: it checks the *qualified compiler
+accepts the sources unchanged*. It does not qualify `discharge`. A qualified compiler is not
+a qualified verifier, and this crate's decision procedure is outside Ferrocene's scope. The
+README's "no qualification evidence" line is still true after this gate runs, and the gate's
+comment says so at the definition site.
 
 ## An untyped generator is a second program, and it needs its own type discipline
 
