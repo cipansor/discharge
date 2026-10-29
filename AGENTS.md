@@ -2756,3 +2756,73 @@ directions — the two true contracts must verify and the two false ones must fa
 over `widen_signed_true`/`_false` and `widen_unsigned_true`/`_false`, because a
 test that only checked the signed case would pass again the moment the rule went
 back to a single default.
+
+## Next stage: the signedness work is a *rule*, so let the engine state it
+
+Both false proofs fixed in this round were the same bug wearing different
+clothes. A value operation silently dropped the signedness of its operand:
+`0 < a` compared `const 0_i8` as unsigned, and `a as i16` zero-filled a signed
+source. The repair went in at each *call site* of `operand_signedness`. That is
+the shape of fix that leaves a third case behind, so the next stage is to make
+the rule structural rather than per-site.
+
+**Stage 1 — make the width-and-signedness rule a type, not a habit.** Every
+`Val::Sym` currently carries a width and nothing else; the signedness is passed
+*alongside* it as a bare `bool`, so any site that forgets to pass it is silently
+unsigned. That is exactly how both bugs happened. The fix is to carry the
+signedness *in* the value (`Val::Int(Var, bool)` or a width/sign pair on the
+symbol), so a missing sign is a type error rather than a default. This is a
+refactor of `eval_rvalue`/`eval_binary`/`operand`, and the existing corpus
+(tripwires `signed_const_left_false`, `widen_signed_false`, `signed_mul_negative`,
+`ashr_signed_false`) is the regression net. Do this *before* adding new shapes,
+because every new shape is another call site that can forget.
+
+**Stage 2 — close the remaining `Rvalue` gaps, one at a time, each with a
+tripwire.** In rough order of how often real Rust hits them:
+
+* **`Rvalue::Cast` to `bool`** (`a != 0` written as `(a as bool)`), and
+  `char`/`bool` in general. Small, and the `Cast` arm is now the place to add it.
+* **`Rvalue::Unary(Not)` on a `bool` operand of the wrong width** is handled, but
+  `!x` for a *word* operand is `all_ones ^ x` only when the width is right; assert
+  the width rather than trusting `dest_w`.
+* **`Rvalue::Aggregate` for a struct literal** (`Config { lo, hi }`). The arm
+  already stores by `Proj::Index`; a struct needs the *field* indices, which means
+  the frontend must know the struct's field order from the source, the way it
+  already reads field *types*. This is the shape behind `struct_reassign_then_field_read`
+  staying incomplete.
+* **`Rvalue::Ref`/`Len`** return `Unknown`. `Len` on a fixed array is a type
+  constant and should be `N`; on a slice it is the bound length. `Ref` is the
+  `&x` rvalue, which the model reads through — refusing is right, but the refusal
+  should be *named* so coverage shows why.
+* **`Rvalue::Discriminant` and `Downcast` for a real enum match.** Both are
+  currently incomplete (`unmodelled switch discriminant`). This is the largest
+  single shape: a `match` on a two-variant enum is ordinary Rust. It needs a tag
+  variable per enum local and a `switchInt` that reads it, and the *tripwire* is a
+  `match` whose arms are swapped, which must fail.
+
+**Stage 3 — the contract language's two deliberate refusals.** `xs[i]` with a
+symbolic `i` on a *slice*, and `a[k]` where `k` is a local rather than an
+argument. Both are refusals today and both are honest, but the first is the more
+valuable: a slice's length is a symbolic input, so `xs[i]` for a bounded `i` is a
+chain over the *length* variable with a bounds obligation, not an unbounded
+enumeration. The second is a frontend gap — `let k = i; a[k]` should be
+substitutable to `a[i]` when `k` is a copy of an argument, which is what a
+`debug`-name-aware local substitution would give.
+
+**Stage 4 — the missing intrinsics.** `wrapping_neg`, `wrapping_div`,
+`wrapping_rem`, `overflowing_*`, `leading_zeros`, `trailing_zeros`, `count_ones`,
+`pow`. The `wrapping_*` family is the same arithmetic the `checked_*` arms already
+do, minus the overflow obligation, so it is mostly plumbing. `count_ones` and the
+zero-counts are small bit-vector loops and belong in `discharge-arithmetic` beside
+the other proved primitives, not in the frontend.
+
+**Ordering rationale.** Stage 1 first because it is the *class* of bug, not one
+bug; doing Stages 2–4 first multiplies the call sites that can forget the sign.
+Stage 2's enum item before Stage 3 because an enum match appears in almost every
+real function and the slice-index case appears in almost none. Stage 4 last
+because it is additive coverage with no soundness content.
+
+**Standing tripwire rule for every stage.** A new shape is not "supported" until
+there is a corpus entry that *verifies* and a tripwire that *fails*. The tripwire
+is the evidence: a shape that only ever verifies is a shape whose model has never
+been contradicted.
