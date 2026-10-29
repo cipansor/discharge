@@ -1319,6 +1319,35 @@ fn a_tuple_component_read_cannot_prove_the_wrong_component() {
     }
 }
 
+/// A signed widening cast sign-extends; an unsigned one zero-fills.
+///
+/// Both directions are pinned because the two casts need *opposite* rules, and a
+/// single-rule implementation is wrong for one of them. `truncate` zero-fills, so
+/// using it for every cast modelled `-1i8 as i16` as `255` and *proved*
+/// `requires: a == -1; ensures: ret == 255` -- a reachable false proof. A
+/// sign-extend-everything rule would instead prove `255u8 as u16 == 65535`.
+#[test]
+fn a_widening_cast_respects_the_sources_signedness() {
+    let names = [
+        "widen_signed_true",
+        "widen_signed_false",
+        "widen_unsigned_true",
+        "widen_unsigned_false",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in ["widen_signed_true", "widen_unsigned_true"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in ["widen_signed_false", "widen_unsigned_false"] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "`{name}` proves a false widening; got: {o}"
+        );
+    }
+}
+
 /// A `(u8, &u8)` return with a postcondition on `ret.0` alone is not skipped.
 ///
 /// Component 1 is a reference with no bit-vector width. Binding every declared

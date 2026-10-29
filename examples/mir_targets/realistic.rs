@@ -600,3 +600,37 @@ pub fn tuple_component_tripwire(a: u8, b: u8) -> u8 {
 pub fn min_call_tripwire(a: u8, b: u8) -> u8 {
     min2(a, b).0
 }
+
+/// A signed widening cast sign-extends: `-1i8 as i16` is `-1`.
+/// requires: a == -1
+/// ensures: ret == -1
+pub fn widen_signed_true(a: i8) -> i16 {
+    a as i16
+}
+
+/// The soundness tripwire for the signed widening cast.
+///
+/// `truncate` zero-fills, so modelling every cast with it made `-1i8 as i16` the
+/// bit pattern `255` -- and `ret == 255` was *proved* for `a == -1`, a reachable
+/// false proof. The real value is `-1`. It must FAIL.
+/// requires: a == -1
+/// ensures: ret == 255
+pub fn widen_signed_false(a: i8) -> i16 {
+    a as i16
+}
+
+/// An unsigned widening cast zero-fills: `255u8 as u16` is `255`.
+/// requires: a == 255
+/// ensures: ret == 255
+pub fn widen_unsigned_true(a: u8) -> u16 {
+    a as u16
+}
+
+/// The counterpart tripwire for the unsigned widening: zero-filling is right
+/// here, so `65535` is wrong and must FAIL. A single sign-extend-everything rule
+/// would prove it.
+/// requires: a == 255
+/// ensures: ret == 65535
+pub fn widen_unsigned_false(a: u8) -> u16 {
+    a as u16
+}

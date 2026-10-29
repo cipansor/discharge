@@ -2732,3 +2732,27 @@ cannot be resolved.
 `caller_of_written_copy`/`clear_copy`, `signed_const_left_false`/`_true`,
 `bool_component`, `first_component_only`, `tuple_local_component`, `min2`/`min_call`
 and the two tuple tripwires.
+
+## A widening cast needs the *source's* signedness, and `truncate` is not it
+
+`Rvalue::Cast` used `smt::truncate` for every target width. `truncate` zero-fills,
+so `-1i8 as i16` was modelled as the bit pattern `255` — and
+`requires: a == -1; ensures: ret == 255` on `a as i16` was **proved**, a second
+reachable false proof of the same family as the constant-left comparison: a value
+operation that silently lost its sign.
+
+The two widening directions need *opposite* rules, so no single rule is right:
+`i8 as i16` sign-extends (`-1` stays `-1`), `u8 as u16` zero-fills (`255` stays
+`255`). The source operand's signedness decides, via the same `operand_signedness`
+the comparison and shift paths use — `Some(true)` → `smt::sign_extend`,
+`Some(false)` → `smt::truncate`, and `None` (the source type could not be read) →
+refuse, because zero-filling a signed value is the false proof above and
+sign-extending an unsigned one turns `255u8 as u16` into `65535`. `sign_extend`
+truncates first when the target is no wider, so a *narrowing* cast (`300i16 as u8`
+→ `44`) is unaffected and `truncate`'s behaviour is unchanged for it.
+
+`tests/mir.rs::a_widening_cast_respects_the_sources_signedness` pins all four
+directions — the two true contracts must verify and the two false ones must fail —
+over `widen_signed_true`/`_false` and `widen_unsigned_true`/`_false`, because a
+test that only checked the signed case would pass again the moment the rule went
+back to a single default.

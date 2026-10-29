@@ -1874,7 +1874,22 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
         Rvalue::Cast(o, ty) => {
             let v = operand(env, o);
             match (v, ty.width()) {
-                (Val::Sym(s), Some(w)) => Val::Sym(smt::truncate(s, w)),
+                (Val::Sym(s), Some(w)) => Val::Sym(match operand_signedness(f, o) {
+                    // Widening a *signed* value sign-extends: `-1i8 as i16` is
+                    // `-1`, not `255`. `truncate` zero-fills, so using it for
+                    // every cast modelled `-1i8 as i16` as `255` and proved
+                    // `requires: a == -1; ensures: ret == 255` -- a reachable
+                    // false proof. `sign_extend` truncates first when the target
+                    // is no wider, so a narrowing cast is unaffected.
+                    Some(true) => smt::sign_extend(s, w),
+                    // An *unsigned* widening zero-fills, which is what `truncate`
+                    // already does. A cast whose source signedness cannot be read
+                    // is refused rather than guessed: zero-filling a signed value
+                    // is the false proof above, and sign-extending an unsigned one
+                    // turns `255u8 as u16` into `65535`.
+                    Some(false) => smt::truncate(s, w),
+                    None => return Val::Unknown,
+                }),
                 (Val::Bool(p), Some(1)) => Val::Bool(p),
                 (Val::Bool(p), Some(w)) => Val::Sym(smt::ite(p, smt::word(1, w), smt::word(0, w))),
                 _ => Val::Unknown,
