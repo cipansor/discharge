@@ -384,6 +384,16 @@ struct Indexed {
     /// its type, so `a[i]` can be modelled as an ite chain over `0..N` -- exactly,
     /// which is what this field makes possible.
     fixed_len: Option<u64>,
+    /// Whether an element write invalidated the seeded elements.
+    ///
+    /// `elems` is seeded with one variable per element the contract named, and
+    /// the ite chain is built from them. A write to an element the store cannot
+    /// represent per index -- an aggregate element, or a symbolic index -- makes
+    /// every element unknown rather than leaving the seeded value readable: a
+    /// stale element is not a missing proof, it is a *wrong* one, and it is
+    /// exactly what `a[0] = 0; a[i]` would otherwise prove. The length survives,
+    /// because a write does not change it.
+    poisoned: bool,
 }
 
 impl Env {
@@ -407,6 +417,9 @@ impl Env {
     /// *function* of the index rather than an arbitrary value per read.
     fn index_elem(&mut self, local: u32, index: u64) -> Option<Var> {
         let s = self.indexed.get_mut(&local)?;
+        if s.poisoned {
+            return None;
+        }
         if let Some(v) = s.elems.get(&index) {
             return Some(*v);
         }
@@ -459,6 +472,12 @@ impl Env {
     fn read_indexed(&mut self, p: &Place) -> Option<Val> {
         if !self.indexed.contains_key(&p.local) {
             return None;
+        }
+        // An element write this store could not represent per index leaves every
+        // element unknown, so the read is a missing value rather than the seeded
+        // one the body overwrote.
+        if self.indexed.get(&p.local).is_some_and(|s| s.poisoned) {
+            return Some(Val::Unknown);
         }
         let index = match p.proj.as_slice() {
             [Proj::Deref, Proj::Index(k)] | [Proj::Index(k)] => *k,
@@ -515,6 +534,7 @@ impl Env {
                 // `indexed` lookup is tried first and only for a local that *is*
                 // one.
                 Proj::Index(k) => match self.indexed.get(&p.local) {
+                    Some(s) if s.poisoned => Val::Unknown,
                     Some(s) => match s.elems.get(k) {
                         Some(v) => Val::Sym(*v),
                         // Not read yet. `get` takes `&self` and so cannot create
@@ -539,6 +559,7 @@ impl Env {
                     };
                     match sym.and_then(|v| smt::evaluate(v, |_| None)) {
                         Some(k) => match self.indexed.get(&p.local) {
+                            Some(s) if s.poisoned => Val::Unknown,
                             Some(s) => {
                                 s.elems.get(&k).map(|v| Val::Sym(*v)).unwrap_or(Val::Unknown)
                             }
@@ -596,6 +617,24 @@ impl Env {
 
     fn set(&mut self, p: &Place, v: Val) {
         if p.proj.is_empty() {
+            // A whole-place assignment replaces the value *and* every part of it
+            // the environment holds separately. The field, element, payload and
+            // tag maps are keyed by local and are not touched by a plain
+            // `locals` write, so leaving them would let a later read of `c.x`
+            // return the value the argument *had* -- which is how `c = d; c.x`
+            // proved `ret == c.x` against the stale `c.x`. A derived part of a
+            // value that is no longer there is a wrong value, not a missing one,
+            // so the parts are dropped here rather than read later.
+            //
+            // `Val::Agg` is the exception, and it is load-bearing: an aggregate
+            // rvalue (`_0 = (a, b)`, or the `(result, overflowed)` tuple of a
+            // `checked_*`) *writes its parts itself* inside `eval_rvalue` and
+            // then hands back `Val::Agg` as the local's value. Clearing here
+            // would delete the parts that were just written, which turns a
+            // modelled tuple back into an unknown one.
+            if !matches!(v, Val::Agg) {
+                self.forget_parts(p.local);
+            }
             self.locals.insert(p.local, v);
             return;
         }
@@ -603,9 +642,29 @@ impl Env {
             [Proj::Field(i)] => {
                 self.fields.insert((p.local, *i), v);
             }
-            [Proj::Index(i)] => {
-                self.elems.insert((p.local, *i), v);
+            // An element write to a slice or array argument has to land in the
+            // *same* store the read consults. Writing it to `elems` -- the
+            // array-literal map -- left the read looking at the seeded value, so
+            // `a[0] = 0; a[i]` proved `ret == a[i]` against the pre-write `a[0]`:
+            // a false contract, proved.
+            [Proj::Index(i)] => self.write_elem(p.local, *i, v),
+            // `_1[_2] = v` -- a symbolic subscript. Only a constant index has a
+            // per-index slot; a symbolic one would have to update every element
+            // the chain could select, which this store does not model, so it
+            // poisons instead of guessing.
+            [Proj::IndexVar(li)] | [Proj::Deref, Proj::IndexVar(li)] => {
+                match self.locals.get(li) {
+                    Some(Val::Sym(x)) => match smt::evaluate(*x, |_| None) {
+                        Some(k) => self.write_elem(p.local, k, v),
+                        None => self.poison_elems(p.local),
+                    },
+                    _ => self.poison_elems(p.local),
+                }
             }
+            // `(*_1)[0] = v` -- how a write to a `&mut [T]` or `&mut [T; N]`
+            // argument lowers. The deref is transparent for an argument, so the
+            // element belongs to the same store `read_indexed` consults.
+            [Proj::Deref, Proj::Index(i)] => self.write_elem(p.local, *i, v),
             [Proj::Downcast(variant), Proj::Field(0)] | [Proj::Downcast(variant)] => {
                 self.payloads.insert((p.local, *variant), (v, 0));
             }
@@ -613,6 +672,60 @@ impl Env {
             // approximately would be a soundness hole, so it is dropped and a
             // later read of that place yields `Unknown`.
             _ => {}
+        }
+    }
+
+    /// Drop every part of `local` the environment holds separately from the
+    /// local's own value: fields, elements, payloads and the enum tag.
+    ///
+    /// Called when the local is overwritten as a whole, because the parts then
+    /// describe a value that is no longer there. The *length* of an indexed local
+    /// is kept: it is a property of the type, not of the value, so a reassigned
+    /// array still has its `N`.
+    fn forget_parts(&mut self, local: u32) {
+        self.fields.retain(|(l, _), _| *l != local);
+        self.elems.retain(|(l, _), _| *l != local);
+        self.payloads.retain(|(l, _), _| *l != local);
+        self.discriminants.remove(&local);
+        if let Some(s) = self.indexed.get_mut(&local) {
+            s.elems.clear();
+            // The seeded elements are gone, so a later read must not find them.
+            // Poisoning is the honest state: the store cannot say what the
+            // elements are now, only that it does not know.
+            s.poisoned = true;
+        }
+    }
+
+    /// Record an element write in whichever store the read for `local` consults.
+    ///
+    /// A slice or array argument's elements live in `indexed`; an array *literal*'s
+    /// live in `elems`. The read path keys on the same distinction, so the two
+    /// must agree here or a write becomes invisible to the read.
+    fn write_elem(&mut self, local: u32, index: u64, v: Val) {
+        match self.indexed.get_mut(&local) {
+            Some(s) => match v {
+                Val::Sym(x) => {
+                    s.elems.insert(index, x);
+                }
+                // An aggregate element, or an unmodelled one. The element is no
+                // longer the seeded input, and this store cannot hold what it is
+                // now; keeping the seed would be a stale read, so it poisons.
+                _ => s.poisoned = true,
+            },
+            None => {
+                self.elems.insert((local, index), v);
+            }
+        }
+    }
+
+    /// Mark every element of `local` unknown, keeping the length.
+    fn poison_elems(&mut self, local: u32) {
+        match self.indexed.get_mut(&local) {
+            Some(s) => s.poisoned = true,
+            // A literal array written through a symbolic subscript: the whole
+            // literal is unmodelled now, so its elements are dropped rather than
+            // left stale.
+            None => self.elems.retain(|(l, _), _| *l != local),
         }
     }
 
@@ -851,7 +964,10 @@ where
     // contract uses always has a binding here.
     for &(local, len, elem_w) in &seeds.lens {
         let fixed_len = seeds.array_lens.iter().find(|(l, _)| *l == local).map(|(_, n)| *n);
-        env.indexed.insert(local, Indexed { len, elem_w, elems: BTreeMap::new(), fixed_len });
+        env.indexed.insert(
+            local,
+            Indexed { len, elem_w, elems: BTreeMap::new(), fixed_len, poisoned: false },
+        );
     }
     for &(local, index, v) in &seeds.elems {
         if let Some(s) = env.indexed.get_mut(&local) {

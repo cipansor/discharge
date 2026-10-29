@@ -14,6 +14,12 @@
 //! `array_alias_tripwire`) *fail*, which is the evidence that two fields or two
 //! elements are two distinct inputs rather than one aliased variable.
 //!
+//! A second group at the end is the *soundness* tripwires: each is a false
+//! contract that the frontend once proved because a write updated one of two
+//! stores a place was held in, or because a generated binding could shadow a real
+//! argument. They must fail (or be refused) for the same reason the alias
+//! tripwires must: a `verified` verdict there is a proof of something untrue.
+//!
 //! The families this file was written to measure, and where each stands:
 //!
 //! * **Fields, elements and lengths.** *Closed.* A contract can name `c.lo` and
@@ -353,4 +359,72 @@ pub fn field_alias_tripwire(c: Config, v: u8) -> u8 {
 /// ensures: ret == xs[1]
 pub fn slice_alias_tripwire(xs: &[u8]) -> u8 {
     xs[0]
+}
+
+// ---------------------------------------------------------------------------
+// Soundness tripwires: a write must reach the store the read consults.
+// ---------------------------------------------------------------------------
+
+/// An element write, then a *symbolic* read of the same array.
+///
+/// The seeded elements are what the ite chain is built from, so an element write
+/// that landed anywhere other than the store the chain reads would leave the
+/// chain selecting the *pre-write* element. The contract here is false -- with
+/// `i == 0` the body returns the `0` it just wrote, not `a[i]` -- so it must
+/// FAIL. A `verified` verdict would be a false contract proved, which is the one
+/// outcome this crate exists to prevent.
+/// requires: i < 4 && i == 0
+/// ensures: ret == a[i]
+pub fn array_write_then_symbolic_read(mut a: [u8; 4], i: usize) -> u8 {
+    a[0] = 0;
+    a[i]
+}
+
+/// The same shape through a `&mut [u8; 4]`, which is how a helper that mutates
+/// its caller's array lowers.
+///
+/// The write goes through a reborrow, so it exercises the `(*_1)[0] = v` path
+/// rather than the by-value one. The contract is false for the same reason as
+/// `array_write_then_symbolic_read` -- with `i == 0` the body returns the `0` it
+/// wrote -- so it must FAIL.
+///
+/// The `&mut [u8]` *slice* form of this shape is a separate gap, not this one:
+/// rustc lowers it through a `&raw const (fake) (*_1)` reborrow whose
+/// `PtrMetadata` the frontend does not model, so the function is incomplete
+/// before any write is reached.
+/// requires: i < 4
+/// ensures: ret == a[i]
+pub fn mut_ref_array_write_then_symbolic_read(a: &mut [u8; 4], i: usize) -> u8 {
+    a[0] = 0;
+    a[i]
+}
+
+/// A whole-struct reassignment, then a field read.
+///
+/// The contract's `c.lo` denotes the field of the *argument*, and the body
+/// overwrites `c` with `d` before reading `c.lo`. The field bindings are keyed by
+/// local, so an assignment that updated only the local would leave `c.lo` holding
+/// the argument's value and this false contract (`ret` is `d.lo`, not `c.lo`)
+/// would verify. It must be refused or refuted, never proved.
+/// requires: true
+/// ensures: ret == c.lo
+#[allow(unused_assignments)]
+pub fn struct_reassign_then_field_read(mut c: Config, d: Config) -> u8 {
+    c = d;
+    c.lo
+}
+
+/// A generated binding name that a real argument also uses.
+///
+/// The contract's `a[i]` is rewritten to a binding named `a__chain`, and the
+/// function has an argument of exactly that name. If the generated binding were
+/// allowed to shadow the argument, `ret == a__chain` would be checked against
+/// the array's chain rather than against the argument the source names. The
+/// contract is false for `i == 0 && a__chain == 0` with `a[0] != 0`, so it must
+/// be refused or refuted, never proved.
+/// requires: i < 4
+/// ensures: ret == a__chain
+#[allow(unused_variables, non_snake_case)]
+pub fn generated_name_shadows_argument(a: [u8; 4], i: usize, a__chain: u8) -> u8 {
+    a[i]
 }

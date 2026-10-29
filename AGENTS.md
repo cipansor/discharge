@@ -2584,3 +2584,73 @@ about `a[i]` fails with a counterexample (so "verified" cannot be the chain bein
 the postcondition happened to accept). The corpus entries are
 `array_symbolic_index`, `array_unbounded_index_refused`, `array_wrong_index_refused` and
 `slice_symbolic_index_refused`.
+
+### A write has to land where the read looks
+
+The three soundness holes below were all the same shape: the environment held a
+value for a place in *two* places, and a write updated one of them. Each produced
+a *false proof* — a contract that does not hold, reported `verified` — which is
+worse than a refusal, because it is the answer that gets trusted. They were found
+by a review that read `Env::set` and `index_elem` side by side, not by a test; the
+tests that now pin them were written after.
+
+* **An element write went to the wrong store.** `Env` kept slice and array
+  *arguments*' elements in `indexed[local].elems` (seeded from `elem_seeds`, and
+  what the ite chain is built from) but stored a write with `elems.insert((local,
+  index), v)` — the map for array *literals*. The read consulted the first, the
+  write updated the second, so `a[0] = 0; a[i]` read the pre-write `a[0]` and
+  `ensures: ret == a[i]` under `i == 0` was *proved*. `set` now routes an element
+  write through `write_elem`, which picks the same store the read picks, and the
+  `(*_1)[0] = v` and `_1[_2] = v` forms are handled too. The general rule: the
+  write path and the read path must key on the same distinction, and when there
+  are two stores the code that writes has to know which one the reader will use.
+
+* **A write the store cannot represent has to poison, not be dropped.** An element
+  write of an aggregate, or through a *symbolic* index (`_1[_2] = v`), has no
+  per-index slot: the first has no word to store and the second would have to
+  update every element the chain could select. Dropping it leaves the seeded value
+  readable — the same stale read, one level down. `Indexed::poisoned` marks every
+  element unknown instead, keeping the *length* (a write does not change a type's
+  length). `index_elem`, `read_indexed` and both `get` arms check it. An unknown
+  element fails a postcondition as an unreadable contract; it does not silently
+  become the old value.
+
+* **A whole-place assignment left the parts behind.** `c = d` wrote `locals[c]`
+  and left `fields[(c, 0)]` holding the *argument's* field, so `c = d; c.lo` read
+  the stale `c.lo` and `ensures: ret == c.lo` was proved against the wrong struct.
+  `set` now calls `forget_parts` on a whole-place write, dropping the field,
+  element, payload and tag maps for that local (and poisoning its elements).
+  `Val::Agg` is the deliberate exception: an aggregate rvalue (`_0 = (a, b)`, the
+  `(result, overflowed)` of a `checked_*`) writes its own parts inside
+  `eval_rvalue` and then returns `Val::Agg`, so clearing there would delete the
+  parts that were just written and turn a modelled tuple back into an unknown one.
+  Clearing the derived state on a whole-value write is the conservative direction;
+  the exception is the one case where the derived state *is* the value.
+
+* **A generated name must not be able to shadow a real one.** Bindings are named
+  by mangling (`a__len`, `c__f0`, `a__chain`) and handed to the parser *after* the
+  arguments, so an argument that happens to be called `a__chain` would be shadowed
+  by the chain and a contract naming it would be checked against the array. The
+  fix is not a less guessable separator — any scheme is guessable — but to record
+  every source name in `FieldEnv::declared` and refuse a generated name that
+  collides (`name_is_free`), so the binding is dropped rather than allowed to
+  shadow. The collision is a refusal, which is the honest answer: the source
+  chose a name the mangling wanted.
+
+The remaining gap this exposed is separate and stays open: a `&mut [u8]` *slice*
+argument lowers a write through `&raw const (fake) (*_1)`, whose `PtrMetadata` the
+frontend does not model, so the function is `incomplete` before any write is
+reached. A `&mut [u8; 4]` does not — it goes through a plain reborrow — and is
+modelled. That is why the corpus tripwire for the reborrowed form is
+`mut_ref_array_write_then_symbolic_read`, not the slice.
+
+`tests/mir.rs` pins each hole by name: `an_element_write_reaches_the_symbolic_chain`
+(requires `Failed`, so a counterexample is the evidence the chain saw the write),
+`an_element_write_through_a_mutable_reference_reaches_the_chain`,
+`a_whole_struct_assignment_invalidates_its_fields` (requires *not* `Verified` — the
+write poisons the field, so the postcondition is unreadable),
+`a_generated_binding_cannot_shadow_an_argument` and
+`a_generated_length_binding_cannot_shadow_an_argument`, plus
+`a_write_cannot_prove_a_stale_contract` over the corpus entries
+`array_write_then_symbolic_read`, `mut_ref_array_write_then_symbolic_read`,
+`generated_name_shadows_argument` and `struct_reassign_then_field_read`.

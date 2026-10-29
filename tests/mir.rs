@@ -1143,6 +1143,38 @@ fn array_elements_are_independent_inputs_not_one_aliased_variable() {
     );
 }
 
+/// The corpus tripwires for the write/read-store desync, asserted end to end.
+///
+/// Each of these contracts is *false* and the frontend used to prove one of them.
+/// The corpus (`examples/mir_targets/realistic.rs`) carries them so
+/// `examples/mir_coverage` measures the shape; this pins the verdict so a
+/// regression is a test failure rather than a quiet false proof.
+#[test]
+fn a_write_cannot_prove_a_stale_contract() {
+    let names = [
+        "array_write_then_symbolic_read",
+        "mut_ref_array_write_then_symbolic_read",
+        "generated_name_shadows_argument",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in names {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "`{name}` proves a false contract; got: {o}"
+        );
+    }
+    // The struct-reassignment shape is refused rather than refuted: the write
+    // poisons `c.lo`, and the postcondition then has no single value to check.
+    // The requirement is the same -- never `Verified`.
+    let Some(report) = verify_realistic(&["struct_reassign_then_field_read"]) else { return };
+    let o = outcome(&report, "struct_reassign_then_field_read");
+    assert!(
+        !o.is_verified(),
+        "`struct_reassign_then_field_read` proves a stale field; got: {o}"
+    );
+}
+
 /// A postcondition can name a component of a tuple return.
 ///
 /// `split` returns `(u8, u8)` and claims `ret.0 <= a`. The return place is an
@@ -1350,6 +1382,139 @@ fn a_symbolic_slice_index_is_still_refused() {
 /// for an arbitrary `u8` element, which is false, so it must FAIL -- and the
 /// counterexample must show the element's value, which only exists if the chain
 /// selected a real element variable.
+/// Verify a one-function source file and return the single outcome.
+///
+/// Each of the tests below needs its own file, because the property under test is
+/// about what the *frontend* does with a specific shape and the corpus is shared.
+/// Writing the source to a temp dir keeps that shape next to its assertion.
+fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
+    let rustc = rustc()?;
+    let dir = std::env::temp_dir().join(format!("discharge-{name}-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("probe.rs");
+    std::fs::write(&file, src).expect("write probe");
+    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let o = report
+        .outcomes
+        .into_iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, o)| o);
+    let _ = std::fs::remove_dir_all(&dir);
+    o
+}
+
+/// An element write must reach the store a *symbolic* read consults.
+///
+/// `a[0] = 0; a[i]` returns `0` when `i == 0`, so `ret == a[i]` is false. The
+/// chain is built from the seeded elements, so if the write landed anywhere else
+/// the chain would select the pre-write `a[0]` and this false contract would
+/// verify. The test requires it to be *refuted*, not merely undecided: a
+/// counterexample is the evidence that the chain is evaluated against the written
+/// value, and `Verified` here would be a false proof.
+#[test]
+fn an_element_write_reaches_the_symbolic_chain() {
+    let src = r#"
+/// requires: i < 4 && i == 0
+/// ensures: ret == a[i]
+pub fn written_then_symbolic(mut a: [u8; 4], i: usize) -> u8 {
+    a[0] = 0;
+    a[i]
+}
+"#;
+    let Some(o) = verify_src("written_then_symbolic", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "a write must not leave a stale element readable by the chain; got: {o}"
+    );
+}
+
+/// The same property through a `&mut [u8; 4]` reborrow.
+#[test]
+fn an_element_write_through_a_mutable_reference_reaches_the_chain() {
+    let src = r#"
+/// requires: i < 4 && i == 0
+/// ensures: ret == a[i]
+pub fn ref_written_then_symbolic(a: &mut [u8; 4], i: usize) -> u8 {
+    a[0] = 0;
+    a[i]
+}
+"#;
+    let Some(o) = verify_src("ref_written_then_symbolic", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "a reborrowed element write must reach the chain too; got: {o}"
+    );
+}
+
+/// A whole-struct reassignment must invalidate the fields bound from it.
+///
+/// `c = d; c.lo` returns `d.lo`, so `ret == c.lo` is false unless `c.lo == d.lo`.
+/// The field bindings are keyed by local and a plain `locals` write does not
+/// touch them, so if the assignment left them the contract's `c.lo` would still
+/// name the argument's field and this false contract would verify. It must be
+/// refused or refuted -- anything but `Verified`.
+#[test]
+fn a_whole_struct_assignment_invalidates_its_fields() {
+    let src = r#"
+pub struct B { pub lo: u8 }
+
+/// requires: true
+/// ensures: ret == c.lo
+pub fn reassigned_then_field(mut c: B, d: B) -> u8 {
+    c = d;
+    c.lo
+}
+"#;
+    let Some(o) = verify_src("reassigned_then_field", src) else { return };
+    assert!(
+        !o.is_verified(),
+        "a reassigned struct's field binding is stale and must not prove a contract; got: {o}"
+    );
+}
+
+/// A generated binding name must not be able to shadow a real argument.
+///
+/// The contract's `a[i]` is rewritten to a binding named `a__chain`, and this
+/// function has an argument of exactly that name. If the generated binding were
+/// inserted unconditionally it would shadow the argument, so `ret == a__chain`
+/// would be checked against the array's chain instead of the argument. With
+/// `i == 0` and `a__chain == 0` but `a[0] != 0` the contract is false, so
+/// `Verified` would be a false proof. Refusing the binding is the fix; this pins
+/// it.
+#[test]
+fn a_generated_binding_cannot_shadow_an_argument() {
+    let src = r#"
+/// requires: i < 4
+/// ensures: ret == a__chain
+pub fn shadow_probe(a: [u8; 4], i: usize, a__chain: u8) -> u8 {
+    a[i]
+}
+"#;
+    let Some(o) = verify_src("shadow_probe", src) else { return };
+    assert!(
+        !o.is_verified(),
+        "`a__chain` is a real argument and must not be replaced by the generated binding; got: {o}"
+    );
+}
+
+/// A `__len` collision is refused the same way, and the array's length binding is
+/// what is dropped rather than the argument.
+#[test]
+fn a_generated_length_binding_cannot_shadow_an_argument() {
+    let src = r#"
+/// requires: a.len() == 4
+/// ensures: ret == a__len
+pub fn shadow_len_probe(a: [u8; 4], a__len: usize) -> usize {
+    a.len()
+}
+"#;
+    let Some(o) = verify_src("shadow_len_probe", src) else { return };
+    assert!(
+        !o.is_verified(),
+        "`a__len` is a real argument and must not be replaced by the generated length; got: {o}"
+    );
+}
+
 #[test]
 fn a_false_symbolic_index_postcondition_is_caught() {
     let src = r#"

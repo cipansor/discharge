@@ -382,9 +382,31 @@ pub struct FieldEnv {
     /// argument has no variable of its own (its type has no bit width), so
     /// without this the parser would refuse `a` as an unknown name.
     sym_chain: BTreeMap<String, Var>,
+    /// Every *source* name in scope: the argument names.
+    ///
+    /// The bindings above are named by mangling (`a__len`, `c__f0`,
+    /// `a__chain`), and those names are handed to the parser alongside the
+    /// arguments. If a real argument happens to be called `a__chain`, the
+    /// generated binding would shadow it: `eval_requires` extends the argument
+    /// names with the generated ones, so the later insert wins and a contract
+    /// naming that argument silently reads the array's chain instead. That is a
+    /// false proof, not a parse error. Every generated name is therefore checked
+    /// against this set before it is inserted, and the binding is refused rather
+    /// than allowed to shadow an argument.
+    declared: BTreeSet<String>,
 }
 
 impl FieldEnv {
+    /// Whether `name` may be introduced as a generated binding.
+    ///
+    /// It may not when a *source* name already holds it: the generated binding is
+    /// inserted after the arguments when a contract is parsed, so a collision
+    /// would let the generated value shadow the argument and a contract naming
+    /// that argument would be checked against the wrong input.
+    fn name_is_free(&self, name: &str) -> bool {
+        !self.declared.contains(name)
+    }
+
     /// Bind a field of an argument to a variable.
     ///
     /// The slot is handed out sequentially, not derived from a hash of the path.
@@ -399,6 +421,7 @@ impl FieldEnv {
     /// it does not have gets a message about the field rather than about the dot.
     pub fn declare_arg(&mut self, name: &str) {
         self.known_args.insert(name.to_string());
+        self.declared.insert(name.to_string());
     }
 
     /// [`bind`] by width and signedness, for callers outside the crate that
@@ -429,8 +452,11 @@ impl FieldEnv {
         if slot as usize >= crate::smt::MAX_VARS {
             return None;
         }
-        self.next_slot += 1;
         let mangled = format!("{arg}__f{index}");
+        if !self.name_is_free(&mangled) {
+            return None;
+        }
+        self.next_slot += 1;
         let v = smt::var_named(slot, w);
         self.vars.insert(mangled.clone(), v);
         self.seeds.push((local, index, v));
@@ -489,13 +515,17 @@ impl FieldEnv {
         if !(1..=64).contains(&elem_w) {
             return None;
         }
+        let len_name = format!("{arg}__len");
+        if !self.name_is_free(&len_name) {
+            return None;
+        }
         let slot = self.base + self.next_slot;
         if slot as usize >= crate::smt::MAX_VARS {
             return None;
         }
         self.next_slot += 1;
         let v = smt::var_named(slot, USIZE_WIDTH);
-        self.vars.insert(format!("{arg}__len"), v);
+        self.vars.insert(len_name, v);
         self.paths.insert(format!("{arg}.len()"), format!("{arg}__len"));
         self.indexed.insert(arg.to_string(), (local, elem_w, None));
         self.len_seeds.push((local, v, elem_w));
@@ -514,8 +544,12 @@ impl FieldEnv {
         if !(1..=64).contains(&elem_w) {
             return None;
         }
+        let len_name = format!("{arg}__len");
+        if !self.name_is_free(&len_name) {
+            return None;
+        }
         let v = smt::word(n, USIZE_WIDTH);
-        self.vars.insert(format!("{arg}__len"), v);
+        self.vars.insert(len_name, v);
         self.paths.insert(format!("{arg}.len()"), format!("{arg}__len"));
         self.indexed.insert(arg.to_string(), (local, elem_w, Some(n)));
         self.len_seeds.push((local, v, elem_w));
@@ -549,6 +583,9 @@ impl FieldEnv {
         let mangled = format!("{arg}__e{index}");
         if let Some(v) = self.vars.get(&mangled) {
             return Some(*v);
+        }
+        if !self.name_is_free(&mangled) {
+            return None;
         }
         let slot = self.base + self.next_slot;
         if slot as usize >= crate::smt::MAX_VARS {
@@ -618,8 +655,12 @@ impl FieldEnv {
         self.sym_chain.insert(arg.to_string(), chain);
         // The rewrite replaces `a[i]` with this name, and the parser resolves it
         // from `vars`, so the chain has to be reachable by name.
-        self.vars.insert(format!("{arg}__chain"), chain);
-        self.paths.insert(format!("{arg}__chain"), format!("{arg}__chain"));
+        let chain_name = format!("{arg}__chain");
+        if !self.name_is_free(&chain_name) {
+            return None;
+        }
+        self.vars.insert(chain_name.clone(), chain);
+        self.paths.insert(chain_name.clone(), chain_name);
         Some(v)
     }
 
@@ -1461,6 +1502,12 @@ pub fn field_env(
     // keeps the two index spaces disjoint for any function, not just a small one.
     let mut env =
         FieldEnv { base: f.locals.keys().max().map(|m| m + 1).unwrap_or(0), ..Default::default() };
+    // Every source name in scope, recorded before any binding is generated: the
+    // mangled names are checked against this set, so a generated binding can
+    // never shadow an argument of the same name.
+    for &l in &f.arg_locals {
+        env.declared.insert(f.name_of(l));
+    }
     for &l in &f.arg_locals {
         let Some(ty) = f.ty_of(l) else { continue };
         // A reference to a struct is read through: `&Config` and `Config` have the
