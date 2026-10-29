@@ -1587,7 +1587,7 @@ fn a_contract_error_quotes_the_source_text() {
     let i = smt::var(64);
     args.insert("i".to_string(), i);
     fields.bind_array_len(0, "a", 8, false, 4);
-    fields.bind_sym_index("a", 8, 4, "i", i);
+    fields.bind_sym_index("a", 8, spec::IndexBound::Const(4), "i", i);
     let src = "ret == a[i] && ret == a[j]";
     let err = spec::eval_ensures(
         src,
@@ -1743,22 +1743,61 @@ fn a_trailing_comment_on_a_variant_keeps_the_layout() {
     assert!(!t.is_verified(), "the trailing-comment tripwire must be refuted, got: {t}");
 }
 
-/// A *slice* subscripted symbolically is still refused.
+/// A *slice* subscripted symbolically is modelled, not refused — when the
+/// precondition bounds both the index and the length.
 ///
 /// The whole feature turns on the domain being finite. An array's length is in its
-/// type, so `0..N` can be enumerated; a slice's length is a symbolic input, so
-/// there is no chain to build and `xs[i]` stays a refusal. This is the boundary,
-/// and it is asserted so the feature cannot silently widen to slices.
+/// type, so `0..N` can be enumerated; a slice's is a symbolic input, so the chain
+/// enumerates `0..MAX_INDEX_CHAIN` and is exact only where the length is within
+/// that. The precondition has to establish both facts, and this pins that the
+/// modelled case really verifies rather than being refused.
 #[test]
-fn a_symbolic_slice_index_is_still_refused() {
-    let Some(report) = verify_realistic(&["slice_symbolic_index_refused"]) else { return };
-    let o = outcome(&report, "slice_symbolic_index_refused");
-    match o {
-        FnOutcome::Skipped { reason } => assert!(
-            reason.contains("unknown name") || reason.contains("xs"),
-            "the refusal must be about the unbound subscript, got: {reason}"
-        ),
-        other => panic!("`slice_symbolic_index_refused` must be skipped, got: {other}"),
+fn a_symbolic_slice_index_is_modelled_when_both_bounds_hold() {
+    let Some(report) = verify_realistic(&["slice_symbolic_index"]) else { return };
+    let o = outcome(&report, "slice_symbolic_index");
+    assert!(o.is_verified(), "`slice_symbolic_index` must verify, got: {o}");
+}
+
+/// The tripwire: a false claim about `xs[i]` must be *refuted*, not refused.
+///
+/// The body returns `xs[i]`, and the contract claims that is also `xs[0]` — false
+/// for every `i != 0`. A pass would mean the chain ignored the index. The
+/// assertion is on `Failed` rather than on `!is_verified()` on purpose: a
+/// `Skipped` or `Incomplete` outcome is also "not verified", and accepting one
+/// would let the tripwire pass without the chain ever having been contradicted.
+#[test]
+fn a_slice_chain_depends_on_the_index() {
+    let Some(report) = verify_realistic(&["slice_symbolic_index_tripwire"]) else { return };
+    let o = outcome(&report, "slice_symbolic_index_tripwire");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`slice_symbolic_index_tripwire` must be refuted (not skipped), got: {o}"
+    );
+}
+
+/// Each of a slice's two bounds is required on its own, and the refusal names the
+/// one that is missing.
+///
+/// The length bound is the half an index-only rule would miss, and the index bound
+/// is the half a length-only rule would miss. Each entry below supplies one fact
+/// and withholds the other, so a rule that checked only one of them would model a
+/// subscript it should refuse.
+#[test]
+fn a_slice_subscript_missing_either_bound_is_refused() {
+    let cases = [
+        ("slice_unbounded_length_refused", "`xs.len() <= 64` does not hold"),
+        ("slice_unbounded_index_refused", "`i < xs.len()` does not hold"),
+    ];
+    for (name, want) in cases {
+        let Some(report) = verify_realistic(&[name]) else { return };
+        let o = outcome(&report, name);
+        match o {
+            FnOutcome::Skipped { reason } => assert!(
+                reason.contains(want),
+                "`{name}`'s refusal must name the missing bound `{want}`, got: {reason}"
+            ),
+            other => panic!("`{name}` must be skipped, got: {other}"),
+        }
     }
 }
 

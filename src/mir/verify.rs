@@ -227,29 +227,75 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         }
     }
 
-    // A symbolic array subscript `a[i]` is modelled as an ite chain, which is an
-    // honest model of `a[i]` only where `i < N`. The chain cannot make that true
-    // on its own, so the *precondition* has to establish it: if `requires` does
-    // not imply `i < N`, the subscript is refused rather than checked against a
-    // chain that quietly returned the last element for an out-of-range index.
+    // A symbolic subscript is modelled as an ite chain, which is an honest model
+    // of the element only where the index is in range. The chain cannot make that
+    // true on its own, so the *precondition* has to establish it: if `requires`
+    // does not imply the bound, the subscript is refused rather than checked
+    // against a chain that quietly returned the wrong element for an
+    // out-of-range index.
     //
     // Conjoining the bound into the precondition instead would be unsound in the
     // direction that matters: it would strengthen what the source asked to be
     // checked, so a contract proved under `i < 4` would claim to hold without it.
-    for (idx, n) in fields.index_guards() {
-        let bound = smt::ult_const(idx, n);
+    //
+    // A slice needs *two* facts. `i < len` says the named index is in range, and
+    // `len <= MAX_INDEX_CHAIN` says the enumeration covers the whole slice -- so
+    // a read at some *other* index the body uses is also covered rather than
+    // falling through the chain to a wrong value. The second is a fact about the
+    // length, not the index, which is why bounding the index alone is not enough.
+    for (idx, bound) in fields.index_guards() {
+        // Two facts, checked separately so the refusal names the one that is
+        // missing. A combined message would leave a user who wrote one of the two
+        // bounds unable to tell which one the checker wanted.
+        let (cond, what) = match bound {
+            spec::IndexBound::Const(n) => (smt::ult_const(idx, n), format!("`i < {n}`")),
+            spec::IndexBound::Len(len) => (
+                smt::and(smt::ult(idx, len), smt::ule_const(len, spec::MAX_INDEX_CHAIN)),
+                format!("`i < xs.len()` and `xs.len() <= {}`", spec::MAX_INDEX_CHAIN),
+            ),
+        };
         let established = match pre {
-            Some(p) => smt::prove(smt::implies(p, bound)) == smt::Verdict::Valid,
+            Some(p) => smt::prove(smt::implies(p, cond)) == smt::Verdict::Valid,
             None => false,
         };
-        if !established {
-            return FnOutcome::Skipped {
-                reason: format!(
-                    "a symbolic array index is not known to be in range: the precondition does \
-                     not imply `i < {n}`, and the subscript is only modelled there"
-                ),
-            };
+        if established {
+            continue;
         }
+        // Which half is missing, for a slice. An array has only the one fact, so
+        // it keeps the plain message.
+        let detail = match bound {
+            spec::IndexBound::Const(_) => String::new(),
+            spec::IndexBound::Len(len) => {
+                let in_range = match pre {
+                    Some(p) => smt::prove(smt::implies(p, smt::ult(idx, len)))
+                        == smt::Verdict::Valid,
+                    None => false,
+                };
+                let bounded = match pre {
+                    Some(p) => {
+                        smt::prove(smt::implies(p, smt::ule_const(len, spec::MAX_INDEX_CHAIN)))
+                            == smt::Verdict::Valid
+                    }
+                    None => false,
+                };
+                match (in_range, bounded) {
+                    (false, false) => " (neither `i < xs.len()` nor `xs.len() <= 64` holds)",
+                    (false, true) => " (`i < xs.len()` does not hold)",
+                    (true, false) => {
+                        " (`xs.len() <= 64` does not hold: the slice may be longer than the \
+                         enumeration covers)"
+                    }
+                    (true, true) => "",
+                }
+                .to_string()
+            }
+        };
+        return FnOutcome::Skipped {
+            reason: format!(
+                "a symbolic index is not known to be in range: the precondition does not \
+                 imply {what}{detail}, and the subscript is only modelled there"
+            ),
+        };
     }
 
     // Build the postcondition as a closure over the return value.
@@ -392,6 +438,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
             fields: fields.seeds.clone(),
             lens: fields.len_seeds.clone(),
             array_lens: fields.array_lens.clone(),
+            slice_steps: fields.slice_chain_steps(),
             elems: fields.elem_seeds.clone(),
             tags: fields.tag_seeds.clone(),
             payload_seeds: fields.payload_seeds.clone(),

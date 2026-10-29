@@ -67,6 +67,34 @@ use crate::smt::{self, Pred, Var};
 /// refused rather than silently approximated.
 pub const MAX_INDEX_CHAIN: u64 = 64;
 
+/// The bound a symbolic subscript's ite chain is valid under.
+///
+/// The chain is built by enumerating a *finite* range and selecting the element
+/// whose index matches. An array's range is its type length, a constant. A
+/// slice's length is a symbolic input, so its range is the length variable --
+/// but the chain can only enumerate a bounded number of steps, so a slice's
+/// chain is valid only where the length is within that bound.
+///
+/// Carrying the bound as a type rather than as a `u64` is what keeps the two
+/// from being confused: a slice has no constant to put in the `u64`, and writing
+/// one would be a guess about the caller.
+#[derive(Clone, Copy, Debug)]
+pub enum IndexBound {
+    /// An array: the length is in the type, so the bound is that constant, and
+    /// `i < n` is the whole obligation.
+    Const(u64),
+    /// A slice: the length is a symbolic input, and the chain enumerates
+    /// `0..MAX_INDEX_CHAIN`, so the chain is exact only where
+    /// `len <= MAX_INDEX_CHAIN`. The obligation is that *and* `i < len`.
+    ///
+    /// The length bound is what makes the chain exact for *every* index in the
+    /// slice rather than only for the index the contract named: with
+    /// `i < len <= MAX` any index the body reads is one the enumeration covers.
+    /// Bounding the index alone would leave a read at some other index falling
+    /// through the chain to a wrong value.
+    Len(Var),
+}
+
 /// A contract attached to a function.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FnContract {
@@ -536,6 +564,15 @@ pub struct FieldEnv {
     /// argument has no variable of its own (its type has no bit width), so
     /// without this the parser would refuse `a` as an unknown name.
     sym_chain: BTreeMap<String, Var>,
+    /// `arg -> the bound its chain is valid under` for an array or slice a
+    /// contract subscripts symbolically.
+    ///
+    /// An array's bound is its type length; a slice's is its length *variable*,
+    /// which is symbolic, so the chain is exact only under `len <=
+    /// MAX_INDEX_CHAIN`. The caller turns this into the obligations the
+    /// precondition must establish, and the executor takes the same bound so its
+    /// own chain covers the same range the contract's does.
+    sym_bound: BTreeMap<String, IndexBound>,
     /// Every *source* name in scope: the argument names.
     ///
     /// The bindings above are named by mangling (`a__len`, `c__f0`,
@@ -863,17 +900,20 @@ impl FieldEnv {
         Some(v)
     }
 
-    /// Bind a symbolic array index: the index variable, and every element of the
-    /// array, so the parser can build the ite chain from bindings that already
+    /// Bind a symbolic index: the index variable, and every element of the array
+    /// or slice, so the parser can build the ite chain from bindings that already
     /// exist.
     ///
     /// The index is a fresh input (whatever the caller passed) and the elements
     /// are the same ones a literal `a[k]` would bind, so `a[i]` and `a[0]` share
     /// their element variables and the two cannot disagree. The *range* is not
-    /// checked here: the parser records `i < N` alongside the chain, and the
-    /// contract is refused unless the precondition implies it. Enumerating
-    /// `0..N` is why this only applies to an array -- a slice's length is a
-    /// symbolic input, so there is nothing to enumerate.
+    /// checked here: the bound is recorded in `sym_bound`, and the contract is
+    /// refused unless the precondition establishes it.
+    ///
+    /// The range enumerated is [`IndexBound::Const`] for an array (its type
+    /// length) and [`IndexBound::Len`] for a slice (its length variable, which is
+    /// symbolic), so a slice's chain enumerates `0..MAX_INDEX_CHAIN` and is exact
+    /// only where the length is within that.
     ///
     /// Every element is bound up front rather than on first use because the
     /// postcondition is evaluated in a closure that cannot hold a `&mut`, and
@@ -884,16 +924,21 @@ impl FieldEnv {
         &mut self,
         arg: &str,
         elem_w: u8,
-        n: u64,
+        bound: IndexBound,
         index_name: &str,
         index: Var,
     ) -> Option<Var> {
         if !(1..=64).contains(&elem_w) {
             return None;
         }
-        if n > MAX_INDEX_CHAIN {
-            return None;
-        }
+        // A slice has no length in its type, so the chain enumerates
+        // `0..MAX_INDEX_CHAIN` and is exact only where the length is within that.
+        // The obligation is recorded in `sym_bound` and established by the caller.
+        let steps = match bound {
+            IndexBound::Const(n) if n <= MAX_INDEX_CHAIN => n,
+            IndexBound::Const(_) => return None,
+            IndexBound::Len(_) => MAX_INDEX_CHAIN,
+        };
         if let Some(v) = self.sym_index.get(arg) {
             // The same array subscripted by two different indices has no single
             // chain to rewrite to. Refusing keeps the second subscript a refusal
@@ -914,8 +959,8 @@ impl FieldEnv {
             return Some(*v);
         }
         // The elements first, so the chain has all of them to build from.
-        let mut elems = Vec::with_capacity(n as usize);
-        for k in 0..n {
+        let mut elems = Vec::with_capacity(steps as usize);
+        for k in 0..steps {
             elems.push(self.bind_indexed_elem(arg, k)?);
         }
         let v = index;
@@ -926,7 +971,7 @@ impl FieldEnv {
         // `i < N` (conjoined by `eval_*`, or assumed from the body's own bounds
         // assert), so the value chosen for `i >= N` is never observed.
         let mut chain = smt::word(0, elem_w);
-        for k in (0..n).rev() {
+        for k in (0..steps).rev() {
             chain = smt::ite(smt::eq_const(v, k), elems[k as usize], chain);
         }
         self.sym_chain.insert(arg.to_string(), chain);
@@ -938,25 +983,53 @@ impl FieldEnv {
         }
         self.vars.insert(chain_name.clone(), chain);
         self.paths.insert(chain_name.clone(), chain_name);
+        self.sym_bound.insert(arg.to_string(), bound);
         Some(v)
     }
 
-    /// `(index variable, length)` for every array a contract subscripts
-    /// symbolically, so the caller can require that the precondition establishes
-    /// each index is in range.
+    /// `(index variable, bound)` for every indexed argument a contract
+    /// subscripts symbolically, so the caller can require that the precondition
+    /// establishes each index is in range.
     ///
-    /// The ite chain has a fall-through for `i >= N` (it has to return
-    /// *something*), so the chain is only an honest model of `a[i]` where `i < N`.
-    /// Rather than refuse the subscript, the caller proves the precondition
-    /// implies the bound; if it does not, the contract is refused. Conjoining the
-    /// bound into the precondition instead would be unsound, because it would
-    /// quietly strengthen what the source asked to be checked.
-    pub fn index_guards(&self) -> Vec<(Var, u64)> {
+    /// The ite chain has a fall-through for an out-of-range index (it has to
+    /// return *something*), so the chain is only an honest model where the index
+    /// is in range. Rather than refuse the subscript, the caller proves the
+    /// precondition implies the bound; if it does not, the contract is refused.
+    /// Conjoining the bound into the precondition instead would be unsound,
+    /// because it would quietly strengthen what the source asked to be checked.
+    ///
+    /// The bound is an [`IndexBound`] rather than a `u64` because a slice's is a
+    /// *term*: its length is a symbolic input. An array's is still the constant
+    /// from its type, wrapped so the two travel as one shape.
+    pub fn index_guards(&self) -> Vec<(Var, IndexBound)> {
         self.sym_index
             .iter()
             .filter_map(|(arg, v)| {
-                let (_, _, n, _) = self.indexed.get(arg)?;
-                Some((*v, (*n)?))
+                let bound = *self.sym_bound.get(arg)?;
+                Some((*v, bound))
+            })
+            .collect()
+    }
+
+    /// `(local, steps)` for every *slice* the contract subscripts symbolically,
+    /// so the executor can build its own chain over the same range.
+    ///
+    /// Only slices appear here. An array's chain comes from its type length, which
+    /// the executor already has from `array_lens`; a slice's has no type length,
+    /// so the executor can only build one when the contract established
+    /// `len <= MAX_INDEX_CHAIN`, which is exactly what `sym_bound` records. A
+    /// slice whose bound the contract did *not* establish is absent, and its
+    /// symbolic subscript stays refused rather than becoming a chain that
+    /// enumerates a range the length may exceed.
+    pub fn slice_chain_steps(&self) -> Vec<(u32, u64)> {
+        self.sym_bound
+            .iter()
+            .filter_map(|(arg, bound)| {
+                let (local, _, _, _) = self.indexed.get(arg)?;
+                match bound {
+                    IndexBound::Len(_) => Some((*local, MAX_INDEX_CHAIN)),
+                    IndexBound::Const(_) => None,
+                }
             })
             .collect()
     }
@@ -1009,9 +1082,26 @@ impl FieldEnv {
                         // left unbound and refused by the parser rather than
                         // mis-modelled.
                         if let Some(&index) = args.get(&inner) {
-                            if let Some((_, elem_w, Some(n), _)) = self.indexed.get(&ident).copied()
+                            // The bound is the array's type length or, for a
+                            // slice, the length *variable* -- which is why the
+                            // argument's length has to be bound before this runs.
+                            // A slice whose length the contract never named has
+                            // no variable to bound the chain by, so it is left
+                            // unbound and refused.
+                            if let Some((_, elem_w, fixed_len, _)) =
+                                self.indexed.get(&ident).copied()
                             {
-                                self.bind_sym_index(&ident, elem_w, n, &inner, index);
+                                let bound = match fixed_len {
+                                    Some(n) => Some(IndexBound::Const(n)),
+                                    None => self.vars.get(&format!("{ident}__len")).map(|l| {
+                                        IndexBound::Len(*l)
+                                    }),
+                                };
+                                if let Some(bound) = bound {
+                                    self.bind_sym_index(
+                                        &ident, elem_w, bound, &inner, index,
+                                    );
+                                }
                             }
                         }
                         i = close + 1;

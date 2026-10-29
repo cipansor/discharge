@@ -492,6 +492,17 @@ struct Indexed {
     /// its type, so `a[i]` can be modelled as an ite chain over `0..N` -- exactly,
     /// which is what this field makes possible.
     fixed_len: Option<u64>,
+    /// How many steps a *slice's* symbolic chain enumerates, when the contract
+    /// established that its length is within `MAX_INDEX_CHAIN`.
+    ///
+    /// A slice has no length in its type, so unlike `fixed_len` there is no
+    /// constant to take from the type. This is `Some(MAX_INDEX_CHAIN)` only when
+    /// the contract's precondition was proved to imply `len <= MAX_INDEX_CHAIN`,
+    /// which is what makes enumerating that many steps an exact model of *every*
+    /// index in the slice. Without it a symbolic slice subscript stays refused:
+    /// the chain would have to stop somewhere, and stopping before the length
+    /// would fall through to a wrong element.
+    slice_steps: Option<u64>,
     /// Whether an element write invalidated the seeded elements.
     ///
     /// `elems` is seeded with one variable per element the contract named, and
@@ -547,20 +558,27 @@ impl Env {
         Some((v, sign))
     }
 
-    /// The ite chain standing for `a[i]` on a fixed-length array, or `None` when
-    /// the local is a slice or the chain is too long to build.
+    /// The ite chain standing for `a[i]` on a fixed-length array or on a slice
+    /// whose length the contract bounded, or `None` when neither applies.
     ///
     /// An array has a finite domain, so `a[i]` is *exactly* `ite(i == 0, e0, ...)`
     /// over `0..N`. Every element is created if it does not exist yet, so the
     /// chain is a function of `i` and the same `i` read twice is the same value.
     /// The caller must be under `i < N`: the bounds assert rustc emits supplies
     /// that, and without it the chain would fall through to the last element,
-    /// which is a wrong value rather than a missing one -- so `None` is returned
-    /// for a slice, where there is no domain to enumerate at all.
+    /// which is a wrong value rather than a missing one.
+    ///
+    /// A slice's length is symbolic, so there is no type length to enumerate. Its
+    /// chain enumerates `0..MAX_INDEX_CHAIN`, which is exact for *every* index the
+    /// slice can hold -- and therefore for the index the body reads -- but only
+    /// because the contract established `len <= MAX_INDEX_CHAIN` first. Without
+    /// that the entry is absent and this returns `None`, which is the refusal a
+    /// slice's symbolic subscript had before.
     fn index_chain(&mut self, local: u32, index: Var) -> Option<Val> {
         let (n, elem_w, elem_signed) = {
             let s = self.indexed.get(&local)?;
-            (s.fixed_len?, s.elem_w, s.elem_signed)
+            // An array's steps come from its type; a slice's from the contract.
+            (s.fixed_len.or(s.slice_steps)?, s.elem_w, s.elem_signed)
         };
         if n > crate::mir::spec::MAX_INDEX_CHAIN {
             return None;
@@ -606,9 +624,10 @@ impl Env {
                         let v = *v;
                         match smt::evaluate(v, |_| None) {
                             Some(k) => k,
-                            // A symbolic index on an *array* is modelled as an ite
-                            // chain; on a slice there is no finite domain, so the
-                            // element is genuinely unknown and stays a refusal.
+                            // A symbolic index on an array or on a
+                            // contract-bounded slice is modelled as an ite chain;
+                            // on an unbounded slice there is no finite domain, so
+                            // the element is genuinely unknown and stays a refusal.
                             None => return self.index_chain(p.local, v),
                         }
                     }
@@ -1149,6 +1168,12 @@ pub struct Seeds {
     /// the domain to enumerate. A slice has no entry, and its `xs[i]` stays
     /// refused.
     pub array_lens: Vec<(u32, u64)>,
+    /// The enumeration length for each *slice* whose contract subscripted it
+    /// symbolically *and* established `len <= MAX_INDEX_CHAIN`. Without an entry
+    /// the executor builds no chain, so a slice subscript stays refused; the entry
+    /// exists only because the caller proved the length is bounded, which is what
+    /// makes a finite chain an honest model of the whole slice.
+    pub slice_steps: Vec<(u32, u64)>,
     /// `(local, index, variable, signed)` for each element a contract names.
     pub elems: Vec<(u32, u64, Var, bool)>,
     /// `(local, tag variable, tag width, discriminants)` for each enum-typed
@@ -1254,9 +1279,22 @@ where
     // contract uses always has a binding here.
     for &(local, len, elem_w, elem_signed) in &seeds.lens {
         let fixed_len = seeds.array_lens.iter().find(|(l, _)| *l == local).map(|(_, n)| *n);
+        // A slice's chain length comes from the *contract*, which established
+        // `len <= MAX_INDEX_CHAIN` before the run; an array's is its type length.
+        // The two are separate lists because they mean different things: the first
+        // is proved, the second is a fact about the type.
+        let slice_steps = seeds.slice_steps.iter().find(|(l, _)| *l == local).map(|(_, n)| *n);
         env.indexed.insert(
             local,
-            Indexed { len, elem_w, elem_signed, elems: BTreeMap::new(), fixed_len, poisoned: false },
+            Indexed {
+                len,
+                elem_w,
+                elem_signed,
+                elems: BTreeMap::new(),
+                fixed_len,
+                slice_steps,
+                poisoned: false,
+            },
         );
     }
     for &(local, index, v, _) in &seeds.elems {

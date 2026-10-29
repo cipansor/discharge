@@ -269,13 +269,58 @@ pub fn array_unbounded_index_refused(a: [u8; 4], i: usize) -> u8 {
     a[i]
 }
 
-/// A *slice* subscripted symbolically. A slice's length is a symbolic input, so
-/// there is no finite domain to enumerate and no chain to build: `xs[i]` stays a
-/// refusal. This is the boundary the feature is drawn at -- an array's length is
-/// in its type, a slice's is not.
-/// requires: i < 4
+/// A *slice* subscripted symbolically, with both facts the model needs.
+///
+/// A slice's length is a symbolic input, so unlike an array there is no type
+/// length to enumerate. The chain therefore enumerates `0..MAX_INDEX_CHAIN`, which
+/// is an exact model of *every* index the slice holds -- and so of the index the
+/// body reads -- but only where the length is within that bound. Both halves are
+/// obligations on the precondition: `i < xs.len()` puts the named index in range,
+/// and `xs.len() <= 64` keeps the whole slice inside the enumeration.
+/// requires: i < xs.len() && xs.len() <= 64
 /// ensures: ret == xs[i]
-pub fn slice_symbolic_index_refused(xs: &[u8], i: usize) -> u8 {
+pub fn slice_symbolic_index(xs: &[u8], i: usize) -> u8 {
+    xs[i]
+}
+
+/// The tripwire: the chain must genuinely depend on the index.
+///
+/// The body returns `xs[i]`, and the contract claims that is also `xs[0]` — false
+/// for every `i != 0`. This must FAIL, with a witness pinning `i` to a non-zero
+/// value. If the chain had collapsed to one element variable, or had been built
+/// from element 0 regardless of `i`, this would verify.
+///
+/// The claim names `xs[i]` *and* `xs[0]` on purpose. Naming only the literal would
+/// leave the body's symbolic read unmodelled — the chain is built when the
+/// contract names a symbolic index — and the tripwire would come back a refusal
+/// rather than a refutation, which a "not verified" assertion would accept for
+/// the wrong reason.
+/// requires: i < xs.len() && xs.len() <= 64
+/// ensures: ret == xs[i] && ret == xs[0]
+pub fn slice_symbolic_index_tripwire(xs: &[u8], i: usize) -> u8 {
+    xs[i]
+}
+
+/// A slice whose *length* the precondition does not bound.
+///
+/// `i < xs.len()` puts the index in range, but says nothing about how long the
+/// slice is, and the chain can only enumerate `0..64`. An index past 64 would fall
+/// through it, so the subscript is refused rather than modelled. This is the half
+/// an index-only bound would miss.
+/// requires: i < xs.len()
+/// ensures: ret == xs[i]
+pub fn slice_unbounded_length_refused(xs: &[u8], i: usize) -> u8 {
+    xs[i]
+}
+
+/// A slice whose *index* the precondition does not bound, with the length bounded.
+///
+/// The mirror of the entry above: `xs.len() <= 64` keeps the chain's range honest,
+/// but nothing says `i` is in it, so `xs[i]` is refused. Two separate obligations,
+/// each with its own refusal.
+/// requires: xs.len() <= 64
+/// ensures: ret == xs[i]
+pub fn slice_unbounded_index_refused(xs: &[u8], i: usize) -> u8 {
     xs[i]
 }
 

@@ -2983,7 +2983,7 @@ entries (`enum_constructed_locally` + tripwire,
 
 **Stage 3 — the contract language's two deliberate refusals.** `xs[i]` with a
 symbolic `i` on a *slice*, and `a[k]` where `k` is a local rather than an
-argument.
+argument. Both halves are DONE.
 
 *The local half is DONE.* `let k = i; a[k]` was refused because the contract's
 `k` resolved to nothing. The refusal was misdiagnosed as "there is no local":
@@ -3009,28 +3009,60 @@ corpus entries carry it — `array_local_index_through_alias` (verifies) and
 — and `array_local_index_written_refused` pins the `written` gate. Coverage went
 from 44/67 to 45/69.
 
-*The slice half remains.* A slice's length is a symbolic input, so `xs[i]` for a
-bounded `i` is a chain over the *length* variable with a bounds obligation, not an
-unbounded enumeration.
+*The slice half is DONE.* The design note below had a soundness hole and it is worth
+recording, because the hole is the interesting part.
 
-The material for it already exists: `FieldEnv::len_seeds` carries
-`(local, len_var, elem_w, elem_signed)` for every slice argument, and the
-precondition's `xs.len()` already resolves to that same `len_var` (it is what the
-body's `PtrMetadata(_1)` reads, so the two agree by construction). What is missing
-is that two things carry a *constant* where they need a term:
+A slice's length is a symbolic input, so `xs[i]` cannot be enumerated over a type
+length the way an array can. The note proposed enumerating `0..MAX_INDEX_CHAIN` and
+guarding each step with `k == n && k < len_var`, with the obligation that the
+precondition imply `i < xs.len()`. That obligation is *not enough*. The chain has to
+return something for `i >= MAX_INDEX_CHAIN`, and an index in `[64, len)` is in range
+and past the enumeration, so it would fall through to a wrong element. The obligation
+that closes it is on the *length*: `xs.len() <= MAX_INDEX_CHAIN`, which makes the
+enumeration cover every index the slice can hold, not just the one the contract named.
+Bounding the index alone leaves the body's read at some other index unmodelled.
 
-* `FieldEnv::index_guards` yields `Vec<(Var, u64)>` — the index variable and the
-  array's type length. A slice's bound is `len_var`, so this becomes a term.
-* `exec::index_chain` builds its chain from `s.fixed_len?`, which is `None` for a
-  slice, and returns `None`. It needs a second path: enumerate `0..MAX_INDEX_CHAIN`
-  and guard each step with `k == n` *and* `k < len_var`, so an index past the
-  caller's length selects nothing and the chain's value stays defined only where
-  the bounds obligation holds.
+So a slice's subscript has two obligations, not one, and they are checked separately so
+the refusal names the missing one:
 
-The soundness content is the same as the array case — the domain has to be finite
-and the caller's precondition has to establish membership — so the slice path must
-carry the same refusal when `i < xs.len()` is not provable. That is the shape the
-next round starts from.
+* `i < xs.len()` — the named index is in range.
+* `xs.len() <= MAX_INDEX_CHAIN` — the enumeration covers the whole slice.
+
+The machinery: `IndexBound` (`Const(n)` for an array, `Len(v)` for a slice) replaces the
+`u64` that `index_guards` used to yield, so the bound travels as one shape whether it is
+a constant or a term. `FieldEnv::sym_bound` records it; `bind_sym_index` enumerates
+`steps` accordingly. On the executor side a slice's chain length cannot come from
+`fixed_len` (there is none), so `Seeds::slice_steps` carries it — and it is populated
+*only* when the contract established `len <= MAX_INDEX_CHAIN`, which is what keeps a
+slice subscript a refusal when it is not bounded. `Indexed` gained `slice_steps` and
+`index_chain` now takes `fixed_len.or(slice_steps)`.
+
+Three corpus entries carry it and each pins a different half: `slice_symbolic_index`
+(verifies, both bounds present), `slice_symbolic_index_tripwire` (must FAIL on the
+postcondition, with `i` pinned non-zero — the evidence the chain depends on the index),
+and `slice_unbounded_length_refused` / `slice_unbounded_index_refused` (each supplies one
+bound and withholds the other, so a rule checking only one would model what it must
+refuse). The tripwire names `xs[i]` *and* `xs[0]`: naming only the literal leaves the
+body's symbolic read unmodelled and the entry comes back a refusal rather than a
+refutation, which a `!is_verified` assertion would accept for the wrong reason — so the
+test asserts `Failed`, not `!is_verified()`.
+
+One shape is left out on purpose. A body reading a *different* symbolic index than the
+contract bounded (`xs[j]` under a contract about `xs[i]`) is modelled, but with two
+64-deep chains the engine returns `Unknown` rather than a refutation, so it is a
+completeness cliff and not a corpus entry: an entry that neither verifies nor refutes is
+not evidence. Coverage went from **51/82 to 52/85** and the test count from 488 to
+**490**.
+
+A second boundary is a consequence of the design and worth stating: a slice's chain
+exists only when the *contract* bounded the length, because `sym_bound` is what the
+executor's `slice_steps` is derived from. So a function whose body reads `xs[i]`
+symbolically but whose contract never names a slice subscript gets no chain and that read
+stays a refusal. An array does not have this coupling — `array_lens` comes from the type,
+not the contract — so a body-only symbolic array read is modelled where the slice one is
+not. The asymmetry loses a proof rather than inventing one, and closing it would mean
+walking the body for slice reads and then proving `len <= 64` for functions that never
+needed slice modelling, so it is left as the honest boundary.
 
 **Stage 4 — the missing intrinsics.** `wrapping_neg`, `wrapping_div`,
 `wrapping_rem`, `overflowing_*`, `leading_zeros`, `trailing_zeros`, `count_ones`,
@@ -3143,10 +3175,10 @@ pins the divergence gate. Two parser unit tests pin the alias rule and the
 the test count from 466 to **470** (two parser unit tests, one integration test,
 and the renamed corpus entries). Full `scripts/gate.sh`: **12/12 green**.
 
-The slice half of Stage 3 is *not* done, and the reason is recorded in the roadmap
-above rather than left as a silent absence: a slice's domain is its length
-*variable*, so both `index_guards` and the executor's `index_chain` want a term
-threaded where they now carry a `u64` type constant.
+The slice half of Stage 3 landed in the same branch. Its own section above records the
+soundness hole the original roadmap note had — an index-only bound is not enough, because
+the chain must be exact for *every* index the slice holds, which needs `len <=
+MAX_INDEX_CHAIN` as a second obligation — and the machinery that closes it.
 
 ## Stage 3 — enum discriminants are rustc's values, not declaration positions
 
