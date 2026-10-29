@@ -90,6 +90,32 @@ pub struct Specs {
     /// contract, which means "check panic freedom on every input" rather than
     /// "skip it".
     pub by_fn: BTreeMap<String, FnContract>,
+    /// Struct layouts read from the same source, keyed by struct name.
+    ///
+    /// A contract that names a field (`c.lo`) needs two things the MIR dump does
+    /// not carry: which *index* that name is (declaration order), and the field's
+    /// width and signedness. The dump prints `_1: &Config` and nothing about
+    /// `Config`, so the layout has to come from the source — the same place the
+    /// contract text itself comes from, which keeps the two consistent by
+    /// construction. A struct with no entry here has no readable fields, and a
+    /// contract naming one is refused rather than guessed.
+    pub structs: BTreeMap<String, StructDef>,
+}
+
+/// A struct's fields, in declaration order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StructDef {
+    /// `(name, type)` for each field. The index in this vector *is* the MIR field
+    /// index, because a struct without `repr(transparent)`/reordering has its
+    /// fields in declaration order and rustc prints `.0` for the first one.
+    pub fields: Vec<(String, Ty)>,
+}
+
+impl StructDef {
+    /// The field index for `name`, or `None` if the struct has no such field.
+    pub fn index_of(&self, name: &str) -> Option<u32> {
+        self.fields.iter().position(|(n, _)| n == name).map(|i| i as u32)
+    }
 }
 
 impl Specs {
@@ -115,6 +141,12 @@ pub fn extract(source: &str) -> Specs {
     let mut pending = FnContract::default();
     let mut in_block_comment = false;
 
+    // Struct layouts, read in the same pass. The MIR dump names a struct
+    // (`_1: &Config`) but never prints its fields, so a contract like
+    // `c.lo <= c.hi` has no way to learn that `lo` is field 0 of width 8 unless
+    // the layout is read here.
+    let mut cur_struct: Option<(String, StructDef)> = None;
+
     for (lineno, raw_line) in source.lines().enumerate() {
         let line = raw_line.trim();
         if in_block_comment {
@@ -127,6 +159,24 @@ pub fn extract(source: &str) -> Specs {
             if !line.contains("*/") {
                 in_block_comment = true;
             }
+            continue;
+        }
+        // Inside a struct body: read fields until the closing brace.
+        if cur_struct.is_some() {
+            if line.starts_with('}') {
+                let (name, def) = cur_struct.take().unwrap();
+                specs.structs.insert(name, def);
+                continue;
+            }
+            if let Some((fname, fty)) = struct_field(line) {
+                if let Some((_, def)) = cur_struct.as_mut() {
+                    def.fields.push((fname, Ty::parse(&fty)));
+                }
+            }
+            continue;
+        }
+        if let Some(name) = struct_head(line) {
+            cur_struct = Some((name, StructDef::default()));
             continue;
         }
         // Inner doc comments (`//!`) and ordinary comments are not contracts.
@@ -207,13 +257,230 @@ impl std::fmt::Display for SpecError {
     }
 }
 
+/// The fields a contract may name, resolved to symbolic variables.
+///
+/// A contract writes `c.lo`, but the expression language knows only flat
+/// identifiers. Rather than grow the grammar with a projection operator, each
+/// readable field is *rewritten* to a mangled identifier (`c.lo` → `c__f0`) and
+/// bound to a variable of the field's own width and signedness. The grammar stays
+/// a comparison of arithmetic expressions over names, and the projection is a
+/// binding decision made before parsing — one place, not one per operator.
+///
+/// The rewrite is textual and runs on the whole contract, so it must not fire
+/// inside a longer identifier: `xs.len()` is handled separately (a length is a
+/// property of the argument, not a field), and `myc.lo` must not match `c.lo`.
+/// The scanner is therefore token-aware rather than a `replace`.
+#[derive(Clone, Debug, Default)]
+pub struct FieldEnv {
+    /// Mangled name → the variable standing for that field.
+    pub vars: BTreeMap<String, Var>,
+    /// Which mangled names are signed, for comparison signedness.
+    pub signed: BTreeSet<String>,
+    /// `arg.field` → mangled name, so the rewrite can be driven by what actually
+    /// exists rather than by a pattern.
+    pub paths: BTreeMap<String, String>,
+    /// The argument names known to be aggregates. Used only to *diagnose*: a
+    /// contract naming `c.lo` where `c` is a struct but `lo` is not a field gets
+    /// "unknown field `lo`" rather than a parser error about the `.` it cannot
+    /// reduce. Both refuse; one says why.
+    pub known_args: BTreeSet<String>,
+    /// The first variable slot this environment may use. It is one past the
+    /// highest local the function declares, so a field variable can never take an
+    /// index a local already holds.
+    ///
+    /// A *fixed* base would be a soundness assumption about the input ("no
+    /// function has 200 locals"). Two variables at one index is not a missing
+    /// proof but a wrong one, so the base is derived from the function instead of
+    /// assumed about it. If the fields do not fit below `MAX_VARS`, the field is
+    /// refused rather than aliased.
+    base: u32,
+    /// How many fields have been bound, which is also the next variable slot.
+    next_slot: u32,
+    /// Base slot for `ret.N` bindings, so they cannot collide with argument
+    /// field slots. The return value's own variable is allocated by the caller
+    /// (it is a real local), so only the *projections* get slots here.
+    next_ret_slot: u32,
+    /// `(local, field index, variable)` for each bound field.
+    ///
+    /// The executor reads `_1.0` out of its own `fields` map, so the *same*
+    /// variable the contract names as `c.lo` has to be seeded there under
+    /// `(_1, 0)`. If the two disagreed, the contract would be about one symbolic
+    /// input and the body about another, and every proof would be vacuous in the
+    /// direction that matters. These seeds are how the two are made to agree by
+    /// construction rather than by convention.
+    pub seeds: Vec<(u32, u32, Var)>,
+}
+
+impl FieldEnv {
+    /// Bind a field of an argument to a variable.
+    ///
+    /// The slot is handed out sequentially, not derived from a hash of the path.
+    /// A hash can collide, and two fields sharing a variable is not a missing
+    /// proof but a *wrong* one — `c.lo <= c.hi` would become `x <= x`. A counter
+    /// cannot collide, so there is nothing to argue about.
+    pub fn bind(&mut self, local: u32, arg: &str, field: &str, index: u32, ty: &Ty) -> Option<()> {
+        self.bind_bits(local, arg, field, index, ty.width()?, ty.is_signed())
+    }
+
+    /// Record that `name` is an aggregate argument, so a contract naming a field
+    /// it does not have gets a message about the field rather than about the dot.
+    pub fn declare_arg(&mut self, name: &str) {
+        self.known_args.insert(name.to_string());
+    }
+
+    /// [`bind`] by width and signedness, for callers outside the crate that
+    /// cannot name the IR's `Ty`.
+    ///
+    /// This is the primitive; `bind` is the typed wrapper. Keeping the IR
+    /// internal is deliberate (see the module docs), so the public entry point
+    /// takes a width rather than a `Ty` and does not leak the parse tree.
+    pub fn bind_bits(
+        &mut self,
+        local: u32,
+        arg: &str,
+        field: &str,
+        index: u32,
+        w: u8,
+        signed: bool,
+    ) -> Option<()> {
+        if !(1..=64).contains(&w) {
+            return None;
+        }
+        // A field is a distinct symbolic input from the argument's own variable.
+        // `var_named` keys on the *local index*, so a field needs an index no
+        // local of this function can use; the base is past the range rustc prints
+        // for these corpora and `var_named` refuses anything at or above
+        // `MAX_VARS`, which keeps a very large field count a refusal rather than
+        // an alias.
+        let slot = self.base + self.next_slot;
+        if slot as usize >= crate::smt::MAX_VARS {
+            return None;
+        }
+        self.next_slot += 1;
+        let mangled = format!("{arg}__f{index}");
+        let v = smt::var_named(slot, w);
+        self.vars.insert(mangled.clone(), v);
+        self.seeds.push((local, index, v));
+        if signed {
+            self.signed.insert(mangled.clone());
+        }
+        self.paths.insert(format!("{arg}.{field}"), mangled);
+        self.known_args.insert(arg.to_string());
+        Some(())
+    }
+}
+
+
+impl FieldEnv {
+    /// Bind `ret.N` to a variable, for a postcondition that names a component of
+    /// a tuple return.
+    ///
+    /// Unlike an argument field, the variable here is not fresh: it is whatever
+    /// the executor holds for element `N` of the return place, so the contract's
+    /// `ret.0` and the body's `_0.0` are the same value. `slot` is only used by
+    /// the up-front parse probe, which needs *some* variable of the right width
+    /// and does not care which.
+    pub fn bind_ret(&mut self, index: u32, ty: &Ty, v: Var) -> Option<()> {
+        ty.width()?;
+        let mangled = format!("ret__f{index}");
+        self.vars.insert(mangled.clone(), v);
+        if ty.is_signed() {
+            self.signed.insert(mangled.clone());
+        }
+        self.paths.insert(format!("ret.{index}"), mangled);
+        Some(())
+    }
+
+    /// A fresh variable for the `index`-th return projection, for the parse probe.
+    pub fn probe_ret_slot(&mut self, index: u32, ty: &Ty) -> Option<Var> {
+        let w = ty.width()?;
+        // Past the field slots, so a return component and an argument field never
+        // share an index.
+        let slot = self.base + self.next_slot + self.next_ret_slot;
+        if slot as usize >= crate::smt::MAX_VARS {
+            return None;
+        }
+        self.next_ret_slot += 1;
+        let v = smt::var_named(slot, w);
+        self.bind_ret(index, ty, v)?;
+        Some(v)
+    }
+}
+
+/// Rewrite `arg.field` to its mangled binding, token-aware.
+///
+/// Only whole `ident.ident` runs that match a *bound* path are replaced, so an
+/// unrelated `x.y` is left for the parser to refuse as an unknown name rather
+/// than silently becoming something else.
+fn rewrite_fields(text: &str, fields: &FieldEnv) -> Result<String, SpecError> {
+    if fields.paths.is_empty() && fields.known_args.is_empty() {
+        return Ok(text.to_string());
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_alphabetic() || c == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let ident: String = chars[start..i].iter().collect();
+            // A field access: `ident.ident`, where the tail is alphanumeric.
+            if chars.get(i) == Some(&'.') {
+                let dot = i;
+                let mut j = i + 1;
+                while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                let field: String = chars[dot + 1..j].iter().collect();
+                // Only rewrite when the tail is a plain identifier followed by
+                // something that is not a call: `xs.len()` must keep its parens
+                // so the `len` path below can refuse it distinctly.
+                let is_call = chars.get(j) == Some(&'(');
+                let key = format!("{ident}.{field}");
+                if !is_call && !field.is_empty() {
+                    if let Some(mangled) = fields.paths.get(&key) {
+                        out.push_str(mangled);
+                        i = j;
+                        continue;
+                    }
+                    // A field of a known aggregate that has no binding: the struct
+                    // has no such field, or its layout was not readable. Refuse
+                    // with a message that names the field, rather than letting the
+                    // `.` reach the parser and produce "expected a comparison
+                    // operator" — the same refusal, a diagnosable one.
+                    if fields.known_args.contains(&ident) {
+                        return Err(SpecError {
+                            text: text.to_string(),
+                            reason: format!("unknown field `{field}` of `{ident}`"),
+                        });
+                    }
+                }
+            }
+            out.push_str(&ident);
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    Ok(out)
+}
+
 /// Turn a `requires` contract into a predicate over the named arguments.
 pub fn eval_requires(
     text: &str,
     args: &BTreeMap<String, Var>,
     signed: &BTreeSet<String>,
+    fields: &FieldEnv,
 ) -> Result<Pred, SpecError> {
-    let mut p = Parser::new(text, args, None, signed, false);
+    let text = rewrite_fields(text, fields)?;
+    let mut names = args.clone();
+    names.extend(fields.vars.iter().map(|(k, v)| (k.clone(), *v)));
+    let mut sgn = signed.clone();
+    sgn.extend(fields.signed.iter().cloned());
+    let mut p = Parser::new(&text, &names, None, &sgn, false);
     let pred = p.parse_or()?;
     p.expect_end()?;
     Ok(pred)
@@ -223,11 +490,17 @@ pub fn eval_requires(
 pub fn eval_ensures(
     text: &str,
     args: &BTreeMap<String, Var>,
-    ret: Var,
+    ret: Option<Var>,
     signed: &BTreeSet<String>,
     ret_signed: bool,
+    fields: &FieldEnv,
 ) -> Result<Pred, SpecError> {
-    let mut p = Parser::new(text, args, Some(ret), signed, ret_signed);
+    let text = rewrite_fields(text, fields)?;
+    let mut names = args.clone();
+    names.extend(fields.vars.iter().map(|(k, v)| (k.clone(), *v)));
+    let mut sgn = signed.clone();
+    sgn.extend(fields.signed.iter().cloned());
+    let mut p = Parser::new(&text, &names, ret, &sgn, ret_signed);
     let pred = p.parse_or()?;
     p.expect_end()?;
     Ok(pred)
@@ -608,6 +881,94 @@ impl<'a> Parser<'a> {
             None => Err(self.err("unexpected end of contract")),
         }
     }
+}
+
+/// Pull the struct name out of a `pub struct Name {` head line.
+///
+/// Only a *braced* struct is recognised. A tuple struct or a unit struct has no
+/// named fields to project, so reading it as a struct with no fields would turn a
+/// contract naming `.0` into an "unknown field" refusal rather than a "this shape
+/// is not modelled" one — the same outcome, and no false layout.
+fn struct_head(line: &str) -> Option<String> {
+    let t = line.trim_start_matches("pub(crate) ").trim_start_matches("pub ").trim();
+    let rest = t.strip_prefix("struct ")?;
+    // Only a brace body on this line is a named-field struct.
+    if !rest.contains('{') {
+        return None;
+    }
+    let name = rest.split(|c: char| c == '{' || c == '<' || c.is_whitespace()).next()?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Pull `(field, type)` out of one line of a struct body.
+///
+/// The line looks like `pub lo: u8,` or `lo: u8,`. A line that is not a
+/// `name: type` pair (a nested item, a comment, an attribute) is skipped, so an
+/// unexpected shape loses a field rather than inventing one — and a lost field
+/// makes a contract naming it a refusal, which is the safe direction.
+fn struct_field(line: &str) -> Option<(String, String)> {
+    let t = line.trim();
+    if t.is_empty() || t.starts_with("//") || t.starts_with('#') {
+        return None;
+    }
+    let t = t.trim_start_matches("pub(crate) ").trim_start_matches("pub ").trim();
+    let (name, ty) = t.split_once(':')?;
+    let name = name.trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    // Strip a trailing comma and any `#[...]` attribute tail.
+    let ty = ty.split(',').next().unwrap_or(ty).trim();
+    if ty.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), ty.to_string()))
+}
+
+/// Bind every field of every struct-typed argument to a symbolic variable.
+///
+/// A struct argument has no width of its own (`Ty::Other("Config")`), so it gets
+/// no variable in [`arg_vars`] and a contract that names it directly is refused.
+/// Its *fields* do have widths, and those are what a contract wants to talk
+/// about. Each field becomes its own symbolic input, so `c.lo` and `c.hi` are
+/// independent — which is the honest model: the frontend has no way to know the
+/// caller's invariant relating them, so assuming one would be unsound.
+///
+/// The struct's layout comes from `structs`, read from the same source as the
+/// contract. A struct that is not there yields no bindings, and a contract naming
+/// one of its fields is then refused by the parser as an unknown name.
+pub fn field_env(
+    f: &crate::mir::parse::MirFn,
+    structs: &BTreeMap<String, StructDef>,
+) -> FieldEnv {
+    // `base` is one past the highest local the function declares. Every local is
+    // seeded at its own index before any field variable is read, so starting here
+    // keeps the two index spaces disjoint for any function, not just a small one.
+    let mut env =
+        FieldEnv { base: f.locals.keys().max().map(|m| m + 1).unwrap_or(0), ..Default::default() };
+    for &l in &f.arg_locals {
+        let Some(ty) = f.ty_of(l) else { continue };
+        // A reference to a struct is read through: `&Config` and `Config` have the
+        // same fields, and the executor treats `*_1` as `_1`.
+        let base = match ty {
+            Ty::Ref(inner) => inner.as_ref(),
+            other => other,
+        };
+        let Ty::Other(name) = base else { continue };
+        let arg = f.name_of(l);
+        // Recorded whether or not a layout was found, so a contract naming a field
+        // gets a message about the field even when the struct's definition was not
+        // readable.
+        env.declare_arg(&arg);
+        let Some(def) = structs.get(name) else { continue };
+        for (i, (fname, fty)) in def.fields.iter().enumerate() {
+            env.bind(l, &arg, fname, i as u32, fty);
+        }
+    }
+    env
 }
 
 /// The argument names whose declared type is signed, for comparison signedness.

@@ -76,6 +76,7 @@ fn verify_all() -> Option<verify::FileReport> {
         "vacuous_precondition",
         "add_always_overflows",
         "div_by_always_zero",
+        "clamp_bounds",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -149,7 +150,7 @@ fn contract_expressions_evaluate() {
     smt::with_fresh(|| {
         let mut args = std::collections::BTreeMap::new();
         args.insert("b".to_string(), smt::var_named(2, 32));
-        let p = spec::eval_requires("b != 0", &args, &std::collections::BTreeSet::new()).expect("should parse");
+        let p = spec::eval_requires("b != 0", &args, &std::collections::BTreeSet::new(), &spec::FieldEnv::default()).expect("should parse");
         // `b != 0` is satisfiable but not valid: some b violates it.
         assert!(!smt::prove(p).is_proved());
     });
@@ -163,7 +164,7 @@ fn a_contradictory_contract_is_refused_or_vacuous() {
         args.insert("b".to_string(), smt::var_named(2, 32));
         // `b < 3 && b > 10` describes no input. The parser should read it, and
         // the engine should say the precondition is unsatisfiable.
-        let p = spec::eval_requires("b < 3 && b > 10", &args, &std::collections::BTreeSet::new()).expect("should parse");
+        let p = spec::eval_requires("b < 3 && b > 10", &args, &std::collections::BTreeSet::new(), &spec::FieldEnv::default()).expect("should parse");
         assert_eq!(smt::find_model(p), smt::Verdict::Unsat);
     });
 }
@@ -175,11 +176,11 @@ fn refuses_a_contract_it_cannot_read() {
         let args = std::collections::BTreeMap::new();
         // A function call is not in the grammar, so it must be refused rather
         // than approximated.
-        assert!(spec::eval_requires("foo(b) < 3", &args, &std::collections::BTreeSet::new()).is_err());
+        assert!(spec::eval_requires("foo(b) < 3", &args, &std::collections::BTreeSet::new(), &spec::FieldEnv::default()).is_err());
         // A cast is not in the grammar either.
-        assert!(spec::eval_requires("b as u64 < 3", &args, &std::collections::BTreeSet::new()).is_err());
+        assert!(spec::eval_requires("b as u64 < 3", &args, &std::collections::BTreeSet::new(), &spec::FieldEnv::default()).is_err());
         // An unknown name is not an argument.
-        assert!(spec::eval_requires("zzz < 3", &args, &std::collections::BTreeSet::new()).is_err());
+        assert!(spec::eval_requires("zzz < 3", &args, &std::collections::BTreeSet::new(), &spec::FieldEnv::default()).is_err());
     });
 }
 
@@ -200,6 +201,7 @@ fn guarded_functions_verify() {
         // rejects, so it belongs with the refuted functions rather than here).
         "shift_const",
         "sat_shift",
+        "clamp_bounds",
     ] {
         let o = outcome(&report, name);
         assert!(
@@ -765,4 +767,132 @@ fn an_always_firing_panic_says_it_fires_on_every_input() {
         detail.contains("every input"),
         "a `Valid` panic query fires on every input and must say so, got: {detail}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Contract projections: struct fields and tuple components
+// ---------------------------------------------------------------------------
+
+const REALISTIC: &str = "examples/mir_targets/realistic.rs";
+
+fn verify_realistic(only: &[&str]) -> Option<verify::FileReport> {
+    let rustc = rustc()?;
+    let only: Vec<String> = only.iter().map(|s| s.to_string()).collect();
+    match verify::verify_file_with(&rustc, std::path::Path::new(REALISTIC), &only) {
+        Ok(r) => Some(r),
+        Err(e) => panic!("frontend failed: {e}"),
+    }
+}
+
+/// A contract can name a struct field, and the field's *value* reaches the body.
+///
+/// `pick_from`'s precondition is `c.lo <= c.hi` and its postcondition is
+/// `ret >= c.lo`. Both name fields of a `&Config`, which the MIR dump prints only
+/// as `_1: &Config` with no layout — the frontend has to read the layout from the
+/// source. Before that, this function was `skipped` with "unknown name".
+#[test]
+fn a_contract_can_name_a_struct_field() {
+    let Some(report) = verify_realistic(&["pick_from", "clamp_by_value"]) else { return };
+    for name in ["pick_from", "clamp_by_value"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+}
+
+/// The tripwire for field *independence*.
+///
+/// `field_alias_tripwire` has the same shape as `clamp_by_value` but claims
+/// `ret >= c.hi`, which is false whenever `v < c.lo <= c.hi`. It must FAIL. If
+/// `c.lo` and `c.hi` were bound to the same symbolic variable the claim would be
+/// `ret >= x` with `ret` in `{x, v}` and `v` unconstrained-but-`<= x`... which is
+/// exactly the vacuous pass this test exists to catch. A counterexample is the
+/// positive evidence that the two fields are distinct inputs.
+#[test]
+fn struct_fields_are_independent_inputs_not_one_aliased_variable() {
+    let Some(report) = verify_realistic(&["field_alias_tripwire"]) else { return };
+    let o = outcome(&report, "field_alias_tripwire");
+    let FnOutcome::Failed { kind, detail } = o else {
+        panic!(
+            "`field_alias_tripwire` must fail: a pass means `c.lo` and `c.hi` \
+             collapsed to one variable and the contract was vacuous. got: {o}"
+        );
+    };
+    assert_eq!(kind, "postcondition", "got: {o}");
+    // The witness must name two different variables for the two fields. If the
+    // binding aliased, the same variable index would appear for both.
+    let names: Vec<&str> = detail.split_whitespace().filter(|t| t.starts_with('v')).collect();
+    assert!(
+        names.len() >= 2,
+        "the counterexample must assign both fields to show they differ, got: {detail}"
+    );
+    assert!(
+        names.iter().collect::<std::collections::BTreeSet<_>>().len() >= 2,
+        "the two fields were assigned the same variable, so they are aliased: {detail}"
+    );
+}
+
+/// A postcondition can name a component of a tuple return.
+///
+/// `split` returns `(u8, u8)` and claims `ret.0 <= a`. The return place is an
+/// aggregate, so there is no single word for `ret`; the frontend binds `ret.0`
+/// and `ret.1` to the components `_0 = (a, b)` actually stored.
+#[test]
+fn a_postcondition_can_name_a_tuple_component() {
+    let Some(report) = verify_realistic(&["split"]) else { return };
+    let o = outcome(&report, "split");
+    assert!(o.is_verified(), "`split` must verify, got: {o}");
+}
+
+/// A contract naming a field the struct does not have is refused, not dropped.
+///
+/// This is the failure mode that matters: if the projection were ignored, the
+/// conjunct would vanish and the function would verify against a weaker contract
+/// than the source states. The refusal is asserted on the *evaluator* rather than
+/// on a corpus function, so it cannot pass by the function being skipped for some
+/// unrelated reason.
+#[test]
+fn a_contract_naming_an_unknown_field_is_refused() {
+    let mut args = std::collections::BTreeMap::new();
+    args.insert("c".to_string(), discharge::smt::var(8));
+    // `c` is a known aggregate with no bindings, so the refusal names the field.
+    let mut env = spec::FieldEnv::default();
+    env.declare_arg("c");
+    let err = spec::eval_requires("c.lo <= 3", &args, &std::collections::BTreeSet::new(), &env)
+        .expect_err("an unbound field must be refused");
+    assert!(
+        err.to_string().contains("unknown field `lo`"),
+        "the refusal must name the field, got: {err}"
+    );
+}
+
+/// The field rewrite is token-aware: it must not fire inside a longer name.
+///
+/// `myc.lo` is a different path from `c.lo`. A naive `str::replace` would rewrite
+/// the tail of `myc.lo` into `myc__f0` (or rewrite `c.lo` inside it), binding the
+/// contract to a variable the caller never declared — a wrong proof. The rewrite
+/// only fires on a whole `ident.ident` run that matches a *bound* path.
+#[test]
+fn the_field_rewrite_does_not_fire_inside_a_longer_name() {
+    let mut fields = spec::FieldEnv::default();
+    let c = discharge::smt::var(8);
+    fields.bind_bits(1, "c", "lo", 0, 8, false).unwrap();
+    let mut args = std::collections::BTreeMap::new();
+    args.insert("myc".to_string(), c);
+    // `myc` is *not* a declared aggregate, so its `.lo` is left alone and the
+    // parser refuses the unknown name `myc`. The point is that it was not
+    // rewritten into the binding that belongs to `c`.
+    let err = spec::eval_requires("myc.lo <= 3", &args, &std::collections::BTreeSet::new(), &fields)
+        .expect_err("`myc.lo` must not be rewritten to the binding for `c.lo`");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown name") || msg.contains("expected a comparison"),
+        "`myc.lo` must be refused, got: {msg}"
+    );
+    assert!(
+        !msg.contains("unknown field"),
+        "`myc` is not a known aggregate, so the message must not claim a bad field: {msg}"
+    );
+    // And the bound path itself *is* rewritten and resolves.
+    let ok = spec::eval_requires("c.lo <= 3", &args, &std::collections::BTreeSet::new(), &fields);
+    assert!(ok.is_ok(), "the bound path must resolve, got: {ok:?}");
 }

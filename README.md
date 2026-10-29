@@ -1229,6 +1229,43 @@ so the state after the loop is *any* state satisfying the invariant and the exit
 condition, not the state of the first pass. Omitting that step would prove false
 postconditions; `AGENTS.md` records the measured case.
 
+A contract may name a field of a struct argument, and a component of a tuple
+return, by the same syntax the Rust body uses:
+
+```rust,ignore
+struct Bounds { lo: u8, hi: u8 }
+
+/// requires: b.lo <= b.hi
+/// ensures: ret >= b.lo && ret <= b.hi
+pub fn clamp_bounds(b: &Bounds, v: u8) -> u8 {
+    if v < b.lo { b.lo } else if v > b.hi { b.hi } else { v }
+}
+
+/// requires: a <= b
+/// ensures: ret.0 <= a
+pub fn split(a: u8, b: u8) -> (u8, u8) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+```
+
+The MIR dump names the struct but never prints its layout — `_1: &Bounds` and
+nothing more — so the field *indices and widths* are read from the source, the
+same place the contract text comes from. That keeps the two consistent by
+construction: a field the layout reader does not find cannot be named by a
+contract that would otherwise be checked against it.
+
+Each field is its own symbolic input. This is the honest model, not a
+convenience: the frontend cannot see the caller's invariant relating two fields,
+so assuming `lo <= hi` would be unsound. `examples/mir_targets/realistic.rs`
+carries a `field_alias_tripwire` whose *failure* is the evidence that the two
+fields are distinct variables rather than one aliased one; `tests/mir.rs`
+requires that failure.
+
+A projection that cannot be resolved is refused, never dropped. `c.lo` where `lo`
+is not a field of `Bounds` is an error naming the field, and a projection on a
+non-aggregate return is refused too — if the conjunct vanished instead, the
+function would verify against a weaker contract than the source states.
+
 The scanner is deliberately strict. A `requires:`, `ensures:` or `invariant:` that sits before a
 `const`, a `struct` or a module comment is *not* attached to the next function, so
 a misplaced contract is dropped rather than silently applied to the wrong item.
@@ -1760,20 +1797,28 @@ The honest split:
 
 | | `discharge` | Kani / Verus / Creusot / Prusti | `contracts` crate |
 |---|---|---|---|
-| What is verified | a model of the program, as an AST you build | the Rust function itself (MIR/IR) | nothing — runtime `assert` |
+| What is verified | the Rust function itself, from its MIR (plus a `Stmt` AST for the older frontend) | the Rust function itself (MIR/IR) | nothing — runtime `assert` |
 | Needs external solver | no | yes (Z3 / CBMC) | no |
 | Toolchain | stable, `no_std`, zero deps | nightly or bespoke driver | stable |
 | Runs on the target | yes (compiled in) | no (host-side) | yes (but unchecked) |
 | Scope | bit-vectors, booleans, bounded quantifiers | first-order + arithmetic + more | — |
 | Maturity | a sketch | industrial | widely used |
 
-Two things follow. First, `discharge` does not compete with Kani or Verus on
-verifying real Rust; it does not read your MIR. It verifies programs written in
-its own `Stmt` AST (see `wp::Stmt`) — except for `exhaustive`, which runs real
-functions over small domains and is the one place a claim is about compiled
-code. Second, the niche it does occupy — a checked contract that can be
-discharged *on the target*, with no solver in the loop — is not one the big
-tools aim at, and it is the same niche a `no_std` flight build actually needs.
+Two things follow. First, `discharge` does compete with the big tools on the
+question that matters — *is the proof about the code or about a model of it?* —
+and the answer is the code: `src/mir/` reads the actual MIR that `rustc` lowers a
+real function to, symbolically executes it, and discharges the overflow, shift and
+divide-by-zero `assert`s `rustc` emits plus the pre- and postconditions you wrote
+as doc comments. Nothing is re-modelled by hand, so nothing can drift. What it
+does *not* match is **scale and scope**: it decides small, deterministic functions
+(a few locals, bounded arithmetic, loops that carry an invariant) and declines the
+rest rather than guessing, where Kani and Verus take on trait-heavy, generic,
+iterator-driven code that this frontend reports as `incomplete`. The older
+`Stmt` AST frontend (`wp::Stmt`) is still there and still useful for programs you
+want to state directly, but it is no longer the only way in. Second, the niche it
+does occupy — a checked contract that can be discharged *on the target*, with no
+solver in the loop — is not one the big tools aim at, and it is the same niche a
+`no_std` flight build actually needs.
 
 They are not rivals here so much as a second opinion. The crate uses Kani and
 Verus, Lean and Coq as *differential oracles* in its test suite (`examples/kanidiff.rs`,

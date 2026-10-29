@@ -13,10 +13,12 @@
 //!   wants to say `c.lo <= c.hi`, but the contract language only knows argument
 //!   *names*, and `c` is a reference with no bit-vector width. `first` wants
 //!   `xs[0]`, and slices are not modelled at all.
-//! * **Loops have no invariant.** `sum_loop` is unwound to `DEFAULT_UNWIND`
-//!   and then reported incomplete. There is no way to state the measure that
-//!   would let it be proved, which is a gap the crate's *other* frontend
-//!   (`wp`) does not have: `wp::Stmt::While` requires an invariant.
+//! * **Loops have no invariant.** *Historical.* A loop with no `invariant:` is
+//!   unwound to `DEFAULT_UNWIND` and then reported incomplete; the fix is to
+//!   write the invariant, which the frontend now cuts on instead of unwinding
+//!   (`sum_to`, `count_up` and `count_evens` below all carry one and verify).
+//!   The gap that remains is that the invariant is not *inferred* — you supply
+//!   the induction hypothesis, as in SPARK.
 //! * **`core` is not modelled.** `via_option` calls `u8::checked_add` and
 //!   `via_iter` calls `<&[u8] as IntoIterator>::into_iter`; both are reported
 //!   as unmodelled calls, so the path is unknown.
@@ -197,5 +199,24 @@ pub fn min_via_ord(a: u8, b: u8) -> u8 {
         a
     } else {
         b
+    }
+}
+
+/// A field contract that must **fail**, as the tripwire for field independence.
+///
+/// If the frontend bound `c.lo` and `c.hi` to the same symbolic variable, this
+/// would verify: with `lo == hi == x` the body returns `x` or `v == x`, so
+/// `ret >= c.hi` would hold. Independent fields make it false — `v < c.lo`
+/// returns `c.lo < c.hi` — so the counterexample is exactly the evidence that the
+/// two fields are distinct inputs. `tests/mir.rs` requires the failure.
+/// requires: c.lo <= c.hi
+/// ensures: ret >= c.hi
+pub fn field_alias_tripwire(c: Config, v: u8) -> u8 {
+    if v < c.lo {
+        c.lo
+    } else if v > c.hi {
+        c.hi
+    } else {
+        v
     }
 }

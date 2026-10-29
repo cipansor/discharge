@@ -132,6 +132,14 @@ pub enum Proj {
     /// path where the enum is `None` must not hand back a payload that does not
     /// exist.
     Downcast(u32),
+    /// A pointer dereference, printed as `(*_1)`.
+    ///
+    /// This frontend does not track aliasing, so a dereference of a `&T` argument
+    /// reads the same symbolic value the argument itself stands for — which is
+    /// exactly what a *reference* means when there is only one owner. It is not a
+    /// model of aliasing, and it is refused for a pointer the frontend did not
+    /// introduce as an argument (see `Env::get`).
+    Deref,
 }
 
 /// A place: a local plus a projection path.
@@ -454,6 +462,15 @@ fn variant_index(name: &str) -> Option<u32> {
 /// Parse a place like `_3.1` or `_2` or `_1.0[0]`.
 fn parse_place(s: &str) -> Option<Place> {
     let s = strip_annot(s).trim();
+    // `(*_1)` — a pointer dereference. Like the downcast below it can appear as a
+    // whole place or as a prefix (`(*_1).0`), so the inner place is parsed and the
+    // `Deref` step is pushed before the tail projections.
+    if let Some(rest) = s.strip_prefix("(*") {
+        let close = rest.find(')')?;
+        let mut place = parse_place(&rest[..close])?;
+        place.proj.push(Proj::Deref);
+        return push_projs(place, rest.get(close + 1..)?);
+    }
     // `(base as Variant)` — an enum downcast. It can appear as a whole place or
     // as a prefix, so the inner place is parsed and the tail projection is
     // appended to it.

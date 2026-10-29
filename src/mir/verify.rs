@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::mir::exec;
-use crate::mir::parse::{self, MirFn, MirProgram};
+use crate::mir::parse::{self, MirFn, MirProgram, Ty};
 
 // The report types are part of the public verdict surface -- `FnOutcome`
 // carries a `MirReport` -- so they are re-exported here rather than leaving a
@@ -171,6 +171,10 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     let contract = specs.get(&f.name);
     let arg_vars = spec::arg_vars(f);
     let signed = spec::signed_args(f);
+    // Fields of struct-typed arguments, bound to their own symbolic inputs. The
+    // same bindings are handed to the executor as seeds, so `c.lo` in a contract
+    // and `((*_1).0)` in the body name one variable.
+    let fields = spec::field_env(f, &specs.structs);
     let ret_signed = f.ret_ty.is_signed();
 
     // A loop invariant. The clause carries no loop label, so it can only be
@@ -200,7 +204,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     let mut pre = None;
     if let Some(c) = contract {
         for r in &c.requires {
-            match spec::eval_requires(r, &arg_vars, &signed) {
+            match spec::eval_requires(r, &arg_vars, &signed, &fields) {
                 Ok(p) => pre = Some(match pre {
                     None => p,
                     Some(prev) => smt::and(prev, p),
@@ -233,21 +237,62 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         // Local `_0` is the return place; `Ty::width` is `Some` for every type a
         // contract can name, and the fallback only keeps the probe total.
         let probe_ret = smt::var_named(0, f.ret_ty.width().unwrap_or(1).clamp(1, 64));
-        if let Some(err) = ensures
-            .iter()
-            .find_map(|e| spec::eval_ensures(e, &arg_vars, probe_ret, &signed, ret_signed).err())
-        {
+        // The probe must resolve exactly what the real postcondition will, so
+        // `ret.N` is bound here too. Leaving it out would make the probe fail on a
+        // contract the run could have handled, and the function would be skipped
+        // for a reason that is not true of it.
+        let mut probe_fields = fields.clone();
+        if let Ty::Tuple(ts) = &f.ret_ty {
+            for (i, ty) in ts.iter().enumerate() {
+                if probe_fields.probe_ret_slot(i as u32, ty).is_none() {
+                    return FnOutcome::Skipped {
+                        reason: format!(
+                            "cannot bind `ret.{i}`: the component's type has no bit-vector width"
+                        ),
+                    };
+                }
+            }
+        }
+        if let Some(err) = ensures.iter().find_map(|e| {
+            spec::eval_ensures(e, &arg_vars, Some(probe_ret), &signed, ret_signed, &probe_fields).err()
+        }) {
             return FnOutcome::Skipped { reason: format!("unreadable `ensures`: {err}") };
         }
     }
     let args_for_post = arg_vars.clone();
+    let fields_for_post = fields.clone();
+    // The return type's components, for a postcondition that names `ret.N`. The
+    // type comes from the MIR (`-> (u8, u8)`), so the binding is to the declared
+    // shape rather than to whichever elements a particular path happened to
+    // write: a path that leaves `_0.1` unwritten must make `ret.1` a refusal, not
+    // a silently dropped conjunct.
+    let ret_components: Vec<Ty> = match &f.ret_ty {
+        Ty::Tuple(ts) => ts.clone(),
+        _ => Vec::new(),
+    };
     let post = if ensures.is_empty() {
         None
     } else {
-        Some(move |ret| {
+        Some(move |ret: Option<smt::Var>, projs: &[(u32, smt::Var)]| {
+            // Bind each declared component that this path actually produced.
+            let mut fields = fields_for_post.clone();
+            for (i, ty) in ret_components.iter().enumerate() {
+                let i = i as u32;
+                // Declared but unwritten on this path: binding a *fresh*
+                // unconstrained variable would be wrong, because a postcondition
+                // about `ret.1` would then pass vacuously. Leaving it unbound makes
+                // the parser refuse the name instead.
+                if let Some((_, v)) = projs.iter().find(|(k, _)| *k == i) {
+                    fields.bind_ret(i, ty, *v);
+                }
+            }
+            // `ret` is `None` when the return value is an aggregate: there is no
+            // single word to stand for it, and the parser refuses a bare `ret`
+            // rather than checking it against a fabricated value. Components are
+            // still reachable as `ret.0`, `ret.1` through `fields`.
             let mut acc: Option<crate::smt::Pred> = None;
             for e in &ensures {
-                let p = spec::eval_ensures(e, &args_for_post, ret, &signed, ret_signed)
+                let p = spec::eval_ensures(e, &args_for_post, ret, &signed, ret_signed, &fields)
                     .map_err(|err| err.to_string())?;
                 acc = Some(match acc {
                     None => p,
@@ -258,7 +303,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         })
     };
 
-    let report = exec::verify_fn(prog, f, pre, post, invariant);
+    let report = exec::verify_fn(prog, f, pre, post, invariant, &fields.seeds);
 
     // A definite failure outranks incompleteness: a counterexample is a result.
     // The polarity is per-kind, so this cannot just look for `Counterexample`:

@@ -2381,3 +2381,61 @@ a missing toolchain and quietly skipped. `run.sh` decides between 2 and 3 by pro
 `librustc_driver-*.so` and `libLLVM-*` in `$sysroot/lib/rustlib/$host/lib` directly, rather
 than by asking `rustup component list` (which answers for a toolchain *named* `nightly`, and
 `DISCHARGE_RUSTC` may point elsewhere).
+
+## A projection is a binding decision, not a grammar rule
+
+Contracts could name arguments and `ret`, and nothing else. `requires: b.lo <= b.hi` on a
+`&Bounds` argument was `skipped` with "unknown name", because the expression language had no
+dot operator and no notion of a field. Two of the fourteen functions in
+`examples/mir_targets/realistic.rs` were lost to that — `pick_from` and `clamp_by_value` — and
+a tuple return (`split`, `ensures: ret.0 <= a`) was lost to the same gap one level down.
+
+The first idea was to add a projection operator to the parser. That is the wrong shape: it
+puts the same decision (which field is this, how wide is it) at every operator that can
+appear next to a place. Instead each readable field is *rewritten* to a mangled identifier
+(`c.lo` → `c__f0`) before parsing, and bound to a variable of the field's own width and
+signedness. The grammar stays "arithmetic over names"; the projection is one binding decision,
+made in one place.
+
+What makes this work, and the parts that would have been silent bugs:
+
+* **The layout is not in the MIR.** The dump prints `_1: &Bounds` and never the fields, so
+  both the field *index* (declaration order) and the *width* have to come from the source.
+  That is consistent with how contracts are already read (doc comments, since attributes need
+  a proc-macro and a proc-macro is a dependency), and it means a contract and the layout it
+  names come from the same bytes. A struct the layout reader does not find yields no bindings,
+  and a contract naming one of its fields is refused — not checked against a guessed width.
+* **Two fields must not alias, and a hash is how they would.** The first version derived the
+  field's variable slot from an FNV-1a hash of `arg.field`. A collision there is not a missing
+  proof but a *wrong* one: `c.lo <= c.hi` becomes `x <= x` and verifies vacuously. A sequential
+  counter cannot collide, so there is nothing left to argue about. The tripwire is
+  `field_alias_tripwire` in `realistic.rs` — same shape as `clamp_bounds` but claiming
+  `ret >= c.hi`, which is false whenever `v < c.lo <= c.hi`. It must FAIL, and its
+  counterexample names two distinct variable indices; `tests/mir.rs` requires both the failure
+  and the two distinct names.
+* **The contract's field and the body's field must be the same variable.** The contract binds
+  `c.lo` to a variable; the body reads `((*_1).0)`. If those were two fresh variables the proof
+  would be vacuous in the direction that matters. `FieldEnv.seeds` carries `(local, field,
+  var)` to the executor, which seeds its `fields` map with exactly those variables, so the two
+  are made to agree by construction rather than by convention.
+* **A deref is transparent only as a whole place.** `*_1` for a `&T` argument names the same
+  value `_1` does, because `Ty::Ref` is modelled as its referent. The gate has to be `i == 0`
+  as well as "the local is a reference": `*(_1.0)`, a field that is itself a reference, is a
+  *different* pointee and `deref_ok` says nothing about it. Reading the field as though it were
+  the argument's referent is a wrong value, not a missing one.
+* **A projection that cannot be resolved is refused, never dropped.** `c.lo` where `lo` is not
+  a field is an error naming the field (not the parser's "expected a comparison operator",
+  which is what the `.` produced before the diagnostic was added), and `ret.0` on a
+  non-aggregate return is refused. A dropped conjunct would verify the function against a
+  weaker contract than the source states — the same class of bug as a skipped function
+  reporting `ok`.
+* **`ret` for an aggregate is `None`, not a fabricated word.** A tuple return has no single
+  word, so `post` receives `Option<Var>` and the parser refuses a bare `ret` while still
+  resolving `ret.0`. Passing a fresh unconstrained word would have let `ensures: ret == k`
+  pass on a tuple return by luck.
+
+Coverage on `realistic.rs` went from 10 of 14 decided to 13 of 14 (the remaining skip,
+`first_of`, is `xs.len() > 0` — a slice length, a different gap). `clamp_bounds` was added to
+`actuator.rs`, the regression corpus where *every* function must be decided, so a regression
+in field support is a failing test rather than a quietly lower number. The `rustc_public`
+oracle (gate 9) agrees on 31 actuator and 15 realistic functions with the new shapes.

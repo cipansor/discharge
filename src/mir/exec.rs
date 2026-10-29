@@ -342,6 +342,15 @@ struct Env {
     /// defined and `0` where it is not. Not a constant, because whether
     /// `checked_add` returns `Some` depends on the operands.
     discriminants: BTreeMap<u32, Val>,
+    /// Locals whose type is a reference, and which may therefore be dereferenced.
+    ///
+    /// A dereference is only transparent for a local the frontend introduced as a
+    /// `&T` *argument*. `Ty::Ref` is modelled as its referent, so `*_1` and `_1`
+    /// name the same symbolic value; that is the single-owner reading of a
+    /// reference, not an aliasing model. A local that is not in this set has no
+    /// such backing, and a deref of it reads `Unknown` rather than inventing a
+    /// value.
+    deref_ok: BTreeMap<u32, ()>,
 }
 
 impl Env {
@@ -352,6 +361,7 @@ impl Env {
             fields: BTreeMap::new(),
             payloads: BTreeMap::new(),
             discriminants: BTreeMap::new(),
+            deref_ok: BTreeMap::new(),
         }
     }
 
@@ -380,6 +390,26 @@ impl Env {
             cur = match &p.proj[i] {
                 Proj::Field(f) => *self.fields.get(&(p.local, *f)).unwrap_or(&Val::Unknown),
                 Proj::Index(k) => *self.elems.get(&(p.local, *k)).unwrap_or(&Val::Unknown),
+                Proj::Deref => {
+                    // The frontend does not track aliasing, so a dereference is
+                    // only meaningful when the pointee *is* the local: `_1` is the
+                    // `&Config` argument and `*_1` is the `Config` it names, which
+                    // the executor already holds under `_1` because `Ty::Ref` is
+                    // modelled as its referent.
+                    //
+                    // `i == 0` is load-bearing. A deref that follows a projection
+                    // -- `*(_1.0)`, a field that is itself a reference -- is a
+                    // *different* pointee, and `deref_ok` says nothing about it
+                    // (it is keyed on the local, and the local's referent is not
+                    // the field's). Letting that through would read the field as
+                    // though it were the argument's referent, which is a wrong
+                    // value rather than a missing one.
+                    if i != 0 || !self.deref_ok.contains_key(&p.local) {
+                        return Val::Unknown;
+                    }
+                    i += 1;
+                    continue;
+                }
                 Proj::Downcast(v) => {
                     if !modelled {
                         return Val::Unknown;
@@ -580,9 +610,10 @@ pub fn verify_fn<F>(
     pre: Option<Pred>,
     post: Option<F>,
     invariant: Option<&str>,
+    field_seeds: &[(u32, u32, Var)],
 ) -> MirReport
 where
-    F: Fn(Var) -> Result<Pred, String>,
+    F: Fn(Option<Var>, &[(u32, Var)]) -> Result<Pred, String>,
 {
     let mut report = MirReport { function: f.name.clone(), ..Default::default() };
 
@@ -617,6 +648,17 @@ where
             None => Val::Unknown,
         };
         env.locals.insert(l, v);
+        // A `&T` argument may be dereferenced: `Ty::Ref` is modelled as its
+        // referent, so `*_1` names the same value `_1` does.
+        if matches!(ty, Ty::Ref(_)) {
+            env.deref_ok.insert(l, ());
+        }
+    }
+    // Struct fields the contract names. The contract's `c.lo` is bound to this
+    // variable, and the body's `((*_1).0)` reads it from here, so the two are the
+    // same symbolic input rather than two that merely look alike.
+    for &(local, field, v) in field_seeds {
+        env.fields.insert((local, field), Val::Sym(v));
     }
 
     let start = match f.blocks.first() {
@@ -971,7 +1013,7 @@ fn operand_width(f: &MirFn, o: &Operand) -> Option<u8> {
 
 fn run_state<F>(prog: &MirProgram, mut st: State, post: &Option<F>, report: &mut MirReport, work: &mut Vec<State>)
 where
-    F: Fn(Var) -> Result<Pred, String>,
+    F: Fn(Option<Var>, &[(u32, Var)]) -> Result<Pred, String>,
 {
     let cur = &prog.fns[st.frame.func];
     let block: Block = match cur.block(st.block) {
@@ -1020,44 +1062,43 @@ where
                 None => {
                     report.returned_paths += 1;
                     if let Some(post) = post {
-                        match ret {
-                            Val::Sym(rv) => match post(rv) {
-                                Ok(p) => {
-                                    let v = smt::prove_implies(st.path, p);
-                                    report.obligations.push(Obligation {
-                                        kind: ObligationKind::Postcondition,
-                                        verdict: v,
-                                    });
-                                }
-                                Err(e) => report
-                                    .unknown_paths
-                                    .push(format!("unreadable `ensures`: {e}")),
-                            },
-                            Val::Bool(rp) => {
-                                // A `bool` return is a one-bit word, so the
-                                // postcondition is evaluated against that bit.
-                                // Proving `path => rp` alone would check only
-                                // that the returned bool is *true*, which is not
-                                // the contract at all: `ensures: ret == false`
-                                // would be ignored and a false postcondition
-                                // would verify.
-                                let rv = smt::ite(rp, smt::word(1, 1), smt::word(0, 1));
-                                match post(rv) {
-                                    Ok(p) => {
-                                        let v = smt::prove_implies(st.path, p);
-                                        report.obligations.push(Obligation {
-                                            kind: ObligationKind::Postcondition,
-                                            verdict: v,
-                                        });
-                                    }
-                                    Err(e) => report
-                                        .unknown_paths
-                                        .push(format!("unreadable `ensures`: {e}")),
-                                }
+                        // The components of a tuple return, so a postcondition can
+                        // name `ret.0`. They are read from the return place's element
+                        // map, which is where `_0 = (a, b)` put them.
+                        let projs: Vec<(u32, Var)> = st
+                            .env
+                            .elems
+                            .iter()
+                            .filter(|((l, _), _)| *l == 0)
+                            .filter_map(|((_, k), v)| match v {
+                                Val::Sym(x) => Some((*k as u32, *x)),
+                                _ => None,
+                            })
+                            .collect();
+                        // What the postcondition is evaluated against. A scalar
+                        // return hands over its word; a bool is widened to a one-bit
+                        // word (proving `path => rp` alone would check only that the
+                        // bool is *true*, which is not the contract — `ensures: ret
+                        // == false` would be ignored). An aggregate has no single
+                        // word, so `ret` itself is passed as `None` and a contract
+                        // that uses bare `ret` is refused by the parser; the
+                        // components are still available as `ret.0`, `ret.1`.
+                        let rv = match ret {
+                            Val::Sym(rv) => Some(rv),
+                            Val::Bool(rp) => Some(smt::ite(rp, smt::word(1, 1), smt::word(0, 1))),
+                            _ => None,
+                        };
+                        match post(rv, &projs) {
+                            Ok(p) => {
+                                let v = smt::prove_implies(st.path, p);
+                                report.obligations.push(Obligation {
+                                    kind: ObligationKind::Postcondition,
+                                    verdict: v,
+                                });
                             }
-                            _ => report
+                            Err(e) => report
                                 .unknown_paths
-                                .push("return value is not modelled, postcondition not checked".into()),
+                                .push(format!("unreadable `ensures`: {e}")),
                         }
                     }
                 }
@@ -1418,6 +1459,11 @@ fn width_of(f: &MirFn, p: &Place) -> Option<u8> {
         ty = match (pr, &ty) {
             (Proj::Field(i), Ty::Tuple(ts)) => ts.get(*i as usize)?.clone(),
             (Proj::Index(_), Ty::Array(inner, _)) => (**inner).clone(),
+            // `*r` for a `&T` has type `T`. The dump prints the deref as
+            // `(*_1)` with no type, so the width has to come from the referent
+            // the local was declared with. This is the same transparency the
+            // executor applies when it reads the value.
+            (Proj::Deref, Ty::Ref(inner)) => (**inner).clone(),
             // A downcast yields the payload, whose type the dump does not print
             // here. Reading it as the base type would mis-size the value: the
             // `u8` inside `Option<u8>` is not the `Option<u8>` local. The caller
