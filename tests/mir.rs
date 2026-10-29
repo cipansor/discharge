@@ -77,6 +77,8 @@ fn verify_all() -> Option<verify::FileReport> {
         "add_always_overflows",
         "div_by_always_zero",
         "clamp_bounds",
+        "first_of",
+        "slice_alias_tripwire",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -829,6 +831,47 @@ fn struct_fields_are_independent_inputs_not_one_aliased_variable() {
         names.iter().collect::<std::collections::BTreeSet<_>>().len() >= 2,
         "the two fields were assigned the same variable, so they are aliased: {detail}"
     );
+}
+
+/// A slice contract the frontend must *not* prove: `first_of` is sound, but
+/// `slice_alias_tripwire` claims `ret == xs[1]` where the body returns `xs[0]`.
+///
+/// The tripwire exists because the tempting wrong model is to give a slice one
+/// "element" variable. Then `xs[0] == xs[1]` and the claim would hold. A failure
+/// is the evidence that two indices are two inputs; a pass means the slice was
+/// collapsed and `first_of`'s proof is not worth anything.
+#[test]
+fn slice_elements_are_independent_inputs_not_one_aliased_variable() {
+    let Some(report) = verify_realistic(&["slice_alias_tripwire"]) else { return };
+    let o = outcome(&report, "slice_alias_tripwire");
+    let FnOutcome::Failed { kind, detail } = o else {
+        panic!(
+            "`slice_alias_tripwire` must fail: a pass means `xs[0]` and `xs[1]` \
+             collapsed to one variable and the slice contract was vacuous. got: {o}"
+        );
+    };
+    assert_eq!(kind, "postcondition", "got: {o}");
+    let names: Vec<&str> = detail.split_whitespace().filter(|t| t.starts_with('v')).collect();
+    assert!(
+        names.iter().collect::<std::collections::BTreeSet<_>>().len() >= 2,
+        "the two elements were assigned the same variable, so they are aliased: {detail}"
+    );
+}
+
+/// The slice length is a symbolic input, not a constant, and `xs.len()` in a
+/// contract names the same variable the body's `PtrMetadata` reads.
+///
+/// `first_of` requires `xs.len() > 0` and claims `ret == xs[0]`. If the length
+/// were a fixed constant (say `0`), the precondition would be unsatisfiable and
+/// the function would be reported vacuous rather than verified; if the contract's
+/// `xs.len()` and the body's `PtrMetadata` were *different* variables, the
+/// bounds `assert` could not be discharged from the precondition and the function
+/// would be incomplete. Verified is the only outcome that shows both hold.
+#[test]
+fn a_slice_length_is_a_symbolic_input_shared_with_the_body() {
+    let Some(report) = verify_realistic(&["first_of"]) else { return };
+    let o = outcome(&report, "first_of");
+    assert!(o.is_verified(), "`first_of` must verify, got: {o}");
 }
 
 /// A postcondition can name a component of a tuple return.

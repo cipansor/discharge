@@ -56,7 +56,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::mir::parse::Ty;
+use crate::mir::parse::{Ty, USIZE_WIDTH};
 use crate::smt::{self, Pred, Var};
 
 /// A contract attached to a function.
@@ -309,6 +309,19 @@ pub struct FieldEnv {
     /// direction that matters. These seeds are how the two are made to agree by
     /// construction rather than by convention.
     pub seeds: Vec<(u32, u32, Var)>,
+    /// `(local, length variable)` for each slice argument.
+    ///
+    /// A slice has no length in its type, so the length is a symbolic input, and
+    /// `xs.len()` in a contract and `PtrMetadata(_1)` in the body must name the
+    /// same one. This is the slice analogue of `seeds`.
+    pub len_seeds: Vec<(u32, Var)>,
+    /// `(local, index, element variable)` for each slice element the contract
+    /// names. The body's `(*_1)[0]` reads the same variable, so `xs[0]` in a
+    /// contract and `xs[0]` in the body are one value, not two that look alike.
+    pub elem_seeds: Vec<(u32, u64, Var)>,
+    /// Slice arguments: name → (local, element width), so a contract's
+    /// `xs.len()` and `xs[0]` can be bound without the IR's `Ty` in hand.
+    slices: BTreeMap<String, (u32, u8)>,
 }
 
 impl FieldEnv {
@@ -405,6 +418,96 @@ impl FieldEnv {
         self.bind_ret(index, ty, v)?;
         Some(v)
     }
+
+    /// Bind a slice argument's length to a fresh symbolic variable.
+    ///
+    /// `xs.len()` has no constant value — the length is whatever the caller
+    /// passed — so it is an input, exactly like the elements. The same variable
+    /// is handed to the executor as a `len_seed`, which is what makes the
+    /// contract's `xs.len()` and the body's `PtrMetadata(_1)` one value.
+    pub fn bind_slice_len(&mut self, local: u32, arg: &str, elem_w: u8) -> Option<Var> {
+        if !(1..=64).contains(&elem_w) {
+            return None;
+        }
+        let slot = self.base + self.next_slot;
+        if slot as usize >= crate::smt::MAX_VARS {
+            return None;
+        }
+        self.next_slot += 1;
+        let v = smt::var_named(slot, USIZE_WIDTH);
+        self.vars.insert(format!("{arg}__len"), v);
+        self.paths.insert(format!("{arg}.len()"), format!("{arg}__len"));
+        self.slices.insert(arg.to_string(), (local, elem_w));
+        self.len_seeds.push((local, v));
+        self.known_args.insert(arg.to_string());
+        Some(v)
+    }
+
+    /// Bind one element of a slice argument to a fresh symbolic variable.
+    ///
+    /// `xs[k]` is a distinct input per index — two indices are two variables, so
+    /// `xs[0] == xs[1]` is not provable — and the same index twice is the same
+    /// variable. The element width is the slice's *referent* width, not the
+    /// length's.
+    fn bind_slice_elem(&mut self, arg: &str, index: u64) -> Option<Var> {
+        let (local, elem_w) = *self.slices.get(arg)?;
+        if !(1..=64).contains(&elem_w) {
+            return None;
+        }
+        // Already bound (the same index twice in one contract): reuse it, so
+        // `xs[0] <= xs[0]` is `x <= x` rather than two unrelated inputs.
+        let mangled = format!("{arg}__e{index}");
+        if let Some(v) = self.vars.get(&mangled) {
+            return Some(*v);
+        }
+        let slot = self.base + self.next_slot;
+        if slot as usize >= crate::smt::MAX_VARS {
+            return None;
+        }
+        self.next_slot += 1;
+        let v = smt::var_named(slot, elem_w);
+        self.vars.insert(mangled.clone(), v);
+        self.paths.insert(format!("{arg}[{index}]"), mangled);
+        self.elem_seeds.push((local, index, v));
+        Some(v)
+    }
+
+    /// Bind every slice element a contract text names, so the rewrite has a
+    /// binding for each and the run needs no mutable access to the environment.
+    ///
+    /// Scanning the text up front rather than binding on demand keeps
+    /// `eval_requires` / `eval_ensures` taking `&FieldEnv`: the postcondition is
+    /// evaluated inside an `Fn` closure the executor calls on every returning
+    /// path, and that closure cannot hold a `&mut`. It also means an element the
+    /// body reads but the contract does not is bound by the *executor* (through
+    /// `slice_elem`), and the two agree because both key on the same index.
+    pub fn bind_slice_refs(&mut self, text: &str) {
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i].is_alphabetic() || chars[i] == '_' {
+                let start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let ident: String = chars[start..i].iter().collect();
+                if chars.get(i) == Some(&'[') {
+                    let mut j = i + 1;
+                    let digits: String = chars[j..].iter().take_while(|c| c.is_ascii_digit()).collect();
+                    j += digits.len();
+                    if !digits.is_empty() && chars.get(j) == Some(&']') {
+                        if let Ok(k) = digits.parse::<u64>() {
+                            self.bind_slice_elem(&ident, k);
+                        }
+                        i = j + 1;
+                        continue;
+                    }
+                }
+                continue;
+            }
+            i += 1;
+        }
+    }
 }
 
 /// Rewrite `arg.field` to its mangled binding, token-aware.
@@ -435,10 +538,25 @@ fn rewrite_fields(text: &str, fields: &FieldEnv) -> Result<String, SpecError> {
                     j += 1;
                 }
                 let field: String = chars[dot + 1..j].iter().collect();
-                // Only rewrite when the tail is a plain identifier followed by
-                // something that is not a call: `xs.len()` must keep its parens
-                // so the `len` path below can refuse it distinctly.
+                // `xs.len()` — the slice length. The parens are required, so a
+                // bare `xs.len` (a field named `len`) is not silently accepted.
                 let is_call = chars.get(j) == Some(&'(');
+                if field == "len" && is_call {
+                    let close = j + 1;
+                    if chars.get(close) == Some(&')') {
+                        if let Some(mangled) = fields.paths.get(&format!("{ident}.len()")) {
+                            out.push_str(mangled);
+                            i = close + 1;
+                            continue;
+                        }
+                        if fields.known_args.contains(&ident) {
+                            return Err(SpecError {
+                                text: text.to_string(),
+                                reason: format!("`{ident}` is not a slice, so `len()` has no meaning here"),
+                            });
+                        }
+                    }
+                }
                 let key = format!("{ident}.{field}");
                 if !is_call && !field.is_empty() {
                     if let Some(mangled) = fields.paths.get(&key) {
@@ -456,6 +574,22 @@ fn rewrite_fields(text: &str, fields: &FieldEnv) -> Result<String, SpecError> {
                             text: text.to_string(),
                             reason: format!("unknown field `{field}` of `{ident}`"),
                         });
+                    }
+                }
+            }
+            // `xs[k]` — a slice element. Only a literal index is rewritten; a
+            // symbolic subscript has no binding to rewrite to and is left for the
+            // parser to refuse, which is the same answer for a slice as for an
+            // array.
+            if chars.get(i) == Some(&'[') {
+                let mut j = i + 1;
+                let digits: String = chars[j..].iter().take_while(|c| c.is_ascii_digit()).collect();
+                j += digits.len();
+                if !digits.is_empty() && chars.get(j) == Some(&']') {
+                    if let Some(mangled) = fields.paths.get(&format!("{ident}[{digits}]")) {
+                        out.push_str(mangled);
+                        i = j + 1;
+                        continue;
                     }
                 }
             }
@@ -957,8 +1091,17 @@ pub fn field_env(
             Ty::Ref(inner) => inner.as_ref(),
             other => other,
         };
-        let Ty::Other(name) = base else { continue };
         let arg = f.name_of(l);
+        // A slice argument: `&[u8]`. Its length is a symbolic input, and its
+        // elements are bound on demand (by `bind_slice_refs` for the contract and
+        // by the executor for the body).
+        if let Ty::Slice(elem) = base {
+            if let Some(w) = elem.width() {
+                env.bind_slice_len(l, &arg, w);
+            }
+            continue;
+        }
+        let Ty::Other(name) = base else { continue };
         // Recorded whether or not a layout was found, so a contract naming a field
         // gets a message about the field even when the struct's definition was not
         // readable.

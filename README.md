@@ -1266,6 +1266,26 @@ is not a field of `Bounds` is an error naming the field, and a projection on a
 non-aggregate return is refused too — if the conjunct vanished instead, the
 function would verify against a weaker contract than the source states.
 
+A slice argument is named by its length and by its elements:
+
+```rust,ignore
+/// requires: xs.len() > 0
+/// ensures: ret == xs[0]
+pub fn first_of(xs: &[u8]) -> u8 {
+    xs[0]
+}
+```
+
+A slice has no length in its type, so `xs.len()` is a *symbolic input* — whatever
+the caller passed — not a constant. The same variable is what the body's
+`PtrMetadata(_1)` reads and what the `assert` before `(*_1)[_2]` checks, so the
+bounds check is discharged from the precondition rather than assumed. Each element
+is its own input per index: `xs[0]` and `xs[1]` are two variables, and a
+`slice_alias_tripwire` in `examples/mir_targets/realistic.rs` fails precisely
+because of it. Only a literal index is modelled; `xs[i]` with `i` a parameter is
+refused rather than resolved to an arbitrary element, which is the same refusal an
+array subscript gets.
+
 The scanner is deliberately strict. A `requires:`, `ensures:` or `invariant:` that sits before a
 `const`, a `struct` or a module comment is *not* attached to the next function, so
 a misplaced contract is dropped rather than silently applied to the wrong item.

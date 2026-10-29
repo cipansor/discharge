@@ -220,3 +220,15 @@ pub fn field_alias_tripwire(c: Config, v: u8) -> u8 {
         v
     }
 }
+
+/// A slice contract that must **fail**, as the tripwire for element independence.
+///
+/// If `xs[0]` and `xs[1]` were bound to the same symbolic variable, the body's
+/// `xs[0]` would equal `xs[1]` and this would verify. Independent elements make
+/// it false — take `xs[0] != xs[1]` — so the counterexample is exactly the
+/// evidence that two indices are two inputs. `tests/mir.rs` requires the failure.
+/// requires: xs.len() > 1
+/// ensures: ret == xs[1]
+pub fn slice_alias_tripwire(xs: &[u8]) -> u8 {
+    xs[0]
+}

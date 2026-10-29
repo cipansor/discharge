@@ -37,13 +37,23 @@ pub enum Ty {
     Tuple(Vec<Ty>),
     /// A fixed-size array, e.g. `[u32; 3]`.
     Array(Box<Ty>, u64),
+    /// A slice, e.g. `[u32]` — the referent of a `&[u32]`. Its *length* is not
+    /// part of the type (that is the whole point of a slice), so it is a symbolic
+    /// input rather than a constant; see `FieldEnv::bind_slice_len`.
+    Slice(Box<Ty>),
     Unit,
     /// A shared or mutable reference. Modelled as its referent's width, because
     /// the frontend does not track aliasing (see the module docs on scope).
     Ref(Box<Ty>),
-    /// Anything else: structs, enums, slices, `!`, …
+    /// Anything else: structs, enums, `!`, …
     Other(String),
 }
+
+/// The width `usize`/`isize` are modelled at, and so the width of a slice's
+/// length and its indices. This tool's own host target is 64-bit; a slice length
+/// is only ever compared against indices of the same width, so one constant keeps
+/// the two in step.
+pub const USIZE_WIDTH: u8 = 64;
 
 impl Ty {
     /// Bit width, when the type is a bit-vector or boolean.
@@ -53,12 +63,12 @@ impl Ty {
             Ty::U8 => 8,
             Ty::U16 => 16,
             Ty::U32 => 32,
-            Ty::U64 | Ty::Usize => 64,
+            Ty::U64 | Ty::Usize => USIZE_WIDTH,
             Ty::U128 => 128,
             Ty::I8 => 8,
             Ty::I16 => 16,
             Ty::I32 => 32,
-            Ty::I64 | Ty::Isize => 64,
+            Ty::I64 | Ty::Isize => USIZE_WIDTH,
             Ty::I128 => 128,
             _ => return None,
         })
@@ -113,6 +123,10 @@ impl Ty {
                 let n = parts[1].trim().parse::<u64>().unwrap_or(0);
                 return Ty::Array(Box::new(Ty::parse(&parts[0])), n);
             }
+            // `[T]` with no length is a slice, which is what a `&[u8]` argument
+            // is a reference to. Distinguishing it from `Other("[u8]")` is what
+            // lets `PtrMetadata` and `(*xs)[i]` be modelled at all.
+            return Ty::Slice(Box::new(Ty::parse(inner)));
         }
         Ty::Other(s.to_string())
     }
@@ -123,6 +137,15 @@ impl Ty {
 pub enum Proj {
     Field(u32),
     Index(u64),
+    /// `_2[_3]` — an index that is a local, not a literal.
+    ///
+    /// A slice read is `(*_1)[_2]` where `_2` came from a constant in the
+    /// *body*, but the body is not the only place an index can come from: a
+    /// contract may write `xs[i]` with `i` a parameter. Modelling only the
+    /// literal form would make the body and the contract disagree about which
+    /// element is named, so the variable form is carried too and resolved
+    /// against the environment when the place is read.
+    IndexVar(u32),
     /// An enum downcast, e.g. the `(_2 as Some)` in `((_2 as Some).0)`.
     ///
     /// The payload of a modelled `Option`-returning call lives here, under the
@@ -245,6 +268,11 @@ pub enum Rvalue {
     Ref(Place),
     /// `Len(place)` — array length.
     Len(Place),
+    /// `PtrMetadata(place)` — the metadata of a pointer: for a `&[T]` it is the
+    /// slice's length, which is what the `assert` before an index reads. Modelled
+    /// for slices only; `PtrMetadata` on any other pointer (a trait object, say)
+    /// has metadata this frontend cannot express and stays `Unknown`.
+    PtrMetadata(Place),
     /// `discriminant(place)` — the enum tag. Only modelled for the `Option`s
     /// this frontend synthesises for `checked_*`, where the tag is `0` for
     /// `None` and `1` for `Some`.
@@ -445,6 +473,17 @@ fn parse_local(s: &str) -> Option<LocalIdx> {
     rest.parse::<LocalIdx>().ok()
 }
 
+/// Drop a leading `copy ` / `move ` from a place expression.
+///
+/// `Len(copy _1)` and `PtrMetadata(copy _1)` print the operand the same way any
+/// other rvalue does, so the marker has to be removed before the place parses.
+/// Only those two rvalues are routed through here; a plain `copy _1` is handled
+/// by `parse_operand`, which keeps the marker as part of the operand.
+fn strip_copy(s: &str) -> &str {
+    let t = s.trim();
+    t.strip_prefix("copy ").or_else(|| t.strip_prefix("move ")).unwrap_or(t)
+}
+
 /// The discriminant rustc gives a variant of a two-variant enum.
 ///
 /// `Option` is laid out as `None = 0, Some = 1` and `Result` as `Ok = 0,
@@ -523,8 +562,15 @@ fn push_projs(mut place: Place, mut rest: &str) -> Option<Place> {
             // None }` produced, and it is what lets the index parse fail closed.
             let r = rest.strip_prefix('[')?;
             let close = r.find(']')?;
-            let n = r[..close].trim().parse::<u64>().ok()?;
-            place.proj.push(Proj::Index(n));
+            let n = r[..close].trim();
+            // A literal index (`_2[0]`) is the common case; a *local* index
+            // (`(*_1)[_2]`) is what a slice read with a symbolic subscript lowers
+            // to. Both are carried, because a contract may write `xs[i]` and the
+            // two must name the same element.
+            place.proj.push(match n.parse::<u64>() {
+                Ok(k) => Proj::Index(k),
+                Err(_) => Proj::IndexVar(parse_local(n)?),
+            });
             rest = r.get(close + 1..)?;
         }
     }
@@ -807,8 +853,13 @@ fn parse_rvalue(s: &str) -> Rvalue {
         }
     }
     if let Some(rest) = t.strip_prefix("Len(") {
-        if let Some(p) = parse_place(rest.trim_end_matches(')')) {
+        if let Some(p) = parse_place(strip_copy(rest.trim_end_matches(')'))) {
             return Rvalue::Len(p);
+        }
+    }
+    if let Some(rest) = t.strip_prefix("PtrMetadata(") {
+        if let Some(p) = parse_place(strip_copy(rest.trim_end_matches(')'))) {
+            return Rvalue::PtrMetadata(p);
         }
     }
     if let Some(rest) = t.strip_prefix("discriminant(") {

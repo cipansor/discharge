@@ -2434,8 +2434,47 @@ What makes this work, and the parts that would have been silent bugs:
   resolving `ret.0`. Passing a fresh unconstrained word would have let `ensures: ret == k`
   pass on a tuple return by luck.
 
-Coverage on `realistic.rs` went from 10 of 14 decided to 13 of 14 (the remaining skip,
-`first_of`, is `xs.len() > 0` — a slice length, a different gap). `clamp_bounds` was added to
-`actuator.rs`, the regression corpus where *every* function must be decided, so a regression
-in field support is a failing test rather than a quietly lower number. The `rustc_public`
-oracle (gate 9) agrees on 31 actuator and 15 realistic functions with the new shapes.
+Coverage on `realistic.rs` went from 10 of 14 decided to 13 of 14 when field and tuple support
+landed. `clamp_bounds` was added to `actuator.rs`, the regression corpus where *every* function
+must be decided, so a regression in field support is a failing test rather than a quietly lower
+number. The `rustc_public` oracle (gate 9) agrees on 31 actuator and 15 realistic functions with
+the new shapes.
+
+## A slice length is an input, and its elements are indexed by value
+
+The last `realistic.rs` skip was `first_of(xs: &[u8]) -> u8 { xs[0] }` with
+`requires: xs.len() > 0` / `ensures: ret == xs[0]`. It is the same class of gap as a field —
+a contract naming something the expression language had no way to name — but the *shape* of
+the fix is different, and the difference is the interesting part.
+
+A slice has no length in its type. `&[u8]` is the whole type; the length is whatever the caller
+passed, so `xs.len()` cannot be a constant the frontend computes. It is a *symbolic input*, on
+the same footing as an argument. The body agrees: rustc lowers `xs[0]` to `_3 =
+PtrMetadata(copy _1)` (the length), `assert(Lt(_2, _3))` (the bounds check), then `(*_1)[_2]`.
+The contract's `xs.len()` and the body's `PtrMetadata(_1)` have to be one variable or the
+bounds check cannot be discharged from the precondition, so the length is bound once in
+`FieldEnv` and handed to the executor as a `len_seed` — the slice analogue of the field seeds.
+
+The parts that would have been silent bugs:
+
+* **Elements are indexed by value, not one variable per slice.** The tempting model gives a
+  slice a single "element" variable. Then `xs[0] == xs[1]`, and `slice_alias_tripwire`
+  (`ensures: ret == xs[1]` on a body returning `xs[0]`) would verify. Elements are keyed by
+  `(local, index)` instead, so two indices are two inputs. The tripwire must FAIL, and its
+  counterexample assigns the two elements different values; `tests/mir.rs` requires both.
+* **A symbolic subscript is refused, not resolved to an arbitrary element.** `xs[i]` with `i` a
+  parameter has no single element to name. Reading "some element" would make `xs[i]` a
+  different value per read — a wrong proof, not a missing one. Only a literal index is
+  modelled, which is the same refusal an array subscript gets.
+* **The element width is the referent's, not the length's.** `&[u8]` has `u8` elements and a
+  `usize` length. Taking the element width from the length variable sizes every read at 64 bits
+  and mis-models the bounds check.
+* **The element is created on first read, which `get` cannot do.** `Env::get` takes `&self`, and
+  the first read of `xs[0]` has no variable yet. A `read_slice_index(&mut self, …)` on the
+  operand path creates it; the second read of the same index finds the same variable. Binding
+  the *contract's* element references up front (`bind_slice_refs`) keeps the postcondition
+  closure — which cannot hold a `&mut` — evaluating against the same bindings.
+
+Coverage on `realistic.rs` is now 14 of 15 decided, the sixteenth being
+`slice_alias_tripwire`, which is decided *and must fail*. `first_of` was added to `tests/mir.rs`
+as a must-verify case, so a regression in slice support fails a test.

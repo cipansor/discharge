@@ -25,7 +25,8 @@ use std::collections::BTreeMap;
 
 use crate::mir::intrinsics::{self, Outcome};
 use crate::mir::parse::{
-    BinOp, Block, Callee, Const, MirFn, MirProgram, Operand, Place, Proj, Rvalue, Stmt, Term, Ty, UnOp,
+    BinOp, Block, Callee, Const, MirFn, MirProgram, Operand, Place, Proj, Rvalue, Stmt, Term, Ty,
+    USIZE_WIDTH, UnOp,
 };
 use crate::smt::{self, Pred, Var, Verdict};
 
@@ -351,6 +352,28 @@ struct Env {
     /// such backing, and a deref of it reads `Unknown` rather than inventing a
     /// value.
     deref_ok: BTreeMap<u32, ()>,
+    /// Slices, keyed by the local the `&[T]` argument lives in: its symbolic
+    /// length and its elements.
+    ///
+    /// A slice has no length in its type, so the length is a fresh symbolic input
+    /// -- it is whatever the caller passed. Its elements are distinct inputs per
+    /// index, so `xs[0]` and `xs[1]` are two values and `xs[0] == xs[1]` is not
+    /// provable; see `Slice::elems`.
+    slices: BTreeMap<u32, Slice>,
+}
+
+/// A modelled slice: a symbolic length, and elements read through it.
+#[derive(Clone, Debug)]
+struct Slice {
+    len: Var,
+    /// The width of one element, which is the *referent's* width (`u8` for
+    /// `&[u8]`), not the length's. Taking it from `len` would make every element
+    /// 64 bits wide and mis-size every read.
+    elem_w: u8,
+    /// `index value -> element variable`. Only indices whose value the run can
+    /// resolve can be looked up here; a symbolic index that cannot be pinned is
+    /// refused rather than guessed.
+    elems: BTreeMap<u64, Var>,
 }
 
 impl Env {
@@ -362,7 +385,57 @@ impl Env {
             payloads: BTreeMap::new(),
             discriminants: BTreeMap::new(),
             deref_ok: BTreeMap::new(),
+            slices: BTreeMap::new(),
         }
+    }
+
+    /// The element variable for `index` of slice `local`, created on first use.
+    ///
+    /// Two different indices are two different variables, and the same index read
+    /// twice is the same variable, which is what makes a slice read a *function*
+    /// of the index rather than an arbitrary value per read.
+    fn slice_elem(&mut self, local: u32, index: u64) -> Option<Var> {
+        let s = self.slices.get_mut(&local)?;
+        if let Some(v) = s.elems.get(&index) {
+            return Some(*v);
+        }
+        let w = s.elem_w;
+        let v = smt::var(w);
+        s.elems.insert(index, v);
+        Some(v)
+    }
+
+    /// Read `(*_1)[_2]` — a slice element subscripted by a local.
+    ///
+    /// Returns `None` when the place is not a slice-element read at all, so the
+    /// caller falls through to the ordinary path; returns `Some(Unknown)` when it
+    /// *is* one but the index cannot be pinned, so an unresolvable subscript is a
+    /// missing value rather than an arbitrary element.
+    ///
+    /// The element is created on first read, which is why this takes `&mut self`
+    /// and `get` cannot: the first read of `xs[0]` has no variable yet, and the
+    /// second read must find the same one.
+    fn read_slice_index(&mut self, p: &Place) -> Option<Val> {
+        if !self.slices.contains_key(&p.local) {
+            return None;
+        }
+        let index = match p.proj.as_slice() {
+            [Proj::Deref, Proj::Index(k)] | [Proj::Index(k)] => *k,
+            [Proj::Deref, Proj::IndexVar(li)] | [Proj::IndexVar(li)] => {
+                match self.locals.get(li) {
+                    Some(Val::Sym(v)) => match smt::evaluate(*v, |_| None) {
+                        Some(k) => k,
+                        None => return Some(Val::Unknown),
+                    },
+                    _ => return Some(Val::Unknown),
+                }
+            }
+            _ => return None,
+        };
+        Some(match self.slice_elem(p.local, index) {
+            Some(v) => Val::Sym(v),
+            None => Val::Unknown,
+        })
     }
 
     fn get(&self, p: &Place) -> Val {
@@ -389,7 +462,44 @@ impl Env {
         while i < p.proj.len() {
             cur = match &p.proj[i] {
                 Proj::Field(f) => *self.fields.get(&(p.local, *f)).unwrap_or(&Val::Unknown),
-                Proj::Index(k) => *self.elems.get(&(p.local, *k)).unwrap_or(&Val::Unknown),
+                // A slice element. `elems` is the array-literal map, keyed by a
+                // concrete index; a slice's elements live under `slices` instead,
+                // read through the length. The two must not be confused, so a
+                // slice lookup is tried first and only for a local that *is* a
+                // slice.
+                Proj::Index(k) => match self.slices.get(&p.local) {
+                    Some(s) => match s.elems.get(k) {
+                        Some(v) => Val::Sym(*v),
+                        // Not read yet. `get` takes `&self` and so cannot create
+                        // the element; the operand path goes through
+                        // `read_slice_index`, which can, and does so before this
+                        // is reached. Answering `Unknown` here is the fallback
+                        // for a caller that did not.
+                        None => Val::Unknown,
+                    },
+                    None => *self.elems.get(&(p.local, *k)).unwrap_or(&Val::Unknown),
+                },
+                // `(*_1)[_2]` — a subscript that is a local. The element is
+                // looked up by the index's *value*: a constant index names one
+                // element, and a symbolic index names none the run can pin, so it
+                // reads `Unknown` rather than an arbitrary element. Reading an
+                // arbitrary element would make `xs[i]` a different value per
+                // read, which is a wrong proof waiting to happen.
+                Proj::IndexVar(li) => {
+                    let k = match self.locals.get(li) {
+                        Some(Val::Sym(v)) => smt::evaluate(*v, |_| None),
+                        _ => None,
+                    };
+                    match k {
+                        Some(k) => match self.slices.get(&p.local) {
+                            Some(s) => {
+                                s.elems.get(&k).map(|v| Val::Sym(*v)).unwrap_or(Val::Unknown)
+                            }
+                            None => *self.elems.get(&(p.local, k)).unwrap_or(&Val::Unknown),
+                        },
+                        None => Val::Unknown,
+                    }
+                }
                 Proj::Deref => {
                     // The frontend does not track aliasing, so a dereference is
                     // only meaningful when the pointee *is* the local: `_1` is the
@@ -584,6 +694,22 @@ struct Cut {
     text: String,
 }
 
+/// Symbolic inputs a contract names, handed to the executor so that the
+/// contract and the body read the *same* variables.
+///
+/// One struct rather than three parallel slices: the three kinds are always
+/// passed together, and bundling them keeps the executor's entry point from
+/// growing an argument per projection shape as more are modelled.
+#[derive(Default, Clone)]
+pub struct Seeds {
+    /// `(local, field index, variable)` for each struct field a contract names.
+    pub fields: Vec<(u32, u32, Var)>,
+    /// `(local, length variable)` for each slice argument.
+    pub lens: Vec<(u32, Var)>,
+    /// `(local, index, variable)` for each slice element a contract names.
+    pub elems: Vec<(u32, u64, Var)>,
+}
+
 /// Verify one function from a parsed program.
 ///
 /// `pre` is the declared precondition (or `None` for `true`); `post` is the
@@ -610,7 +736,7 @@ pub fn verify_fn<F>(
     pre: Option<Pred>,
     post: Option<F>,
     invariant: Option<&str>,
-    field_seeds: &[(u32, u32, Var)],
+    seeds: &Seeds,
 ) -> MirReport
 where
     F: Fn(Option<Var>, &[(u32, Var)]) -> Result<Pred, String>,
@@ -657,8 +783,30 @@ where
     // Struct fields the contract names. The contract's `c.lo` is bound to this
     // variable, and the body's `((*_1).0)` reads it from here, so the two are the
     // same symbolic input rather than two that merely look alike.
-    for &(local, field, v) in field_seeds {
+    for &(local, field, v) in &seeds.fields {
         env.fields.insert((local, field), Val::Sym(v));
+    }
+    // Slice lengths and elements the contract names. The contract's `xs.len()` and
+    // `xs[0]` and the body's `PtrMetadata(_1)` and `(*_1)[0]` must be one value,
+    // so the *same* variables are seeded here. An element the contract does not
+    // name is not seeded; the first body read creates it (see `slice_elem`), and
+    // a contract that names it later would then disagree — which is why
+    // `bind_slice_refs` runs over every contract text before the run, so a name a
+    // contract uses always has a binding here.
+    for &(local, len) in &seeds.lens {
+        let elem_w = match f.ty_of(local) {
+            Some(Ty::Ref(inner)) => match inner.as_ref() {
+                Ty::Slice(e) => e.width().unwrap_or(USIZE_WIDTH),
+                _ => USIZE_WIDTH,
+            },
+            _ => USIZE_WIDTH,
+        };
+        env.slices.insert(local, Slice { len, elem_w, elems: BTreeMap::new() });
+    }
+    for &(local, index, v) in &seeds.elems {
+        if let Some(s) = env.slices.get_mut(&local) {
+            s.elems.insert(index, v);
+        }
     }
 
     let start = match f.blocks.first() {
@@ -1148,7 +1296,7 @@ where
             // exactly when `path ∧ ¬c` is satisfiable. rustc prints the
             // overflow and divide-by-zero checks as `assert(!bit)`, so `negated`
             // flips which polarity is the failing one.
-            let c = operand(&st.env, cond);
+            let c = operand(&mut st.env, cond);
             let holds = match c {
                 Val::Bool(p) => p,
                 // A bit-vector condition is true when it is non-zero.
@@ -1178,7 +1326,7 @@ where
             advance(prog, next, *target, report, work);
         }
         Term::SwitchInt { discr, cases, otherwise } => {
-            let d = operand(&st.env, discr);
+            let d = operand(&mut st.env, discr);
             let arm = |k: u128, positive: bool| -> Option<Pred> {
                 match d {
                     Val::Bool(p) => Some(if (k != 0) == positive { p } else { smt::not(p) }),
@@ -1288,7 +1436,7 @@ where
             };
             let mut env = Env::new();
             for (i, a) in args.iter().enumerate() {
-                let v = operand(&st.env, a);
+                let v = operand(&mut st.env, a);
                 if let Some(&l) = callee_fn.arg_locals.get(i) {
                     env.locals.insert(l, v);
                 }
@@ -1334,9 +1482,16 @@ where
 }
 
 /// Resolve an operand to a symbolic value.
-fn operand(env: &Env, o: &Operand) -> Val {
+fn operand(env: &mut Env, o: &Operand) -> Val {
     match o {
-        Operand::Copy(p) | Operand::Move(p) => env.get(p),
+        Operand::Copy(p) | Operand::Move(p) => {
+            // A slice element is created on first read, so it goes through the
+            // mutable path before the ordinary one.
+            if let Some(v) = env.read_slice_index(p) {
+                return v;
+            }
+            env.get(p)
+        }
         Operand::Const(c) => match c {
             Const::UInt(v, ty) => match ty.as_ref().and_then(|t| t.width()) {
                 Some(1) => Val::Bool(smt::truth(*v == 1)),
@@ -1434,6 +1589,14 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
             Val::Agg
         }
         Rvalue::Ref(_) | Rvalue::Len(_) | Rvalue::Unknown(_) => Val::Unknown,
+        // `PtrMetadata(_1)` — for a `&[T]` this is the slice's length. Modelled
+        // only when the local is a slice the frontend bound a length for; any
+        // other pointer has metadata this model cannot express, and answering
+        // `Unknown` there is what keeps an invented length out of a proof.
+        Rvalue::PtrMetadata(p) => match env.slices.get(&p.local) {
+            Some(s) => Val::Sym(s.len),
+            None => Val::Unknown,
+        },
         Rvalue::Discriminant(p) => match env.discriminants.get(&p.local) {
             // The tag's width is the payload's, not the dump's `isize`. The
             // `switchInt` compares it against the small variant constants, so

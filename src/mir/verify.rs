@@ -174,7 +174,16 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     // Fields of struct-typed arguments, bound to their own symbolic inputs. The
     // same bindings are handed to the executor as seeds, so `c.lo` in a contract
     // and `((*_1).0)` in the body name one variable.
-    let fields = spec::field_env(f, &specs.structs);
+    let mut fields = spec::field_env(f, &specs.structs);
+    // Slice element references a contract names, bound before the rewrite runs so
+    // each `xs[k]` has a binding to rewrite to. Done here, once, rather than on
+    // demand, because the postcondition is evaluated inside a closure that cannot
+    // hold a `&mut`.
+    if let Some(c) = contract {
+        for text in c.requires.iter().chain(c.ensures.iter()).chain(c.invariants.iter()) {
+            fields.bind_slice_refs(text);
+        }
+    }
     let ret_signed = f.ret_ty.is_signed();
 
     // A loop invariant. The clause carries no loop label, so it can only be
@@ -303,7 +312,18 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         })
     };
 
-    let report = exec::verify_fn(prog, f, pre, post, invariant, &fields.seeds);
+    let report = exec::verify_fn(
+        prog,
+        f,
+        pre,
+        post,
+        invariant,
+        &exec::Seeds {
+            fields: fields.seeds.clone(),
+            lens: fields.len_seeds.clone(),
+            elems: fields.elem_seeds.clone(),
+        },
+    );
 
     // A definite failure outranks incompleteness: a counterexample is a result.
     // The polarity is per-kind, so this cannot just look for `Counterexample`:
