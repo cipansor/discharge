@@ -536,7 +536,7 @@ fn enum_layouts(specs: &Specs) -> BTreeMap<String, parse::EnumLayout> {
         .enums
         .iter()
         .map(|(name, def)| {
-            let variants = def.variants.iter().map(|(v, _)| v.clone()).collect();
+            let variants = def.variants.iter().map(|(v, _, d)| (v.clone(), *d)).collect();
             (name.clone(), parse::EnumLayout { variants })
         })
         .collect()

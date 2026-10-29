@@ -2891,28 +2891,35 @@ optional file argument, which is what made the measurement cheap.)
   the false contract is now a counterexample, not a shrug.
 * **`Rvalue::Discriminant` and `Downcast` for a real enum match — DONE.**
   A `match` on an enum lowers to `_2 = discriminant(_1); switchInt(move _2)`,
-  so the tag is a symbolic input whose *domain is the enum's arity*. That bound
-  is a fact about the type, not an assumption about the caller, so the run may
-  assume it -- and it is what makes the `otherwise` arm (lowered to
-  `unreachable` for an exhaustive `match`) genuinely unreachable instead of a
-  spurious panic. Three pieces make it work:
-  - `spec::EnumDef` / `EnumLayout` read the variants in **declaration order**
-    from the same source pass as the contracts, so a `(base as Variant)`
-    downcast's index and a contract's `Mode::Run` constant agree by
-    construction rather than by convention. A one-line body
+  so the tag is a symbolic input whose *domain is the set of variant
+  discriminants*. That bound is a fact about the type, not an assumption about
+  the caller, so the run may assume it -- and it is what makes the `otherwise`
+  arm (lowered to `unreachable` for an exhaustive `match`) genuinely unreachable
+  instead of a spurious panic. Three pieces make it work:
+  - `spec::EnumDef` / `EnumLayout` carry each variant's **discriminant** from the
+    same source pass as the contracts, so a `(base as Variant)` downcast's tag
+    and a contract's `Mode::Run` constant agree by construction rather than by
+    convention. The discriminant is rustc's value, not the vector position: an
+    explicit `B = 3` renumbers `C` to `4`, and numbering by position would put a
+    contract naming `Gap::C` on the wrong tag. A one-line body
     (`pub enum E { A, B }`) and a multi-line one are read by the same
     top-level-comma split, so the numbering cannot drift between them.
   - `FieldEnv::bind_enum` binds the argument's own name to the tag, so a
     contract writes `m == Mode::Run`; each variant's first payload is bound
-    separately, so `m.Data` names the same variable the body's
-    `((_1 as Data).0)` downcast reads.
-  - `Seeds::tags` seeds the tag and `Seeds::payload_seeds` the payloads, and the
-    run conjoins `tag < arity` onto the initial path.
+    separately (keyed by discriminant), so `m.Data` names the same variable the
+    body's `((_1 as Data).0)` downcast reads.
+  - `Seeds::tag_seeds` seeds the tag with its discriminants and
+    `Seeds::payload_seeds` the payloads, and the run conjoins the *disjunction of
+    the discriminants* onto the initial path -- `tag < count` is only the same
+    domain when the numbering is `0..count`, which an explicit discriminant
+    breaks.
   The tripwires pin the model rather than its presence: `enum_match_tripwire`
   claims every arm returns `2` and must be refuted with the tag in the witness
-  (a constant tag would prove it), and `enum_payload_tripwire` names a *unit*
-  variant's payload, which is refused rather than bound to a fabricated value.
-  A variant with no payload is refused with a message naming the variant.
+  (a constant tag would prove it), `enum_explicit_discriminant_tripwire` claims
+  the `B` arm ran for `Gap::C` and must be refuted (a positional reader proves
+  it), and `enum_payload_tripwire` names a *unit* variant's payload, which is
+  refused rather than bound to a fabricated value. A variant with no payload is
+  refused with a message naming the variant.
 * **A locally constructed variant has a *known* tag — DONE.** `let m = Mode::Idle;`
   lowers to `_1 = Mode::Idle;`, a bare path constant with **no `const ` prefix**,
   which the rvalue parser did not recognise: it fell through to `Rvalue::Unknown`
@@ -2921,15 +2928,36 @@ optional file argument, which is what made the measurement cheap.)
   it. `parse_rvalue` recognises a bare `Enum::Variant` path as a constant, and
   `eval_rvalue::Use` resolves it against the program's enum layouts -- the same
   table a `match`'s downcast reads -- writing a *constant* tag rather than
-  seeding a symbolic one. The tag's width is the enum's arity, taken from the
-  destination's type, not the dump's `isize`: `Env::tag_widths` records it so
-  `discriminant` reads the tag back at the width the contract's comparison was
-  checked at. A payload construction (`Msg::Data(9)`) is `Rvalue::Variant`: the
-  tag is the declaration index and the operands are written as the variant's
-  fields, so the match's `((_1 as Data).0)` downcast reads what the construction
-  wrote. `enum_constructed_locally` verifies and
+  seeding a symbolic one. The tag's width is the enum's *discriminants'*, taken
+  from the destination's type, not the dump's `isize`: `Env::tag_widths` records
+  it so `discriminant` reads the tag back at the width the contract's comparison
+  was checked at. A payload construction (`Msg::Data(9)`) is `Rvalue::Variant`:
+  the tag is the variant's discriminant and the operands are written as the
+  variant's fields, so the match's `((_1 as Data).0)` downcast reads what the
+  construction wrote. `enum_constructed_locally` verifies and
   `enum_constructed_locally_tripwire` is refuted; the payload case
   (`enum_constructed_payload_reads_through`) verifies.
+* **A variant's tag is rustc's *discriminant*, not its position — DONE.** The
+  reader used to number variants by their position in the declaration
+  (`EnumDef::index_of` returned the vector index, the tag's width was the
+  variant *count*'s, and payloads were keyed by position). An explicit
+  discriminant breaks all three: `pub enum Gap { A, B = 3, C }` gives `C` the
+  discriminant `4`, so a positional reader calls it `1`, puts a contract naming
+  `Gap::C` on the wrong tag, and -- because the `match` arm constants come from
+  rustc -- lets the contract and the arm disagree, which is a **false proof**
+  (`enum_explicit_discriminant_tripwire` was *verified* before the fix). The
+  data model now carries `(name, payload, discriminant)` per variant,
+  `parse_discriminant_literal` reads a decimal/hex/binary/octal literal (an
+  unreadable one refuses the *whole* layout rather than guessing), `tag_width`
+  is the largest discriminant's width, the tag's assumed domain is the
+  *disjunction of the discriminants* rather than `tag < count`, and payloads are
+  keyed by discriminant. Two related built-in hazards were closed at the same
+  time: a *declared* layout now wins over the built-in `Option`/`Result`
+  numbering for a qualified name (`Shadow::Some` is tag `0` for a user
+  `enum Shadow { Some, None }`, not `Option`'s `1` --
+  `enum_user_variant_not_option_constructed_tripwire` was verified before this
+  fix), and a qualified name whose enum is unknown is refused rather than
+  answered by another layout that happens to share the variant name.
 * **`// MIR FOR CTFE` is a copy, not a second function — DONE.** Building a
   tuple-variant constructor in a `let` (`Msg::Data(9)`) makes rustc print a
   *second*, `// MIR FOR CTFE`-marked body for the constructor. It is a copy of an
@@ -3119,3 +3147,107 @@ The slice half of Stage 3 is *not* done, and the reason is recorded in the roadm
 above rather than left as a silent absence: a slice's domain is its length
 *variable*, so both `index_guards` and the executor's `index_chain` want a term
 threaded where they now carry a `u64` type constant.
+
+## Stage 3 — enum discriminants are rustc's values, not declaration positions
+
+The enum model numbered variants by their position in the declaration. That is
+right for the common case and wrong the moment the source gives an explicit
+discriminant, and the wrongness is a *false proof* rather than a refusal, because
+the `match` arm constants come from rustc while the contract's variant constant
+came from this reader.
+
+**The bug, measured.** `pub enum Gap { A, B = 3, C }` gives `C` the discriminant
+`4`. The reader dropped the `B = 3` line (it matched no known shape), so its
+layout became `[A, C]` with `C` at position `1`. A contract `requires: g ==
+Gap::C` then pinned the tag to `1`, the body's `switchInt` compared against the
+real constants (`0`, `3`, `4`), and the contract landed on the `B` arm. The
+tripwire `enum_explicit_discriminant_tripwire` — which claims the `B` arm ran —
+was **verified**, i.e. a false contract proved. Before the fix the corpus read
+`decided 46 of 74` with both new tests failing; after, `49 of 78` with both
+refuted.
+
+**Three places carried the position, and all three moved to the discriminant.**
+`EnumDef.variants` is now `(name, payload, discriminant)` and `index_of` returns
+the stored discriminant; `tag_width` is the largest discriminant's width (three
+bits for `4`, not the two a count of three gives); and the tag's assumed domain
+is the *disjunction of the discriminants* rather than `tag < count` — because an
+assumed bound that is *false* for a real input is the unsound direction, it can
+make a proof vacuous. Payload seeds are keyed by discriminant too, matching what
+a `Downcast` projection carries.
+
+**An unreadable discriminant refuses the whole layout.** Only a literal is read
+(decimal, `0x`/`0b`/`0o`, optional type suffix). `B = 1 << 4` is not evaluated:
+dropping the variant would shift every later discriminant and guessing one would
+put a contract on the wrong tag, so the enum is dropped from the map entirely and
+a contract naming any of its variants becomes a refusal. The literal reader
+requires the *whole* remainder to be digits, so `1 << 4` is refused rather than
+silently read as `1`.
+
+**Two built-in hazards closed at the same time.** A qualified name
+(`Shadow::Some`) now resolves against the *declared* layout first, so a user
+`enum Shadow { Some, None }` is not mistaken for `Option` — pre-fix,
+`enum_user_variant_not_option_constructed_tripwire` was **verified** because the
+built-in `Option` numbering put `Some` on tag `1`. And a qualified name whose
+qualifier is not a declared enum *and* not one of the two built-in enums
+(`Option`, `Result`) is refused rather than answered by another layout that
+happens to share the variant name. (The built-in case is the follow-up in the
+next section: a qualified `Option::<u8>::Some` must still resolve, and a
+declared layout must still win over it.)
+
+**Evidence.** Four corpus entries: `enum_explicit_discriminant_selects_by_tag`
+(verifies) with `enum_explicit_discriminant_tripwire` (refuted), and
+`enum_user_variant_not_option` / `..._constructed` (verify) with their two
+tripwires (refuted). Eight unit tests pin the parser and the layout reader with no
+nightly needed, plus two integration tests pinning the earlier array-spelling
+work. Coverage went from **45/69 to 49/78**, the test count from 470 to **480**.
+
+## Stage 3 follow-up — three reader bugs a review found after the discriminant landed
+
+The discriminant work above fixed the *value* a variant has. Three defects in the
+same reader survived it, and all three fail in the same direction: a function
+that should have been checked is instead dropped from the check set or refused,
+and the user is never told. They were found by review, then reproduced against the
+real code before anything was changed.
+
+**1. A refused one-line enum swallowed everything after it.** `enum_head` returns
+the parsed head of an `enum` line. For a one-line body whose discriminant is
+unreadable (`pub enum E { A, B = 1 << 4 }`) it returned "a multi-line body
+follows" — but the closing brace was already on that line. The caller then opened
+an enum *cursor*, and every following line, including `///` contracts and the `fn`
+items they belong to, was consumed as enum contents. Those functions had no
+contract at all, so they were neither verified nor reported as skipped: they
+silently left the check set, which is the worst failure mode a verifier has. The
+head is now a three-way enum — `Inline(variants)`, `MultiLine`, `Refused` — and
+`Refused` drops the layout *without* opening a cursor. The multi-line path already
+closed its cursor at the brace; the one-line path now does too.
+
+**2. A qualified standard construction resolved to nothing.** rustc prints a
+standard construction with its generic arguments: `let o: Option<u8> =
+Option::<u8>::Some(9)` lowers to `_1 = Option::<u8>::Some(const 9_u8)`. The
+qualifier branch split the name on `::`, so the segment before the variant was
+`u8` — the generic argument, not the enum — and `enums.get("u8")` found no layout.
+The construction became an unmodelled read and the `match` an *unmodelled switch
+discriminant*, losing a shape the unqualified spelling (`Some(9)`) handles. The
+fix strips balanced `<…>` generic arguments before splitting, so the qualifier is
+`Option`. Since no source file declares `Option` or `Result`, those two qualifiers
+now resolve to the fixed numbering (`Some`/`Err` = 1, `None`/`Ok` = 0), but only
+*after* a declared layout has had its chance — so a user `enum E { Some, None }`
+still wins over `Option`'s numbering.
+
+**3. A trailing line comment erased the whole enum layout.** `B = 3, // special`
+puts the comma *before* the comment. The variant reader trimmed a trailing comma
+off the raw line, but the line now ends in the comment, so no comma was trimmed
+and `3, // special` went to the discriminant reader, which rejected it — and a
+rejected discriminant drops the *entire* layout. Every contract naming a variant
+of that enum then became a refusal. The comment is not part of the variant, so it
+is stripped first, with string and character literals tracked so a `//` inside one
+is not mistaken for a comment.
+
+**Evidence.** Four corpus entries: `option_qualified_some_payload` and
+`enum_trailing_comment_keeps_the_layout` (verify) with their tripwires (refuted),
+plus six unit tests and two integration tests. Coverage went from **49/78 to
+51/82**, the test count from 480 to **488**. Each fix was checked for teeth by
+reverting it and watching its test fail: without fix 1 the contract after a
+refused enum is gone (`by_fn` is empty); without fix 2 the qualified construction
+is `incomplete (1 reason) - unmodelled switch discriminant`; without fix 3 the
+layout is dropped and the contract is `skipped: unknown name`.

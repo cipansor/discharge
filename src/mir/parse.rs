@@ -150,12 +150,16 @@ pub enum Proj {
     /// An enum downcast, e.g. the `(_2 as Some)` in `((_2 as Some).0)`.
     ///
     /// The payload of a modelled `Option`-returning call lives here, under the
-    /// *variant index* (`Some` is 1). Keeping it separate from `Field` is what
-    /// stops a payload from colliding with a tuple field of the same enum local,
-    /// and it is what lets a read be gated on the discriminant: reading `.0` on a
-    /// path where the enum is `None` must not hand back a payload that does not
-    /// exist.
-    Downcast(u32),
+    /// variant's *discriminant* (`Some` is 1). Keeping it separate from `Field` is
+    /// what stops a payload from colliding with a tuple field of the same enum
+    /// local, and it is what lets a read be gated on the discriminant: reading `.0`
+    /// on a path where the enum is `None` must not hand back a payload that does
+    /// not exist.
+    ///
+    /// A discriminant, not a position: a variant after an explicit discriminant
+    /// (`B = 3`) has a value that is not its index, and the arm constants and
+    /// payload keys all have to agree on the same number.
+    Downcast(u64),
     /// A pointer dereference, printed as `(*_1)`.
     ///
     /// This frontend does not track aliasing, so a dereference of a `&T` argument
@@ -291,7 +295,7 @@ pub enum Rvalue {
     ///
     /// Kept apart from [`Rvalue::Aggregate`] because the operands are the
     /// *payloads* of one variant, not the elements of a sequence: the tag is the
-    /// variant's declaration index and the operands are written as the variant's
+    /// variant's discriminant and the operands are written as the variant's
     /// fields. A model that stored them as elements would leave the match's
     /// downcast read looking in a store the construction never wrote.
     Variant(String, Vec<Operand>),
@@ -518,14 +522,22 @@ pub struct MirProgram {
 /// reach for the contract reader.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EnumLayout {
-    /// Variant names in declaration order; the position is the discriminant.
-    pub variants: Vec<String>,
+    /// `(name, discriminant)` in declaration order. The discriminant is rustc's
+    /// value, which is the position only when no variant gives an explicit one
+    /// (`B = 3` makes every later variant's value differ from its position).
+    pub variants: Vec<(String, u64)>,
 }
 
 impl EnumLayout {
     /// The discriminant for a variant name.
-    pub fn index_of(&self, name: &str) -> Option<u32> {
-        self.variants.iter().position(|n| n == name).map(|i| i as u32)
+    pub fn index_of(&self, name: &str) -> Option<u64> {
+        self.variants.iter().find(|(n, _)| n == name).map(|(_, d)| *d)
+    }
+
+    /// The width that can hold every discriminant, and no more.
+    pub fn tag_width(&self) -> u8 {
+        let max = self.variants.iter().map(|(_, d)| *d).max().unwrap_or(0);
+        (64 - max.leading_zeros()).max(1) as u8
     }
 }
 
@@ -672,38 +684,67 @@ fn strip_copy(s: &str) -> &str {
     t.strip_prefix("copy ").or_else(|| t.strip_prefix("move ")).unwrap_or(t)
 }
 
-/// The discriminant rustc gives a variant of a two-variant enum.
+/// The discriminant rustc gives a variant.
 ///
-/// `Option` is laid out as `None = 0, Some = 1` and `Result` as `Ok = 0,
-/// Err = 1`, in declaration order. Only those two shapes are modelled, so
-/// anything else returns `None` and the place stays unparsed -- which surfaces
-/// as an unmodelled read rather than a wrong tag.
-pub fn variant_index(name: &str, enums: &BTreeMap<String, EnumLayout>) -> Option<u32> {
-    let short = name.rsplit("::").next().unwrap_or(name);
+/// A *declared* layout always answers for a qualified name: `Mode::Idle` is
+/// resolved against the layout keyed by `Mode`, so a user enum whose variants are
+/// named `Some`/`None` is not mistaken for `Option`. `Option` and `Result` have a
+/// fixed, well-known numbering that no source file declares, so an *unqualified*
+/// `Some`/`None`/`Ok`/`Err` resolves without a layout. Anything else returns
+/// `None` and the place stays unparsed -- which surfaces as an unmodelled read
+/// rather than a wrong tag.
+pub fn variant_index(name: &str, enums: &BTreeMap<String, EnumLayout>) -> Option<u64> {
+    // Generic arguments are part of how a construction is *spelled*
+    // (`Option::<u8>::Some`), not part of which variant it is. Dropping them
+    // before splitting keeps the qualifier a plain path segment; without it the
+    // `::` inside `::<u8>` would make `u8` look like the qualifier and the
+    // variant would resolve to nothing.
+    let stripped = strip_generics(name);
+    let segs: Vec<&str> = stripped.split("::").filter(|s| !s.is_empty()).collect();
+    let short = segs.last().copied().unwrap_or(name);
+    // A qualified name prints the enum before the variant (`Mode::Idle`); the enum
+    // is what the layout is keyed by. A *declared* layout always wins, even when
+    // the variant is named `Some` or `None`: a user enum with those names is not
+    // `Option`, and resolving it to `Option`'s numbering would take the wrong arm.
+    if let Some(qual) = segs.len().checked_sub(2).map(|i| segs[i]) {
+        if let Some(l) = enums.get(qual) {
+            return l.index_of(short);
+        }
+        // A *standard* enum has a fixed, well-known numbering that no source file
+        // declares, so a qualified spelling of it (`Option::<u8>::Some`) has to
+        // resolve the same as the unqualified one. Only these two are recognised;
+        // any other qualifier naming an enum this reader does not know is refused,
+        // because searching other layouts by variant name would borrow an
+        // unrelated enum's numbering.
+        return match qual {
+            "Option" => match short {
+                "None" => Some(0),
+                "Some" => Some(1),
+                _ => None,
+            },
+            "Result" => match short {
+                "Ok" => Some(0),
+                "Err" => Some(1),
+                _ => None,
+            },
+            _ => None,
+        };
+    }
     // `Option` and `Result` have a fixed, well-known numbering that no source file
-    // declares, so they resolve without a layout. Every other enum's numbering is
-    // declaration order, which only the source has.
+    // declares, so an *unqualified* `Some`/`None`/`Ok`/`Err` resolves without a
+    // layout. A declared layout with those variant names has already been given the
+    // chance to answer above, so this default cannot shadow it.
     match short {
         "None" | "Ok" => return Some(0),
         "Some" | "Err" => return Some(1),
         _ => {}
     }
-    // A qualified name prints the enum before the variant (`Mode::Idle`); the enum
-    // is what the layout is keyed by. A bare variant name is looked up in every
-    // layout, which is ambiguous only if two enums share a variant name -- and
-    // then the qualified form, which rustc prints, resolves it.
-    if let Some((qual, _)) = name.rsplit_once("::") {
-        if let Some(l) = enums.get(qual.rsplit("::").next().unwrap_or(qual)) {
-            if let Some(i) = l.index_of(short) {
-                return Some(i);
-            }
-        }
-    }
+    // A bare variant name is looked up in every layout. Two layouts claiming the
+    // same variant name is a genuine ambiguity, and refusing is the only answer
+    // that cannot pick the wrong arm.
     let mut found = None;
     for l in enums.values() {
         if let Some(i) = l.index_of(short) {
-            // Two layouts claiming the same variant name is a genuine ambiguity;
-            // refusing is the only answer that cannot pick the wrong arm.
             if found.is_some() {
                 return None;
             }
@@ -711,6 +752,28 @@ pub fn variant_index(name: &str, enums: &BTreeMap<String, EnumLayout>) -> Option
         }
     }
     found
+}
+
+/// Drop balanced `<…>` generic arguments from a path, so `Option::<u8>::Some`
+/// reads as `Option::::Some` (empty segments are filtered by the caller).
+fn strip_generics(s: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0i32;
+    for c in s.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' => {
+                if depth > 0 {
+                    depth -= 1;
+                } else {
+                    out.push(c);
+                }
+            }
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Parse a place like `_3.1` or `_2` or `_1.0[0]`.
@@ -1686,6 +1749,76 @@ fn add(_1: u32, _2: u32) -> u32 {
             None,
             "`k` aliases `_2`, which the body writes, so it must not resolve"
         );
+    }
+
+    fn layout(variants: &[(&str, u64)]) -> BTreeMap<String, EnumLayout> {
+        let mut m = BTreeMap::new();
+        m.insert(
+            "E".to_string(),
+            EnumLayout { variants: variants.iter().map(|(n, d)| (n.to_string(), *d)).collect() },
+        );
+        m
+    }
+
+    /// An explicit discriminant is the variant's tag, not its position.
+    #[test]
+    fn a_variant_after_an_explicit_discriminant_keeps_its_value() {
+        let enums = layout(&[("A", 0), ("B", 3), ("C", 4)]);
+        assert_eq!(variant_index("E::C", &enums), Some(4));
+        assert_eq!(variant_index("E::B", &enums), Some(3));
+        assert_eq!(variant_index("E::A", &enums), Some(0));
+    }
+
+    /// A declared layout wins over the built-in `Option`/`Result` numbering.
+    ///
+    /// A user enum with a variant named `None` or `Some` is not `Option`; taking
+    /// the built-in tag for a qualified name would select the wrong arm.
+    #[test]
+    fn a_declared_variant_shadows_the_option_default() {
+        let enums = layout(&[("None", 0), ("Some", 5)]);
+        assert_eq!(variant_index("E::Some", &enums), Some(5));
+        // An *unqualified* `Some` still resolves to the built-in numbering, since
+        // it names no enum.
+        assert_eq!(variant_index("Some", &enums), Some(1));
+    }
+
+    /// A qualified name whose enum is unknown is refused, not answered by another
+    /// layout that happens to share the variant name.
+    #[test]
+    fn an_unknown_qualifier_is_refused() {
+        let enums = layout(&[("A", 0), ("B", 3), ("C", 4)]);
+        assert_eq!(variant_index("Other::C", &enums), None);
+    }
+
+    /// A *qualified* spelling of `Option`/`Result` resolves to the same numbering
+    /// as the unqualified one.
+    ///
+    /// rustc prints a standard construction with its generic arguments:
+    /// `Option::<u8>::Some(9)` is `_1 = Option::<u8>::Some(const 9_u8)`, and the
+    /// match's `switchInt` compares the tag against `Option`'s numbering. No
+    /// source file declares a layout for `Option`, so before this the qualifier
+    /// branch found no layout and refused the construction -- losing the tag and
+    /// the payload of a shape the unqualified form handles. The `::<u8>` is part
+    /// of the spelling, not the variant, so it is dropped before splitting.
+    #[test]
+    fn a_qualified_standard_variant_resolves() {
+        let enums = layout(&[("A", 0), ("B", 3), ("C", 4)]);
+        assert_eq!(variant_index("Option::<u8>::Some", &enums), Some(1));
+        assert_eq!(variant_index("Option::<u8>::None", &enums), Some(0));
+        assert_eq!(variant_index("Result::<u8, u8>::Ok", &enums), Some(0));
+        assert_eq!(variant_index("Result::<u8, u8>::Err", &enums), Some(1));
+        // The unqualified spellings still resolve to the same values.
+        assert_eq!(variant_index("Some", &enums), Some(1));
+        assert_eq!(variant_index("Ok", &enums), Some(0));
+    }
+
+    /// A *declared* enum still wins over the standard numbering when the spelling
+    /// carries generics, so the qualifier branch cannot mistake a user enum for
+    /// `Option`.
+    #[test]
+    fn a_declared_enum_still_wins_over_the_standard_numbering() {
+        let enums = layout(&[("Some", 0), ("None", 5)]);
+        assert_eq!(variant_index("E::Some", &enums), Some(0));
     }
 }
 

@@ -63,7 +63,7 @@ pub const MUL_MAX_WIDTH: u8 = 8;
 
 /// The discriminant of the `Some` variant, where a modelled `Option` payload
 /// lives. rustc numbers `None` 0 and `Some` 1.
-pub const SOME_TAG: u32 = 1;
+pub const SOME_TAG: u64 = 1;
 
 /// What a modelled intrinsic computes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

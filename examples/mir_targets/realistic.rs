@@ -330,6 +330,14 @@ pub enum Mode { Off, Idle, Run }
 /// payload to read, which is what the payload tripwire relies on.
 pub enum Msg { Ping, Data(u8), Stop }
 
+/// An enum with an *explicit* discriminant, for the numbering shapes.
+///
+/// `B = 3` makes rustc assign `C` the discriminant `4`, not the position `1` that
+/// a reader numbering by declaration order would give it. A contract naming
+/// `Gap::C` must mean tag `4`, and a `match` arm on `Gap::C` compares against `4`;
+/// numbering by position would put the contract and the arm in disagreement.
+pub enum Gap { A, B = 3, C }
+
 /// A struct with *signed* fields, for the signed-comparison shapes.
 ///
 /// `Config`'s fields are `u8`, so a contract that needs `i8::MIN` cannot use it:
@@ -925,6 +933,47 @@ pub fn enum_match_tripwire(m: Mode) -> u8 {
     }
 }
 
+/// A variant after an *explicit* discriminant takes rustc's value, not its
+/// position.
+///
+/// `Gap` is `A, B = 3, C`, so rustc numbers `A`=0, `B`=3, `C`=4. A reader that
+/// numbered by declaration order would call `C` the discriminant `1`, and a
+/// contract saying `g == Gap::C` would then pin the tag to `1` -- the value of a
+/// different variant. `match g { Gap::C => 7, _ => 0 }` compiles to
+/// `switchInt(discriminant(g))` with the arm constant `4`, so the contract and
+/// the arm only agree if the reader uses `4`.
+///
+/// The body returns `7` exactly when the tag is `4`, so the contract holds for
+/// the real numbering and would fail for a positional one.
+/// requires: g == Gap::C
+/// ensures: ret == 2
+pub fn enum_explicit_discriminant_selects_by_tag(g: Gap) -> u8 {
+    match g {
+        Gap::A => 0,
+        Gap::B => 1,
+        Gap::C => 2,
+    }
+}
+
+/// The tripwire for explicit discriminants: the *positional* value must not be
+/// what `Gap::C` means.
+///
+/// The same body, but the contract claims the return is `1` -- the `B` arm's
+/// value. Under rustc's numbering `g == Gap::C` means tag `4`, which takes the
+/// `C` arm and returns `2`, so the contract is false for every input and must
+/// FAIL. A positional reader would call `Gap::C` the tag `1`, truncate the arm
+/// constants to the arity's width, and land on the `B` arm -- proving this false
+/// contract. Refuting it is the evidence the discriminant is rustc's value.
+/// requires: g == Gap::C
+/// ensures: ret == 1
+pub fn enum_explicit_discriminant_tripwire(g: Gap) -> u8 {
+    match g {
+        Gap::A => 0,
+        Gap::B => 1,
+        Gap::C => 2,
+    }
+}
+
 /// A variant *payload* is a symbolic input, read through the downcast.
 ///
 /// `Msg::Data(x)` lowers to `_3 = copy ((_1 as Data).0)`, so the payload is read
@@ -1004,5 +1053,133 @@ pub fn enum_constructed_payload_reads_through() -> u8 {
         Msg::Ping => 0,
         Msg::Data(x) => x,
         Msg::Stop => 255,
+    }
+}
+
+/// A user enum whose variant names collide with `Option`'s.
+///
+/// `Shadow` is `Some, None` -- but here they are *this* enum's variants, not
+/// `Option`'s, and `Shadow::Some` is tag `0`. A reader that resolved a variant
+/// name to the built-in `Option` numbering before consulting the declared layout
+/// would read `Shadow::Some` as `Option`'s `Some`, which is tag `1`, and the
+/// contract and the `match` arm would then disagree about which variant `s` is.
+pub enum Shadow { Some, None }
+
+/// The contract names `Shadow::Some`, which is tag `0` for this enum.
+/// requires: s == Shadow::Some
+/// ensures: ret == 0
+pub fn enum_user_variant_not_option(s: Shadow) -> u8 {
+    match s {
+        Shadow::Some => 0,
+        Shadow::None => 1,
+    }
+}
+
+/// The tripwire: `Option`'s numbering for `Some` is `1`, so a reader that used it
+/// would pin the tag to `1` -- the `None` arm -- and prove this false contract.
+/// requires: s == Shadow::Some
+/// ensures: ret == 1
+pub fn enum_user_variant_not_option_tripwire(s: Shadow) -> u8 {
+    match s {
+        Shadow::Some => 0,
+        Shadow::None => 1,
+    }
+}
+
+/// The construction path for the same collision: `let s = Shadow::Some;`.
+///
+/// A local construction resolves the variant name through the same table a
+/// contract does. `Shadow::Some` is tag `0` here, so the `Some` arm runs and the
+/// return is `0`. A reader that took the built-in `Option` numbering for the
+/// qualified name would build the tag `1` -- the `None` arm -- and the run would
+/// report `1` instead of `0`.
+/// requires: true
+/// ensures: ret == 0
+pub fn enum_user_variant_not_option_constructed() -> u8 {
+    let s = Shadow::Some;
+    match s {
+        Shadow::Some => 0,
+        Shadow::None => 1,
+    }
+}
+
+/// The tripwire for the constructed collision: `ret == 1` is what the built-in
+/// `Option` numbering produces, and it is false for every input.
+/// requires: true
+/// ensures: ret == 1
+pub fn enum_user_variant_not_option_constructed_tripwire() -> u8 {
+    let s = Shadow::Some;
+    match s {
+        Shadow::Some => 0,
+        Shadow::None => 1,
+    }
+}
+
+/// A *qualified* standard construction resolves to the same tag as the
+/// unqualified one.
+///
+/// rustc prints a standard construction with its generic arguments:
+/// `let o: Option<u8> = Option::<u8>::Some(9);` lowers to
+/// `_1 = Option::<u8>::Some(const 9_u8); _2 = discriminant(_1)` with
+/// `switchInt(move _2) -> [0: …, 1: …]`. No source file declares a layout for
+/// `Option`, so a reader that resolves a qualified name only through a declared
+/// layout finds none and refuses the construction -- losing a shape the
+/// unqualified spelling handles. The `::<u8>` is part of the spelling, not the
+/// variant, so it is dropped before the qualifier is read.
+/// requires: true
+/// ensures: ret == 9
+pub fn option_qualified_some_payload() -> u8 {
+    let o: Option<u8> = Option::<u8>::Some(9);
+    match o {
+        Option::Some(v) => v,
+        Option::None => 0,
+    }
+}
+
+/// The tripwire for the qualified standard construction: `None` is tag `0` and
+/// takes the other arm, so the payload `9` is never returned.
+/// requires: true
+/// ensures: ret == 0
+pub fn option_qualified_some_payload_tripwire() -> u8 {
+    let o: Option<u8> = Option::<u8>::Some(9);
+    match o {
+        Option::Some(v) => v,
+        Option::None => 0,
+    }
+}
+
+/// An enum whose variants carry trailing line comments.
+///
+/// `B = 3, // special` puts the comma *before* the comment, so a reader that
+/// trims a trailing comma off the raw line no longer sees a comma at all and
+/// hands `3, // special` to the discriminant parser, which rejects it. The whole
+/// layout is then dropped and a contract naming any variant is refused. The
+/// comment is not part of the variant, so stripping it first leaves `B = 3,` and
+/// the layout is read.
+pub enum Commented {
+    A, // first
+    B = 3, // special
+    C,
+}
+
+/// The contract names `Commented::C`, which is tag `4` (it follows `B = 3`).
+/// requires: c == Commented::C
+/// ensures: ret == 2
+pub fn enum_trailing_comment_keeps_the_layout(c: Commented) -> u8 {
+    match c {
+        Commented::A => 0,
+        Commented::B => 1,
+        Commented::C => 2,
+    }
+}
+
+/// The tripwire: `Commented::C` is not the `B` arm, so `ret == 1` is false.
+/// requires: c == Commented::C
+/// ensures: ret == 1
+pub fn enum_trailing_comment_tripwire(c: Commented) -> u8 {
+    match c {
+        Commented::A => 0,
+        Commented::B => 1,
+        Commented::C => 2,
     }
 }

@@ -1197,6 +1197,9 @@ fn stage_two_rvalues_are_modelled_and_their_tripwires_refuted() {
         "enum_payload_reads_through",
         "enum_constructed_locally",
         "enum_constructed_payload_reads_through",
+        "enum_explicit_discriminant_selects_by_tag",
+        "enum_user_variant_not_option",
+        "enum_user_variant_not_option_constructed",
     ];
     let refuted = [
         // Written in reverse order; a positional-by-write-order model proves it.
@@ -1209,6 +1212,13 @@ fn stage_two_rvalues_are_modelled_and_their_tripwires_refuted() {
         // that resolved the variant to the wrong index (or to a symbolic tag)
         // would prove it.
         "enum_constructed_locally_tripwire",
+        // Claims the `B` arm ran for `Gap::C`, whose real tag is `4`; a reader
+        // numbering variants by position would call it `1` and prove this.
+        "enum_explicit_discriminant_tripwire",
+        // Claims the `None` arm ran for `Shadow::Some`, whose real tag is `0`;
+        // taking `Option`'s numbering for the qualified name proves this.
+        "enum_user_variant_not_option_tripwire",
+        "enum_user_variant_not_option_constructed_tripwire",
     ];
     let Some(report) = verify_realistic(&verified) else { return };
     for name in verified {
@@ -1686,6 +1696,51 @@ fn a_shadowed_alias_is_refused() {
         ),
         other => panic!("`array_shadowed_alias_refused` must be skipped, got: {other}"),
     }
+}
+
+/// A *qualified* standard construction (`Option::<u8>::Some`) resolves.
+///
+/// rustc prints a standard construction with its generic arguments, so the
+/// qualifier is `Option`, not `u8`. A reader that only consults declared layouts
+/// for a qualified name finds none for `Option` and refuses the construction,
+/// losing a shape the unqualified spelling handles. The true contract must
+/// verify and the false one must be refuted, which only happens if the tag and
+/// the payload are both read.
+#[test]
+fn a_qualified_standard_construction_resolves() {
+    let Some(report) = verify_realistic(&[
+        "option_qualified_some_payload",
+        "option_qualified_some_payload_tripwire",
+    ]) else {
+        return;
+    };
+    let o = outcome(&report, "option_qualified_some_payload");
+    assert!(o.is_verified(), "`option_qualified_some_payload` must verify, got: {o}");
+    let t = outcome(&report, "option_qualified_some_payload_tripwire");
+    assert!(!t.is_verified(), "the qualified-construction tripwire must be refuted, got: {t}");
+}
+
+/// A trailing line comment on a variant line does not erase the enum layout.
+///
+/// `B = 3, // special` keeps the comma *before* the comment, so the reader that
+/// trims a trailing comma from the raw line no longer finds one, rejects the
+/// discriminant, and drops the whole layout -- taking every contract that names
+/// a variant with it. The true contract must verify and the tripwire refute.
+#[test]
+fn a_trailing_comment_on_a_variant_keeps_the_layout() {
+    let Some(report) = verify_realistic(&[
+        "enum_trailing_comment_keeps_the_layout",
+        "enum_trailing_comment_tripwire",
+    ]) else {
+        return;
+    };
+    let o = outcome(&report, "enum_trailing_comment_keeps_the_layout");
+    assert!(
+        o.is_verified(),
+        "`enum_trailing_comment_keeps_the_layout` must verify, got: {o}"
+    );
+    let t = outcome(&report, "enum_trailing_comment_tripwire");
+    assert!(!t.is_verified(), "the trailing-comment tripwire must be refuted, got: {t}");
 }
 
 /// A *slice* subscripted symbolically is still refused.

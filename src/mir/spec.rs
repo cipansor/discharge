@@ -123,33 +123,59 @@ pub struct Specs {
 
 /// An enum's variants, in declaration order.
 ///
-/// The index in this vector *is* the discriminant, which is what makes the
-/// layout useful: `variant 0` is the first variant written, and rustc numbers
-/// them the same way unless the source gives explicit discriminants (which this
-/// reader does not model, and which a contract naming a variant then refuses).
+/// The *discriminant* is stored per variant, not taken from the vector position.
+/// rustc numbers variants by declaration order *unless* the source gives an
+/// explicit value (`B = 3`), and then a later variant's discriminant is neither
+/// its position nor its predecessor's value. A reader numbering by position puts
+/// a contract naming `E::C` on the wrong tag, and -- because the `match` arm
+/// constants come from rustc, not from this reader -- the contract and the arm
+/// then disagree about which variant a value is.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EnumDef {
-    /// `(name, payload types)` per variant. A unit variant has an empty payload;
-    /// a struct variant records no payload types, so a contract naming one of its
-    /// fields is refused rather than bound to the wrong thing.
-    pub variants: Vec<(String, Vec<Ty>)>,
+    /// `(name, payload types, discriminant)` per variant, in declaration order.
+    /// A unit variant has an empty payload; a struct variant records no payload
+    /// types, so a contract naming one of its fields is refused rather than bound
+    /// to the wrong thing.
+    pub variants: Vec<(String, Vec<Ty>, u64)>,
 }
 
 impl EnumDef {
     /// The discriminant for `name`, or `None` if the enum has no such variant.
-    pub fn index_of(&self, name: &str) -> Option<u32> {
-        self.variants.iter().position(|(n, _)| n == name).map(|i| i as u32)
+    pub fn index_of(&self, name: &str) -> Option<u64> {
+        self.variants.iter().find(|(n, _, _)| n == name).map(|(_, _, d)| *d)
     }
 
-    /// How many variants the enum has, which bounds the tag's domain.
+    /// The width that can hold every discriminant, and no more.
     ///
-    /// A value of an `N`-variant enum always has a tag below `N`; that is a
-    /// property of the *type*, not an assumption about the caller, so the run may
-    /// assume it (see `exec::verify_fn`). Without it the `otherwise` arm of an
-    /// exhaustive `match` -- which rustc lowers to `unreachable` -- would look
-    /// reachable and every `match` would report a spurious panic.
-    pub fn arity(&self) -> u64 {
-        self.variants.len() as u64
+    /// A tag's domain is the set of discriminants, so the width is the largest
+    /// one's. Taking the variant *count*'s width instead is only the same thing
+    /// when the discriminants are `0..count`, which an explicit discriminant
+    /// breaks: `A, B = 3, C` needs three bits for the tag `4`, not the two bits a
+    /// count of three would give.
+    pub fn tag_width(&self) -> u8 {
+        let max = self.variants.iter().map(|(_, _, d)| *d).max().unwrap_or(0);
+        (64 - max.leading_zeros()).max(1) as u8
+    }
+
+    /// The predicate that a value of this enum's tag is one of its variants.
+    ///
+    /// This is what the run may *assume* about a symbolic tag, and it has to be
+    /// exact rather than a count. `tag < arity` is a fact about the type only when
+    /// the discriminants are consecutive from zero; with `A, B = 3, C` the real
+    /// tags are `0`, `3` and `4`, and `tag < 3` would exclude `4` -- excluding a
+    /// value the type admits. An assumed bound that is *false* for a real input is
+    /// the unsound direction: it can make a proof vacuous. The disjunction of
+    /// equalities is exact for any numbering.
+    pub fn tag_bound(&self, tag: Var) -> Pred {
+        let mut acc: Option<Pred> = None;
+        for (_, _, d) in &self.variants {
+            let p = smt::eq_const(tag, *d);
+            acc = Some(match acc {
+                None => p,
+                Some(prev) => smt::or(prev, p),
+            });
+        }
+        acc.unwrap_or_else(|| smt::truth(false))
     }
 }
 
@@ -223,9 +249,20 @@ pub fn extract(source: &str) -> Specs {
                 specs.enums.insert(name, def);
                 continue;
             }
-            if let Some((vname, payload)) = enum_variant(line) {
-                if let Some((_, def)) = cur_enum.as_mut() {
-                    def.variants.push((vname, payload));
+            match enum_variant(line) {
+                VariantLine::Variant { name: vname, payload, explicit } => {
+                    if let Some((_, def)) = cur_enum.as_mut() {
+                        push_variant(def, vname, payload, explicit);
+                    }
+                }
+                VariantLine::NotAVariant => {}
+                // An explicit discriminant this reader cannot evaluate: the whole
+                // layout is refused, because dropping the variant would shift
+                // every later discriminant and guessing one would put a contract
+                // on the wrong tag. Removing the enum makes a contract naming any
+                // of its variants a refusal, which is the safe direction.
+                VariantLine::UnreadableDiscriminant => {
+                    cur_enum = None;
                 }
             }
             continue;
@@ -248,13 +285,18 @@ pub fn extract(source: &str) -> Specs {
             cur_struct = Some((name, StructDef::default()));
             continue;
         }
-        if let Some((name, inline)) = enum_head(line) {
-            match inline {
+        if let Some((name, head)) = enum_head(line) {
+            match head {
                 // A one-line body is complete already; it needs no cursor.
-                Some(variants) => {
+                EnumHead::Inline(variants) => {
                     specs.enums.insert(name, EnumDef { variants });
                 }
-                None => cur_enum = Some((name, EnumDef::default())),
+                EnumHead::MultiLine => cur_enum = Some((name, EnumDef::default())),
+                // The body was refused *and* closed on this line. Opening a
+                // cursor here would run past the brace and consume every
+                // following line -- contracts included -- as enum contents, so
+                // the layout is dropped and the cursor stays shut.
+                EnumHead::Refused => {}
             }
             continue;
         }
@@ -423,22 +465,26 @@ pub struct FieldEnv {
     /// in a contract and `xs[0]` in the body are one value, not two that look
     /// alike.
     pub elem_seeds: Vec<(u32, u64, Var, bool)>,
-    /// `(local, tag variable, tag width, arity)` for each enum-typed argument.
+    /// `(local, tag variable, tag width, discriminants)` for each enum-typed
+    /// argument.
     ///
     /// An enum argument has no bit width of its own, but its *tag* does, and the
     /// tag is the only thing a contract can say about an enum without naming a
-    /// variant. It is a symbolic input whose domain is `0..arity`, because a value
-    /// of an `N`-variant enum always has a tag below `N` -- a fact about the type,
-    /// so the run may assume it. Seeding it here is what makes the contract's `m`
-    /// and the body's `discriminant(_1)` one variable.
-    pub tag_seeds: Vec<(u32, Var, u8, u64)>,
+    /// variant. It is a symbolic input whose domain is the set of variant
+    /// discriminants — a fact about the type, so the run may assume it. The
+    /// discriminants travel with the seed rather than a variant count, because
+    /// `tag < count` is only the same domain when the numbering is `0..count`,
+    /// which an explicit discriminant (`B = 3`) breaks. Seeding the tag here is
+    /// what makes the contract's `m` and the body's `discriminant(_1)` one
+    /// variable.
+    pub tag_seeds: Vec<(u32, Var, u8, Vec<u64>)>,
     /// `(local, variant, variable, width, signed)` for each variant payload.
     ///
     /// A payload is a symbolic input like any other: the frontend cannot know what
     /// the caller put in it, so assuming a relation would be unsound. Seeding it
     /// means the body's `((_1 as Data).0)` and a contract's `m.Data` name one
     /// variable rather than two that look alike.
-    pub payload_seeds: Vec<(u32, u32, Var, u8, bool)>,
+    pub payload_seeds: Vec<(u32, u64, Var, u8, bool)>,
     /// `Enum::Variant` → `(discriminant, tag width)`, so a contract can write
     /// `m == Mode::Idle` and have it mean the tag equals that variant's index.
     /// A name not in here is refused, which keeps a misspelled variant from being
@@ -585,10 +631,10 @@ impl FieldEnv {
     /// is skipped, and a contract naming it is then refused rather than bound to
     /// a fabricated word.
     ///
-    /// The tag's width is the arity's, not the dump's `isize`: the `switchInt`
-    /// compares it against the small variant constants, so the width only has to
-    /// hold them. Using the arity keeps the tag and the payload in a width that
-    /// `discriminant` reads back consistently.
+    /// The tag's width is the *discriminants'*, not the dump's `isize`: the
+    /// `switchInt` compares it against the variant constants, so the width only
+    /// has to hold them. Using the discriminants' width keeps the tag and the
+    /// payload in a width that `discriminant` reads back consistently.
     pub fn bind_enum(
         &mut self,
         local: u32,
@@ -596,13 +642,13 @@ impl FieldEnv {
         enum_name: &str,
         def: &EnumDef,
     ) -> Option<()> {
-        let arity = def.arity();
-        if arity == 0 {
+        if def.variants.is_empty() {
             return None;
         }
-        // The tag needs `ceil(log2(arity))` bits, and at least one. `N` variants
-        // need to be distinguishable, which is `N - 1` as a maximum index.
-        let width = (64 - (arity - 1).leading_zeros()).max(1) as u8;
+        // The tag needs enough bits for the *largest discriminant*, which an
+        // explicit value can push past the variant count: `A, B = 3, C` needs
+        // three bits for `4`, not the two a count of three would give.
+        let width = def.tag_width();
         let tag_slot = self.base + self.next_slot;
         if tag_slot as usize >= crate::smt::MAX_VARS {
             return None;
@@ -618,16 +664,19 @@ impl FieldEnv {
         // without a projection. Bound after the tag variable exists so the two are
         // the same word.
         self.vars.insert(arg.to_string(), tag);
-        self.tag_seeds.push((local, tag, width, arity));
+        // The seeds carry the width and the *discriminant list*, because the
+        // executor has to assume exactly the tag's domain -- a disjunction of the
+        // real discriminants, not a `0..count` bound.
+        let discs: Vec<u64> = def.variants.iter().map(|(_, _, d)| *d).collect();
+        self.tag_seeds.push((local, tag, width, discs));
         self.enum_args.insert(arg.to_string());
-        for (i, (vname, payload)) in def.variants.iter().enumerate() {
-            let i = i as u32;
-            // The variant name is a constant of the tag's width. Keyed by the
-            // *enum's* name, because that is what a contract writes
-            // (`m == Mode::Idle`); the argument's name is also accepted, so
-            // `m::Idle` works for a contract that prefers it.
-            self.variant_consts.insert(format!("{enum_name}::{vname}"), (i as u64, width));
-            self.variant_consts.insert(format!("{arg}::{vname}"), (i as u64, width));
+        for (vname, payload, d) in def.variants.iter() {
+            // The variant name is a constant of the tag's width, holding the
+            // *discriminant* rustc assigned -- the same number a `match` arm
+            // compares against. Numbering by position here is what put a contract
+            // and an arm in disagreement.
+            self.variant_consts.insert(format!("{enum_name}::{vname}"), (*d, width));
+            self.variant_consts.insert(format!("{arg}::{vname}"), (*d, width));
             // A payload: `m.Data` is field 0 of variant `Data`. Only the first
             // payload is bound, because the MIR downcast this frontend models
             // reads `.0`; a second field would need a tuple projection the
@@ -638,14 +687,18 @@ impl FieldEnv {
             if slot as usize >= crate::smt::MAX_VARS {
                 continue;
             }
-            let mangled = format!("{arg}__v{i}_0");
+            let mangled = format!("{arg}__v{d}_0");
             if !self.name_is_free(&mangled) {
                 continue;
             }
             self.next_slot += 1;
             let v = smt::var_named(slot, w);
             self.vars.insert(mangled.clone(), v);
-            self.payload_seeds.push((local, i, v, w, first.is_signed()));
+            // Keyed by the *discriminant*, because that is what a `Downcast`
+            // projection carries: the executor stores and reads payloads under the
+            // same number, and a positional key would not match a variant after an
+            // explicit discriminant.
+            self.payload_seeds.push((local, *d, v, w, first.is_signed()));
             if first.is_signed() {
                 self.signed.insert(mangled.clone());
             }
@@ -1810,10 +1863,24 @@ fn struct_field(line: &str) -> Option<(String, String)> {
     }
     Some((name.to_string(), ty.to_string()))
 }
-/// The parsed head of an `enum` declaration: its name, and its variants when the
-/// body is on the same line.
-type EnumHead = (String, Option<Vec<(String, Vec<Ty>)>>);
-
+/// The parsed head of an `enum` declaration.
+///
+/// The three cases are distinct on purpose. A *one-line* body carries its
+/// variants already; a *multi-line* body needs a cursor to collect them; and a
+/// body whose explicit discriminant cannot be read is *refused* -- and, because
+/// its closing brace has already been seen, that refusal must not be mistaken for
+/// "a cursor is needed". Returning the multi-line case for a refused one-line body
+/// would leave the cursor open past the brace and swallow every following line,
+/// including contracts, so those functions would silently leave the check set.
+enum EnumHead {
+    /// A one-line body, fully parsed.
+    Inline(Vec<(String, Vec<Ty>, u64)>),
+    /// A multi-line body whose `{` opens the last thing on the line.
+    MultiLine,
+    /// A body this reader refuses (an unreadable discriminant). The layout is
+    /// dropped, and the enum is *closed*: nothing after it belongs to it.
+    Refused,
+}
 
 /// Pull the enum name out of a `pub enum Name {` head line.
 ///
@@ -1823,7 +1890,7 @@ type EnumHead = (String, Option<Vec<(String, Vec<Ty>)>>);
 /// the head text, and getting that wrong would number the variants wrongly, which
 /// is the one thing this layout must not do. A missing layout makes a contract
 /// naming a variant a refusal, which is the safe direction.
-fn enum_head(line: &str) -> Option<EnumHead> {
+fn enum_head(line: &str) -> Option<(String, EnumHead)> {
     let t = line.trim_start_matches("pub(crate) ").trim_start_matches("pub ").trim();
     let rest = t.strip_prefix("enum ")?;
     // A generic enum (`enum E<T>`) is read for its name, but a variant payload
@@ -1840,65 +1907,230 @@ fn enum_head(line: &str) -> Option<EnumHead> {
     // construction.
     if let Some(close) = after.rfind('}') {
         let inner = &after[..close];
-        let variants = split_top_level(inner, ',')
-            .iter()
-            .filter_map(|v| enum_variant(v))
-            .collect();
-        return Some((name.to_string(), Some(variants)));
+        let mut def = EnumDef::default();
+        for v in split_top_level(inner, ',') {
+            match enum_variant(&v) {
+                VariantLine::Variant { name, payload, explicit } => {
+                    push_variant(&mut def, name, payload, explicit);
+                }
+                VariantLine::NotAVariant => {}
+                // An unreadable discriminant on a one-line body refuses the whole
+                // enum, the same as the multi-line path. The body is already
+                // closed, so this is a *refusal*, not an open cursor.
+                VariantLine::UnreadableDiscriminant => {
+                    return Some((name.to_string(), EnumHead::Refused))
+                }
+            }
+        }
+        return Some((name.to_string(), EnumHead::Inline(def.variants)));
     }
     // A multi-line body: the brace must end the line, so nothing but the brace
     // follows it.
     if !after.trim().is_empty() {
         return None;
     }
-    Some((name.to_string(), None))
+    Some((name.to_string(), EnumHead::MultiLine))
+}
+
+/// One line of an enum body, as far as the layout reader can tell.
+enum VariantLine {
+    /// A variant, with the explicit discriminant when the source wrote a literal
+    /// one (`B = 3`).
+    Variant {
+        /// The variant's name.
+        name: String,
+        /// Its payload types; empty for a unit or struct variant.
+        payload: Vec<Ty>,
+        /// The explicit discriminant, when the source gave a literal one.
+        explicit: Option<u64>,
+    },
+    /// A line that is not a variant (a comment, an attribute, a nested item).
+    NotAVariant,
+    /// A variant whose explicit discriminant is not a literal this reader can
+    /// evaluate. The *whole* layout is refused: dropping the variant would shift
+    /// every later discriminant, and guessing one would put a contract on the
+    /// wrong tag. A refused layout makes a contract naming any of its variants a
+    /// refusal, which is the safe direction.
+    UnreadableDiscriminant,
 }
 
 /// Pull one variant out of a line of an enum body.
 ///
-/// The line looks like `Off,`, `Idle,`, `Data(u8),` or `Pair { x: u8, y: u8 },`.
-/// A unit variant and a tuple variant are both modelled; a *struct* variant
-/// records no payload types, so a contract naming one of its fields is refused
-/// rather than bound to a wrong index. A line that is not a variant (a nested
-/// item, an attribute, a comment) is skipped, which loses a variant rather than
-/// inventing one -- and a lost variant shifts every discriminant after it, so the
-/// skip is restricted to lines that clearly are not variants.
-fn enum_variant(line: &str) -> Option<(String, Vec<Ty>)> {
+/// The line looks like `Off,`, `Idle,`, `Data(u8),`, `Pair { x: u8, y: u8 },` or
+/// `B = 3,`. A unit variant and a tuple variant are both modelled; a *struct*
+/// variant records no payload types, so a contract naming one of its fields is
+/// refused rather than bound to a wrong index. A line that is not a variant (a
+/// nested item, an attribute, a comment) is skipped, which loses a variant rather
+/// than inventing one -- and a lost variant shifts every discriminant after it, so
+/// the skip is restricted to lines that clearly are not variants.
+fn enum_variant(line: &str) -> VariantLine {
+    // A trailing line comment is not part of the variant. Stripping it *first*
+    // matters because the comma that ends the variant sits before the comment:
+    // `B = 3, // tag` would otherwise keep the comma (the line no longer ends in
+    // one) and the discriminant reader would reject the whole line, dropping the
+    // layout and skipping every contract that names one of its variants.
+    let line = strip_line_comment(line);
     let t = line.trim().trim_end_matches(',').trim();
     if t.is_empty() || t.starts_with("//") || t.starts_with('#') || t.starts_with("}") {
-        return None;
+        return VariantLine::NotAVariant;
     }
     let t = t.trim_start_matches("pub(crate) ").trim_start_matches("pub ").trim();
     // The variant name is the leading identifier.
     let name: String = t.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
     if name.is_empty() || !name.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false)
     {
-        return None;
+        return VariantLine::NotAVariant;
     }
     let after = t[name.len()..].trim_start();
-    // A unit variant: nothing follows the name.
-    if after.is_empty() {
-        return Some((name, Vec::new()));
-    }
-    // A tuple variant: `Name(u8, u16)`. The payload types are what a `match` arm's
-    // downcast reads, so they are recorded even though the tag does not need them.
-    if let Some(rest) = after.strip_prefix('(') {
-        let close = rest.find(')')?;
-        let inner = rest[..close].trim();
+    let (payload, rest) = if after.is_empty() {
+        // A unit variant: nothing follows the name.
+        (Vec::new(), "")
+    } else if let Some(inner_rest) = after.strip_prefix('(') {
+        // A tuple variant: `Name(u8, u16)`. The payload types are what a `match`
+        // arm's downcast reads, so they are recorded even though the tag does not
+        // need them.
+        let Some(close) = inner_rest.find(')') else { return VariantLine::NotAVariant };
+        let inner = inner_rest[..close].trim();
         let tys = if inner.is_empty() {
             Vec::new()
         } else {
             split_top_level(inner, ',').iter().map(|t| Ty::parse(t.trim())).collect()
         };
-        return Some((name, tys));
+        (tys, inner_rest[close + 1..].trim_start())
+    } else if after.starts_with('{') {
+        // A struct variant: the fields are not modelled, but the *variant* is, so
+        // it still takes its discriminant.
+        let Some(close) = after.rfind('}') else { return VariantLine::NotAVariant };
+        (Vec::new(), after[close + 1..].trim_start())
+    } else if after.starts_with('=') {
+        (Vec::new(), after)
+    } else {
+        return VariantLine::NotAVariant;
+    };
+    // An explicit discriminant: `B = 3`. Only a literal is accepted; an
+    // expression (`= 1 << 4`) would have to be evaluated, and evaluating it wrongly
+    // is exactly the failure this reader exists to avoid, so the layout is refused
+    // instead.
+    if rest.is_empty() {
+        return VariantLine::Variant { name, payload, explicit: None };
     }
-    // A struct variant: the fields are not modelled, but the *variant* is, so it
-    // still takes its discriminant. Recording it with no payload types keeps the
-    // numbering right for every variant after it.
-    if after.starts_with('{') {
-        return Some((name, Vec::new()));
+    let Some(expr) = rest.strip_prefix('=') else { return VariantLine::NotAVariant };
+    match parse_discriminant_literal(expr) {
+        Some(d) => VariantLine::Variant { name, payload, explicit: Some(d) },
+        None => VariantLine::UnreadableDiscriminant,
     }
-    None
+}
+
+/// A discriminant literal: decimal, `0x`/`0b`/`0o`, with an optional type suffix.
+///
+/// Only a literal is accepted. Anything else -- an expression, a `const` path, a
+/// negative value under a signed `repr` -- returns `None`, and the caller refuses
+/// the whole layout rather than guessing a number.
+fn parse_discriminant_literal(s: &str) -> Option<u64> {
+    let s = s.trim().trim_end_matches(';').trim();
+    if s.is_empty() {
+        return None;
+    }
+    // A negative literal (`= -1` under a signed `repr`) is refused: its value
+    // depends on the tag's width, which the reader does not know here.
+    if s.starts_with('-') {
+        return None;
+    }
+    let body = strip_int_suffix(s);
+    let (radix, digits) = if let Some(r) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        (16u32, r)
+    } else if let Some(r) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
+        (2, r)
+    } else if let Some(r) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
+        (8, r)
+    } else {
+        (10, body)
+    };
+    // The whole remainder must be digits (underscores allowed), so `1 << 4` is
+    // refused rather than silently read as `1`. A partial read is exactly the
+    // kind of wrong number this reader exists to avoid.
+    let mut seen = false;
+    for c in digits.chars() {
+        if c == '_' {
+            continue;
+        }
+        if !c.is_digit(radix) {
+            return None;
+        }
+        seen = true;
+    }
+    if !seen {
+        return None;
+    }
+    let digits: String = digits.chars().filter(|c| *c != '_').collect();
+    u64::from_str_radix(&digits, radix).ok()
+}
+
+/// Drop a trailing `// …` line comment, respecting string and char literals.
+///
+/// The enum reader is handed one trimmed source line at a time, and a comment on
+/// that line is not part of the variant. A `//` inside a string or character
+/// literal is not a comment, so the scan tracks those; a variant line has no such
+/// literal in practice, but the scan keeps the rule true by construction rather
+/// than by luck.
+fn strip_line_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut in_str = false;
+    let mut in_char = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_str = false;
+            }
+        } else if in_char {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == b'\'' {
+                in_char = false;
+            }
+        } else if c == b'"' {
+            in_str = true;
+        } else if c == b'\'' {
+            in_char = true;
+        } else if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            return &line[..i];
+        }
+        i += 1;
+    }
+    line
+}
+
+/// Drop a trailing integer type suffix (`3u8`, `0x10_i32`) if one is present.
+fn strip_int_suffix(s: &str) -> &str {
+    for suf in [
+        "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
+    ] {
+        if let Some(head) = s.strip_suffix(suf) {
+            return head.trim_end_matches('_');
+        }
+    }
+    s
+}
+
+/// Push a variant, computing its discriminant.
+///
+/// Without an explicit value the discriminant is the previous one plus one,
+/// starting at zero -- rustc's rule. The explicit value is stored as written, so
+/// a variant after it continues from *that* value and not from its position.
+fn push_variant(def: &mut EnumDef, name: String, payload: Vec<Ty>, explicit: Option<u64>) {
+    let d = match explicit {
+        Some(d) => d,
+        None => def.variants.last().map(|(_, _, d)| d + 1).unwrap_or(0),
+    };
+    def.variants.push((name, payload, d));
 }
 
 /// Bind every field of every struct-typed argument to a symbolic variable.
@@ -2061,4 +2293,127 @@ pub fn arg_vars(f: &crate::mir::parse::MirFn) -> BTreeMap<String, Var> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn def(src: &str) -> EnumDef {
+        let specs = extract(src);
+        specs.enums.get("E").cloned().unwrap_or_default()
+    }
+
+    /// An explicit discriminant sets the variant's value and the next continues
+    /// from it, not from the variant's position.
+    #[test]
+    fn an_explicit_discriminant_renumbers_the_rest() {
+        let d = def("pub enum E { A, B = 3, C }\n");
+        assert_eq!(d.index_of("A"), Some(0));
+        assert_eq!(d.index_of("B"), Some(3));
+        assert_eq!(d.index_of("C"), Some(4));
+        // The tag has to hold `4`, which needs three bits, not the two a count of
+        // three would give.
+        assert_eq!(d.tag_width(), 3);
+    }
+
+    /// A hex, binary or octal literal is read at its own radix.
+    #[test]
+    fn a_radix_prefixed_discriminant_is_read() {
+        let d = def("pub enum E { A = 0x10, B = 0b101, C = 0o7, D }\n");
+        assert_eq!(d.index_of("A"), Some(16));
+        assert_eq!(d.index_of("B"), Some(5));
+        assert_eq!(d.index_of("C"), Some(7));
+        assert_eq!(d.index_of("D"), Some(8));
+    }
+
+    /// A non-literal discriminant refuses the whole layout, so a contract naming
+    /// any variant of the enum is a refusal rather than a guess.
+    #[test]
+    fn an_unreadable_discriminant_refuses_the_whole_layout() {
+        let specs = extract("pub enum E { A, B = 1 << 4, C }\n");
+        assert!(!specs.enums.contains_key("E"), "the layout must not be recorded at all");
+    }
+
+    /// A struct variant still takes its discriminant, so a later variant's value
+    /// is right.
+    #[test]
+    fn a_struct_variant_still_takes_a_discriminant() {
+        let d = def("pub enum E {\n    A,\n    Pair { x: u8 },\n    C,\n}\n");
+        assert_eq!(d.index_of("A"), Some(0));
+        assert_eq!(d.index_of("Pair"), Some(1));
+        assert_eq!(d.index_of("C"), Some(2));
+    }
+
+    /// The domain assumed for a tag is the set of discriminants, so a gap is not
+    /// excluded.
+    #[test]
+    fn the_tag_domain_is_the_discriminants() {
+        let d = def("pub enum E { A, B = 3, C }\n");
+        assert_eq!(d.variants.iter().map(|(_, _, d)| *d).collect::<Vec<_>>(), vec![0, 3, 4]);
+    }
+
+    /// An unreadable discriminant on a *one-line* enum must not leave the enum
+    /// cursor open.
+    ///
+    /// The one-line reader returns the variants when it can read them and, for an
+    /// unreadable discriminant, used to answer "a multi-line body follows". That
+    /// answer opened a cursor *after* the closing brace had already been seen, so
+    /// every following line -- including `///` contracts and the `fn` items they
+    /// belong to -- was consumed as enum contents. Those functions then had no
+    /// contract at all, so they were neither verified nor reported as skipped:
+    /// they silently left the check set.
+    #[test]
+    fn an_unreadable_one_line_enum_does_not_swallow_the_next_contract() {
+        let src = "pub enum E { A, B = 1 << 4 }\n\n\
+                   /// ensures: ret == 1\n\
+                   pub fn f() -> u8 { 0 }\n";
+        let specs = extract(src);
+        assert!(!specs.enums.contains_key("E"), "the refused layout must not be recorded");
+        assert!(
+            specs.by_fn.contains_key("f"),
+            "the contract after a refused enum must still be read, got: {:?}",
+            specs.by_fn.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// The same for the multi-line path: the refusal must close the cursor at the
+    /// brace, not at whatever `}` comes next.
+    #[test]
+    fn a_refused_multi_line_enum_does_not_swallow_the_next_contract() {
+        let src = "pub enum E {\n    A,\n    B = 1 << 4,\n}\n\n\
+                   /// ensures: ret == 1\n\
+                   pub fn f() -> u8 { 0 }\n";
+        let specs = extract(src);
+        assert!(!specs.enums.contains_key("E"), "the refused layout must not be recorded");
+        assert!(
+            specs.by_fn.contains_key("f"),
+            "the contract after a refused multi-line enum must still be read, got: {:?}",
+            specs.by_fn.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A trailing line comment on a variant line is not part of the variant.
+    ///
+    /// `B = 3, // special` puts the comma *before* the comment, so trimming a
+    /// trailing comma off the raw line leaves `B = 3, // special` -- the comma is
+    /// no longer last. The discriminant reader then rejected the whole line and
+    /// the layout was dropped, taking every contract that named a variant with it.
+    #[test]
+    fn a_trailing_comment_on_a_variant_is_not_part_of_it() {
+        let src = "pub enum E {\n    A,\n    B = 3, // special\n    C,\n}\n";
+        let d = def(src);
+        assert_eq!(d.index_of("A"), Some(0));
+        assert_eq!(d.index_of("B"), Some(3));
+        assert_eq!(d.index_of("C"), Some(4), "C follows B's explicit value, not its position");
+    }
+
+    /// A comment after an implicit variant must not change its numbering either.
+    #[test]
+    fn a_trailing_comment_on_an_implicit_variant_is_ignored() {
+        let src = "pub enum E {\n    A, // first\n    B,\n}\n";
+        let d = def(src);
+        assert_eq!(d.index_of("A"), Some(0));
+        assert_eq!(d.index_of("B"), Some(1));
+    }
 }
