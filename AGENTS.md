@@ -2983,11 +2983,26 @@ from 44/67 to 45/69.
 
 *The slice half remains.* A slice's length is a symbolic input, so `xs[i]` for a
 bounded `i` is a chain over the *length* variable with a bounds obligation, not an
-unbounded enumeration. This is the larger half and it is not attempted yet: the
-chain's domain is the length variable rather than a type constant, so
-`index_guards` — which yields a `u64` — would have to yield a term, and the
-executor's `index_chain` builds its chain only from a `fixed_len`. Both want the
-length term threaded through, which is the work the item needs.
+unbounded enumeration.
+
+The material for it already exists: `FieldEnv::len_seeds` carries
+`(local, len_var, elem_w, elem_signed)` for every slice argument, and the
+precondition's `xs.len()` already resolves to that same `len_var` (it is what the
+body's `PtrMetadata(_1)` reads, so the two agree by construction). What is missing
+is that two things carry a *constant* where they need a term:
+
+* `FieldEnv::index_guards` yields `Vec<(Var, u64)>` — the index variable and the
+  array's type length. A slice's bound is `len_var`, so this becomes a term.
+* `exec::index_chain` builds its chain from `s.fixed_len?`, which is `None` for a
+  slice, and returns `None`. It needs a second path: enumerate `0..MAX_INDEX_CHAIN`
+  and guard each step with `k == n` *and* `k < len_var`, so an index past the
+  caller's length selects nothing and the chain's value stays defined only where
+  the bounds obligation holds.
+
+The soundness content is the same as the array case — the domain has to be finite
+and the caller's precondition has to establish membership — so the slice path must
+carry the same refusal when `i < xs.len()` is not provable. That is the shape the
+next round starts from.
 
 **Stage 4 — the missing intrinsics.** `wrapping_neg`, `wrapping_div`,
 `wrapping_rem`, `overflowing_*`, `leading_zeros`, `trailing_zeros`, `count_ones`,
