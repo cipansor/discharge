@@ -480,6 +480,12 @@ impl FieldEnv {
     /// the up-front parse probe, which needs *some* variable of the right width
     /// and does not care which.
     pub fn bind_ret(&mut self, index: u32, ty: &Ty, v: Var) -> Option<()> {
+        // The component's own type decides. A `&T` component is *not* read
+        // through to its referent here, because the executor seeds a scalar `&T`
+        // argument as `Unknown` (`Ty::width` is `None` for `Ref`), so a `ret.1`
+        // of type `&u8` has no value to bind. Reading through would make the probe
+        // accept a component the run then cannot resolve -- the probe exists to
+        // refuse exactly what the run would refuse, so it must refuse here too.
         ty.width()?;
         let mangled = format!("ret__f{index}");
         self.vars.insert(mangled.clone(), v);
@@ -491,6 +497,12 @@ impl FieldEnv {
     }
 
     /// A fresh variable for the `index`-th return projection, for the parse probe.
+    ///
+    /// Only called for a component a contract actually *names* (see
+    /// [`named_ret_components`]). Binding every declared component instead made a
+    /// `(u8, &u8)` return unprobeable -- component 1 is a reference with no
+    /// bit-vector width -- so the whole function was skipped for a component no
+    /// contract asked about, even when the contract only mentioned `ret.0`.
     pub fn probe_ret_slot(&mut self, index: u32, ty: &Ty) -> Option<Var> {
         let w = ty.width()?;
         // Past the field slots, so a return component and an argument field never
@@ -751,6 +763,48 @@ impl FieldEnv {
 /// Only whole `ident.ident` runs that match a *bound* path are replaced, so an
 /// unrelated `x.y` is left for the parser to refuse as an unknown name rather
 /// than silently becoming something else.
+/// The `ret.N` components the given contract texts name.
+///
+/// The up-front parse probe uses this to bind only what a contract can mention.
+/// Binding *every* declared component of the return type makes a `(u8, &u8)`
+/// return unprobeable: component 1 is a reference with no bit-vector width, so
+/// the probe refuses and the function is `Skipped` -- for a component the
+/// contract never named. `(u8, &u8)` and `(bool, &T)` returns are ordinary, so
+/// that skip silently loses the proof.
+///
+/// Only `ret.N` is matched, not `result.N`: the rewrite that gives a component
+/// its binding emits `ret.N`, so `result.N` was never resolvable and is left to
+/// the parser to refuse rather than half-supported here.
+pub fn named_ret_components(texts: &[String]) -> BTreeSet<u32> {
+    let mut out = BTreeSet::new();
+    for text in texts {
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i].is_alphabetic() || chars[i] == '_' {
+                let start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let ident: String = chars[start..i].iter().collect();
+                if ident == "ret" && chars.get(i) == Some(&'.') {
+                    let j = i + 1;
+                    let digits: String =
+                        chars[j..].iter().take_while(|c| c.is_ascii_digit()).collect();
+                    if !digits.is_empty() {
+                        if let Ok(k) = digits.parse::<u32>() {
+                            out.insert(k);
+                        }
+                    }
+                }
+                continue;
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
 fn rewrite_fields(text: &str, fields: &FieldEnv) -> Result<String, SpecError> {
     if fields.paths.is_empty() && fields.known_args.is_empty() {
         return Ok(text.to_string());

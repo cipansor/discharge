@@ -239,6 +239,17 @@ pub struct Config {
     pub hi: u8,
 }
 
+/// A struct with *signed* fields, for the signed-comparison shapes.
+///
+/// `Config`'s fields are `u8`, so a contract that needs `i8::MIN` cannot use it:
+/// the bound would not fit the field's width. The signedness of a field is not in
+/// the MIR dump (`_1.0: i8` appears only on the *copy* out of it), so the field
+/// types have to come from here.
+pub struct SignedConfig {
+    pub lo: i8,
+    pub hi: i8,
+}
+
 // ---------------------------------------------------------------------------
 // Gap 2: a loop cannot carry an invariant.
 // ---------------------------------------------------------------------------
@@ -427,4 +438,165 @@ pub fn struct_reassign_then_field_read(mut c: Config, d: Config) -> u8 {
 #[allow(unused_variables, non_snake_case)]
 pub fn generated_name_shadows_argument(a: [u8; 4], i: usize, a__chain: u8) -> u8 {
     a[i]
+}
+
+/// A helper that indexes its by-value array parameter, called from a contract.
+///
+/// The callee's `a[0]` must be the *same* symbolic input the caller passed, so
+/// the caller's `ret == a[0]` is about the element the helper returned rather
+/// than an unknown. Before the call handed the callee a copy of the indexed
+/// store, the callee's `_1[_2]` had nothing to read and the caller was
+/// incomplete.
+/// requires: true
+/// ensures: ret == a[0]
+pub fn head(a: [u8; 4]) -> u8 {
+    a[0]
+}
+
+/// The caller of [`head`], whose contract the helper's element read must satisfy.
+/// requires: true
+/// ensures: ret == a[0]
+pub fn caller_of_head(a: [u8; 4]) -> u8 {
+    head(a)
+}
+
+/// A helper that writes through a `&mut [u8; 4]` and returns the element.
+///
+/// The write is to the *caller's* storage, so on return the caller's `a[0]` is
+/// the `0` the helper wrote, and `ret == 0` must verify.
+/// requires: true
+/// ensures: ret == 0
+pub fn clear_head(a: &mut [u8; 4]) -> u8 {
+    a[0] = 0;
+    a[0]
+}
+
+/// The caller of [`clear_head`]: the helper's write to the shared store is what
+/// makes `ret == 0` true here.
+/// requires: true
+/// ensures: ret == 0
+pub fn caller_of_clear_head(a: &mut [u8; 4]) -> u8 {
+    clear_head(a)
+}
+
+/// The by-value counterpart: a helper's write to its *own* copy must not reach
+/// the caller.
+///
+/// `head_of` writes `a[0]` in its own frame and returns it; the caller's `a` is
+/// the array it passed, untouched, so `ret == 0` is FALSE (the caller returns
+/// its own `a[0]`). If the callee's copy were shared with the caller's store --
+/// the tempting wrong model -- this would verify. It must fail.
+/// requires: true
+/// ensures: ret == 0
+pub fn caller_of_written_copy(a: [u8; 4]) -> u8 {
+    let _ = clear_copy(a);
+    a[0]
+}
+
+/// A helper that clears its by-value copy and returns it.
+/// requires: true
+/// ensures: ret == 0
+#[allow(unused_assignments)]
+pub fn clear_copy(mut a: [u8; 4]) -> u8 {
+    a[0] = 0;
+    a[0]
+}
+
+/// A signed field compared against a signed constant, where the constant is the
+/// *left* operand: `0 < c.lo`.
+///
+/// `0` here is `const 0_i8` in the dump, so the comparison is signed. Reading a
+/// constant operand as unsigned made this an unsigned test, under which
+/// `i8::MIN` (0x80) is the largest value and `ret == 1` was *proved* for
+/// `c.lo == i8::MIN` -- a false proof, because `i8::MIN` is negative. It must
+/// FAIL.
+/// requires: c.lo == i8::MIN
+/// ensures: ret == 1
+pub fn signed_const_left_false(c: SignedConfig) -> u8 {
+    if 0 < c.lo { 1 } else { 0 }
+}
+
+/// The true counterpart of [`signed_const_left_false`]: for `i8::MIN` the branch
+/// is not taken, so `ret == 0` must verify.
+/// requires: c.lo == i8::MIN
+/// ensures: ret == 0
+pub fn signed_const_left_true(c: SignedConfig) -> u8 {
+    if 0 < c.lo { 1 } else { 0 }
+}
+
+/// A `(bool, u8)` tuple return with a postcondition on the bool component.
+///
+/// `ret.0` is a `bool` in the type but a one-bit word in the postcondition, so
+/// the component has to be widened. Before that, `ret.0` had no binding and the
+/// contract was refused as unreadable.
+/// requires: a < 3
+/// ensures: ret.0 == true
+pub fn bool_component(a: u8) -> (bool, u8) {
+    (a < 3, 0)
+}
+
+/// A `(u8, &u8)` return with a postcondition on the *first* component only.
+///
+/// Component 1 is a reference with no bit width, so binding every declared
+/// component skipped the function. Only `ret.0`, which the contract names, needs
+/// a binding.
+/// requires: true
+/// ensures: ret.0 == a
+pub fn first_component_only(a: u8, r: &u8) -> (u8, &u8) {
+    (a, r)
+}
+
+/// A tuple local whose component is read back: `let t = (a, b); t.0`.
+///
+/// `_3 = (a, b)` stores the components under an *index* projection, but rustc
+/// prints the read as `_3.0` -- a *field* projection. The two spellings have to
+/// meet in one store, or `t.0` reads `Unknown` and a contract about the return is
+/// unreadable.
+/// requires: true
+/// ensures: ret == a
+pub fn tuple_local_component(a: u8, b: u8) -> u8 {
+    let t = (a, b);
+    t.0
+}
+
+/// A helper returning a tuple.
+/// requires: true
+/// ensures: ret.0 == a || ret.0 == b
+pub fn min2(a: u8, b: u8) -> (u8, bool) {
+    if a < b { (a, true) } else { (b, false) }
+}
+
+/// A caller that reads a component of a tuple-returning call: `min2(a, b).0`.
+///
+/// The callee stores its result in its *own* return place (`_0.0`, `_0.1`), so
+/// the components have to cross the call boundary with the aggregate; carrying
+/// only the aggregate loses them and the contract is unreadable rather than
+/// checked.
+/// requires: true
+/// ensures: ret == a || ret == b
+pub fn min_call(a: u8, b: u8) -> u8 {
+    min2(a, b).0
+}
+
+/// The soundness tripwire for the tuple-component read: the *other* component.
+///
+/// `t.0` is `a`, so claiming `ret == b` is false. If the field-projection
+/// fallback into the element store picked the wrong component -- or read the
+/// last-written one regardless of index -- this would verify. It must FAIL.
+/// requires: true
+/// ensures: ret == b
+pub fn tuple_component_tripwire(a: u8, b: u8) -> u8 {
+    let t = (a, b);
+    t.0
+}
+
+/// The call-boundary counterpart: a false claim about the component that crossed.
+///
+/// `min2(a, b).0` is the smaller of the two, so claiming `ret == b` is false
+/// whenever `a < b`. If the components crossed the boundary in the wrong order,
+/// or as one shared value, this would verify. It must FAIL.
+/// requires: true
+/// ensures: ret == b
+pub fn min_call_tripwire(a: u8, b: u8) -> u8 {
+    min2(a, b).0
 }

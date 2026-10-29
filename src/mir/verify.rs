@@ -280,15 +280,26 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         // `ret.N` is bound here too. Leaving it out would make the probe fail on a
         // contract the run could have handled, and the function would be skipped
         // for a reason that is not true of it.
+        //
+        // Only the components a contract *names* are probed. Binding every
+        // declared component made a `(u8, &u8)` return unprobeable -- component 1
+        // is a reference with no bit-vector width -- so a contract about `ret.0`
+        // alone skipped the whole function. A component the contract does name and
+        // that has no width is still refused, because then the name really cannot
+        // be resolved.
         let mut probe_fields = fields.clone();
+        let named_components = spec::named_ret_components(&ensures);
         if let Ty::Tuple(ts) = &f.ret_ty {
-            for (i, ty) in ts.iter().enumerate() {
-                if probe_fields.probe_ret_slot(i as u32, ty).is_none() {
-                    return FnOutcome::Skipped {
-                        reason: format!(
-                            "cannot bind `ret.{i}`: the component's type has no bit-vector width"
-                        ),
-                    };
+            for i in &named_components {
+                match ts.get(*i as usize) {
+                    Some(ty) if probe_fields.probe_ret_slot(*i, ty).is_some() => {}
+                    _ => {
+                        return FnOutcome::Skipped {
+                            reason: format!(
+                                "cannot bind `ret.{i}`: the component's type has no bit-vector width"
+                            ),
+                        };
+                    }
                 }
             }
         }

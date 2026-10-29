@@ -1187,6 +1187,151 @@ fn a_postcondition_can_name_a_tuple_component() {
     assert!(o.is_verified(), "`split` must verify, got: {o}");
 }
 
+/// A same-dump helper that indexes its parameter must reach the caller's element.
+///
+/// `head` returns `a[0]` and `caller_of_head` claims `ret == a[0]`. The call is
+/// inlined into a fresh callee `Env`, and before that `Env` was handed a copy of
+/// the *indexed* store the callee's `_1[_2]` reads, the element was unknown and
+/// the caller was incomplete. The two functions are checked together because the
+/// property is about what crosses the call boundary.
+#[test]
+fn a_helper_that_indexes_its_parameter_reaches_the_caller_element() {
+    let names = ["head", "caller_of_head"];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in names {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+}
+
+/// A helper that writes through a `&mut` array changes the *caller's* element.
+///
+/// `clear_head` writes `a[0] = 0` through the reference and returns it;
+/// `caller_of_clear_head` claims `ret == 0`, which is only true if the helper's
+/// write is visible to the caller. The reference is the shared store, so the
+/// callee's post-state must be copied back.
+#[test]
+fn a_write_through_a_reference_reaches_the_caller() {
+    let names = ["clear_head", "caller_of_clear_head"];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in names {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+}
+
+/// The soundness tripwire for the call boundary: a by-value helper's write to its
+/// *own copy* must not reach the caller.
+///
+/// `clear_copy` clears its by-value array and returns `0`, but the caller's `a` is
+/// the array it passed and is untouched, so `caller_of_written_copy` returning
+/// `a[0]` is not `0`. If the callee's copy were shared with the caller's store --
+/// the tempting way to make the element reads agree -- this false contract would
+/// verify. It must fail.
+#[test]
+fn a_by_value_helper_cannot_write_the_callers_array() {
+    let Some(report) = verify_realistic(&["caller_of_written_copy"]) else { return };
+    let o = outcome(&report, "caller_of_written_copy");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "a by-value helper's write leaked to the caller; got: {o}"
+    );
+}
+
+/// A signed comparison whose *left* operand is a constant must be signed.
+///
+/// `0 < c.lo` lowers to `Lt(const 0_i8, ...)`, and the constant carries the
+/// signedness. Reading a constant operand as unsigned made this an unsigned test,
+/// under which `i8::MIN` (`0x80`) is the largest value, so `ret == 1` was
+/// *proved* for `c.lo == i8::MIN` -- a false proof, since `i8::MIN` is negative
+/// and the branch is never taken. The pair pins both directions: the false claim
+/// must fail, and the true one must verify.
+#[test]
+fn a_constant_left_signed_compare_is_signed_not_unsigned() {
+    let names = ["signed_const_left_false", "signed_const_left_true"];
+    let Some(report) = verify_realistic(&names) else { return };
+    let bad = outcome(&report, "signed_const_left_false");
+    assert!(
+        matches!(bad, FnOutcome::Failed { .. }),
+        "`signed_const_left_false` proves a false contract; got: {bad}"
+    );
+    let good = outcome(&report, "signed_const_left_true");
+    assert!(good.is_verified(), "`signed_const_left_true` must verify, got: {good}");
+}
+
+/// A `(bool, u8)` return can be checked on its bool component.
+///
+/// `ret.0` is a `bool` in the type but compared against a one-bit word in the
+/// postcondition, so the component has to be widened when it is read out of the
+/// return place. Before that, `ret.0` had no binding and the contract was refused
+/// as unreadable.
+#[test]
+fn a_postcondition_can_name_a_bool_tuple_component() {
+    let Some(report) = verify_realistic(&["bool_component"]) else { return };
+    let o = outcome(&report, "bool_component");
+    assert!(o.is_verified(), "`bool_component` must verify, got: {o}");
+}
+
+/// A tuple local's component can be read back as a *field* projection.
+///
+/// `let t = (a, b); t.0` stores the components under an index projection and
+/// reads them back as `_3.0`, a field projection. Before the two spellings met in
+/// one store, `t.0` was `Unknown` and a contract about the return was unreadable.
+#[test]
+fn a_tuple_locals_component_can_be_read_back() {
+    let Some(report) = verify_realistic(&["tuple_local_component"]) else { return };
+    let o = outcome(&report, "tuple_local_component");
+    assert!(o.is_verified(), "`tuple_local_component` must verify, got: {o}");
+}
+
+/// A component of a tuple-*returning call* reaches the caller.
+///
+/// `min_call` returns `min2(a, b).0`. The callee's components live in its own
+/// return place, so they must cross the call boundary with the aggregate; before
+/// that, only the aggregate crossed and the component was lost, leaving the
+/// caller's contract unreadable rather than checked.
+#[test]
+fn a_tuple_returning_calls_component_reaches_the_caller() {
+    let names = ["min2", "min_call"];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in names {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+}
+
+/// The soundness tripwires for the tuple-component reads.
+///
+/// Each is a *false* contract that the tempting wrong model would prove: reading
+/// the wrong component of a tuple local, or carrying the components across a call
+/// boundary in the wrong order (or as one shared value). A `verified` verdict
+/// here is a proof of something untrue, so both must fail.
+#[test]
+fn a_tuple_component_read_cannot_prove_the_wrong_component() {
+    let names = ["tuple_component_tripwire", "min_call_tripwire"];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in names {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "`{name}` proves the wrong tuple component; got: {o}"
+        );
+    }
+}
+
+/// A `(u8, &u8)` return with a postcondition on `ret.0` alone is not skipped.
+///
+/// Component 1 is a reference with no bit-vector width. Binding every declared
+/// component up front made the up-front parse probe refuse, so the function was
+/// `Skipped` for a component the contract never named. Only the components a
+/// contract names are probed.
+#[test]
+fn a_reference_component_the_contract_does_not_name_does_not_skip_the_function() {
+    let Some(report) = verify_realistic(&["first_component_only"]) else { return };
+    let o = outcome(&report, "first_component_only");
+    assert!(o.is_verified(), "`first_component_only` must verify, got: {o}");
+}
+
 /// A contract naming a field the struct does not have is refused, not dropped.
 ///
 /// This is the failure mode that matters: if the projection were ignored, the

@@ -21,7 +21,7 @@
 //! verdict is `Unknown` and the obligation is left open. Every one of these
 //! failures lands on the "I could not decide" side, never on "valid".
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::mir::intrinsics::{self, Outcome};
 use crate::mir::parse::{
@@ -361,6 +361,16 @@ struct Env {
     /// distinct inputs per index, so `xs[0]` and `xs[1]` are two values and
     /// `xs[0] == xs[1]` is not provable; see `Indexed::elems`.
     indexed: BTreeMap<u32, Indexed>,
+    /// Locals whose indexed store has been written since this `Env` was built.
+    ///
+    /// A call hands a callee a *copy* of an indexed argument's state. For a
+    /// by-value `[T; N]` the callee's writes are its own and die with its frame,
+    /// so the caller's store is untouched. For a `&mut [T]`/`&mut [T; N]` the
+    /// callee writes the caller's storage, which this frontend does not model,
+    /// so the caller's elements must become unknown when it returns -- a stale
+    /// element there is a wrong value, not a missing one. This set is how the
+    /// return path learns that a callee wrote.
+    indexed_writes: BTreeSet<u32>,
 }
 
 /// A modelled value with a length and elements: a slice or an array.
@@ -406,6 +416,7 @@ impl Env {
             discriminants: BTreeMap::new(),
             deref_ok: BTreeMap::new(),
             indexed: BTreeMap::new(),
+            indexed_writes: BTreeSet::new(),
         }
     }
 
@@ -527,7 +538,19 @@ impl Env {
         let mut i = 0;
         while i < p.proj.len() {
             cur = match &p.proj[i] {
-                Proj::Field(f) => *self.fields.get(&(p.local, *f)).unwrap_or(&Val::Unknown),
+                // A struct field lives in `fields`; a *tuple* component lives in
+                // `elems`, because `_3 = (a, b)` stores it under `Proj::Index` and
+                // rustc prints the read back as `_3.0` (`Proj::Field`). The two
+                // spellings of "component 0" have to meet in one store, or a tuple
+                // local's component reads `Unknown`: `let t = (a, b); t.0` would
+                // not be `a`. A local is a struct or a tuple and never both, so the
+                // `elems` lookup can only ever hit for the tuple case, and a struct
+                // whose field is genuinely unwritten finds nothing in either store
+                // and stays `Unknown`.
+                Proj::Field(f) => match self.fields.get(&(p.local, *f)) {
+                    Some(v) => *v,
+                    None => *self.elems.get(&(p.local, *f as u64)).unwrap_or(&Val::Unknown),
+                },
                 // An indexed element. `elems` is the array-literal map, keyed by
                 // a concrete index; a slice's or array *argument*'s elements live
                 // under `indexed` instead. The two must not be confused, so the
@@ -668,10 +691,18 @@ impl Env {
             [Proj::Downcast(variant), Proj::Field(0)] | [Proj::Downcast(variant)] => {
                 self.payloads.insert((p.local, *variant), (v, 0));
             }
-            // A nested projection would need a place tree. Modelling it
-            // approximately would be a soundness hole, so it is dropped and a
-            // later read of that place yields `Unknown`.
-            _ => {}
+            // A shape the arms above do not cover. A nested projection would
+            // need a place tree, and `*a = v` (a whole-store write through a
+            // `&mut [T; N]`) would need a new store, so both are dropped. For an
+            // indexed local that leaves the store describing a value that is no
+            // longer there, so it is poisoned rather than left stale -- and
+            // `poison_elems` records the write, so a `&mut` caller sees the
+            // poison rather than its pre-call elements.
+            _ => {
+                if self.indexed.contains_key(&p.local) {
+                    self.poison_elems(p.local);
+                }
+            }
         }
     }
 
@@ -702,6 +733,7 @@ impl Env {
     /// live in `elems`. The read path keys on the same distinction, so the two
     /// must agree here or a write becomes invisible to the read.
     fn write_elem(&mut self, local: u32, index: u64, v: Val) {
+        self.indexed_writes.insert(local);
         match self.indexed.get_mut(&local) {
             Some(s) => match v {
                 Val::Sym(x) => {
@@ -720,6 +752,7 @@ impl Env {
 
     /// Mark every element of `local` unknown, keeping the length.
     fn poison_elems(&mut self, local: u32) {
+        self.indexed_writes.insert(local);
         match self.indexed.get_mut(&local) {
             Some(s) => s.poisoned = true,
             // A literal array written through a symbolic subscript: the whole
@@ -788,6 +821,16 @@ struct Frame {
     /// `Incomplete`, never a false proof -- but it silently discards a valid
     /// proof, which is the failure this crate treats as a defect.
     saved_cut: Option<Cut>,
+    /// `(caller local, callee local)` for each indexed argument the caller
+    /// handed over through a reference (`&[T]` / `&mut [T]`).
+    ///
+    /// The frontend models `&T` as its referent, so these two locals denote the
+    /// same storage and the callee's post-state is copied back to the caller's
+    /// local on return. A by-value argument is deliberately *not* in this list:
+    /// its writes must stay in the callee's frame, or `let b = f(a)` would
+    /// mutate `a` and a caller contract about `a` would be checked against the
+    /// wrong value.
+    by_ref_indexed: Vec<(u32, u32)>,
     /// The caller's frame, or `None` for the root.
     caller: Option<Box<Frame>>,
 }
@@ -1010,6 +1053,7 @@ where
             ret_dest: None,
             saved_env: None,
             saved_cut: None,
+            by_ref_indexed: Vec::new(),
             caller: None,
         },
         block: start,
@@ -1282,7 +1326,10 @@ fn try_intrinsic(
     // the width from there would ask the engine for a 64-bit overflow test.
     let first = args.first()?;
     let w = operand_width(cur, first)?;
-    let signed = operand_is_signed(cur, first);
+    // An intrinsic whose operand signedness cannot be read is refused: guessing
+    // would give `sdiv`/`srem` the unsigned meaning, which is a wrong value for
+    // every negative operand rather than a weaker proof.
+    let signed = operand_signedness(cur, first)?;
     let x = match operand(env, first) {
         Val::Sym(v) => v,
         // A `bool` operand has no bit-vector to hand the model, and an unknown
@@ -1379,6 +1426,14 @@ where
                         // The components of a tuple return, so a postcondition can
                         // name `ret.0`. They are read from the return place's element
                         // map, which is where `_0 = (a, b)` put them.
+                        //
+                        // A `bool` component is widened to a one-bit word for the
+                        // same reason a `bool` *return* is: a postcondition
+                        // `ret.0 == true` compares against a word, and dropping the
+                        // component would leave the name unbound, so the parser
+                        // refuses the whole contract. `(bool, u8)` returns are
+                        // common (every `checked_*` is `(T, bool)`), so refusing
+                        // them silently loses the proof.
                         let projs: Vec<(u32, Var)> = st
                             .env
                             .elems
@@ -1386,6 +1441,9 @@ where
                             .filter(|((l, _), _)| *l == 0)
                             .filter_map(|((_, k), v)| match v {
                                 Val::Sym(x) => Some((*k as u32, *x)),
+                                Val::Bool(p) => {
+                                    Some((*k as u32, smt::ite(*p, smt::word(1, 1), smt::word(0, 1))))
+                                }
                                 _ => None,
                             })
                             .collect();
@@ -1427,8 +1485,54 @@ where
                     // value crosses the boundary, written to the call's
                     // destination.
                     let mut env = caller.saved_env.clone().unwrap_or_else(Env::new);
+                    // The callee ran in its own `Env`, seeded from a copy of each
+                    // indexed argument's store. What happens to that store now
+                    // depends on how the argument was passed, and the two cases
+                    // are opposites:
+                    //
+                    // * A by-value `[T; N]` is the callee's *own copy*. Its writes
+                    //   die with the frame, so the caller's array is still the one
+                    //   it passed and must not be overwritten from the callee.
+                    //   Nothing is copied back.
+                    // * A `&mut [T]`/`&mut [T; N]` is the caller's storage. The
+                    //   frontend models `&T` as its referent (the single-owner
+                    //   reading, not an aliasing model), so the callee's local and
+                    //   the caller's local denote the same value: the callee's
+                    //   post-state *is* the caller's post-state, and is copied
+                    //   back. That is what makes a helper that writes through a
+                    //   reference visible to the caller, and a callee that wrote
+                    //   nothing leaves the caller's store as it was.
+                    for (cl, cal) in &caller.by_ref_indexed {
+                        if let Some(s) = st.env.indexed.get(cal) {
+                            env.indexed.insert(*cl, s.clone());
+                        }
+                    }
                     if let Some(dest) = &caller.ret_dest {
                         env.set(dest, ret);
+                        // A tuple return has components, and the callee stored
+                        // them in its *own* return place (`_0.0`, `_0.1`). The
+                        // caller's `min2(a, b).0` reads `_2.0`, so the components
+                        // have to cross the boundary with the return value.
+                        // Carrying only the aggregate loses them, and a contract
+                        // about `min2(a, b).0` is then unreadable rather than
+                        // checked. They are copied under the *destination's*
+                        // local, which is the place the caller actually reads.
+                        //
+                        // Only the components the callee wrote are copied, so a
+                        // path that left `_0.1` unwritten leaves the caller's
+                        // `dest.1` unknown rather than inventing a value.
+                        if matches!(ret, Val::Agg) {
+                            for ((l, k), v) in st.env.elems.iter() {
+                                if *l != 0 {
+                                    continue;
+                                }
+                                let p = Place {
+                                    local: dest.local,
+                                    proj: vec![Proj::Index(*k)],
+                                };
+                                env.set(&p, *v);
+                            }
+                        }
                     }
                     // Restore the caller's loop cut, which entering the callee
                     // cleared. Without this the resumed caller has no cut, so the
@@ -1601,10 +1705,33 @@ where
                 return;
             };
             let mut env = Env::new();
+            // Which caller locals were handed over through a reference, so the
+            // return path knows whose store the callee's post-state belongs to.
+            let mut by_ref_indexed: Vec<(u32, u32)> = Vec::new();
             for (i, a) in args.iter().enumerate() {
                 let v = operand(&mut st.env, a);
-                if let Some(&l) = callee_fn.arg_locals.get(i) {
-                    env.locals.insert(l, v);
+                let Some(&l) = callee_fn.arg_locals.get(i) else { continue };
+                env.locals.insert(l, v);
+                // Carry the indexed argument's state into the callee. Without
+                // this the callee's `a[0]` and `a.len()` have no store to read, so
+                // a helper that indexes its parameter cannot be modelled at all
+                // and a caller's contract about the result stays unproved.
+                //
+                // The store is *cloned*, never shared: the callee must not be able
+                // to write the caller's copy directly, or a by-value argument would
+                // behave like a reference. Only a reference argument's post-state
+                // is copied back (see the return path).
+                let Place { local: cl, proj } = match a {
+                    Operand::Copy(p) | Operand::Move(p) => p,
+                    Operand::Const(_) => continue,
+                };
+                if !proj.is_empty() {
+                    continue;
+                }
+                let Some(store) = st.env.indexed.get(cl).cloned() else { continue };
+                env.indexed.insert(l, store);
+                if arg_is_indexed_ref(callee_fn, i) {
+                    by_ref_indexed.push((*cl, l));
                 }
             }
             let caller = Frame {
@@ -1618,6 +1745,7 @@ where
                 // describes the caller's loop, and the caller is still inside it
                 // when this call returns.
                 saved_cut: st.cut.clone(),
+                by_ref_indexed: by_ref_indexed.clone(),
                 caller: st.frame.caller.clone(),
             };
             let mut visits = st.visits;
@@ -1629,6 +1757,7 @@ where
                     ret_dest: None,
                     saved_env: None,
                     saved_cut: None,
+                    by_ref_indexed: Vec::new(),
                     caller: Some(Box::new(caller)),
                 },
                 block: b0.id,
@@ -1686,9 +1815,13 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
         }
         Rvalue::Binary(op, a, b) => {
             let (x, y) = (operand(env, a), operand(env, b));
-            // The signedness of the *left* operand decides what `Shr` means; the
-            // amount's type is irrelevant and rustc keeps it a distinct `u32`.
-            let signed = operand_is_signed(f, a);
+            // The signedness of the *left* operand decides what `Shr` means and
+            // what `<`/`<=`/`>`/`>=` mean; the amount's type is irrelevant and
+            // rustc keeps it a distinct `u32`. An operand whose type cannot be
+            // resolved is refused rather than read as unsigned: `0 < a` on an
+            // `i8` is a signed comparison, and taking the constant for unsigned
+            // turned it into one that says `i8::MIN` is positive -- a false proof.
+            let Some(signed) = operand_signedness(f, a) else { return Val::Unknown };
             eval_binary(*op, x, y, dest_w, signed)
         }
         Rvalue::CheckedBinary(op, a, b) => {
@@ -1703,7 +1836,7 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
                 .unwrap_or(64);
             let x = operand(env, a);
             let y = operand(env, b);
-            let signed = operand_is_signed(f, a);
+            let Some(signed) = operand_signedness(f, a) else { return Val::Unknown };
             let res = eval_binary(*op, x, y, Some(w), signed);
             env.set(&Place { local: dest.local, proj: vec![Proj::Field(0)] }, res);
             match overflow_pred(*op, x, y, w, signed) {
@@ -1807,17 +1940,69 @@ fn width_of(f: &MirFn, p: &Place) -> Option<u8> {
     }
 }
 
-/// Whether the operand's declared type is a signed integer.
+/// Whether the `i`-th argument is an indexed value passed through a reference
+/// (`&[T]` or `&mut [T; N]`) rather than by value (`[T; N]`).
+///
+/// The distinction decides what a call does to the caller's store: a reference
+/// shares it (the callee's post-state is the caller's), a by-value array is the
+/// callee's own copy (the caller's is unchanged). Reading it off the callee's
+/// declared parameter type is what keeps the two apart, because the *caller's*
+/// operand type is the same for both.
+fn arg_is_indexed_ref(f: &MirFn, i: usize) -> bool {
+    let Some(&l) = f.arg_locals.get(i) else { return false };
+    matches!(f.ty_of(l), Some(Ty::Ref(inner)) if matches!(**inner, Ty::Slice(_) | Ty::Array(..)))
+}
+
+/// The declared type of a place, resolving the projections the dump spells out.
+///
+/// A projection changes the type, and therefore the signedness: a `u8` element of
+/// an `[u8; 4]` is unsigned, and a field of a tuple is whatever that field's type
+/// is. Reading signedness off the base local would read the *wrong* type for
+/// exactly the operands this exists to classify.
+///
+/// A struct-field projection is not resolvable here -- the dump prints
+/// `_1: Config` and says nothing about `Config`'s layout -- so it returns `None`,
+/// which the caller treats as "refuse" rather than "unsigned". In practice rustc
+/// copies a field into a temp before using it as a binary operand, so this is the
+/// defensive case; refusing is still the right answer if the shape ever changes.
+fn type_of_place(f: &MirFn, p: &Place) -> Option<Ty> {
+    let mut ty = f.ty_of(p.local)?.clone();
+    for pr in &p.proj {
+        ty = match (pr, &ty) {
+            (Proj::Field(i), Ty::Tuple(ts)) => ts.get(*i as usize)?.clone(),
+            (Proj::Index(_), Ty::Array(inner, _)) => (**inner).clone(),
+            (Proj::Deref, Ty::Ref(inner)) => (**inner).clone(),
+            (Proj::Downcast(_), _) => return None,
+            _ => return None,
+        };
+    }
+    Some(ty)
+}
+
+/// Whether the operand's declared type is a signed integer, or `None` when the
+/// type could not be resolved.
 ///
 /// `Shr` is arithmetic for a signed operand and logical for an unsigned one, and
 /// the bit pattern alone does not say which. Guessing would be a wrong answer for
-/// every signed shift, so the type is read rather than assumed.
-fn operand_is_signed(f: &MirFn, o: &Operand) -> bool {
+/// every signed shift, so the type is read rather than assumed. `None` is *not*
+/// "unsigned": the caller must refuse rather than pick a meaning.
+///
+/// The constant case is the one that was a live false proof. `0 < a` lowers to
+/// `Lt(const 0_i8, copy _1)` -- the constant is the *left* operand, and a constant
+/// carries its own signedness in the dump's type suffix. Reading a constant as
+/// unsigned made `0 < a` an unsigned comparison, so for a body of
+/// `if 0 < a { 1 } else { 0 }` the contract `requires: a == i8::MIN; ensures:
+/// ret == 1` was *proved*: `i8::MIN` is `0x80`, which is the largest `u8`, so the
+/// unsigned test said "taken" and the branch returned `1`. The real `i8` value is
+/// negative, the branch is never taken, and the function returns `0`.
+fn operand_signedness(f: &MirFn, o: &Operand) -> Option<bool> {
     match o {
-        Operand::Copy(p) | Operand::Move(p) => {
-            f.ty_of(p.local).map(Ty::is_signed).unwrap_or(false)
-        }
-        Operand::Const(_) => false,
+        Operand::Copy(p) | Operand::Move(p) => type_of_place(f, p).map(|t| t.is_signed()),
+        // A constant's suffix is its type: `const 0_i8` is signed, `const 0_u8`
+        // is not. A constant the dump printed without a suffix has no signedness
+        // to read, so it is refused rather than defaulted.
+        Operand::Const(Const::UInt(_, ty)) => ty.as_ref().map(Ty::is_signed),
+        Operand::Const(_) => None,
     }
 }
 
@@ -2080,6 +2265,45 @@ mod tests {
             // refutes it and hands back one of them.
             smt::find_model(smt::ult_const(x, 3))
         })
+    }
+
+    /// The signedness of a constant operand comes from its own type suffix.
+    ///
+    /// This is the helper the false proof lived in: `0 < a` lowers to
+    /// `Lt(const 0_i8, copy _1)`, and reading `const 0_i8` as unsigned made the
+    /// comparison unsigned. The test pins all three answers the helper can give --
+    /// signed, unsigned, and "the type was not printed, so refuse" -- because the
+    /// bug was a *default*, and a test that only checked the signed case would
+    /// pass again the moment the default came back.
+    #[test]
+    fn a_constants_signedness_comes_from_its_suffix() {
+        let f = MirFn {
+            name: "f".to_string(),
+            arg_locals: Vec::new(),
+            ret_ty: Ty::U8,
+            locals: BTreeMap::from([
+                (0, Ty::U8),
+                (1, Ty::I8),
+                (2, Ty::U8),
+                (3, Ty::Array(Box::new(Ty::I8), 4)),
+            ]),
+            local_names: BTreeMap::new(),
+            blocks: Vec::new(),
+        };
+        let signed_const = Operand::Const(Const::UInt(0, Some(Ty::I8)));
+        let unsigned_const = Operand::Const(Const::UInt(0, Some(Ty::U8)));
+        // A literal the dump printed with no suffix carries no signedness at all.
+        let bare_const = Operand::Const(Const::UInt(0, None));
+        assert_eq!(operand_signedness(&f, &signed_const), Some(true));
+        assert_eq!(operand_signedness(&f, &unsigned_const), Some(false));
+        assert_eq!(operand_signedness(&f, &bare_const), None);
+        // A place operand reads its declared type, and a projection resolves to
+        // the *element's* type rather than the container's: local 3 is `[i8; 4]`,
+        // so `_3[0]` is signed.
+        assert_eq!(operand_signedness(&f, &Operand::Copy(Place::new(0))), Some(false));
+        assert_eq!(operand_signedness(&f, &Operand::Copy(Place::new(1))), Some(true));
+        let elem = Place { local: 3, proj: vec![Proj::Index(0)] };
+        assert_eq!(operand_signedness(&f, &Operand::Copy(elem)), Some(true));
     }
 
     fn panic_kind() -> ObligationKind {

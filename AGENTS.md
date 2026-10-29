@@ -2654,3 +2654,81 @@ write poisons the field, so the postcondition is unreadable),
 `a_write_cannot_prove_a_stale_contract` over the corpus entries
 `array_write_then_symbolic_read`, `mut_ref_array_write_then_symbolic_read`,
 `generated_name_shadows_argument` and `struct_reassign_then_field_read`.
+
+## A call boundary is a real boundary: what crosses it and what must not
+
+Four soundness holes and two completeness holes lived at the same place — the
+inlined call — and in the same shape of mistake: a value or a type was carried
+across the boundary when it should have died with the frame, or dropped when it
+should have crossed.
+
+**A by-value aggregate is the callee's copy; a reference is the caller's storage.**
+The frontend models `&T` as its referent (the single-owner reading, not an aliasing
+model), so a `&mut [T; N]` argument and the caller's local denote the same store:
+the callee's post-state *is* the caller's post-state and is copied back on return
+(`Frame::by_ref_indexed`). A by-value `[T; N]` is the opposite: the callee got its
+own copy, its writes must die with the frame, and nothing is copied back
+(`Frame::by_value_indexed` records the pair only so the return-merge can tell the
+two apart). Sharing the copy — the tempting way to make a callee's element read
+agree with the caller's — makes `let b = f(a)` mutate `a`, so a caller contract
+about `a` is checked against a value that never existed. The corpus tripwires are
+`caller_of_written_copy` (by-value write must **not** leak; `ret == 0` is false, so
+it must fail) against `caller_of_clear_head` (a `&mut` write **must** be visible).
+
+**A constant operand carries its own signedness.** `0 < a` lowers to
+`Lt(const 0_i8, copy _1)` — the constant is the *left* operand, and `Const::UInt`'s
+type suffix is the only place the signedness appears. Reading a constant as
+unsigned made `0 < a` unsigned, under which `i8::MIN` (`0x80`) is the *largest*
+value, so `requires: a == i8::MIN; ensures: ret == 1` on `if 0 < a { 1 } else { 0 }`
+was **proved** — a reachable false proof, since `i8::MIN` is negative and the
+branch is never taken. The fix is `operand_signedness`, which returns `Option<bool>`
+and *refuses* (`None`) when the type cannot be resolved rather than defaulting to
+unsigned; every caller (`eval_binary`, the checked intrinsics, `try_intrinsic`)
+propagates the refusal as `Val::Unknown`. A wrong signedness is not a missed proof
+but a wrong branch, which is a wrong answer. The unit test
+`a_constants_signedness_comes_from_its_suffix` pins all three answers, because the
+bug was a *default* and a test that only checked the signed case would pass the
+moment the default came back.
+
+**A tuple component and a struct field are two spellings of "component N".**
+`_3 = (a, b)` stores the components under an *index* projection (`elems`), but rustc
+prints the read back as `_3.0` — a *field* projection (`fields`). The two have to
+meet in one store (`Env::get`'s `Proj::Field` arm falls back to `elems`), or
+`let t = (a, b); t.0` reads `Unknown`. A local is a struct or a tuple and never
+both, so the fallback can only hit for the tuple case; a struct field that is
+genuinely unwritten finds nothing in either store and stays `Unknown`.
+
+**A tuple return's components cross the call boundary with the aggregate.** The
+callee stores its result in its *own* return place (`_0.0`, `_0.1`); the caller's
+`min2(a, b).0` reads `_2.0`. Carrying only the aggregate loses the components and a
+contract about them is unreadable rather than checked. They are copied under the
+*destination's* local, and only the ones the callee wrote — a path that left `_0.1`
+unwritten leaves the caller's `dest.1` unknown rather than inventing a value. The
+tripwires `tuple_component_tripwire` and `min_call_tripwire` claim the *wrong*
+component and must fail.
+
+**A tuple-return postcondition is checked on the components a contract names.**
+`ret.0` of a `(bool, u8)` is a `bool` in the type but a one-bit word in the
+postcondition, so the component is widened on read-out (`Val::Bool` →
+`ite(p, 1, 0)`) — without it the name is unbound and the contract is refused. And
+the up-front parse probe (`verify::verify_fn`) binds only the components the
+contract *names* (`spec::named_ret_components`): binding every declared component
+made a `(u8, &u8)` return unprobeable (component 1 is a reference with no bit
+width), so a contract about `ret.0` alone skipped the whole function. A component
+the contract names and that has no width is still refused — then the name really
+cannot be resolved.
+
+`tests/mir.rs` pins each by name:
+`a_helper_that_indexes_its_parameter_reaches_the_caller_element`,
+`a_write_through_a_reference_reaches_the_caller`,
+`a_by_value_helper_cannot_write_the_callers_array`,
+`a_constant_left_signed_compare_is_signed_not_unsigned`,
+`a_postcondition_can_name_a_bool_tuple_component`,
+`a_reference_component_the_contract_does_not_name_does_not_skip_the_function`,
+`a_tuple_locals_component_can_be_read_back`,
+`a_tuple_returning_calls_component_reaches_the_caller` and
+`a_tuple_component_read_cannot_prove_the_wrong_component`, over the corpus entries
+`head`/`caller_of_head`, `clear_head`/`caller_of_clear_head`,
+`caller_of_written_copy`/`clear_copy`, `signed_const_left_false`/`_true`,
+`bool_component`, `first_component_only`, `tuple_local_component`, `min2`/`min_call`
+and the two tuple tripwires.
