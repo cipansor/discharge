@@ -397,6 +397,41 @@ pub(crate) struct Ctx {
 /// Sentinel: variable `i` has no replacement.
 const NO_SUBST: u32 = u32::MAX;
 
+/// A compile-time gate that [`Ctx`] is `!Send` and `!Sync`.
+///
+/// The bare-metal [`with_ctx`] hands out `&'static mut Ctx` from a single global
+/// `static mut CTX`, which is sound only while nothing else can reach that
+/// context -- no second thread, and no re-entrant call. The `_not_shared` marker
+/// is what makes that true, and until now only a comment said so: delete the
+/// marker and `Ctx` is auto-`Send` and auto-`Sync` (every remaining field is a
+/// plain array or integer), the crate still builds, and the safety argument is
+/// quietly false. This turns "the marker is load-bearing" into something the
+/// compiler checks on every build.
+///
+/// The mechanism is inference ambiguity, not a reading of the impls. The trait is
+/// implemented for *every* type at `AmbiguousIfImpl<()>`, and again at
+/// `AmbiguousIfImpl<InvalidSend>` for every `Send` type. If `Ctx` is `!Send` only
+/// the first applies, so the `_` below infers to `()` and this compiles. If `Ctx`
+/// *were* `Send`, both would apply and `_` would have no unique value -- an
+/// inference error, which is the gate firing. `Sync` is checked the same way, so
+/// the fact that this file compiles *is* the proof.
+const _: fn() = || {
+    trait AmbiguousIfImpl<A> {
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+
+    #[allow(dead_code)]
+    enum InvalidSend {}
+    impl<T: ?Sized + Send> AmbiguousIfImpl<InvalidSend> for T {}
+
+    #[allow(dead_code)]
+    enum InvalidSync {}
+    impl<T: ?Sized + Sync> AmbiguousIfImpl<InvalidSync> for T {}
+
+    let _ = <Ctx as AmbiguousIfImpl<_>>::some_item;
+};
+
 impl Ctx {
     const fn new() -> Self {
         Ctx {

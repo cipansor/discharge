@@ -1820,5 +1820,82 @@ fn add(_1: u32, _2: u32) -> u32 {
         let enums = layout(&[("Some", 0), ("None", 5)]);
         assert_eq!(variant_index("E::Some", &enums), Some(0));
     }
+
+    /// The front end is total: no input, however mangled, may panic.
+    ///
+    /// The parser reads text the crate did not write -- rustc's `-Zunpretty=mir`
+    /// output, or anything a caller hands [`parse_program`] directly -- so a panic
+    /// on a shape it did not expect is a crash in the caller's process, not a
+    /// refusal. The property is "returns, always", and the way to test it is to
+    /// feed it inputs that are *nearly* valid: a random token soup reaches few
+    /// parser states, but a valid dump with a few characters mutated reaches the
+    /// boundary between the states. Deterministic and seeded, so a failure is
+    /// reproducible, and cheap enough to sit in the ordinary unit suite.
+    ///
+    /// It also asserts the reader is a *function*: the same text parses to the same
+    /// structure twice. That is what makes the survival above evidence rather than
+    /// a coincidence of allocation -- and it keeps the test from passing trivially
+    /// if `parse_program` were ever changed to return an empty program for
+    /// everything.
+    #[test]
+    fn no_input_panics_the_reader() {
+        let seeds: [&str; 2] = [
+            DUMP,
+            "fn f(_1: u8, _2: u8) -> u8 {\n    debug a => _1;\n    let mut _0: u8;\n    \
+             bb0: {\n        _0 = copy _1;\n        return;\n    }\n}\n",
+        ];
+        // Characters the reader reacts to, so a mutation lands on a real boundary
+        // rather than in a comment.
+        let pool: Vec<char> = "fn(){ }_0123456789:b->u8usizelet mutgoto returncopy move \
+                               constdebugx=>;scopeSwitchIntotherwise[],requires:ensures:ret==&&<\
+                               truefalseifelseu32.a\n \"'%!|^&/\\*+-"
+            .chars()
+            .collect();
+
+        // The LCG the rest of the suite uses, so the inputs are reproducible.
+        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state
+        };
+
+        let mut saw_a_function = false;
+        for _ in 0..20_000 {
+            let mut b: Vec<char> = seeds[(next() % seeds.len() as u64) as usize].chars().collect();
+            for _ in 0..1 + (next() % 12) {
+                if b.is_empty() {
+                    break;
+                }
+                let i = (next() as usize) % b.len();
+                match next() % 3 {
+                    0 => {
+                        b.remove(i);
+                    }
+                    1 => b[i] = pool[(next() as usize) % pool.len()],
+                    _ => b.insert(i, pool[(next() as usize) % pool.len()]),
+                }
+            }
+            let text: String = b.into_iter().collect();
+
+            // The claim under test. A panic here is the failure, and the text is in
+            // the message so the seed can be recovered.
+            let first = std::panic::catch_unwind(|| parse_program(&text))
+                .unwrap_or_else(|_| panic!("parse_program panicked on: {text:?}"));
+            let second = parse_program(&text);
+            assert_eq!(first, second, "parse_program is not a function on: {text:?}");
+
+            // The contract reader reads the same text, so it gets the same
+            // treatment. Only the panic property is asserted here; its own unit
+            // tests pin what it parses.
+            let _ = std::panic::catch_unwind(|| crate::mir::spec::extract(&text))
+                .unwrap_or_else(|_| panic!("spec::extract panicked on: {text:?}"));
+
+            saw_a_function |= !first.fns.is_empty();
+        }
+        // The corpus is meant to produce *some* real programs, not only refusals.
+        // Without this the test could pass while the reader stopped recognising
+        // anything at all.
+        assert!(saw_a_function, "no mutation produced a parsed function");
+    }
 }
 

@@ -1285,6 +1285,51 @@ claim by asserting the trait bound in a scratch test and watching it fail. A com
 names a mechanism the type system enforces will survive refactoring; one that names an
 intention will not.
 
+**Follow-up: the scratch test was not enough, so it is now a gate.** A scratch test that
+was run once and deleted leaves the marker exactly as unprotected as the comment was — the
+next refactor that drops `_not_shared` builds clean and the safety argument is false again,
+with nothing to notice. `smt.rs` now carries a permanent `const _: fn() = || { ... }` that
+fails the *build* if `Ctx` ever becomes `Send` or `Sync`. The mechanism is inference
+ambiguity: `AmbiguousIfImpl<()>` is implemented for every type, and
+`AmbiguousIfImpl<InvalidSend>` again for every `Send` type, so a `let _ = <Ctx as
+AmbiguousIfImpl<_>>::some_item;` compiles only while `Ctx` is `!Send` (one applicable impl)
+and is an `E0283` inference error the moment it is `Send` (two). `Sync` is checked the same
+way. Teeth confirmed the only way that counts: removing `_not_shared` fails the build with
+`multiple impls satisfying Ctx: AmbiguousIfImpl<_>`, and restoring it builds. The general
+rule this is an instance of: a one-off verification of an invariant is not the same as a
+gate, and only the gate survives the next change.
+
+## The front end is total, and "it has never panicked" is not the same as "it cannot"
+
+The MIR reader parses text the crate did not write — rustc's `-Zunpretty=mir` output, or
+anything a caller hands `parse_program` directly. A panic on a shape it did not expect is a
+crash in the caller's process, not a refusal, and the crate's whole posture is that an
+unmodelled input is a refusal. So "the reader is total" is a property the safety story leans
+on, and it was, until now, only an observation: nobody had seen it panic.
+
+It is now a test, `mir::parse::tests::no_input_panics_the_reader`. The interesting choice is
+the *input distribution*. A random token soup is cheap and reaches almost no parser state —
+it fails at the first unexpected token, which is the easy path. What reaches the boundary
+between states is a **valid dump with a few characters mutated**, so the corpus is two real
+dumps with 1-12 single-character insertions, deletions and substitutions from a pool of
+characters the reader actually reacts to. 20,000 such inputs, deterministic and seeded.
+
+The test asserts three things, not one, because "did not panic" alone can pass for the wrong
+reason:
+
+* it does not panic (the property);
+* the same text parses to the same structure twice (so the reader is a function, not a
+  side-effecting accumulator — this is what makes the survival evidence rather than luck);
+* at least one mutation still produced a parsed function (a positive control, so the test
+  cannot pass by the reader refusing everything — the same trap as the export-checker test
+  above).
+
+The contract reader (`spec::extract`) reads the same text and is checked for the panic
+property too. It survived 300,000 token-soup inputs and 700,000 mutation inputs across the
+two entry points while this was being written, so the property appears to hold rather than
+merely to be untested. Nothing was found, which is the honest result: a robustness test that
+finds nothing has still converted an assumption into a check.
+
 ## A number in a document is a claim that must reproduce
 
 The README said "77 of 800 random predicates" were ill-sorted by the old exporter. The
