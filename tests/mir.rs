@@ -186,6 +186,152 @@ fn refuses_a_contract_it_cannot_read() {
     });
 }
 
+/// A literal takes its width from the operand it meets, not from the widest
+/// name in scope.
+///
+/// This is the bug that array support exposed. A slice or array length is a
+/// `usize`, so once such an argument is in scope it becomes the widest name, and
+/// a contract literal was sized from that maximum. `ret <= 255` for a `u8` return
+/// then became an 8-bit value compared against a 64-bit constant, which the
+/// engine reports as ill-formed -- and an ill-formed term makes *every*
+/// obligation in the run `Unknown`, so the whole function was `incomplete` for a
+/// reason that had nothing to do with its body.
+///
+/// The check is on the evaluator, so it does not depend on a corpus function
+/// happening to be skipped for another reason. `n` stands in for the wide
+/// length, `ret` for the narrow return: the literal must end up 8 bits wide.
+#[test]
+fn a_literal_is_sized_from_the_operand_it_meets() {
+    use discharge::smt;
+    smt::with_fresh(|| {
+        let mut args = std::collections::BTreeMap::new();
+        // A 64-bit "length", in scope but not mentioned by the contract.
+        args.insert("xs__len".to_string(), smt::var(64));
+        let ret = smt::var(8);
+        let p = spec::eval_ensures(
+            "ret <= 255",
+            &args,
+            Some(ret),
+            &std::collections::BTreeSet::new(),
+            false,
+            &spec::FieldEnv::default(),
+        )
+        .expect("a narrow literal against a wide name must still parse");
+        assert!(
+            !smt::is_ill_formed(),
+            "the literal must be resized to `ret`'s 8 bits, not left at 64"
+        );
+        assert!(smt::prove(p).is_proved(), "`ret <= 255` must hold for every u8");
+    });
+}
+
+/// A literal too large for the operand's width is refused, not truncated.
+///
+/// `a <= 300` for a `u8` cannot hold, so the honest answers are "refused" or
+/// "unsatisfiable". What it must *not* be is silently narrowed to `a <= 44`,
+/// which is what a truncating resize would do -- and that is a weaker claim that
+/// could pass. The refusal is the error, and it names the width so the message is
+/// actionable.
+#[test]
+fn a_literal_that_does_not_fit_is_refused_not_truncated() {
+    use discharge::smt;
+    smt::with_fresh(|| {
+        let mut args = std::collections::BTreeMap::new();
+        args.insert("a".to_string(), smt::var(8));
+        let err = spec::eval_requires(
+            "a <= 300",
+            &args,
+            &std::collections::BTreeSet::new(),
+            &spec::FieldEnv::default(),
+        )
+        .expect_err("300 does not fit a u8, so the contract must be refused");
+        assert!(
+            err.to_string().contains("300") && err.to_string().contains("8-bit"),
+            "the refusal must name the value and the width, got: {err}"
+        );
+    });
+}
+
+/// A named type bound carries the width of the type it names.
+///
+/// `i8::MIN` is the bit pattern `0x80`, exactly 8 bits. Building it at the
+/// widest name in scope and narrowing it back would compare a 64-bit `128`
+/// against the signed 8-bit range and refuse it -- a refusal of a bound that is
+/// in range by construction. The width has to come from `i8`, not from the
+/// contract's other operands.
+#[test]
+fn a_named_type_bound_keeps_its_own_width() {
+    use discharge::smt;
+    smt::with_fresh(|| {
+        let mut args = std::collections::BTreeMap::new();
+        args.insert("a".to_string(), smt::var(8));
+        // A 64-bit name in scope, which is what used to widen the bound.
+        args.insert("xs__len".to_string(), smt::var(64));
+        let mut signed = std::collections::BTreeSet::new();
+        signed.insert("a".to_string());
+        let p = spec::eval_requires("a >= i8::MIN", &args, &signed, &spec::FieldEnv::default())
+            .expect("`a >= i8::MIN` must parse even with a wide name in scope");
+        assert!(!smt::is_ill_formed(), "the bound must be built at 8 bits");
+        // Every `i8` is `>= i8::MIN`, so the precondition holds on all inputs.
+        assert!(smt::prove(p).is_proved(), "`a >= i8::MIN` must hold for every i8");
+    });
+}
+
+/// A negative literal keeps its value when it is widened to a signed operand.
+///
+/// `a >= -10` for an `i8` is the shape that makes sign extension matter: the
+/// literal is parsed as `0 - 10` at some width and then has to reach `a`'s width
+/// with the *value* preserved. Zero-extending it would turn `-10` into a large
+/// positive number and the comparison would mean something else entirely.
+#[test]
+fn a_negative_literal_is_sign_extended_to_the_operand() {
+    use discharge::smt;
+    smt::with_fresh(|| {
+        let mut args = std::collections::BTreeMap::new();
+        args.insert("a".to_string(), smt::var(8));
+        let mut signed = std::collections::BTreeSet::new();
+        signed.insert("a".to_string());
+        let p = spec::eval_requires("a >= -10", &args, &signed, &spec::FieldEnv::default())
+            .expect("`a >= -10` must parse");
+        assert!(!smt::is_ill_formed(), "the literal must be resized to 8 bits");
+        // `a >= -10` is the negation of `a < -10`, and for an `i8` the only such
+        // `a` are -128..=-11. So the contract must *fail* on those inputs.
+        // `-10` as an `i8` is the bit pattern `0xF6`; building it from a `u64`
+        // would itself be ill-formed, since `2^64 - 10` does not fit 8 bits.
+        let minus_ten = smt::word(0xF6, 8);
+        let bad = smt::and(p, smt::slt(args["a"], minus_ten));
+        assert_eq!(
+            smt::find_model(bad),
+            smt::Verdict::Unsat,
+            "`a >= -10` must exclude exactly `a < -10`"
+        );
+    });
+    smt::with_fresh(|| {
+        // The same contract with a 64-bit name also in scope. `-10` is built at
+        // 64 bits as `2^64 - 10`, and narrowing that to 8 bits must take the low
+        // byte (`0xF6`) rather than rebuild a word from the 64-bit value, which
+        // would not fit and would set the ill-formed flag.
+        let mut args = std::collections::BTreeMap::new();
+        args.insert("a".to_string(), smt::var(8));
+        args.insert("xs__len".to_string(), smt::var(64));
+        let mut signed = std::collections::BTreeSet::new();
+        signed.insert("a".to_string());
+        let p = spec::eval_requires("a >= -10", &args, &signed, &spec::FieldEnv::default())
+            .expect("`a >= -10` must parse with a wide name in scope");
+        assert!(
+            !smt::is_ill_formed(),
+            "narrowing a negative literal must take the low bits, not rebuild a wide word"
+        );
+        // And it must still mean what it says: satisfiable (an `i8` of `-10`
+        // satisfies it), but not valid (every `i8` below `-10` violates it).
+        assert!(
+            !matches!(smt::find_model(p), smt::Verdict::Unsat),
+            "`a >= -10` must be satisfiable"
+        );
+        assert!(!smt::prove(p).is_proved(), "`a >= -10` must not hold for every i8");
+    });
+}
+
 // ---------------------------------------------------------------------------
 // End-to-end verification, with rustc
 // ---------------------------------------------------------------------------
@@ -872,6 +1018,60 @@ fn a_slice_length_is_a_symbolic_input_shared_with_the_body() {
     let Some(report) = verify_realistic(&["first_of"]) else { return };
     let o = outcome(&report, "first_of");
     assert!(o.is_verified(), "`first_of` must verify, got: {o}");
+}
+
+/// A fixed-size array argument: elements are inputs, but the length is not.
+///
+/// `max_of_pair` requires `a[0] <= a[1]` and claims `ret == a[1]`. This is the
+/// array counterpart of `first_of`, and the difference is the point: a slice's
+/// length is a symbolic input read through `PtrMetadata`, while an array's length
+/// is a *type* constant, so the bounds check in the body is against the literal
+/// `4` and `a.len()` in a contract is `4` rather than a fresh variable.
+#[test]
+fn a_contract_can_name_a_fixed_size_array_element() {
+    let Some(report) = verify_realistic(&["max_of_pair", "array_third"]) else { return };
+    for name in ["max_of_pair", "array_third"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+}
+
+/// An array built in the body has *concrete* elements, not inputs.
+///
+/// `array_literal_elem` returns `a[1]` of `[10, 20, 30, 40]` and claims
+/// `ret == 20`. Verified is the evidence that the element map holds the literal
+/// values: if the index were modelled as an unconstrained input the claim would
+/// fail with a counterexample instead.
+#[test]
+fn an_array_literal_element_is_concrete() {
+    let Some(report) = verify_realistic(&["array_literal_elem"]) else { return };
+    let o = outcome(&report, "array_literal_elem");
+    assert!(o.is_verified(), "`array_literal_elem` must verify, got: {o}");
+}
+
+/// The tripwire for array *element independence*.
+///
+/// `array_alias_tripwire` has the same body as `max_of_pair` but claims
+/// `ret <= a[0]`, which is false when `a[1] > a[0]`. It must FAIL, and the
+/// counterexample must assign `a[0]` and `a[1]` to *different* variables -- a
+/// pass would mean the elements collapsed to one input and `max_of_pair`'s proof
+/// was vacuous.
+#[test]
+fn array_elements_are_independent_inputs_not_one_aliased_variable() {
+    let Some(report) = verify_realistic(&["array_alias_tripwire"]) else { return };
+    let o = outcome(&report, "array_alias_tripwire");
+    let FnOutcome::Failed { kind, detail } = o else {
+        panic!(
+            "`array_alias_tripwire` must fail: a pass means `a[0]` and `a[1]` \
+             collapsed to one variable and the array contract was vacuous. got: {o}"
+        );
+    };
+    assert_eq!(kind, "postcondition", "got: {o}");
+    let names: Vec<&str> = detail.split_whitespace().filter(|t| t.starts_with('v')).collect();
+    assert!(
+        names.iter().collect::<std::collections::BTreeSet<_>>().len() >= 2,
+        "the two elements were assigned the same variable, so they are aliased: {detail}"
+    );
 }
 
 /// A postcondition can name a component of a tuple return.

@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use crate::mir::intrinsics::{self, Outcome};
 use crate::mir::parse::{
     BinOp, Block, Callee, Const, MirFn, MirProgram, Operand, Place, Proj, Rvalue, Stmt, Term, Ty,
-    USIZE_WIDTH, UnOp,
+    UnOp,
 };
 use crate::smt::{self, Pred, Var, Verdict};
 
@@ -352,23 +352,26 @@ struct Env {
     /// such backing, and a deref of it reads `Unknown` rather than inventing a
     /// value.
     deref_ok: BTreeMap<u32, ()>,
-    /// Slices, keyed by the local the `&[T]` argument lives in: its symbolic
-    /// length and its elements.
+    /// Values addressed by an index, with a length: slice arguments (`&[T]`) and
+    /// array arguments (`[T; N]`), keyed by the local the argument lives in.
     ///
-    /// A slice has no length in its type, so the length is a fresh symbolic input
-    /// -- it is whatever the caller passed. Its elements are distinct inputs per
-    /// index, so `xs[0]` and `xs[1]` are two values and `xs[0] == xs[1]` is not
-    /// provable; see `Slice::elems`.
-    slices: BTreeMap<u32, Slice>,
+    /// A slice has no length in its type, so its length is a fresh symbolic input
+    /// -- it is whatever the caller passed. An array's length is the constant in
+    /// its type. Either way the length is a *word* here, and the elements are
+    /// distinct inputs per index, so `xs[0]` and `xs[1]` are two values and
+    /// `xs[0] == xs[1]` is not provable; see `Indexed::elems`.
+    indexed: BTreeMap<u32, Indexed>,
 }
 
-/// A modelled slice: a symbolic length, and elements read through it.
+/// A modelled value with a length and elements: a slice or an array.
 #[derive(Clone, Debug)]
-struct Slice {
+struct Indexed {
+    /// The length. A symbolic input for a slice, the type's constant for an
+    /// array; the executor only needs it to be a word of `usize` width.
     len: Var,
     /// The width of one element, which is the *referent's* width (`u8` for
-    /// `&[u8]`), not the length's. Taking it from `len` would make every element
-    /// 64 bits wide and mis-size every read.
+    /// `&[u8]` or `[u8; 4]`), not the length's. Taking it from `len` would make
+    /// every element 64 bits wide and mis-size every read.
     elem_w: u8,
     /// `index value -> element variable`. Only indices whose value the run can
     /// resolve can be looked up here; a symbolic index that cannot be pinned is
@@ -385,17 +388,18 @@ impl Env {
             payloads: BTreeMap::new(),
             discriminants: BTreeMap::new(),
             deref_ok: BTreeMap::new(),
-            slices: BTreeMap::new(),
+            indexed: BTreeMap::new(),
         }
     }
 
-    /// The element variable for `index` of slice `local`, created on first use.
+    /// The element variable for `index` of an indexed value (slice or array)
+    /// `local`, created on first use.
     ///
     /// Two different indices are two different variables, and the same index read
-    /// twice is the same variable, which is what makes a slice read a *function*
-    /// of the index rather than an arbitrary value per read.
-    fn slice_elem(&mut self, local: u32, index: u64) -> Option<Var> {
-        let s = self.slices.get_mut(&local)?;
+    /// twice is the same variable, which is what makes an indexed read a
+    /// *function* of the index rather than an arbitrary value per read.
+    fn index_elem(&mut self, local: u32, index: u64) -> Option<Var> {
+        let s = self.indexed.get_mut(&local)?;
         if let Some(v) = s.elems.get(&index) {
             return Some(*v);
         }
@@ -405,18 +409,19 @@ impl Env {
         Some(v)
     }
 
-    /// Read `(*_1)[_2]` — a slice element subscripted by a local.
+    /// Read `(*_1)[_2]` — an indexed element (a slice or an array) subscripted by
+    /// a local.
     ///
-    /// Returns `None` when the place is not a slice-element read at all, so the
-    /// caller falls through to the ordinary path; returns `Some(Unknown)` when it
-    /// *is* one but the index cannot be pinned, so an unresolvable subscript is a
+    /// Returns `None` when the place is not an indexed read at all, so the caller
+    /// falls through to the ordinary path; returns `Some(Unknown)` when it *is*
+    /// one but the index cannot be pinned, so an unresolvable subscript is a
     /// missing value rather than an arbitrary element.
     ///
     /// The element is created on first read, which is why this takes `&mut self`
     /// and `get` cannot: the first read of `xs[0]` has no variable yet, and the
     /// second read must find the same one.
-    fn read_slice_index(&mut self, p: &Place) -> Option<Val> {
-        if !self.slices.contains_key(&p.local) {
+    fn read_indexed(&mut self, p: &Place) -> Option<Val> {
+        if !self.indexed.contains_key(&p.local) {
             return None;
         }
         let index = match p.proj.as_slice() {
@@ -432,7 +437,7 @@ impl Env {
             }
             _ => return None,
         };
-        Some(match self.slice_elem(p.local, index) {
+        Some(match self.index_elem(p.local, index) {
             Some(v) => Val::Sym(v),
             None => Val::Unknown,
         })
@@ -462,17 +467,17 @@ impl Env {
         while i < p.proj.len() {
             cur = match &p.proj[i] {
                 Proj::Field(f) => *self.fields.get(&(p.local, *f)).unwrap_or(&Val::Unknown),
-                // A slice element. `elems` is the array-literal map, keyed by a
-                // concrete index; a slice's elements live under `slices` instead,
-                // read through the length. The two must not be confused, so a
-                // slice lookup is tried first and only for a local that *is* a
-                // slice.
-                Proj::Index(k) => match self.slices.get(&p.local) {
+                // An indexed element. `elems` is the array-literal map, keyed by
+                // a concrete index; a slice's or array *argument*'s elements live
+                // under `indexed` instead. The two must not be confused, so the
+                // `indexed` lookup is tried first and only for a local that *is*
+                // one.
+                Proj::Index(k) => match self.indexed.get(&p.local) {
                     Some(s) => match s.elems.get(k) {
                         Some(v) => Val::Sym(*v),
                         // Not read yet. `get` takes `&self` and so cannot create
                         // the element; the operand path goes through
-                        // `read_slice_index`, which can, and does so before this
+                        // `read_indexed`, which can, and does so before this
                         // is reached. Answering `Unknown` here is the fallback
                         // for a caller that did not.
                         None => Val::Unknown,
@@ -491,7 +496,7 @@ impl Env {
                         _ => None,
                     };
                     match k {
-                        Some(k) => match self.slices.get(&p.local) {
+                        Some(k) => match self.indexed.get(&p.local) {
                             Some(s) => {
                                 s.elems.get(&k).map(|v| Val::Sym(*v)).unwrap_or(Val::Unknown)
                             }
@@ -704,9 +709,10 @@ struct Cut {
 pub struct Seeds {
     /// `(local, field index, variable)` for each struct field a contract names.
     pub fields: Vec<(u32, u32, Var)>,
-    /// `(local, length variable)` for each slice argument.
-    pub lens: Vec<(u32, Var)>,
-    /// `(local, index, variable)` for each slice element a contract names.
+    /// `(local, length variable, element width)` for each slice or array
+    /// argument.
+    pub lens: Vec<(u32, Var, u8)>,
+    /// `(local, index, variable)` for each element a contract names.
     pub elems: Vec<(u32, u64, Var)>,
 }
 
@@ -793,18 +799,11 @@ where
     // a contract that names it later would then disagree — which is why
     // `bind_slice_refs` runs over every contract text before the run, so a name a
     // contract uses always has a binding here.
-    for &(local, len) in &seeds.lens {
-        let elem_w = match f.ty_of(local) {
-            Some(Ty::Ref(inner)) => match inner.as_ref() {
-                Ty::Slice(e) => e.width().unwrap_or(USIZE_WIDTH),
-                _ => USIZE_WIDTH,
-            },
-            _ => USIZE_WIDTH,
-        };
-        env.slices.insert(local, Slice { len, elem_w, elems: BTreeMap::new() });
+    for &(local, len, elem_w) in &seeds.lens {
+        env.indexed.insert(local, Indexed { len, elem_w, elems: BTreeMap::new() });
     }
     for &(local, index, v) in &seeds.elems {
-        if let Some(s) = env.slices.get_mut(&local) {
+        if let Some(s) = env.indexed.get_mut(&local) {
             s.elems.insert(index, v);
         }
     }
@@ -1487,7 +1486,7 @@ fn operand(env: &mut Env, o: &Operand) -> Val {
         Operand::Copy(p) | Operand::Move(p) => {
             // A slice element is created on first read, so it goes through the
             // mutable path before the ordinary one.
-            if let Some(v) = env.read_slice_index(p) {
+            if let Some(v) = env.read_indexed(p) {
                 return v;
             }
             env.get(p)
@@ -1593,7 +1592,7 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
         // only when the local is a slice the frontend bound a length for; any
         // other pointer has metadata this model cannot express, and answering
         // `Unknown` there is what keeps an invented length out of a proof.
-        Rvalue::PtrMetadata(p) => match env.slices.get(&p.local) {
+        Rvalue::PtrMetadata(p) => match env.indexed.get(&p.local) {
             Some(s) => Val::Sym(s.len),
             None => Val::Unknown,
         },

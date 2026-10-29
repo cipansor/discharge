@@ -7,23 +7,30 @@
 //! reports which. Nothing here asserts a verdict, so adding a shape that fails
 //! is the point rather than a broken test: it is how the gap is measured.
 //!
-//! The three failure families, and the shape that produces each:
+//! Every shape below is decided: fields of by-value and by-reference structs,
+//! tuple components, slice lengths and elements, fixed-size array lengths and
+//! elements, `core::num` intrinsics and loops with invariants. The three
+//! tripwires (`field_alias_tripwire`, `slice_alias_tripwire`,
+//! `array_alias_tripwire`) *fail*, which is the evidence that two fields or two
+//! elements are two distinct inputs rather than one aliased variable.
 //!
-//! * **Contracts cannot name a field or an element.** `pick`'s precondition
-//!   wants to say `c.lo <= c.hi`, but the contract language only knows argument
-//!   *names*, and `c` is a reference with no bit-vector width. `first` wants
-//!   `xs[0]`, and slices are not modelled at all.
-//! * **Loops have no invariant.** *Historical.* A loop with no `invariant:` is
-//!   unwound to `DEFAULT_UNWIND` and then reported incomplete; the fix is to
-//!   write the invariant, which the frontend now cuts on instead of unwinding
-//!   (`sum_to`, `count_up` and `count_evens` below all carry one and verify).
-//!   The gap that remains is that the invariant is not *inferred* — you supply
-//!   the induction hypothesis, as in SPARK.
-//! * **`core` is not modelled.** `via_option` calls `u8::checked_add` and
-//!   `via_iter` calls `<&[u8] as IntoIterator>::into_iter`; both are reported
-//!   as unmodelled calls, so the path is unknown.
+//! The families this file was written to measure, and where each stands:
 //!
-//! Keep the functions small. The point is to isolate one missing capability per
+//! * **Fields, elements and lengths.** *Closed.* A contract can name `c.lo` and
+//!   `c.hi` on a by-value struct, `xs[0]` and `xs.len()` on a slice, and `a[0]`
+//!   and `a.len()` on a fixed-size array. A slice's length is a symbolic input;
+//!   an array's length is a type constant, so it is bound to `N` rather than to
+//!   a fresh variable.
+//! * **Loops have no invariant.** *Partly closed.* A loop without one is
+//!   unwound to `DEFAULT_UNWIND` and reported incomplete; writing the invariant
+//!   makes the frontend cut on it instead (`sum_to`, `count_up` and
+//!   `count_evens` all carry one and verify). The invariant is not *inferred* —
+//!   you supply the induction hypothesis, as in SPARK.
+//! * **`core` is not modelled.** *Closed for the `num` intrinsics.*
+//!   `checked_*`, `saturating_*` and `wrapping_*` are computed in the frontend
+//!   from their operands rather than by reading `core`'s MIR.
+//!
+//! Keep the functions small. The point is to isolate one capability per
 //! function, so a change that adds it moves exactly one row from `incomplete`
 //! to `verified`.
 
@@ -59,7 +66,7 @@ pub fn clamp_simple(lo: u8, hi: u8, v: u8) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
-// Gap 1: a contract cannot name a field, an element, or a length.
+// Contracts that name a field, an element, or a length.
 // ---------------------------------------------------------------------------
 
 /// A struct passed by reference. The natural precondition is about two fields.
@@ -80,6 +87,51 @@ pub fn pick_from(c: &Config, v: u8) -> u8 {
 /// ensures: ret == xs[0]
 pub fn first_of(xs: &[u8]) -> u8 {
     xs[0]
+}
+
+/// A fixed-size array argument. Unlike a slice the length is a *type*
+/// constant, so `a.len()` is not an input and the bounds check is against a
+/// literal: `_3 = Lt(_2, const 4_usize)`. That literal is what makes this shape
+/// a separate case from `first_of` -- the array's length never becomes a
+/// symbolic variable, and the element width comes from `[u8; 4]` itself.
+/// requires: a[0] <= a[1]
+/// ensures: ret == a[1]
+pub fn max_of_pair(a: [u8; 4]) -> u8 {
+    if a[0] > a[1] {
+        a[0]
+    } else {
+        a[1]
+    }
+}
+
+/// The array-length tripwire: the same shape as `max_of_pair` but the contract
+/// claims a bound the body does not meet. It must FAIL, and the counterexample
+/// must assign `a[0]` and `a[1]` to *different* variables -- a pass would mean
+/// the elements collapsed to one input and the array proof was vacuous.
+/// requires: true
+/// ensures: ret <= a[0]
+pub fn array_alias_tripwire(a: [u8; 4]) -> u8 {
+    if a[0] > a[1] {
+        a[0]
+    } else {
+        a[1]
+    }
+}
+
+/// The array length is a constant, so a contract can *rely* on it: `a.len()` is
+/// `4` here regardless of the caller, which a slice's length never is.
+/// requires: a.len() == 4
+/// ensures: ret == a[2]
+pub fn array_third(a: [u8; 4]) -> u8 {
+    a[2]
+}
+
+/// An array built in the body, so the elements are concrete rather than inputs.
+/// requires: true
+/// ensures: ret == 20
+pub fn array_literal_elem() -> u8 {
+    let a = [10u8, 20, 30, 40];
+    a[1]
 }
 
 /// A struct by value, to separate "field projection" from "behind a reference".

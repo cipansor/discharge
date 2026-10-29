@@ -181,7 +181,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     // hold a `&mut`.
     if let Some(c) = contract {
         for text in c.requires.iter().chain(c.ensures.iter()).chain(c.invariants.iter()) {
-            fields.bind_slice_refs(text);
+            fields.bind_index_refs(text);
         }
     }
     let ret_signed = f.ret_ty.is_signed();
@@ -243,9 +243,14 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     // unsound in the other direction.
     let ensures: Vec<String> = contract.map(|c| c.ensures.clone()).unwrap_or_default();
     if !ensures.is_empty() {
-        // Local `_0` is the return place; `Ty::width` is `Some` for every type a
-        // contract can name, and the fallback only keeps the probe total.
-        let probe_ret = smt::var_named(0, f.ret_ty.width().unwrap_or(1).clamp(1, 64));
+        // Local `_0` is the return place; `Ty::width` is `Some` for a scalar
+        // return, which is the only case where a bare `ret` can be read. For an
+        // aggregate there is no single word, so the probe must pass `None` here
+        // exactly as the run does -- a fabricated one-bit word would let a bare
+        // `ret` in an aggregate contract parse against it, and the width then
+        // comes out as 1, so `ret <= 5` is refused with a message about a
+        // "1-bit width" that has nothing to do with the function.
+        let probe_ret = f.ret_ty.width().map(|w| smt::var_named(0, w.clamp(1, 64)));
         // The probe must resolve exactly what the real postcondition will, so
         // `ret.N` is bound here too. Leaving it out would make the probe fail on a
         // contract the run could have handled, and the function would be skipped
@@ -263,7 +268,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
             }
         }
         if let Some(err) = ensures.iter().find_map(|e| {
-            spec::eval_ensures(e, &arg_vars, Some(probe_ret), &signed, ret_signed, &probe_fields).err()
+            spec::eval_ensures(e, &arg_vars, probe_ret, &signed, ret_signed, &probe_fields).err()
         }) {
             return FnOutcome::Skipped { reason: format!("unreadable `ensures`: {err}") };
         }

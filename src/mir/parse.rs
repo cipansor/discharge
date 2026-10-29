@@ -39,7 +39,8 @@ pub enum Ty {
     Array(Box<Ty>, u64),
     /// A slice, e.g. `[u32]` — the referent of a `&[u32]`. Its *length* is not
     /// part of the type (that is the whole point of a slice), so it is a symbolic
-    /// input rather than a constant; see `FieldEnv::bind_slice_len`.
+    /// input rather than a constant; see `FieldEnv::bind_indexed_len`. An array's
+    /// length, by contrast, is in its type; see `FieldEnv::bind_array_len`.
     Slice(Box<Ty>),
     Unit,
     /// A shared or mutable reference. Modelled as its referent's width, because

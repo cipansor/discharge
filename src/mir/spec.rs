@@ -309,19 +309,28 @@ pub struct FieldEnv {
     /// direction that matters. These seeds are how the two are made to agree by
     /// construction rather than by convention.
     pub seeds: Vec<(u32, u32, Var)>,
-    /// `(local, length variable)` for each slice argument.
+    /// `(local, length variable, element width)` for each slice or array
+    /// argument.
     ///
     /// A slice has no length in its type, so the length is a symbolic input, and
     /// `xs.len()` in a contract and `PtrMetadata(_1)` in the body must name the
-    /// same one. This is the slice analogue of `seeds`.
-    pub len_seeds: Vec<(u32, Var)>,
-    /// `(local, index, element variable)` for each slice element the contract
-    /// names. The body's `(*_1)[0]` reads the same variable, so `xs[0]` in a
-    /// contract and `xs[0]` in the body are one value, not two that look alike.
+    /// same one. An array's length *is* in its type, so there it is the constant
+    /// `N`, and the contract's `a.len()` and the body's `const N_usize` agree by
+    /// being the same word. This is the indexed analogue of `seeds`.
+    pub len_seeds: Vec<(u32, Var, u8)>,
+    /// `(local, index, element variable)` for each slice or array element the
+    /// contract names. The body's `(*_1)[0]` reads the same variable, so `xs[0]`
+    /// in a contract and `xs[0]` in the body are one value, not two that look
+    /// alike.
     pub elem_seeds: Vec<(u32, u64, Var)>,
-    /// Slice arguments: name → (local, element width), so a contract's
-    /// `xs.len()` and `xs[0]` can be bound without the IR's `Ty` in hand.
-    slices: BTreeMap<String, (u32, u8)>,
+    /// Indexed arguments (slices and arrays): name → (local, element width, the
+    /// array's fixed length if it is one), so a contract's `xs.len()` and `xs[0]`
+    /// can be bound without the IR's `Ty` in hand.
+    ///
+    /// The length is `Some(n)` for an array and `None` for a slice, which is what
+    /// lets a contract naming `a[9]` on a `[u8; 4]` be refused as out of range
+    /// rather than bound to a fresh variable for an element that does not exist.
+    indexed: BTreeMap<String, (u32, u8, Option<u64>)>,
 }
 
 impl FieldEnv {
@@ -425,7 +434,7 @@ impl FieldEnv {
     /// passed — so it is an input, exactly like the elements. The same variable
     /// is handed to the executor as a `len_seed`, which is what makes the
     /// contract's `xs.len()` and the body's `PtrMetadata(_1)` one value.
-    pub fn bind_slice_len(&mut self, local: u32, arg: &str, elem_w: u8) -> Option<Var> {
+    pub fn bind_indexed_len(&mut self, local: u32, arg: &str, elem_w: u8) -> Option<Var> {
         if !(1..=64).contains(&elem_w) {
             return None;
         }
@@ -437,22 +446,51 @@ impl FieldEnv {
         let v = smt::var_named(slot, USIZE_WIDTH);
         self.vars.insert(format!("{arg}__len"), v);
         self.paths.insert(format!("{arg}.len()"), format!("{arg}__len"));
-        self.slices.insert(arg.to_string(), (local, elem_w));
-        self.len_seeds.push((local, v));
+        self.indexed.insert(arg.to_string(), (local, elem_w, None));
+        self.len_seeds.push((local, v, elem_w));
         self.known_args.insert(arg.to_string());
         Some(v)
     }
 
-    /// Bind one element of a slice argument to a fresh symbolic variable.
+    /// Bind an array argument's length to its *constant*, `N`.
+    ///
+    /// Unlike a slice, an array's length is part of its type, so `a.len()` is the
+    /// constant `N` and not an input: there is nothing for the caller to choose.
+    /// Binding it to a fresh variable would be the unsound direction — it would
+    /// admit lengths the type excludes, so a contract proved at length 4 would
+    /// claim to hold at any length.
+    pub fn bind_array_len(&mut self, local: u32, arg: &str, elem_w: u8, n: u64) -> Option<()> {
+        if !(1..=64).contains(&elem_w) {
+            return None;
+        }
+        let v = smt::word(n, USIZE_WIDTH);
+        self.vars.insert(format!("{arg}__len"), v);
+        self.paths.insert(format!("{arg}.len()"), format!("{arg}__len"));
+        self.indexed.insert(arg.to_string(), (local, elem_w, Some(n)));
+        self.len_seeds.push((local, v, elem_w));
+        self.known_args.insert(arg.to_string());
+        Some(())
+    }
+
+    /// Bind one element of a slice or array argument to a fresh symbolic variable.
     ///
     /// `xs[k]` is a distinct input per index — two indices are two variables, so
     /// `xs[0] == xs[1]` is not provable — and the same index twice is the same
-    /// variable. The element width is the slice's *referent* width, not the
-    /// length's.
-    fn bind_slice_elem(&mut self, arg: &str, index: u64) -> Option<Var> {
-        let (local, elem_w) = *self.slices.get(arg)?;
+    /// variable. The element width is the *referent* width (`u8` for `[u8; 4]`),
+    /// not the length's.
+    ///
+    /// An array index past its length is refused rather than bound: the element
+    /// does not exist, so a contract naming it is about nothing, and a fresh
+    /// variable there would make a meaningless precondition look like a real one.
+    fn bind_indexed_elem(&mut self, arg: &str, index: u64) -> Option<Var> {
+        let (local, elem_w, fixed_len) = *self.indexed.get(arg)?;
         if !(1..=64).contains(&elem_w) {
             return None;
+        }
+        if let Some(n) = fixed_len {
+            if index >= n {
+                return None;
+            }
         }
         // Already bound (the same index twice in one contract): reuse it, so
         // `xs[0] <= xs[0]` is `x <= x` rather than two unrelated inputs.
@@ -472,7 +510,7 @@ impl FieldEnv {
         Some(v)
     }
 
-    /// Bind every slice element a contract text names, so the rewrite has a
+    /// Bind every indexed element a contract text names, so the rewrite has a
     /// binding for each and the run needs no mutable access to the environment.
     ///
     /// Scanning the text up front rather than binding on demand keeps
@@ -480,8 +518,8 @@ impl FieldEnv {
     /// evaluated inside an `Fn` closure the executor calls on every returning
     /// path, and that closure cannot hold a `&mut`. It also means an element the
     /// body reads but the contract does not is bound by the *executor* (through
-    /// `slice_elem`), and the two agree because both key on the same index.
-    pub fn bind_slice_refs(&mut self, text: &str) {
+    /// `index_elem`), and the two agree because both key on the same index.
+    pub fn bind_index_refs(&mut self, text: &str) {
         let chars: Vec<char> = text.chars().collect();
         let mut i = 0;
         while i < chars.len() {
@@ -497,7 +535,7 @@ impl FieldEnv {
                     j += digits.len();
                     if !digits.is_empty() && chars.get(j) == Some(&']') {
                         if let Ok(k) = digits.parse::<u64>() {
-                            self.bind_slice_elem(&ident, k);
+                            self.bind_indexed_elem(&ident, k);
                         }
                         i = j + 1;
                         continue;
@@ -552,7 +590,9 @@ fn rewrite_fields(text: &str, fields: &FieldEnv) -> Result<String, SpecError> {
                         if fields.known_args.contains(&ident) {
                             return Err(SpecError {
                                 text: text.to_string(),
-                                reason: format!("`{ident}` is not a slice, so `len()` has no meaning here"),
+                                reason: format!(
+                                    "`{ident}` is not a slice or array, so `len()` has no meaning here"
+                                ),
                             });
                         }
                     }
@@ -635,6 +675,7 @@ pub fn eval_ensures(
     let mut sgn = signed.clone();
     sgn.extend(fields.signed.iter().cloned());
     let mut p = Parser::new(&text, &names, ret, &sgn, ret_signed);
+    p.in_ensures = true;
     let pred = p.parse_or()?;
     p.expect_end()?;
     Ok(pred)
@@ -675,6 +716,11 @@ struct Parser<'a> {
     signed: &'a BTreeSet<String>,
     /// Whether `ret` is signed.
     ret_signed: bool,
+    /// Whether this is an `ensures`, where a bare `ret` is *meant* to be
+    /// readable. It separates the two reasons `ret` can be unbound: outside an
+    /// `ensures` the name is meaningless, while inside one it is meaningful but
+    /// an aggregate return has no single word to bind it to.
+    in_ensures: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -738,7 +784,16 @@ impl<'a> Parser<'a> {
         signed: &'a BTreeSet<String>,
         ret_signed: bool,
     ) -> Parser<'a> {
-        Parser { toks: tokenize(s), pos: 0, args, ret, text: s.to_string(), signed, ret_signed }
+        Parser {
+            toks: tokenize(s),
+            pos: 0,
+            args,
+            ret,
+            text: s.to_string(),
+            signed,
+            ret_signed,
+            in_ensures: false,
+        }
     }
 
     /// Whether the variable named `name` is signed, for choosing the comparison.
@@ -831,6 +886,93 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
+    /// The value of a term that has no free variable, if it is constant.
+    ///
+    /// `Op::Const` is the common case, but a literal is not always a single node:
+    /// `-10` is `0 - 10`, and `1 + 1` is an `Add`. Evaluating the term catches
+    /// those too, so a negative or folded literal is resized like any other
+    /// rather than treated as an opaque non-constant.
+    fn const_value(&self, v: Var) -> Option<u64> {
+        smt::evaluate(v, |_| None)
+    }
+
+    /// Resize a constant operand to `wide` bits, refusing one that does not fit.
+    ///
+    /// Widening is exact: zero-extend unsigned, sign-extend signed. Narrowing is
+    /// where a contract can be wrong rather than merely imprecise -- `a <= 300`
+    /// for a `u8` would become `a <= 44` if the value were truncated -- so a
+    /// value that does not fit is an error and the function is skipped, not a
+    /// weaker proof.
+    fn resize_const(&self, v: Var, wide: u8, signed: bool) -> Result<Var, SpecError> {
+        let w = smt::bits(v);
+        let val = self.const_value(v).expect("resize_const is only called on a constant");
+        if wide >= w {
+            return Ok(if signed && wide > w { smt::sign_extend(v, wide) } else { smt::word(val, wide) });
+        }
+        let fits = if signed {
+            // Interpret the value as a signed `w`-bit number, then test it against
+            // the signed `wide`-bit range. `i128` keeps `1 << 63` in range.
+            let sval = if w >= 64 {
+                val as i64 as i128
+            } else if val & (1u64 << (w - 1)) != 0 {
+                val as i128 - (1i128 << w)
+            } else {
+                val as i128
+            };
+            let lo = -(1i128 << (wide - 1));
+            let hi = (1i128 << (wide - 1)) - 1;
+            sval >= lo && sval <= hi
+        } else {
+            val < (1u64 << wide)
+        };
+        if !fits {
+            return Err(self.err(format!(
+                "literal {val} does not fit the operand's {wide}-bit width"
+            )));
+        }
+        // Truncate rather than rebuild from `val`. A negative literal is the bit
+        // pattern `2^w - 10` at its *source* width, so `word(val, wide)` would be
+        // handed a value that does not fit `wide` and would set the engine's
+        // ill-formed flag -- turning a valid contract into `Unknown`. Truncation
+        // takes the low `wide` bits, which is the same bit pattern the value
+        // denotes, and the `fits` check above is what keeps it from being silent.
+        Ok(smt::truncate(v, wide))
+    }
+
+    /// Make two operands agree in width, by resizing the *constant* one.
+    ///
+    /// A contract literal is written without a type, so its width has to come
+    /// from the operand it meets. Sizing it from the widest name in scope instead
+    /// makes `ret <= 255` a 64-bit comparison whenever a slice or array length (a
+    /// `usize`) is also in scope, and an 8-bit `ret` against a 64-bit constant is
+    /// ill-formed -- which the engine reports as `Unknown` for *every* obligation
+    /// in the run, not just that one. So the width is decided here, per use.
+    ///
+    /// Only a constant is resized: a non-constant operand's width is a property
+    /// of its type, and changing it would change what the term means. Two
+    /// non-constant operands of different widths cannot arise from Rust that
+    /// compiles, so that is refused rather than coerced.
+    fn align_widths(&self, a: Var, b: Var, signed: bool) -> Result<(Var, Var), SpecError> {
+        let (wa, wb) = (smt::bits(a), smt::bits(b));
+        if wa == wb {
+            return Ok((a, b));
+        }
+        match (self.const_value(a), self.const_value(b)) {
+            (Some(_), None) => Ok((self.resize_const(a, wb, signed)?, b)),
+            (None, Some(_)) => Ok((a, self.resize_const(b, wa, signed)?)),
+            (Some(_), Some(_)) => {
+                if wa > wb {
+                    Ok((self.resize_const(a, wb, signed)?, b))
+                } else {
+                    Ok((a, self.resize_const(b, wa, signed)?))
+                }
+            }
+            (None, None) => {
+                Err(self.err("comparison between operands of different widths"))
+            }
+        }
+    }
+
     fn parse_cmp(&mut self) -> Result<Pred, SpecError> {
         // `true` / `false` as whole predicates, so a contract can say
         // `requires: true` when the function really has no precondition.
@@ -865,6 +1007,13 @@ impl<'a> Parser<'a> {
                 // language will not compare an `i8` with a `u8`), so either flag
                 // decides it, and a literal on one side leaves the other to say.
                 let signed = ls || rs;
+                // A literal is written without a type, so its width comes from
+                // the operand it meets. Sizing it from the widest name in scope
+                // makes `ret <= 255` a 64-bit comparison whenever a slice or
+                // array length is also in scope, and an 8-bit `ret` against a
+                // 64-bit constant is ill-formed -- which poisons *every*
+                // obligation in the run, not just this one.
+                let (left, right) = self.align_widths(left, right, signed)?;
                 return Ok(match op {
                     "==" => smt::eq(left, right),
                     "!=" => smt::not(smt::eq(left, right)),
@@ -943,17 +1092,45 @@ impl<'a> Parser<'a> {
         match self.peek().cloned() {
             Some(Tok::Num(n)) => {
                 self.pos += 1;
-                // The width is taken from the widest argument, so a literal in a
-                // contract is a constant at the arguments' width. A contract
-                // whose literal does not fit that width is refused by the engine
-                // as ill-formed, which surfaces as `Unknown`.
-                let w = self.args.values().chain(self.ret.iter()).map(|v| smt::bits(*v)).max().unwrap_or(64);
+                // A literal is built wide enough to *hold* its own value, and at
+                // least as wide as the widest name in scope. Both halves matter:
+                //
+                // * Holding the value keeps the number exact, so the width
+                //   decision can be made later, per use, by `align_widths`.
+                //   Building it at the scope's width instead would mask `300` to
+                //   `44` for a `u8` and set the engine's ill-formed flag -- the
+                //   term would then decide `Unknown`, with no hint that the
+                //   contract, not the body, was at fault.
+                // * The scope's width keeps the common case (`a <= 5` for a `u32`)
+                //   from building a needlessly wide constant.
+                let need = (u64::BITS - n.leading_zeros()).max(1) as u8;
+                let scope = self
+                    .args
+                    .values()
+                    .chain(self.ret.iter())
+                    .map(|v| smt::bits(*v))
+                    .max()
+                    .unwrap_or(64);
+                let w = scope.max(need).min(64);
                 Ok((smt::word(n, w), false))
             }
             Some(Tok::Ident(name)) => {
                 self.pos += 1;
                 if name == "ret" || name == "result" {
-                    let v = self.ret.ok_or_else(|| self.err("`ret` is only meaningful in `ensures`"))?;
+                    let v = self.ret.ok_or_else(|| {
+                        if self.in_ensures {
+                            // An aggregate return has no single word, so the
+                            // contract has to name a component. Saying "only
+                            // meaningful in `ensures`" here would be false and
+                            // would send the reader looking in the wrong place.
+                            self.err(
+                                "the return type is an aggregate, so `ret` has no single \
+                                 value; name a component such as `ret.0`",
+                            )
+                        } else {
+                            self.err("`ret` is only meaningful in `ensures`")
+                        }
+                    })?;
                     return Ok((v, self.ret_signed));
                 }
                 if name == "true" || name == "false" {
@@ -986,8 +1163,14 @@ impl<'a> Parser<'a> {
                     None
                 };
                 if let Some((ty, a)) = assoc {
-                    if let Some(k) = type_bound(&ty, &a) {
-                        let w = self.args.values().chain(self.ret.iter()).map(|v| smt::bits(*v)).max().unwrap_or(64);
+                    if let Some((k, w)) = type_bound(&ty, &a) {
+                        // The bound is built at the width of the type it *names*,
+                        // not at the widest name in scope. `i8::MIN` is the bit
+                        // pattern `0x80`, which is exactly 8 bits; widening it to
+                        // a 64-bit `128` and then narrowing it back would test
+                        // `128 <= i8::MAX` and refuse the constant as out of range
+                        // for a signed 8-bit operand -- a refusal of a bound that
+                        // is by definition in range.
                         return Ok((smt::word(k, w), ty.starts_with('i')));
                     }
                     return Err(self.err(format!("unknown constant `{ty}::{a}`")));
@@ -1093,11 +1276,20 @@ pub fn field_env(
         };
         let arg = f.name_of(l);
         // A slice argument: `&[u8]`. Its length is a symbolic input, and its
-        // elements are bound on demand (by `bind_slice_refs` for the contract and
+        // elements are bound on demand (by `bind_index_refs` for the contract and
         // by the executor for the body).
         if let Ty::Slice(elem) = base {
             if let Some(w) = elem.width() {
-                env.bind_slice_len(l, &arg, w);
+                env.bind_indexed_len(l, &arg, w);
+            }
+            continue;
+        }
+        // An array argument: `[u8; 4]`. Its length is the constant in its type,
+        // so unlike a slice there is nothing for the caller to choose; the
+        // elements are still distinct inputs per index.
+        if let Ty::Array(elem, n) = base {
+            if let Some(w) = elem.width() {
+                env.bind_array_len(l, &arg, w, *n);
             }
             continue;
         }
@@ -1130,7 +1322,7 @@ pub fn signed_args(f: &crate::mir::parse::MirFn) -> BTreeSet<String> {
 /// A contract says `a != i16::MIN`, and the parser has no way to look the value
 /// up except here. Returning `None` for an unknown type keeps an unrecognized
 /// name a refusal rather than a zero.
-fn type_bound(ty: &str, assoc: &str) -> Option<u64> {
+fn type_bound(ty: &str, assoc: &str) -> Option<(u64, u8)> {
     let signed = ty.starts_with('i');
     let unsigned = ty.starts_with('u');
     if !signed && !unsigned {
@@ -1144,15 +1336,24 @@ fn type_bound(ty: &str, assoc: &str) -> Option<u64> {
         "isize" | "usize" => 64,
         _ => return None,
     };
-    match assoc {
-        "MAX" if signed => Some((1u64 << (bits - 1)) - 1),
-        "MAX" => Some(if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 }),
+    // The value is the bit pattern at the named type's own width, which is what
+    // lets `i8::MIN` be `0x80` rather than an out-of-range 64-bit `128`.
+    let v = match assoc {
+        "MAX" if signed => (1u64 << (bits - 1)) - 1,
+        "MAX" => {
+            if bits == 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            }
+        }
         // `MIN` for a signed type is the most negative value, which as a bit
         // pattern is the top bit alone.
-        "MIN" if signed => Some(1u64 << (bits - 1)),
-        "MIN" => Some(0),
-        _ => None,
-    }
+        "MIN" if signed => 1u64 << (bits - 1),
+        "MIN" => 0,
+        _ => return None,
+    };
+    Some((v, bits as u8))
 }
 
 /// The argument names and widths of a function, in declaration order, as they
