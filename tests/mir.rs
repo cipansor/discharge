@@ -1644,6 +1644,50 @@ fn a_subscript_through_a_reassigned_argument_is_refused() {
     }
 }
 
+/// A subscript through an alias is one element under *every* spelling of the
+/// index, not just the first.
+///
+/// `a[i]` and `a[k]` with `let k = i` name the same element, so a contract using
+/// both must be readable and verify — the second subscript has to rewrite to the
+/// same chain as the first. The tripwire claims they differ and must be refuted.
+/// Keeping only the first spelling left the second unrewritten and the parser
+/// refused the whole contract, which skipped a function that should have
+/// verified; this pins the fix.
+#[test]
+fn a_symbolic_index_resolves_under_every_spelling() {
+    let Some(report) =
+        verify_realistic(&["array_two_spellings_of_one_index", "array_two_spellings_tripwire"])
+    else {
+        return;
+    };
+    let o = outcome(&report, "array_two_spellings_of_one_index");
+    assert!(o.is_verified(), "`array_two_spellings_of_one_index` must verify, got: {o}");
+    let t = outcome(&report, "array_two_spellings_tripwire");
+    assert!(
+        !t.is_verified(),
+        "the two-spellings tripwire must be refuted, got: {t}"
+    );
+}
+
+/// A subscript by a name that is *shadowed* is refused.
+///
+/// `let k = i; let k = 0;` prints two bindings for `k`, and only the second is
+/// what `a[k]` reads. Resolving `k` from the first would check the contract
+/// against `i` while the body used the constant — a contract that is false for
+/// `i == 1` could prove. The name is bound more than once, so it is refused.
+#[test]
+fn a_shadowed_alias_is_refused() {
+    let Some(report) = verify_realistic(&["array_shadowed_alias_refused"]) else { return };
+    let o = outcome(&report, "array_shadowed_alias_refused");
+    match o {
+        FnOutcome::Skipped { reason } => assert!(
+            reason.contains("unknown name"),
+            "a shadowed alias must be refused as an unknown name, got: {reason}"
+        ),
+        other => panic!("`array_shadowed_alias_refused` must be skipped, got: {other}"),
+    }
+}
+
 /// A *slice* subscripted symbolically is still refused.
 ///
 /// The whole feature turns on the domain being finite. An array's length is in its

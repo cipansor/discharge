@@ -471,10 +471,17 @@ pub struct FieldEnv {
     /// finite domain to enumerate and `xs[i]` stays a refusal. That is the honest
     /// boundary -- an array's length is in its type, a slice's is not.
     sym_index: BTreeMap<String, Var>,
-    /// `arg -> the index argument's name` for an array a contract subscripts
+    /// `arg -> every index spelling` for an array a contract subscripts
     /// symbolically, so the rewrite can tell `a[i]` (which has a chain) from
     /// `a[j]` (which does not) instead of rewriting both to the same chain.
-    sym_index_name: BTreeMap<String, String>,
+    ///
+    /// A *set*, not one name: one index variable can be spelled more than once —
+    /// `a[i]` and `a[k]` where `let k = i`, or the same name twice — and every
+    /// spelling of the bound index names the same element, so every spelling has
+    /// to rewrite to the same chain. Keeping only the first left the second
+    /// subscript unrewritten and the whole contract unreadable, which skipped a
+    /// function that should have verified.
+    sym_index_names: BTreeMap<String, BTreeSet<String>>,
     /// `arg -> the ite chain` for an array a contract subscripts symbolically.
     ///
     /// Built once by [`bind_sym_index`](Self::bind_sym_index) from the element
@@ -843,7 +850,15 @@ impl FieldEnv {
             // two spellings of one index (`a[i]` and `a[k]` where `let k = i`)
             // share a chain rather than colliding. That is what makes an alias a
             // rename and nothing more.
-            return if *v == index { Some(*v) } else { None };
+            if *v != index {
+                return None;
+            }
+            // The same index under a new spelling: it names the same element, so
+            // record the spelling and let the rewrite replace it too. Returning
+            // early here left the second spelling unrewritten, and the parser then
+            // refused the whole contract as an unknown name.
+            self.sym_index_names.entry(arg.to_string()).or_default().insert(index_name.to_string());
+            return Some(*v);
         }
         // The elements first, so the chain has all of them to build from.
         let mut elems = Vec::with_capacity(n as usize);
@@ -852,7 +867,7 @@ impl FieldEnv {
         }
         let v = index;
         self.sym_index.insert(arg.to_string(), v);
-        self.sym_index_name.insert(arg.to_string(), index_name.to_string());
+        self.sym_index_names.entry(arg.to_string()).or_default().insert(index_name.to_string());
         // `ite(i == 0, e0, ite(i == 1, e1, ... ite(i == N-1, e_{N-1}, 0)))`.
         // The fall-through is unreachable: every use of the chain is guarded by
         // `i < N` (conjoined by `eval_*`, or assumed from the body's own bounds
@@ -1127,8 +1142,11 @@ fn rewrite_fields(text: &str, fields: &FieldEnv) -> Result<String, SpecError> {
                     // different index (`a[j]` where the chain is `a[i]`) has no
                     // chain, so it is left for the parser to refuse rather than
                     // rewritten to the wrong subscript.
-                    let is_bound_index =
-                        fields.sym_index_name.get(&ident).map(|n| n == &inner).unwrap_or(false);
+                    let is_bound_index = fields
+                        .sym_index_names
+                        .get(&ident)
+                        .map(|names| names.contains(&inner))
+                        .unwrap_or(false);
                     if is_bound_index {
                         if let Some(mangled) = fields.paths.get(&format!("{ident}__chain")) {
                             out.push_str(mangled);

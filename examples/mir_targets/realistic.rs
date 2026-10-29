@@ -214,6 +214,52 @@ pub fn array_local_index_written_refused(a: [u8; 4], mut i: usize) -> u8 {
     a[k]
 }
 
+/// A subscript by a name that has been *shadowed* is refused.
+///
+/// `let k = i; let k = 0;` prints **two** bindings for `k`: `debug k => _2;` and,
+/// nested deeper, `debug k => const 0_usize;`. Only the second is what the body's
+/// `a[k]` reads. If the frontend resolved `k` from the first binding — which is
+/// the only one that names a local — this contract would be checked against `i`
+/// while the body used the constant: `requires: k == 0` would restrict `i` to 0
+/// and `ensures: ret == a[i]` would prove, although the body returns `a[0]` and
+/// the postcondition is false whenever `i == 1` and `a[0] != a[1]`. The name is
+/// bound more than once, so it is refused rather than resolved.
+/// requires: k == 0
+/// ensures: ret == a[i]
+pub fn array_shadowed_alias_refused(a: [u8; 4], i: usize) -> u8 {
+    let k = i;
+    let k = 0usize;
+    a[k]
+}
+
+/// A contract that names the *same* index under two spellings verifies.
+///
+/// `a[i]` and `a[k]` with `let k = i` are one element, so a contract that uses
+/// both must be readable — the second subscript has to rewrite to the same chain
+/// as the first. Keeping only the first spelling left the second unrewritten and
+/// the parser refused the whole contract, which skipped a function that should
+/// have verified. This is a completeness gate, not a soundness one: the answer
+/// was a refusal, never a wrong proof.
+/// requires: i < 4
+/// ensures: ret == a[k] && ret == a[i]
+pub fn array_two_spellings_of_one_index(a: [u8; 4], i: usize) -> u8 {
+    let k = i;
+    a[k]
+}
+
+/// The tripwire for two spellings: both must name the *same* element.
+///
+/// `a[i]` and `a[k]` are the same subscript here, so claiming they differ must
+/// FAIL. If the two spellings were rewritten to different chains — or one were
+/// left as a fresh variable — this would verify, which is the wrong answer the
+/// single-spelling code path was one step away from.
+/// requires: i < 4
+/// ensures: ret == a[i] && a[k] != a[i]
+pub fn array_two_spellings_tripwire(a: [u8; 4], i: usize) -> u8 {
+    let k = i;
+    a[k]
+}
+
 /// A symbolic subscript the precondition does *not* bound. `requires: true` says
 /// nothing about `i`, so the ite chain would fall through for `i >= 4` and the
 /// subscript is refused. This is the soundness gate for the whole feature.

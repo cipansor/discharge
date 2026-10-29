@@ -372,16 +372,25 @@ pub struct MirFn {
     ///
     /// First binding wins, so a scoped alias never renames the parameter it
     /// aliases. Every binding, including the ones this map drops, is kept in
-    /// [`Self::debug_aliases`].
+    /// [`Self::debug_bindings`].
     pub local_names: BTreeMap<LocalIdx, String>,
-    /// Every `debug` binding in the dump, in the order printed, including the
-    /// scoped ones `local_names` discards.
+    /// Every `debug` binding in the dump, in the order printed, with `None` for a
+    /// binding whose target is not a local at all.
     ///
     /// A scoped binding is how `let k = i;` reaches the dump: `k` is not a local
     /// at all, it is another name for `_2`. `local_names` cannot hold it without
     /// renaming `i`, but the contract language still has to resolve `k`, so the
     /// pair is kept here and [`Self::alias_locals`] decides whether it is usable.
-    pub debug_aliases: Vec<(String, LocalIdx)>,
+    ///
+    /// The target is an `Option` because a name can also be bound to something
+    /// that is not a local. `let k = i; let k = 0;` prints *two* bindings for `k`
+    /// — `debug k => _2;` and, nested deeper, `debug k => const 0_usize;` — and
+    /// only the second is what the body's `a[k]` reads. Recording the constant
+    /// binding is what lets `alias_locals` see the shadowing and refuse the name;
+    /// dropping it (as keeping only local targets would) leaves the stale `_2`
+    /// binding looking like the only one, and a contract's `k` would then be
+    /// checked against `i` while the body used the constant.
+    pub debug_bindings: Vec<(String, Option<LocalIdx>)>,
     pub blocks: Vec<Block>,
     /// Every local the body *writes* — the destination of an assignment, or of a
     /// call.
@@ -414,9 +423,16 @@ impl MirFn {
     /// therefore makes the contract name the same index the body reads, which is
     /// the whole point.
     ///
-    /// Four conditions keep that sound, and all are checked here rather than left
+    /// Five conditions keep that sound, and all are checked here rather than left
     /// to the caller:
     ///
+    /// * the name is bound exactly once in the dump. A name bound twice has been
+    ///   shadowed, and the later binding is the live one — `let k = i; let k = 0;`
+    ///   prints `debug k => _2;` and then `debug k => const 0_usize;`. Resolving
+    ///   the name to the earlier `_2` would check a contract about the *constant*
+    ///   against the argument, which is a wrong proof rather than a missing one.
+    ///   Only the earliest binding is ever a parameter alias, and it is only the
+    ///   live one when nothing shadows it, so a repeated name is refused outright.
     /// * the aliased local is an argument (never a temporary),
     /// * it is not in [`Self::written`], so nothing reassigns it between the alias
     ///   and its use,
@@ -432,8 +448,21 @@ impl MirFn {
         let args: std::collections::BTreeSet<LocalIdx> = self.arg_locals.iter().copied().collect();
         let arg_names: std::collections::BTreeSet<String> =
             self.arg_locals.iter().map(|l| self.name_of(*l)).collect();
+        // How many times each name is bound, and whether any of those bindings is
+        // to a non-local. A name bound more than once is shadowed; a name bound
+        // once to a non-local has no argument to resolve to at all.
+        let mut bindings: BTreeMap<&str, usize> = BTreeMap::new();
+        for (name, _) in &self.debug_bindings {
+            *bindings.entry(name.as_str()).or_insert(0) += 1;
+        }
         let mut out: BTreeMap<String, LocalIdx> = BTreeMap::new();
-        for (name, local) in &self.debug_aliases {
+        for (name, local) in &self.debug_bindings {
+            let Some(local) = local else { continue };
+            // A shadowed name is refused: the earlier binding is not the live one,
+            // and the later binding is not a local, so neither can be resolved.
+            if bindings.get(name.as_str()).copied().unwrap_or(0) != 1 {
+                continue;
+            }
             if !args.contains(local) || self.written.contains(local) {
                 continue;
             }
@@ -1340,7 +1369,7 @@ pub fn parse_program_with(text: &str, enums: &BTreeMap<String, EnumLayout>) -> M
                 ret_ty: ret_ty.clone(),
                 locals: BTreeMap::new(),
                 local_names: BTreeMap::new(),
-                debug_aliases: Vec::new(),
+                debug_bindings: Vec::new(),
                 blocks: Vec::new(),
                 written: std::collections::BTreeSet::new(),
             };
@@ -1374,7 +1403,17 @@ pub fn parse_program_with(text: &str, enums: &BTreeMap<String, EnumLayout>) -> M
                 }
                 if let Some(rest) = t.strip_prefix("debug ") {
                     if let Some((n, p)) = rest.split_once("=>") {
-                        if let Some(idx) = parse_local(p.trim().trim_end_matches(';')) {
+                        let name = n.trim().to_string();
+                        let target = p.trim().trim_end_matches(';');
+                        // Recorded before the local check, so a binding to a
+                        // constant is visible as a shadowing. `let k = i; let k =
+                        // 0;` prints `debug k => _2;` then `debug k => const
+                        // 0_usize;`, and dropping the second (as keeping only
+                        // local targets would) leaves the stale `_2` looking like
+                        // the only binding, so a contract's `k` would be checked
+                        // against `i` while the body used the constant.
+                        f.debug_bindings.push((name.clone(), parse_local(target)));
+                        if let Some(idx) = parse_local(target) {
                             // First binding wins, and it must. A `debug` line at
                             // function level names the *parameter*; a later one
                             // inside a `scope` block names whatever value has
@@ -1385,12 +1424,7 @@ pub fn parse_program_with(text: &str, enums: &BTreeMap<String, EnumLayout>) -> M
                             // up `a`, find only `s`, and be skipped as unreadable
                             // -- the function would go unverified because a
                             // local borrowed the parameter's slot.
-                            f.local_names.entry(idx).or_insert_with(|| n.trim().to_string());
-                            // Kept in full, including the scoped bindings the map
-                            // above drops: `debug k => _2;` inside a `scope` block
-                            // is an alias the contract may name, and dropping it
-                            // here would leave `a[k]` an unknown name.
-                            f.debug_aliases.push((n.trim().to_string(), idx));
+                            f.local_names.entry(idx).or_insert_with(|| name.clone());
                         }
                     }
                     j += 1;
