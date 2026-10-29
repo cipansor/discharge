@@ -1070,11 +1070,17 @@ impl<'a> Parser<'a> {
                 return Ok((left, sgn));
             };
             let (r, rs) = self.parse_term()?;
+            // A literal operand is sized to the other one, exactly as in a
+            // comparison. Without this, `ret == a + 5` with a slice length in
+            // scope adds an 8-bit `a` to a 64-bit `5`, which `bin_word` reports
+            // as ill-formed -- and that poisons every obligation in the run, so
+            // the function is undecided for a reason unrelated to its body.
+            let (l, r) = self.align_widths(left, r, sgn || rs)?;
             left = match op {
-                "+" => smt::add(left, r),
-                "-" => smt::sub(left, r),
-                "|" => smt::bor(left, r),
-                _ => smt::bxor(left, r),
+                "+" => smt::add(l, r),
+                "-" => smt::sub(l, r),
+                "|" => smt::bor(l, r),
+                _ => smt::bxor(l, r),
             };
             sgn = sgn || rs;
         }
@@ -1091,7 +1097,10 @@ impl<'a> Parser<'a> {
                 return Ok((left, sgn));
             };
             let (r, rs) = self.parse_atom()?;
-            left = if op == "*" { smt::mul(left, r) } else { smt::band(left, r) };
+            // Same width rule as the additive operators: a literal product or
+            // mask is sized to the operand it meets.
+            let (l, r) = self.align_widths(left, r, sgn || rs)?;
+            left = if op == "*" { smt::mul(l, r) } else { smt::band(l, r) };
             sgn = sgn || rs;
         }
     }

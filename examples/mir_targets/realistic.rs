@@ -53,6 +53,21 @@ pub fn increment_tiny(a: u8) -> u8 {
     a + 1
 }
 
+/// A literal in *arithmetic* is sized like one in a comparison.
+///
+/// The slice length puts a 64-bit name in scope, so `a + 5` would add an 8-bit
+/// `a` to a 64-bit `5`. That is ill-formed, and an ill-formed term makes every
+/// obligation in the run `Unknown` -- the same poisoning the comparison fix
+/// addresses, reached through `+` instead of `<=`. The `*` and `&` forms are
+/// sized the same way.
+///
+/// requires: a <= 250
+/// ensures: ret == a + 5
+pub fn add_literal_wide_scope(a: u8, xs: &[u8]) -> u8 {
+    let _ = xs.len();
+    a.wrapping_add(5)
+}
+
 /// requires: lo <= hi
 /// ensures: ret <= hi
 pub fn clamp_simple(lo: u8, hi: u8, v: u8) -> u8 {

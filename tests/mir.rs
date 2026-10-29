@@ -307,6 +307,20 @@ fn a_bare_ret_with_an_unknown_value_names_the_unknown_reason() {
     });
 }
 
+/// A literal in *arithmetic* is sized to the operand it meets, like one in a
+/// comparison.
+///
+/// `add_literal_wide_scope` has a slice length in scope, so a literal built at
+/// the scope's 64-bit width would make `a + 5` an 8-bit/64-bit `Add` -- ill-formed,
+/// and so `Unknown` for the whole run. The fix is the same `align_widths` the
+/// comparison path uses, reached through the additive and multiplicative operators.
+#[test]
+fn a_literal_in_arithmetic_is_sized_to_its_operand() {
+    let Some(report) = verify_realistic(&["add_literal_wide_scope"]) else { return };
+    let o = outcome(&report, "add_literal_wide_scope");
+    assert!(o.is_verified(), "`add_literal_wide_scope` must verify, got: {o}");
+}
+
 /// A named type bound carries the width of the type it names.
 ///
 /// `i8::MIN` is the bit pattern `0x80`, exactly 8 bits. Building it at the
