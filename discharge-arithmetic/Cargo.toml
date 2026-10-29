@@ -1,8 +1,8 @@
 [package]
 name = "discharge-arithmetic"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.75"
+edition = "2024"
+rust-version = "1.85"
 description = "Integer primitives for safety-critical Rust whose central properties are proved inside the crate by exhaustive enumeration: checked and saturating arithmetic, overflow-free mul_div, Q16.16 fixed point, and a refinement-typed Bounded. no_std, zero dependencies."
 license = "Apache-2.0"
 authors = ["Yayasan Pesantren Cipansor and contributors <halo@cipansor.or.id>"]

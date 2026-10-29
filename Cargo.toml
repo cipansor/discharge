@@ -13,8 +13,8 @@ resolver = "2"
 [package]
 name = "discharge"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.75"
+edition = "2024"
+rust-version = "1.85"
 description = "In-code formal verification for Rust: an embedded bit-blasting SMT decision procedure, a symbolic DSL, contracts and a machine-checked proof kernel. SPARK-inspired, no_std, no external dependencies."
 authors = ["Yayasan Pesantren Cipansor and contributors <halo@cipansor.or.id>"]
 license = "Apache-2.0"

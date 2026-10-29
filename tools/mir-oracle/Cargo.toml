@@ -1,7 +1,7 @@
 [package]
 name = "mir-oracle"
 version = "0.0.0"
-edition = "2021"
+edition = "2024"
 publish = false
 description = "A `rustc_public` oracle that checks the `discharge` text-MIR frontend against rustc's own typed MIR. Never a dependency of `discharge`."
 

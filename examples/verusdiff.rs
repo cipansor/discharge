@@ -136,7 +136,7 @@ fn run_verus(file: &Path, case_lines: &[usize]) -> std::io::Result<VerusRun> {
                 case_lines
                     .iter()
                     .enumerate()
-                    .filter(|(_, &l)| l <= line_no)
+                    .filter(|&(_, &l)| l <= line_no)
                     .map(|(i, _)| i)
                     .next_back()
             });

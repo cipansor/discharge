@@ -40,12 +40,20 @@ jobs:
       # the per-kind discharge polarity (`Obligation::is_discharged`) came to have no teeth
       # in CI. The in-module oracle in `src/mir/exec.rs` covers that logic ungated; this
       # makes the end-to-end tests run too.
-      - name: Install Rust (stable, nightly, bare-metal target)
+      - name: Install Rust (stable, nightly, MSRV, bare-metal target)
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup toolchain install nightly --profile minimal --no-self-update
+          # The MSRV gate in `scripts/gate.sh` builds with the oldest compiler the manifests
+          # promise to support. It is installed here so the gate *runs* rather than skipping:
+          # a floor that is never exercised is the claim this gate exists to stop trusting.
+          # It must match `rust-version` in `Cargo.toml` and `discharge-arithmetic/Cargo.toml`.
+          rustup toolchain install 1.85 --profile minimal --no-self-update
           rustup default stable
           rustup target add thumbv7em-none-eabihf
+          # The bare-metal target has to be present for the MSRV toolchain too, or the
+          # gate's no_std half skips and the floor is only half-checked.
+          rustup target add thumbv7em-none-eabihf --toolchain 1.85
 
       # `gate.sh` treats an absent z3 as a failure, on purpose: an oracle that did not run
       # is not evidence about the exporter. setup-python gives a pip that is not externally

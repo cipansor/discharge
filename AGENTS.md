@@ -3251,3 +3251,42 @@ reverting it and watching its test fail: without fix 1 the contract after a
 refused enum is gone (`by_fn` is empty); without fix 2 the qualified construction
 is `incomplete (1 reason) - unmodelled switch discriminant`; without fix 3 the
 layout is dropped and the contract is `skipped: unknown name`.
+
+## Toolchain — edition 2024 and the MSRV floor (1.85)
+
+Both manifests are **edition 2024** with `rust-version = "1.85"`. The two numbers
+are one decision, not two: cargo refuses edition 2024 on any compiler below 1.85,
+and 1.85 is the release that stabilised it, so there is no version that takes the
+edition without the floor. Raising one means raising the other.
+
+The floor is a *lower* bound, not a pin. The crate is exercised on current stable
+(1.99 at the time of writing) and the MIR frontend runs a nightly. The oracle
+toolchains move independently and none of them forces the floor down: Verus tracks
+stable (`channel = "1.99.1"`), Kani tracks a nightly (`nightly-2026-10-23`), and
+Ferrocene — the qualified compiler, whose lag is the only one that could matter
+for a safety build — is downstream of Rust 1.96. The MSRV is deliberately *not*
+raised to follow them: a `no_std` crate that ships into a bare-metal safety build
+is the one place a high floor costs something real, because it locks out qualified
+and long-term-support toolchains that lag upstream.
+
+**The migration was three edits, all found by compiling rather than by reading:**
+
+1. `examples/verusdiff.rs` — `filter(|(_, &l)| …)` is rejected in edition 2024
+   ("cannot explicitly dereference within an implicitly-borrowing pattern"); it
+   becomes `filter(|&(_, &l)| …)`.
+2. `tests/loopdiff.rs` — `gen` is a reserved keyword in edition 2024, so `fn gen(`
+   was renamed to `fn make_steps(`.
+3. `discharge-arithmetic/src/prove.rs` — three `.map_or(true, |c| …)` calls became
+   `.is_none_or(|c| …)`. This one is *caused by the MSRV bump*, not by the
+   edition: clippy only suggests `is_none_or` (1.82+) once `rust-version` permits
+   it, so the lint appears exactly when the floor moves. Worth knowing before
+   touching `rust-version` again.
+
+**The floor is now a gate, not a claim.** `scripts/gate.sh` step 13 builds with
+`1.85` (overridable via `DISCHARGE_MSRV`) so a feature newer than the floor fails
+in CI rather than in a downstream build. It follows the Ferrocene/Kani convention:
+an absent toolchain, or a `thumbv7em-none-eabihf` target not installed *for that
+toolchain*, is reported and skipped rather than folded into a pass. CI installs
+both the 1.85 toolchain and that target for it so the gate actually runs. The gate
+numbering is now **13 steps**, not 12; the README and `ci.yml` were renumbered
+with it.

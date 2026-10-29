@@ -1336,6 +1336,29 @@ check an obligation that does not mean what the source says.
 | the contract | the source text | MIR carries no attributes or doc comments |
 | the compiler | `DISCHARGE_RUSTC`, else `rustc` | `--emit=mir` needs nightly; naming it separately keeps cargo's `rustc` alone |
 
+### The edition and the minimum compiler
+
+The crates are **edition 2024**, and `rust-version = "1.85"` in both manifests.
+Edition 2024 is what the language is now: `gen` is reserved, `unsafe_op_in_unsafe_fn`
+is on, and the pattern binding modes are the strict ones. Since 1.85 is exactly the
+release that stabilised the edition, the floor and the edition are the same
+decision — there is no version that takes one without the other.
+
+The floor is a *lower* bound, not a pin. Everything here builds on the current
+stable (1.99 at the time of writing) and the frontend runs a nightly, so the
+crate is exercised on recent compilers rather than held back to an old one. The
+toolchains the oracles pin are newer still and move independently: Verus tracks
+stable (`channel = "1.99.1"`), Kani tracks a nightly, and Ferrocene — the
+qualified compiler, which is the one whose ceiling could matter for a safety
+build — is currently downstream of Rust 1.96, comfortably above 1.85. So no
+oracle forces the floor down, and none is held back by it.
+
+The MSRV is deliberately *not* raised to follow them. A `no_std` crate that ships
+into a bare-metal safety build is the one place a high floor costs something real:
+it locks out qualified and long-term-support toolchains that lag upstream. 1.85
+buys the current edition at the oldest version that has it, and every later
+compiler still works, so nothing is given up by staying there.
+
 ### The arithmetic, and one new primitive
 
 MIR makes the checks explicit, so modelling them is most of the work. `a + b`

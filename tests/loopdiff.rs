@@ -121,7 +121,7 @@ fn build(steps: &[Step], acc: Var, x: Var) -> &'static Stmt<'static> {
     Box::leak(Box::new(seq))
 }
 
-fn gen(r: &mut Lcg, depth: u32, n: usize) -> Vec<Step> {
+fn make_steps(r: &mut Lcg, depth: u32, n: usize) -> Vec<Step> {
     gen_with(r, depth, n, true)
 }
 
@@ -242,7 +242,7 @@ fn a_verified_report_never_misses_a_failed_claim() {
     let mut with_failed_claim = 0u32;
     for _ in 0..800 {
         let n = 1 + r.below(4) as usize;
-        let steps = gen(&mut r, 2, n);
+        let steps = make_steps(&mut r, 2, n);
 
         smt::with_fresh(|| {
             let x = var(8);

@@ -110,7 +110,7 @@ fn forall_pair(w: u8, p: impl Fn(u64, u64) -> bool) -> Verdict {
         return Verdict::Unknown;
     }
     let domain = 1u64 << w;
-    if domain.checked_mul(domain).map_or(true, |c| c > ENUM_BUDGET) {
+    if domain.checked_mul(domain).is_none_or(|c| c > ENUM_BUDGET) {
         return Verdict::Unknown;
     }
     let mut a = 0u64;
@@ -151,7 +151,7 @@ fn forall_pair_bounded(w: u8, bound: u64, p: impl Fn(u64, u64) -> bool) -> Verdi
         return Verdict::Unknown;
     }
     let side = bound + 1;
-    if side.checked_mul(side).map_or(true, |c| c > ENUM_BUDGET) {
+    if side.checked_mul(side).is_none_or(|c| c > ENUM_BUDGET) {
         return Verdict::Unknown;
     }
     let mut a = 0u64;
@@ -278,7 +278,7 @@ pub fn bounded_walk_covers_its_rectangle(w: u8, bound: u64) -> Verdict {
     if side
         .checked_mul(side)
         .and_then(|c| c.checked_mul(walks))
-        .map_or(true, |c| c > ENUM_BUDGET)
+        .is_none_or(|c| c > ENUM_BUDGET)
     {
         return Verdict::Unknown;
     }
