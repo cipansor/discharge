@@ -2766,16 +2766,38 @@ source. The repair went in at each *call site* of `operand_signedness`. That is
 the shape of fix that leaves a third case behind, so the next stage is to make
 the rule structural rather than per-site.
 
-**Stage 1 — make the width-and-signedness rule a type, not a habit.** Every
-`Val::Sym` currently carries a width and nothing else; the signedness is passed
-*alongside* it as a bare `bool`, so any site that forgets to pass it is silently
-unsigned. That is exactly how both bugs happened. The fix is to carry the
-signedness *in* the value (`Val::Int(Var, bool)` or a width/sign pair on the
-symbol), so a missing sign is a type error rather than a default. This is a
-refactor of `eval_rvalue`/`eval_binary`/`operand`, and the existing corpus
-(tripwires `signed_const_left_false`, `widen_signed_false`, `signed_mul_negative`,
-`ashr_signed_false`) is the regression net. Do this *before* adding new shapes,
-because every new shape is another call site that can forget.
+**Stage 1 — make the width-and-signedness rule a type, not a habit.** DONE.
+`Val::Sym` is now `Val::Sym(Var, Sign)`, and `Sign` has *three* cases:
+`Signed`, `Unsigned`, and `Unknown` for a value whose dump printed no type. The
+third case is the whole point. With only two cases, a site that could not read
+the sign had somewhere to fall back to, and both false proofs were exactly that
+fallback: a suffix-less `const 0_i8` read as unsigned, and a cast source whose
+sign was dropped. With three cases, every signedness-sensitive site has to say
+what it does when the sign is missing, and the compiler names the ones that do
+not -- which is how the four sites below were found rather than remembered:
+
+* `eval_binary` -- a relational comparison (`<`, `<=`, `>`, `>=`) and the signed
+  divider/`srem` refuse an `Unknown` sign. `==`/`!=`, `+`, `&` and the rest do
+  not read the sign, so they still compute.
+* `overflow_pred` -- an `Unknown` sign has no sound predicate, so it returns
+  `None` and the path is reported unmodelled rather than proved.
+* `try_intrinsic` -- `sdiv`/`srem` on an `Unknown` sign are refused.
+* `Rvalue::Cast` -- an `Unknown` *source* sign refuses the cast. This is the
+  `-1i8 as i16` bug's home; zero-filling a signed source and sign-extending an
+  unsigned one are both wrong, so neither may be guessed.
+
+The sign travels with the seed too: `FieldEnv::seeds`, `len_seeds`, `elem_seeds`
+and the `Indexed` element store all carry it, so an array element read out of the
+store is a signed value on an `&[i8]` without any site having to look the type up
+again. `operand_signedness` is *deleted* -- the lookup it performed no longer has
+a caller to get wrong, because the sign is a field of the value it describes.
+
+The regression net is the corpus (`signed_const_left_false`, `widen_signed_false`,
+`signed_mul_negative`, `ashr_signed_false`) plus the two new entries
+`signed_slice_element_is_signed` / `signed_slice_element_tripwire`, which pin the
+element-side case: `i8::MIN` is the most negative `i8` and the largest `u8`, so
+`xs[0] < 0` proves the opposite branch under the unsigned reading. A unit test
+(`a_comparison_on_an_unprinted_sign_is_refused`) pins the refusal directly.
 
 **Stage 2 — close the remaining `Rvalue` gaps, one at a time, each with a
 tripwire.** In rough order of how often real Rust hits them:

@@ -634,3 +634,38 @@ pub fn widen_unsigned_true(a: u8) -> u16 {
 pub fn widen_unsigned_false(a: u8) -> u16 {
     a as u16
 }
+
+/// A comparison of a *signed* array element is a signed comparison.
+///
+/// This is the element-side counterpart of the `const 0_i8` case. The element's
+/// signedness is a property of the array's element *type*, and it has to reach
+/// the value the subscript produces. `i8::MIN` (0x80) is the most negative `i8`
+/// and the largest `u8`, so the two readings of `xs[0] < 0` disagree on it:
+/// signed says the branch is taken and returns `1`, unsigned says `0`. The
+/// contract claims `1`, so it verifies only under the signed reading.
+/// requires: xs.len() > 0 && xs[0] == i8::MIN
+/// ensures: ret == 1
+pub fn signed_slice_element_is_signed(xs: &[i8]) -> i8 {
+    if xs[0] < 0 {
+        1
+    } else {
+        0
+    }
+}
+
+/// The tripwire for the signed element read.
+///
+/// The same body and the same precondition as
+/// [`signed_slice_element_is_signed`], but the contract claims `0`. That is the
+/// answer the *unsigned* reading gives -- an unsigned value is never below zero
+/// -- so this false contract is *proved* by exactly the bug. It must FAIL, and
+/// the counterexample is the element being negative.
+/// requires: xs.len() > 0 && xs[0] == i8::MIN
+/// ensures: ret == 0
+pub fn signed_slice_element_tripwire(xs: &[i8]) -> i8 {
+    if xs[0] < 0 {
+        1
+    } else {
+        0
+    }
+}

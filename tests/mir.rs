@@ -1348,6 +1348,26 @@ fn a_widening_cast_respects_the_sources_signedness() {
     }
 }
 
+/// A signed array element stays signed through the subscript.
+///
+/// The element's signedness lives in the array's element *type* and has to reach
+/// the value the subscript produces. The two entries pin both directions: the
+/// true one verifies only if `xs[0] < 0` is a signed test, and the tripwire
+/// (`xs[0] == i8::MIN`, where the most negative element *is* negative) is
+/// *proved* under the unsigned reading, so it must FAIL.
+#[test]
+fn a_signed_element_comparison_keeps_the_elements_sign() {
+    let names = ["signed_slice_element_is_signed", "signed_slice_element_tripwire"];
+    let Some(report) = verify_realistic(&names) else { return };
+    let o = outcome(&report, "signed_slice_element_is_signed");
+    assert!(o.is_verified(), "`signed_slice_element_is_signed` must verify, got: {o}");
+    let o = outcome(&report, "signed_slice_element_tripwire");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`signed_slice_element_tripwire` proves `!(i8::MIN < 0)`; got: {o}"
+    );
+}
+
 /// A `(u8, &u8)` return with a postcondition on `ret.0` alone is not skipped.
 ///
 /// Component 1 is a reference with no bit-vector width. Binding every declared
@@ -1486,7 +1506,7 @@ fn a_contract_error_quotes_the_source_text() {
     // argument, which is what makes it bindable as an index.
     let i = smt::var(64);
     args.insert("i".to_string(), i);
-    fields.bind_array_len(0, "a", 8, 4);
+    fields.bind_array_len(0, "a", 8, false, 4);
     fields.bind_sym_index("a", 8, 4, "i", i);
     let src = "ret == a[i] && ret == a[j]";
     let err = spec::eval_ensures(

@@ -330,7 +330,10 @@ pub struct FieldEnv {
     /// input and the body about another, and every proof would be vacuous in the
     /// direction that matters. These seeds are how the two are made to agree by
     /// construction rather than by convention.
-    pub seeds: Vec<(u32, u32, Var)>,
+    /// The `bool` is the field's signedness, carried here so the executor can
+    /// build a `Val::Sym` that *knows* its sign. A seed without one would force
+    /// the executor to guess, which is the bug class this closes.
+    pub seeds: Vec<(u32, u32, Var, bool)>,
     /// `(local, fixed length)` for each *array* argument, so the executor can
     /// enumerate the domain a symbolic subscript needs. A slice has no entry:
     /// there is no fixed domain, so its `xs[i]` stays refused.
@@ -343,12 +346,12 @@ pub struct FieldEnv {
     /// same one. An array's length *is* in its type, so there it is the constant
     /// `N`, and the contract's `a.len()` and the body's `const N_usize` agree by
     /// being the same word. This is the indexed analogue of `seeds`.
-    pub len_seeds: Vec<(u32, Var, u8)>,
+    pub len_seeds: Vec<(u32, Var, u8, bool)>,
     /// `(local, index, element variable)` for each slice or array element the
     /// contract names. The body's `(*_1)[0]` reads the same variable, so `xs[0]`
     /// in a contract and `xs[0]` in the body are one value, not two that look
     /// alike.
-    pub elem_seeds: Vec<(u32, u64, Var)>,
+    pub elem_seeds: Vec<(u32, u64, Var, bool)>,
     /// Indexed arguments (slices and arrays): name → (local, element width, the
     /// array's fixed length if it is one), so a contract's `xs.len()` and `xs[0]`
     /// can be bound without the IR's `Ty` in hand.
@@ -356,7 +359,7 @@ pub struct FieldEnv {
     /// The length is `Some(n)` for an array and `None` for a slice, which is what
     /// lets a contract naming `a[9]` on a `[u8; 4]` be refused as out of range
     /// rather than bound to a fresh variable for an element that does not exist.
-    indexed: BTreeMap<String, (u32, u8, Option<u64>)>,
+    indexed: BTreeMap<String, (u32, u8, Option<u64>, bool)>,
     /// `arg -> index variable` for an array argument a contract subscripts with a
     /// *symbolic* index (`a[i]`).
     ///
@@ -459,7 +462,7 @@ impl FieldEnv {
         self.next_slot += 1;
         let v = smt::var_named(slot, w);
         self.vars.insert(mangled.clone(), v);
-        self.seeds.push((local, index, v));
+        self.seeds.push((local, index, v, signed));
         if signed {
             self.signed.insert(mangled.clone());
         }
@@ -523,7 +526,13 @@ impl FieldEnv {
     /// passed — so it is an input, exactly like the elements. The same variable
     /// is handed to the executor as a `len_seed`, which is what makes the
     /// contract's `xs.len()` and the body's `PtrMetadata(_1)` one value.
-    pub fn bind_indexed_len(&mut self, local: u32, arg: &str, elem_w: u8) -> Option<Var> {
+    pub fn bind_indexed_len(
+        &mut self,
+        local: u32,
+        arg: &str,
+        elem_w: u8,
+        elem_signed: bool,
+    ) -> Option<Var> {
         if !(1..=64).contains(&elem_w) {
             return None;
         }
@@ -539,8 +548,8 @@ impl FieldEnv {
         let v = smt::var_named(slot, USIZE_WIDTH);
         self.vars.insert(len_name, v);
         self.paths.insert(format!("{arg}.len()"), format!("{arg}__len"));
-        self.indexed.insert(arg.to_string(), (local, elem_w, None));
-        self.len_seeds.push((local, v, elem_w));
+        self.indexed.insert(arg.to_string(), (local, elem_w, None, elem_signed));
+        self.len_seeds.push((local, v, elem_w, elem_signed));
         self.known_args.insert(arg.to_string());
         Some(v)
     }
@@ -552,7 +561,14 @@ impl FieldEnv {
     /// Binding it to a fresh variable would be the unsound direction — it would
     /// admit lengths the type excludes, so a contract proved at length 4 would
     /// claim to hold at any length.
-    pub fn bind_array_len(&mut self, local: u32, arg: &str, elem_w: u8, n: u64) -> Option<()> {
+    pub fn bind_array_len(
+        &mut self,
+        local: u32,
+        arg: &str,
+        elem_w: u8,
+        elem_signed: bool,
+        n: u64,
+    ) -> Option<()> {
         if !(1..=64).contains(&elem_w) {
             return None;
         }
@@ -563,8 +579,8 @@ impl FieldEnv {
         let v = smt::word(n, USIZE_WIDTH);
         self.vars.insert(len_name, v);
         self.paths.insert(format!("{arg}.len()"), format!("{arg}__len"));
-        self.indexed.insert(arg.to_string(), (local, elem_w, Some(n)));
-        self.len_seeds.push((local, v, elem_w));
+        self.indexed.insert(arg.to_string(), (local, elem_w, Some(n), elem_signed));
+        self.len_seeds.push((local, v, elem_w, elem_signed));
         self.array_lens.push((local, n));
         self.known_args.insert(arg.to_string());
         Some(())
@@ -581,7 +597,7 @@ impl FieldEnv {
     /// does not exist, so a contract naming it is about nothing, and a fresh
     /// variable there would make a meaningless precondition look like a real one.
     fn bind_indexed_elem(&mut self, arg: &str, index: u64) -> Option<Var> {
-        let (local, elem_w, fixed_len) = *self.indexed.get(arg)?;
+        let (local, elem_w, fixed_len, elem_signed) = *self.indexed.get(arg)?;
         if !(1..=64).contains(&elem_w) {
             return None;
         }
@@ -607,7 +623,7 @@ impl FieldEnv {
         let v = smt::var_named(slot, elem_w);
         self.vars.insert(mangled.clone(), v);
         self.paths.insert(format!("{arg}[{index}]"), mangled);
-        self.elem_seeds.push((local, index, v));
+        self.elem_seeds.push((local, index, v, elem_signed));
         Some(v)
     }
 
@@ -690,7 +706,7 @@ impl FieldEnv {
         self.sym_index
             .iter()
             .filter_map(|(arg, v)| {
-                let (_, _, n) = self.indexed.get(arg)?;
+                let (_, _, n, _) = self.indexed.get(arg)?;
                 Some((*v, (*n)?))
             })
             .collect()
@@ -742,7 +758,7 @@ impl FieldEnv {
                         // argument. A compound index (`a[i + 1]`) is left unbound
                         // and refused by the parser rather than mis-modelled.
                         if let Some(&index) = args.get(&inner) {
-                            if let Some((_, elem_w, Some(n))) = self.indexed.get(&ident).copied()
+                            if let Some((_, elem_w, Some(n), _)) = self.indexed.get(&ident).copied()
                             {
                                 self.bind_sym_index(&ident, elem_w, n, &inner, index);
                             }
@@ -1576,7 +1592,7 @@ pub fn field_env(
         // by the executor for the body).
         if let Ty::Slice(elem) = base {
             if let Some(w) = elem.width() {
-                env.bind_indexed_len(l, &arg, w);
+                env.bind_indexed_len(l, &arg, w, elem.is_signed());
             }
             continue;
         }
@@ -1585,7 +1601,7 @@ pub fn field_env(
         // elements are still distinct inputs per index.
         if let Ty::Array(elem, n) = base {
             if let Some(w) = elem.width() {
-                env.bind_array_len(l, &arg, w, *n);
+                env.bind_array_len(l, &arg, w, elem.is_signed(), *n);
             }
             continue;
         }

@@ -73,10 +73,78 @@ pub const DEFAULT_PATH_BUDGET: usize = 64;
 /// returns or asserts an unknown value is not evidence of anything. That is the
 /// single rule that keeps this frontend honest — there is no place where an
 /// unmodelled construct is quietly given a convenient meaning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sign {
+    /// The type is `i8`/`i16`/`i32`/`i64`/`i128`/`isize`.
+    Signed,
+    /// The type is unsigned, or has no integer signedness at all.
+    Unsigned,
+    /// The dump did not print enough type for the sign to be read -- a literal
+    /// with no suffix, and nothing in scope to take it from.
+    ///
+    /// This variant is why the enum has three cases rather than two. The bug the
+    /// type exists to prevent was a *default*: a site that could not read the
+    /// sign fell back to unsigned, and unsigned `0 < a` on an `i8` calls
+    /// `i8::MIN` the largest value. With only two variants that fallback is
+    /// always available to write; with three, every signedness-sensitive site has
+    /// to handle `Unknown` explicitly and the compiler names the ones that do not.
+    Unknown,
+}
+
+impl Sign {
+    /// The sign `ty` declares.
+    ///
+    /// A type with no integer signedness (`bool`, an aggregate, a reference)
+    /// answers `Unsigned`, which is the right reading for *widening* it (zero
+    /// fill) but not for a comparison -- but rustc gives such a type no
+    /// comparison to make, so `Unsigned` is not a fallback here, it is the
+    /// reading.
+    pub fn of(ty: &Ty) -> Sign {
+        if ty.is_signed() {
+            Sign::Signed
+        } else {
+            Sign::Unsigned
+        }
+    }
+
+    /// The sign, or `None` when it could not be read.
+    ///
+    /// Deliberately *not* named `is_signed`: a `bool` answer would let a
+    /// signedness-sensitive site write `if v.is_signed()` and silently take the
+    /// unsigned branch on `Unknown`, which is the false proof the type prevents.
+    /// Every caller has to say what it does when the sign is missing.
+    pub fn known(self) -> Option<bool> {
+        match self {
+            Sign::Signed => Some(true),
+            Sign::Unsigned => Some(false),
+            Sign::Unknown => None,
+        }
+    }
+
+    /// The sign a bare `bool` (as the seeds and the `Indexed` store carry it)
+    /// stands for. Kept as a constructor so the conversion is in one place: a
+    /// `bool` read the wrong way round is exactly the bug this type exists to
+    /// make impossible.
+    pub fn of_bool(signed: bool) -> Sign {
+        if signed {
+            Sign::Signed
+        } else {
+            Sign::Unsigned
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Val {
-    /// A bit-vector of a known width.
-    Sym(Var),
+    /// A bit-vector of a known width, *and* the signedness its type declares.
+    ///
+    /// The sign lives in the value rather than beside it because the bug it
+    /// prevents was precisely a signedness threaded alongside: each call site
+    /// asked `operand_signedness` and a site that forgot got `Unsigned`. `0 < a`
+    /// on an `i8` became an unsigned test (so `i8::MIN` read as positive), and
+    /// `-1i8 as i16` zero-filled to `255` -- two reachable false proofs, both
+    /// from a missing sign. Here a missing sign is a construction-site error.
+    Sym(Var, Sign),
     Bool(Pred),
     /// An aggregate (array or tuple). Its parts live in the environment's
     /// `elems`/`fields` maps, keyed by the aggregate's own local.
@@ -383,6 +451,10 @@ struct Indexed {
     /// `&[u8]` or `[u8; 4]`), not the length's. Taking it from `len` would make
     /// every element 64 bits wide and mis-size every read.
     elem_w: u8,
+    /// The signedness of one element. Every element of an array or slice has the
+    /// same type, so one sign serves them all; an element read out of this store
+    /// carries it, which is what keeps `xs[0] < 0` a signed test on an `&[i8]`.
+    elem_signed: bool,
     /// `index value -> element variable`. Only indices whose value the run can
     /// resolve can be looked up here; a symbolic index that cannot be pinned is
     /// refused rather than guessed.
@@ -426,18 +498,19 @@ impl Env {
     /// Two different indices are two different variables, and the same index read
     /// twice is the same variable, which is what makes an indexed read a
     /// *function* of the index rather than an arbitrary value per read.
-    fn index_elem(&mut self, local: u32, index: u64) -> Option<Var> {
+    fn index_elem(&mut self, local: u32, index: u64) -> Option<(Var, Sign)> {
         let s = self.indexed.get_mut(&local)?;
         if s.poisoned {
             return None;
         }
+        let sign = Sign::of_bool(s.elem_signed);
         if let Some(v) = s.elems.get(&index) {
-            return Some(*v);
+            return Some((*v, sign));
         }
         let w = s.elem_w;
         let v = smt::var(w);
         s.elems.insert(index, v);
-        Some(v)
+        Some((v, sign))
     }
 
     /// The ite chain standing for `a[i]` on a fixed-length array, or `None` when
@@ -450,23 +523,24 @@ impl Env {
     /// that, and without it the chain would fall through to the last element,
     /// which is a wrong value rather than a missing one -- so `None` is returned
     /// for a slice, where there is no domain to enumerate at all.
-    fn index_chain(&mut self, local: u32, index: Var) -> Option<Var> {
-        let (n, elem_w) = {
+    fn index_chain(&mut self, local: u32, index: Var) -> Option<Val> {
+        let (n, elem_w, elem_signed) = {
             let s = self.indexed.get(&local)?;
-            (s.fixed_len?, s.elem_w)
+            (s.fixed_len?, s.elem_w, s.elem_signed)
         };
         if n > crate::mir::spec::MAX_INDEX_CHAIN {
             return None;
         }
         let mut elems = Vec::with_capacity(n as usize);
         for k in 0..n {
-            elems.push(self.index_elem(local, k)?);
+            elems.push(self.index_elem(local, k)?.0);
         }
         let mut chain = smt::word(0, elem_w);
         for k in (0..n).rev() {
             chain = smt::ite(smt::eq_const(index, k), elems[k as usize], chain);
         }
-        Some(chain)
+        // The chain's *value* is an element, so it carries the element's sign.
+        Some(Val::Sym(chain, Sign::of_bool(elem_signed)))
     }
 
     /// Read `(*_1)[_2]` — an indexed element (a slice or an array) subscripted by
@@ -494,14 +568,14 @@ impl Env {
             [Proj::Deref, Proj::Index(k)] | [Proj::Index(k)] => *k,
             [Proj::Deref, Proj::IndexVar(li)] | [Proj::IndexVar(li)] => {
                 match self.locals.get(li) {
-                    Some(Val::Sym(v)) => {
+                    Some(Val::Sym(v, _)) => {
                         let v = *v;
                         match smt::evaluate(v, |_| None) {
                             Some(k) => k,
                             // A symbolic index on an *array* is modelled as an ite
                             // chain; on a slice there is no finite domain, so the
                             // element is genuinely unknown and stays a refusal.
-                            None => return self.index_chain(p.local, v).map(Val::Sym),
+                            None => return self.index_chain(p.local, v),
                         }
                     }
                     _ => return Some(Val::Unknown),
@@ -510,7 +584,7 @@ impl Env {
             _ => return None,
         };
         Some(match self.index_elem(p.local, index) {
-            Some(v) => Val::Sym(v),
+            Some((v, sign)) => Val::Sym(v, sign),
             None => Val::Unknown,
         })
     }
@@ -559,7 +633,7 @@ impl Env {
                 Proj::Index(k) => match self.indexed.get(&p.local) {
                     Some(s) if s.poisoned => Val::Unknown,
                     Some(s) => match s.elems.get(k) {
-                        Some(v) => Val::Sym(*v),
+                        Some(v) => Val::Sym(*v, Sign::of_bool(s.elem_signed)),
                         // Not read yet. `get` takes `&self` and so cannot create
                         // the element; the operand path goes through
                         // `read_indexed`, which can, and does so before this
@@ -577,14 +651,15 @@ impl Env {
                 // read, which is a wrong proof waiting to happen.
                 Proj::IndexVar(li) => {
                     let sym = match self.locals.get(li) {
-                        Some(Val::Sym(v)) => Some(*v),
+                        Some(Val::Sym(v, _)) => Some(*v),
                         _ => None,
                     };
                     match sym.and_then(|v| smt::evaluate(v, |_| None)) {
                         Some(k) => match self.indexed.get(&p.local) {
                             Some(s) if s.poisoned => Val::Unknown,
                             Some(s) => {
-                                s.elems.get(&k).map(|v| Val::Sym(*v)).unwrap_or(Val::Unknown)
+                                let sign = Sign::of_bool(s.elem_signed);
+                                s.elems.get(&k).map(|v| Val::Sym(*v, sign)).unwrap_or(Val::Unknown)
                             }
                             None => *self.elems.get(&(p.local, k)).unwrap_or(&Val::Unknown),
                         },
@@ -677,7 +752,7 @@ impl Env {
             // poisons instead of guessing.
             [Proj::IndexVar(li)] | [Proj::Deref, Proj::IndexVar(li)] => {
                 match self.locals.get(li) {
-                    Some(Val::Sym(x)) => match smt::evaluate(*x, |_| None) {
+                    Some(Val::Sym(x, _)) => match smt::evaluate(*x, |_| None) {
                         Some(k) => self.write_elem(p.local, k, v),
                         None => self.poison_elems(p.local),
                     },
@@ -736,7 +811,7 @@ impl Env {
         self.indexed_writes.insert(local);
         match self.indexed.get_mut(&local) {
             Some(s) => match v {
-                Val::Sym(x) => {
+                Val::Sym(x, _) => {
                     s.elems.insert(index, x);
                 }
                 // An aggregate element, or an unmodelled one. The element is no
@@ -909,17 +984,19 @@ struct Cut {
 /// growing an argument per projection shape as more are modelled.
 #[derive(Default, Clone)]
 pub struct Seeds {
-    /// `(local, field index, variable)` for each struct field a contract names.
-    pub fields: Vec<(u32, u32, Var)>,
-    /// `(local, length variable, element width)` for each slice or array
-    /// argument.
-    pub lens: Vec<(u32, Var, u8)>,
+    /// `(local, field index, variable, signed)` for each struct field a contract
+    /// names. The sign travels with the seed so the executor builds a
+    /// `Val::Sym` that knows it, rather than one it has to guess at.
+    pub fields: Vec<(u32, u32, Var, bool)>,
+    /// `(local, length variable, element width, element signed)` for each slice
+    /// or array argument.
+    pub lens: Vec<(u32, Var, u8, bool)>,
     /// The fixed length for each array argument, so a symbolic subscript knows
     /// the domain to enumerate. A slice has no entry, and its `xs[i]` stays
     /// refused.
     pub array_lens: Vec<(u32, u64)>,
-    /// `(local, index, variable)` for each element a contract names.
-    pub elems: Vec<(u32, u64, Var)>,
+    /// `(local, index, variable, signed)` for each element a contract names.
+    pub elems: Vec<(u32, u64, Var, bool)>,
 }
 
 /// Verify one function from a parsed program.
@@ -982,7 +1059,9 @@ where
         let ty = f.ty_of(l).cloned().unwrap_or(Ty::Other("?".into()));
         let v = match ty.width() {
             Some(1) => Val::Bool(smt::var_named(l, 1).eq_val(1)),
-            Some(w) => Val::Sym(smt::var_named(l, w)),
+            // The argument's own type declares its sign, so the value carries it
+            // rather than a later site having to look it up.
+            Some(w) => Val::Sym(smt::var_named(l, w), Sign::of(&ty)),
             None => Val::Unknown,
         };
         env.locals.insert(l, v);
@@ -995,8 +1074,8 @@ where
     // Struct fields the contract names. The contract's `c.lo` is bound to this
     // variable, and the body's `((*_1).0)` reads it from here, so the two are the
     // same symbolic input rather than two that merely look alike.
-    for &(local, field, v) in &seeds.fields {
-        env.fields.insert((local, field), Val::Sym(v));
+    for &(local, field, v, signed) in &seeds.fields {
+        env.fields.insert((local, field), Val::Sym(v, Sign::of_bool(signed)));
     }
     // Slice lengths and elements the contract names. The contract's `xs.len()` and
     // `xs[0]` and the body's `PtrMetadata(_1)` and `(*_1)[0]` must be one value,
@@ -1005,14 +1084,14 @@ where
     // a contract that names it later would then disagree — which is why
     // `bind_slice_refs` runs over every contract text before the run, so a name a
     // contract uses always has a binding here.
-    for &(local, len, elem_w) in &seeds.lens {
+    for &(local, len, elem_w, elem_signed) in &seeds.lens {
         let fixed_len = seeds.array_lens.iter().find(|(l, _)| *l == local).map(|(_, n)| *n);
         env.indexed.insert(
             local,
-            Indexed { len, elem_w, elems: BTreeMap::new(), fixed_len, poisoned: false },
+            Indexed { len, elem_w, elem_signed, elems: BTreeMap::new(), fixed_len, poisoned: false },
         );
     }
-    for &(local, index, v) in &seeds.elems {
+    for &(local, index, v, _) in &seeds.elems {
         if let Some(s) = env.indexed.get_mut(&local) {
             s.elems.insert(index, v);
         }
@@ -1196,7 +1275,7 @@ fn loop_writes(f: &MirFn, header: usize) -> Vec<u32> {
 fn invariant_names(f: &MirFn, env: &Env) -> BTreeMap<String, Var> {
     let mut out = BTreeMap::new();
     for (&local, name) in &f.local_names {
-        if let Some(Val::Sym(v)) = env.locals.get(&local) {
+        if let Some(Val::Sym(v, _)) = env.locals.get(&local) {
             out.insert(name.clone(), *v);
         }
     }
@@ -1286,7 +1365,9 @@ fn advance(
                 let fresh = if w == 1 {
                     Val::Bool(smt::var(1).eq_val(1))
                 } else {
-                    Val::Sym(smt::var(w))
+                    // A havoced local is a fresh *input* of the same type, so it
+                    // keeps the type's sign.
+                    Val::Sym(smt::var(w), Sign::of(ty))
                 };
                 st.env.locals.insert(l, fresh);
             }
@@ -1326,19 +1407,26 @@ fn try_intrinsic(
     // the width from there would ask the engine for a 64-bit overflow test.
     let first = args.first()?;
     let w = operand_width(cur, first)?;
-    // An intrinsic whose operand signedness cannot be read is refused: guessing
+    // The operand's signedness comes *from the value*. An operand whose type
+    // could not be read was already refused when the value was built (it is
+    // `Val::Unknown`, not a `Sym`), so there is no sign to guess here: guessing
     // would give `sdiv`/`srem` the unsigned meaning, which is a wrong value for
     // every negative operand rather than a weaker proof.
-    let signed = operand_signedness(cur, first)?;
-    let x = match operand(env, first) {
-        Val::Sym(v) => v,
+    let (x, sign) = match operand(env, first) {
+        // The sign comes out of the value with the word, so the two cannot be
+        // read from different places and disagree.
+        Val::Sym(v, sign) => (v, sign),
         // A `bool` operand has no bit-vector to hand the model, and an unknown
         // one has no value at all. Either way there is nothing to compute with.
         _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
     };
+    // A sign the dump did not print is a refusal, not an unsigned reading:
+    // `sdiv` on an `i8` read as unsigned returns a huge positive quotient for
+    // every negative operand, which is a wrong value rather than a weaker proof.
+    let signed = sign.known()?;
     let y = match args.get(1) {
         Some(a) => match operand(env, a) {
-            Val::Sym(v) => v,
+            Val::Sym(v, _) => v,
             _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
         },
         // The unary family (`checked_neg`, `wrapping_abs`, …) is not modelled,
@@ -1349,15 +1437,19 @@ fn try_intrinsic(
     let Some(outcome) = intrinsics::eval(op, x, y, w, signed) else {
         return Some(Err(format!("`{name}` past what the model covers at {w} bits")));
     };
+    // The result of an arithmetic intrinsic has the operand's type, so it has
+    // the operand's sign -- `wrapping_sub(0, 1)` on a `u8` is `255` and on an
+    // `i8` is `-1`, the same bits read two ways.
+    let sign = Sign::of_bool(signed);
     match outcome {
-        Outcome::Value(v) => env.set(dest, Val::Sym(v)),
+        Outcome::Value(v) => env.set(dest, Val::Sym(v, sign)),
         Outcome::Option { tag, payload } => {
             // The payload is recorded under the `Some` projection with the
             // operand width, and the tag alongside it. rustc reads the payload
             // only inside the arm where the tag is `1`, so recording it now is
             // sound; the width is what keeps the read from being mis-sized.
-            env.set_discriminant(dest.local, Val::Sym(tag));
-            env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(payload), w);
+            env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
+            env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(payload, sign), w);
         }
     }
     Some(Ok(()))
@@ -1440,7 +1532,7 @@ where
                             .iter()
                             .filter(|((l, _), _)| *l == 0)
                             .filter_map(|((_, k), v)| match v {
-                                Val::Sym(x) => Some((*k as u32, *x)),
+                                Val::Sym(x, _) => Some((*k as u32, *x)),
                                 Val::Bool(p) => {
                                     Some((*k as u32, smt::ite(*p, smt::word(1, 1), smt::word(0, 1))))
                                 }
@@ -1456,7 +1548,7 @@ where
                         // that uses bare `ret` is refused by the parser; the
                         // components are still available as `ret.0`, `ret.1`.
                         let rv = match ret {
-                            Val::Sym(rv) => Some(rv),
+                            Val::Sym(rv, _) => Some(rv),
                             Val::Bool(rp) => Some(smt::ite(rp, smt::word(1, 1), smt::word(0, 1))),
                             _ => None,
                         };
@@ -1569,8 +1661,10 @@ where
             let c = operand(&mut st.env, cond);
             let holds = match c {
                 Val::Bool(p) => p,
-                // A bit-vector condition is true when it is non-zero.
-                Val::Sym(v) => smt::not(smt::eq_const(v, 0)),
+                // A bit-vector condition is true when it is non-zero. An assert
+                // condition is a `bool` in Rust, so the sign here is irrelevant;
+                // it is carried for uniformity, not used.
+                Val::Sym(v, _) => smt::not(smt::eq_const(v, 0)),
                 Val::Agg | Val::Unknown => {
                     report.unknown_paths.push(format!("unmodelled assert condition: {msg}"));
                     return;
@@ -1600,7 +1694,9 @@ where
             let arm = |k: u128, positive: bool| -> Option<Pred> {
                 match d {
                     Val::Bool(p) => Some(if (k != 0) == positive { p } else { smt::not(p) }),
-                    Val::Sym(v) => {
+                    // A `switchInt` compares against a discriminant, which is an
+                    // integer: equality does not depend on the sign.
+                    Val::Sym(v, _) => {
                         let eq = smt::eq_const(v, k as u64);
                         Some(if positive { eq } else { smt::not(eq) })
                     }
@@ -1790,7 +1886,17 @@ fn operand(env: &mut Env, o: &Operand) -> Val {
         Operand::Const(c) => match c {
             Const::UInt(v, ty) => match ty.as_ref().and_then(|t| t.width()) {
                 Some(1) => Val::Bool(smt::truth(*v == 1)),
-                Some(w) => Val::Sym(smt::word(*v as u64, w)),
+                // A constant's type suffix is the only place its signedness
+                // appears -- `const 0_i8` versus `const 0_u8` -- so the sign is
+                // read here, once, and travels with the value.
+                Some(w) => {
+                    // No suffix means the dump printed no type, so there is no
+                    // sign to read. It is `Unknown`, not `Unsigned`: defaulting to
+                    // unsigned here is exactly the false proof this type exists to
+                    // prevent, and the callers refuse an `Unknown` sign.
+                    let sign = ty.as_ref().map(Sign::of).unwrap_or(Sign::Unknown);
+                    Val::Sym(smt::word(*v as u64, w), sign)
+                }
                 None => Val::Unknown,
             },
             Const::Bool(b) => Val::Bool(smt::truth(*b)),
@@ -1808,21 +1914,27 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
             // the dump did not print a suffix.
             if let Operand::Const(Const::UInt(v, None)) = o {
                 if let Some(w) = dest_w {
-                    return Val::Sym(smt::word(*v as u64, w));
+                    // The literal has no suffix, so it takes the place's type --
+                    // and therefore the place's signedness. A place whose type
+                    // the dump did not print leaves the sign unknown, which the
+                    // consumers refuse rather than read as unsigned.
+                    let sign = type_of_place(f, dest).map(|t| Sign::of(&t))
+                        .unwrap_or(Sign::Unknown);
+                    return Val::Sym(smt::word(*v as u64, w), sign);
                 }
             }
             operand(env, o)
         }
         Rvalue::Binary(op, a, b) => {
-            let (x, y) = (operand(env, a), operand(env, b));
             // The signedness of the *left* operand decides what `Shr` means and
             // what `<`/`<=`/`>`/`>=` mean; the amount's type is irrelevant and
-            // rustc keeps it a distinct `u32`. An operand whose type cannot be
-            // resolved is refused rather than read as unsigned: `0 < a` on an
-            // `i8` is a signed comparison, and taking the constant for unsigned
-            // turned it into one that says `i8::MIN` is positive -- a false proof.
-            let Some(signed) = operand_signedness(f, a) else { return Val::Unknown };
-            eval_binary(*op, x, y, dest_w, signed)
+            // rustc keeps it a distinct `u32`. That sign is now *in* the value
+            // (`Val::Sym(word, sign)`), so there is no separate lookup that a
+            // later caller could forget: an operand whose type cannot be resolved
+            // is `Val::Unknown` here, and `eval_binary` refuses it rather than
+            // reading it as unsigned.
+            let (x, y) = (operand(env, a), operand(env, b));
+            eval_binary(*op, x, y, dest_w)
         }
         Rvalue::CheckedBinary(op, a, b) => {
             // The tuple is `(result, overflowed)`. Field 0 gets the wrapped
@@ -1836,10 +1948,9 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
                 .unwrap_or(64);
             let x = operand(env, a);
             let y = operand(env, b);
-            let Some(signed) = operand_signedness(f, a) else { return Val::Unknown };
-            let res = eval_binary(*op, x, y, Some(w), signed);
+            let res = eval_binary(*op, x, y, Some(w));
             env.set(&Place { local: dest.local, proj: vec![Proj::Field(0)] }, res);
-            match overflow_pred(*op, x, y, w, signed) {
+            match overflow_pred(*op, x, y, w) {
                 Some(p) => {
                     env.set(&Place { local: dest.local, proj: vec![Proj::Field(1)] }, Val::Bool(p));
                 }
@@ -1857,15 +1968,18 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
             match (op, v) {
                 (_, Val::Unknown) => Val::Unknown,
                 (UnOp::Not, Val::Bool(p)) => Val::Bool(smt::not(p)),
-                (UnOp::Not, Val::Sym(s)) => match dest_w {
-                    Some(w) => Val::Sym(smt::bxor(s, smt::all_ones(w))),
+                // `!x` is a bitwise complement, so the result has the operand's
+                // type and keeps its sign.
+                (UnOp::Not, Val::Sym(s, sign)) => match dest_w {
+                    Some(w) => Val::Sym(smt::bxor(s, smt::all_ones(w)), sign),
                     None => Val::Unknown,
                 },
                 // `-x` is `0 - x`, which is the right bit pattern for every input
                 // including `MIN` (it wraps back to `MIN`, which is what rustc's
-                // own `assert(x != MIN)` guards and then computes anyway).
-                (UnOp::Neg, Val::Sym(s)) => match dest_w {
-                    Some(w) => Val::Sym(smt::sub(smt::word(0, w), s)),
+                // own `assert(x != MIN)` guards and then computes anyway). The
+                // result has the operand's type, so it keeps the operand's sign.
+                (UnOp::Neg, Val::Sym(s, sign)) => match dest_w {
+                    Some(w) => Val::Sym(smt::sub(smt::word(0, w), s), sign),
                     None => Val::Unknown,
                 },
                 _ => Val::Unknown,
@@ -1873,25 +1987,34 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
         }
         Rvalue::Cast(o, ty) => {
             let v = operand(env, o);
+            // The cast's *result* has the target type, so its sign is the
+            // target's. The source's sign comes out of the value, which is what
+            // decides whether a widening sign-extends or zero-fills.
+            let out_sign = Sign::of(ty);
             match (v, ty.width()) {
-                (Val::Sym(s), Some(w)) => Val::Sym(match operand_signedness(f, o) {
-                    // Widening a *signed* value sign-extends: `-1i8 as i16` is
-                    // `-1`, not `255`. `truncate` zero-fills, so using it for
-                    // every cast modelled `-1i8 as i16` as `255` and proved
-                    // `requires: a == -1; ensures: ret == 255` -- a reachable
-                    // false proof. `sign_extend` truncates first when the target
-                    // is no wider, so a narrowing cast is unaffected.
-                    Some(true) => smt::sign_extend(s, w),
-                    // An *unsigned* widening zero-fills, which is what `truncate`
-                    // already does. A cast whose source signedness cannot be read
-                    // is refused rather than guessed: zero-filling a signed value
-                    // is the false proof above, and sign-extending an unsigned one
-                    // turns `255u8 as u16` into `65535`.
-                    Some(false) => smt::truncate(s, w),
-                    None => return Val::Unknown,
-                }),
+                // Widening a *signed* value sign-extends: `-1i8 as i16` is `-1`,
+                // not `255`. `truncate` zero-fills, so using it for every cast
+                // modelled `-1i8 as i16` as `255` and proved
+                // `requires: a == -1; ensures: ret == 255` -- a reachable false
+                // proof. `sign_extend` truncates first when the target is no
+                // wider, so a narrowing cast is unaffected. An *unsigned* source
+                // zero-fills, which is what `truncate` does.
+                (Val::Sym(s, src), Some(w)) => {
+                    // A source sign the dump did not print is a refusal: zero
+                    // -filling a signed value is the `-1i8 as i16` false proof,
+                    // and sign-extending an unsigned one turns `255u8 as u16`
+                    // into `65535`. Neither reading is safe to guess.
+                    let bits = match src.known() {
+                        Some(true) => smt::sign_extend(s, w),
+                        Some(false) => smt::truncate(s, w),
+                        None => return Val::Unknown,
+                    };
+                    Val::Sym(bits, out_sign)
+                }
                 (Val::Bool(p), Some(1)) => Val::Bool(p),
-                (Val::Bool(p), Some(w)) => Val::Sym(smt::ite(p, smt::word(1, w), smt::word(0, w))),
+                (Val::Bool(p), Some(w)) => {
+                    Val::Sym(smt::ite(p, smt::word(1, w), smt::word(0, w)), out_sign)
+                }
                 _ => Val::Unknown,
             }
         }
@@ -1908,7 +2031,8 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
         // other pointer has metadata this model cannot express, and answering
         // `Unknown` there is what keeps an invented length out of a proof.
         Rvalue::PtrMetadata(p) => match env.indexed.get(&p.local) {
-            Some(s) => Val::Sym(s.len),
+            // A length is a `usize`, so it is unsigned.
+            Some(s) => Val::Sym(s.len, Sign::Unsigned),
             None => Val::Unknown,
         },
         Rvalue::Discriminant(p) => match env.discriminants.get(&p.local) {
@@ -1916,9 +2040,10 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
             // `switchInt` compares it against the small variant constants, so
             // the width only has to be wide enough to hold them; taking it from
             // the payload keeps `discriminant` and the payload in one width.
-            Some(Val::Sym(tag)) => {
+            Some(Val::Sym(tag, _)) => {
                 let w = env.option_width(p.local).unwrap_or(64);
-                Val::Sym(smt::truncate(*tag, w))
+                // A discriminant is an unsigned integer.
+                Val::Sym(smt::truncate(*tag, w), Sign::Unsigned)
             }
             Some(v) => *v,
             // No modelled call wrote a tag here. An enum this frontend did not
@@ -1994,32 +2119,6 @@ fn type_of_place(f: &MirFn, p: &Place) -> Option<Ty> {
     Some(ty)
 }
 
-/// Whether the operand's declared type is a signed integer, or `None` when the
-/// type could not be resolved.
-///
-/// `Shr` is arithmetic for a signed operand and logical for an unsigned one, and
-/// the bit pattern alone does not say which. Guessing would be a wrong answer for
-/// every signed shift, so the type is read rather than assumed. `None` is *not*
-/// "unsigned": the caller must refuse rather than pick a meaning.
-///
-/// The constant case is the one that was a live false proof. `0 < a` lowers to
-/// `Lt(const 0_i8, copy _1)` -- the constant is the *left* operand, and a constant
-/// carries its own signedness in the dump's type suffix. Reading a constant as
-/// unsigned made `0 < a` an unsigned comparison, so for a body of
-/// `if 0 < a { 1 } else { 0 }` the contract `requires: a == i8::MIN; ensures:
-/// ret == 1` was *proved*: `i8::MIN` is `0x80`, which is the largest `u8`, so the
-/// unsigned test said "taken" and the branch returned `1`. The real `i8` value is
-/// negative, the branch is never taken, and the function returns `0`.
-fn operand_signedness(f: &MirFn, o: &Operand) -> Option<bool> {
-    match o {
-        Operand::Copy(p) | Operand::Move(p) => type_of_place(f, p).map(|t| t.is_signed()),
-        // A constant's suffix is its type: `const 0_i8` is signed, `const 0_u8`
-        // is not. A constant the dump printed without a suffix has no signedness
-        // to read, so it is refused rather than defaulted.
-        Operand::Const(Const::UInt(_, ty)) => ty.as_ref().map(Ty::is_signed),
-        Operand::Const(_) => None,
-    }
-}
 
 /// Which of the engine's three shifts a MIR `Shl`/`Shr` means.
 ///
@@ -2034,11 +2133,32 @@ fn shift_kind(op: BinOp, signed: bool) -> smt::Shift {
 }
 
 /// Apply a binary operator, respecting the destination width.
-fn eval_binary(op: BinOp, a: Val, b: Val, width: Option<u8>, signed: bool) -> Val {
+///
+/// The operand's signedness is *in* the operand -- `Val::Sym(word, sign)` -- not
+/// a parameter, which is the point of the type. It used to be a bare `bool` the
+/// caller looked up separately, and a caller that looked it up wrong (or not at
+/// all) turned `0 < a` on an `i8` into an unsigned comparison, under which
+/// `i8::MIN` is the largest value. A wrong signedness is not a missed proof but a
+/// wrong branch, so the sign has to travel with the bits it describes.
+fn eval_binary(op: BinOp, a: Val, b: Val, width: Option<u8>) -> Val {
+    // rustc gives both operands of a binary op the same type, so one sign serves
+    // both. It is taken from the left, matching how the operand type is chosen.
+    //
+    // `Some(signed)` only when the sign was actually read. `None` is not
+    // "unsigned": the signedness-sensitive operators below refuse it rather than
+    // pick a meaning. The operators that do not read the sign (`+`, `&`, `==`)
+    // proceed, because for them the sign is genuinely irrelevant.
+    let signed = match a {
+        Val::Sym(_, sign) => sign.known(),
+        // A comparison of two `bool`s (`p == q`) has no integer sign to use, and
+        // the arms below handle it before any sign is read. Anything else here
+        // has no bit-vector at all and returns `Unknown` below.
+        _ => Some(false),
+    };
     match op {
         BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
             let (x, y) = match (a, b) {
-                (Val::Sym(x), Val::Sym(y)) => (x, y),
+                (Val::Sym(x, _), Val::Sym(y, _)) => (x, y),
                 (Val::Bool(x), Val::Bool(y)) => {
                     return Val::Bool(match op {
                         BinOp::Eq => smt::iff(x, y),
@@ -2048,14 +2168,20 @@ fn eval_binary(op: BinOp, a: Val, b: Val, width: Option<u8>, signed: bool) -> Va
                 }
                 _ => return Val::Unknown,
             };
+            // `==`/`!=` do not read the sign -- two bit patterns are equal or
+            // not regardless of how they are read -- so they are answered before
+            // the sign is required. The relational four do read it, and refuse
+            // when it was not printed: `<` on an `i8` is not `<` on a `u8`, and
+            // the unsigned form calls `-1` the largest value. A wrong choice is
+            // not a missed proof but a wrong branch, which is a wrong answer.
+            if matches!(op, BinOp::Eq | BinOp::Ne) {
+                return Val::Bool(match op {
+                    BinOp::Eq => smt::eq(x, y),
+                    _ => smt::not(smt::eq(x, y)),
+                });
+            }
+            let Some(signed) = signed else { return Val::Unknown };
             Val::Bool(match op {
-                BinOp::Eq => smt::eq(x, y),
-                BinOp::Ne => smt::not(smt::eq(x, y)),
-                // Signedness matters here and only here: `<` on an `i8` is not
-                // `<` on a `u8`, and the unsigned form calls `-1` the largest
-                // value. rustc picks signed or unsigned by the operand type, so
-                // the type is what decides -- a wrong choice is not a missed
-                // proof but a wrong branch, which is a wrong answer.
                 BinOp::Lt if signed => smt::slt(x, y),
                 BinOp::Le if signed => smt::sle(x, y),
                 BinOp::Gt if signed => smt::sgt(x, y),
@@ -2069,7 +2195,7 @@ fn eval_binary(op: BinOp, a: Val, b: Val, width: Option<u8>, signed: bool) -> Va
         }
         _ => {
             let (x, y) = match (a, b) {
-                (Val::Sym(x), Val::Sym(y)) => (x, y),
+                (Val::Sym(x, _), Val::Sym(y, _)) => (x, y),
                 // Bitwise operators on `bool`. rustc lowers `p && q` to
                 // `BitAnd(p, q)` and the OR/XOR forms likewise, so a contract
                 // assert whose condition was written with `&&` arrives here as a
@@ -2089,6 +2215,16 @@ fn eval_binary(op: BinOp, a: Val, b: Val, width: Option<u8>, signed: bool) -> Va
             if width.is_none() {
                 return Val::Unknown;
             }
+            // Every arm below is an integer operation whose result has the
+            // operand's type, so the result carries the operand's sign. The sign
+            // is `Unknown` exactly when the dump did not print it; the arms that
+            // do not read it still compute, and the two that do (`Div`/`Rem` and
+            // the shifts) refuse below rather than guess.
+            let sign = match signed {
+                Some(true) => Sign::Signed,
+                Some(false) => Sign::Unsigned,
+                None => Sign::Unknown,
+            };
             Val::Sym(match op {
                 BinOp::Add => smt::add(x, y),
                 BinOp::Sub => smt::sub(x, y),
@@ -2104,12 +2240,20 @@ fn eval_binary(op: BinOp, a: Val, b: Val, width: Option<u8>, signed: bool) -> Va
                 // huge positive quotient for `-7 / 2`, which is a wrong value
                 // and not merely a weaker proof.
                 BinOp::Div | BinOp::Rem => {
-                    let signed_pair = (signed, op);
-                    match signed_pair {
-                        (true, BinOp::Div) => smt::sdiv(x, y),
-                        (true, BinOp::Rem) => smt::srem(x, y),
-                        (false, BinOp::Div) => smt::udiv(x, y),
-                        _ => smt::urem(x, y),
+                    // A signed operand needs the *signed* divider, and an
+                    // unprinted sign is a refusal: the unsigned divider returns a
+                    // huge positive quotient for `-7 / 2`, a wrong value rather
+                    // than a weaker proof.
+                    match (signed, op) {
+                        (Some(true), BinOp::Div) => smt::sdiv(x, y),
+                        (Some(true), BinOp::Rem) => smt::srem(x, y),
+                        (Some(false), BinOp::Div) => smt::udiv(x, y),
+                        (Some(false), BinOp::Rem) => smt::urem(x, y),
+                        // The arm is reached only for `Div`/`Rem` (the outer
+                        // `match op` selects it), so `None` is the only other
+                        // case and it is a refusal.
+                        (None, _) => return Val::Unknown,
+                        _ => return Val::Unknown,
                     }
                 }
                 // A *variable* shift amount is a barrel shifter (see
@@ -2119,6 +2263,10 @@ fn eval_binary(op: BinOp, a: Val, b: Val, width: Option<u8>, signed: bool) -> Va
                 // which is also what makes `x << 3` prove without any guard at all.
                 BinOp::Shl | BinOp::Shr => {
                     let Some(w) = width else { return Val::Unknown };
+                    // `Shr` is arithmetic on a signed operand and logical on an
+                    // unsigned one; an unprinted sign is a refusal, because the
+                    // two differ for every negative value.
+                    let Some(signed) = signed else { return Val::Unknown };
                     match smt::const_of(y) {
                         // rustc's guard says `k < w`; a constant outside that range
                         // is a compile error, so this is defensive only.
@@ -2128,16 +2276,16 @@ fn eval_binary(op: BinOp, a: Val, b: Val, width: Option<u8>, signed: bool) -> Va
                                 smt::Shift::LogicalRight => smt::lshr(x, k as u32),
                                 smt::Shift::ArithmeticRight => smt::ashr(x, k as u32),
                             };
-                            return Val::Sym(v);
+                            return Val::Sym(v, sign);
                         }
                         Some(_) => return Val::Unknown,
                         None => {
-                            return Val::Sym(smt::shift_var(shift_kind(op, signed), x, y));
+                            return Val::Sym(smt::shift_var(shift_kind(op, signed), x, y), sign);
                         }
                     }
                 }
                 _ => return Val::Unknown,
-            })
+            }, sign)
         }
     }
 }
@@ -2152,9 +2300,12 @@ fn eval_binary(op: BinOp, a: Val, b: Val, width: Option<u8>, signed: bool) -> Va
 /// dischargeable and an overflowing program would be reported panic-free — the
 /// exact failure mode the README calls out, where an unsound engine reports a
 /// *better-looking* result than the truth.
-fn overflow_pred(op: BinOp, a: Val, b: Val, w: u8, signed: bool) -> Option<Pred> {
-    let (x, y) = match (a, b) {
-        (Val::Sym(x), Val::Sym(y)) => (x, y),
+fn overflow_pred(op: BinOp, a: Val, b: Val, w: u8) -> Option<Pred> {
+    // The sign is the operand's, read from the operand, for the same reason
+    // `eval_binary` does: a wrong sign here is a wrong overflow predicate, and an
+    // overflow predicate that is too weak is an overflow the tool calls safe.
+    let (x, y, signed) = match (a, b) {
+        (Val::Sym(x, sx), Val::Sym(y, _)) => (x, y, sx.known()?),
         _ => return None,
     };
     Some(match op {
@@ -2282,43 +2433,81 @@ mod tests {
         })
     }
 
-    /// The signedness of a constant operand comes from its own type suffix.
+    /// The signedness a `Val` is *built* with comes from the operand's own type.
     ///
-    /// This is the helper the false proof lived in: `0 < a` lowers to
-    /// `Lt(const 0_i8, copy _1)`, and reading `const 0_i8` as unsigned made the
-    /// comparison unsigned. The test pins all three answers the helper can give --
-    /// signed, unsigned, and "the type was not printed, so refuse" -- because the
-    /// bug was a *default*, and a test that only checked the signed case would
-    /// pass again the moment the default came back.
+    /// This is the invariant the whole refactor exists for. The sign used to be a
+    /// `bool` threaded alongside the value, and the two false proofs both came
+    /// from a site that dropped it: `const 0_i8` read as unsigned made `0 < a` an
+    /// unsigned test (so `i8::MIN` read as positive), and a signed source cast
+    /// without its sign zero-filled `-1i8 as i16` to `255`. Here the sign is a
+    /// field of `Val::Sym`, and this test pins that the *only* place a `Val` is
+    /// made from an `Operand` -- `operand` -- reads it from the operand's type:
+    /// a constant's suffix, a place's declared type, and a projection's element
+    /// type rather than its container's.
     #[test]
-    fn a_constants_signedness_comes_from_its_suffix() {
-        let f = MirFn {
-            name: "f".to_string(),
-            arg_locals: Vec::new(),
-            ret_ty: Ty::U8,
-            locals: BTreeMap::from([
-                (0, Ty::U8),
-                (1, Ty::I8),
-                (2, Ty::U8),
-                (3, Ty::Array(Box::new(Ty::I8), 4)),
-            ]),
-            local_names: BTreeMap::new(),
-            blocks: Vec::new(),
+    fn a_vals_sign_comes_from_the_operands_type() {
+        let mut env = Env::new();
+        // A constant's suffix is its type: `const 0_i8` is signed, `const 0_u8`
+        // is not.
+        let sign_of = |env: &mut Env, o: &Operand| match operand(env, o) {
+            Val::Sym(_, s) => s,
+            other => panic!("expected a bit-vector, got {other:?}"),
         };
-        let signed_const = Operand::Const(Const::UInt(0, Some(Ty::I8)));
-        let unsigned_const = Operand::Const(Const::UInt(0, Some(Ty::U8)));
-        // A literal the dump printed with no suffix carries no signedness at all.
-        let bare_const = Operand::Const(Const::UInt(0, None));
-        assert_eq!(operand_signedness(&f, &signed_const), Some(true));
-        assert_eq!(operand_signedness(&f, &unsigned_const), Some(false));
-        assert_eq!(operand_signedness(&f, &bare_const), None);
-        // A place operand reads its declared type, and a projection resolves to
-        // the *element's* type rather than the container's: local 3 is `[i8; 4]`,
-        // so `_3[0]` is signed.
-        assert_eq!(operand_signedness(&f, &Operand::Copy(Place::new(0))), Some(false));
-        assert_eq!(operand_signedness(&f, &Operand::Copy(Place::new(1))), Some(true));
-        let elem = Place { local: 3, proj: vec![Proj::Index(0)] };
-        assert_eq!(operand_signedness(&f, &Operand::Copy(elem)), Some(true));
+        assert_eq!(
+            sign_of(&mut env, &Operand::Const(Const::UInt(0, Some(Ty::I8)))),
+            Sign::Signed
+        );
+        assert_eq!(
+            sign_of(&mut env, &Operand::Const(Const::UInt(0, Some(Ty::U8)))),
+            Sign::Unsigned
+        );
+        // A suffix-less constant carries no width *and* no sign, so it is
+        // `Val::Unknown` outright -- there is nothing to read a signedness from,
+        // which is what keeps the false-proof default from coming back.
+        assert!(matches!(
+            operand(&mut env, &Operand::Const(Const::UInt(0, None))),
+            Val::Unknown
+        ));
+        // A place read returns the value that was *stored* for the local, so the
+        // sign is the one the seeding site gave it. This is the path an argument
+        // or an array element takes, and it is where a missing sign would have
+        // been invisible before: `env.locals` held a bare `Var`.
+        env.locals.insert(0, Val::Sym(smt::var(8), Sign::Unsigned));
+        env.locals.insert(1, Val::Sym(smt::var(8), Sign::Signed));
+        assert_eq!(sign_of(&mut env, &Operand::Copy(Place::new(0))), Sign::Unsigned);
+        assert_eq!(sign_of(&mut env, &Operand::Copy(Place::new(1))), Sign::Signed);
+    }
+
+    /// A relational test on a value whose sign the dump did not print is
+    /// *refused*, not read as unsigned.
+    ///
+    /// This is the regression guard for the `0 < a` false proof. `Lt` on two
+    /// `Sign::Unknown` operands must be `Val::Unknown`, which the caller reports
+    /// as an unmodelled path, rather than `smt::ult`, which would call
+    /// `i8::MIN` the largest value and prove the wrong branch.
+    #[test]
+    fn a_comparison_on_an_unprinted_sign_is_refused() {
+        let unknown = Val::Sym(smt::var(8), Sign::Unknown);
+        let v = eval_binary(BinOp::Lt, unknown, unknown, Some(8));
+        assert!(matches!(v, Val::Unknown), "expected a refusal, got {v:?}");
+        // The equality forms do not read the sign, so they still answer.
+        assert!(matches!(eval_binary(BinOp::Eq, unknown, unknown, Some(8)), Val::Bool(_)));
+        // Division and shifts read it too, and refuse the same way.
+        assert!(matches!(
+            eval_binary(BinOp::Div, unknown, unknown, Some(8)),
+            Val::Unknown
+        ));
+        assert!(matches!(
+            eval_binary(BinOp::Shr, unknown, unknown, Some(8)),
+            Val::Unknown
+        ));
+        // An *unsigned* pair is answered, so the refusal is specific to the
+        // missing sign rather than to the operator.
+        let unsigned = Val::Sym(smt::var(8), Sign::Unsigned);
+        assert!(matches!(
+            eval_binary(BinOp::Lt, unsigned, unsigned, Some(8)),
+            Val::Bool(_)
+        ));
     }
 
     fn panic_kind() -> ObligationKind {
