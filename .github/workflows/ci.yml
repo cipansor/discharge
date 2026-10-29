@@ -107,8 +107,11 @@ jobs:
             https://github.com/ferrocene/criticalup/releases/latest/download/criticalup-installer.sh | sh
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      # `criticalup auth set` is interactive, so the token is piped to it. The token is never
-      # echoed; `set -x` is deliberately not used anywhere in this job.
+      # The token goes in on stdin rather than as an argument. CriticalUp accepts either
+      # (`criticalup auth set [TOKEN]`), but an argument would put the token in the process
+      # table, where any process on the runner can read it; on a non-TTY stdin CriticalUp
+      # reads a single line, which is what the pipe provides. Nothing echoes the token, and
+      # `set -x` is deliberately not used anywhere in this job.
       - name: Authenticate CriticalUp and build with the qualified toolchain
         if: steps.have_token.outputs.present == 'true'
         env:
