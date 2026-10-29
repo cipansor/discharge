@@ -369,13 +369,92 @@ pub struct MirFn {
     pub ret_ty: Ty,
     pub locals: BTreeMap<LocalIdx, Ty>,
     /// `debug a => _1;` — local to source name, for readable counterexamples.
+    ///
+    /// First binding wins, so a scoped alias never renames the parameter it
+    /// aliases. Every binding, including the ones this map drops, is kept in
+    /// [`Self::debug_aliases`].
     pub local_names: BTreeMap<LocalIdx, String>,
+    /// Every `debug` binding in the dump, in the order printed, including the
+    /// scoped ones `local_names` discards.
+    ///
+    /// A scoped binding is how `let k = i;` reaches the dump: `k` is not a local
+    /// at all, it is another name for `_2`. `local_names` cannot hold it without
+    /// renaming `i`, but the contract language still has to resolve `k`, so the
+    /// pair is kept here and [`Self::alias_locals`] decides whether it is usable.
+    pub debug_aliases: Vec<(String, LocalIdx)>,
     pub blocks: Vec<Block>,
+    /// Every local the body *writes* — the destination of an assignment, or of a
+    /// call.
+    ///
+    /// This is what makes a scoped `debug` name safe to resolve as an alias. A
+    /// `debug k => _2;` means the compiler aliased `k` to local `_2` — which is
+    /// usually an argument, because `let k = i;` of a `Copy` value lowers to no
+    /// new local at all. Resolving `k` to the argument's variable is exactly
+    /// right *provided* `_2` is never assigned: an assignment to a parameter
+    /// (`i = 2`) is a write to `_2`, and the alias no longer holds after it.
+    ///
+    /// The conservative direction is the only safe one here. A local that is
+    /// written anywhere makes the alias unusable, so `alias_locals` withholds it
+    /// and the subscript stays a refusal. That loses a proof on a shape like
+    /// `mut i` reassigned before the alias; it cannot produce a wrong one.
+    pub written: std::collections::BTreeSet<LocalIdx>,
 }
 
 impl MirFn {
     pub fn ty_of(&self, local: LocalIdx) -> Option<&Ty> {
         self.locals.get(&local)
+    }
+
+    /// Source name → the *argument* local it is a direct alias of.
+    ///
+    /// A contract may subscript with a name that is not an argument —
+    /// `let k = i; a[k]` prints `debug k => _2;` inside a scope block, with no
+    /// local of its own. The body's `a[k]` is `_1[_2]`, so the index really is
+    /// the argument; only the *contract text* has `k`. Resolving `k` to `_2`
+    /// therefore makes the contract name the same index the body reads, which is
+    /// the whole point.
+    ///
+    /// Four conditions keep that sound, and all are checked here rather than left
+    /// to the caller:
+    ///
+    /// * the aliased local is an argument (never a temporary),
+    /// * it is not in [`Self::written`], so nothing reassigns it between the alias
+    ///   and its use,
+    /// * the name is not already an argument's own name, so a shadowing `let k =
+    ///   i;` cannot silently change what a parameter name means, and
+    /// * the name does not alias two different arguments, which is a genuine
+    ///   ambiguity and not something to guess at.
+    ///
+    /// A name that fails any test is simply absent from the map, and the
+    /// subscript is refused as an unknown name — the same answer as before, with
+    /// no wrong one available.
+    pub fn alias_locals(&self) -> BTreeMap<String, LocalIdx> {
+        let args: std::collections::BTreeSet<LocalIdx> = self.arg_locals.iter().copied().collect();
+        let arg_names: std::collections::BTreeSet<String> =
+            self.arg_locals.iter().map(|l| self.name_of(*l)).collect();
+        let mut out: BTreeMap<String, LocalIdx> = BTreeMap::new();
+        for (name, local) in &self.debug_aliases {
+            if !args.contains(local) || self.written.contains(local) {
+                continue;
+            }
+            // An argument's own name is already in `arg_vars`; letting an alias
+            // reuse it would change what that name means.
+            if arg_names.contains(name) {
+                continue;
+            }
+            match out.get(name) {
+                // Two different arguments under one name: no single value to
+                // resolve to, so the name is dropped rather than picked.
+                Some(prev) if prev != local => {
+                    out.remove(name);
+                    continue;
+                }
+                Some(_) => continue,
+                None => {}
+            }
+            out.insert(name.clone(), *local);
+        }
+        out
     }
 
     pub fn block(&self, id: usize) -> Option<&Block> {
@@ -1261,7 +1340,9 @@ pub fn parse_program_with(text: &str, enums: &BTreeMap<String, EnumLayout>) -> M
                 ret_ty: ret_ty.clone(),
                 locals: BTreeMap::new(),
                 local_names: BTreeMap::new(),
+                debug_aliases: Vec::new(),
                 blocks: Vec::new(),
+                written: std::collections::BTreeSet::new(),
             };
             // Local `_0` is the return place, so it carries the return type.
             f.locals.insert(0, ret_ty);
@@ -1305,6 +1386,11 @@ pub fn parse_program_with(text: &str, enums: &BTreeMap<String, EnumLayout>) -> M
                             // -- the function would go unverified because a
                             // local borrowed the parameter's slot.
                             f.local_names.entry(idx).or_insert_with(|| n.trim().to_string());
+                            // Kept in full, including the scoped bindings the map
+                            // above drops: `debug k => _2;` inside a `scope` block
+                            // is an alias the contract may name, and dropping it
+                            // here would leave `a[k]` an unknown name.
+                            f.debug_aliases.push((n.trim().to_string(), idx));
                         }
                     }
                     j += 1;
@@ -1353,6 +1439,23 @@ pub fn parse_program_with(text: &str, enums: &BTreeMap<String, EnumLayout>) -> M
                 j += 1;
             }
             // Keep the locals map from losing the return slot's real type.
+            //
+            // Every local the body assigns is recorded, so `alias_locals` can
+            // refuse to alias an argument that is reassigned. A `let mut i = …`
+            // argument that the body writes is exactly the case where a scoped
+            // `debug k => _2;` stops being an alias, so this is collected from the
+            // parsed blocks rather than from the text: the parser is the only
+            // thing that knows which lines were statements.
+            for b in &f.blocks {
+                for s in &b.stmts {
+                    if let Stmt::Assign(p, _) = s {
+                        f.written.insert(p.local);
+                    }
+                }
+                if let Term::Call { dest, .. } = &b.term {
+                    f.written.insert(dest.local);
+                }
+            }
             prog.fns.push(f);
             i = j + 1;
             continue;
@@ -1494,6 +1597,61 @@ fn add(_1: u32, _2: u32) -> u32 {
             Some(Stmt::Assign(_, Rvalue::Unknown(_))) => {}
             other => panic!("expected an unknown rvalue, got {other:?}"),
         }
+    }
+
+    /// A scoped `debug` alias of an unwritten argument is resolvable by name.
+    ///
+    /// This is the whole `let k = i; a[k]` case, and it is a parser-level rule:
+    /// the alias has to be collected even though `local_names` refuses to keep it
+    /// (keeping it would rename `i`), and it must be withheld the moment the body
+    /// writes the argument it aliases.
+    #[test]
+    fn a_scoped_debug_name_aliases_an_unwritten_argument() {
+        let dump = "fn f(_1: [u8; 4], _2: usize) -> u8 {\n    debug a => _1;\n    debug i => _2;\n    let mut _0: u8;\n    let mut _3: bool;\n    scope 1 {\n        debug k => _2;\n    }\n\n    bb0: {\n        _3 = Lt(copy _2, const 4_usize);\n        assert(move _3, \"index out of bounds\", const 4_usize, copy _2) -> [success: bb1, unwind continue];\n    }\n\n    bb1: {\n        _0 = copy _1[_2];\n        return;\n    }\n}\n";
+        let prog = parse_program(dump);
+        let f = &prog.fns[0];
+        // `i` is still the argument's name; the alias did not take it over.
+        assert_eq!(f.name_of(2), "i");
+        let aliases = f.alias_locals();
+        assert_eq!(aliases.get("k"), Some(&2), "`k` must alias the argument `_2`");
+        assert_eq!(aliases.get("i"), None, "an argument's own name is not an alias");
+        assert!(!f.written.contains(&2), "`_2` is never assigned in this body");
+    }
+
+    /// The alias is withheld when the argument it names is written.
+    ///
+    /// `debug k => _2;` with a later `_2 = …` means `k` and `_2` diverge, so the
+    /// name must not resolve. This is the soundness gate, asserted directly so a
+    /// refactor cannot drop the `written` check unnoticed.
+    #[test]
+    fn an_alias_of_a_written_argument_is_withheld() {
+        let dump = "fn f(_1: [u8; 4], _2: usize) -> u8 {\n    debug a => _1;\n    debug i => _2;\n    let mut _0: u8;\n    let _3: usize;\n    let mut _4: bool;\n    scope 1 {\n        debug k => _3;\n    }\n\n    bb0: {\n        _3 = copy _2;\n        _2 = const 2_usize;\n        _4 = Lt(copy _3, const 4_usize);\n        assert(move _4, \"index out of bounds\", const 4_usize, copy _3) -> [success: bb1, unwind continue];\n    }\n\n    bb1: {\n        _0 = copy _1[_3];\n        return;\n    }\n}\n";
+        let prog = parse_program(dump);
+        let f = &prog.fns[0];
+        // `_3` is not an argument, so `k` is not an argument alias at all.
+        assert_eq!(f.alias_locals().get("k"), None);
+        assert!(f.written.contains(&2), "`_2` is assigned, and that is what matters");
+    }
+
+    /// A scoped `debug` name that points straight at a *written* argument is
+    /// withheld too.
+    ///
+    /// rustc does not print this shape — it materialises a local for the copy —
+    /// but the rule has to hold on the dump alone, not on the assumption that
+    /// rustc will keep printing what it prints today. `debug k => _2;` beside a
+    /// `_2 = …` is exactly the case where resolving `k` to the argument would
+    /// follow a reassignment, so the name must not resolve.
+    #[test]
+    fn an_alias_of_a_written_argument_is_withheld_even_when_it_names_the_argument() {
+        let dump = "fn f(_1: [u8; 4], _2: usize) -> u8 {\n    debug a => _1;\n    debug i => _2;\n    let mut _0: u8;\n    let mut _3: bool;\n    scope 1 {\n        debug k => _2;\n    }\n\n    bb0: {\n        _2 = const 2_usize;\n        _3 = Lt(copy _2, const 4_usize);\n        assert(move _3, \"index out of bounds\", const 4_usize, copy _2) -> [success: bb1, unwind continue];\n    }\n\n    bb1: {\n        _0 = copy _1[_2];\n        return;\n    }\n}\n";
+        let prog = parse_program(dump);
+        let f = &prog.fns[0];
+        assert!(f.written.contains(&2));
+        assert_eq!(
+            f.alias_locals().get("k"),
+            None,
+            "`k` aliases `_2`, which the body writes, so it must not resolve"
+        );
     }
 }
 

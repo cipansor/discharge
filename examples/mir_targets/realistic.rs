@@ -172,14 +172,45 @@ pub fn array_wrong_index_refused(a: [u8; 4], i: usize, j: usize) -> u8 {
     a[i]
 }
 
-/// The contract subscripts with a name that is not an argument at all. There is
-/// no variable to build a chain for `k`, so nothing is bound and the parser
-/// refuses the name rather than inventing an index. This is the "no chain to
-/// rewrite to" case, distinct from the unbounded one above.
+/// The contract subscripts with a name that is not an argument — but which is a
+/// *direct alias* of one. `let k = i;` of a `Copy` value lowers to no local at
+/// all: the body's `a[k]` is `a[i]` (`_1[_2]`), and `k` survives only as a
+/// scoped `debug k => _2;`. So the contract's `k` and the body's index are the
+/// same value, and resolving the name makes the contract name what the body
+/// reads. This is the "alias to an argument" case, distinct from the refusal
+/// below where the name is not an alias at all.
 /// requires: i < 4
 /// ensures: ret == a[k]
-pub fn array_local_index_refused(a: [u8; 4], i: usize) -> u8 {
+pub fn array_local_index_through_alias(a: [u8; 4], i: usize) -> u8 {
     let k = i;
+    a[k]
+}
+
+/// The tripwire for the alias: the same shape, with a postcondition that is
+/// false. `a[k]` is an arbitrary element, so claiming it is at most `a[0]` must
+/// FAIL — and the witness has to name an index where it is not, which only
+/// happens if `k` resolved to the real index variable rather than to a constant
+/// the contract happened to accept.
+/// requires: i < 4
+/// ensures: ret <= a[0]
+pub fn array_local_index_tripwire(a: [u8; 4], i: usize) -> u8 {
+    let k = i;
+    a[k]
+}
+
+/// The alias rule's soundness gate: the local is a *copy* of the argument, and a
+/// later write to the argument must not be aliased through.
+///
+/// `let k = i;` then `i = 2;` — after the write, `i` is 2 but `k` is still the
+/// original argument. rustc does *not* print `debug k => _2;` here: it
+/// materialises a real local for the copy, so `k` is not an alias of the
+/// argument and the name is refused. That refusal is what keeps a contract's `k`
+/// from silently following a reassigned `i`.
+/// requires: i < 4
+/// ensures: ret == a[k]
+pub fn array_local_index_written_refused(a: [u8; 4], mut i: usize) -> u8 {
+    let k = i;
+    i = 2;
     a[k]
 }
 

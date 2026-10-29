@@ -1600,22 +1600,47 @@ fn a_contract_error_quotes_the_source_text() {
     );
 }
 
-/// A subscript by a name that is not an argument is refused.
+/// A subscript by a name that is a *direct alias* of an argument is resolved.
 ///
-/// `a[k]` where `k` is a local has no variable to build a chain from, so nothing
-/// is bound and the parser refuses `k`. This is the distinct "no chain to rewrite
-/// to" refusal, as opposed to the "chain exists but the index is unbounded" one;
-/// conflating them would hide a bound index behind the wrong message.
+/// `let k = i;` on a `Copy` value lowers to no local: the body's `a[k]` is
+/// `a[i]`, and `k` survives only as a scoped `debug k => _2;`. The contract's `k`
+/// therefore names the very index the body reads, so it must verify — and the
+/// tripwire must FAIL, which is what shows the name resolved to the real index
+/// rather than to a constant the postcondition happened to accept.
 #[test]
-fn a_symbolic_index_that_is_not_an_argument_is_refused() {
-    let Some(report) = verify_realistic(&["array_local_index_refused"]) else { return };
-    let o = outcome(&report, "array_local_index_refused");
+fn a_symbolic_index_through_a_local_alias_is_resolved() {
+    let Some(report) =
+        verify_realistic(&["array_local_index_through_alias", "array_local_index_tripwire"])
+    else {
+        return;
+    };
+    let o = outcome(&report, "array_local_index_through_alias");
+    assert!(o.is_verified(), "`array_local_index_through_alias` must verify, got: {o}");
+    let t = outcome(&report, "array_local_index_tripwire");
+    assert!(
+        !t.is_verified(),
+        "the alias tripwire must be refuted, got: {t}"
+    );
+}
+
+/// The alias rule is not a licence to follow a reassigned argument.
+///
+/// `let k = i; i = 2;` — rustc materialises a real local for the copy and prints
+/// `debug k => _3;` pointing at *that* local, not at `_2`. So `k` is not an alias
+/// of the argument and the contract's `k` is refused. If the frontend instead
+/// aliased `k` to `i` unconditionally, the contract would be checked against a
+/// reassigned index and could be proved or refuted about the wrong value.
+#[test]
+fn a_subscript_through_a_reassigned_argument_is_refused() {
+    let Some(report) = verify_realistic(&["array_local_index_written_refused"]) else { return };
+    let o = outcome(&report, "array_local_index_written_refused");
     match o {
         FnOutcome::Skipped { reason } => assert!(
             reason.contains("unknown name"),
-            "a non-argument index must be refused as an unknown name, got: {reason}"
+            "a subscript through a reassigned argument must be refused as an unknown name, \
+             got: {reason}"
         ),
-        other => panic!("`array_local_index_refused` must be skipped, got: {other}"),
+        other => panic!("`array_local_index_written_refused` must be skipped, got: {other}"),
     }
 }
 

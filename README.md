@@ -1437,6 +1437,13 @@ The frontend refuses far more than it accepts, and every refusal is reported:
   elements of by-value aggregates, and elements and lengths of slices and
   fixed-size arrays, *are* modelled — only the pointer arithmetic is not.
 
+A subscript whose index is a *local* that aliases an argument is resolved to that
+argument. `let k = i; a[k]` on a `Copy` index lowers to no local at all — the
+body's `a[k]` really is `a[i]` — so the contract's `k` names the same index, and
+`a[k]` builds the same ite chain `a[i]` would. The name resolves only when the
+aliased local is an argument that the body never writes, so `let k = i; i = 2;`
+does not alias `k` to the reassigned `i`; that subscript is refused instead.
+
 ### Signedness is a value question, not a display one
 
 `i8`, `i16` and friends are bit patterns like any other, so every operation has one

@@ -2955,12 +2955,39 @@ entries (`enum_constructed_locally` + tripwire,
 
 **Stage 3 — the contract language's two deliberate refusals.** `xs[i]` with a
 symbolic `i` on a *slice*, and `a[k]` where `k` is a local rather than an
-argument. Both are refusals today and both are honest, but the first is the more
-valuable: a slice's length is a symbolic input, so `xs[i]` for a bounded `i` is a
-chain over the *length* variable with a bounds obligation, not an unbounded
-enumeration. The second is a frontend gap — `let k = i; a[k]` should be
-substitutable to `a[i]` when `k` is a copy of an argument, which is what a
-`debug`-name-aware local substitution would give.
+argument.
+
+*The local half is DONE.* `let k = i; a[k]` was refused because the contract's
+`k` resolved to nothing. The refusal was misdiagnosed as "there is no local":
+`rustc` prints no local for `k` at all. A `Copy` argument copied into a `let`
+lowers to the argument's *own* local, and `k` survives only as a scoped
+`debug k => _2;` — the body's `a[k]` really is `_1[_2]`. So the fix is to resolve
+the name, not to bind a new variable.
+
+The parser keeps every `debug` binding in `MirFn::debug_aliases` (the existing
+`local_names` map cannot: it keeps the *first* binding per local, so that a scoped
+alias does not rename the parameter, and it therefore drops `k`). `MirFn::
+alias_locals` then decides which of those names may resolve, and it resolves a
+name only when the aliased local is an argument, is never written by the body, is
+not already an argument's own name, and does not alias two different arguments.
+The `written` set is collected from the parsed blocks, so a `mut i` that the body
+reassigns makes `k` unresolvable — the conservative direction, which loses a
+proof rather than inventing one.
+
+The names flow through `arg_vars` and `signed_args`, so `a[k]` builds the same
+ite chain `a[i]` would *and* a signed `i` makes `k` signed in a comparison. Two
+corpus entries carry it — `array_local_index_through_alias` (verifies) and
+`array_local_index_tripwire` (must fail, and its witness pins `k` to a real index)
+— and `array_local_index_written_refused` pins the `written` gate. Coverage went
+from 44/67 to 45/69.
+
+*The slice half remains.* A slice's length is a symbolic input, so `xs[i]` for a
+bounded `i` is a chain over the *length* variable with a bounds obligation, not an
+unbounded enumeration. This is the larger half and it is not attempted yet: the
+chain's domain is the length variable rather than a type constant, so
+`index_guards` — which yields a `u64` — would have to yield a term, and the
+executor's `index_chain` builds its chain only from a `fixed_len`. Both want the
+length term threaded through, which is the work the item needs.
 
 **Stage 4 — the missing intrinsics.** `wrapping_neg`, `wrapping_div`,
 `wrapping_rem`, `overflowing_*`, `leading_zeros`, `trailing_zeros`, `count_ones`,
@@ -3014,3 +3041,66 @@ and this repository only ever runs tests with `--features std`.
 What Ferrocene does *not* buy, stated in the README, the tool's README and here: a qualified
 compiler is not a qualified verifier, and `discharge`'s engine is outside Ferrocene's
 qualification scope. The gate checks the qualified compiler accepts the sources unchanged.
+
+## Stage 3, first half: a contract may name a local that aliases an argument
+
+The roadmap's Stage 3 listed two refusals. The smaller one — `a[k]` where `k` is a
+local — turned out to be a misdiagnosis, and the misdiagnosis is the interesting
+part.
+
+The entry was documented as "there is no variable to build a chain for `k`", with
+`k` assumed to be a local the contract language could not reach. rustc prints no
+local for `k` at all. `let k = i;` where `i: usize` is `Copy` lowers to *no
+instruction*: `a[k]` is `_1[_2]`, and the name `k` survives only as a scoped
+`debug k => _2;` inside `scope 1`. So the body already used the argument as the
+index; only the contract text had `k`. The fix is to resolve the name, not to bind
+anything.
+
+**The parser could not see it.** `MirFn::local_names` keeps the *first* `debug`
+binding per local, and that rule is load-bearing: a scoped `debug s => _1;` after
+`let s = a;` would otherwise rename the parameter `a` to `s`, and a contract
+saying `a <= 127` would find only `s` and be skipped. Keeping the first binding is
+what makes `a` keep meaning `a`. But it means the scoped binding for `k` is
+dropped, so `k` reached the contract parser as nothing.
+
+`MirFn::debug_aliases` now keeps every binding, in printed order, and
+`MirFn::alias_locals` decides which ones may resolve. A name resolves only when
+all four hold:
+
+* the aliased local is an argument — never a temporary;
+* the body never writes that local;
+* the name is not already an argument's own name, so an alias cannot shadow a
+  parameter; and
+* the name does not alias two different arguments.
+
+The `written` set is collected from the *parsed blocks* rather than from the text,
+so it is the parser — which alone knows which lines became statements — that
+decides. This is what makes the rule sound on the dump alone rather than on an
+assumption about what rustc prints today.
+
+**The divergence case, measured.** `let k = i; i = 2;` does *not* print
+`debug k => _2;`. rustc materialises a real local (`let _3: usize;`) and prints
+`debug k => _3;`, so `k` is not an argument alias and is refused — correctly, and
+for a reason the frontend can see rather than one it has to be told. The
+`written` check still has to exist for the case where rustc *does* print the
+alias against a written argument, which is a dump shape this frontend must not
+trust. A parser-level unit test constructs exactly that dump and asserts the name
+is withheld, so a refactor cannot drop the check unnoticed.
+
+**Sign flow.** The alias names go into both `arg_vars` and `signed_args`. The
+second matters as much as the first: a signed `i` aliased as `k` must make `k < 0`
+a signed comparison, which is the class of bug the three-case `Sign` type exists
+to prevent.
+
+**Evidence.** `array_local_index_through_alias` verifies and
+`array_local_index_tripwire` fails with a witness that pins the index — which only
+happens if `k` resolved to the real index variable. `array_local_index_written_refused`
+pins the divergence gate. Two parser unit tests pin the alias rule and the
+`written` gate with no nightly needed. Coverage went from **44/67 to 45/69**, and
+the test count from 466 to **470** (two parser unit tests, one integration test,
+and the renamed corpus entries). Full `scripts/gate.sh`: **12/12 green**.
+
+The slice half of Stage 3 is *not* done, and the reason is recorded in the roadmap
+above rather than left as a silent absence: a slice's domain is its length
+*variable*, so both `index_guards` and the executor's `index_chain` want a term
+threaded where they now carry a `u64` type constant.

@@ -835,9 +835,14 @@ impl FieldEnv {
             return None;
         }
         if let Some(v) = self.sym_index.get(arg) {
-            // The same array subscripted by two different symbolic indices has no
-            // single chain to rewrite to. Refusing keeps the second subscript a
-            // refusal rather than silently reusing the first chain.
+            // The same array subscripted by two different indices has no single
+            // chain to rewrite to. Refusing keeps the second subscript a refusal
+            // rather than silently reusing the first chain.
+            //
+            // The comparison is on the *bound index variable*, not on the name, so
+            // two spellings of one index (`a[i]` and `a[k]` where `let k = i`)
+            // share a chain rather than colliding. That is what makes an alias a
+            // rename and nothing more.
             return if *v == index { Some(*v) } else { None };
         }
         // The elements first, so the chain has all of them to build from.
@@ -931,8 +936,10 @@ impl FieldEnv {
                     if let Some(close) = close {
                         let inner: String = chars[i + 1..close].iter().collect();
                         // The index has to be a name the contract may use -- an
-                        // argument. A compound index (`a[i + 1]`) is left unbound
-                        // and refused by the parser rather than mis-modelled.
+                        // argument, or a local that is a direct alias of one
+                        // (`let k = i; a[k]`). A compound index (`a[i + 1]`) is
+                        // left unbound and refused by the parser rather than
+                        // mis-modelled.
                         if let Some(&index) = args.get(&inner) {
                             if let Some((_, elem_w, Some(n), _)) = self.indexed.get(&ident).copied()
                             {
@@ -956,7 +963,6 @@ impl FieldEnv {
 /// unrelated `x.y` is left for the parser to refuse as an unknown name rather
 /// than silently becoming something else.
 /// The `ret.N` components the given contract texts name.
-///
 /// The up-front parse probe uses this to bind only what a contract can mention.
 /// Binding *every* declared component of the return type makes a `(u8, &u8)`
 /// return unprobeable: component 1 is a reference with no bit-vector width, so
@@ -1954,11 +1960,21 @@ pub fn field_env(
 }
 
 /// The argument names whose declared type is signed, for comparison signedness.
+///
+/// Alias names are included for the same reason they are in [`arg_vars`]: `k` in
+/// `let k = i;` stands for `i`, so a signed `i` makes `k` signed too. Omitting
+/// them would make `k < 0` an unsigned comparison — the exact class of bug the
+/// `Sign` type was introduced to prevent.
 pub fn signed_args(f: &crate::mir::parse::MirFn) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for &l in &f.arg_locals {
         if f.ty_of(l).map(|t| t.is_signed()).unwrap_or(false) {
             out.insert(f.name_of(l));
+        }
+    }
+    for (name, local) in f.alias_locals() {
+        if f.ty_of(local).map(|t| t.is_signed()).unwrap_or(false) {
+            out.insert(name);
         }
     }
     out
@@ -2004,13 +2020,26 @@ fn type_bound(ty: &str, assoc: &str) -> Option<(u64, u8)> {
 }
 
 /// The argument names and widths of a function, in declaration order, as they
-/// appear in the MIR dump.
+/// appear in the MIR dump, plus any source name that is a direct alias of an
+/// argument.
+///
+/// The alias names are added here rather than only to the index binder because
+/// they are ordinary contract names: `let k = i;` makes `k` usable wherever `i`
+/// is, so a `requires: k < 4` has to resolve too. `MirFn::alias_locals` decides
+/// which names qualify, and it only ever names an argument that the body never
+/// writes, so every entry here stands for the very value the body uses.
 pub fn arg_vars(f: &crate::mir::parse::MirFn) -> BTreeMap<String, Var> {
     let mut out = BTreeMap::new();
     for &l in &f.arg_locals {
         let ty = f.ty_of(l).cloned().unwrap_or(Ty::Other("?".into()));
         if let Some(w) = ty.width() {
             out.insert(f.name_of(l), smt::var_named(l, w));
+        }
+    }
+    for (name, local) in f.alias_locals() {
+        let ty = f.ty_of(local).cloned().unwrap_or(Ty::Other("?".into()));
+        if let Some(w) = ty.width() {
+            out.insert(name, smt::var_named(local, w));
         }
     }
     out
