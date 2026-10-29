@@ -267,8 +267,21 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
                 }
             }
         }
+        // The probe's `ret` is `None` exactly when the return type has no single
+        // word, so the aggregate message is the honest one here.
+        let probe_absent =
+            if probe_ret.is_some() { spec::RET_IS_UNKNOWN } else { spec::RET_IS_AGGREGATE };
         if let Some(err) = ensures.iter().find_map(|e| {
-            spec::eval_ensures(e, &arg_vars, probe_ret, &signed, ret_signed, &probe_fields).err()
+            spec::eval_ensures(
+                e,
+                &arg_vars,
+                probe_ret,
+                probe_absent,
+                &signed,
+                ret_signed,
+                &probe_fields,
+            )
+            .err()
         }) {
             return FnOutcome::Skipped { reason: format!("unreadable `ensures`: {err}") };
         }
@@ -283,6 +296,14 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     let ret_components: Vec<Ty> = match &f.ret_ty {
         Ty::Tuple(ts) => ts.clone(),
         _ => Vec::new(),
+    };
+    // Which refusal to give when a bare `ret` is unbound. It is decided from the
+    // return *type*: a scalar return can only be unbound because its value is
+    // unknown on this path, while an aggregate has no single word to bind at all.
+    let ret_absent = if f.ret_ty.width().is_some() {
+        spec::RET_IS_UNKNOWN
+    } else {
+        spec::RET_IS_AGGREGATE
     };
     let post = if ensures.is_empty() {
         None
@@ -306,8 +327,16 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
             // still reachable as `ret.0`, `ret.1` through `fields`.
             let mut acc: Option<crate::smt::Pred> = None;
             for e in &ensures {
-                let p = spec::eval_ensures(e, &args_for_post, ret, &signed, ret_signed, &fields)
-                    .map_err(|err| err.to_string())?;
+                let p = spec::eval_ensures(
+                    e,
+                    &args_for_post,
+                    ret,
+                    ret_absent,
+                    &signed,
+                    ret_signed,
+                    &fields,
+                )
+                .map_err(|err| err.to_string())?;
                 acc = Some(match acc {
                     None => p,
                     Some(prev) => smt::and(prev, p),

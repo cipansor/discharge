@@ -660,11 +660,25 @@ pub fn eval_requires(
     Ok(pred)
 }
 
+/// The refusal when a bare `ret` names an aggregate return, which has no single
+/// word. The contract has to name a component instead.
+pub const RET_IS_AGGREGATE: &str =
+    "the return type is an aggregate, so `ret` has no single value; name a component such as `ret.0`";
+
+/// The refusal when a bare `ret` names a scalar return whose value the run does
+/// not know on this path -- an unmodelled read, or a deref with no backing.
+///
+/// It is a *different* problem from an aggregate return, and saying "the return
+/// type is an aggregate" here would be false: the return type is a plain `u8`,
+/// and the reader would go looking for a tuple that does not exist.
+pub const RET_IS_UNKNOWN: &str = "the return value is not known on this path";
+
 /// Turn an `ensures` contract into a predicate over the arguments and `ret`.
 pub fn eval_ensures(
     text: &str,
     args: &BTreeMap<String, Var>,
     ret: Option<Var>,
+    ret_absent: &'static str,
     signed: &BTreeSet<String>,
     ret_signed: bool,
     fields: &FieldEnv,
@@ -675,7 +689,7 @@ pub fn eval_ensures(
     let mut sgn = signed.clone();
     sgn.extend(fields.signed.iter().cloned());
     let mut p = Parser::new(&text, &names, ret, &sgn, ret_signed);
-    p.in_ensures = true;
+    p.ret_absent = ret_absent;
     let pred = p.parse_or()?;
     p.expect_end()?;
     Ok(pred)
@@ -716,11 +730,14 @@ struct Parser<'a> {
     signed: &'a BTreeSet<String>,
     /// Whether `ret` is signed.
     ret_signed: bool,
-    /// Whether this is an `ensures`, where a bare `ret` is *meant* to be
-    /// readable. It separates the two reasons `ret` can be unbound: outside an
-    /// `ensures` the name is meaningless, while inside one it is meaningful but
-    /// an aggregate return has no single word to bind it to.
-    in_ensures: bool,
+    /// What to say when `ret` has no value to name. It is supplied by the
+    /// caller because only the caller knows *why*: outside an `ensures` the name
+    /// is meaningless, an aggregate return has no single word, and a scalar
+    /// return can be unbound because the value is not known on this path. These
+    /// are three different problems and the message must not describe the wrong
+    /// one -- a scalar return reported as an aggregate sends the reader looking
+    /// for a tuple that is not there.
+    ret_absent: &'static str,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -792,7 +809,7 @@ impl<'a> Parser<'a> {
             text: s.to_string(),
             signed,
             ret_signed,
-            in_ensures: false,
+            ret_absent: "`ret` is only meaningful in `ensures`",
         }
     }
 
@@ -1117,20 +1134,7 @@ impl<'a> Parser<'a> {
             Some(Tok::Ident(name)) => {
                 self.pos += 1;
                 if name == "ret" || name == "result" {
-                    let v = self.ret.ok_or_else(|| {
-                        if self.in_ensures {
-                            // An aggregate return has no single word, so the
-                            // contract has to name a component. Saying "only
-                            // meaningful in `ensures`" here would be false and
-                            // would send the reader looking in the wrong place.
-                            self.err(
-                                "the return type is an aggregate, so `ret` has no single \
-                                 value; name a component such as `ret.0`",
-                            )
-                        } else {
-                            self.err("`ret` is only meaningful in `ensures`")
-                        }
-                    })?;
+                    let v = self.ret.ok_or_else(|| self.err(self.ret_absent))?;
                     return Ok((v, self.ret_signed));
                 }
                 if name == "true" || name == "false" {

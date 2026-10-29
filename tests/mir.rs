@@ -212,6 +212,7 @@ fn a_literal_is_sized_from_the_operand_it_meets() {
             "ret <= 255",
             &args,
             Some(ret),
+            spec::RET_IS_UNKNOWN,
             &std::collections::BTreeSet::new(),
             false,
             &spec::FieldEnv::default(),
@@ -248,6 +249,60 @@ fn a_literal_that_does_not_fit_is_refused_not_truncated() {
         assert!(
             err.to_string().contains("300") && err.to_string().contains("8-bit"),
             "the refusal must name the value and the width, got: {err}"
+        );
+    });
+}
+
+/// An aggregate return refuses a bare `ret` with the aggregate message.
+///
+/// `ret <= 5` on a `(u8, u8)` return is refused because there is no single word.
+/// The message must say *that*, so the reader knows to name a component.
+#[test]
+fn a_bare_ret_on_an_aggregate_names_the_aggregate_reason() {
+    use discharge::smt;
+    smt::with_fresh(|| {
+        let args = std::collections::BTreeMap::new();
+        let err = spec::eval_ensures(
+            "ret <= 5",
+            &args,
+            None,
+            spec::RET_IS_AGGREGATE,
+            &std::collections::BTreeSet::new(),
+            false,
+            &spec::FieldEnv::default(),
+        )
+        .expect_err("a bare `ret` on an aggregate must be refused");
+        assert!(
+            err.to_string().contains(spec::RET_IS_AGGREGATE),
+            "the message must name the aggregate cause and the fix, got: {err}"
+        );
+    });
+}
+
+/// A scalar return whose value is unknown is refused with *that* reason.
+///
+/// The value can be unbound on a path where a read was unmodelled, even though
+/// the return type is a plain `u8`. Reporting "the return type is an aggregate"
+/// here would be false, and would send the reader looking for a tuple that does
+/// not exist. The two causes have to be two messages.
+#[test]
+fn a_bare_ret_with_an_unknown_value_names_the_unknown_reason() {
+    use discharge::smt;
+    smt::with_fresh(|| {
+        let args = std::collections::BTreeMap::new();
+        let err = spec::eval_ensures(
+            "ret <= 5",
+            &args,
+            None,
+            spec::RET_IS_UNKNOWN,
+            &std::collections::BTreeSet::new(),
+            false,
+            &spec::FieldEnv::default(),
+        )
+        .expect_err("a bare `ret` with no value must be refused");
+        assert!(
+            err.to_string().contains(spec::RET_IS_UNKNOWN),
+            "a scalar return must not be reported as an aggregate, got: {err}"
         );
     });
 }
