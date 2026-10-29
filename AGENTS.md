@@ -2979,3 +2979,38 @@ because it is additive coverage with no soundness content.
 there is a corpus entry that *verifies* and a tripwire that *fails*. The tripwire
 is the evidence: a shape that only ever verifies is a shape whose model has never
 been contradicted.
+
+## Ferrocene gate: what was verified end to end
+
+The Ferrocene work landed as three commits on `license-arith-mir-oracle` (PR #3):
+
+- `af8818e` — the gate itself: `tools/ferrocene/run.sh` (exit 0 built / 1 real failure /
+  2 no toolchain), `criticalup.toml`, `tools/ferrocene/README.md`, gate 3 in
+  `scripts/gate.sh`, and the `ferrocene` job in `.github/workflows/ci.yml`.
+- `18681e1` — `examples/bare_metal.rs`, the `#![no_std]` `lib` example that *calls the
+  decision procedure*, so the qualified compiler builds the prover itself and not just the
+  types around it. Wired into gate 4 and `run.sh`; `test = true` so the host verdict tests
+  actually run. Test count 463 -> 466.
+- `5bed9d4` — the token goes to CriticalUp on stdin, not as an argument, so it never
+  reaches the process table.
+
+Verified, not assumed:
+
+- Full `scripts/gate.sh`: **12/12 green** on the final head.
+- `run.sh` exercised in all three modes: no toolchain (exit 2, reports and skips), stable
+  rustc named via `FERROCENE_RUSTC` (exit 0, all three builds), bad path (exit 2).
+- `examples/bare_metal.rs` builds for `thumbv7em-none-eabihf` with `--no-default-features`,
+  and its three host tests pass (proved / refuted / refused).
+- `actionlint` clean on `.github/workflows/ci.yml`.
+- CI on `5bed9d4`: **all seven jobs success**. The `ferrocene` job ran and reported its skip
+  rather than passing quietly — steps 5 and 6 `skipped`, step 7 emits the `::warning::`
+  annotation, log reads "No FERROCENE_TOKEN secret; skipping the qualified-toolchain build.
+  This is reported, not passed: the gate did not run." The token is masked (`token: ***`).
+
+`cargo test --workspace` *without* `--features std` fails in `src/smt.rs` lib tests
+(`std::panic::catch_unwind`). That is pre-existing — confirmed identical on a stashed tree —
+and this repository only ever runs tests with `--features std`.
+
+What Ferrocene does *not* buy, stated in the README, the tool's README and here: a qualified
+compiler is not a qualified verifier, and `discharge`'s engine is outside Ferrocene's
+qualification scope. The gate checks the qualified compiler accepts the sources unchanged.
