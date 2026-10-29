@@ -2475,6 +2475,60 @@ The parts that would have been silent bugs:
   the *contract's* element references up front (`bind_slice_refs`) keeps the postcondition
   closure — which cannot hold a `&mut` — evaluating against the same bindings.
 
-Coverage on `realistic.rs` is now 14 of 15 decided, the sixteenth being
-`slice_alias_tripwire`, which is decided *and must fail*. `first_of` was added to `tests/mir.rs`
-as a must-verify case, so a regression in slice support fails a test.
+Coverage on `realistic.rs` is now complete: every function is decided, and the three
+tripwires (`field_`, `slice_`, `array_alias_tripwire`) are decided *and must fail*, which is
+what makes them evidence rather than decoration. `first_of` was added to `tests/mir.rs` as a
+must-verify case, so a regression in slice support fails a test.
+
+### An array's length is a constant, not an input
+
+`[u8; 4]` and `&[u8]` look alike at the use site and are not alike at all. A slice's length is
+whatever the caller passed, so it is a fresh input. An array's length is *in the type*: `4` is
+the only length the value can have. Binding it to a fresh variable would be the unsound
+direction — the contract would be proved for some length the caller chose, when there was
+nothing to choose, and a contract proved at length 4 would appear to hold at any length. So
+`bind_array_len` binds `a.len()` to the constant word `4`, and the body's bounds check
+(`assert(Lt(_2, const 4_usize))`) is discharged from the index being a literal below 4.
+
+The rest of the machinery is shared with slices, deliberately: `FieldEnv::indexed` maps a name
+to `(local, elem_w, Option<fixed_len>)`, where the length is `Some(n)` for an array and `None`
+for a slice. One map, one element model, one scanner (`bind_index_refs`) — an array is not a
+second feature bolted on, it is the same feature with the length known. `bind_indexed_elem`
+refuses an index `>= n` for an array rather than binding a fresh variable, because the element
+does not exist and a fresh variable there would make a meaningless contract look meaningful.
+
+### A literal's width comes from the operand, not from the scope
+
+This is the bug array support exposed, and it is worth recording because the symptom pointed
+nowhere near the cause. `arr_pre(a: [u8; 4]) -> u8` with `ensures: ret <= 255` came back
+`incomplete`. The body was trivially fine. The cause: a contract literal was built at the width
+of the *widest name in scope*, and an array or slice length is a `usize`. So `255` was a 64-bit
+constant compared against an 8-bit `ret`. `smt::cmp` refuses mismatched widths by setting the
+engine's `ill_formed` flag, and **an ill-formed term makes every obligation in the run
+`Unknown`** — so the function was undecided for a reason that had nothing to do with it. The
+same bug had been silently present for slices: `slice_le` was `incomplete` at HEAD.
+
+The fix is a per-use width decision, in three parts, and each part is a separate way to be
+wrong:
+
+* **Build the literal wide enough to hold its own value.** Sizing it at the scope's width
+  instead masks it: `a <= 300` for a `u8` becomes `a <= 44`, which is a weaker claim that could
+  pass. So the constant keeps its exact value and the width is chosen later.
+* **Resize the constant to the other operand's width (`align_widths`).** Zero-extend for an
+  unsigned operand, sign-extend for a signed one. A value that does not fit is *refused*, not
+  truncated: `a <= 300` for a `u8` is an error naming the value and the width, because the
+  alternative is a proof of the wrong proposition.
+* **Narrow by truncation, not by rebuilding from the value.** A negative literal is the bit
+  pattern `2^w - 10` at its source width. Rebuilding `word(val, wide)` from that value hands
+  `wide` a number that does not fit and sets `ill_formed` again — the very flag being avoided.
+  Taking the low `wide` bits is the same bit pattern, and the `fits` check is what keeps it
+  from being silent.
+
+`i8::MIN` and friends are the same lesson from the other side: the bound must carry the width of
+the type it *names*. `i8::MIN` is `0x80`, exactly 8 bits. Building it at a wide scope width and
+narrowing back tested a 64-bit `128` against the signed 8-bit range and refused a bound that is
+in range by construction.
+
+Each of these has a test in `tests/mir.rs` written against the *evaluator*, so it does not
+depend on a corpus function happening to be skipped for an unrelated reason. Two of them failed
+when first written and found the masking and truncation bugs above.

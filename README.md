@@ -1283,8 +1283,41 @@ bounds check is discharged from the precondition rather than assumed. Each eleme
 is its own input per index: `xs[0]` and `xs[1]` are two variables, and a
 `slice_alias_tripwire` in `examples/mir_targets/realistic.rs` fails precisely
 because of it. Only a literal index is modelled; `xs[i]` with `i` a parameter is
-refused rather than resolved to an arbitrary element, which is the same refusal an
-array subscript gets.
+refused rather than resolved to an arbitrary element.
+
+A fixed-size array is named the same way, but its length is not an input:
+
+```rust,ignore
+/// requires: a[0] <= a[1]
+/// ensures: ret == a[1]
+pub fn max_of_pair(a: [u8; 4]) -> u8 {
+    if a[0] > a[1] { a[0] } else { a[1] }
+}
+```
+
+An array's length is part of its type, so `a.len()` is the *constant* `4` and not a
+fresh variable — binding it to an input would admit lengths the type excludes, so a
+contract proved at length 4 would claim to hold at any length. The body's bounds
+check is against that same literal (`Lt(_2, const 4_usize)`), so it is discharged
+from the index being a literal. Elements are inputs per index exactly as a slice's
+are, and `array_alias_tripwire` fails to show it. An index past the length is
+refused rather than bound, since the element does not exist.
+
+A literal in a contract takes its width from the operand it meets, not from the
+widest name in scope:
+
+```rust,ignore
+/// requires: true
+/// ensures: ret <= 255
+pub fn idx(a: [u8; 4]) -> u8 { a[0] }
+```
+
+Here `a` contributes a 64-bit length, but `ret` is 8 bits, so `255` has to be read
+at 8 bits. Sizing it from the length instead made the comparison ill-formed, and an
+ill-formed term makes *every* obligation in the run `Unknown` — so the function was
+reported incomplete for a reason that had nothing to do with its body. A literal too
+large for the operand's width is refused rather than truncated: `a <= 300` for a
+`u8` must not become `a <= 44`.
 
 The scanner is deliberately strict. A `requires:`, `ensures:` or `invariant:` that sits before a
 `const`, a `struct` or a module comment is *not* attached to the next function, so
@@ -1395,7 +1428,11 @@ The frontend refuses far more than it accepts, and every refusal is reported:
   `saturating_*` and `wrapping_*` for `add`/`sub`/`mul`/`div`/`rem` and the
   bitwise ops are computed from their operands (see below). Every other
   intrinsic, and every trait method, is still a call the frontend cannot model.
-- **Aggregates, slices, references.** No pointer model.
+- **A symbolic index, or a mutable reference write.** `xs[i]` with `i` a parameter
+  has no single element to name, so it is refused rather than resolved to an
+  arbitrary one; `*r = v` is the aliasing model the crate does not claim. Fields
+  and elements of by-value aggregates, and elements and lengths of slices and
+  fixed-size arrays, *are* modelled — only the pointer arithmetic is not.
 
 ### Signedness is a value question, not a display one
 
