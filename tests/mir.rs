@@ -2040,3 +2040,71 @@ fn a_unit_variant_has_no_payload_to_name() {
         "`enum_payload_tripwire` names a unit variant's payload and must be refused, got: {o}"
     );
 }
+
+/// `count_ones` is modelled, and its result is *widened* to the return type.
+///
+/// The operand is `u8` and the result is `u32`, so this is the one modelled call
+/// whose result width differs from its operand's. A model that built an 8-bit
+/// term and wrote it to a `u32` local would be ill-formed, and a contract at the
+/// top of the count's range would not decide. Both entries must verify.
+#[test]
+fn count_ones_is_modelled_and_widens_its_result() {
+    let Some(report) = verify_realistic(&[
+        "popcount_of_nonzero",
+        "popcount_bounded_by_width",
+    ]) else {
+        return;
+    };
+    for name in ["popcount_of_nonzero", "popcount_bounded_by_width"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+}
+
+/// The tripwire: if `count_ones` were left unmodelled, both entries would be
+/// `Skipped` rather than decided, and if it were modelled *wrongly* the false
+/// claims would pass. A failure on the tripwires is the evidence the model was
+/// contradicted; a decision at all is the evidence it is modelled.
+#[test]
+fn the_count_ones_tripwires_are_refuted_not_skipped() {
+    let Some(report) = verify_realistic(&[
+        "popcount_of_nonzero_tripwire",
+        "popcount_bounded_by_width_tripwire",
+    ]) else {
+        return;
+    };
+    for name in ["popcount_of_nonzero_tripwire", "popcount_bounded_by_width_tripwire"] {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` must FAIL: a `Skipped` means `count_ones` is not modelled, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
+/// `wrapping_abs` is modelled, unary, and reads its operand's sign.
+///
+/// The verifying entry is `ret >= x`, which holds at every `i8` including `MIN`
+/// (where `abs` wraps back to `MIN`). The tripwire is `ret > x`, false at `x == 0`
+/// where `abs` is the identity. Both must be *decided*: a `Skipped` would mean the
+/// unary shape is not modelled at all, which is the gap this closed.
+#[test]
+fn wrapping_abs_is_modelled_unary_and_signed() {
+    let Some(report) = verify_realistic(&["abs_never_below_operand"]) else { return };
+    let o = outcome(&report, "abs_never_below_operand");
+    assert!(o.is_verified(), "`abs_never_below_operand` must verify, got: {o}");
+
+    let Some(report) = verify_realistic(&["abs_never_below_operand_tripwire"]) else { return };
+    let o = outcome(&report, "abs_never_below_operand_tripwire");
+    let FnOutcome::Failed { kind, detail } = o else {
+        panic!("`abs_never_below_operand_tripwire` must FAIL, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "got: {o}");
+    // The counterexample must be `x == 0`, the one point where `abs` is the
+    // identity: if the model were wrong on the negative side the witness would
+    // name a negative value instead.
+    assert!(
+        detail.contains("= 0"),
+        "the witness should be x == 0 (where abs is the identity), got: {detail}"
+    );
+}

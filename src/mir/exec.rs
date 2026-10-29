@@ -1675,6 +1675,36 @@ fn try_intrinsic(
         // one has no value at all. Either way there is nothing to compute with.
         _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
     };
+    // The unary shapes take one operand and no operator. They are handled here
+    // rather than through a `BinOp`, because there is no second operand to read
+    // and, for `count_ones`, no sign that matters.
+    if op.is_unary() {
+        // `wrapping_abs` reads the operand's sign, so a dump that did not print
+        // it is refused -- the unsigned reading of `abs` is the operand itself
+        // for every input, which is a wrong value rather than a weaker proof.
+        // `count_ones` counts bits and does not care about the sign.
+        let signed = match op {
+            intrinsics::Intrinsic::Abs => sign.known()?,
+            _ => false,
+        };
+        // `count_ones` returns a type wider than its operand (`u8` -> `u32`), so
+        // the result term is built at the destination's width. Taking it from the
+        // operand instead would leave an 8-bit term in a 32-bit local, and the
+        // next read of that local would be ill-formed.
+        let result_w = width_of(cur, dest).unwrap_or(w);
+        let Some(outcome) = intrinsics::eval(op, x, x, w, signed, result_w) else {
+            return Some(Err(format!("`{name}` past what the model covers at {w} bits")));
+        };
+        return Some(match outcome {
+            Outcome::Value(v) => {
+                env.set(dest, Val::Sym(v, Sign::of_bool(signed)));
+                Ok(())
+            }
+            // Neither unary shape is an `Option`, so this is a shape mismatch and
+            // not a value. Refusing is the only honest answer.
+            Outcome::Option { .. } => Err(format!("`{name}` produced an unexpected `Option`")),
+        });
+    }
     // A sign the dump did not print is a refusal, not an unsigned reading:
     // `sdiv` on an `i8` read as unsigned returns a huge positive quotient for
     // every negative operand, which is a wrong value rather than a weaker proof.
@@ -1684,12 +1714,12 @@ fn try_intrinsic(
             Val::Sym(v, _) => v,
             _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
         },
-        // The unary family (`checked_neg`, `wrapping_abs`, …) is not modelled,
+        // The unary family (`checked_neg`, `wrapping_neg`, …) is not modelled,
         // so every modelled name takes two operands. Reaching here means the
         // dump had a shape the model does not cover.
         None => return Some(Err(format!("unmodelled arity for `{name}`"))),
     };
-    let Some(outcome) = intrinsics::eval(op, x, y, w, signed) else {
+    let Some(outcome) = intrinsics::eval(op, x, y, w, signed, w) else {
         return Some(Err(format!("`{name}` past what the model covers at {w} bits")));
     };
     // The result of an arithmetic intrinsic has the operand's type, so it has

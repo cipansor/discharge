@@ -24,6 +24,14 @@
 //!   with a hand-rolled guard are decided by one rule.
 //! * `checked_*` — an `Option<T>`. The tag is the *negation* of the overflow
 //!   test and the payload is the result, so `Some` means exactly "defined".
+//! * `count_ones` — a sum of the operand's bits, at the *return* type's width.
+//!   It is the one modelled call whose result is wider than its operand
+//!   (`u8::count_ones` returns `u32`), so the count is built at the operand's
+//!   width and zero-extended, which is the promotion Rust performs.
+//! * `wrapping_abs` — `if x < 0 { 0 - x } else { x }`. The `0 - x` wraps at
+//!   `MIN`, where the magnitude is unrepresentable, and that wrap *is* the
+//!   method's answer, so the expression is the whole definition rather than a
+//!   near miss that needs a special case for `MIN`.
 //!
 //! # What is not, and why refusing is the right answer
 //!
@@ -37,9 +45,12 @@
 //!   under one name is not something to guess at.
 //! * `unchecked_*` is undefined behaviour on overflow. There is no value to
 //!   model, and a proof about UB is not a proof, so it is refused.
-//! * `pow`, `neg`, `abs`, `add_signed`, the float ops, `rotate_*`, the `is_*`
-//!   predicates and everything else are absent, so they keep the refusal they
-//!   had.
+//! * `pow`, `neg`, `add_signed`, the float ops, `rotate_*`, the zero-counts
+//!   (`leading_zeros`, `trailing_zeros`, `count_zeros`) and the `is_*`
+//!   predicates are absent, so they keep the refusal they had. `pow` and `neg`
+//!   are *reachable* extensions -- `pow(x, k)` is a `k`-fold product and
+//!   `wrapping_neg` is `0 - x` -- but neither is modelled yet, and an
+//!   unmodelled name is refused rather than approximated.
 
 use crate::mir::parse::BinOp;
 use crate::smt::{self, Pred, Var};
@@ -75,14 +86,29 @@ pub enum Intrinsic {
     /// The operation as `Option<T>`: `None` where it would overflow or divide by
     /// zero, `Some(result)` otherwise.
     Checked(BinOp),
+    /// The number of set bits, as a value of the *return* type (which is wider
+    /// than the operand: `u8::count_ones` returns `u32`). Cannot fail.
+    ///
+    /// It is not a [`BinOp`] family member because it is not an operator at all:
+    /// the `wrapping_`/`saturating_`/`checked_` prefix that names the other
+    /// families does not apply, and neither does the two-operand shape.
+    Popcount,
+    /// The absolute value, taken modulo `2^w` (`wrapping_abs`). Cannot fail.
+    ///
+    /// Like [`Intrinsic::Popcount`] it has no family prefix, and it is unary.
+    /// The result width equals the operand width, and the two disagree about
+    /// nothing except the `MIN` case, where the magnitude is unrepresentable and
+    /// the wrapped value is `MIN` itself.
+    Abs,
 }
 
 impl Intrinsic {
-    /// The operator this family is built on.
-    pub fn binop(self) -> BinOp {
-        match self {
-            Intrinsic::Wrapping(op) | Intrinsic::Saturating(op) | Intrinsic::Checked(op) => op,
-        }
+    /// True for the two shapes that take one operand and no operator.
+    ///
+    /// `eval` and the executor both branch on this: a unary call has no second
+    /// argument to read, so the two-operand path must not be entered for it.
+    pub fn is_unary(self) -> bool {
+        matches!(self, Intrinsic::Popcount | Intrinsic::Abs)
     }
 }
 
@@ -106,8 +132,21 @@ pub enum Outcome {
 /// u8>::checked_add` and a bare `checked_add` resolve. The whole suffix is
 /// matched, not a prefix of it, so `wrapping_add_signed` and `saturating_pow`
 /// are refused rather than read as `wrapping_add` and `saturating_add`.
+///
+/// Two shapes are not families at all and are matched before the prefix split:
+/// `count_ones` and `wrapping_abs`. `count_ones` has no `wrapping_`/`saturating_`
+/// /`checked_` prefix and no sibling that this crate models, and `wrapping_abs`
+/// would otherwise be read as `wrapping_` + an operator named `abs`, which is not
+/// in the operator table. Matching them first keeps the family split honest: it
+/// only ever sees an operator name.
 pub fn classify(name: &str) -> Option<Intrinsic> {
     let short = name.rsplit("::").next().unwrap_or(name);
+    if short == "count_ones" {
+        return Some(Intrinsic::Popcount);
+    }
+    if short == "wrapping_abs" {
+        return Some(Intrinsic::Abs);
+    }
     let (family, op) = if let Some(rest) = short.strip_prefix("wrapping_") {
         (0u8, rest)
     } else if let Some(rest) = short.strip_prefix("saturating_") {
@@ -145,15 +184,31 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
     if w == 0 || w > 64 {
         return false;
     }
-    match op.binop() {
-        // Division is only modelled for the family that can express the failure
-        // as a value rather than a panic.
-        BinOp::Div | BinOp::Rem => matches!(op, Intrinsic::Checked(_)) && w <= DIV_MAX_WIDTH,
-        // A product needs the widened exact result to test, and to clamp.
-        BinOp::Mul => w <= MUL_MAX_WIDTH,
-        BinOp::Add | BinOp::Sub | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => true,
-        BinOp::Shl | BinOp::Shr | BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt
-        | BinOp::Ge => false,
+    match op {
+        // `count_ones` is a sum of the operand's bits, so it is exact at any
+        // width the engine holds. Its *result* is `u32` for any operand up to
+        // `u32`, and the model builds it by zero-extending the count to that
+        // width -- so `w` here is the operand width, and the result width is
+        // whatever the caller's destination type says.
+        Intrinsic::Popcount => true,
+        // `wrapping_abs` is `if x < 0 { -x } else { x }` modulo `2^w`, which is
+        // defined at every width. The signed reading is what makes the sign
+        // bit meaningful; on an unsigned type the method does not exist, so a
+        // dump that calls it was signed.
+        Intrinsic::Abs => true,
+        // The two-operand families. `binop` is `Some` for exactly these.
+        Intrinsic::Wrapping(bin)
+        | Intrinsic::Saturating(bin)
+        | Intrinsic::Checked(bin) => match bin {
+            // Division is only modelled for the family that can express the
+            // failure as a value rather than a panic.
+            BinOp::Div | BinOp::Rem => matches!(op, Intrinsic::Checked(_)) && w <= DIV_MAX_WIDTH,
+            // A product needs the widened exact result to test, and to clamp.
+            BinOp::Mul => w <= MUL_MAX_WIDTH,
+            BinOp::Add | BinOp::Sub | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => true,
+            BinOp::Shl | BinOp::Shr | BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt
+            | BinOp::Ge => false,
+        },
     }
 }
 
@@ -162,19 +217,43 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
 /// A mismatch -- a width the engine cannot hold, a shape with no definition --
 /// returns `None`, and the caller reports the path as unknown rather than
 /// guessing.
-pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool) -> Option<Outcome> {
-    if !is_modelled(op, w, signed) {
+///
+/// `w` is the operand width. `result_w` is the destination type's width, which
+/// differs from `w` only for `count_ones` (`u8::count_ones` returns `u32`); for
+/// every other shape the two are equal, and the caller passes `w` for both. The
+/// result term is built at `result_w` so that it has the width of the local it is
+/// written to -- a term narrower than its local would make the next read of that
+/// local ill-formed.
+pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) -> Option<Outcome> {
+    if !is_modelled(op, w, signed) || result_w == 0 || result_w > 64 {
         return None;
     }
-    let plain = plain_result(op.binop(), x, y, signed)?;
     Some(match op {
-        Intrinsic::Wrapping(_) => Outcome::Value(plain),
-        Intrinsic::Saturating(_) => {
-            let bound = saturation_bound(op.binop(), x, y, w, signed)?;
-            let fails = failure(op.binop(), x, y, w, signed)?;
-            Outcome::Value(smt::ite(fails, bound, plain))
+        // The bit count, widened to the result type. `popcount` returns a term of
+        // the operand's width, which is wide enough because the count cannot
+        // exceed the operand width; zero-extending it to `result_w` is the
+        // promotion Rust performs. For a `u32` result of a `u8` operand that is
+        // an 8- to 32-bit widening, and for the (signed) fixed-width case where
+        // `w == result_w` it is a no-op.
+        Intrinsic::Popcount => Outcome::Value(smt::truncate(popcount(x), result_w)),
+        // `wrapping_abs`: the magnitude, except at `MIN` where the magnitude is
+        // not representable and the wrapped result is `MIN` itself. Written as
+        // `if x < 0 { 0 - x } else { x }`, which already yields `MIN` at `MIN`
+        // because `0 - MIN` wraps -- so no separate `MIN` case is needed, and
+        // stating one would be a second definition that could drift.
+        Intrinsic::Abs => Outcome::Value(smt::ite(smt::negative(x), smt::sub(smt::word(0, w), x), x)),
+        Intrinsic::Wrapping(bin) => {
+            let plain = plain_result(bin, x, y, signed)?;
+            Outcome::Value(smt::truncate(plain, result_w))
+        }
+        Intrinsic::Saturating(bin) => {
+            let plain = plain_result(bin, x, y, signed)?;
+            let bound = saturation_bound(bin, x, y, w, signed)?;
+            let fails = failure(bin, x, y, w, signed)?;
+            Outcome::Value(smt::truncate(smt::ite(fails, bound, plain), result_w))
         }
         Intrinsic::Checked(bin) => {
+            let plain = plain_result(bin, x, y, signed)?;
             let fails = failure(bin, x, y, w, signed)?;
             // The tag is `1` exactly where the operation is defined, so the
             // `switchInt` on it takes the `Some` arm on those paths and the
@@ -183,10 +262,32 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool) -> Option<Outcom
             // reads the payload inside the `Some` arm, where this tag is `1`.
             Outcome::Option {
                 tag: smt::ite(fails, smt::word(0, w), smt::word(1, w)),
-                payload: plain,
+                payload: smt::truncate(plain, result_w),
             }
         }
     })
+}
+
+/// The number of set bits in `x`, as a term of the *same width* as `x`.
+///
+/// A tree of adds over the individual bits: `x & 1` is bit 0, `(x >> k) & 1` is
+/// bit `k`, and the sum of those is the count. The bits are extracted as
+/// predicates rather than as one-bit terms because `smt` has no one-bit word to
+/// add, and `ite(bit, 1, 0)` turns each into a term the adder already handles.
+///
+/// The width is the operand's, not the result type's: a `u8` count never exceeds
+/// 8, so 8 bits hold it, and the caller widens to the destination type. Building
+/// it wide here would add terms the zero-extension throws away.
+fn popcount(x: Var) -> Var {
+    let w = smt::bits(x);
+    let mut acc = smt::word(0, w);
+    let one = smt::word(1, w);
+    for k in 0..w {
+        // The `k`-th bit, as `1` or `0`.
+        let bit = smt::ite(smt::eq_const(smt::band(smt::lshr(x, k as u32), one), 1), one, smt::word(0, w));
+        acc = smt::add(acc, bit);
+    }
+    acc
 }
 
 /// The operation with the result taken modulo `2^w`.
@@ -417,7 +518,7 @@ mod tests {
         smt::with_fresh(|| {
             let a = smt::var(w);
             let b = smt::var(w);
-            let outcome = eval(op, a, b, w, signed)
+            let outcome = eval(op, a, b, w, signed, w)
                 .unwrap_or_else(|| panic!("{label} at {w} bits must be modelled"));
             let (ai, bi) = (smt::index(a), smt::index(b));
             each_pair(w, |xb, yb| {
@@ -701,7 +802,7 @@ mod tests {
             let a = smt::var(16);
             let b = smt::var(16);
             let op = Intrinsic::Saturating(BinOp::Add);
-            let outcome = eval(op, a, b, 16, false).expect("u16 is modelled");
+            let outcome = eval(op, a, b, 16, false, 16).expect("u16 is modelled");
             let (ai, bi) = (smt::index(a), smt::index(b));
             for &x in &vals {
                 for &y in &vals {
@@ -724,7 +825,7 @@ mod tests {
             let a = smt::var(8);
             let b = smt::var(8);
             let op = Intrinsic::Checked(BinOp::Div);
-            let outcome = eval(op, a, b, 8, true).expect("i8 is modelled");
+            let outcome = eval(op, a, b, 8, true, 8).expect("i8 is modelled");
             let (ai, bi) = (smt::index(a), smt::index(b));
             let (got_some, _) = read(outcome, ai, bi, i8_bits(i8::MIN as i64), i8_bits(-1));
             assert_eq!(
@@ -763,7 +864,7 @@ mod tests {
             .expect("the name is recognised, so it classifies");
         assert_eq!(sat_div, Intrinsic::Saturating(BinOp::Div));
         assert!(
-            eval(sat_div, smt::var(8), smt::var(8), 8, false).is_none(),
+            eval(sat_div, smt::var(8), smt::var(8), 8, false, 8).is_none(),
             "saturating_div must not be modelled: it panics on a zero divisor"
         );
         assert!(!is_modelled(sat_div, 8, false));
@@ -779,17 +880,18 @@ mod tests {
     fn past_the_width_limits_the_model_declines() {
         // Multiplication needs a `2w`-bit product; past `MUL_MAX_WIDTH` it declines.
         let mw = MUL_MAX_WIDTH + 1;
-        assert!(eval(Intrinsic::Saturating(BinOp::Mul), smt::var(mw), smt::var(mw), mw, false).is_none());
+        assert!(eval(Intrinsic::Saturating(BinOp::Mul), smt::var(mw), smt::var(mw), mw, false, mw).is_none());
         // Division past `DIV_MAX_WIDTH` declines too.
         let dw = DIV_MAX_WIDTH + 1;
-        assert!(eval(Intrinsic::Checked(BinOp::Div), smt::var(dw), smt::var(dw), dw, false).is_none());
+        assert!(eval(Intrinsic::Checked(BinOp::Div), smt::var(dw), smt::var(dw), dw, false, dw).is_none());
         // And the limits themselves are still modelled.
         assert!(eval(
             Intrinsic::Saturating(BinOp::Mul),
             smt::var(MUL_MAX_WIDTH),
             smt::var(MUL_MAX_WIDTH),
             MUL_MAX_WIDTH,
-            false
+            false,
+            MUL_MAX_WIDTH
         )
         .is_some());
         assert!(eval(
@@ -797,8 +899,131 @@ mod tests {
             smt::var(DIV_MAX_WIDTH),
             smt::var(DIV_MAX_WIDTH),
             DIV_MAX_WIDTH,
-            false
+            false,
+            DIV_MAX_WIDTH
         )
         .is_some());
+    }
+
+    /// Walk every `w`-bit value and compare a unary model against Rust.
+    ///
+    /// The unary analogue of [`check`]: one operand, so one variable, and the
+    /// result width is given separately because `count_ones` widens. `oracle`
+    /// takes the operand's bit pattern and returns the expected result's bit
+    /// pattern, calling the real `core` method so the expectation is not a
+    /// second copy of the model.
+    fn check_unary(
+        op: Intrinsic,
+        w: u8,
+        result_w: u8,
+        signed: bool,
+        oracle: impl Fn(u64) -> u64,
+        label: &str,
+    ) {
+        smt::with_fresh(|| {
+            let a = smt::var(w);
+            let outcome = eval(op, a, a, w, signed, result_w)
+                .unwrap_or_else(|| panic!("{label} at {w} bits must be modelled"));
+            let ai = smt::index(a);
+            for xb in 0..(1u64 << w) {
+                let want = oracle(xb);
+                let Outcome::Value(v) = outcome else {
+                    panic!("{label} must produce a plain value");
+                };
+                let got = smt::evaluate(v, |i| if i == ai { Some(xb) } else { None });
+                assert_eq!(
+                    got,
+                    Some(want),
+                    "{label} at bits {xb}: the model says {got:?}, Rust says {want}"
+                );
+            }
+        });
+    }
+
+    /// `count_ones` counts the set bits, at every width, against Rust's own.
+    ///
+    /// The result type is wider than the operand (`u8` -> `u32`), which is the
+    /// case the model has to widen; the same test at `result_w == w` covers the
+    /// fixed-width reading. The exhaustive walk is what makes it a proof rather
+    /// than a sample: every operand value is visited.
+    #[test]
+    fn count_ones_agrees_with_rust() {
+        for w in [1u8, 4, 8] {
+            check_unary(
+                Intrinsic::Popcount,
+                w,
+                32,
+                false,
+                |b| u64::from((b as u32).count_ones()),
+                "count_ones (widened to u32)",
+            );
+            check_unary(
+                Intrinsic::Popcount,
+                w,
+                w,
+                false,
+                |b| u64::from((b as u32).count_ones()),
+                "count_ones (at operand width)",
+            );
+        }
+    }
+
+    /// `wrapping_abs` agrees with Rust over every `i8`, `MIN` included.
+    ///
+    /// `MIN` is the interesting point: its magnitude is not representable, and
+    /// Rust wraps it back to `MIN`. The model reaches that through `0 - x`
+    /// wrapping, so this test is what pins that the shortcut is the same
+    /// function as the method and not a near miss.
+    #[test]
+    fn wrapping_abs_agrees_with_rust() {
+        check_unary(
+            Intrinsic::Abs,
+            8,
+            8,
+            true,
+            |b| i8::from_ne_bytes([b as u8]).wrapping_abs() as u8 as u64,
+            "wrapping_abs i8",
+        );
+    }
+
+    /// `wrapping_abs` and `count_ones` classify, and their neighbours do not.
+    ///
+    /// The two are matched *before* the family split, so the names that would
+    /// otherwise be read as `wrapping_` + an operator must still be refused:
+    /// `wrapping_neg` is a real method this crate does not model, and reading it
+    /// as the unknown operator `neg` would be a refusal anyway -- but reading
+    /// `wrapping_abs` as the unknown operator `abs` would have made the *new*
+    /// shape silently unmodelled, which is the failure this guards.
+    #[test]
+    fn the_unary_shapes_classify_and_their_neighbours_do_not() {
+        assert_eq!(classify("core::num::<impl u8>::count_ones"), Some(Intrinsic::Popcount));
+        assert_eq!(classify("count_ones"), Some(Intrinsic::Popcount));
+        assert_eq!(classify("core::num::<impl i8>::wrapping_abs"), Some(Intrinsic::Abs));
+        // Still refused: no operator named `neg`/`pow`/`abs` in the table, and
+        // the family split only ever sees an operator name.
+        assert!(classify("wrapping_neg").is_none());
+        assert!(classify("checked_neg").is_none());
+        assert!(classify("saturating_pow").is_none());
+        // The near misses must not be read as the shapes that are modelled.
+        assert!(classify("count_zeros").is_none());
+        assert!(classify("leading_zeros").is_none());
+        assert!(classify("trailing_zeros").is_none());
+        assert!(classify("count_ones_signed").is_none());
+        assert!(classify("wrapping_abs_signed").is_none());
+    }
+
+    /// The unary shapes are `is_unary`; the two-operand families are not.
+    ///
+    /// The executor branches on this to decide whether to read a second operand,
+    /// so a family wrongly reported unary would read one argument and mis-shape
+    /// every call, and a unary shape wrongly reported binary would refuse every
+    /// call for missing its second argument.
+    #[test]
+    fn only_the_unary_shapes_are_unary() {
+        assert!(Intrinsic::Popcount.is_unary());
+        assert!(Intrinsic::Abs.is_unary());
+        assert!(!Intrinsic::Wrapping(BinOp::Add).is_unary());
+        assert!(!Intrinsic::Saturating(BinOp::Sub).is_unary());
+        assert!(!Intrinsic::Checked(BinOp::Mul).is_unary());
     }
 }

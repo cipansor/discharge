@@ -3116,6 +3116,31 @@ do, minus the overflow obligation, so it is mostly plumbing. `count_ones` and th
 zero-counts are small bit-vector loops and belong in `discharge-arithmetic` beside
 the other proved primitives, not in the frontend.
 
+**Stage 4 progress: `count_ones` and `wrapping_abs` are modelled.** Both are unary
+and neither is a `wrapping_*`/`saturating_*`/`checked_*` family member, so they are
+matched by name *before* the family split and carried as their own `Intrinsic`
+variants. Two findings are worth more than the coverage:
+
+* **`count_ones` is the one modelled call whose result width differs from its
+  operand's** (`u8::count_ones` returns `u32`). The model builds the count at the
+  operand's width and zero-extends it to the destination's; the executor reads the
+  destination's width for exactly this reason, and the `eval` signature now takes
+  the operand width and the result width separately. Every other shape passes the
+  same value for both, so the change is inert outside this one call.
+* **`wrapping_abs` needs no `MIN` special case.** It is `if x < 0 { 0 - x } else
+  { x }`, and `0 - MIN` *wraps* to `MIN`, which is the method's answer. Writing a
+  `MIN` case would be a second definition that could drift from the first; the
+  exhaustive `i8` test is what proves the one expression is the whole function.
+
+`wrapping_neg` and `pow` remain reachable and unmodelled (`0 - x`, and a `k`-fold
+product); `wrapping_div`/`wrapping_rem`/`saturating_div` are *not* reachable by
+design, because they panic on a zero divisor and modelling them as total would hide
+that panic. The `count_ones` proof does **not** go in `discharge-arithmetic`: its
+oracle here is Rust's own `count_ones`, checked exhaustively over the whole operand
+domain, which is a stronger oracle than a small-domain enumeration would be. A
+third engine with less coverage is not a proof, so the split the roadmap proposed is
+not made.
+
 **Ordering rationale.** Stage 1 first because it is the *class* of bug, not one
 bug; doing Stages 2–4 first multiplies the call sites that can forget the sign.
 Stage 2's enum item before Stage 3 because an enum match appears in almost every

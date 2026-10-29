@@ -34,7 +34,8 @@
 //!   you supply the induction hypothesis, as in SPARK.
 //! * **`core` is not modelled.** *Closed for the `num` intrinsics.*
 //!   `checked_*`, `saturating_*` and `wrapping_*` are computed in the frontend
-//!   from their operands rather than by reading `core`'s MIR.
+//!   from their operands rather than by reading `core`'s MIR, and so are the two
+//!   unary shapes `count_ones` and `wrapping_abs`.
 //!
 //! Keep the functions small. The point is to isolate one capability per
 //! function, so a change that adds it moves exactly one row from `incomplete`
@@ -1227,4 +1228,62 @@ pub fn enum_trailing_comment_tripwire(c: Commented) -> u8 {
         Commented::B => 1,
         Commented::C => 2,
     }
+}
+
+// ---------------------------------------------------------------------------
+// `count_ones` and `wrapping_abs`: the two `core::num` methods that are neither
+// a two-operand family nor an `Option`. `count_ones` widens its result (`u8` ->
+// `u32`), which is the one place a modelled call's result width differs from its
+// operand's; `wrapping_abs` is unary and reads its operand's sign.
+//
+// Each pair below is one *verified* contract and one *tripwire*, per the
+// standing rule: a shape is not supported until a corpus entry verifies **and**
+// one fails, because a shape that only ever verifies is one whose model has
+// never been contradicted.
+// ---------------------------------------------------------------------------
+
+/// A zero operand has no set bits and every other value has at least one, so the
+/// count is at least 1. This is the shape `checked_*` cannot express: the result
+/// type is `u32` while the operand is `u8`.
+/// requires: x != 0
+/// ensures: ret >= 1
+pub fn popcount_of_nonzero(x: u8) -> u32 {
+    x.count_ones()
+}
+
+/// The tripwire: a `u8` has eight bits, so the count is at least 2 for every
+/// nonzero operand -- which is false at `x == 1`, whose count is 1.
+/// requires: x != 0
+/// ensures: ret >= 2
+pub fn popcount_of_nonzero_tripwire(x: u8) -> u32 {
+    x.count_ones()
+}
+
+/// The count cannot exceed the operand's width. Stated at the top of the range,
+/// where the *widened* result would be wrong if the model left it 8-bit.
+/// ensures: ret <= 8
+pub fn popcount_bounded_by_width(x: u8) -> u32 {
+    x.count_ones()
+}
+
+/// The tripwire: `x == 0xFF` has eight set bits, so a bound of 7 is false.
+/// ensures: ret <= 7
+pub fn popcount_bounded_by_width_tripwire(x: u8) -> u32 {
+    x.count_ones()
+}
+
+/// `wrapping_abs` never returns a value below its operand: it is the identity on
+/// non-negative inputs and the negation on negative ones, and at `MIN` it wraps
+/// back to `MIN` itself. All three cases are `ret >= x`, which is why this is
+/// true including at the `MIN` point where the magnitude is unrepresentable.
+/// ensures: ret >= x
+pub fn abs_never_below_operand(x: i8) -> i8 {
+    x.wrapping_abs()
+}
+
+/// The tripwire: strict inequality fails at `x == 0`, where `abs` is the identity
+/// and the result equals the operand.
+/// ensures: ret > x
+pub fn abs_never_below_operand_tripwire(x: i8) -> i8 {
+    x.wrapping_abs()
 }
