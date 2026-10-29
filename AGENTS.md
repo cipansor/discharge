@@ -1509,6 +1509,14 @@ Three things had to be true for that gate to be honest, and each is a rule worth
   CI job raises a warning annotation, so "Ferrocene did not run" is on the run summary
   rather than being an absence nobody notices.
 
+The build that carries the weight is `examples/bare_metal.rs`: `#![no_std]`, no `main`, and
+it *calls the decision procedure*, so compiling it for the target is what shows the prover
+itself is code the qualified compiler accepts. It is a `crate-type = ["lib"]` example with
+`test = true`, because the target has no test harness but the verdicts still need checking
+somewhere -- the `lib` shape lets the bare-metal build exist, and `test = true` makes
+`cargo test --workspace` run the host-side verdict tests rather than building and ignoring
+them, which is the "gate that silently did not run" trap again.
+
 What the gate buys is narrow and worth stating plainly: it checks the *qualified compiler
 accepts the sources unchanged*. It does not qualify `discharge`. A qualified compiler is not
 a qualified verifier, and this crate's decision procedure is outside Ferrocene's scope. The

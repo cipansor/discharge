@@ -1656,6 +1656,8 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   │                      (needs Lean via elan; a development tool, not a dependency)
 │   ├── coqdiff.rs         differential harness: engine vs Coq's kernel, by enumeration
 │   │                      (needs `coqc`; a development tool, not a dependency)
+│   ├── bare_metal.rs      the prover as `#![no_std]` code, built for the target by
+│   │                      Ferrocene, the qualified toolchain (a `lib` example, no `main`)
 │   ├── support/           the IR the engine harnesses share, so they check the
 │   │                      same formulas rather than two drifting corpora
 │   ├── mir_demo.rs        verifies real Rust read from MIR, end to end
@@ -1966,6 +1968,13 @@ does not allow programmatic access, so the gate reports and skips when the
 toolchain is absent rather than passing in silence — the same convention Kani,
 Verus, Lean and Coq follow here. A skipped oracle is not evidence, and the gate
 says so.
+
+The build that matters most is `examples/bare_metal.rs`. It is `#![no_std]`, it
+has no `main`, and it *calls the decision procedure* — so compiling it for
+`thumbv7em-none-eabihf` is what shows the prover itself, and not just the types
+around it, is code the qualified compiler accepts for the target. The target has
+no test harness, so its verdict tests run on the host instead, under
+`cargo test --workspace --features std`.
 
 [Ferrocene]: https://ferrocene.dev/
 

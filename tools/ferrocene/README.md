@@ -20,6 +20,13 @@ checked:
 - it produces the same artifact shape for the target this repository ships to
   (`thumbv7em-none-eabihf`), which is a target Ferrocene itself qualifies.
 
+The three builds are the parent crate without `std`, the arithmetic sibling, and
+`examples/bare_metal.rs`. The example is the one that matters most: it is
+`#![no_std]` and it calls the decision procedure, so compiling it for
+`thumbv7em-none-eabihf` is what shows the *prover* — the BDD blasting and the SAT
+fallback, not just the types around them — is code the qualified compiler accepts
+for the target.
+
 It does **not** check that the verification the crate performs is sound, and it
 does not confer qualification on the crate. A qualified *compiler* is not a
 qualified *verifier*; `discharge`'s engine is not in Ferrocene's qualification

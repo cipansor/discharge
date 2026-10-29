@@ -37,6 +37,22 @@ discharge-arithmetic = { path = "discharge-arithmetic" }
 default = []
 std = []
 
+# `examples/bare_metal.rs` is `#![no_std]` and has no `main`, so it cannot be a normal
+# binary example -- `cargo` would look for a `main` on a target that has no runtime to
+# start one. Building it as a library example is what lets the *qualified* toolchain
+# compile the decision procedure for `thumbv7em-none-eabihf` (see
+# `tools/ferrocene/run.sh`), which is the whole point of the file: the prover is code in
+# the artifact, so it has to build for the artifact's target. `cargo test --example
+# bare_metal` still runs its `#[cfg(test)]` module on the host.
+[[example]]
+name = "bare_metal"
+crate-type = ["lib"]
+# Examples are not tested by default, so its host-side verdict tests would be built and
+# then ignored -- exactly the "gate that silently did not run" this repository keeps
+# finding. `test = true` makes `cargo test --workspace --features std` execute them and
+# count them.
+test = true
+
 [profile.release]
 opt-level = 2
 

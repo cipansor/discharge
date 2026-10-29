@@ -71,5 +71,13 @@ RUSTC="$RUSTC_BIN" cargo build -q -p discharge-arithmetic --target "$TARGET" || 
   echo "ferrocene: build of discharge-arithmetic for $TARGET failed" >&2
   exit 1
 }
+# The example is the part that matters most: it is `#![no_std]` and it *calls the
+# decision procedure*, so this is the build that shows the prover itself — the BDD
+# blasting and the SAT fallback, not just the types around them — compiles for the target
+# under the qualified compiler. A `lib` example, because the target has no `main`.
+RUSTC="$RUSTC_BIN" cargo build -q --no-default-features --target "$TARGET" --example bare_metal || {
+  echo "ferrocene: build of examples/bare_metal.rs for $TARGET failed" >&2
+  exit 1
+}
 
-echo "ferrocene: built discharge and discharge-arithmetic for $TARGET with $version"
+echo "ferrocene: built discharge, discharge-arithmetic and examples/bare_metal.rs for $TARGET with $version"

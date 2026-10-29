@@ -49,6 +49,12 @@ echo "== 4/12 no_std bare-metal build =="
 cargo build -q --no-default-features --target thumbv7em-none-eabihf || fail "bare-metal build"
 cargo build -q -p discharge-arithmetic --target thumbv7em-none-eabihf \
   || fail "bare-metal build of discharge-arithmetic"
+# `examples/bare_metal.rs` is the crate's own claim on the target: it is `no_std`, it
+# calls the decision procedure, and building it is what proves the prover is code in the
+# artifact rather than a host-side tool. A `lib` example (see `[[example]]` in Cargo.toml)
+# because a bare-metal target has no `main` to give it.
+cargo build -q --no-default-features --target thumbv7em-none-eabihf --example bare_metal \
+  || fail "bare-metal build of examples/bare_metal.rs"
 
 echo "== 5/12 no external dependencies =="
 # The property is not "the tree has one line" any more -- the arithmetic primitives were
