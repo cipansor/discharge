@@ -181,7 +181,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     // hold a `&mut`.
     if let Some(c) = contract {
         for text in c.requires.iter().chain(c.ensures.iter()).chain(c.invariants.iter()) {
-            fields.bind_index_refs(text);
+            fields.bind_index_refs(text, &arg_vars);
         }
     }
     let ret_signed = f.ret_ty.is_signed();
@@ -224,6 +224,31 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
                     }
                 }
             }
+        }
+    }
+
+    // A symbolic array subscript `a[i]` is modelled as an ite chain, which is an
+    // honest model of `a[i]` only where `i < N`. The chain cannot make that true
+    // on its own, so the *precondition* has to establish it: if `requires` does
+    // not imply `i < N`, the subscript is refused rather than checked against a
+    // chain that quietly returned the last element for an out-of-range index.
+    //
+    // Conjoining the bound into the precondition instead would be unsound in the
+    // direction that matters: it would strengthen what the source asked to be
+    // checked, so a contract proved under `i < 4` would claim to hold without it.
+    for (idx, n) in fields.index_guards() {
+        let bound = smt::ult_const(idx, n);
+        let established = match pre {
+            Some(p) => smt::prove(smt::implies(p, bound)) == smt::Verdict::Valid,
+            None => false,
+        };
+        if !established {
+            return FnOutcome::Skipped {
+                reason: format!(
+                    "a symbolic array index is not known to be in range: the precondition does \
+                     not imply `i < {n}`, and the subscript is only modelled there"
+                ),
+            };
         }
     }
 
@@ -355,6 +380,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         &exec::Seeds {
             fields: fields.seeds.clone(),
             lens: fields.len_seeds.clone(),
+            array_lens: fields.array_lens.clone(),
             elems: fields.elem_seeds.clone(),
         },
     );

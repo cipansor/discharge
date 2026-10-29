@@ -59,6 +59,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::mir::parse::{Ty, USIZE_WIDTH};
 use crate::smt::{self, Pred, Var};
 
+/// How long an array may be before a symbolic subscript is refused.
+///
+/// `a[i]` is modelled as an ite chain over the array's whole domain, so the cost
+/// is linear in the length. A bound keeps a very large array from turning a
+/// contract into a term the solver cannot handle; past it the subscript is
+/// refused rather than silently approximated.
+pub const MAX_INDEX_CHAIN: u64 = 64;
+
 /// A contract attached to a function.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FnContract {
@@ -251,6 +259,20 @@ pub struct SpecError {
     pub reason: String,
 }
 
+impl SpecError {
+    /// Re-point the error at the *source* contract text.
+    ///
+    /// The parser reads the text *after* the field rewrite, so its errors quote
+    /// mangled names (`a__chain`, `c__f0`) that appear nowhere in the source.
+    /// Reporting those to the user is a diagnosability bug, not just a cosmetic
+    /// one: the name in the message cannot be searched for. The reason is kept as
+    /// is -- it is about the rewritten form -- and only the quoted text is the
+    /// source's.
+    fn about(self, text: &str) -> Self {
+        Self { text: text.to_string(), reason: self.reason }
+    }
+}
+
 impl std::fmt::Display for SpecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "cannot read contract `{}`: {}", self.text, self.reason)
@@ -309,6 +331,10 @@ pub struct FieldEnv {
     /// direction that matters. These seeds are how the two are made to agree by
     /// construction rather than by convention.
     pub seeds: Vec<(u32, u32, Var)>,
+    /// `(local, fixed length)` for each *array* argument, so the executor can
+    /// enumerate the domain a symbolic subscript needs. A slice has no entry:
+    /// there is no fixed domain, so its `xs[i]` stays refused.
+    pub array_lens: Vec<(u32, u64)>,
     /// `(local, length variable, element width)` for each slice or array
     /// argument.
     ///
@@ -331,6 +357,31 @@ pub struct FieldEnv {
     /// lets a contract naming `a[9]` on a `[u8; 4]` be refused as out of range
     /// rather than bound to a fresh variable for an element that does not exist.
     indexed: BTreeMap<String, (u32, u8, Option<u64>)>,
+    /// `arg -> index variable` for an array argument a contract subscripts with a
+    /// *symbolic* index (`a[i]`).
+    ///
+    /// An array has a finite domain, so a symbolic subscript can be *modelled*
+    /// rather than refused: `a[i]` becomes the ite chain over `0..N`, which is
+    /// exact. The index variable is a fresh input, and the chain is built by the
+    /// parser from the element variables in [`elem_seeds`](Self::elem_seeds) so
+    /// the contract's `a[i]` and the body's `a[i]` are the same expression.
+    ///
+    /// A *slice* gets no entry: its length is a symbolic input, so there is no
+    /// finite domain to enumerate and `xs[i]` stays a refusal. That is the honest
+    /// boundary -- an array's length is in its type, a slice's is not.
+    sym_index: BTreeMap<String, Var>,
+    /// `arg -> the index argument's name` for an array a contract subscripts
+    /// symbolically, so the rewrite can tell `a[i]` (which has a chain) from
+    /// `a[j]` (which does not) instead of rewriting both to the same chain.
+    sym_index_name: BTreeMap<String, String>,
+    /// `arg -> the ite chain` for an array a contract subscripts symbolically.
+    ///
+    /// Built once by [`bind_sym_index`](Self::bind_sym_index) from the element
+    /// variables, so the rewrite can replace `a[i]` with a *name* the parser
+    /// resolves, and the chain is the same term every time it is used. An array
+    /// argument has no variable of its own (its type has no bit width), so
+    /// without this the parser would refuse `a` as an unknown name.
+    sym_chain: BTreeMap<String, Var>,
 }
 
 impl FieldEnv {
@@ -468,6 +519,7 @@ impl FieldEnv {
         self.paths.insert(format!("{arg}.len()"), format!("{arg}__len"));
         self.indexed.insert(arg.to_string(), (local, elem_w, Some(n)));
         self.len_seeds.push((local, v, elem_w));
+        self.array_lens.push((local, n));
         self.known_args.insert(arg.to_string());
         Some(())
     }
@@ -510,6 +562,87 @@ impl FieldEnv {
         Some(v)
     }
 
+    /// Bind a symbolic array index: the index variable, and every element of the
+    /// array, so the parser can build the ite chain from bindings that already
+    /// exist.
+    ///
+    /// The index is a fresh input (whatever the caller passed) and the elements
+    /// are the same ones a literal `a[k]` would bind, so `a[i]` and `a[0]` share
+    /// their element variables and the two cannot disagree. The *range* is not
+    /// checked here: the parser records `i < N` alongside the chain, and the
+    /// contract is refused unless the precondition implies it. Enumerating
+    /// `0..N` is why this only applies to an array -- a slice's length is a
+    /// symbolic input, so there is nothing to enumerate.
+    ///
+    /// Every element is bound up front rather than on first use because the
+    /// postcondition is evaluated in a closure that cannot hold a `&mut`, and
+    /// because the executor is handed the same element variables as seeds: an
+    /// element the contract did not bind would be created fresh by the body and
+    /// the two `a[i]` would then be different values that look alike.
+    pub fn bind_sym_index(
+        &mut self,
+        arg: &str,
+        elem_w: u8,
+        n: u64,
+        index_name: &str,
+        index: Var,
+    ) -> Option<Var> {
+        if !(1..=64).contains(&elem_w) {
+            return None;
+        }
+        if n > MAX_INDEX_CHAIN {
+            return None;
+        }
+        if let Some(v) = self.sym_index.get(arg) {
+            // The same array subscripted by two different symbolic indices has no
+            // single chain to rewrite to. Refusing keeps the second subscript a
+            // refusal rather than silently reusing the first chain.
+            return if *v == index { Some(*v) } else { None };
+        }
+        // The elements first, so the chain has all of them to build from.
+        let mut elems = Vec::with_capacity(n as usize);
+        for k in 0..n {
+            elems.push(self.bind_indexed_elem(arg, k)?);
+        }
+        let v = index;
+        self.sym_index.insert(arg.to_string(), v);
+        self.sym_index_name.insert(arg.to_string(), index_name.to_string());
+        // `ite(i == 0, e0, ite(i == 1, e1, ... ite(i == N-1, e_{N-1}, 0)))`.
+        // The fall-through is unreachable: every use of the chain is guarded by
+        // `i < N` (conjoined by `eval_*`, or assumed from the body's own bounds
+        // assert), so the value chosen for `i >= N` is never observed.
+        let mut chain = smt::word(0, elem_w);
+        for k in (0..n).rev() {
+            chain = smt::ite(smt::eq_const(v, k), elems[k as usize], chain);
+        }
+        self.sym_chain.insert(arg.to_string(), chain);
+        // The rewrite replaces `a[i]` with this name, and the parser resolves it
+        // from `vars`, so the chain has to be reachable by name.
+        self.vars.insert(format!("{arg}__chain"), chain);
+        self.paths.insert(format!("{arg}__chain"), format!("{arg}__chain"));
+        Some(v)
+    }
+
+    /// `(index variable, length)` for every array a contract subscripts
+    /// symbolically, so the caller can require that the precondition establishes
+    /// each index is in range.
+    ///
+    /// The ite chain has a fall-through for `i >= N` (it has to return
+    /// *something*), so the chain is only an honest model of `a[i]` where `i < N`.
+    /// Rather than refuse the subscript, the caller proves the precondition
+    /// implies the bound; if it does not, the contract is refused. Conjoining the
+    /// bound into the precondition instead would be unsound, because it would
+    /// quietly strengthen what the source asked to be checked.
+    pub fn index_guards(&self) -> Vec<(Var, u64)> {
+        self.sym_index
+            .iter()
+            .filter_map(|(arg, v)| {
+                let (_, _, n) = self.indexed.get(arg)?;
+                Some((*v, (*n)?))
+            })
+            .collect()
+    }
+
     /// Bind every indexed element a contract text names, so the rewrite has a
     /// binding for each and the run needs no mutable access to the environment.
     ///
@@ -519,7 +652,7 @@ impl FieldEnv {
     /// path, and that closure cannot hold a `&mut`. It also means an element the
     /// body reads but the contract does not is bound by the *executor* (through
     /// `index_elem`), and the two agree because both key on the same index.
-    pub fn bind_index_refs(&mut self, text: &str) {
+    pub fn bind_index_refs(&mut self, text: &str, args: &BTreeMap<String, Var>) {
         let chars: Vec<char> = text.chars().collect();
         let mut i = 0;
         while i < chars.len() {
@@ -538,6 +671,30 @@ impl FieldEnv {
                             self.bind_indexed_elem(&ident, k);
                         }
                         i = j + 1;
+                        continue;
+                    }
+                    // Not a literal index: a symbolic subscript of an *array*,
+                    // `a[i]`. Only an array has a finite domain to enumerate; a
+                    // slice's length is a symbolic input, so `xs[i]` is left
+                    // unbound and the parser refuses it. Binding here (rather
+                    // than in the parser) keeps the element variables in
+                    // `elem_seeds`, so the executor is handed the same ones.
+                    // Anything that is not a name the contract may use is left
+                    // unbound and refused by the parser -- a refusal, not a
+                    // wrong value.
+                    let close = chars[j..].iter().position(|c| *c == ']').map(|p| p + j);
+                    if let Some(close) = close {
+                        let inner: String = chars[i + 1..close].iter().collect();
+                        // The index has to be a name the contract may use -- an
+                        // argument. A compound index (`a[i + 1]`) is left unbound
+                        // and refused by the parser rather than mis-modelled.
+                        if let Some(&index) = args.get(&inner) {
+                            if let Some((_, elem_w, Some(n))) = self.indexed.get(&ident).copied()
+                            {
+                                self.bind_sym_index(&ident, elem_w, n, &inner, index);
+                            }
+                        }
+                        i = close + 1;
                         continue;
                     }
                 }
@@ -632,6 +789,29 @@ fn rewrite_fields(text: &str, fields: &FieldEnv) -> Result<String, SpecError> {
                         continue;
                     }
                 }
+                // `a[i]` on an array: replace the whole subscript with the ite
+                // chain bound for `a`. The chain is an exact function of `i`, so
+                // this is a definitional rewrite, not an approximation. The index
+                // itself is left in place: the range guard (`i < N`) is conjoined
+                // by the caller, which is what makes the chain's fall-through
+                // unreachable.
+                if let Some(close) = chars[j..].iter().position(|c| *c == ']').map(|p| p + j) {
+                    let inner: String = chars[i + 1..close].iter().collect();
+                    // The chain bound for `ident` is only `ident[inner]` when
+                    // `inner` is the very index that chain was built from. A
+                    // different index (`a[j]` where the chain is `a[i]`) has no
+                    // chain, so it is left for the parser to refuse rather than
+                    // rewritten to the wrong subscript.
+                    let is_bound_index =
+                        fields.sym_index_name.get(&ident).map(|n| n == &inner).unwrap_or(false);
+                    if is_bound_index {
+                        if let Some(mangled) = fields.paths.get(&format!("{ident}__chain")) {
+                            out.push_str(mangled);
+                            i = close + 1;
+                            continue;
+                        }
+                    }
+                }
             }
             out.push_str(&ident);
             continue;
@@ -649,14 +829,15 @@ pub fn eval_requires(
     signed: &BTreeSet<String>,
     fields: &FieldEnv,
 ) -> Result<Pred, SpecError> {
+    let orig = text;
     let text = rewrite_fields(text, fields)?;
     let mut names = args.clone();
     names.extend(fields.vars.iter().map(|(k, v)| (k.clone(), *v)));
     let mut sgn = signed.clone();
     sgn.extend(fields.signed.iter().cloned());
     let mut p = Parser::new(&text, &names, None, &sgn, false);
-    let pred = p.parse_or()?;
-    p.expect_end()?;
+    let pred = p.parse_or().map_err(|e| e.about(orig))?;
+    p.expect_end().map_err(|e| e.about(orig))?;
     Ok(pred)
 }
 
@@ -683,6 +864,7 @@ pub fn eval_ensures(
     ret_signed: bool,
     fields: &FieldEnv,
 ) -> Result<Pred, SpecError> {
+    let orig = text;
     let text = rewrite_fields(text, fields)?;
     let mut names = args.clone();
     names.extend(fields.vars.iter().map(|(k, v)| (k.clone(), *v)));
@@ -690,8 +872,8 @@ pub fn eval_ensures(
     sgn.extend(fields.signed.iter().cloned());
     let mut p = Parser::new(&text, &names, ret, &sgn, ret_signed);
     p.ret_absent = ret_absent;
-    let pred = p.parse_or()?;
-    p.expect_end()?;
+    let pred = p.parse_or().map_err(|e| e.about(orig))?;
+    p.expect_end().map_err(|e| e.about(orig))?;
     Ok(pred)
 }
 

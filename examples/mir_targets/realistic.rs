@@ -141,6 +141,61 @@ pub fn array_third(a: [u8; 4]) -> u8 {
     a[2]
 }
 
+/// A *symbolic* subscript of an array. `a[i]` is not a single element, but an
+/// array has a finite domain, so it is the exact ite chain over `0..4` -- a
+/// definition, not an approximation. The chain is only `a[i]` where `i < 4`, so
+/// the precondition has to establish that; `i < 4` here is what makes the
+/// subscript admissible, and without it the function is refused rather than
+/// checked against a chain that quietly returned the last element.
+/// requires: i < 4
+/// ensures: ret == a[i]
+pub fn array_symbolic_index(a: [u8; 4], i: usize) -> u8 {
+    a[i]
+}
+
+/// The contract subscripts with an index *other* than the one the precondition
+/// bounds. `requires: i < 4` says nothing about `j`, and `a[j]` is only modelled
+/// where `j < 4`, so the contract is refused -- it is not silently rewritten to
+/// the `a[i]` chain, which would prove `a[j] == a[i]` and be wrong for every
+/// `i != j`. Both indices are live, so the refusal is about the contract's
+/// subscript, not a dead argument.
+/// requires: i < 4
+/// ensures: ret == a[j]
+pub fn array_wrong_index_refused(a: [u8; 4], i: usize, j: usize) -> u8 {
+    let _ = a[j];
+    a[i]
+}
+
+/// The contract subscripts with a name that is not an argument at all. There is
+/// no variable to build a chain for `k`, so nothing is bound and the parser
+/// refuses the name rather than inventing an index. This is the "no chain to
+/// rewrite to" case, distinct from the unbounded one above.
+/// requires: i < 4
+/// ensures: ret == a[k]
+pub fn array_local_index_refused(a: [u8; 4], i: usize) -> u8 {
+    let k = i;
+    a[k]
+}
+
+/// A symbolic subscript the precondition does *not* bound. `requires: true` says
+/// nothing about `i`, so the ite chain would fall through for `i >= 4` and the
+/// subscript is refused. This is the soundness gate for the whole feature.
+/// requires: true
+/// ensures: ret == a[i]
+pub fn array_unbounded_index_refused(a: [u8; 4], i: usize) -> u8 {
+    a[i]
+}
+
+/// A *slice* subscripted symbolically. A slice's length is a symbolic input, so
+/// there is no finite domain to enumerate and no chain to build: `xs[i]` stays a
+/// refusal. This is the boundary the feature is drawn at -- an array's length is
+/// in its type, a slice's is not.
+/// requires: i < 4
+/// ensures: ret == xs[i]
+pub fn slice_symbolic_index_refused(xs: &[u8], i: usize) -> u8 {
+    xs[i]
+}
+
 /// An array built in the body, so the elements are concrete rather than inputs.
 /// requires: true
 /// ensures: ret == 20

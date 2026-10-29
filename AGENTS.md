@@ -2462,10 +2462,12 @@ The parts that would have been silent bugs:
   (`ensures: ret == xs[1]` on a body returning `xs[0]`) would verify. Elements are keyed by
   `(local, index)` instead, so two indices are two inputs. The tripwire must FAIL, and its
   counterexample assigns the two elements different values; `tests/mir.rs` requires both.
-* **A symbolic subscript is refused, not resolved to an arbitrary element.** `xs[i]` with `i` a
-  parameter has no single element to name. Reading "some element" would make `xs[i]` a
-  different value per read — a wrong proof, not a missing one. Only a literal index is
-  modelled, which is the same refusal an array subscript gets.
+* **A symbolic subscript is refused on a slice, and modelled on an array.** `xs[i]` with `i` a
+  parameter has no single element to name on a slice, and reading "some element" would make
+  `xs[i]` a different value per read — a wrong proof, not a missing one. An *array* is
+  different: its length is in its type, so `a[i]` is the exact ite chain over `0..N` and is
+  modelled (see the symbolic-index section below). The distinction is the domain being finite,
+  not the subscript being symbolic.
 * **The element width is the referent's, not the length's.** `&[u8]` has `u8` elements and a
   `usize` length. Taking the element width from the length variable sizes every read at 64 bits
   and mis-models the bounds check.
@@ -2538,3 +2540,47 @@ The rule is not a comparison rule, it is a *meet* rule, and it applies wherever 
 scope had the identical failure — an 8-bit `a` added to a 64-bit `5` — and was `incomplete` for
 the same reason. That the first fix was written only in `parse_cmp` is what made the arithmetic
 case a separate bug rather than the same one.
+
+### A symbolic subscript is modelled on an array and refused on a slice
+
+`a[i]` and `xs[i]` are the same source shape and are not the same problem. The difference is
+not that one is symbolic and one is not — both are — but that one has a *finite domain*. An
+array's length is in its type, so `a[i]` ranges over a set the frontend can enumerate:
+`ite(i == 0, a0, ite(i == 1, a1, … ite(i == N-1, a_{N-1}, 0)))`. That is not an approximation of
+`a[i]`, it is a *definition* of it. A slice's length is a symbolic input, so there is no domain
+to enumerate and `xs[i]` stays the refusal it always was. The feature is drawn at the domain,
+and `MAX_INDEX_CHAIN` bounds it so a large array is refused rather than turned into a term the
+solver cannot hold.
+
+Three things had to be true for the chain to be sound, and each is a separate trap:
+
+* **The chain is only `a[i]` where `i < N`, so the precondition must establish that.** The chain
+  has to return *something* for `i >= N` (it falls through to the last element). Checking a
+  contract there would check it against a value that is not `a[i]`. So `index_guards` reports
+  `(index var, N)` for every symbolic subscript, and `verify_function` *proves* `pre ⇒ i < N`.
+  If it does not hold, the function is `Skipped` with a reason naming the bound. The tempting
+  alternative — conjoin `i < N` into the precondition — is unsound in the direction that
+  matters: it strengthens what the source asked to be verified, so a contract proved under
+  `i < 4` would be claimed to hold without it.
+* **The chain must be built from the *same* element variables the body reads.** The parser
+  rewrites `a[i]` to the chain, and the chain is built from `elem_seeds` — the very variables
+  the executor is seeded with. If the contract's `a[i]` were built from fresh variables, the
+  postcondition would be about one array and the body about another, and every proof would be
+  vacuous in the direction that matters. `bind_sym_index` therefore binds *every* element of
+  the array up front, not on demand: an element the contract did not bind would be created
+  fresh by the body's first read.
+* **Only the index that was bound has a chain.** `a[j]` where only `a[i]` was bound must not be
+  rewritten to the `a[i]` chain — that would prove `a[j] == a[i]`, false for every `i != j`. The
+  rewrite checks `sym_index_name` for the exact index argument before replacing, so a name that
+  merely looks like the bound one is left for the parser to refuse.
+
+The index is a *name the contract may use* — an argument — and it is bound to that argument's
+own variable, so `requires: i < 4` and the chain's guard are the same `i`. A compound index
+(`a[i + 1]`) has no name to bind and is refused rather than mis-modelled.
+
+`tests/mir.rs` pins all four sides: the chain verifies, an unbounded index is refused, a
+different index is refused, a slice subscript is still refused, and a *false* postcondition
+about `a[i]` fails with a counterexample (so "verified" cannot be the chain being a constant
+the postcondition happened to accept). The corpus entries are
+`array_symbolic_index`, `array_unbounded_index_refused`, `array_wrong_index_refused` and
+`slice_symbolic_index_refused`.

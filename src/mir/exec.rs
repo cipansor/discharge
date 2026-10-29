@@ -377,6 +377,13 @@ struct Indexed {
     /// resolve can be looked up here; a symbolic index that cannot be pinned is
     /// refused rather than guessed.
     elems: BTreeMap<u64, Var>,
+    /// The array's fixed length, when it is an array rather than a slice.
+    ///
+    /// A slice's length is a symbolic input, so there is no finite domain to
+    /// enumerate and a symbolic subscript stays refused. An array's length is in
+    /// its type, so `a[i]` can be modelled as an ite chain over `0..N` -- exactly,
+    /// which is what this field makes possible.
+    fixed_len: Option<u64>,
 }
 
 impl Env {
@@ -409,6 +416,35 @@ impl Env {
         Some(v)
     }
 
+    /// The ite chain standing for `a[i]` on a fixed-length array, or `None` when
+    /// the local is a slice or the chain is too long to build.
+    ///
+    /// An array has a finite domain, so `a[i]` is *exactly* `ite(i == 0, e0, ...)`
+    /// over `0..N`. Every element is created if it does not exist yet, so the
+    /// chain is a function of `i` and the same `i` read twice is the same value.
+    /// The caller must be under `i < N`: the bounds assert rustc emits supplies
+    /// that, and without it the chain would fall through to the last element,
+    /// which is a wrong value rather than a missing one -- so `None` is returned
+    /// for a slice, where there is no domain to enumerate at all.
+    fn index_chain(&mut self, local: u32, index: Var) -> Option<Var> {
+        let (n, elem_w) = {
+            let s = self.indexed.get(&local)?;
+            (s.fixed_len?, s.elem_w)
+        };
+        if n > crate::mir::spec::MAX_INDEX_CHAIN {
+            return None;
+        }
+        let mut elems = Vec::with_capacity(n as usize);
+        for k in 0..n {
+            elems.push(self.index_elem(local, k)?);
+        }
+        let mut chain = smt::word(0, elem_w);
+        for k in (0..n).rev() {
+            chain = smt::ite(smt::eq_const(index, k), elems[k as usize], chain);
+        }
+        Some(chain)
+    }
+
     /// Read `(*_1)[_2]` — an indexed element (a slice or an array) subscripted by
     /// a local.
     ///
@@ -428,10 +464,16 @@ impl Env {
             [Proj::Deref, Proj::Index(k)] | [Proj::Index(k)] => *k,
             [Proj::Deref, Proj::IndexVar(li)] | [Proj::IndexVar(li)] => {
                 match self.locals.get(li) {
-                    Some(Val::Sym(v)) => match smt::evaluate(*v, |_| None) {
-                        Some(k) => k,
-                        None => return Some(Val::Unknown),
-                    },
+                    Some(Val::Sym(v)) => {
+                        let v = *v;
+                        match smt::evaluate(v, |_| None) {
+                            Some(k) => k,
+                            // A symbolic index on an *array* is modelled as an ite
+                            // chain; on a slice there is no finite domain, so the
+                            // element is genuinely unknown and stays a refusal.
+                            None => return self.index_chain(p.local, v).map(Val::Sym),
+                        }
+                    }
                     _ => return Some(Val::Unknown),
                 }
             }
@@ -491,17 +533,21 @@ impl Env {
                 // arbitrary element would make `xs[i]` a different value per
                 // read, which is a wrong proof waiting to happen.
                 Proj::IndexVar(li) => {
-                    let k = match self.locals.get(li) {
-                        Some(Val::Sym(v)) => smt::evaluate(*v, |_| None),
+                    let sym = match self.locals.get(li) {
+                        Some(Val::Sym(v)) => Some(*v),
                         _ => None,
                     };
-                    match k {
+                    match sym.and_then(|v| smt::evaluate(v, |_| None)) {
                         Some(k) => match self.indexed.get(&p.local) {
                             Some(s) => {
                                 s.elems.get(&k).map(|v| Val::Sym(*v)).unwrap_or(Val::Unknown)
                             }
                             None => *self.elems.get(&(p.local, k)).unwrap_or(&Val::Unknown),
                         },
+                        // A symbolic subscript: `get` takes `&self`, so it cannot
+                        // create the elements the chain needs. The operand path
+                        // goes through `read_indexed`, which can, and does so
+                        // first; this is the fallback for a caller that did not.
                         None => Val::Unknown,
                     }
                 }
@@ -712,6 +758,10 @@ pub struct Seeds {
     /// `(local, length variable, element width)` for each slice or array
     /// argument.
     pub lens: Vec<(u32, Var, u8)>,
+    /// The fixed length for each array argument, so a symbolic subscript knows
+    /// the domain to enumerate. A slice has no entry, and its `xs[i]` stays
+    /// refused.
+    pub array_lens: Vec<(u32, u64)>,
     /// `(local, index, variable)` for each element a contract names.
     pub elems: Vec<(u32, u64, Var)>,
 }
@@ -800,7 +850,8 @@ where
     // `bind_slice_refs` runs over every contract text before the run, so a name a
     // contract uses always has a binding here.
     for &(local, len, elem_w) in &seeds.lens {
-        env.indexed.insert(local, Indexed { len, elem_w, elems: BTreeMap::new() });
+        let fixed_len = seeds.array_lens.iter().find(|(l, _)| *l == local).map(|(_, n)| *n);
+        env.indexed.insert(local, Indexed { len, elem_w, elems: BTreeMap::new(), fixed_len });
     }
     for &(local, index, v) in &seeds.elems {
         if let Some(s) = env.indexed.get_mut(&local) {

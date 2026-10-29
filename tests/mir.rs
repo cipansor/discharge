@@ -1208,3 +1208,170 @@ fn the_field_rewrite_does_not_fire_inside_a_longer_name() {
     let ok = spec::eval_requires("c.lo <= 3", &args, &std::collections::BTreeSet::new(), &fields);
     assert!(ok.is_ok(), "the bound path must resolve, got: {ok:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Symbolic array subscripts
+// ---------------------------------------------------------------------------
+
+/// `a[i]` on a fixed-length array is modelled as the exact ite chain over `0..N`,
+/// and the precondition has to establish `i < N`.
+///
+/// An array's length is in its type, so unlike a slice there *is* a finite domain
+/// to enumerate: `a[i]` is `ite(i == 0, a0, ite(i == 1, a1, ...))`, a definition
+/// rather than an approximation. The chain can only be `a[i]` where `i < N`, so
+/// `requires: i < 4` is what makes the subscript admissible.
+#[test]
+fn a_symbolic_array_index_is_modelled_as_an_ite_chain() {
+    let Some(report) = verify_realistic(&["array_symbolic_index"]) else { return };
+    let o = outcome(&report, "array_symbolic_index");
+    assert!(o.is_verified(), "`array_symbolic_index` must verify, got: {o}");
+}
+
+/// The soundness gate: a symbolic subscript whose index the precondition does not
+/// bound is refused, not checked.
+///
+/// The ite chain has to return *something* for `i >= N` (it falls through to the
+/// last element), so a contract checked without `i < N` would be checked against a
+/// value that is not `a[i]`. Refusing is the only honest answer; the tempting bug
+/// is to conjoin `i < N` into the precondition, which would silently strengthen
+/// what the source asked to be verified.
+#[test]
+fn an_unbounded_symbolic_array_index_is_refused() {
+    let Some(report) = verify_realistic(&["array_unbounded_index_refused"]) else { return };
+    let o = outcome(&report, "array_unbounded_index_refused");
+    match o {
+        FnOutcome::Skipped { reason } => assert!(
+            reason.contains("not known to be in range"),
+            "the refusal must say the index is unbounded, got: {reason}"
+        ),
+        other => panic!("`array_unbounded_index_refused` must be skipped, got: {other}"),
+    }
+}
+
+/// A contract naming a *different* index than the body reads is refused.
+///
+/// Only `a[i]` has a chain; `a[j]` does not, and rewriting it to the `a[i]` chain
+/// would prove `a[j] == a[i]` -- false for every `i != j`. The refusal is what
+/// keeps a name that merely looks like the bound one from being silently aliased.
+#[test]
+fn a_contract_naming_a_different_symbolic_index_is_refused() {
+    let Some(report) = verify_realistic(&["array_wrong_index_refused"]) else { return };
+    let o = outcome(&report, "array_wrong_index_refused");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "`array_wrong_index_refused` must be skipped, got: {o}"
+    );
+}
+
+/// A contract error quotes the *source* text, not the rewritten form.
+///
+/// The parser reads the contract after the field/subscript rewrite, so its errors
+/// naturally quote mangled names (`a__chain`, `c__f0`) that appear nowhere in the
+/// source. A name the user cannot search for is a diagnosability bug, so the eval
+/// boundary re-points the error at the original text. This pins that, because it
+/// is the kind of thing a later refactor silently drops.
+#[test]
+fn a_contract_error_quotes_the_source_text() {
+    use discharge::mir::spec;
+    use discharge::smt;
+    let mut fields = spec::FieldEnv::default();
+    let mut args = std::collections::BTreeMap::new();
+    // Bind `a[i]` as a symbolic subscript, so the rewrite fires. `i` is an
+    // argument, which is what makes it bindable as an index.
+    let i = smt::var(64);
+    args.insert("i".to_string(), i);
+    fields.bind_array_len(0, "a", 8, 4);
+    fields.bind_sym_index("a", 8, 4, "i", i);
+    let src = "ret == a[i] && ret == a[j]";
+    let err = spec::eval_ensures(
+        src,
+        &args,
+        Some(smt::var(8)),
+        spec::RET_IS_UNKNOWN,
+        &std::collections::BTreeSet::new(),
+        false,
+        &fields,
+    )
+    .expect_err("`a[j]` has no chain and must be refused");
+    assert_eq!(
+        err.text, src,
+        "the error must quote the source contract, not the rewritten one"
+    );
+    assert!(
+        !err.text.contains("__"),
+        "no mangled name may leak into the quoted text: {}",
+        err.text
+    );
+}
+
+/// A subscript by a name that is not an argument is refused.
+///
+/// `a[k]` where `k` is a local has no variable to build a chain from, so nothing
+/// is bound and the parser refuses `k`. This is the distinct "no chain to rewrite
+/// to" refusal, as opposed to the "chain exists but the index is unbounded" one;
+/// conflating them would hide a bound index behind the wrong message.
+#[test]
+fn a_symbolic_index_that_is_not_an_argument_is_refused() {
+    let Some(report) = verify_realistic(&["array_local_index_refused"]) else { return };
+    let o = outcome(&report, "array_local_index_refused");
+    match o {
+        FnOutcome::Skipped { reason } => assert!(
+            reason.contains("unknown name"),
+            "a non-argument index must be refused as an unknown name, got: {reason}"
+        ),
+        other => panic!("`array_local_index_refused` must be skipped, got: {other}"),
+    }
+}
+
+/// A *slice* subscripted symbolically is still refused.
+///
+/// The whole feature turns on the domain being finite. An array's length is in its
+/// type, so `0..N` can be enumerated; a slice's length is a symbolic input, so
+/// there is no chain to build and `xs[i]` stays a refusal. This is the boundary,
+/// and it is asserted so the feature cannot silently widen to slices.
+#[test]
+fn a_symbolic_slice_index_is_still_refused() {
+    let Some(report) = verify_realistic(&["slice_symbolic_index_refused"]) else { return };
+    let o = outcome(&report, "slice_symbolic_index_refused");
+    match o {
+        FnOutcome::Skipped { reason } => assert!(
+            reason.contains("unknown name") || reason.contains("xs"),
+            "the refusal must be about the unbound subscript, got: {reason}"
+        ),
+        other => panic!("`slice_symbolic_index_refused` must be skipped, got: {other}"),
+    }
+}
+
+/// The chain is really evaluated: a false postcondition about `a[i]` produces a
+/// counterexample that pins the index to an in-range value.
+///
+/// Without this, "verified" above would be consistent with the chain being a
+/// constant the postcondition happened to accept. `body_only` claims `ret <= 9`
+/// for an arbitrary `u8` element, which is false, so it must FAIL -- and the
+/// counterexample must show the element's value, which only exists if the chain
+/// selected a real element variable.
+#[test]
+fn a_false_symbolic_index_postcondition_is_caught() {
+    let src = r#"
+/// requires: i < 4
+/// ensures: ret <= 9
+pub fn chain_must_be_read(a: [u8; 4], i: usize) -> u8 {
+    a[i]
+}
+"#;
+    let Some(rustc) = rustc() else { return };
+    let dir = std::env::temp_dir().join(format!("discharge-chain-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("chain.rs");
+    std::fs::write(&file, src).expect("write probe");
+    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let o = outcome(&report, "chain_must_be_read");
+    match o {
+        FnOutcome::Failed { detail, .. } => assert!(
+            !detail.is_empty(),
+            "a failed symbolic-index obligation must carry a counterexample"
+        ),
+        other => panic!("`chain_must_be_read` must FAIL (ret <= 9 is false), got: {other}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

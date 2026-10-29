@@ -1428,10 +1428,13 @@ The frontend refuses far more than it accepts, and every refusal is reported:
   `saturating_*` and `wrapping_*` for `add`/`sub`/`mul`/`div`/`rem` and the
   bitwise ops are computed from their operands (see below). Every other
   intrinsic, and every trait method, is still a call the frontend cannot model.
-- **A symbolic index, or a mutable reference write.** `xs[i]` with `i` a parameter
-  has no single element to name, so it is refused rather than resolved to an
-  arbitrary one; `*r = v` is the aliasing model the crate does not claim. Fields
-  and elements of by-value aggregates, and elements and lengths of slices and
+- **A symbolic index into a *slice*, or a mutable reference write.** An array
+  subscripted by a parameter (`a[i]` on `[u8; 4]`) *is* modelled: the length is in
+  the type, so `a[i]` is the exact ite chain over `0..N`, admitted only when the
+  precondition establishes `i < N`. A slice has no such bound — its length is a
+  symbolic input — so `xs[i]` is refused rather than resolved to an arbitrary
+  element. `*r = v` is the aliasing model the crate does not claim. Fields and
+  elements of by-value aggregates, and elements and lengths of slices and
   fixed-size arrays, *are* modelled — only the pointer arithmetic is not.
 
 ### Signedness is a value question, not a display one
