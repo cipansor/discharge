@@ -2532,3 +2532,9 @@ in range by construction.
 Each of these has a test in `tests/mir.rs` written against the *evaluator*, so it does not
 depend on a corpus function happening to be skipped for an unrelated reason. Two of them failed
 when first written and found the masking and truncation bugs above.
+
+The rule is not a comparison rule, it is a *meet* rule, and it applies wherever two operands meet:
+`parse_expr` and `parse_term` call the same `align_widths`. `ret == a + 5` with a slice length in
+scope had the identical failure — an 8-bit `a` added to a 64-bit `5` — and was `incomplete` for
+the same reason. That the first fix was written only in `parse_cmp` is what made the arithmetic
+case a separate bug rather than the same one.
