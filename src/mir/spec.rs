@@ -2223,6 +2223,81 @@ fn push_variant(def: &mut EnumDef, name: String, payload: Vec<Ty>, explicit: Opt
     def.variants.push((name, payload, d));
 }
 
+/// The layout of `Option<T>` or `Result<T, E>`, reconstructed from the type's
+/// own generic arguments.
+///
+/// These are the two enums a real function reads without any source file
+/// declaring them: `checked_add` returns `Option<u8>`, and `?` threads a
+/// `Result`. `variant_index` already knows their fixed numbering
+/// (`None`/`Ok` = 0, `Some`/`Err` = 1) for a *construction*; this gives an
+/// *argument* of the same type a tag and payload seeds, so a `match` on it is
+/// modelled instead of refused as an unmodelled switch discriminant.
+///
+/// `Option`'s payload type is the type argument (`Option<u8>` → `Some(u8)`);
+/// `Result`'s is its two type arguments in order (`Result<T, E>` → `Ok(T)`,
+/// `Err(E)`). The split is top-level, so a nested type (`Result<Option<u8>, u8>`)
+/// stays one argument rather than being cut at its own comma.
+///
+/// A *declared* enum always wins — the caller consults `enums` first — so a user
+/// `enum E { Some, None }` is not read as `Option`. An unrecognised spelling
+/// yields `None`, which leaves the argument unbound and the function refused, the
+/// conservative direction.
+pub fn std_enum_def(name: &str) -> Option<EnumDef> {
+    let name = name.trim();
+    let inner = |head: &str| -> Option<String> {
+        let rest = name.strip_prefix(head)?.trim_start();
+        if !rest.starts_with('<') {
+            return None;
+        }
+        // The opening `<` is still in `rest`, so the scan starts at depth 0 and
+        // the matching `>` is the index where the depth returns to 0.
+        let close = {
+            let mut d = 0i32;
+            let mut end = None;
+            for (i, c) in rest.char_indices() {
+                match c {
+                    '<' => d += 1,
+                    '>' => {
+                        d -= 1;
+                        if d == 0 {
+                            end = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            end?
+        };
+        let args = &rest[1..close];
+        // Reject anything after the closing `>` that is not whitespace, so a
+        // spelling like `Option<u8>X` is not silently read as `Option<u8>`.
+        if !rest[close + 1..].trim().is_empty() {
+            return None;
+        }
+        Some(args.to_string())
+    };
+    let variant = |vname: &str, payload: Vec<Ty>, d: u64| (vname.to_string(), payload, d);
+    if let Some(args) = inner("Option") {
+        let t = Ty::parse(args.trim());
+        return Some(EnumDef {
+            variants: vec![variant("None", vec![], 0), variant("Some", vec![t], 1)],
+        });
+    }
+    if let Some(args) = inner("Result") {
+        let parts = split_top_level(&args, ',');
+        if parts.len() != 2 {
+            return None;
+        }
+        let ok = Ty::parse(parts[0].trim());
+        let err = Ty::parse(parts[1].trim());
+        return Some(EnumDef {
+            variants: vec![variant("Ok", vec![ok], 0), variant("Err", vec![err], 1)],
+        });
+    }
+    None
+}
+
 /// Bind every field of every struct-typed argument to a symbolic variable.
 ///
 /// A struct argument has no width of its own (`Ty::Other("Config")`), so it gets
@@ -2283,8 +2358,19 @@ pub fn field_env(
         // its domain, and each variant's payload is its own input. Checked before
         // the struct path because an enum name is an `Other` too, and binding it
         // as a struct with no fields would silently lose the tag.
+        //
+        // A *declared* layout always wins. `Option` and `Result` are the two the
+        // reader knows without a declaration, because `checked_*` and the `?`
+        // operator hand them to real functions and no source file declares them;
+        // `std_enum_def` reconstructs their layout from the type's generic
+        // arguments. `Shadow` is a declared `enum { Some, None }` and is not
+        // `Option`, so it must reach `enums` first.
         if let Some(def) = enums.get(name) {
             env.bind_enum(l, &arg, name, def);
+            continue;
+        }
+        if let Some(def) = std_enum_def(name) {
+            env.bind_enum(l, &arg, name, &def);
             continue;
         }
         // Recorded whether or not a layout was found, so a contract naming a field
@@ -2392,6 +2478,42 @@ mod tests {
     fn def(src: &str) -> EnumDef {
         let specs = extract(src);
         specs.enums.get("E").cloned().unwrap_or_default()
+    }
+
+    /// The two standard enums a real function reads are reconstructed from the
+    /// type's own generic arguments, with the payloads at their declared widths.
+    #[test]
+    fn a_standard_enum_argument_gets_a_layout() {
+        let o = std_enum_def("Option<u8>").expect("Option<u8> has a layout");
+        assert_eq!(o.index_of("None"), Some(0));
+        assert_eq!(o.index_of("Some"), Some(1));
+        assert_eq!(o.tag_width(), 1);
+        assert_eq!(o.variants[1].1, vec![Ty::U8], "`Some` carries the type argument");
+
+        let r = std_enum_def("Result<u8, u16>").expect("Result<u8, u16> has a layout");
+        assert_eq!(r.index_of("Ok"), Some(0));
+        assert_eq!(r.index_of("Err"), Some(1));
+        assert_eq!(r.variants[0].1, vec![Ty::U8], "`Ok` carries the first argument");
+        assert_eq!(r.variants[1].1, vec![Ty::U16], "`Err` carries the second");
+    }
+
+    /// The argument split is top-level, so a nested type stays one argument.
+    #[test]
+    fn a_nested_standard_enum_payload_is_one_type() {
+        let r = std_enum_def("Result<Option<u8>, u8>").expect("nested Result has a layout");
+        assert_eq!(r.variants[0].1, vec![Ty::Other("Option<u8>".into())]);
+        assert_eq!(r.variants[1].1, vec![Ty::U8]);
+    }
+
+    /// A spelling that is not `Option`/`Result`, or is malformed, is refused
+    /// rather than guessed -- an unrecognised type must leave the argument
+    /// unbound so the function is refused, not modelled at the wrong width.
+    #[test]
+    fn a_non_standard_or_malformed_name_is_refused() {
+        assert!(std_enum_def("Mode").is_none());
+        assert!(std_enum_def("Option").is_none(), "no type argument is not Option<T>");
+        assert!(std_enum_def("Option<u8>X").is_none(), "trailing text is not Option<u8>");
+        assert!(std_enum_def("Result<u8>").is_none(), "Result needs two arguments");
     }
 
     /// An explicit discriminant sets the variant's value and the next continues

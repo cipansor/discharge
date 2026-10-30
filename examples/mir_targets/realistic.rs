@@ -1274,6 +1274,88 @@ pub fn enum_trailing_comment_tripwire(c: Commented) -> u8 {
     }
 }
 
+/// A `match` on a *standard-library* enum **argument**.
+///
+/// `Option` and `Result` are read by real functions (`checked_add` returns
+/// `Option<u8>`; `?` threads a `Result`), but no source file declares them, so an
+/// argument of one of those types had no layout: the tag was never seeded and the
+/// `switchInt` on it came back an *unmodelled switch discriminant*. A declared
+/// enum argument (`Mode`) and a locally constructed `Option` both worked; the
+/// argument form is the one the reader has to know without a declaration.
+/// The contract is true for every input, so it must VERIFY -- `None` gives `0`
+/// and `Some` gives `1`, and both are `<= 1`.
+/// requires: true
+/// ensures: ret <= 1
+pub fn option_arg_match(x: Option<u8>) -> u8 {
+    match x {
+        Some(_) => 1,
+        None => 0,
+    }
+}
+
+/// The tripwire for the standard-enum argument: the body returns `1` for `Some`
+/// and `0` for `None`, so `ret == 0` is false whenever the caller passes `Some`.
+/// A model that seeded no tag would not reach this -- it refused -- but one that
+/// seeded a *constant* tag would take one arm always and could prove this.
+/// requires: true
+/// ensures: ret == 0
+pub fn option_arg_match_tripwire(x: Option<u8>) -> u8 {
+    match x {
+        Some(_) => 1,
+        None => 0,
+    }
+}
+
+/// The `Result` half: `Ok` is tag `0` and `Err` is tag `1`, and the two type
+/// arguments are the payloads in order, so `Ok`'s payload is a `u8` and `Err`'s is
+/// a `u16`. The contract is true for both arms.
+/// requires: true
+/// ensures: ret <= 1
+pub fn result_arg_match(r: Result<u8, u16>) -> u8 {
+    match r {
+        Ok(_) => 0,
+        Err(_) => 1,
+    }
+}
+
+/// The tripwire: `Err` takes the second arm, so `ret == 0` is false when the
+/// caller passes `Err`.
+/// requires: true
+/// ensures: ret == 0
+pub fn result_arg_match_tripwire(r: Result<u8, u16>) -> u8 {
+    match r {
+        Ok(_) => 0,
+        Err(_) => 1,
+    }
+}
+
+/// The `Option` payload read through the argument: `Some`'s payload is the type
+/// argument, so `Option<u8>::Some` carries a `u8`. The body's downcast read
+/// `((_1 as Some).0)` must name the same seeded payload variable the contract's
+/// `x.Some` does. A tautology like `ret <= 255` would hold even if the payload
+/// came back unconstrained, so it would pin nothing; `ret <= x.Some` fails on the
+/// `Some` arm whenever the body returns anything but the seeded payload.
+/// requires: true
+/// ensures: ret <= x.Some
+pub fn option_arg_payload_passthrough(x: Option<u8>) -> u8 {
+    match x {
+        Some(v) => v,
+        None => 0,
+    }
+}
+
+/// The tripwire: the contract claims the payload is one more than it is, so the
+/// `Some` arm is false for every input -- the payload is read, not a free
+/// variable the contract could make true.
+/// requires: true
+/// ensures: ret == x.Some + 1
+pub fn option_arg_payload_tripwire(x: Option<u8>) -> u8 {
+    match x {
+        Some(v) => v,
+        None => 0,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // `count_ones` and `wrapping_abs`: the two `core::num` methods that are neither
 // a two-operand family nor an `Option`. `count_ones` widens its result (`u8` ->

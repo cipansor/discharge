@@ -3646,3 +3646,58 @@ worked through a plain reborrow — the raw form appears only for a `&mut` *slic
 which is why the array tripwire (`mut_ref_array_write_then_symbolic_read`) and the
 slice one are separate entries rather than one.
 
+## A `match` on a standard-library enum *argument*: the layout no source declares
+
+Stage 3 taught the reader that `Option` and `Result` have a fixed numbering no
+source file declares, so a *construction* (`Option::<u8>::Some(9)`) resolves
+without a layout. The *argument* form was still missing: `match x { Some(_) => …,
+None => … }` where `x: Option<u8>` came back `incomplete: unmodelled switch
+discriminant`. A `match` on a declared enum argument (`Mode`) verified, and a
+locally constructed `Option` verified — only the standard enum **as an argument**
+was refused, which is the shape a real function has when it takes `Option<T>` or
+threads a `Result`.
+
+The cause is in `field_env`'s argument dispatch. An enum argument's tag is a
+symbolic input, seeded from the argument's `EnumDef`; the dispatch looks that
+layout up in `enums`, which is keyed by enums *declared in the source*. `Option`
+and `Result` are never declared, so the lookup missed, no tag was seeded, and the
+`switchInt` on `discriminant(_1)` had nothing to compare against. The
+construction path already had the fixed numbering; the argument path had no
+layout at all.
+
+The fix reconstructs the layout from the type's own generic arguments
+(`std_enum_def`): `Option<T>` is `None`/`Some(T)` at tags `0`/`1`, and
+`Result<T, E>` is `Ok(T)`/`Err(E)`. The argument list is split at the *top level*,
+so a nested payload (`Result<Option<u8>, u8>`) stays one type rather than being
+cut at its own comma and read as two. A *declared* layout is consulted first, so
+`Shadow { Some, None }` is still `Shadow` and not `Option` — the same ordering
+`variant_index` already pins for constructions. Anything else (`Mode`, a malformed
+`Option<u8>X`, a one-argument `Result<u8>`) yields no layout, which leaves the
+argument unbound and the function refused — the conservative direction.
+
+**Corpus.** Six entries, and they separate the tag from the payload:
+
+* `option_arg_match` and `result_arg_match` verify (`ret <= 1` for both arms),
+  which only holds if the tag is seeded and the `switchInt` decides.
+* `option_arg_match_tripwire` and `result_arg_match_tripwire` claim one arm's
+  value and are refuted — a *constant* tag would take one arm always and prove
+  them.
+* `option_arg_payload_passthrough` (`ensures: ret <= x.Some`) and
+  `option_arg_payload_tripwire` (`ret == x.Some + 1`) pin the *payload*: the
+  body's downcast read `((_1 as Some).0)` must name the same seeded variable the
+  contract's `x.Some` does. A tautology such as `ret <= 255` would hold even if
+  the payload came back unconstrained, so it would pin nothing.
+
+Coverage went from **76/131 to 79/137** decided. `tests/mir.rs` pins the corpus
+verdicts by name, and a second test writes the shape to an isolated file so the
+fix is pinned even if the corpus entry is edited; `spec::tests` pins
+`std_enum_def` directly (both enums, the nested split, and the refusals), so the
+guard runs without a nightly toolchain.
+
+The honest boundary: only `Option` and `Result` are reconstructed, because they
+are the two the reader already names in `variant_index`. A user enum is declared
+and read normally; a *different* standard-library enum (`Poll`, `ControlFlow`)
+still has no layout, so an argument of one is refused rather than guessed — the
+right answer, since guessing a numbering is exactly the failure `Shadow` guards
+against.
+

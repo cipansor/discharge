@@ -2420,3 +2420,74 @@ fn the_unary_neg_and_abs_families_disagree_at_min() {
         "the `wrapping_abs` witness should be x == i8::MIN (bits 128), got: {detail}"
     );
 }
+
+/// A `match` on a standard-library enum *argument* is modelled.
+///
+/// `Option` and `Result` are the two enums a real function reads without any
+/// source file declaring them: `checked_add` returns `Option<u8>`, and `?` threads
+/// a `Result`. An *argument* of one of those types had no layout, so its tag was
+/// never seeded and the `switchInt` on it came back an unmodelled switch
+/// discriminant -- a refusal, not a verdict. The declared-enum argument (`Mode`)
+/// and the locally constructed `Option` both worked; the argument form is the gap.
+///
+/// Both halves matter: the true contracts must verify (the tag and the payload are
+/// seeded) and the tripwires must be refuted (the tag and the payload are *read*,
+/// not free variables the contract could make true). A model that seeded a
+/// constant tag would take one arm always and prove a false tripwire.
+#[test]
+fn a_standard_enum_argument_is_a_switch_on_a_seeded_tag() {
+    let Some(report) = verify_realistic(&[
+        "option_arg_match",
+        "option_arg_match_tripwire",
+        "result_arg_match",
+        "result_arg_match_tripwire",
+        "option_arg_payload_passthrough",
+        "option_arg_payload_tripwire",
+    ]) else {
+        return;
+    };
+    for name in ["option_arg_match", "result_arg_match", "option_arg_payload_passthrough"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in
+        ["option_arg_match_tripwire", "result_arg_match_tripwire", "option_arg_payload_tripwire"]
+    {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` must FAIL: a `Skipped` means the shape is not modelled, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
+/// The same shape in an isolated file, so the fix is pinned even if the corpus
+/// entry is edited: a `match` on `Option<u8>` must produce a verdict, not the
+/// "unmodelled switch discriminant" refusal.
+///
+/// The nested-type spelling is the part worth pinning separately -- the payload is
+/// the type argument as *one* type, so `Option<u8>` carries a `u8` and a
+/// `Result<u8, u16>` carries a `u8` for `Ok` and a `u16` for `Err`. Splitting the
+/// argument list at the wrong level (or reading the payload as the whole `u8, u16`
+/// text) would size the payload wrongly and the width assertion in the contract
+/// would fail.
+#[test]
+fn a_standard_enum_argument_payload_has_its_own_width() {
+    let src = r#"
+        /// requires: true
+        /// ensures: ret <= 255
+        pub fn opt_payload(x: Option<u8>) -> u8 {
+            match x { Some(v) => v, None => 0 }
+        }
+        /// requires: true
+        /// ensures: ret <= 1
+        pub fn res_payload(r: Result<u8, u16>) -> u8 {
+            match r { Ok(_) => 0, Err(_) => 1 }
+        }
+    "#;
+    let Some(o) = verify_src("opt_payload", src) else { return };
+    assert!(o.is_verified(), "`opt_payload` must verify, got: {o}");
+    let Some(o) = verify_src("res_payload", src) else { return };
+    assert!(o.is_verified(), "`res_payload` must verify, got: {o}");
+}
+
