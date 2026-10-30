@@ -1618,3 +1618,59 @@ pub fn wrapping_pow_zero_exponent_is_one(x: u8) -> u8 {
 pub fn wrapping_pow_one_exponent_is_one_tripwire(x: u8) -> u8 {
     x.wrapping_pow(1)
 }
+
+
+// ---------------------------------------------------------------------------
+// The bitwise complement, `!x`.
+//
+// `!x` is `all_ones ^ x` at the *operand's* width, and the model reads that
+// width off the value rather than trusting the destination local's declared
+// width -- the two agree for well-typed MIR, and where they would disagree the
+// read is refused rather than masked at a width the value does not have.
+//
+// The shape had no corpus entry before this: `!x` is common in real Rust and was
+// modelled, but nothing pinned it, which is exactly the "supported until
+// contradicted" gap the standing tripwire rule exists to close.
+// ---------------------------------------------------------------------------
+
+/// The complement of zero is all ones: `255` at a `u8`. Stated on the operand's
+/// width, so a model that masked at the destination's width would agree here and
+/// disagree at a narrower operand.
+/// requires: x == 0
+/// ensures: ret == 255
+pub fn not_of_zero_is_all_ones(x: u8) -> u8 {
+    !x
+}
+
+/// `!x == 255 - x` at a `u8`, the identity the mask at the operand's width gives.
+/// An operand is named so the claim is symbolic rather than one input.
+/// requires: true
+/// ensures: ret == 255 - x
+pub fn not_is_255_minus_x(x: u8) -> u8 {
+    !x
+}
+
+/// The tripwire: `!x` is `255` only at `x == 0`, so claiming it always is false
+/// at every other input. A model that ignored the operand -- `all_ones ^ 0`, or a
+/// constant `255` -- would prove this.
+/// requires: true
+/// ensures: ret == 255
+pub fn not_is_always_255_tripwire(x: u8) -> u8 {
+    !x
+}
+
+/// The complement keeps the operand's sign, so at an `i8` the complement of zero
+/// is `-1`, not `255` -- the same bit pattern read as the operand's type.
+/// requires: x == 0
+/// ensures: ret == -1
+pub fn not_of_zero_is_minus_one(x: i8) -> i8 {
+    !x
+}
+
+/// The width is the operand's, so a `u32` complement of zero is `4294967295`
+/// rather than the `u8` value. This is the width the mask must be derived from.
+/// requires: x == 0
+/// ensures: ret == 4294967295
+pub fn not_of_zero_u32_is_all_ones(x: u32) -> u32 {
+    !x
+}

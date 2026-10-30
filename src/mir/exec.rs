@@ -2416,11 +2416,19 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
                 (_, Val::Unknown) => Val::Unknown,
                 (UnOp::Not, Val::Bool(p)) => Val::Bool(smt::not(p)),
                 // `!x` is a bitwise complement, so the result has the operand's
-                // type and keeps its sign.
-                (UnOp::Not, Val::Sym(s, sign)) => match dest_w {
-                    Some(w) => Val::Sym(smt::bxor(s, smt::all_ones(w)), sign),
-                    None => Val::Unknown,
-                },
+                // type and keeps its sign. The mask must therefore be the
+                // *operand's* width, which the value carries; `dest_w` is only a
+                // cross-check. Deriving the mask from `dest_w` is right exactly
+                // when the two agree, so a disagreement -- the dump and the value
+                // disagreeing about the type -- is refused rather than masked at
+                // a width the value does not have.
+                (UnOp::Not, Val::Sym(s, sign)) => {
+                    let w = smt::bits(s);
+                    if dest_w.is_some_and(|dw| dw != w) {
+                        return Val::Unknown;
+                    }
+                    Val::Sym(smt::bxor(s, smt::all_ones(w)), sign)
+                }
                 // `-x` is `0 - x`, which is the right bit pattern for every input
                 // including `MIN` (it wraps back to `MIN`, which is what rustc's
                 // own `assert(x != MIN)` guards and then computes anyway). The

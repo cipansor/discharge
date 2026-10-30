@@ -3031,9 +3031,16 @@ optional file argument, which is what made the measurement cheap.)
   that follows it. This is exactly the class of printer change gate 9 exists to
   catch: the frontend's own verdicts were unaffected, and only the oracle
   noticed.
-* **`Rvalue::Unary(Not)` on a word operand** is handled, but `!x` is
-  `all_ones ^ x` only when `dest_w` is the operand's width; assert the width
-  rather than trusting `dest_w`. Small, and not yet measured against the corpus.
+* **`Rvalue::Unary(Not)` on a word operand — DONE.** The mask now comes from
+  the *operand's* width (`smt::bits`), with `dest_w` kept as a cross-check that
+  refuses a disagreement. Measured first: rustc lowers `!x` at `u8`/`i8`/`u32`
+  to `_0 = Not(copy _1)` with `dest_w` equal to the operand's width, so the
+  reachable behaviour is unchanged -- this removes a way to be wrong, it does not
+  change an answer. The real gap was coverage: `!x` had *no* corpus entry. Five
+  now carry it (`not_of_zero_is_all_ones`, `not_of_zero_u32_is_all_ones`,
+  `not_of_zero_is_minus_one`, `not_is_255_minus_x` and
+  `not_is_always_255_tripwire`, refuted with witness `v1 = 1`), taking coverage
+  from 71/123 to **75/128**. See the section below.
 
 Corpus coverage went from 33/51 to 44/67 decided across this round; the new
 entries are `struct_literal_reads_its_field`, `struct_literal_order` (+ its
@@ -3519,3 +3526,52 @@ and lives in a thread-local, so it sits close to the test harness's thread stack
 by 512 KB overflows that stack. The memo is therefore small on purpose -- 128 slots, about
 33 KB -- and the measurement says that is enough for the fold terms a single query touches
 (`N=64` and `N=256` behave identically to `N=128` on the corpus).
+
+## Stage 2, last bullet: the complement's width comes from the operand, not the destination
+
+The roadmap's final Stage 2 item was one line: `Rvalue::Unary(Not)` is "handled,
+but `!x` is `all_ones ^ x` only when `dest_w` is the operand's width; assert the
+width rather than trusting `dest_w`. Small, and not yet measured against the
+corpus."
+
+Measuring it first, as the roadmap insists, changed the shape of the work. A MIR
+probe of `!x` at `u8`, `i8`, `u32` and `bool` shows rustc always lowers it to
+`_0 = Not(copy _1)` with the destination local declared at the operand's type, so
+`dest_w` *is* the operand's width for every well-typed body. The code was
+therefore not producing wrong answers -- a six-function probe decided 5 of 6, with
+the tripwire correctly refuted and both `!x == 255 - x` and `!x == x ^ 255`
+verified. What the bullet names is a *defensive* concern, not a live bug: the
+mask was derived from `dest_w`, so a body where the dump and the value disagreed
+about the type would have been masked at the wrong width rather than refused.
+
+The fix derives the mask from the operand -- `smt::bits(s)`, the width the value
+actually carries -- and treats `dest_w` as a cross-check: a destination local that
+disagrees is refused (`Val::Unknown`) rather than masked at a width the value does
+not have. The reachable behaviour is unchanged, which is the point: the change
+removes a way to be wrong, it does not change an answer.
+
+**The bigger finding is that the shape had no corpus entry at all.** `!x` is
+common in real Rust and was modelled, but nothing pinned it -- the exact
+"supported until contradicted" gap the standing tripwire rule exists to close.
+Five entries now carry it, and each pins a different half of the model:
+
+* `not_of_zero_is_all_ones` (`u8`) and `not_of_zero_u32_is_all_ones` (`u32`) state
+  the operand's width at two widths, so a mask taken at the wrong width fails the
+  wide one.
+* `not_of_zero_is_minus_one` (`i8`) pins the sign the value keeps -- the same bit
+  pattern read as the operand's type.
+* `not_is_255_minus_x` states the identity symbolically, so the operand is read
+  rather than the answer being a constant.
+* `not_is_always_255_tripwire` is the evidence the operand is read at all: a
+  model that ignored it (a constant `255`, or `all_ones ^ 0`) would prove it. It
+  is refuted with witness `v1:u8 = 1`.
+
+Coverage went from **71/123 to 75/128** decided, and the test
+`the_bitwise_complement_reads_the_operands_width` pins the verdicts so a
+regression is a failure rather than a quiet false proof.
+
+The honest boundary: the *refusal* branch (a `dest_w` that disagrees with the
+operand) is not reachable from well-typed MIR, so it is defensive and untested by
+construction -- no corpus entry can exercise it, because rustc will not emit it.
+The corpus entries pin the reachable half; the refusal is the belt to the
+suspender, kept because the alternative to a refusal is a wrong mask.

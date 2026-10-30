@@ -1234,6 +1234,35 @@ fn stage_two_rvalues_are_modelled_and_their_tripwires_refuted() {
     }
 }
 
+/// The bitwise complement `!x`, pinned by a true half and a tripwire.
+///
+/// `!x` is `all_ones ^ x` at the *operand's* width. The model reads that width
+/// off the value and refuses a destination local that disagrees with it, rather
+/// than masking at `dest_w`. The three verifying entries name the operand's width
+/// at three different widths (`u8`, `i8`, `u32`), so a model that masked at the
+/// wrong width would fail the `u32` one; `not_of_zero_is_minus_one` pins the sign
+/// the value keeps; and the tripwire is the evidence the operand is read at all,
+/// since a constant `255` (or `all_ones ^ 0`) would prove it.
+#[test]
+fn the_bitwise_complement_reads_the_operands_width() {
+    let verified = [
+        "not_of_zero_is_all_ones",
+        "not_is_255_minus_x",
+        "not_of_zero_is_minus_one",
+        "not_of_zero_u32_is_all_ones",
+    ];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let Some(report) = verify_realistic(&["not_is_always_255_tripwire"]) else { return };
+    let o = outcome(&report, "not_is_always_255_tripwire");
+    let FnOutcome::Failed { .. } = o else {
+        panic!("`not_is_always_255_tripwire` is false and must be refuted, got: {o}");
+    };
+}
+
 /// The struct-literal tripwire's counterexample is the `hi` operand, not `lo`.
 ///
 /// [`struct_literal_order_tripwire`] writes `lo: 7` and `hi: a` and claims
