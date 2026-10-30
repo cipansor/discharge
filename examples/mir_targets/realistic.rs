@@ -1585,6 +1585,63 @@ pub fn contract_bang_paren_arithmetic_is_a_value(x: u8) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Radix literals: `0x`, `0b`, `0o`.
+//
+// The tokenizer read every numeric literal as decimal. The digit run stopped at
+// the `x` of `0xFF` and the rest was skipped as a type suffix, so the value was
+// `0` -- and a wrong value in a precondition is a *false proof*, not a refusal:
+// `requires: x == 0xFF` became `x == 0`, so `ensures: ret == 0` was proved for a
+// function returning `255`. These entries pin the value each radix reads, and the
+// control pins that the fixed value is *not* the truncated one.
+
+/// A hex literal reads at radix 16: `0xFF` is `255`. The body returns the argument
+/// unchanged, so `ret == 255` holds only under the correct reading; the truncated
+/// `x == 0` reading refutes it.
+/// requires: x == 0xFF
+/// ensures: ret == 255
+pub fn contract_hex_literal_is_255(x: u8) -> u8 {
+    x
+}
+
+/// A binary literal reads at radix 2: `0b1010` is `10`, not `0`.
+/// requires: x == 0b1010
+/// ensures: ret == 10
+pub fn contract_binary_literal_is_ten(x: u8) -> u8 {
+    x
+}
+
+/// An octal literal reads at radix 8: `0o17` is `15`, not `0`.
+/// requires: x == 0o17
+/// ensures: ret == 15
+pub fn contract_octal_literal_is_fifteen(x: u8) -> u8 {
+    x
+}
+
+/// Underscores separate digits in any radix: `0xFF_FF` is `65535`.
+/// requires: x == 0xFF_FF
+/// ensures: ret == 65535
+pub fn contract_hex_underscore_is_65535(x: u16) -> u16 {
+    x
+}
+
+/// A hex literal with a type suffix is still that value: `0xFFu8` is `255`.
+/// requires: x == 0xFFu8
+/// ensures: ret == 255
+pub fn contract_hex_with_suffix_is_255(x: u8) -> u8 {
+    x
+}
+
+/// The control: the *truncated* reading is `0`, so `ret == 0` is false for a body
+/// that returns `x` under `x == 0xFF`. This must be **refuted**; if the literal is
+/// mis-read as `0`, the precondition becomes `x == 0` and this is "proved" -- the
+/// false proof the fix removes.
+/// requires: x == 0xFF
+/// ensures: ret == 0
+pub fn contract_hex_literal_is_not_zero_control(x: u8) -> u8 {
+    x
+}
+
+// ---------------------------------------------------------------------------
 // The contract operators that were missing, and the *precedence* they need.
 //
 // The expression language had `+ - * & | ^` but no `/ % << >>`, so a contract

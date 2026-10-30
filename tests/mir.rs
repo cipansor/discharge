@@ -2866,6 +2866,23 @@ fn the_contract_reader_agrees_with_rustc_on_a_grid() {
         ("x | 1 ^ 1", "u8", "u8", &[0, 1, 255], None),
         ("x & 3 | 4", "u8", "u8", &[0, 1, 3, 255], None),
         ("x ^ 1 & 3", "u8", "u8", &[0, 1, 3, 255], None),
+        ("x | 1 ^ 2", "u8", "u8", &[0, 1, 2, 255], None),
+        // Unary `!` stacked, and `!` feeding a shift: both are bitwise, so `!!x` is
+        // `x` and `!x >> 1` shifts the complement.
+        ("!!x", "u8", "u8", &[0, 1, 5, 250, 255], None),
+        ("!x >> 1", "u8", "u8", &[0, 1, 250, 255], None),
+        // A shift and a bitwise `|` in one expression: `x << 1 | 1` is
+        // `(x << 1) | 1`, because `<<` binds tighter than `|`.
+        ("x << 1 | 1", "u8", "u8", &[0, 1, 2, 63], None),
+        // Unary `-` feeding a shift, and unary `-` feeding `+`.
+        ("-x >> 1", "i8", "i8", &[-127, -1, 0, 1, 127], None),
+        ("-x + 1", "i8", "i8", &[-126, -1, 0, 1, 126], None),
+        // A cast feeding a bitwise `&`, and a double cast.
+        ("x as u16 & 1", "i8", "u16", &[-128, -1, 0, 1, 127], None),
+        ("x as u8 as u16", "i8", "u16", &[-128, -1, 0, 1, 127], None),
+        // `*` binds tighter than `+`, and a repeated shift is left-associative.
+        ("1 + x * 2", "u8", "u8", &[0, 1, 5, 63], None),
+        ("x >> 1 >> 1", "u8", "u8", &[0, 1, 255], None),
         // A cast binds tighter than `+`, and unary `-` binds tighter than a cast. The
         // guard mode reads the *type* of the result, which is where `(x as i16) + 1`
         // and `x as (i16 + 1)` would differ. (`*` is left out: an `i16 * i16` body has
@@ -2908,6 +2925,19 @@ fn the_contract_reader_agrees_with_rustc_on_a_grid() {
         // postcondition, so an unreadable contract (a non-folded reader) shows up
         // as a non-verified outcome here.
         ("x >> 1 + 1", "u8", "u8", &[0, 1, 2, 4, 8, 16, 128, 255], None),
+        // A radix literal is the expression in *both* the body and the
+        // postcondition: rustc compiles the body `0xFF` to `255`, and the reader
+        // must read the contract `0xFF` as `255` for `ret == 0xFF` to hold. A
+        // decimal-only reader read it as `0`, so the postcondition became
+        // `ret == 0` and the tool *proved* it for a body returning `255` -- a false
+        // proof, which this row turns into a disagreement. The `x == 0` guard makes
+        // the function total so the only thing under test is the literal.
+        ("0xFF", "u8", "u8", &[0], None),
+        ("0b1010", "u8", "u8", &[0], None),
+        ("0o17", "u8", "u8", &[0], None),
+        ("0xFFu8", "u8", "u8", &[0], None),
+        ("0xFF_FF", "u16", "u16", &[0], None),
+        ("0x10", "u8", "u8", &[0], None),
     ];
 
     let mut checked = 0u32;
@@ -3027,6 +3057,41 @@ fn a_folded_constant_is_read_as_a_constant() {
         o.is_verified(),
         "a folded shift amount in the body must be lowered as a constant, got: {o}"
     );
+}
+
+/// A radix literal must be read at its radix, and the *control* is the point.
+///
+/// `0xFF` used to read as `0`, so `requires: x == 0xFF` became `x == 0` and
+/// `ensures: ret == 0` was **proved** for a function returning `255` -- a false
+/// proof, the worst outcome this crate can produce. The verifying entries show the
+/// value is now right; the control shows the truncated value is gone, because it is
+/// the entry that used to be a false proof and must now be refuted.
+#[test]
+fn a_radix_literal_is_read_at_its_radix() {
+    let verified = [
+        "contract_hex_literal_is_255",
+        "contract_binary_literal_is_ten",
+        "contract_octal_literal_is_fifteen",
+        "contract_hex_underscore_is_65535",
+        "contract_hex_with_suffix_is_255",
+    ];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let Some(report) = verify_realistic(&["contract_hex_literal_is_not_zero_control"]) else {
+        return;
+    };
+    let o = outcome(&report, "contract_hex_literal_is_not_zero_control");
+    let FnOutcome::Failed { kind, detail, .. } = o else {
+        panic!("the control must be refuted -- verifying it is the false proof, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "the control got: {o}");
+    // The witness is `255`, the value `0xFF` *should* be. Under the old truncating
+    // read it would have been a proof, so the witness is the evidence the literal
+    // is now read at radix 16.
+    assert!(detail.contains("= 255"), "the witness should be `255`, got: {detail}");
 }
 
 /// The corpus entries that pin *where* `!` binds, asserted end to end.

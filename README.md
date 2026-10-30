@@ -1319,6 +1319,16 @@ reported incomplete for a reason that had nothing to do with its body. A literal
 large for the operand's width is refused rather than truncated: `a <= 300` for a
 `u8` must not become `a <= 44`.
 
+A literal is read at the radix it is written in. `0xFF` is `255`, `0b1010` is `10`
+and `0o17` is `15`, in any width and with underscores or a type suffix (`0xFFu8`,
+`0xFF_FF`). Reading every literal as decimal silently made `0xFF` equal `0` — the
+digit run stopped at the `x` and the rest was skipped as a type suffix — and a wrong
+value in a precondition is a *false proof*, not a refusal: `requires: x == 0xFF`
+became `x == 0`, so `ensures: ret == 0` was proved for a function returning `255`. A
+literal that is not an exact integer — a digit invalid for its radix (`0b12`, `0o9`),
+no digits (`0xg`), an unknown suffix (`0xFFg`), or a value past `u64` — is refused,
+so the fix does not trade one silent number for another.
+
 The scanner is deliberately strict. A `requires:`, `ensures:` or `invariant:` that sits before a
 `const`, a `struct` or a module comment is *not* attached to the next function, so
 a misplaced contract is dropped rather than silently applied to the wrong item.

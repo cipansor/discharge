@@ -4072,3 +4072,50 @@ silent omission reads as an oversight:
 The general rule: a grid row is only evidence when *both* the probe and the assertion
 are decided. A row that fails for a reason unrelated to the property under test is
 worse than no row, because it looks like a check and is not one.
+
+## Bug 6: a radix literal was read as decimal -- a false proof
+
+The sixth bug is the worst family in this file, and the first *false proof*: the
+tokenizer read every numeric literal as decimal. The digit run stopped at the `x` of
+`0xFF` and the rest was skipped as a type suffix, so the value was `0`. In a
+precondition that is not a refusal, it is a wrong *number*:
+
+```rust
+/// requires: x == 0xFF     // read as `x == 0`
+/// ensures: ret == 0       // "proved" for a body returning `255`
+pub fn f(x: u8) -> u8 { x }
+```
+
+The tool reported **verified**. `0b1010` became `0`, `0o17` became `0`. A false proof
+is the one outcome the whole crate exists to prevent, so this is the most serious
+entry in the series; the earlier five were dropped obligations or, in the folded-zero
+case, a definite verdict from an undefined operation -- bad, but not a proof of
+something untrue.
+
+The fix reads each literal at its radix (`0x`/`0b`/`0o`, underscores, an optional
+integer suffix) and, just as important, *refuses* one that is not an exact integer
+rather than taking a partial value: `0b12`, `0o9`, `0xg`, `0xFFg`, and anything past
+`u64` are `Skipped`, not silently truncated. A new `Tok::BadNum` carries that
+refusal, so the parser reports "a numeric literal that is not an exact integer"
+instead of `0`. The fix is worth nothing without the refusal half: reading at the
+radix but still swallowing a bad digit would have traded one silent number for
+another.
+
+Found by a *discriminating* probe, which is the lesson. My first literal probes
+(`requires: x == 0xFF`, `ensures: ret == 255`, body `255`) **verified** -- and would
+have verified under either reading, so they proved nothing. The probe only had teeth
+when the body returned the argument and the postcondition named the value: correct
+reading gives `x == 255`, body `255`, holds; truncating reading gives `x == 0`, body
+`0`, refuted. A test that passes under the bug is not a test. Every literal probe in
+the corpus now has the `_control` companion that returns the argument, so the
+truncated reading is a *refutation*, not a pass.
+
+Evidence: `a_radix_literal_is_read_at_its_radix` (spec unit test, parse-level),
+`a_radix_literal_is_read_at_its_radix` (integration, corpus + the `_control`),
+six corpus entries, six rows in the rustc grid. The grid rows are the differential
+form: `expr` is both the body (compiled by rustc to the true value) and the
+postcondition (parsed by the reader), so a decimal-only reader shows up as a
+disagreement, not as a silent pass. Reverting the radix read makes the grid fail with
+`0xFF` expected `verified=true`, got `skipped` -- the oracle is sensitive.
+
+Coverage **115/195 to 120/201**, test-count 540 to 542. Gate green.

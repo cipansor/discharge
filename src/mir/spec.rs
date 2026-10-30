@@ -1424,6 +1424,16 @@ struct Parser<'a> {
 enum Tok {
     Ident(String),
     Num(u64),
+    /// A numeric literal the tokenizer could not read *exactly* -- a digit that
+    /// is invalid for its radix, or a value past `u64`.
+    ///
+    /// It is a distinct token so the parser refuses it rather than reading it as
+    /// `0`. Reading every literal as decimal silently truncated `0xFF` to `0`
+    /// (the digit run stopped at `x` and the rest was skipped as a type suffix),
+    /// and a mis-read constant in a precondition is a false proof: `requires: x
+    /// == 0xFF` became `x == 0`, so `ensures: ret == 0` was "proved" for a
+    /// function returning `255`. A refusal is safe; a wrong number is not.
+    BadNum,
     Op(String),
 }
 
@@ -1438,18 +1448,83 @@ fn tokenize(s: &str) -> Vec<Tok> {
             continue;
         }
         if c.is_ascii_digit() {
-            let mut n = String::new();
-            while i < b.len() && (b[i].is_ascii_digit() || b[i] == '_') {
+            // A radix prefix, or a plain decimal. `0x`/`0b`/`0o` is always a prefix
+            // when it starts a literal: `0xg` is a malformed hex literal, not a
+            // decimal `0` followed by an identifier, and reading it as the latter
+            // would be the same silent truncation this scan exists to avoid.
+            let radix = if c == '0' {
+                match b.get(i + 1) {
+                    Some('x' | 'X') => {
+                        i += 2;
+                        16
+                    }
+                    Some('b' | 'B') => {
+                        i += 2;
+                        2
+                    }
+                    Some('o' | 'O') => {
+                        i += 2;
+                        8
+                    }
+                    _ => 10,
+                }
+            } else {
+                10
+            };
+            // Take the longest run of digits and `_` separators. A `_` between
+            // digits is a separator; the run stops at anything else, which is how a
+            // type suffix (`100u32`) is left for the loop below.
+            let mut digits = String::new();
+            while i < b.len() && (b[i].is_digit(radix) || b[i] == '_') {
                 if b[i] != '_' {
-                    n.push(b[i]);
+                    digits.push(b[i]);
                 }
                 i += 1;
             }
-            // Skip a type suffix (`100u32`) so the literal stays a number.
-            while i < b.len() && (b[i].is_alphanumeric()) {
-                i += 1;
+            // Skip a type suffix (`100u32`, `0xFF_i32`) so the literal stays a
+            // number. It must be one of the integer type names: `0xFFg` is
+            // malformed, and swallowing the `g` as a suffix would read the literal
+            // as a well-formed `255` -- the same silent mis-read this scan exists
+            // to avoid. A trailing `_` (`100_`) is a separator, not a suffix, and
+            // Rust accepts it.
+            if b.get(i).is_some_and(|d| d.is_ascii_alphabetic()) {
+                let sfx_start = i;
+                while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_') {
+                    i += 1;
+                }
+                let sfx: String = b[sfx_start..i].iter().collect();
+                if !matches!(
+                    sfx.as_str(),
+                    "i8" | "i16"
+                        | "i32"
+                        | "i64"
+                        | "i128"
+                        | "isize"
+                        | "u8"
+                        | "u16"
+                        | "u32"
+                        | "u64"
+                        | "u128"
+                        | "usize"
+                ) {
+                    out.push(Tok::BadNum);
+                    continue;
+                }
             }
-            out.push(Tok::Num(n.parse().unwrap_or(0)));
+            // Anything the run did not consume is a malformed literal: a digit not
+            // valid for the radix (`0b12`, `0o9`), or a value past `u64`. Refuse
+            // rather than take a partial value -- a wrong number in a precondition
+            // is a false proof, a refusal is not.
+            let exact = i == b.len() || (!b[i].is_alphanumeric() && b[i] != '_');
+            let val = if digits.is_empty() {
+                None
+            } else {
+                u64::from_str_radix(&digits, radix).ok()
+            };
+            match (exact, val) {
+                (true, Some(v)) => out.push(Tok::Num(v)),
+                _ => out.push(Tok::BadNum),
+            }
             continue;
         }
         if c.is_alphabetic() || c == '_' {
@@ -2067,6 +2142,9 @@ impl<'a> Parser<'a> {
                     return Err(self.err("missing `)`"));
                 }
                 Ok((v, s))
+            }
+            Some(Tok::BadNum) => {
+                Err(self.err("a numeric literal that is not an exact integer (bad digit for its radix, or past u64)"))
             }
             Some(t) => Err(self.err(format!("unexpected token {t:?}"))),
             None => Err(self.err("unexpected end of contract")),
@@ -2972,6 +3050,50 @@ mod tests {
         assert!(p.parse_expr().is_err(), "a folded zero divisor is refused");
         // A constant, non-zero divisor folds and reads: `4 / (1 + 1)` is `2`.
         assert_eq!(smt::evaluate(parse("x / (1 + 1)"), |_| Some(4)), Some(2));
+    }
+
+    /// A radix literal is read at its *radix*, and one that is not an exact
+    /// integer is refused rather than truncated.
+    ///
+    /// Every literal used to be read as decimal: the digit run stopped at the `x`
+    /// of `0xFF` and the rest was skipped as a type suffix, so the value was `0`.
+    /// That is a wrong *value*, and a wrong value in a precondition is a false
+    /// proof -- `requires: x == 0xFF` became `x == 0`, and `ensures: ret == 0` was
+    /// "proved" for a function returning `255`. Reading at the radix fixes the
+    /// value; refusing the malformed shapes (`0b12`, `0o9`, `0xg`, `0xFFg`, past
+    /// `u64`) keeps the fix from trading one silent number for another.
+    #[test]
+    fn a_radix_literal_is_read_at_its_radix_or_refused() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::var(16));
+        let unsigned = BTreeSet::new();
+        let val = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let (v, _) = p.parse_expr().expect("parses");
+            p.expect_end().expect("no trailing tokens");
+            smt::evaluate(v, |_| None).expect("a constant")
+        };
+        let refuses = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            p.parse_expr().is_err() || p.expect_end().is_err()
+        };
+        // Each radix reads at its own radix, not decimal.
+        assert_eq!(val("0xFF"), 255, "`0xFF` is 255, not 0");
+        assert_eq!(val("0x10"), 16, "`0x10` is 16, not 0");
+        assert_eq!(val("0b1010"), 10, "`0b1010` is 10, not 0");
+        assert_eq!(val("0o17"), 15, "`0o17` is 15, not 0");
+        assert_eq!(val("0xFFFF"), 65535);
+        // Underscores are separators in any radix, and a type suffix is dropped.
+        assert_eq!(val("0xFF_FF"), 65535);
+        assert_eq!(val("1_000"), 1000);
+        assert_eq!(val("0xFFu8"), 255);
+        assert_eq!(val("100_"), 100, "a trailing `_` is a separator");
+        // A malformed literal is refused, never partially read.
+        assert!(refuses("0b12"), "`0b12` has a non-binary digit");
+        assert!(refuses("0o9"), "`0o9` has a non-octal digit");
+        assert!(refuses("0xg"), "`0xg` has no hex digits");
+        assert!(refuses("0xFFg"), "`0xFFg` has an unknown suffix");
+        assert!(refuses("18446744073709551616"), "past `u64` is refused");
     }
 
     /// An explicit discriminant sets the variant's value and the next continues
