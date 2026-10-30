@@ -1947,6 +1947,68 @@ pub fn ref_written_then_symbolic(a: &mut [u8; 4], i: usize) -> u8 {
     );
 }
 
+/// A `&mut [u8]` slice write must reach the store the read consults.
+///
+/// This is the gap the `&raw const (fake) (*_1)` parse closed. Before it, the
+/// bounds check on a `&mut [u8]` argument read its length through a raw reborrow
+/// the parser did not recognise, so the function was `incomplete` before any
+/// write was reached -- the write was never even evaluated. Now the true half
+/// must *verify* (a write then a read of the same index returns what was
+/// written) and the tripwire -- the same body claiming the pre-write value --
+/// must be refuted, since a model that dropped the write would leave the seeded
+/// element readable and prove it.
+#[test]
+fn a_slice_element_write_reaches_the_store_the_read_consults() {
+    let src = r#"
+/// requires: s.len() > 0
+/// ensures: ret == v
+pub fn slice_written_then_read(s: &mut [u8], v: u8) -> u8 {
+    s[0] = v;
+    s[0]
+}
+
+/// requires: s.len() > 0
+/// ensures: ret == s[0]
+pub fn slice_written_then_read_tripwire(s: &mut [u8], v: u8) -> u8 {
+    s[0] = v;
+    s[0]
+}
+"#;
+    let Some(o) = verify_src("slice_written_then_read", src) else { return };
+    assert!(
+        o.is_verified(),
+        "a write then a read of the same slice index returns what was written; got: {o}"
+    );
+    let Some(o) = verify_src("slice_written_then_read_tripwire", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "the pre-write element must not stay readable after a slice write; got: {o}"
+    );
+}
+
+/// The `&mut [u8]` *symbolic* read must see the slice write too.
+///
+/// The array form of this shape is [`an_element_write_through_a_mutable_reference_reaches_the_chain`];
+/// the slice form differs in the bounds check, not the store, so the same
+/// requirement holds -- the false contract must be refuted rather than left
+/// undecided, which is what a missing `PtrMetadata` would have made it.
+#[test]
+fn a_slice_element_write_reaches_the_symbolic_chain() {
+    let src = r#"
+/// requires: i < s.len() && s.len() <= 64 && i == 0
+/// ensures: ret == s[i]
+pub fn slice_written_then_symbolic(s: &mut [u8], i: usize) -> u8 {
+    s[0] = 0;
+    s[i]
+}
+"#;
+    let Some(o) = verify_src("slice_written_then_symbolic", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "a slice write must not leave a stale element readable by the chain; got: {o}"
+    );
+}
+
 /// A whole-struct reassignment must invalidate the fields bound from it.
 ///
 /// `c = d; c.lo` returns `d.lo`, so `ret == c.lo` is false unless `c.lo == d.lo`.

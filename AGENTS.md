@@ -2746,16 +2746,18 @@ tests that now pin them were written after.
   shadow. The collision is a refusal, which is the honest answer: the source
   chose a name the mangling wanted.
 
-The remaining gap this exposed is separate and stays open: a `&mut [u8]` *slice*
-argument lowers a write through `&raw const (fake) (*_1)`, whose `PtrMetadata` the
-frontend does not model, so the function is `incomplete` before any write is
-reached. A `&mut [u8; 4]` does not — it goes through a plain reborrow — and is
-modelled. That is why the corpus tripwire for the reborrowed form is
-`mut_ref_array_write_then_symbolic_read`, not the slice.
+The `&mut [u8]` *slice* argument used to be a separate gap: a write lowers
+through `&raw const (fake) (*_1)`, whose `PtrMetadata` the frontend did not model,
+so the function was `incomplete` before any write was reached. That is now closed
+(see the section below): the parser reads `&raw const (fake) (place)` as the place
+it names, so the slice shape is modelled like the `&mut [u8; 4]` one — which goes
+through a plain reborrow and was modelled all along.
 
 `tests/mir.rs` pins each hole by name: `an_element_write_reaches_the_symbolic_chain`
 (requires `Failed`, so a counterexample is the evidence the chain saw the write),
 `an_element_write_through_a_mutable_reference_reaches_the_chain`,
+`a_slice_element_write_reaches_the_store_the_read_consults` (the true half must
+verify and its tripwire must fail), `a_slice_element_write_reaches_the_symbolic_chain`,
 `a_whole_struct_assignment_invalidates_its_fields` (requires *not* `Verified` — the
 write poisons the field, so the postcondition is unreadable),
 `a_generated_binding_cannot_shadow_an_argument` and
@@ -3575,3 +3577,72 @@ operand) is not reachable from well-typed MIR, so it is defensive and untested b
 construction -- no corpus entry can exercise it, because rustc will not emit it.
 The corpus entries pin the reachable half; the refusal is the belt to the
 suspender, kept because the alternative to a refusal is a wrong mask.
+
+## The `&mut [T]` slice argument: `&raw const (fake)` is a reference, not an unknown
+
+A `&mut [u8]` argument was the last open item on the roadmap: `s[0] = v` was
+`incomplete` *before* any write was reached, with `unmodelled assert condition:
+index out of bounds`. Measuring first (the roadmap's rule) is what made the cause
+visible. The frontend reads rustc's *unoptimised* `--emit=mir`, and at that
+setting the bounds check on a mutable slice lowers differently from the immutable
+one:
+
+```
+fn first_of(_1: &[u8]) -> u8            fn first_of_mut(_1: &mut [u8]) -> u8
+    _3 = PtrMetadata(copy _1);              _3 = &raw const (fake) (*_1);
+                                            _4 = PtrMetadata(move _3);
+    _4 = Lt(copy _2, copy _3);              _5 = Lt(copy _2, copy _4);
+```
+
+The immutable form hands `PtrMetadata` the slice local directly; the mutable form
+first takes a *raw reborrow* of the deref, `&raw const (fake) (*_1)`, and asks
+`PtrMetadata` of that. Two pieces of that string were unparsed:
+
+* `&raw const` / `&raw mut` — the raw-borrow prefix. The parser's reference arm
+  stripped only `&` and `&mut`, so it was left with `raw const (fake) (*_1)`,
+  which is not a place.
+* `(fake)` — a marker rustc prints on the place of a raw reborrow that does not
+  correspond to a real local. It names the same place as its operand, so it is not
+  a projection.
+
+Either one alone was enough to make `_3` an unknown, and an unknown length makes
+the bounds-check `assert` unmodellable, which refuses the whole function. The fix
+is two small parses: `&raw const ` / `&raw mut ` are read as `Rvalue::Ref` (both
+name a place, exactly as `&` does), and a leading `(fake)` is stripped from the
+place. The `(fake)` strip has to happen in `parse_rvalue`, *before* `parse_place`:
+`strip_annot` sees `(fake) (*_1)`, reads it as an annotated place, and strips the
+outer parentheses to `fake) (*_1)` — so the marker is removed at the reference arm
+where the raw prefix is already known.
+
+This is the conservative reading: `(fake)` is dropped because it carries no
+projection, and the raw borrow is a `Ref` because it names a place — the same
+`Rvalue::Ref` an `&` produces. Nothing is guessed about what a pointer *is*; the
+mapping `resolve` consults is recorded exactly as for `&`.
+
+**Corpus.** Three entries now carry the slice shape, and they separate the two
+things a write can get wrong:
+
+* `mut_ref_slice_write_then_read` (`requires: s.len() > 0`) *verifies* — a write
+  then a read of the same index returns what was written, and the length
+  precondition discharges the bounds check. This is the entry that proves the
+  write reaches the store the read consults: had it landed anywhere else, the read
+  would find the seeded element and the contract would be refuted.
+* `mut_ref_slice_write_then_read_tripwire` is the same body claiming the
+  *pre-write* value (`ret == s[0]`), which is false — a model that dropped the
+  write would leave the seed readable and prove it. It is refuted.
+* `mut_ref_slice_write_then_symbolic_read` (`i == 0`) is the symbolic-index half:
+  the ite chain must be evaluated against the written element, so the false
+  contract is refuted rather than left undecided.
+
+Coverage went from **75/128 to 76/131** decided. `tests/mir.rs` pins the verdicts
+by name (`a_slice_element_write_reaches_the_store_the_read_consults`,
+`a_slice_element_write_reaches_the_symbolic_chain`), and a unit test
+(`a_raw_fake_reborrow_parses_as_a_reference`) pins the parse itself, so the guard
+runs even without a nightly toolchain.
+
+The honest boundary: only the *write-through-`&mut`* path was the gap. The
+immutable `&[T]` read (`first_of`) already worked, and `&mut [T; N]` already
+worked through a plain reborrow — the raw form appears only for a `&mut` *slice*,
+which is why the array tripwire (`mut_ref_array_write_then_symbolic_read`) and the
+slice one are separate entries rather than one.
+

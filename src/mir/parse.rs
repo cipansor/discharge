@@ -1131,8 +1131,21 @@ fn parse_rvalue(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Rvalue {
     if t.starts_with("copy ") || t.starts_with("move ") {
         return Rvalue::Use(parse_operand(t, enums));
     }
-    // `&_1`, `&mut _1`
-    if let Some(r) = t.strip_prefix("&mut ").or_else(|| t.strip_prefix('&')) {
+    // `&_1`, `&mut _1`, `&raw const _1`, `&raw mut _1`
+    //
+    // The raw forms appear for a `&mut [T]` argument's bounds check: rustc
+    // materialises the metadata through a raw borrow, `_3 = &raw const (fake)
+    // (*_1); _4 = PtrMetadata(move _3)`, where the immutable `&[T]` reads
+    // `PtrMetadata(copy _1)` directly. Both name the same place, so both are a
+    // `Ref`.
+    let raw = t.strip_prefix("&raw const ").or_else(|| t.strip_prefix("&raw mut "));
+    if let Some(r) = raw.or_else(|| t.strip_prefix("&mut ")).or_else(|| t.strip_prefix('&')) {
+        // `(fake)` is the marker rustc prints on the *place* of a `&mut [T]`
+        // argument's metadata borrow; it names the same place as its operand.
+        // It is stripped here rather than in `parse_place`, because `strip_annot`
+        // would otherwise read the whole `(fake) (*_1)` as an annotated place and
+        // strip the outer parentheses, leaving `fake) (*_1`.
+        let r = r.strip_prefix("(fake)").map(str::trim_start).unwrap_or(r);
         if let Some(p) = parse_place(r, enums) {
             return Rvalue::Ref(p);
         }
@@ -1788,6 +1801,27 @@ fn add(_1: u32, _2: u32) -> u32 {
     fn an_unknown_qualifier_is_refused() {
         let enums = layout(&[("A", 0), ("B", 3), ("C", 4)]);
         assert_eq!(variant_index("Other::C", &enums), None);
+    }
+
+    /// The `&raw const (fake) (*_1)` reborrow a `&mut [T]` bounds check lowers to
+    /// is a `Ref` on the place it names, not an unknown.
+    ///
+    /// The immutable `&[T]` form reads `PtrMetadata(copy _1)` directly, so the
+    /// raw form only ever appears for a `&mut` slice argument. The `(fake)` marker
+    /// is not a projection -- it names the same place as its operand -- so the
+    /// parsed place must be the deref of `_1` and nothing else. Before this arm
+    /// the whole rvalue was `Unknown`, which made the slice's length unknown and
+    /// left the bounds check unmodelled.
+    #[test]
+    fn a_raw_fake_reborrow_parses_as_a_reference() {
+        let enums = BTreeMap::new();
+        let rv = parse_rvalue("&raw const (fake) (*_1)", &enums);
+        let Rvalue::Ref(place) = rv else { panic!("expected a Ref, got {rv:?}") };
+        assert_eq!(place, Place { local: 1, proj: vec![Proj::Deref] });
+        // The `&raw mut` spelling is the same shape.
+        let rv = parse_rvalue("&raw mut (fake) (*_2)", &enums);
+        let Rvalue::Ref(place) = rv else { panic!("expected a Ref, got {rv:?}") };
+        assert_eq!(place, Place { local: 2, proj: vec![Proj::Deref] });
     }
 
     /// A *qualified* spelling of `Option`/`Result` resolves to the same numbering

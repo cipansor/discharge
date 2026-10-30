@@ -550,16 +550,53 @@ pub fn array_write_then_symbolic_read(mut a: [u8; 4], i: usize) -> u8 {
 /// rather than the by-value one. The contract is false for the same reason as
 /// `array_write_then_symbolic_read` -- with `i == 0` the body returns the `0` it
 /// wrote -- so it must FAIL.
-///
-/// The `&mut [u8]` *slice* form of this shape is a separate gap, not this one:
-/// rustc lowers it through a `&raw const (fake) (*_1)` reborrow whose
-/// `PtrMetadata` the frontend does not model, so the function is incomplete
-/// before any write is reached.
 /// requires: i < 4
 /// ensures: ret == a[i]
 pub fn mut_ref_array_write_then_symbolic_read(a: &mut [u8; 4], i: usize) -> u8 {
     a[0] = 0;
     a[i]
+}
+
+/// The `&mut [u8]` *slice* form of the same shape.
+///
+/// This used to be a separate gap: rustc lowers the bounds check through a
+/// `&raw const (fake) (*_1)` reborrow whose `PtrMetadata` the frontend did not
+/// model, so the function was `incomplete` before any write was reached. The
+/// parser now reads `&raw const (fake) (place)` as the place it names, so the
+/// slice shape is modelled like the array one.
+///
+/// The contract is false for the same reason -- with `i == 0` the body returns
+/// the `0` it wrote, not `s[i]` -- so it must FAIL. A `verified` verdict would be
+/// a false contract proved.
+/// requires: i < s.len() && s.len() <= 64 && i == 0
+/// ensures: ret == s[i]
+pub fn mut_ref_slice_write_then_symbolic_read(s: &mut [u8], i: usize) -> u8 {
+    s[0] = 0;
+    s[i]
+}
+
+/// The true half of the slice shape: a write then a read of the *same* index
+/// returns what was written, and the `s.len() > 0` precondition puts index `0`
+/// in range so the bounds check is discharged rather than a panic.
+///
+/// This is the entry that shows the write reaches the store the read consults:
+/// if the write had landed anywhere else, the read would find the seeded element
+/// and the contract would be refuted, not proved.
+/// requires: s.len() > 0
+/// ensures: ret == v
+pub fn mut_ref_slice_write_then_read(s: &mut [u8], v: u8) -> u8 {
+    s[0] = v;
+    s[0]
+}
+
+/// The tripwire for the true half above: the same body claiming the *pre-write*
+/// value is false, so a model that dropped the write -- leaving the seeded
+/// element readable -- would prove it.
+/// requires: s.len() > 0
+/// ensures: ret == s[0]
+pub fn mut_ref_slice_write_then_read_tripwire(s: &mut [u8], v: u8) -> u8 {
+    s[0] = v;
+    s[0]
 }
 
 /// A whole-struct reassignment, then a field read.
