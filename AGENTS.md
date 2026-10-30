@@ -4044,3 +4044,31 @@ the integration test fail with `FAILED: postcondition — v1:u8 = 3`, the verdic
 `srem(x, 0)`. rustc treats `x % 0`, `x % (1 - 1)` and `x % (2 - 2)` identically under
 `unconditional_panic`, which is the evidence that refusing them alike is right.
 
+
+## After a fix, probe the neighbours — and be honest when they are already right
+
+The two bugs above came out of probing the shapes *around* a fix. So after the folded-
+constant fix I probed the four neighbouring precedences against `rustc` directly: `&`
+vs `|`, `>>` vs `==`, a cast vs `+`, and unary `-` vs a cast and `%`. All four were
+already correct. That is a coverage result, not a fix, and the write-up says so — a
+changelog that called each probe a "bug found" would be dishonest, and the next reader
+would not know which commits to trust.
+
+What the batch adds is *evidence* for shapes that were "supported until contradicted":
+six corpus entries with their tripwires, asserted end to end in
+`contract_operators_and_their_precedence`, and four rows in the rustc grid. Coverage
+**109/187 to 115/195**.
+
+Two shapes are left out of the grid on purpose, and the source says why, because a
+silent omission reads as an oversight:
+
+- `x >> 1 == 2` in *guard* mode would append `> 0` and produce `x >> 1 == 2 > 0`, a
+  chained comparison rustc rejects. The comparison is already a predicate, so value
+  mode is the only construction that fits.
+- `x as i16 * 2` in guard mode builds an `i16 * i16` body, whose overflow assert the
+  engine declines to model (`wide > 16`). The probe is then undecided and the guard
+  cannot read the comparison. That is the documented BDD scaling wall, not a gap.
+
+The general rule: a grid row is only evidence when *both* the probe and the assertion
+are decided. A row that fails for a reason unrelated to the property under test is
+worse than no row, because it looks like a check and is not one.
