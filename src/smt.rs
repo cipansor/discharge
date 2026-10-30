@@ -1966,6 +1966,21 @@ pub fn negative(x: Var) -> Pred {
     // `x >= 2^(w-1)` is exactly "the top bit is set".
     uge_const(x, 1u64 << (w - 1))
 }
+/// Whether bit `k` of `x` is set. `k` is a *constant*, so bit 0 is the `& 1`
+/// test and bit `k` is a constant shift followed by the same test.
+///
+/// A shift is used rather than a comparison against `2^k` because the two differ
+/// at the top bit: `x >= 2^(w-1)` and `bit(w-1)` agree, but a reader that took
+/// `x >= 2^k` as "bit `k`" would be right only up to the width, and the shift
+/// spelling has no such edge. A `k` past the width yields `false` rather than a
+/// shift the engine would have to define.
+pub fn bit_set(x: Var, k: u32) -> Pred {
+    let w = bits(x);
+    if k >= u32::from(w) {
+        return truth(false);
+    }
+    eq_const(band(lshr(x, k), word(1, w)), 1)
+}
 /// `x < y` (signed, two's complement).
 ///
 /// The unsigned comparison next to this one is *wrong* for a signed operand, and

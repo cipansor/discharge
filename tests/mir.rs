@@ -2108,3 +2108,111 @@ fn wrapping_abs_is_modelled_unary_and_signed() {
         "the witness should be x == 0 (where abs is the identity), got: {detail}"
     );
 }
+
+/// The zero-counts beside `count_ones` are modelled, and `leading_zeros` of a
+/// zero operand is the *full* width.
+///
+/// `leading_zeros` is the shape where an off-by-one hides: every non-zero operand
+/// has at most `w - 1` leading zeros, so a model that counted only those would
+/// agree with `core` everywhere except `x == 0`, and that is exactly the input the
+/// tripwire names. Both entries must be *decided* -- a `Skipped` would mean the
+/// name is not modelled at all.
+#[test]
+fn the_zero_counts_are_modelled() {
+    let Some(report) = verify_realistic(&[
+        "leading_zeros_of_a_small_value",
+        "trailing_zeros_of_a_top_bit_value",
+    ]) else {
+        return;
+    };
+    for name in ["leading_zeros_of_a_small_value", "trailing_zeros_of_a_top_bit_value"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+
+    let Some(report) = verify_realistic(&[
+        "leading_zeros_of_a_small_value_tripwire",
+        "trailing_zeros_of_a_top_bit_value_tripwire",
+    ]) else {
+        return;
+    };
+    for name in [
+        "leading_zeros_of_a_small_value_tripwire",
+        "trailing_zeros_of_a_top_bit_value_tripwire",
+    ] {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` must FAIL: a `Skipped` means the name is not modelled, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+    // The `leading_zeros` witness must be `x == 0`, the only input where the count
+    // is the full width. A model that counted `w - 1` there would name a non-zero
+    // witness instead.
+    let o = outcome(&report, "leading_zeros_of_a_small_value_tripwire");
+    let FnOutcome::Failed { detail, .. } = o else { panic!("got: {o}") };
+    assert!(
+        detail.contains("= 0"),
+        "the `leading_zeros` witness should be x == 0, got: {detail}"
+    );
+}
+
+/// The four unary `neg`/`abs` families are modelled, and they disagree about
+/// `MIN` -- which is what proves each is the right one and not a shared stand-in.
+///
+/// `saturating_neg` and `saturating_abs` clamp at `MIN`, so their results are
+/// never negative; `wrapping_neg` and `wrapping_abs` return `MIN` there, which
+/// *is* negative. The verifying entries state the clamp; the tripwires state the
+/// same claim about the wrapping family, where `MIN` refutes it. If the four
+/// shared one definition, either the clamps would fail or the tripwires would
+/// pass, and both are caught here.
+#[test]
+fn the_unary_neg_and_abs_families_disagree_at_min() {
+    let Some(report) = verify_realistic(&[
+        "saturating_neg_of_positive_is_negative",
+        "saturating_neg_of_non_positive_is_non_negative",
+        "saturating_abs_is_never_negative",
+        "saturating_abs_of_non_negative_is_identity",
+    ]) else {
+        return;
+    };
+    for name in [
+        "saturating_neg_of_positive_is_negative",
+        "saturating_neg_of_non_positive_is_non_negative",
+        "saturating_abs_is_never_negative",
+        "saturating_abs_of_non_negative_is_identity",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+
+    let Some(report) = verify_realistic(&[
+        "wrapping_neg_is_negative_tripwire",
+        "wrapping_neg_of_non_positive_is_non_negative_tripwire",
+        "wrapping_abs_is_never_negative_tripwire",
+        "saturating_abs_is_identity_tripwire",
+    ]) else {
+        return;
+    };
+    for name in [
+        "wrapping_neg_is_negative_tripwire",
+        "wrapping_neg_of_non_positive_is_non_negative_tripwire",
+        "wrapping_abs_is_never_negative_tripwire",
+        "saturating_abs_is_identity_tripwire",
+    ] {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` must FAIL: a `Skipped` means the shape is not modelled, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+    // The `abs`-at-`MIN` tripwire must name `x == 128`, which is `i8::MIN` read
+    // unsigned -- the one input where the magnitude is unrepresentable. Naming
+    // any other witness would mean the model disagrees with `core` elsewhere.
+    let o = outcome(&report, "wrapping_abs_is_never_negative_tripwire");
+    let FnOutcome::Failed { detail, .. } = o else { panic!("got: {o}") };
+    assert!(
+        detail.contains("= 128"),
+        "the `wrapping_abs` witness should be x == i8::MIN (bits 128), got: {detail}"
+    );
+}

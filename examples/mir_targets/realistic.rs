@@ -33,9 +33,10 @@
 //!   `count_evens` all carry one and verify). The invariant is not *inferred* —
 //!   you supply the induction hypothesis, as in SPARK.
 //! * **`core` is not modelled.** *Closed for the `num` intrinsics.*
-//!   `checked_*`, `saturating_*` and `wrapping_*` are computed in the frontend
-//!   from their operands rather than by reading `core`'s MIR, and so are the two
-//!   unary shapes `count_ones` and `wrapping_abs`.
+//!   `checked_*`, `saturating_*`, `wrapping_*` and `overflowing_*` are computed
+//!   in the frontend from their operands rather than by reading `core`'s MIR.
+//!   So are the unary operators — `neg` and `abs` in all four families — and the
+//!   three bit counts `count_ones`, `leading_zeros` and `trailing_zeros`.
 //!
 //! Keep the functions small. The point is to isolate one capability per
 //! function, so a change that adds it moves exactly one row from `incomplete`
@@ -1286,4 +1287,111 @@ pub fn abs_never_below_operand(x: i8) -> i8 {
 /// ensures: ret > x
 pub fn abs_never_below_operand_tripwire(x: i8) -> i8 {
     x.wrapping_abs()
+}
+
+// ---------------------------------------------------------------------------
+// The rest of the unary `core::num` surface.
+//
+// `leading_zeros` and `trailing_zeros` sit beside `count_ones`, and the four
+// families each define `neg` and (on the signed types) `abs`. These are the
+// shapes where the *type* decides what a method means: `wrapping_neg` on a `u8`
+// is modular, `saturating_neg` does not exist on a `u8` at all, and `MIN` is the
+// one input where `neg` and `abs` have no representable result. Each pair below
+// is one verifying contract and one tripwire.
+// ---------------------------------------------------------------------------
+
+/// `leading_zeros` counts the zero bits above the highest set bit, so an operand
+/// below `0x80` has at least one -- and the count is on the widened `u32` result.
+/// requires: x < 128
+/// ensures: ret >= 1
+pub fn leading_zeros_of_a_small_value(x: u8) -> u32 {
+    x.leading_zeros()
+}
+
+/// The tripwire: `x == 0` has eight leading zeros, so a bound of *nine* is false
+/// even though it looks safe for every non-zero operand.
+/// requires: x < 128
+/// ensures: ret >= 9
+pub fn leading_zeros_of_a_small_value_tripwire(x: u8) -> u32 {
+    x.leading_zeros()
+}
+
+/// `trailing_zeros` counts the zero bits below the lowest set bit, so a value
+/// with the top bit set has at most seven of them.
+/// requires: x >= 128
+/// ensures: ret <= 7
+pub fn trailing_zeros_of_a_top_bit_value(x: u8) -> u32 {
+    x.trailing_zeros()
+}
+
+/// The tripwire: `x == 0x80` has exactly seven trailing zeros, so a bound of six
+/// is false -- and the witness is the smallest operand the precondition allows.
+/// requires: x >= 128
+/// ensures: ret <= 6
+pub fn trailing_zeros_of_a_top_bit_value_tripwire(x: u8) -> u32 {
+    x.trailing_zeros()
+}
+
+/// `saturating_neg` of a positive value is negative: the negation is in range, so
+/// no clamp happens, and the result is `-x`.
+/// requires: x > 0
+/// ensures: ret < 0
+pub fn saturating_neg_of_positive_is_negative(x: i8) -> i8 {
+    x.saturating_neg()
+}
+
+/// The tripwire: the *wrapping* negation of `x == 0` is `0`, which is not
+/// negative, so the same claim without the positivity precondition is false.
+/// requires: true
+/// ensures: ret < 0
+pub fn wrapping_neg_is_negative_tripwire(x: i8) -> i8 {
+    x.wrapping_neg()
+}
+
+/// `saturating_abs` is the magnitude, and at `MIN` -- where the magnitude is not
+/// representable -- it clamps to `MAX` rather than wrapping back to `MIN`. So the
+/// result is never negative, for any operand.
+/// requires: true
+/// ensures: ret >= 0
+pub fn saturating_abs_is_never_negative(x: i8) -> i8 {
+    x.saturating_abs()
+}
+
+/// The tripwire: the *wrapping* absolute value of `MIN` is `MIN`, which is
+/// negative, so the same claim about the wrapping family is false.
+/// requires: true
+/// ensures: ret >= 0
+pub fn wrapping_abs_is_never_negative_tripwire(x: i8) -> i8 {
+    x.wrapping_abs()
+}
+
+/// `saturating_neg` of a non-positive value clamps to zero rather than wrapping,
+/// which is what distinguishes it from `wrapping_neg` at `MIN`.
+/// requires: x <= 0
+/// ensures: ret >= 0
+pub fn saturating_neg_of_non_positive_is_non_negative(x: i8) -> i8 {
+    x.saturating_neg()
+}
+
+/// The tripwire: `wrapping_neg` at `MIN` is `MIN`, which is negative.
+/// requires: x <= 0
+/// ensures: ret >= 0
+pub fn wrapping_neg_of_non_positive_is_non_negative_tripwire(x: i8) -> i8 {
+    x.wrapping_neg()
+}
+
+/// `saturating_abs` is monotone in the sense that its result is at least the
+/// operand when the operand is non-negative -- where it is the identity.
+/// requires: x >= 0
+/// ensures: ret == x
+pub fn saturating_abs_of_non_negative_is_identity(x: i8) -> i8 {
+    x.saturating_abs()
+}
+
+/// The tripwire: for a *negative* operand the identity claim fails, and the
+/// witness is the negation.
+/// requires: true
+/// ensures: ret == x
+pub fn saturating_abs_is_identity_tripwire(x: i8) -> i8 {
+    x.saturating_abs()
 }

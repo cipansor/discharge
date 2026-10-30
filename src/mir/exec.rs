@@ -1676,18 +1676,18 @@ fn try_intrinsic(
         _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
     };
     // The unary shapes take one operand and no operator. They are handled here
-    // rather than through a `BinOp`, because there is no second operand to read
-    // and, for `count_ones`, no sign that matters.
+    // rather than through a `BinOp`, because there is no second operand to read.
     if op.is_unary() {
-        // `wrapping_abs` reads the operand's sign, so a dump that did not print
-        // it is refused -- the unsigned reading of `abs` is the operand itself
-        // for every input, which is a wrong value rather than a weaker proof.
-        // `count_ones` counts bits and does not care about the sign.
+        // A bit count does not read the sign at all -- the bits of a negative
+        // value are just bits -- so a dump that did not print one is still
+        // modelled. A unary *operator* does read it, because `neg` and `abs`
+        // mean different things on the two types, so a missing sign is refused
+        // there rather than guessed.
         let signed = match op {
-            intrinsics::Intrinsic::Abs => sign.known()?,
+            intrinsics::Intrinsic::Unary(..) => sign.known()?,
             _ => false,
         };
-        // `count_ones` returns a type wider than its operand (`u8` -> `u32`), so
+        // A bit count returns a type wider than its operand (`u8` -> `u32`), so
         // the result term is built at the destination's width. Taking it from the
         // operand instead would leave an 8-bit term in a 32-bit local, and the
         // next read of that local would be ill-formed.
@@ -1697,12 +1697,35 @@ fn try_intrinsic(
         };
         return Some(match outcome {
             Outcome::Value(v) => {
+                // The result has the operand's type, so it has the operand's
+                // sign. For a bit count that reading is only a label -- the value
+                // is unsigned and non-negative -- but it is the type's sign, and
+                // labelling it anything else would be a second opinion about a
+                // type this code already knows.
                 env.set(dest, Val::Sym(v, Sign::of_bool(signed)));
                 Ok(())
             }
-            // Neither unary shape is an `Option`, so this is a shape mismatch and
-            // not a value. Refusing is the only honest answer.
-            Outcome::Option { .. } => Err(format!("`{name}` produced an unexpected `Option`")),
+            Outcome::Option { tag, payload } => {
+                // `checked_neg` and `checked_abs` return an `Option`.
+                env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
+                env.set_payload(
+                    dest.local,
+                    intrinsics::SOME_TAG,
+                    Val::Sym(payload, Sign::of_bool(signed)),
+                    w,
+                );
+                Ok(())
+            }
+            Outcome::Tuple { value, overflowed } => {
+                // `overflowing_neg` and `overflowing_abs` return `(T, bool)`,
+                // which is a plain aggregate: field 0 the value, field 1 the
+                // flag. `Val::Agg` is returned so `set` does not clear the parts
+                // that were just written.
+                let field = |i| Place { local: dest.local, proj: vec![Proj::Field(i)] };
+                env.set(&field(0), Val::Sym(value, Sign::of_bool(signed)));
+                env.set(&field(1), Val::Bool(overflowed));
+                Ok(())
+            }
         });
     }
     // A sign the dump did not print is a refusal, not an unsigned reading:
@@ -1714,9 +1737,8 @@ fn try_intrinsic(
             Val::Sym(v, _) => v,
             _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
         },
-        // The unary family (`checked_neg`, `wrapping_neg`, …) is not modelled,
-        // so every modelled name takes two operands. Reaching here means the
-        // dump had a shape the model does not cover.
+        // Every two-operand name has both operands printed, so a missing second
+        // argument means the dump had a shape the model does not cover.
         None => return Some(Err(format!("unmodelled arity for `{name}`"))),
     };
     let Some(outcome) = intrinsics::eval(op, x, y, w, signed, w) else {
@@ -1735,6 +1757,15 @@ fn try_intrinsic(
             // sound; the width is what keeps the read from being mis-sized.
             env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
             env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(payload, sign), w);
+        }
+        Outcome::Tuple { value, overflowed } => {
+            // `overflowing_*` returns `(result, overflowed)`, which is a plain
+            // aggregate rather than an `Option`. Field 0 gets the wrapped value
+            // and field 1 the flag, so a caller that writes `let (r, o) = …` or
+            // asserts `!o` reads a real condition.
+            let field = |i| Place { local: dest.local, proj: vec![Proj::Field(i)] };
+            env.set(&field(0), Val::Sym(value, sign));
+            env.set(&field(1), Val::Bool(overflowed));
         }
     }
     Some(Ok(()))
