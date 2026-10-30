@@ -1357,6 +1357,91 @@ pub fn option_arg_payload_tripwire(x: Option<u8>) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// A cast in a *contract*: `x as u32`. The body has modelled `as` for a while
+// (it is what lets a narrow argument meet a wide return), but the contract
+// language had no cast at all, so any contract that related the two was
+// unreadable -- `ret == x as u32` came back `cannot read contract`. A cast in a
+// contract has to *extend*, not reinterpret: `-1i8 as i16` is `-1`, not `255`.
+// An unknown source sign is a refusal, the same call the body makes, because
+// guessing it is how `-1i8 as i16 == 255` becomes a reachable false proof.
+
+/// A widening cast of an *unsigned* source zero-fills, so `x as u32` is `x`.
+/// requires: true
+/// ensures: ret == x as u32
+pub fn contract_cast_widens_unsigned(x: u8) -> u32 {
+    x as u32
+}
+
+/// The tripwire: the same widening, but the contract names a value one too high,
+/// so it is false for every input -- the cast is read, not a free variable.
+/// requires: true
+/// ensures: ret == (x as u32) + 1
+pub fn contract_cast_widens_unsigned_tripwire(x: u8) -> u32 {
+    x as u32
+}
+
+/// A widening cast of a *signed* source sign-extends, so `x as i32` is the same
+/// signed value. The contract's `x as i32` and the body's `x as i32` must both
+/// sign-extend; if either zero-filled, `requires: x == -1; ensures: ret == -1`
+/// would be refuted at `-1` (the body would return `255`).
+/// requires: x == -1
+/// ensures: ret == -1
+pub fn contract_cast_widens_signed(x: i8) -> i32 {
+    x as i32
+}
+
+/// The tripwire that separates sign-extension from zero-filling. Rust sign-extends
+/// through a widening cast even when the *target* is unsigned: `-1i8 as u16` is
+/// `65535`, not the zero-extended `255`. A contract cast that zero-filled would
+/// name `255`, and the true entry below (`ret == 65535`) would be refuted instead
+/// of proved -- so this pair pins the direction.
+/// requires: x == -1
+/// ensures: ret == 255
+pub fn contract_cast_signed_to_unsigned_tripwire(x: i8) -> u16 {
+    x as u16
+}
+
+/// The true half of the pair above: `-1i8 as u16` sign-extends to `65535`.
+/// requires: x == -1
+/// ensures: ret == 65535
+pub fn contract_cast_signed_to_unsigned(x: i8) -> u16 {
+    x as u16
+}
+
+/// A narrowing cast keeps the low bits: `x as u8` drops the high byte. The body
+/// and the contract must agree, so `ret == x as u8` is the identity here.
+/// requires: true
+/// ensures: ret == x as u8
+pub fn contract_cast_narrows(x: u16) -> u8 {
+    x as u8
+}
+
+/// The tripwire for narrowing pins *which* bits are kept: `256` is `0x100`, so
+/// `256 as u8` is `0` (the low byte), not `1`. A model that kept the wrong byte,
+/// or read the cast as a free variable, could make `ret == 1` true.
+/// requires: x == 256
+/// ensures: ret == 1
+pub fn contract_cast_narrows_tripwire(x: u16) -> u8 {
+    x as u8
+}
+
+/// A cast chain applies left to right, and each step's source sign is the
+/// previous step's target sign. `x as u16 as u32` is two zero-fills, which is `x`.
+/// requires: true
+/// ensures: ret == x as u16 as u32
+pub fn contract_cast_chain(x: u8) -> u32 {
+    x as u16 as u32
+}
+
+/// The tripwire: the chain is a value, not a free variable, so naming it one too
+/// high is false for every input.
+/// requires: true
+/// ensures: ret == (x as u16 as u32) + 1
+pub fn contract_cast_chain_tripwire(x: u8) -> u32 {
+    x as u16 as u32
+}
+
+// ---------------------------------------------------------------------------
 // `count_ones` and `wrapping_abs`: the two `core::num` methods that are neither
 // a two-operand family nor an `Option`. `count_ones` widens its result (`u8` ->
 // `u32`), which is the one place a modelled call's result width differs from its

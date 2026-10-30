@@ -3701,3 +3701,47 @@ still has no layout, so an argument of one is refused rather than guessed — th
 right answer, since guessing a numbering is exactly the failure `Shadow` guards
 against.
 
+## A cast in a *contract*: the same extension rule the body already obeys
+
+The body has modelled `as` for a while — it is what lets a narrow argument meet a
+wide return — but the contract language had no cast at all, so `ret == x as u32`
+came back `cannot read contract`. Any contract that related a narrow argument to a
+wide return was therefore unreadable, which is a dropped obligation: a contract the
+parser cannot read is a function that never gets checked. The corpus never used a
+cast in a contract, so nothing tripped over it; the probe found it.
+
+`cast_chain` applies `as <type>` to an atom, left to right, and returns the value
+with the target's width and sign. The rule is *extension*, not reinterpretation:
+`-1i8 as i16` is `-1`, not `255`. A widening cast of a signed source sign-extends;
+an unsigned source zero-fills (`truncate`); a narrowing cast keeps the low bits.
+This is the same rule the body's `Rvalue::Cast` already implements, and for the
+same reason: zero-filling a signed value would prove `-1i8 as i16 == 255`, a
+reachable false proof.
+
+A cast chain is well-defined even when the first source's sign is not, because each
+step's source sign is the previous step's *target* sign — which the cast just set.
+So `x as u16 as u32` is two zero-fills from an unsigned source and two sign-fills
+from a signed one, and the chain always carries a known sign after the first cast.
+
+**The rule pinned by the corpus, not by a claim.** Nine entries, five true and four
+tripwires. The one that matters is the pair
+`contract_cast_signed_to_unsigned` (`-1i8 as u16 == 65535`, verifying) and
+`contract_cast_signed_to_unsigned_tripwire` (`== 255`, refuted, witness `x == -1`).
+Rust sign-extends through a widening cast *even when the target is unsigned*, so a
+contract cast that zero-filled would refute the true entry and prove the false one —
+the pair separates the two rules. `contract_cast_narrows_tripwire`
+(`256 as u8 == 1` is false; `256` keeps the low byte `0`) pins *which* bits
+narrowing keeps, and the chain pair pins left-to-right application.
+
+Coverage went from **79/137 to 84/146** decided. `tests/mir.rs` pins the corpus
+verdicts and writes the shape to an isolated file; a `spec::tests` unit test pins
+the width-and-sign rule (`x as u32` is 32-bit unsigned, `x as i32` is 32-bit
+signed, `x as u16 as i32` ends 32-bit signed), so the parse rule has a guard that
+runs without a nightly toolchain.
+
+The honest boundary: the target is read as a *simple* type name, so a cast to a
+generic or path type (`x as Vec<u8>`, `x as T`) is not applied — the `as` is left
+unconsumed and reported as a trailing token, a refusal rather than a guess. That is
+the right direction: a cast whose target width is unknown cannot be sized, and
+sizing it wrongly is the failure the whole rule exists to prevent.
+

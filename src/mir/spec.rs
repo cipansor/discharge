@@ -1820,13 +1820,13 @@ impl<'a> Parser<'a> {
                     .max()
                     .unwrap_or(64);
                 let w = scope.max(need).min(64);
-                Ok((smt::word(n, w), false))
+                Ok(self.cast_chain(smt::word(n, w), false))
             }
             Some(Tok::Ident(name)) => {
                 self.pos += 1;
                 if name == "ret" || name == "result" {
                     let v = self.ret.ok_or_else(|| self.err(self.ret_absent))?;
-                    return Ok((v, self.ret_signed));
+                    return Ok(self.cast_chain(v, self.ret_signed));
                 }
                 if name == "true" || name == "false" {
                     // A boolean literal is a one-bit word, so a `bool`-returning
@@ -1890,7 +1890,7 @@ impl<'a> Parser<'a> {
                     .copied()
                     .ok_or_else(|| self.err(format!("unknown name `{name}` (not an argument)")))?;
                 let s = self.is_signed_name(&name);
-                Ok((v, s))
+                Ok(self.cast_chain(v, s))
             }
             Some(Tok::Op(o)) if o == "(" => {
                 self.pos += 1;
@@ -1901,11 +1901,49 @@ impl<'a> Parser<'a> {
                 if !self.eat_op(")") {
                     return Err(self.err("missing `)`"));
                 }
-                Ok((v, s))
+                Ok(self.cast_chain(v, s))
             }
             Some(t) => Err(self.err(format!("unexpected token {t:?}"))),
             None => Err(self.err("unexpected end of contract")),
         }
+    }
+
+    /// Apply any `as <type>` casts that immediately follow an atom, returning the
+    /// value and its signedness.
+    ///
+    /// The result of `x as T` has `T`'s width and `T`'s sign, and it *extends*
+    /// rather than reinterprets: `-1i8 as i16` is `-1`, not `255`. A widening cast
+    /// of a signed source sign-extends; an unsigned one zero-fills, which is
+    /// `truncate`; a narrowing cast keeps the low bits, which `sign_extend` and
+    /// `truncate` both do when the target is no wider.
+    ///
+    /// An unknown source sign is a refusal, not a guess, for the same reason the
+    /// body refuses one: zero-filling a signed value would prove `-1i8 as i16 ==
+    /// 255`, a reachable false proof, and sign-extending an unsigned one would
+    /// turn `255u8 as u16` into `65535`. Guessing the sign is exactly the failure
+    /// this crate exists to avoid.
+    ///
+    /// A cast *chain* (`x as u16 as u32`) applies left to right, and each step's
+    /// source sign is the previous step's *target* sign -- which the cast just
+    /// set, so it is always known. That is what makes the chain well-defined even
+    /// when the first source's sign was not.
+    fn cast_chain(&mut self, v: Var, sgn: bool) -> (Var, bool) {
+        let (mut v, mut sgn) = (v, sgn);
+        while matches!(self.peek(), Some(Tok::Ident(n)) if n == "as") {
+            let Some(Tok::Ident(ty_name)) = self.toks.get(self.pos + 1).cloned() else {
+                // `as` with no type after it is not a cast; leave it for the
+                // caller to report as a trailing token rather than consuming it.
+                break;
+            };
+            let ty = Ty::parse(&ty_name);
+            let Some(w) = ty.width() else {
+                break;
+            };
+            self.pos += 2;
+            v = if sgn { smt::sign_extend(v, w) } else { smt::truncate(v, w) };
+            sgn = ty.is_signed();
+        }
+        (v, sgn)
     }
 }
 
@@ -2514,6 +2552,35 @@ mod tests {
         assert!(std_enum_def("Option").is_none(), "no type argument is not Option<T>");
         assert!(std_enum_def("Option<u8>X").is_none(), "trailing text is not Option<u8>");
         assert!(std_enum_def("Result<u8>").is_none(), "Result needs two arguments");
+    }
+
+    /// A contract cast sets the target's width *and* sign, and a chain applies
+    /// left to right. Pinned here, not only in the nightly-gated MIR tests, so
+    /// the parse rule has a guard that runs without a toolchain.
+    #[test]
+    fn a_contract_cast_sets_the_target_width_and_sign() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::word(0, 8));
+        let unsigned = BTreeSet::new();
+        let signed: BTreeSet<String> = ["x".to_string()].into_iter().collect();
+
+        // `x as u32` from an unsigned source: 32 bits, unsigned.
+        let mut p = Parser::new("x as u32", &args, None, &unsigned, false);
+        let (v, s) = p.parse_expr().expect("`x as u32` parses");
+        assert_eq!(smt::bits(v), 32);
+        assert!(!s);
+
+        // `x as i32` from a *signed* source: 32 bits, signed.
+        let mut p = Parser::new("x as i32", &args, None, &signed, false);
+        let (v, s) = p.parse_expr().expect("`x as i32` parses");
+        assert_eq!(smt::bits(v), 32);
+        assert!(s);
+
+        // A chain applies left to right: the last cast decides width and sign.
+        let mut p = Parser::new("x as u16 as i32", &args, None, &unsigned, false);
+        let (v, s) = p.parse_expr().expect("the chain parses");
+        assert_eq!(smt::bits(v), 32);
+        assert!(s);
     }
 
     /// An explicit discriminant sets the variant's value and the next continues

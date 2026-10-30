@@ -2491,3 +2491,83 @@ fn a_standard_enum_argument_payload_has_its_own_width() {
     assert!(o.is_verified(), "`res_payload` must verify, got: {o}");
 }
 
+/// A cast in a *contract* (`x as u32`) is readable, and it extends the way Rust
+/// does: `-1i8 as i16` is `-1`, and `-1i8 as u16` is `65535` (sign-extended even
+/// into an unsigned target), not the zero-extended `255`.
+///
+/// The body has modelled `as` for a while; the contract language had none, so a
+/// contract relating a narrow argument to a wide return was unreadable. The
+/// direction is the whole point: a contract cast that zero-filled a signed source
+/// would refute the true `ret == 65535` and prove the false `ret == 255`, so the
+/// true entries verifying *and* the tripwires being refuted is what pins it.
+#[test]
+fn a_cast_in_a_contract_extends_like_rust() {
+    let Some(report) = verify_realistic(&[
+        "contract_cast_widens_unsigned",
+        "contract_cast_widens_unsigned_tripwire",
+        "contract_cast_widens_signed",
+        "contract_cast_signed_to_unsigned",
+        "contract_cast_signed_to_unsigned_tripwire",
+        "contract_cast_narrows",
+        "contract_cast_narrows_tripwire",
+        "contract_cast_chain",
+        "contract_cast_chain_tripwire",
+    ]) else {
+        return;
+    };
+    for name in [
+        "contract_cast_widens_unsigned",
+        "contract_cast_widens_signed",
+        "contract_cast_signed_to_unsigned",
+        "contract_cast_narrows",
+        "contract_cast_chain",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in [
+        "contract_cast_widens_unsigned_tripwire",
+        "contract_cast_signed_to_unsigned_tripwire",
+        "contract_cast_narrows_tripwire",
+        "contract_cast_chain_tripwire",
+    ] {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` must FAIL: a `Skipped` means the cast is not modelled, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+    // The sign-extension witness must be `-1`, the one input where the two
+    // extension rules differ; naming any other input would mean the model
+    // disagrees with `core` elsewhere.
+    let o = outcome(&report, "contract_cast_signed_to_unsigned_tripwire");
+    let FnOutcome::Failed { detail, .. } = o else { panic!("got: {o}") };
+    assert!(
+        detail.contains("= 255"),
+        "the sign-extension witness should be x == -1 (bits 255), got: {detail}"
+    );
+}
+
+/// The cast shape in an isolated file, so the parse is pinned even if the corpus
+/// entry is edited: `ret == x as u32` must be *readable* (a cast the parser cannot
+/// read is a `Skipped`, i.e. a dropped obligation) and must hold.
+#[test]
+fn a_contract_cast_is_read_and_proved() {
+    let src = r#"
+        /// requires: true
+        /// ensures: ret == x as u32
+        pub fn widen(x: u8) -> u32 {
+            x as u32
+        }
+        /// requires: true
+        /// ensures: ret == x as u8
+        pub fn narrow(x: u16) -> u8 {
+            x as u8
+        }
+    "#;
+    let Some(o) = verify_src("widen", src) else { return };
+    assert!(o.is_verified(), "`widen` must verify, got: {o}");
+    let Some(o) = verify_src("narrow", src) else { return };
+    assert!(o.is_verified(), "`narrow` must verify, got: {o}");
+}
+
