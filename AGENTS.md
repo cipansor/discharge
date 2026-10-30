@@ -3938,16 +3938,16 @@ probing it against hand-checked answers found the next. The first two were refus
 or crashes; this one and the signedness bug were *wrong values*, which is the
 direction a verifier must never fail in.
 
-## The gap that let three bugs through: no oracle covered the contract reader
+## The gap that let the early bugs through: no oracle covered the contract reader
 
 The crate has five differential oracles (z3, Kani, Lean, Coq, Verus) and every one
 of them builds its terms with `smt::` calls directly. They all start *below* the
-contract reader — the layer where all three bugs above lived. So a whole layer had
-no independent check, and the bugs were found by hand-probing rather than by a gate.
+contract reader — the layer where the first three bugs above lived. So a whole layer had
+no independent check, and those bugs were found by hand-probing rather than by a gate.
 
 `the_contract_reader_agrees_with_rustc_on_a_grid` in `tests/mir.rs` closes that gap
 using the one decision procedure that *defines* Rust: `rustc` itself. Two
-constructions, because the two bugs needed different ones:
+constructions, because the bugs needed different ones:
 
 * **Value.** The function's body *is* the expression, so `ret` is rustc's value; the
   postcondition `ret == <expr>` asserts the reader's value at the same point. The
@@ -3957,6 +3957,13 @@ constructions, because the two bugs needed different ones:
   the function verifies iff rustc says the comparison holds. This catches a wrong
   *type*: `-x as u8` and `-(x as u8)` have the same value, so no value check can see
   the difference, but only one is `u8`, and the comparison is what reads the type.
+
+The oracle did not stop at three. It made the next bugs *reachable*: with the reader
+now trusted on the shapes the grid already covered, probing the neighbouring shapes —
+`!` on a value, a constant *expression* where a literal was expected — found two more
+(a wrong verdict from `!x == 5`, and a definite verdict built on `srem(x, 0)`), both
+of which the grid now pins. That is the point of an oracle over a hand-written test
+list: it makes the next shape a single line to add rather than a new investigation.
 
 The grid is the point: one value per expression would have missed the signedness bug.
 Each case runs the type's extremes, `-1`, `0`, `1`.
