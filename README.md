@@ -1339,7 +1339,7 @@ reads like the code it describes:
 | shift | `<<` `>>` |
 | additive | `+` `-` |
 | multiplicative | `*` `/` `%` |
-| unary | `-` `!` (on predicates) |
+| unary | `-` (negation) `!` (bitwise NOT on a value, negation on a predicate) |
 | comparison | `==` `!=` `<` `<=` `>` `>=` |
 | logical | `&&` `\|\|` |
 | cast | `as u8` … `as u64` (an atom followed by one or more `as <type>`) |
@@ -1350,7 +1350,10 @@ choices the body makes. A *negated literal* is signed, so `-7 % 3` is `-1` (the 
 follows the dividend), `-7 / 2` is `-3` (truncated toward zero) and `-7 < 3` is
 true — Rust does not compile `let x: u32 = -1;`, so a negation is its own evidence
 of a signed type. A unary `-` binds *tighter* than `as` (`-x as u8` is
-`(-x) as u8`, type `u8`). A cast *extends*: `-1i8 as i16` is `-1`, and `-1i8 as u16`
+`(-x) as u8`, type `u8`). A unary `!` on a *value* is bitwise NOT and binds tighter
+than `==`, so `!x == 5` is `(!x) == 5` (`x == 250` for a `u8`), not `!(x == 5)`; on a
+parenthesized *predicate* it negates, so `!(x == 5)` is `x != 5`. A cast *extends*:
+`-1i8 as i16` is `-1`, and `-1i8 as u16`
 is `65535`, not `255`. A shift amount must be a constant; a symbolic amount is a
 barrel shifter in the body and is refused in a contract rather than guessed at.
 

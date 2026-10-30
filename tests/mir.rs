@@ -2860,6 +2860,18 @@ fn the_contract_reader_agrees_with_rustc_on_a_grid() {
         // The signedness of a comparison on a variable, over the whole grid.
         ("x", "i8", "i8", &[-128, -7, -1, 0, 1, 7, 127], Some(0)),
         ("x % 3", "i8", "i8", &[-128, -7, -1, 0, 1, 7, 127], Some(0)),
+        // Unary `!` on a value is *bitwise* NOT, and binds tighter than `==`:
+        // `!x == 5` is `(!x) == 5` (`x == 250`), not `!(x == 5)` (`x != 5`). The
+        // predicate reading is a different predicate, so it is a wrong verdict.
+        ("!x", "u8", "u8", &[0, 1, 128, 255], None),
+        ("!!x", "u8", "u8", &[0, 1, 128, 255], None),
+        ("!x + 1", "u8", "u8", &[1, 128, 255], None),
+        ("x & !1", "u8", "u8", &[0, 1, 3, 255], None),
+        // The guard form is the discriminator: `(!x) == 5` holds only at `x == 250`,
+        // where `!(x == 5)` would hold everywhere else. Pinning `x == v` makes the
+        // two readings differ at every point but one.
+        ("!x", "u8", "u8", &[0, 1, 5, 250, 255], Some(5)),
+        ("!x", "u8", "u8", &[0, 1, 5, 250, 255], Some(4)),
     ];
 
     let mut checked = 0u32;

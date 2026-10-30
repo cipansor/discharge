@@ -1537,8 +1537,16 @@ impl<'a> Parser<'a> {
     /// `(a + b) == c` the scan returns at the `)` after `b` and never sees the
     /// `==`, so the group stays arithmetic.
     fn paren_is_predicate(&self) -> bool {
+        self.paren_is_predicate_from(self.pos)
+    }
+
+    /// [`Self::paren_is_predicate`], starting at an explicit token index.
+    ///
+    /// The `!` lookahead needs this: to decide whether `!` negates a *predicate* it
+    /// must ask about the `(` that follows the `!`, not the one at the cursor.
+    fn paren_is_predicate_from(&self, start: usize) -> bool {
         let mut depth = 0usize;
-        for t in &self.toks[self.pos..] {
+        for t in &self.toks[start..] {
             match t {
                 Tok::Op(o) if o == "(" => depth += 1,
                 Tok::Op(o) if o == ")" => {
@@ -1557,6 +1565,18 @@ impl<'a> Parser<'a> {
             }
         }
         false
+    }
+
+    /// Whether the `!` at the cursor applies to a *predicate* rather than a value.
+    ///
+    /// True for `!(a == b)` (a parenthesized predicate) and `!true`/`!false`; false
+    /// for `!x`, `!7` and `!x == 5`, where `!` is the unary prefix on a value.
+    fn bang_is_predicate(&self) -> bool {
+        match self.toks.get(self.pos + 1) {
+            Some(Tok::Op(o)) if o == "(" => self.paren_is_predicate_from(self.pos + 1),
+            Some(Tok::Ident(n)) if n == "true" || n == "false" => true,
+            _ => false,
+        }
     }
 
     fn expect_end(&self) -> Result<(), SpecError> {
@@ -1682,7 +1702,7 @@ impl<'a> Parser<'a> {
                 return Ok(smt::truth(v));
             }
         }
-        if self.eat_op("!") {
+        if self.bang_is_predicate() && self.eat_op("!") {
             let inner = self.parse_cmp()?;
             return Ok(smt::not(inner));
         }
@@ -1912,6 +1932,17 @@ impl<'a> Parser<'a> {
             let (v, _) = self.parse_neg()?;
             let w = smt::bits(v);
             return Ok((smt::sub(smt::word(0, w), v), true));
+        }
+        // `!` is a unary prefix on a *value* here, because `bang_is_predicate`
+        // ruled out the predicate reading above. On an integer it is bitwise NOT,
+        // which is `x ^ all_ones` -- the same term the body builds for `UnOp::Not`
+        // in `mir/exec.rs`. Reading it at the predicate level instead made
+        // `!x == 5` mean `!(x == 5)` (`x != 5`) where Rust means `(!x) == 5`
+        // (`x == 250`): a different predicate, so a wrong verdict, not a refusal.
+        if self.eat_op("!") {
+            let (v, sgn) = self.parse_neg()?;
+            let w = smt::bits(v);
+            return Ok((smt::bxor(v, smt::all_ones(w)), sgn));
         }
         self.parse_atom()
     }
@@ -2818,6 +2849,65 @@ mod tests {
         // undone the previous one.
         let (_, sgn) = parse("-x");
         assert!(sgn, "a negation with no cast is signed");
+    }
+
+    /// Unary `!` on a value is *bitwise* NOT and binds *tighter* than `==`, so
+    /// `!x == 5` is `(!x) == 5`, not `!(x == 5)`.
+    ///
+    /// The parser handled `!` only at the *predicate* level, so `!x == 5` was read
+    /// as the predicate `!(x == 5)` — `x != 5` — where Rust means `x == 250` for a
+    /// `u8`. That is a different predicate, so it is a *wrong verdict*, not a
+    /// refusal, and a bare `!x` was not readable at all. The fix splits the two:
+    /// `bang_is_predicate` decides which reading applies, a predicate `!` stays at
+    /// `parse_cmp`, and a value `!` is a prefix at `parse_neg` (bitwise NOT, the
+    /// same term `mir/exec.rs` builds for `UnOp::Not`).
+    #[test]
+    fn a_bang_on_a_value_is_bitwise_not_and_binds_tight() {
+        let mut args = BTreeMap::new();
+        // A real variable, so the assignment below is what `x` reads.
+        args.insert("x".to_string(), smt::var(8));
+        let unsigned = BTreeSet::new();
+        let eval_const = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let (v, _) = p.parse_expr().expect("parses");
+            p.expect_end().expect("no trailing tokens");
+            smt::evaluate(v, |_| None).expect("a constant")
+        };
+        // `!0` is `255` at 8 bits: bitwise NOT, not a boolean.
+        assert_eq!(eval_const("!0"), 0xFF, "`!` on a value is bitwise NOT");
+        // `!!0` is `0`: the complement of the complement.
+        assert_eq!(eval_const("!!0"), 0, "a double `!` is the identity");
+        // `!1 + 1` is `(!1) + 1` = `254 + 1` = `255`. Read at the predicate level
+        // it would not even parse as arithmetic.
+        assert_eq!(eval_const("!1 + 1"), 0xFF, "`!` binds tighter than `+`");
+        // `0 & !1` is `0 & 254` = `0`; the prefix applies to the literal `1`.
+        assert_eq!(eval_const("0 & !1"), 0, "`!` applies to the operand, not the `&`");
+
+        // The value of `!x` under an assignment, which is the bitwise complement.
+        let eval_at = |text: &str, x: u64| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let (v, _) = p.parse_expr().expect("parses");
+            p.expect_end().expect("no trailing tokens");
+            smt::evaluate(v, |_| Some(x)).expect("decides")
+        };
+        assert_eq!(eval_at("!x", 0), 0xFF, "a bare `!x` reads, and is bitwise");
+        assert_eq!(eval_at("!x", 250), 5, "`!250` is `5` at 8 bits");
+
+        // The two readings of `!x == 5` are decided at the *predicate* level, so
+        // assert the predicate itself: `(!x) == 5` holds at `x == 250` and not at
+        // `x == 5`, which is the opposite of what `!(x == 5)` would say.
+        let pred = |text: &str, x: u64| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let pr = p.parse_or().expect("parses as a predicate");
+            p.expect_end().expect("no trailing tokens");
+            smt::evaluate_pred(pr, |_| Some(x)).expect("decides")
+        };
+        assert!(pred("!x == 5", 250), "`!x == 5` is `(!x) == 5`: true at 250");
+        assert!(!pred("!x == 5", 5), "`!x == 5` is `(!x) == 5`: false at 5");
+        // `!(x == 5)` is the predicate reading, and must still negate: false at 5
+        // (the comparison holds, so its negation does not), true at 250.
+        assert!(!pred("!(x == 5)", 5), "`!(x == 5)` is `x != 5`: false at 5");
+        assert!(pred("!(x == 5)", 250), "`!(x == 5)` is `x != 5`: true at 250");
     }
 
     /// An explicit discriminant sets the variant's value and the next continues

@@ -1475,6 +1475,48 @@ pub fn contract_neg_binds_tighter_than_cast_tripwire(x: i8) -> u8 {
     1
 }
 
+/// Unary `!` on a *value* is bitwise NOT, and binds *tighter* than `==`, so
+/// `!x == 5` is `(!x) == 5` (`x == 250`), not `!(x == 5)` (`x != 5`). The two are
+/// different predicates, so reading it the second way is a wrong verdict, not a
+/// refusal. The body returns `x`, so with Rust's reading the postcondition holds
+/// and the function verifies; with the predicate reading the tool would refute it
+/// at `x == 0`.
+/// requires: !x == 5
+/// ensures: ret == 250
+pub fn contract_bang_binds_tighter_than_eq(x: u8) -> u8 {
+    x
+}
+
+/// A control for the entry above, not a reverse discriminator. The two readings of
+/// `!x == 5` are `x == 250` (Rust) and `x != 5` (the bug); the second is *broader*,
+/// so it can only refute things the first verifies, never verify something the
+/// first refutes — there is no false-proof direction here. What this entry does is
+/// prove the tool is not simply verifying everything under that precondition: the
+/// body returns `x`, so `ret == 249` is false at the only input Rust admits
+/// (`x == 250`) and the tool must refute it under *both* readings.
+/// requires: !x == 5
+/// ensures: ret == 249
+pub fn contract_bang_binds_tighter_than_eq_control(x: u8) -> u8 {
+    x
+}
+
+/// A bare `!x` on an integer is bitwise NOT: for `u8`, `!0` is `255`. It used to
+/// be unreadable, which dropped the obligation rather than checking it.
+/// requires: x == 0
+/// ensures: ret == !x
+pub fn contract_bang_is_bitwise_not(x: u8) -> u8 {
+    !x
+}
+
+/// A predicate `!` still negates: `!(x == 8)` is `x != 8`, so the guard holds at
+/// `x == 7` and the function verifies. This is the shape that must *not* break
+/// when value-level `!` is added.
+/// requires: x == 7 && !(x == 8)
+/// ensures: ret == 1
+pub fn contract_bang_still_negates_a_predicate(x: u8) -> u8 {
+    1
+}
+
 // ---------------------------------------------------------------------------
 // The contract operators that were missing, and the *precedence* they need.
 //

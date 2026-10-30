@@ -3973,3 +3973,35 @@ What it does not cover, stated plainly: the grid is finite, so it is not a proof
 completeness; and it checks the reader's direct evaluation, not the translation to
 SMT, which the z3 oracle covers. Together they span contract text to verdict.
 
+## `!` on a value is bitwise NOT, and it binds tighter than `==`
+
+The oracle above earned its keep immediately. Probing `!` found a fourth bug, and it
+is the same shape as the other three: the parser picked a different meaning than Rust
+for the same characters.
+
+`!` was handled only at the *predicate* level, where it negates a comparison. But in
+Rust `!` is a unary prefix on a *value*, binding tighter than `==`, and on an integer
+it is *bitwise* NOT. So `!x == 5` was read as the predicate `!(x == 5)` — that is,
+`x != 5` — where Rust means `(!x) == 5`, which for a `u8` is `x == 250`. Two different
+predicates: a **wrong verdict**, not a refusal. And a bare `!x` was not readable at
+all, which *dropped* the obligation.
+
+The fix splits the two readings. `bang_is_predicate` looks at the token after the `!`:
+`!(...)` with a comparator inside, or `!true`/`!false`, is the predicate form and stays
+at `parse_cmp`; anything else is a value form, handled as a prefix in `parse_neg`,
+where it is `x ^ all_ones` — the same term `mir/exec.rs` builds for `UnOp::Not`. The
+`!` is a prefix on the operand, so `!1 + 1` is `(!1) + 1` and `x & !1` is `x & (!1)`.
+
+Pinned by four corpus entries (verify / refute / verify / verify) and one unit test
+that asserts both readings of `!x == 5` as *predicates*, so the discriminator is the
+predicate itself rather than a value. Coverage **100/176 to 103/180**.
+
+One honest note on the corpus entry that looks like a tripwire but is not. The two
+readings of `!x == 5` are `x == 250` (Rust) and `x != 5` (the bug), and the second is
+*broader* — it admits every input the first does, and more. A broader precondition can
+only produce false *refutations*, never a false proof, so there is no reverse-tripwire
+direction to pin here; the entry that accompanies the verifiable one is a *control*
+that must refute under both readings, which shows the tool is not simply verifying
+everything. The false-proof direction for `!` is the bare `!x`, and that one was a
+dropped obligation rather than a wrong verdict, because it did not parse.
+
