@@ -37,6 +37,12 @@
 //!   in the frontend from their operands rather than by reading `core`'s MIR.
 //!   So are the unary operators — `neg` and `abs` in all four families — and the
 //!   three bit counts `count_ones`, `leading_zeros` and `trailing_zeros`.
+//!   Division is the one narrowing: only `checked_div`/`checked_rem` are
+//!   modelled, because every other family — `overflowing_*` included — panics on
+//!   a zero divisor and hiding that panic is not something a proof may do. A
+//!   `(T, bool)` return read through `ret.1` reaches the component a modelled
+//!   call wrote, which is the tuple-family coverage the `overflowing_*` block at
+//!   the end pins.
 //!
 //! Keep the functions small. The point is to isolate one capability per
 //! function, so a change that adds it moves exactly one row from `incomplete`
@@ -1395,3 +1401,75 @@ pub fn saturating_abs_of_non_negative_is_identity(x: i8) -> i8 {
 pub fn saturating_abs_is_identity_tripwire(x: i8) -> i8 {
     x.saturating_abs()
 }
+
+// ---------------------------------------------------------------------------
+// The two-operand `overflowing_*` family, read through a `ret.N` contract.
+//
+// This is the family whose result is a `(T, bool)` tuple: the wrapped value in
+// field 0 and the overflow flag in field 1. A modelled call writes those two
+// fields directly, without ever assigning the tuple local as a whole, so a
+// postcondition naming `ret.1` reaches a component that lives in the *field*
+// store rather than the element store. Until the return-component reader
+// consulted both, `ret.1` came back unbound and the whole contract was refused
+// as an aggregate with no such component -- a refusal that looked like a
+// modelling gap but was a store mismatch.
+//
+// As always, each shape carries one verifying contract and one tripwire.
+// ---------------------------------------------------------------------------
+
+/// The flag is set exactly when the addition overflowed, so either it did
+/// (the flag is `true`) or the wrapped value is the exact sum. This is the whole
+/// meaning of `overflowing_add` in one contract, and it reads *both* components
+/// of the return through `ret.0` and `ret.1`.
+/// requires: true
+/// ensures: ret.1 == true || ret.0 == x + y
+pub fn overflowing_add_flag_or_exact_sum(x: u8, y: u8) -> (u8, bool) {
+    x.overflowing_add(y)
+}
+
+/// The tripwire: the flag is *not* always clear -- `0xFF + 1` overflows -- so a
+/// contract that reads `ret.1` and claims it is false must fail.
+/// requires: true
+/// ensures: ret.1 == false
+pub fn overflowing_add_flag_never_set_tripwire(x: u8, y: u8) -> (u8, bool) {
+    x.overflowing_add(y)
+}
+
+/// A guarded addition: with `x < 16` and `y < 16` the sum fits in a `u8`, so the
+/// flag is clear -- and this reads the flag, not just the value.
+/// requires: x < 16
+/// requires: y < 16
+/// ensures: ret.1 == false
+pub fn overflowing_add_small_operands_never_flag(x: u8, y: u8) -> (u8, bool) {
+    x.overflowing_add(y)
+}
+
+/// The tripwire: dropping the second bound lets `y == 0xFF` through, and
+/// `16 + 0xFF` overflows, so the flag is not always clear.
+/// requires: x < 16
+/// ensures: ret.1 == false
+pub fn overflowing_add_one_bound_only_tripwire(x: u8, y: u8) -> (u8, bool) {
+    x.overflowing_add(y)
+}
+
+/// When the addition does not overflow the wrapped value *is* the sum, so a
+/// contract on `ret.0` alone is checkable and must agree with the body's own
+/// arithmetic. The precondition is what makes it true, and it is the value
+/// component this time rather than the flag.
+/// requires: x < 16
+/// requires: y < 16
+/// ensures: ret.0 == x + y
+pub fn overflowing_add_value_is_exact_when_no_overflow(x: u8, y: u8) -> (u8, bool) {
+    x.overflowing_add(y)
+}
+
+/// The tripwire: the wrapped value is *not* always at least the left operand.
+/// The contract's own `+` wraps at `u8` exactly as the method does, so an
+/// "exact sum" claim cannot distinguish the two -- the place the wrapping shows
+/// is the order. `0xFF + 1` wraps to `0`, below `x`, and the witness finds it.
+/// requires: true
+/// ensures: ret.0 >= x
+pub fn overflowing_add_wrapped_value_below_operand_tripwire(x: u8, y: u8) -> (u8, bool) {
+    x.overflowing_add(y)
+}
+

@@ -1448,6 +1448,51 @@ fn a_signed_element_comparison_keeps_the_elements_sign() {
     );
 }
 
+/// A postcondition naming a component a *modelled call* wrote is not refused.
+///
+/// `overflowing_add` returns `(T, bool)` and the modelled call writes `_0.0` and
+/// `_0.1` directly -- it never assigns the tuple local as a whole. So the value
+/// component lives in the *field* store while a literal's `_0 = (a, b)` lives in
+/// the element store, and a `ret.N` reader that consulted only the latter found
+/// the component unbound. The symptom was the whole contract refused as "the
+/// return type is an aggregate, so `ret` has no single value" -- a message about
+/// the wrong problem, since the reader already knew to look at components.
+///
+/// The two verifying entries read `ret.1` (the flag) and `ret.0` (the value), so
+/// both stores are exercised, and the two tripwires must FAIL: a reader that
+/// dropped a component would make those contracts vacuously true.
+#[test]
+fn a_postcondition_can_name_a_component_a_modelled_call_wrote() {
+    let names = [
+        "overflowing_add_flag_or_exact_sum",
+        "overflowing_add_small_operands_never_flag",
+        "overflowing_add_value_is_exact_when_no_overflow",
+        "overflowing_add_flag_never_set_tripwire",
+        "overflowing_add_one_bound_only_tripwire",
+        "overflowing_add_wrapped_value_below_operand_tripwire",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in [
+        "overflowing_add_flag_or_exact_sum",
+        "overflowing_add_small_operands_never_flag",
+        "overflowing_add_value_is_exact_when_no_overflow",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in [
+        "overflowing_add_flag_never_set_tripwire",
+        "overflowing_add_one_bound_only_tripwire",
+        "overflowing_add_wrapped_value_below_operand_tripwire",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "`{name}` states a false contract a dropped component would prove; got: {o}"
+        );
+    }
+}
+
 /// A `(u8, &u8)` return with a postcondition on `ret.0` alone is not skipped.
 ///
 /// Component 1 is a reference with no bit-vector width. Binding every declared

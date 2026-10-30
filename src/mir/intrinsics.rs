@@ -37,11 +37,15 @@
 //!
 //! # What is not, and why refusing is the right answer
 //!
-//! * `wrapping_div`, `wrapping_rem` and `saturating_div`/`saturating_rem` panic
-//!   on a zero divisor. Modelling them as total would *hide a panic*, which is
-//!   the one thing this frontend must never do. Only `checked_div` (which returns
-//!   `None`) and `overflowing_div` (which returns a flag) can express the failure
-//!   as a value, and only up to [`DIV_MAX_WIDTH`].
+//! * `wrapping_div`, `wrapping_rem`, `saturating_div`, `saturating_rem` **and
+//!   `overflowing_div`/`overflowing_rem`** panic on a zero divisor. Modelling
+//!   them as total would *hide a panic*, which is the one thing this frontend
+//!   must never do. Only `checked_div`/`checked_rem` express the failure as a
+//!   value -- `None` covers a zero divisor *and* `MIN / -1` -- so only they are
+//!   modelled, and only up to [`DIV_MAX_WIDTH`]. The `overflowing_*` spelling is
+//!   the trap here: it reports `MIN / -1` in its flag, which makes it look like a
+//!   total form of division, but its flag is not the whole failure predicate and
+//!   the zero divisor still panics.
 //! * The shifts are refused because the families disagree: `wrapping_shl` takes
 //!   the amount modulo the width, while the engine's variable shift saturates to
 //!   zero, and `checked_shl` returns `None` past the width. Three behaviours
@@ -267,13 +271,16 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         | Intrinsic::Saturating(bin)
         | Intrinsic::Checked(bin)
         | Intrinsic::Overflowing(bin) => match bin {
-            // Division is only modelled for the families that can express the
-            // failure as a value: `checked_div` returns `None` and `overflowing_div`
-            // returns a flag. The others panic on a zero divisor, and modelling
-            // them as total would hide that panic.
+            // Division is modelled only for the family that can express *both*
+            // failures as a value. `checked_div` returns `None`, which covers a
+            // zero divisor as well as `MIN / -1`. Nothing else does:
+            // `overflowing_div` reports `MIN / -1` in its flag but still *panics*
+            // on a zero divisor -- its flag is not the whole failure predicate --
+            // and `wrapping_div`/`saturating_div` panic on zero outright.
+            // Modelling any of them as total would hide that panic, so only
+            // `checked_*` is admitted.
             BinOp::Div | BinOp::Rem => {
-                matches!(op, Intrinsic::Checked(_) | Intrinsic::Overflowing(_))
-                    && w <= DIV_MAX_WIDTH
+                matches!(op, Intrinsic::Checked(_)) && w <= DIV_MAX_WIDTH
             }
             // A product needs the widened exact result to test, and to clamp.
             BinOp::Mul => w <= MUL_MAX_WIDTH,
@@ -726,6 +733,170 @@ mod tests {
 
     fn unident(bits: u64) -> i64 {
         bits as i64
+    }
+
+    /// Check a two-operand `(T, bool)` model against `rust` over every input pair.
+    ///
+    /// The generic [`check`] cannot serve here. It reads a `Tuple`'s flag through
+    /// the same `Option<bool>` channel an `Option` tag uses, and its arms treat
+    /// `false` as "the operation is undefined" -- which is right for a `checked_*`
+    /// but wrong for an `overflowing_*`, whose value is defined everywhere and
+    /// whose flag is a *result*, not a definedness bit. So the flag is compared on
+    /// its own, at every pair, as the pair `overflowing_*` actually returns.
+    fn check_tuple(
+        op: Intrinsic,
+        w: u8,
+        signed: bool,
+        from_bits: impl Fn(u64) -> i64,
+        to_bits: impl Fn(i64) -> u64,
+        rust: impl Fn(i64, i64) -> (i64, bool),
+        label: &str,
+    ) {
+        smt::with_fresh(|| {
+            let a = smt::var(w);
+            let b = smt::var(w);
+            let outcome = eval(op, a, b, w, signed, w)
+                .unwrap_or_else(|| panic!("{label} at {w} bits must be modelled"));
+            let Outcome::Tuple { value, overflowed } = outcome else {
+                panic!("{label} must produce a tuple");
+            };
+            let (ai, bi) = (smt::index(a), smt::index(b));
+            each_pair(w, |xb, yb| {
+                let (x, y) = (from_bits(xb), from_bits(yb));
+                let (want_val, want_flag) = rust(x, y);
+                let env = |i: u32| {
+                    if i == ai {
+                        Some(xb)
+                    } else if i == bi {
+                        Some(yb)
+                    } else {
+                        None
+                    }
+                };
+                assert_eq!(
+                    smt::evaluate(value, env),
+                    Some(to_bits(want_val)),
+                    "{label} at ({x}, {y}): value mismatch"
+                );
+                assert_eq!(
+                    smt::evaluate_pred(overflowed, env),
+                    Some(want_flag),
+                    "{label} at ({x}, {y}): overflow flag mismatch"
+                );
+            });
+        });
+    }
+
+    /// The `overflowing_*` family, two-operand, against `core` over all of `u8`
+    /// and `i8`.
+    ///
+    /// This is the family whose flag is the shared overflow predicate read
+    /// directly. The value is the wrapped one and is defined at *every* input,
+    /// which the exhaustive walk checks rather than assumes; the flag is checked
+    /// at every input too, so a predicate that happened to agree on the boundary
+    /// but not in the interior would be caught.
+    #[test]
+    fn the_overflowing_family_agrees_with_rust() {
+        check_tuple(
+            Intrinsic::Overflowing(BinOp::Add),
+            8,
+            false,
+            unident,
+            ident,
+            |x, y| {
+                let (v, o) = u8::overflowing_add(x as u8, y as u8);
+                (v as i64, o)
+            },
+            "overflowing_add u8",
+        );
+        check_tuple(
+            Intrinsic::Overflowing(BinOp::Sub),
+            8,
+            false,
+            unident,
+            ident,
+            |x, y| {
+                let (v, o) = u8::overflowing_sub(x as u8, y as u8);
+                (v as i64, o)
+            },
+            "overflowing_sub u8",
+        );
+        check_tuple(
+            Intrinsic::Overflowing(BinOp::Mul),
+            8,
+            false,
+            unident,
+            ident,
+            |x, y| {
+                let (v, o) = u8::overflowing_mul(x as u8, y as u8);
+                (v as i64, o)
+            },
+            "overflowing_mul u8",
+        );
+        check_tuple(
+            Intrinsic::Overflowing(BinOp::Add),
+            8,
+            true,
+            to_i8,
+            i8_bits,
+            |x, y| {
+                let (v, o) = i8::overflowing_add(x as i8, y as i8);
+                (v as i64, o)
+            },
+            "overflowing_add i8",
+        );
+        check_tuple(
+            Intrinsic::Overflowing(BinOp::Sub),
+            8,
+            true,
+            to_i8,
+            i8_bits,
+            |x, y| {
+                let (v, o) = i8::overflowing_sub(x as i8, y as i8);
+                (v as i64, o)
+            },
+            "overflowing_sub i8",
+        );
+        check_tuple(
+            Intrinsic::Overflowing(BinOp::Mul),
+            8,
+            true,
+            to_i8,
+            i8_bits,
+            |x, y| {
+                let (v, o) = i8::overflowing_mul(x as i8, y as i8);
+                (v as i64, o)
+            },
+            "overflowing_mul i8",
+        );
+    }
+
+    /// `overflowing_div`/`overflowing_rem` are refused, like the rest of the
+    /// division families except `checked_*`.
+    ///
+    /// This looks like a form of division that can report its failure as a value,
+    /// and the flag *does* report `MIN / -1`. But a zero divisor still panics --
+    /// the flag is not the whole failure predicate -- so modelling it as total
+    /// would hide a panic. The differential test against `core` is what exposed
+    /// this: `7u8.overflowing_div(0)` unwinds, it does not return `(_, true)`.
+    #[test]
+    fn overflowing_division_is_refused_like_the_other_panicking_families() {
+        for w in [8u8, 16, 32] {
+            for signed in [false, true] {
+                assert!(
+                    !is_modelled(Intrinsic::Overflowing(BinOp::Div), w, signed),
+                    "overflowing_div must be refused at {w} bits (signed={signed})"
+                );
+                assert!(
+                    !is_modelled(Intrinsic::Overflowing(BinOp::Rem), w, signed),
+                    "overflowing_rem must be refused at {w} bits (signed={signed})"
+                );
+            }
+        }
+        // `checked_*` is still the one division family that is modelled, which is
+        // what makes the refusal above a *narrowing* and not an accident.
+        assert!(is_modelled(Intrinsic::Checked(BinOp::Div), 8, false));
+        assert!(is_modelled(Intrinsic::Checked(BinOp::Rem), 8, false));
     }
 
     #[test]

@@ -751,6 +751,17 @@ impl Env {
             // unknown and the `switchInt` on the tag would go unmodelled.
             None => match self.discriminants.get(&p.local) {
                 Some(v) => *v,
+                // A local with no whole value but with *parts*: an aggregate a
+                // modelled call wrote field-by-field (`overflowing_add` writes
+                // `_0.0` and `_0.1` without ever assigning `_0`), or an enum built
+                // from a variant. The projections below are what carry the value,
+                // so falling through to them is right; returning `Unknown` here
+                // would make every such component unreadable, which is exactly how
+                // a `ret.1` contract for the `overflowing_*` family was reported
+                // as an aggregate with no such component. A projection-less read
+                // of such a local still has no single value, and the loop below
+                // leaves `cur` as this same `Unknown` for it.
+                None if !p.proj.is_empty() => Val::Unknown,
                 None => return Val::Unknown,
             },
         };
@@ -1832,8 +1843,25 @@ where
                     report.returned_paths += 1;
                     if let Some(post) = post {
                         // The components of a tuple return, so a postcondition can
-                        // name `ret.0`. They are read from the return place's element
-                        // map, which is where `_0 = (a, b)` put them.
+                        // name `ret.0`. They are read through the *same* place read
+                        // the body uses, rather than from one store directly.
+                        //
+                        // That is not a convenience: a tuple local's component is
+                        // written under `Proj::Index` by a literal (`_0 = (a, b)`) and
+                        // under `Proj::Field` by a modelled call (`overflowing_add`
+                        // writes field 0 and field 1), while `Env::get` consults
+                        // `fields` and falls back to `elems` so both spellings of
+                        // "component `k`" meet. Collecting from `elems` alone missed
+                        // every call-written component, and the symptom was a
+                        // postcondition about `ret.1` reported unreadable -- an
+                        // aggregate with no such component -- rather than checked.
+                        // Going through `get` makes the two agree by construction.
+                        //
+                        // The candidate indices are the union of the two stores, and
+                        // an unwritten component stays out of the list: binding a
+                        // *fresh* variable for it would make a postcondition about
+                        // `ret.1` pass vacuously, which is why the filter drops
+                        // anything that is not a readable value.
                         //
                         // A `bool` component is widened to a one-bit word for the
                         // same reason a `bool` *return* is: a postcondition
@@ -1842,17 +1870,28 @@ where
                         // refuses the whole contract. `(bool, u8)` returns are
                         // common (every `checked_*` is `(T, bool)`), so refusing
                         // them silently loses the proof.
-                        let projs: Vec<(u32, Var)> = st
-                            .env
-                            .elems
-                            .iter()
-                            .filter(|((l, _), _)| *l == 0)
-                            .filter_map(|((_, k), v)| match v {
-                                Val::Sym(x, _) => Some((*k as u32, *x)),
-                                Val::Bool(p) => {
-                                    Some((*k as u32, smt::ite(*p, smt::word(1, 1), smt::word(0, 1))))
+                        let mut components: BTreeSet<u32> = BTreeSet::new();
+                        for (l, k) in st.env.elems.keys() {
+                            if *l == 0 {
+                                components.insert(*k as u32);
+                            }
+                        }
+                        for (l, k) in st.env.fields.keys() {
+                            if *l == 0 {
+                                components.insert(*k);
+                            }
+                        }
+                        let projs: Vec<(u32, Var)> = components
+                            .into_iter()
+                            .filter_map(|k| {
+                                let p = Place { local: 0, proj: vec![Proj::Field(k)] };
+                                match st.env.get(&p) {
+                                    Val::Sym(x, _) => Some((k, x)),
+                                    Val::Bool(p) => {
+                                        Some((k, smt::ite(p, smt::word(1, 1), smt::word(0, 1))))
+                                    }
+                                    _ => None,
                                 }
-                                _ => None,
                             })
                             .collect();
                         // What the postcondition is evaluated against. A scalar

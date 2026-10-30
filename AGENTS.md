@@ -3110,19 +3110,22 @@ walking the body for slice reads and then proving `len <= 64` for functions that
 needed slice modelling, so it is left as the honest boundary.
 
 **Stage 4 — the missing intrinsics.** `wrapping_neg`, `wrapping_div`,
-`wrapping_rem`, `overflowing_*`, `leading_zeros`, `trailing_zeros`, `count_ones`,
-`pow`. The `wrapping_*` family is the same arithmetic the `checked_*` arms already
-do, minus the overflow obligation, so it is mostly plumbing. `count_ones` and the
-zero-counts are small bit-vector loops and belong in `discharge-arithmetic` beside
-the other proved primitives, not in the frontend.
+`wrapping_rem`, `leading_zeros`, `trailing_zeros`, `count_ones`, `pow`. The
+`wrapping_*` family is the same arithmetic the `checked_*` arms already do, minus
+the overflow obligation, so it is mostly plumbing. `count_ones` and the zero-counts
+are small bit-vector loops and belong in `discharge-arithmetic` beside the other
+proved primitives, not in the frontend. All of these are now modelled except `pow`
+and the division families that cannot express a zero divisor as a value (see below).
 
-**Stage 4 progress: the whole unary surface is modelled.** `count_ones`,
-`leading_zeros` and `trailing_zeros` are the bit counts; `neg` and `abs` are
-modelled in all four families (`wrapping`, `saturating`, `checked`, `overflowing`).
-The `Intrinsic` enum was restructured to say so: `Bits(BitKind)` for the counts,
-`Unary(Family, UnOp)` for the operators, and `Overflowing(BinOp)` for the
-`(T, bool)` family the unary work made unavoidable. Findings worth more than the
-coverage:
+**Stage 4 progress: the two-operand families and the whole unary surface are
+modelled.** `checked_*`, `saturating_*`, `wrapping_*` and `overflowing_*` are all
+computed in the frontend from their operands: the two-operand `overflowing_*`
+shapes share the `failure` predicate the other families read, and were checked
+against `core` over the whole `u8`/`i8` domain. `count_ones`, `leading_zeros` and
+`trailing_zeros` are the bit counts; `neg` and `abs` are modelled in all four
+families. The `Intrinsic` enum was restructured to say so: `Bits(BitKind)` for the
+counts, `Unary(Family, UnOp)` for the operators, and `Overflowing(BinOp)` for the
+`(T, bool)` family. Findings worth more than the coverage:
 
 * **`count_ones`, `leading_zeros` and `trailing_zeros` are the modelled calls whose
   result width differs from their operand's** (`u8::count_ones` returns `u32`). The
@@ -3148,12 +3151,29 @@ coverage:
   That is one wrong input out of `2^w`, and it is exactly the input the corpus
   tripwire names -- a sample-based test would have missed it.
 
+* **The `overflowing_*` return is a `(T, bool)` whose components a modelled call
+  writes *field by field*, and the `ret.N` reader had to learn that.** A literal
+  `_0 = (a, b)` stores components under `Proj::Index`; a modelled call writes
+  `_0.0`/`_0.1` under `Proj::Field`. `Env::get` already met both spellings, but two
+  other readers did not: the return-component collector read `elems` only, and
+  `Env::get` itself returned `Unknown` early for a local with no whole value before
+  ever consulting the projected store. The symptom was a `ret.1` contract refused as
+  "the return type is an aggregate, so `ret` has no single value" -- a message about
+  the wrong problem, since the answer was to read the component, not to give up on
+  it. Both readers now go through `get`.
+* **`overflowing_div`/`overflowing_rem` panic on a zero divisor and are refused.**
+  The flag reports `MIN / -1`, which makes the family look like a total form of
+  division -- and the previous session modelled it as one. A differential test
+  against `core` is what exposed it: `7u8.overflowing_div(0)` *unwinds*, it does not
+  return `(_, true)`. So the flag is not the whole failure predicate, and treating
+  the call as total would have let a function that divides by zero be *proved
+  panic-free*. `is_modelled` now admits only `checked_div`/`checked_rem`, and the
+  corpus records why.
+
 `wrapping_div`/`wrapping_rem`/`saturating_div`/`saturating_rem` are *not* reachable
 by design, because they panic on a zero divisor and modelling them as total would
-hide that panic; `overflowing_div`/`overflowing_rem` are reachable but not yet
-written, because they need the same zero-divisor handling the `checked_*` arms have
-plus the flag. `pow` remains reachable and unmodelled. The bit-count proofs do
-**not** go in `discharge-arithmetic`: their oracle here is Rust's own method, checked
+hide that panic; `overflowing_div`/`overflowing_rem` join them for the same reason.
+`pow` remains reachable and unmodelled. The bit-count proofs do **not** go in `discharge-arithmetic`: their oracle here is Rust's own method, checked
 exhaustively over the whole operand domain, which is a stronger oracle than a
 small-domain enumeration would be. A third engine with less coverage is not a proof,
 so the split the roadmap proposed is not made.
