@@ -1543,6 +1543,72 @@ pub fn contract_sdiv_tripwire(x: i32) -> i32 {
     x / 2
 }
 
+/// A *constant* signed expression, with no symbolic operand at all. The existing
+/// `contract_srem`/`contract_sdiv` entries pin a symbolic argument (`x == -7`),
+/// and signedness is read from the names in an expression — so they never
+/// exercised the one shape where there is no name to read it from. Here the body
+/// is folded by rustc to `-1`, and the contract is the literal `-7 % 3`. Rust says
+/// `-1` (the sign follows the dividend); the unsigned engine would say
+/// `4294967289 % 3`, i.e. `0`, and refute this.
+/// requires: true
+/// ensures: ret == -7 % 3
+pub fn contract_const_srem_negative() -> i32 {
+    -7i32 % 3i32
+}
+
+/// The companion for division: `-7 / 2` is `-3`, truncated toward zero. The
+/// unsigned engine would give `2147483641`, a huge positive.
+/// requires: true
+/// ensures: ret == -7 / 2
+pub fn contract_const_sdiv_negative() -> i32 {
+    -7i32 / 2i32
+}
+
+/// The companion for an arithmetic shift: `-8 >> 1` is `-4` on a signed operand.
+/// A logical reading would give `2147483644`.
+/// requires: true
+/// ensures: ret == -8 >> 1
+pub fn contract_const_ashr_negative() -> i32 {
+    -8i32 >> 1
+}
+
+/// The tripwire: `-7 % 3` is `-1`, never `2` (which is what a remainder that
+/// followed the *divisor's* sign would give). The body is `-1`, so `2` is
+/// refuted.
+/// requires: true
+/// ensures: ret == 2
+pub fn contract_const_srem_negative_tripwire() -> i32 {
+    -7i32 % 3i32
+}
+
+/// The tripwire for the shift: `-8 >> 1` is `-4`, never `-1`.
+/// requires: true
+/// ensures: ret == -1
+pub fn contract_const_ashr_negative_tripwire() -> i32 {
+    -8i32 >> 1
+}
+
+/// The same unsigned flag decides a *comparison*, not only `/ % >>`. `-7 < 3` is
+/// true on a signed reading and false on an unsigned one (`4294967289 < 3`), so a
+/// literal that reports itself unsigned made this precondition unsatisfiable —
+/// the safe direction, but wrong. The body returns `1`, so the postcondition is
+/// true whenever the precondition is.
+/// requires: -7 < 3
+/// ensures: ret == 1
+pub fn contract_const_cmp_negative() -> u8 {
+    1
+}
+
+/// The tripwire: `-7 > 0` is false, so a *signed* reading makes the precondition
+/// unsatisfiable and the function vacuous. An unsigned reading (`4294967289 > 0`)
+/// would make it true and the function verify — so a regression here shows up as
+/// this entry *passing*, which is the direction to watch.
+/// requires: -7 > 0
+/// ensures: ret == 1
+pub fn contract_const_cmp_negative_tripwire() -> u8 {
+    1
+}
+
 /// Precedence: Rust reads `x & 1 + 1` as `x & (1 + 1)`, i.e. `x & 2`. The body
 /// computes `x & 2`, so a parser that read `(x & 1) + 1` would refute this.
 /// requires: true

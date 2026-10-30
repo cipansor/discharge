@@ -1346,7 +1346,10 @@ reads like the code it describes:
 
 `>>` is arithmetic on a signed operand and logical on an unsigned one, and `/`/`%`
 take the signed quotient or remainder when either operand is signed — the same
-choices the body makes. A cast *extends*: `-1i8 as i16` is `-1`, and `-1i8 as u16`
+choices the body makes. A *negated literal* is signed, so `-7 % 3` is `-1` (the sign
+follows the dividend), `-7 / 2` is `-3` (truncated toward zero) and `-7 < 3` is
+true — Rust does not compile `let x: u32 = -1;`, so a negation is its own evidence
+of a signed type. A cast *extends*: `-1i8 as i16` is `-1`, and `-1i8 as u16`
 is `65535`, not `255`. A shift amount must be a constant; a symbolic amount is a
 barrel shifter in the body and is refused in a contract rather than guessed at.
 

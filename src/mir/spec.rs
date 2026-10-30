@@ -1888,9 +1888,18 @@ impl<'a> Parser<'a> {
         // `-10` and `-a` are both expressible. It is a *value* negation, not a
         // subtraction, which is what makes `a >= -10` read the way it looks.
         if self.eat_op("-") {
-            let (v, s) = self.parse_atom()?;
+            let (v, _) = self.parse_atom()?;
             let w = smt::bits(v);
-            return Ok((smt::sub(smt::word(0, w), v), s));
+            // The result is signed whatever the operand was. Negation is only
+            // defined on a signed type in Rust (`let x: u32 = -1;` does not
+            // compile), so a negation *is* the evidence that the expression is
+            // signed. The operand's own flag cannot be used: `-7` negates the
+            // literal `7`, which is unsigned, and reading the flag through would
+            // make `-7 % 3` take the unsigned remainder (`4294967289 % 3`, i.e.
+            // `0`) where Rust says `-1`. Only `% / >>` consult the flag, so the
+            // mistake is a *wrong value* rather than a refusal -- the one
+            // outcome a verifier must not produce silently.
+            return Ok((smt::sub(smt::word(0, w), v), true));
         }
         match self.peek().cloned() {
             Some(Tok::Num(n)) => {
@@ -2716,6 +2725,45 @@ mod tests {
         assert_eq!(eval("x | 1 ^ 1"), 1, "`^` must bind tighter than `|`");
         // `8 / 4 / 2` is left-associative: `(8 / 4) / 2` is `1`.
         assert_eq!(eval("8 / 4 / 2"), 1, "`/` is left-associative");
+    }
+
+    /// A negated literal is *signed*, and the flag has to say so or `%`, `/` and
+    /// `>>` pick the unsigned engine and return a different number.
+    ///
+    /// This is the shape the precedence test cannot reach: signedness is read from
+    /// the *names* in an expression, and `-7 % 3` has no name. The operand of the
+    /// negation is the literal `7`, which is unsigned, so passing the operand's own
+    /// flag through made the whole expression unsigned. Only `%`, `/` and `>>`
+    /// consult the flag, so the mistake produced a *wrong value* rather than a
+    /// refusal: `4294967289 % 3` is `0`, where Rust says `-1`. The flag is asserted
+    /// directly here, because the values are what the corpus entries cover.
+    #[test]
+    fn a_negated_literal_is_signed() {
+        // An 8-bit name in scope, so a bare literal is built 8 bits wide and the
+        // value below is the readable `0xF9` rather than a 64-bit pattern.
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::word(1, 8));
+        let unsigned = BTreeSet::new();
+        let parse = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let (v, sgn) = p.parse_expr().expect("parses");
+            p.expect_end().expect("no trailing tokens");
+            (v, sgn)
+        };
+        // A negation is only defined on a signed type, so `-7` is signed even
+        // though the `7` it negates is not.
+        let (_, sgn) = parse("-7");
+        assert!(sgn, "a negated literal is signed");
+        let (_, sgn) = parse("-7 % 3");
+        assert!(sgn, "a remainder of a negated literal is signed");
+        // A bare literal stays unsigned, or `x % 3` for an unsigned `x` would
+        // take the signed engine -- the mirror of the same mistake.
+        let (_, sgn) = parse("7 % 3");
+        assert!(!sgn, "a bare literal is unsigned");
+        // The value is still a *value* negation: `-7` is the two's-complement
+        // `7` subtracted from `0`, so it evaluates to `-1` at 8 bits.
+        let (v, _) = parse("-7");
+        assert_eq!(smt::evaluate(v, |_| None).expect("a constant"), 0xF9);
     }
 
     /// An explicit discriminant sets the variant's value and the next continues

@@ -3861,3 +3861,45 @@ one, is refused outright. Modelling 128-bit arithmetic would need the engine's
 words widened past 64 bits, which is a change to the engine rather than to the
 frontend, and is not attempted here.
 
+## A negated literal reported itself unsigned, and `/ % >>` read a different number
+
+The signedness flag is what `%`, `/` and `>>` consult to choose the signed engine
+over the unsigned one, and it is inferred from the **names** in an expression: an
+expression is signed when any name in it is. That is exact for the shapes the
+corpus had, because every signed entry pinned a symbolic argument (`requires: x ==
+-7; ensures: ret == -1`). It is not exact for `-7 % 3`, which has no name at all.
+
+`parse_atom`'s unary minus passed the *operand's* flag through, and the operand of
+`-7` is the literal `7`, which is unsigned. So `-7 % 3` came out unsigned and took
+`urem`: `4294967289 % 3`, which is `0`, where Rust says `-1`. Same for `-7 / 2`
+(`2147483641` instead of `-3`) and `-8 >> 1` (`2147483644` instead of `-4`).
+
+The failure mode is the one that matters most here. It was not a refusal and not a
+`Skipped` — it was a **wrong value**, and it pointed the dangerous way: a *false*
+postcondition would have been refuted (fine), but the tripwires I wrote to catch a
+wrong engine would have **verified**, which manufactures a false proof. A verifier
+that returns a confident `verified` on a false statement is worse than one that
+crashes, and that is exactly the direction this bug leaned.
+
+The fix is one line, and the reasoning is what makes it safe rather than a patch:
+**negation is only defined on a signed type in Rust** (`let x: u32 = -1;` does not
+compile), so a negation is itself the evidence that the expression is signed. The
+flag is set to `true` unconditionally, not `operand_sgn || true` — the operand's
+flag is discarded because it is about the wrong thing.
+
+It was found the same way the 128-bit crash was: the earlier fix (`/ % << >>`) made
+a shape *reachable* that nothing had reached, and probing it against values I could
+check by hand showed three "postcondition holds for no input" results where rustc
+says the postcondition is true on every input.
+
+Pinned by seven corpus entries (four that must verify, three tripwires that must be
+refuted or vacuous) and two tests. The `spec` unit test asserts the flag
+*directly* — `-7` is signed, `7` is not — because the flag, not the value, is the
+thing that broke; and it checks the value is still a value negation (`0xF9` at 8
+bits), so a "fix" that made negation mean something else fails. The `tests/mir.rs`
+test writes each pair to an isolated file and asserts **both** directions, so
+flipping the flag the wrong way fails there too. The same flag also decides a
+*comparison* (`slt` versus `ult`), which is why `-7 < 3` was unsatisfiable rather
+than false, and two of the entries pin that second family. Coverage **94/166 to
+98/173** decided.
+

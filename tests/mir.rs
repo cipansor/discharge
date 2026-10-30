@@ -2712,3 +2712,44 @@ fn contract_operators_parse_in_isolation() {
     }
 }
 
+/// A constant signed expression, with no symbolic operand, must use the *signed*
+/// engine for `%`, `/` and `>>`. Signedness is inferred from the names in an
+/// expression, and there are none here, so the negated literal is the only
+/// evidence — and it used to report itself unsigned. The mistake was a *wrong
+/// value*, not a refusal: the unsigned `%` gives `4294967289 % 3 == 0` where Rust
+/// says `-1`, and the tripwires below would then have *verified*, which is the
+/// direction that manufactures a false proof. Each pair is asserted both ways, so
+/// a fix that merely flipped the flag the other way fails here too.
+#[test]
+fn a_constant_signed_expression_uses_the_signed_engine() {
+    let srcs = [
+        (
+            "srem",
+            "/// requires: true\n/// ensures: ret == -7 % 3\n\
+             pub fn srem() -> i32 { -7i32 % 3i32 }",
+            "/// requires: true\n/// ensures: ret == 2\n\
+             pub fn srem() -> i32 { -7i32 % 3i32 }",
+        ),
+        (
+            "sdiv",
+            "/// requires: true\n/// ensures: ret == -7 / 2\n\
+             pub fn sdiv() -> i32 { -7i32 / 2i32 }",
+            "/// requires: true\n/// ensures: ret == 3\n\
+             pub fn sdiv() -> i32 { -7i32 / 2i32 }",
+        ),
+        (
+            "ashr",
+            "/// requires: true\n/// ensures: ret == -8 >> 1\n\
+             pub fn ashr() -> i32 { -8i32 >> 1 }",
+            "/// requires: true\n/// ensures: ret == -1\n\
+             pub fn ashr() -> i32 { -8i32 >> 1 }",
+        ),
+    ];
+    for (name, true_src, false_src) in srcs {
+        let Some(o) = verify_src(name, true_src) else { return };
+        assert!(o.is_verified(), "`{name}` (true) must verify, got: {o}");
+        let Some(o) = verify_src(name, false_src) else { return };
+        assert!(!o.is_verified(), "`{name}` (tripwire) must be refuted, got: {o}");
+    }
+}
+
