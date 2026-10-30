@@ -1368,6 +1368,18 @@ constructor runs.
 | the contract | the source text | MIR carries no attributes or doc comments |
 | the compiler | `DISCHARGE_RUSTC`, else `rustc` | `--emit=mir` needs nightly; naming it separately keeps cargo's `rustc` alone |
 
+The five differential oracles (z3, Kani, Lean, Coq, Verus) all build their terms
+with `smt::` calls, so they start *below* the contract reader. That left the reader
+— the layer that turns contract text into terms — with no independent check, and
+three parser bugs in a row (a negated literal read as unsigned, so `-7 % 3` was `0`;
+a cast applied before a negation, so `-x as u8` had the wrong type) were found by
+hand rather than by a gate. `the_contract_reader_agrees_with_rustc_on_a_grid` in
+`tests/mir.rs` closes it against `rustc` itself: a *value* construction (the body is
+the expression, so `ret == <expr>` is the agreement claim) and a *guard*
+construction (`x == v && <expr> > t`, which is where a wrong *type* shows up, since
+the value of `-x as u8` is the same under both readings but its type is not). The
+oracle is itself checked by reverting each fix and confirming it fails.
+
 ### The edition and the minimum compiler
 
 The crates are **edition 2024**, and `rust-version = "1.85"` in both manifests.

@@ -2790,3 +2790,127 @@ fn a_negation_binds_tighter_than_a_cast() {
     }
 }
 
+/// A differential oracle for the contract expression language, against rustc.
+///
+/// The five existing oracles (z3, Kani, Lean, Coq, Verus) all build their terms with
+/// `smt::` calls, so they start *below* the contract reader — the layer where three
+/// bugs in a row lived. This closes that gap using the one decision procedure that
+/// defines Rust: the compiler.
+///
+/// Two constructions, because the two bugs this found needed different ones:
+///
+/// * **Value** (`guard: None`). The body *is* the expression, so `ret` is rustc's
+///   value of `E` at `x == v`; the postcondition `ret == E` asserts the reader's value
+///   of `E` at the same point. This catches a wrong *value* — the signedness bug, where
+///   `-7 % 3` was read as `0`.
+///
+/// * **Guard** (`guard: Some(t)`). The precondition is `x == v && E > t`, so the
+///   comparison is decided at exactly `v`, and the body returns `1` with `ensures: ret
+///   == 1`. The function verifies iff rustc says `E > t` at `v`. This is what catches a
+///   wrong *type*: `-x as u8` and `-(x as u8)` have the same value (negation and
+///   truncation commute), so no value check sees the difference — but only one of them
+///   is `u8`, and the comparison is what reads the type. Pinning `x == v` makes the
+///   expected verdict exact, so a *vacuous* result is a failure and not a grey area.
+///
+/// The grid is the point. A single point per expression would have missed the
+/// signedness bug, so each case runs every value where a signed/unsigned confusion is
+/// visible: the extremes of the type, `-1`, `0`, `1`. Each case lists its own grid,
+/// because some expressions overflow at the extreme (`-x` for `x == i8::MIN` panics,
+/// and `(x + 1) << 1` overflows `u8` at `x == 127`) — a panic is a *true* verdict, but
+/// not the agreement this test is for.
+#[test]
+fn the_contract_reader_agrees_with_rustc_on_a_grid() {
+    // (expression, argument type, return type, grid, guard threshold)
+    type Case = (&'static str, &'static str, &'static str, &'static [i64], Option<u8>);
+    let cases: &[Case] = &[
+        // Signed remainder, division and arithmetic shift, over the grid. The negative
+        // points are what separate the signed engine from the unsigned one.
+        ("x % 3", "i8", "i8", &[-128, -7, -1, 0, 1, 7, 127], None),
+        ("x / 2", "i8", "i8", &[-128, -7, -1, 0, 1, 7, 127], None),
+        ("x >> 1", "i8", "i8", &[-128, -7, -1, 0, 1, 7, 127], None),
+        // A negated literal, the shape the first bug was about.
+        ("-7 % 3", "i8", "i8", &[0], None),
+        ("-7 / 2", "i8", "i8", &[0], None),
+        ("-8 >> 1", "i8", "i8", &[0], None),
+        // Unary `-` before the cast, as a *value*: both readings agree, so this half
+        // only guards against a fix that broke the value.
+        ("-x as u8", "i8", "u8", &[-7, -1, 0, 1, 127], None),
+        // The same expression as a *guard*, which is where the type is observable:
+        // `(-x) as u8 > 127` is true at `x == 1` (255), false under a signed reading.
+        ("-x as u8", "i8", "u8", &[-7, -1, 0, 1, 127], Some(127)),
+        // Casts: widening sign-extends, narrowing keeps the low bits, a chain is
+        // left to right.
+        ("x as i16", "i8", "i16", &[-128, -1, 0, 1, 127], None),
+        ("x as i8", "i16", "i8", &[-32768, -129, -1, 0, 1, 127, 128, 32767], None),
+        ("x as i8 as i32", "i16", "i32", &[-32768, -129, -1, 0, 1, 127, 128, 32767], None),
+        ("x as u16", "u8", "u16", &[0, 1, 128, 255], None),
+        // Precedence and associativity, on the grid.
+        ("x & 1 + 1", "u8", "u8", &[0, 1, 2, 3, 255], None),
+        ("x + 1 << 1", "u8", "u8", &[0, 1, 63, 126], None),
+        ("x | 1 ^ 1", "u8", "u8", &[0, 1, 255], None),
+        ("x << 2", "u8", "u8", &[0, 1, 63, 255], None),
+        ("8 - 4 - 2", "i32", "i32", &[0], None),
+        ("8 / 4 / 2", "u32", "u32", &[0], None),
+        // A negation of a name, and a double negation, which is the value again.
+        ("-x", "i8", "i8", &[-127, -1, 0, 1, 127], None),
+        ("- -x", "i8", "i8", &[-127, -1, 0, 1, 127], None),
+        // `0 - x` is a subtraction, not a negation, so it *overflows* at `x ==
+        // i8::MIN` (the body panics, a true verdict but not an agreement point).
+        ("0 - x", "i8", "i8", &[-127, -1, 0, 1, 127], None),
+        // The signedness of a comparison on a variable, over the whole grid.
+        ("x", "i8", "i8", &[-128, -7, -1, 0, 1, 7, 127], Some(0)),
+        ("x % 3", "i8", "i8", &[-128, -7, -1, 0, 1, 7, 127], Some(0)),
+    ];
+
+    let mut checked = 0u32;
+    for (expr, arg_ty, ret_ty, grid, guard) in cases {
+        for &v in *grid {
+            // A stable, identifier-safe name: the index, not the expression (which
+            // contains characters Rust will not take in a name).
+            let name = format!("oracle_{checked}");
+            let (src, want) = match guard {
+                // Value: body is the expression, postcondition asserts the reader's
+                // value equals rustc's.
+                None => (
+                    format!(
+                        "/// requires: x == {v}\n/// ensures: ret == {expr}\n\
+                         pub fn {name}(x: {arg_ty}) -> {ret_ty} {{ {expr} }}\n"
+                    ),
+                    true,
+                ),
+                // Guard: the body returns `1` and the precondition is the comparison
+                // pinned at `v`, so it verifies iff rustc's comparison is true.
+                Some(t) => {
+                    // Ask rustc for the comparison at this point, so the expectation is
+                    // the compiler's, not mine.
+                    let probe = format!(
+                        "/// requires: x == {v}\n/// ensures: ret == 1\n\
+                         pub fn {name}(x: {arg_ty}) -> u8 {{ if {expr} > {t} {{ 1 }} else {{ 0 }} }}\n"
+                    );
+                    // The probe's body is rustc's comparison; the value it returns is
+                    // what `expect_verified` must match. `1` means satisfiable.
+                    let o = verify_src(&name, &probe);
+                    let Some(o) = o else { return };
+                    // The probe verifies iff the body always returns `1`, which is true
+                    // only when the comparison holds at `v`.
+                    let truth = o.is_verified();
+                    let src = format!(
+                        "/// requires: x == {v} && {expr} > {t}\n/// ensures: ret == 1\n\
+                         pub fn {name}(x: {arg_ty}) -> u8 {{ 1 }}\n"
+                    );
+                    (src, truth)
+                }
+            };
+            let Some(o) = verify_src(&name, &src) else { return };
+            assert_eq!(
+                o.is_verified(),
+                want,
+                "the reader disagrees with rustc: `{expr}` at x == {v} ({arg_ty}), guard {guard:?} — expected verified={want}, got: {o}"
+            );
+            checked += 1;
+        }
+    }
+    // A run that checked nothing is not evidence.
+    assert!(checked >= 60, "the oracle checked only {checked} points");
+}
+

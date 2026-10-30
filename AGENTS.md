@@ -3938,3 +3938,38 @@ probing it against hand-checked answers found the next. The first two were refus
 or crashes; this one and the signedness bug were *wrong values*, which is the
 direction a verifier must never fail in.
 
+## The gap that let three bugs through: no oracle covered the contract reader
+
+The crate has five differential oracles (z3, Kani, Lean, Coq, Verus) and every one
+of them builds its terms with `smt::` calls directly. They all start *below* the
+contract reader — the layer where all three bugs above lived. So a whole layer had
+no independent check, and the bugs were found by hand-probing rather than by a gate.
+
+`the_contract_reader_agrees_with_rustc_on_a_grid` in `tests/mir.rs` closes that gap
+using the one decision procedure that *defines* Rust: `rustc` itself. Two
+constructions, because the two bugs needed different ones:
+
+* **Value.** The function's body *is* the expression, so `ret` is rustc's value; the
+  postcondition `ret == <expr>` asserts the reader's value at the same point. The
+  function verifies exactly when they agree. This catches a wrong *value* — the
+  signedness bug, where `-7 % 3` was read as `0`.
+* **Guard.** The precondition is `x == v && <expr> > t` and the body returns `1`, so
+  the function verifies iff rustc says the comparison holds. This catches a wrong
+  *type*: `-x as u8` and `-(x as u8)` have the same value, so no value check can see
+  the difference, but only one is `u8`, and the comparison is what reads the type.
+
+The grid is the point: one value per expression would have missed the signedness bug.
+Each case runs the type's extremes, `-1`, `0`, `1`.
+
+**The oracle is checked against the bugs it exists for.** A test that passes on both
+the fixed and the broken code is decoration, so each fix was reverted in turn and the
+oracle confirmed to fail: reverting the signedness fix makes it report `-7 % 3` at
+`x == 0` as a disagreement; reverting the cast precedence makes it report `-x as u8`
+at `x == 1` as vacuous where rustc says satisfiable. That the *guard* construction was
+needed for the second one is itself the finding — the value construction passes on the
+broken cast code, which is exactly why no value-based test caught that bug.
+
+What it does not cover, stated plainly: the grid is finite, so it is not a proof of
+completeness; and it checks the reader's direct evaluation, not the translation to
+SMT, which the z3 oracle covers. Together they span contract text to verdict.
+
