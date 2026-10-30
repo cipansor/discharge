@@ -1385,6 +1385,24 @@ Ordered BDD. Invariants that are easy to break and hard to debug:
 7. **`with_fresh` must not be nested.** The inner call wipes the arena while the
    outer scope still holds live `Var`s. The symptom is unbounded recursion, not a
    clean panic.
+8. **`blast` must stop on `overflow`, not walk to completion.** Once the node
+   table is full every `mk_node` returns `FALSE` without setting `overflow` again,
+   so nothing downstream notices. A fold-built term (`pow`, `udiv`) is a fan-out
+   DAG whose *unrolled* size is exponential in its step count, and `blast` visits
+   a shared subterm once per path to it -- so the walk runs for minutes on a query
+   that should have fallen back to SAT. The `overflow` check in `Ctx::blast` turns
+   "arena full" into "stop now"; the caller's `overflow` test then routes the query
+   to the SAT engine. `overflow` is checked *separately* from `stale`: marking the
+   query stale on overflow would refuse it (`Unknown`) instead of falling back.
+9. **A fold over a constant must not build the steps that cannot run.** The
+   general `pow_fold` gates every step with an `ite`, which is correct and also
+   exponential in the unrolled DAG; a literal exponent is known up front, so the
+   `smt::const_of` fast path skips the dead steps entirely. The two paths are the
+   same recurrence and `a_constant_exponent_agrees_with_a_symbolic_one` pins that
+   they agree, because "same recurrence" is an argument and not a measurement.
+   Note the symbolic path is still intractable at the BDD wall, so a corpus entry
+   with a *symbolic* exponent and a wide base cannot be posed; pin constant
+   exponents there.
 
 ## Conventions
 

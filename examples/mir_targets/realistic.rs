@@ -1473,3 +1473,148 @@ pub fn overflowing_add_wrapped_value_below_operand_tripwire(x: u8, y: u8) -> (u8
     x.overflowing_add(y)
 }
 
+
+// ---------------------------------------------------------------------------
+// The `pow` families, read through a `u32` exponent beside a base of the
+// method's own width.
+//
+// `pow` is the first modelled call with two operands of *different* types: the
+// base has the method's width and sign, and the exponent is the `u32` it is
+// declared as. The frontend reads the exponent on its own, from the argument's
+// type, rather than as a second operand at the base's width -- reading it at the
+// base's width would fold the wrong number of bits.
+//
+// All four families are modelled because `pow`'s failure is an *overflow*, and an
+// overflow is a value in every family: `wrapping_pow` wraps, `saturating_pow`
+// clamps, `checked_pow` returns `None` and `overflowing_pow` sets the flag. The
+// plain `pow`, which panics on overflow, is not modelled at all -- hiding that
+// panic is not something a proof may do.
+//
+// Each shape carries one verifying contract and one tripwire, per the standing
+// rule.
+// ---------------------------------------------------------------------------
+
+/// `wrapping_pow(2, 7)` is `128`, which fits in a `u8`; the same base at exponent
+/// `8` wraps to `0`. Stated on the wrapped value, where a wrong fold shows as a
+/// wrong number.
+/// requires: true
+/// ensures: ret == 128
+pub fn wrapping_pow_two_to_seven_is_128() -> u8 {
+    2u8.wrapping_pow(7)
+}
+
+/// The tripwire: `2^8` wraps to `0` at a `u8`. `256` cannot be written here --
+/// the frontend refuses a literal that does not fit the operand's width, which is
+/// the right refusal, so the claim names the *neighbouring* value instead: a
+/// model that stopped one step early, or folded at the wrong width and truncated
+/// only at the end, agrees on `2^7 == 128` and fails here.
+/// requires: true
+/// ensures: ret == 128
+pub fn wrapping_pow_two_to_eight_is_256_tripwire() -> u8 {
+    2u8.wrapping_pow(8)
+}
+
+/// `checked_pow` returns `None` exactly where `wrapping_pow` overflowed, so the
+/// match arms meet the `Some` case at `2^7`.
+/// requires: true
+/// ensures: ret == 128
+pub fn checked_pow_two_to_seven_is_some_128() -> u8 {
+    match 2u8.checked_pow(7) {
+        Some(v) => v,
+        None => 0,
+    }
+}
+
+/// The tripwire: `checked_pow(2, 8)` is `None`, so the `None` arm runs and the
+/// result is `0`, not `255`.
+/// requires: true
+/// ensures: ret == 255
+pub fn checked_pow_two_to_eight_is_none_tripwire() -> u8 {
+    match 2u8.checked_pow(8) {
+        Some(v) => v,
+        None => 0,
+    }
+}
+
+/// `saturating_pow(3, 5)` is `243`, in range, so no clamp happens.
+/// requires: true
+/// ensures: ret == 243
+pub fn saturating_pow_three_to_five_is_243() -> u8 {
+    3u8.saturating_pow(5)
+}
+
+/// The tripwire: `3^6` is `729`, past `u8::MAX`, so `saturating_pow` clamps to
+/// `255` rather than wrapping to `217`.
+/// requires: true
+/// ensures: ret == 217
+pub fn saturating_pow_three_to_six_clamps_tripwire() -> u8 {
+    3u8.saturating_pow(6)
+}
+
+/// The overflow flag is set exactly where the product overflowed, so either it
+/// fired or the value is the exact power -- and `2^7` does not overflow.
+/// requires: true
+/// ensures: ret.1 == false
+pub fn overflowing_pow_two_to_seven_did_not_overflow() -> (u8, bool) {
+    2u8.overflowing_pow(7)
+}
+
+/// The tripwire: `2^8` *does* overflow a `u8`, so the flag is `true` and the
+/// claim that it did not is false.
+/// requires: true
+/// ensures: ret.1 == false
+pub fn overflowing_pow_two_to_eight_flag_tripwire() -> (u8, bool) {
+    2u8.overflowing_pow(8)
+}
+
+/// A signed base: `(-2)^7` is `-128`, the one value in range at this magnitude,
+/// so the wrap does not happen and the result is exactly `MIN`.
+/// requires: true
+/// ensures: ret == -128
+pub fn wrapping_pow_negative_two_to_seven_is_min() -> i8 {
+    (-2i8).wrapping_pow(7)
+}
+
+/// The tripwire: `(-2)^8` is `256`, past `i8::MAX`, and wraps to `0`. The true
+/// value is not writable as an `i8` literal, so the claim names `i8::MAX`: a
+/// model that read the exponent's bits as signed, or that clamped the signed case
+/// to `MAX` instead of wrapping it, lands there and refutes the claim.
+/// requires: true
+/// ensures: ret == 127
+pub fn wrapping_pow_negative_two_to_eight_wraps_tripwire() -> i8 {
+    (-2i8).wrapping_pow(8)
+}
+
+/// `saturating_pow` of a negative base with an *odd* exponent is negative and
+/// past the range, so it clamps to `MIN` rather than `MAX`. This is the signed
+/// clamp direction, and it is the one a "clamp everything to `MAX`" model gets
+/// wrong.
+/// requires: true
+/// ensures: ret == -128
+pub fn saturating_pow_negative_base_clamps_to_min() -> i8 {
+    (-3i8).saturating_pow(5)
+}
+
+/// The tripwire: the same claim pinned to `MAX` is false, because the true result
+/// is negative.
+/// requires: true
+/// ensures: ret == 127
+pub fn saturating_pow_negative_base_to_max_tripwire() -> i8 {
+    (-3i8).saturating_pow(5)
+}
+
+/// `pow(x, 0)` is `1` for every base, including `0`. This is the fold's base
+/// case, and it is the one exponent every family agrees on.
+/// requires: true
+/// ensures: ret == 1
+pub fn wrapping_pow_zero_exponent_is_one(x: u8) -> u8 {
+    x.wrapping_pow(0)
+}
+
+/// The tripwire: `pow(x, 1)` is `x`, not `1`, for every base -- so the claim is
+/// false at every base other than `1`.
+/// requires: true
+/// ensures: ret == 1
+pub fn wrapping_pow_one_exponent_is_one_tripwire(x: u8) -> u8 {
+    x.wrapping_pow(1)
+}

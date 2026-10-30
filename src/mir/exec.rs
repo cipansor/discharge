@@ -1743,6 +1743,50 @@ fn try_intrinsic(
     // `sdiv` on an `i8` read as unsigned returns a huge positive quotient for
     // every negative operand, which is a wrong value rather than a weaker proof.
     let signed = sign.known()?;
+    // `pow` reads two operands of *different* types: the base has the method's
+    // width and sign, the exponent is the `u32` it is declared as. So the exponent
+    // is read on its own -- a `Val::Sym` and its width from the argument's type --
+    // and the fold is handed the two separately. Reading it as a second operand at
+    // `w` bits would read an `i8` exponent for a `u8` base, or a `u8` exponent for
+    // a `u32` one, and fold the wrong number of bits.
+    if let intrinsics::Intrinsic::Pow(_) = op {
+        let Some(exp_arg) = args.get(1) else {
+            return Some(Err(format!("unmodelled arity for `{name}`")));
+        };
+        let Some(exp_w) = operand_width(cur, exp_arg) else {
+            return Some(Err(format!("unmodelled exponent type for `{name}`")));
+        };
+        // The exponent is unsigned by construction (`u32`); a signed reading of
+        // its bits would make `exp == 0x8000_0000` a negative number.
+        let exp = match operand(env, exp_arg) {
+            Val::Sym(v, _) => v,
+            _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
+        };
+        if !intrinsics::pow_exponent_fits(exp_w) {
+            return Some(Err(format!("`{name}` exponent past the model's 32 bits")));
+        }
+        let Some(outcome) = intrinsics::eval(op, x, exp, w, signed, w) else {
+            return Some(Err(format!("`{name}` past what the model covers at {w} bits")));
+        };
+        let sign = Sign::of_bool(signed);
+        return Some(match outcome {
+            Outcome::Value(v) => {
+                env.set(dest, Val::Sym(v, sign));
+                Ok(())
+            }
+            Outcome::Option { tag, payload } => {
+                env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
+                env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(payload, sign), w);
+                Ok(())
+            }
+            Outcome::Tuple { value, overflowed } => {
+                let field = |i| Place { local: dest.local, proj: vec![Proj::Field(i)] };
+                env.set(&field(0), Val::Sym(value, sign));
+                env.set(&field(1), Val::Bool(overflowed));
+                Ok(())
+            }
+        });
+    }
     let y = match args.get(1) {
         Some(a) => match operand(env, a) {
             Val::Sym(v, _) => v,

@@ -1247,8 +1247,26 @@ impl Ctx {
         // read a stale node and then *build* a current node that refers back to the stale
         // id, so the graph contains a cycle whose every node is current. Stopping the
         // whole traversal on the first stale touch is what breaks it.
+        //
+        // `overflow` is checked here for the same reason and it is not optional: once the
+        // node table is full every `mk_node` returns `FALSE` *without* setting `overflow`
+        // again, so nothing below this point can notice, and the traversal keeps recursing.
+        // A term built by a fold (`pow`, the divider) is a DAG with heavy sharing, and
+        // walking it to completion visits a shared subterm once per path to it -- millions
+        // of times for a 32-step fold. That is not a slow answer, it is a hang: the query
+        // never returns to the caller that would have fallen back to the SAT engine. The
+        // check turns "the arena is full" into "stop now", and the caller's `overflow` test
+        // then routes the query to the fallback.
         if self.stale || t.gen_bits() != self.gen_masked() {
             self.stale = true;
+            out.fill(FALSE);
+            return;
+        }
+        // `overflow` stops the walk too, but it is *not* `stale`: an overflowed arena is a
+        // full one, not a wrong one, and the caller routes it to the SAT fallback rather
+        // than refusing. Setting `stale` here would turn a fallback into a refusal and
+        // would hide the SAT engine behind a query that never reaches it.
+        if self.overflow {
             out.fill(FALSE);
             return;
         }
@@ -1736,7 +1754,71 @@ pub fn bits(v: Var) -> u8 {
 /// constant amount stored in the node, and `Shr` is arithmetic (the sign bit
 /// replicates), matching the bit-blaster exactly.
 pub fn evaluate(t: Var, value: impl Fn(u32) -> Option<u64>) -> Option<u64> {
-    with_ctx(|c| eval_term(c, t.0, &value))
+    // The memo is local to this call, so it needs no invalidation: it cannot
+    // outlive the assignment it was computed under, and a later call starts from
+    // an empty table. It is bounded and small so that `Ctx` -- whose size the
+    // crate budgets statically -- does not grow by an arena's worth of memo.
+    let mut memo = EvalMemo::new();
+    with_ctx(|c| eval_term(c, t.0, &value, &mut memo))
+}
+
+/// A bounded memo for one [`evaluate`] walk.
+///
+/// `eval_term` walks a term's DAG, and a term built by a fold (`pow`, the
+/// divider) shares subterms heavily: without a memo the walk visits a shared
+/// subterm once per path to it, which is exponential in the number of steps. It
+/// is the same blow-up the BDD `neg` cache exists for, one layer up.
+///
+/// The table is direct-indexed by term slot with linear probing. A collision
+/// evicts the older entry rather than failing, which is sound because a miss only
+/// costs a recomputation -- the value is a pure function of the term and the
+/// assignment. The size is a working-set estimate: a `pow` fold is a few hundred
+/// terms, and the probe bound stops a pathological case from turning a memo miss
+/// into a linear scan.
+struct EvalMemo {
+    /// Term slot, or [`EVAL_MEMO_EMPTY`] when the entry is free.
+    slot: [u32; EVAL_MEMO_SLOTS],
+    val: [u64; EVAL_MEMO_SLOTS],
+}
+
+const EVAL_MEMO_SLOTS: usize = 1024;
+const EVAL_MEMO_EMPTY: u32 = u32::MAX;
+/// How far a lookup probes before giving up. A miss recomputes; it never fails.
+const EVAL_MEMO_PROBES: usize = 8;
+
+impl EvalMemo {
+    fn new() -> Self {
+        EvalMemo { slot: [EVAL_MEMO_EMPTY; EVAL_MEMO_SLOTS], val: [0; EVAL_MEMO_SLOTS] }
+    }
+
+    fn get(&self, slot: u32) -> Option<u64> {
+        let mut i = (slot as usize) & (EVAL_MEMO_SLOTS - 1);
+        for _ in 0..EVAL_MEMO_PROBES {
+            let k = self.slot[i];
+            if k == EVAL_MEMO_EMPTY {
+                return None;
+            }
+            if k == slot {
+                return Some(self.val[i]);
+            }
+            i = (i + 1) & (EVAL_MEMO_SLOTS - 1);
+        }
+        None
+    }
+
+    fn put(&mut self, slot: u32, val: u64) {
+        let mut i = (slot as usize) & (EVAL_MEMO_SLOTS - 1);
+        for _ in 0..EVAL_MEMO_PROBES {
+            if self.slot[i] == EVAL_MEMO_EMPTY || self.slot[i] == slot {
+                self.slot[i] = slot;
+                self.val[i] = val;
+                return;
+            }
+            i = (i + 1) & (EVAL_MEMO_SLOTS - 1);
+        }
+        // Every probe in the window is taken by another slot; drop the entry.
+        // Losing a memo costs time, never an answer.
+    }
 }
 
 /// [`evaluate`] for a predicate. `None` when some input is unknown.
@@ -1744,25 +1826,45 @@ pub fn evaluate_pred(p: Pred, value: impl Fn(u32) -> Option<u64>) -> Option<bool
     evaluate(Var(p.0), value).map(|v| v != 0)
 }
 
-fn eval_term(ctx: &mut Ctx, t: Term, value: &impl Fn(u32) -> Option<u64>) -> Option<u64> {
+fn eval_term(
+    ctx: &mut Ctx,
+    t: Term,
+    value: &impl Fn(u32) -> Option<u64>,
+    memo: &mut EvalMemo,
+) -> Option<u64> {
     if !ctx.is_current_term(t) {
         // A stale handle has no meaning to evaluate; `None` is "cannot say", which is
         // what `evaluate` already means by it.
         return None;
     }
+    let slot = t.slot() as u32;
+    if let Some(v) = memo.get(slot) {
+        return Some(v);
+    }
+    let v = eval_term_body(ctx, t, value, memo)?;
+    memo.put(slot, v);
+    Some(v)
+}
+
+fn eval_term_body(
+    ctx: &mut Ctx,
+    t: Term,
+    value: &impl Fn(u32) -> Option<u64>,
+    memo: &mut EvalMemo,
+) -> Option<u64> {
     let n = ctx.node_of(t);
     let w = n.width;
     let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
     let v = match n.op {
         Op::Var => return value(n.a).map(|x| x & mask),
         Op::Const => (n.a as u64) | ((n.hi as u64) << 32),
-        Op::Not => !eval_term(ctx, Term(n.a), value)? & mask,
-        Op::And => eval_term(ctx, Term(n.a), value)? & eval_term(ctx, Term(n.b), value)? & mask,
-        Op::Or => eval_term(ctx, Term(n.a), value)? | eval_term(ctx, Term(n.b), value)? & mask,
-        Op::Xor => eval_term(ctx, Term(n.a), value)? ^ eval_term(ctx, Term(n.b), value)? & mask,
+        Op::Not => !eval_term(ctx, Term(n.a), value, memo)? & mask,
+        Op::And => eval_term(ctx, Term(n.a), value, memo)? & eval_term(ctx, Term(n.b), value, memo)? & mask,
+        Op::Or => eval_term(ctx, Term(n.a), value, memo)? | eval_term(ctx, Term(n.b), value, memo)? & mask,
+        Op::Xor => eval_term(ctx, Term(n.a), value, memo)? ^ eval_term(ctx, Term(n.b), value, memo)? & mask,
         // The shift amount lives in the node, not in a term; see `shift`.
         Op::Shl => {
-            let a = eval_term(ctx, Term(n.a), value)?;
+            let a = eval_term(ctx, Term(n.a), value, memo)?;
             let sh = n.b;
             if sh >= 64 {
                 0
@@ -1771,7 +1873,7 @@ fn eval_term(ctx: &mut Ctx, t: Term, value: &impl Fn(u32) -> Option<u64>) -> Opt
             }
         }
         Op::LShr => {
-            let a = eval_term(ctx, Term(n.a), value)?;
+            let a = eval_term(ctx, Term(n.a), value, memo)?;
             let sh = n.b;
             if sh >= 64 {
                 0
@@ -1781,7 +1883,7 @@ fn eval_term(ctx: &mut Ctx, t: Term, value: &impl Fn(u32) -> Option<u64>) -> Opt
         }
         Op::Shr => {
             // Arithmetic: replicate the sign bit, matching the bit-blaster.
-            let a = eval_term(ctx, Term(n.a), value)? & mask;
+            let a = eval_term(ctx, Term(n.a), value, memo)? & mask;
             let sh = n.b;
             if sh >= w as u32 {
                 if a >> (w - 1) & 1 == 1 {
@@ -1794,29 +1896,29 @@ fn eval_term(ctx: &mut Ctx, t: Term, value: &impl Fn(u32) -> Option<u64>) -> Opt
                 (a >> sh) | (sign_fill & !(mask >> sh))
             }
         }
-        Op::Add => eval_term(ctx, Term(n.a), value)?.wrapping_add(eval_term(ctx, Term(n.b), value)?) & mask,
-        Op::Sub => eval_term(ctx, Term(n.a), value)?.wrapping_sub(eval_term(ctx, Term(n.b), value)?) & mask,
-        Op::Mul => eval_term(ctx, Term(n.a), value)?.wrapping_mul(eval_term(ctx, Term(n.b), value)?) & mask,
+        Op::Add => eval_term(ctx, Term(n.a), value, memo)?.wrapping_add(eval_term(ctx, Term(n.b), value, memo)?) & mask,
+        Op::Sub => eval_term(ctx, Term(n.a), value, memo)?.wrapping_sub(eval_term(ctx, Term(n.b), value, memo)?) & mask,
+        Op::Mul => eval_term(ctx, Term(n.a), value, memo)?.wrapping_mul(eval_term(ctx, Term(n.b), value, memo)?) & mask,
         Op::Eq => {
-            u64::from(eval_term(ctx, Term(n.a), value)? == eval_term(ctx, Term(n.b), value)?)
+            u64::from(eval_term(ctx, Term(n.a), value, memo)? == eval_term(ctx, Term(n.b), value, memo)?)
         }
         Op::Ult => {
-            u64::from(eval_term(ctx, Term(n.a), value)? < eval_term(ctx, Term(n.b), value)?)
+            u64::from(eval_term(ctx, Term(n.a), value, memo)? < eval_term(ctx, Term(n.b), value, memo)?)
         }
         Op::Ule => {
-            u64::from(eval_term(ctx, Term(n.a), value)? <= eval_term(ctx, Term(n.b), value)?)
+            u64::from(eval_term(ctx, Term(n.a), value, memo)? <= eval_term(ctx, Term(n.b), value, memo)?)
         }
         Op::Ite => {
-            let c = eval_term(ctx, Term(n.a), value)?;
+            let c = eval_term(ctx, Term(n.a), value, memo)?;
             if c != 0 {
-                eval_term(ctx, Term(n.b), value)?
+                eval_term(ctx, Term(n.b), value, memo)?
             } else {
-                eval_term(ctx, Term(n.c), value)?
+                eval_term(ctx, Term(n.c), value, memo)?
             }
         }
         Op::Trunc => {
             // Keep the low bits, zero-fill the rest.
-            let a = eval_term(ctx, Term(n.a), value)?;
+            let a = eval_term(ctx, Term(n.a), value, memo)?;
             let src = n.b;
             if src >= 64 {
                 a & mask
@@ -2208,8 +2310,10 @@ pub fn mul_eq(x: Var, y: Var, z: Var) -> Pred {
 ///
 /// `None` for anything else. The MIR frontend uses this to keep a shift by a
 /// *constant* amount on the cheap `Op::Shl` path instead of paying for a barrel
-/// shifter; both paths agree, but only one of them is free. Gated on `std` because
-/// the frontend that calls it is: without it this is dead code, and the bare-metal
+/// shifter; both paths agree, but only one of them is free. `pow_fold` uses it for
+/// the same reason: a constant exponent lets the fold skip the steps that cannot
+/// run instead of building them behind a zero gate. Gated on `std` because the
+/// frontend that calls it is: without it this is dead code, and the bare-metal
 /// gate builds with warnings denied.
 #[cfg(feature = "std")]
 pub(crate) fn const_of(v: Var) -> Option<u64> {

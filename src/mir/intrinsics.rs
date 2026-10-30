@@ -113,6 +113,17 @@ pub enum Intrinsic {
     /// unlike every other shape it is built at the operand's width and
     /// zero-extended to the destination's. It cannot fail.
     Bits(BitKind),
+    /// A `pow` in one of the four families: `wrapping_pow`, `saturating_pow`,
+    /// `checked_pow` or `overflowing_pow`.
+    ///
+    /// Its *exponent* is a `u32` operand while its *base* has the method's own
+    /// width, so unlike every other shape it reads two operands of different
+    /// types. It also cannot be written as one `BinOp`: `pow` is a fold over the
+    /// exponent's bits, so it is its own shape rather than a member of the
+    /// `Wrapping`/`Saturating`/`Checked`/`Overflowing` operators. The family is
+    /// carried for the same reason it is on `Unary`: the four disagree about the
+    /// failure case, and `pow`'s failure is an *overflow*, not a zero divisor.
+    Pow(Family),
 }
 
 /// Which family of a `core::num` method name a call belongs to.
@@ -214,6 +225,10 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     match op {
         "neg" => return Some(Intrinsic::Unary(family, UnOp::Neg)),
         "abs" => return Some(Intrinsic::Unary(family, UnOp::Abs)),
+        // `pow` is a fold over the exponent's bits rather than one operator, so
+        // it is its own shape too. It is matched here rather than falling into
+        // the operator table below, which has no `pow` entry and would refuse it.
+        "pow" => return Some(Intrinsic::Pow(family)),
         _ => {}
     }
     let op = match op {
@@ -288,6 +303,19 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
             BinOp::Shl | BinOp::Shr | BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt
             | BinOp::Ge => false,
         },
+        // `pow`. Unlike the families above it reads a `u32` exponent beside a
+        // base of the method's own width, so it is its own shape. It is modelled
+        // only where a *product* is: the fold's every step is a `mul_failure`
+        // query, and past [`MUL_MAX_WIDTH`] the widened multiply is the scaling
+        // wall, so the answer would be "unknown" at the first step anyway.
+        //
+        // All four families are modelled, and `pow` is not the division trap: its
+        // failure is an overflow, and an overflow is a *value* in every family --
+        // `wrapping` wraps, `saturating` clamps, `checked` returns `None` and
+        // `overflowing` sets the flag. Nothing here can panic, so there is no
+        // panic to hide. The plain `pow`, which panics on overflow, is not a
+        // modelled name at all: `classify` has no prefix for it.
+        Intrinsic::Pow(_) => w <= MUL_MAX_WIDTH,
     }
 }
 
@@ -304,7 +332,7 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
 /// written to -- a term narrower than its local would make the next read of that
 /// local ill-formed.
 pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) -> Option<Outcome> {
-    if !is_modelled(op, w, signed) || result_w == 0 || result_w > 64 {
+    if !is_modelled(op, w, signed) {
         return None;
     }
     Some(match op {
@@ -314,8 +342,16 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
         // -> `u32`). Building it wide here would add terms the extension throws
         // away, and for the fixed-width reading where `w == result_w` it is a
         // no-op.
-        Intrinsic::Bits(kind) => Outcome::Value(smt::truncate(bit_count(kind, x), result_w)),
+        Intrinsic::Bits(kind) => {
+            if result_w == 0 || result_w > 64 {
+                return None;
+            }
+            Outcome::Value(smt::truncate(bit_count(kind, x), result_w))
+        }
         Intrinsic::Unary(family, un) => {
+            if result_w == 0 || result_w > 64 {
+                return None;
+            }
             let fails = unary_failure(un, x, w, signed)?;
             let plain = unary_result(un, x, w);
             match family {
@@ -352,16 +388,25 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             }
         }
         Intrinsic::Wrapping(bin) => {
+            if result_w == 0 || result_w > 64 {
+                return None;
+            }
             let plain = plain_result(bin, x, y, signed)?;
             Outcome::Value(smt::truncate(plain, result_w))
         }
         Intrinsic::Saturating(bin) => {
+            if result_w == 0 || result_w > 64 {
+                return None;
+            }
             let plain = plain_result(bin, x, y, signed)?;
             let bound = saturation_bound(bin, x, y, w, signed)?;
             let fails = failure(bin, x, y, w, signed)?;
             Outcome::Value(smt::truncate(smt::ite(fails, bound, plain), result_w))
         }
         Intrinsic::Checked(bin) => {
+            if result_w == 0 || result_w > 64 {
+                return None;
+            }
             let plain = plain_result(bin, x, y, signed)?;
             let fails = failure(bin, x, y, w, signed)?;
             Outcome::Option {
@@ -370,9 +415,37 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             }
         }
         Intrinsic::Overflowing(bin) => {
+            if result_w == 0 || result_w > 64 {
+                return None;
+            }
             let plain = plain_result(bin, x, y, signed)?;
             let fails = failure(bin, x, y, w, signed)?;
             Outcome::Tuple { value: smt::truncate(plain, result_w), overflowed: fails }
+        }
+        // `pow`. `y` is the *exponent*, a `u32` operand, and `w` is the base's
+        // width -- which is why `result_w` is not guarded here: the base and the
+        // result share the method's width, so a `result_w` other than `w` would be
+        // a different shape, not a wider one.
+        Intrinsic::Pow(family) => {
+            if result_w != w {
+                return None;
+            }
+            let (value, fails) = pow_fold(x, y, w, signed)?;
+            match family {
+                Family::Wrapping => Outcome::Value(value),
+                Family::Saturating => {
+                    // `pow`'s magnitude is non-decreasing in the base, so an
+                    // overflow can only push the result past a bound, never back
+                    // inside one. `pow(0, 0)` is `1` in every family, which is why
+                    // the `0^0` corner is not a failure.
+                    Outcome::Value(smt::ite(fails, saturation_end(x, y, w, signed)?, value))
+                }
+                Family::Checked => Outcome::Option {
+                    tag: smt::ite(fails, smt::word(0, w), smt::word(1, w)),
+                    payload: value,
+                },
+                Family::Overflowing => Outcome::Tuple { value, overflowed: fails },
+            }
         }
     })
 }
@@ -515,32 +588,9 @@ fn failure(op: BinOp, x: Var, y: Var, w: u8, signed: bool) -> Option<Pred> {
         }
         BinOp::Sub => smt::ult(x, y),
         // A product wraps exactly when the exact result needs more than `w` bits.
-        // The exact result is built by widening: `truncate` zero-extends when the
-        // target is wider, so the operands are widened to `2w` and multiplied
-        // exactly there. Exact rather than a sufficient condition, because a
-        // too-weak predicate would make an overflowing function look panic-free.
-        BinOp::Mul => {
-            let wide = w.saturating_mul(2).min(64);
-            if wide <= w || wide > 16 {
-                return None;
-            }
-            if signed {
-                // The `2w`-bit product of two `w`-bit signed values always fits
-                // in `2w` signed bits, so this multiply cannot itself wrap. The
-                // result is right exactly when it equals the `w`-bit wrapped
-                // result sign-extended back to `2w`; comparing a *zero*-extended
-                // result would fire on every negative product.
-                let exact = smt::mul(smt::sign_extend(x, wide), smt::sign_extend(y, wide));
-                let want = smt::sign_extend(smt::mul(x, y), wide);
-                smt::not(smt::eq(exact, want))
-            } else {
-                let exact = smt::mul(smt::truncate(x, wide), smt::truncate(y, wide));
-                // 2^w, as a constant in the widened width.
-                let limit = 1u64 << (w - 1);
-                let limit = limit.saturating_mul(2);
-                smt::uge_const(exact, limit)
-            }
-        }
+        // The predicate is `mul_failure`'s, shared with `pow`, so a `saturating_mul`
+        // and a `pow` step cannot disagree about what a product overflow is.
+        BinOp::Mul => return mul_failure(x, y, w, signed),
         // Division and remainder fail on a zero divisor. The signed forms fail
         // on `MIN / -1` as well: the quotient is not representable, and
         // `checked_div` returns `None` there rather than wrapping.
@@ -554,6 +604,163 @@ fn failure(op: BinOp, x: Var, y: Var, w: u8, signed: bool) -> Option<Pred> {
         BinOp::Div | BinOp::Rem => smt::eq_const(y, 0),
         _ => return None,
     })
+}
+
+/// When a `w`-bit product has no representable result.
+///
+/// This is the `Mul` arm of [`failure`], lifted out because `pow` needs it for
+/// every step of its fold: the two must agree on what a product overflow is, and
+/// two copies of a widened multiply could drift. It is exact rather than
+/// sufficient -- a too-weak predicate would make an overflowing function look
+/// panic-free.
+///
+/// The exact result is built by widening: `truncate` zero-extends when the target
+/// is wider, so the operands are widened to `2w` and multiplied exactly there.
+/// Past `2w == 16` the widened multiply is the scaling wall this crate documents,
+/// so the model declines and the caller reports the path unknown.
+fn mul_failure(x: Var, y: Var, w: u8, signed: bool) -> Option<Pred> {
+    let wide = w.saturating_mul(2).min(64);
+    if wide <= w || wide > 16 {
+        return None;
+    }
+    Some(if signed {
+        // The `2w`-bit product of two `w`-bit signed values always fits in `2w`
+        // signed bits, so this multiply cannot itself wrap. The result is right
+        // exactly when it equals the `w`-bit wrapped result sign-extended back to
+        // `2w`; comparing a *zero*-extended result would fire on every negative
+        // product.
+        let exact = smt::mul(smt::sign_extend(x, wide), smt::sign_extend(y, wide));
+        let want = smt::sign_extend(smt::mul(x, y), wide);
+        smt::not(smt::eq(exact, want))
+    } else {
+        let exact = smt::mul(smt::truncate(x, wide), smt::truncate(y, wide));
+        // 2^w, as a constant in the widened width.
+        let limit = 1u64 << (w - 1);
+        let limit = limit.saturating_mul(2);
+        smt::uge_const(exact, limit)
+    })
+}
+
+/// The wrapped value and the overflow flag of `base.pow(exp)`, by squaring.
+///
+/// `exp` is the *exponent* operand, a `u32`; `w` is the base's width. The fold is
+/// the right-to-left binary exponentiation Rust itself performs, unrolled one step
+/// per exponent bit rather than run as a loop, because the model is a term and not
+/// a program:
+///
+/// ```text
+/// result = 1; base = x
+/// for k in 0..32:
+///     result = if bit_k(exp) { result * base } else { result }
+///     base   = if any bit above k of exp is set { base * base } else { base }
+/// ```
+///
+/// Every step is a `w`-bit multiply, and the flag is the `or` of the *product*
+/// overflow of the steps that actually ran. That is the whole subtlety: a squaring
+/// the fold discards must not contribute its overflow, so both the value and the
+/// flag are gated on the same condition. Ungating the flag made `pow` report an
+/// overflow for a `2` that never had one -- and it is the same gate, not two that
+/// could drift, because the value and the flag are read from the one step.
+///
+/// `result` and `base` start at `1` and `x`, so `exp == 0` yields `1` and no step
+/// runs -- which is `pow(x, 0) == 1` for every `x`, `0` included.
+///
+/// The base has the operand's sign and the exponent does not: the exponent is a
+/// `u32` count, and a signed reading of its bits would make `exp == 0x8000_0000`
+/// a negative number and the fold a different function.
+fn pow_fold(x: Var, exp: Var, w: u8, signed: bool) -> Option<(Var, Pred)> {
+    // A constant exponent is the common case in a specification (`x.pow(3)`), and
+    // it is also the case the general fold cannot carry: the 32-step fold below
+    // builds a fan-out DAG whose *unrolled* size is exponential in the number of
+    // steps, and the bit-blaster walks a DAG once per path to a shared node. That
+    // is a hang, not a slow answer. A literal exponent is known before the fold
+    // starts, so the steps that cannot run are skipped here rather than built and
+    // then multiplied by a zero gate.
+    //
+    // The two paths must agree. The general fold computes `x^e` by binary
+    // exponentiation over the exponent's bits, and the fast path is the same
+    // recurrence with the bits read from a `u64` -- so a mismatch would be a bug
+    // in this branch, which the differential test sweeps.
+    if let Some(e) = smt::const_of(exp) {
+        let e = e & 0xFFFF_FFFF;
+        let mut result = smt::word(1, w);
+        let mut base = x;
+        let mut flag = smt::truth(false);
+        let mut k = 0u32;
+        while k < 32 {
+            if (e >> k) & 1 == 1 {
+                let (product, product_overflows) = mul_step(result, base, w, signed)?;
+                result = product;
+                flag = smt::or(flag, product_overflows);
+            }
+            k += 1;
+            // Only square while a higher exponent bit remains. A squaring whose
+            // result no later step reads is dead, and at the BDD wall a dead
+            // subterm is not free: it is still a term in the arena and still
+            // walked if anything reaches it.
+            if k < 32 && (e >> k) != 0 {
+                let (square, square_overflows) = mul_step(base, base, w, signed)?;
+                base = square;
+                flag = smt::or(flag, square_overflows);
+            }
+        }
+        return Some((result, flag));
+    }
+    let one = smt::word(1, w);
+    let mut result = one;
+    let mut base = x;
+    // The overflow of the steps that ran. `or`-ing in the overflow of a step that
+    // did not run would report an overflow that never happened.
+    let mut flag = smt::truth(false);
+    for k in 0..32 {
+        let bit = smt::bit_set(exp, k);
+        let (product, product_overflows) = mul_step(result, base, w, signed)?;
+        result = smt::ite(bit, product, result);
+        flag = smt::or(flag, smt::and(bit, product_overflows));
+        if k + 1 < 32 {
+            // A squaring is only needed while a higher exponent bit remains. The
+            // gate is a test on the exponent's *bits*, which are unsigned, so
+            // `uge_const` is the right order here and a signed compare would be
+            // wrong for a top bit set.
+            let higher = smt::uge_const(exp, 1u64 << (k + 1));
+            let (square, square_overflows) = mul_step(base, base, w, signed)?;
+            base = smt::ite(higher, square, base);
+            flag = smt::or(flag, smt::and(higher, square_overflows));
+        }
+    }
+    Some((result, flag))
+}
+
+/// One `w`-bit multiply: its wrapped value and whether it overflowed.
+///
+/// The value is MIR's plain `*`, the same term a hand-written `a * b` produces, so
+/// the fold's steps cannot disagree with a plain multiply about what wrapping is.
+fn mul_step(a: Var, b: Var, w: u8, signed: bool) -> Option<(Var, Pred)> {
+    Some((smt::mul(a, b), mul_failure(a, b, w, signed)?))
+}
+
+/// The bound `saturating_pow` takes when the result overflows.
+///
+/// The direction is the sign of the *true* result, and `pow` is simpler than the
+/// two-operand `saturating_*` here: the magnitude only ever grows with the base, so
+/// the result is negative exactly when the base is negative and the exponent is
+/// odd. Every other overflowing case is above `MAX`.
+fn saturation_end(x: Var, exp: Var, w: u8, signed: bool) -> Option<Var> {
+    let (lo, hi) = bounds(w, signed)?;
+    if !signed {
+        return Some(hi);
+    }
+    Some(smt::ite(smt::and(smt::negative(x), smt::bit_set(exp, 0)), lo, hi))
+}
+
+/// Whether every exponent the model can represent is covered by the fold.
+///
+/// The fold runs 32 steps, so it is exact for a `u32` exponent and would silently
+/// truncate a wider one. The caller reads the exponent's width from the dump, so
+/// this is a check rather than an assumption -- and a wider exponent is refused
+/// rather than folded with its top bits dropped.
+pub fn pow_exponent_fits(exp_w: u8) -> bool {
+    exp_w <= 32
 }
 
 /// The value a saturating operation takes when it would overflow.
@@ -786,6 +993,358 @@ mod tests {
             });
         });
     }
+
+    /// The exponents a `pow` walk sweeps.
+    ///
+    /// `pow`'s exponent is a `u32`, so the full cross product is `2^32` per base
+    /// and cannot be walked. The sweep is instead the range where the fold's
+    /// *control flow* can differ -- every exponent up to 256 covers all values
+    /// whose low eight bits vary -- plus the boundaries where a step's gating
+    /// changes: `2^k - 1`, `2^k`, `2^k + 1` for every `k` in the fold, and the
+    /// extremes. Between them those exercise every branch of the unrolled fold,
+    /// including the "no higher bit remains" cut at each position.
+    fn pow_exponents() -> Vec<u32> {
+        let mut e: Vec<u32> = (0..=256).collect();
+        // The `2^k +/- 1` boundaries only matter where the *gate* flips, and the
+        // low 17 positions are where a `u8`/`i8` base can still be in range; past
+        // that every exponent overflows every base, and the extremes below pin the
+        // high gates.
+        for k in 0..=16u32 {
+            let p = 1u32 << k;
+            e.push(p.wrapping_sub(1));
+            e.push(p);
+            e.push(p.wrapping_add(1));
+        }
+        e.extend([
+            u32::MAX,
+            u32::MAX - 1,
+            u32::MAX / 2,
+            u32::MAX / 2 + 1,
+            1 << 30,
+            (1 << 24) + 1,
+        ]);
+        e.sort_unstable();
+        e.dedup();
+        e
+    }
+
+    /// Check a `pow` family against `core` over every base and the exponent set.
+    ///
+    /// One helper for all four families, because they share the fold: a
+    /// `wrapping_pow` and an `overflowing_pow` that disagreed about the wrapped
+    /// value would be two definitions of `pow`, and checking them through one
+    /// walk is what stops that. `oracle` returns the expected `(value, flag)`,
+    /// or `None` for the `checked_pow` case where `core` returns `None`, and it
+    /// calls the real `core` method so the expectation is never a copy of the
+    /// model.
+    fn check_pow(
+        op: Intrinsic,
+        w: u8,
+        signed: bool,
+        base_from: impl Fn(u64) -> i64,
+        base_to: impl Fn(i64) -> u64,
+        oracle: impl Fn(i64, u32) -> Option<(i64, bool)>,
+        label: &str,
+    ) {
+        smt::with_fresh(|| {
+            let base = smt::var(w);
+            let exp = smt::var(32);
+            let outcome = eval(op, base, exp, w, signed, w)
+                .unwrap_or_else(|| panic!("{label} at {w} bits must be modelled"));
+            let (bi, ei) = (smt::index(base), smt::index(exp));
+            let n = 1u64 << w;
+            for xb in 0..n {
+                let x = base_from(xb);
+                for e in pow_exponents() {
+                    let env = |i: u32| {
+                        if i == bi {
+                            Some(xb)
+                        } else if i == ei {
+                            Some(u64::from(e))
+                        } else {
+                            None
+                        }
+                    };
+                    let (got_some, got_val, got_flag) = match outcome {
+                        Outcome::Value(v) => (None, smt::evaluate(v, env), None),
+                        Outcome::Option { tag, payload } => (
+                            smt::evaluate(tag, env).map(|t| t != 0),
+                            smt::evaluate(payload, env),
+                            None,
+                        ),
+                        Outcome::Tuple { value, overflowed } => (
+                            smt::evaluate_pred(overflowed, env),
+                            smt::evaluate(value, env),
+                            smt::evaluate_pred(overflowed, env),
+                        ),
+                    };
+                    let want = oracle(x, e);
+                    let Some((wv, wf)) = want else {
+                        assert_eq!(
+                            got_some,
+                            Some(false),
+                            "{label} at ({x}, {e}): the model says `Some`, Rust says `None`"
+                        );
+                        continue;
+                    };
+                    assert_eq!(
+                        got_val,
+                        Some(base_to(wv)),
+                        "{label} at ({x}, {e}): value mismatch"
+                    );
+                    // An `Option` outcome carries the flag in its tag, a `Tuple`
+                    // in field 1; both are read above, so one assertion covers
+                    // whichever shape this family produced.
+                    if let Some(gf) = got_flag {
+                        assert_eq!(gf, wf, "{label} at ({x}, {e}): overflow flag mismatch");
+                    }
+                }
+            }
+        });
+    }
+
+    /// `wrapping_pow` and `overflowing_pow` against `core`, over all of `u8`/`i8`
+    /// and the exponent sweep.
+    ///
+    /// The two families are checked together because they must agree on the
+    /// *wrapped* value while disagreeing on nothing else: `wrapping_pow` is
+    /// `overflowing_pow` with the flag dropped. `checked_pow` is here too, so the
+    /// `None` boundary is pinned to the same flag -- if the fold reported an
+    /// overflow the other two did not, one of the three would fail.
+    #[test]
+    fn the_pow_families_agree_with_rust() {
+        // `wrapping_pow`: the flag is discarded, so the oracle returns the value
+        // with a flag that is never read.
+        check_pow(
+            Intrinsic::Pow(Family::Wrapping),
+            8,
+            false,
+            unident,
+            ident,
+            |x, e| Some((u8::wrapping_pow(x as u8, e) as i64, false)),
+            "wrapping_pow u8",
+        );
+        check_pow(
+            Intrinsic::Pow(Family::Wrapping),
+            8,
+            true,
+            to_i8,
+            i8_bits,
+            |x, e| Some((i8::wrapping_pow(x as i8, e) as i64, false)),
+            "wrapping_pow i8",
+        );
+        // `overflowing_pow`: the flag is the shared overflow predicate.
+        check_pow(
+            Intrinsic::Pow(Family::Overflowing),
+            8,
+            false,
+            unident,
+            ident,
+            |x, e| {
+                let (v, o) = u8::overflowing_pow(x as u8, e);
+                Some((v as i64, o))
+            },
+            "overflowing_pow u8",
+        );
+        check_pow(
+            Intrinsic::Pow(Family::Overflowing),
+            8,
+            true,
+            to_i8,
+            i8_bits,
+            |x, e| {
+                let (v, o) = i8::overflowing_pow(x as i8, e);
+                Some((v as i64, o))
+            },
+            "overflowing_pow i8",
+        );
+        // `checked_pow`: `None` exactly where the flag is set.
+        check_pow(
+            Intrinsic::Pow(Family::Checked),
+            8,
+            false,
+            unident,
+            ident,
+            |x, e| u8::checked_pow(x as u8, e).map(|v| (v as i64, false)),
+            "checked_pow u8",
+        );
+        check_pow(
+            Intrinsic::Pow(Family::Checked),
+            8,
+            true,
+            to_i8,
+            i8_bits,
+            |x, e| i8::checked_pow(x as i8, e).map(|v| (v as i64, false)),
+            "checked_pow i8",
+        );
+    }
+
+    /// `saturating_pow` against `core`, over all of `u8`/`i8`.
+    ///
+    /// This is the one family whose result is a *clamp*, so the value at an
+    /// overflow is the interesting part: it has to land on the right bound, and
+    /// the signed case picks between `MIN` and `MAX` by the sign of the true
+    /// result. A model that clamped both signs to `MAX` would agree with `core`
+    /// for every non-negative base and fail on the negative ones -- which is what
+    /// the `i8` walk covers.
+    #[test]
+    fn saturating_pow_agrees_with_rust() {
+        check_pow(
+            Intrinsic::Pow(Family::Saturating),
+            8,
+            false,
+            unident,
+            ident,
+            |x, e| Some((u8::saturating_pow(x as u8, e) as i64, false)),
+            "saturating_pow u8",
+        );
+        check_pow(
+            Intrinsic::Pow(Family::Saturating),
+            8,
+            true,
+            to_i8,
+            i8_bits,
+            |x, e| Some((i8::saturating_pow(x as i8, e) as i64, false)),
+            "saturating_pow i8",
+        );
+    }
+
+    /// A constant exponent takes a different path through the fold than a symbolic
+    /// one, and the two must agree.
+    ///
+    /// `pow_fold` fast-paths a literal exponent: it reads the exponent's bits from
+    /// a `u64` and builds only the steps that run, because the general fold's
+    /// `ite`-gated fan-out is exponential in the unrolled size and the bit-blaster
+    /// cannot carry it (the query hangs rather than answering `Unknown`). The
+    /// fast path is the same binary-exponentiation recurrence, so it is the same
+    /// function -- but "same recurrence" is an argument, not a measurement. This
+    /// pins it: for every exponent in the sweep, the constant `e` term and the
+    /// symbolic term bound to `e` are *evaluated* and compared bit for bit, at
+    /// every base of a `u8`.
+    ///
+    /// Both sides go through `smt::evaluate`, so this is the model's arithmetic
+    /// and not the blaster's -- which is the point. The blaster is what the fast
+    /// path exists to spare, so a test that needed it could not check the branch
+    /// that removes the load.
+    #[test]
+    fn a_constant_exponent_agrees_with_a_symbolic_one() {
+        for family in [Family::Wrapping, Family::Checked, Family::Saturating, Family::Overflowing] {
+            for signed in [false, true] {
+                let (w, to_signed, to_bits) = if signed {
+                    (8u8, to_i8 as fn(u64) -> i64, i8_bits as fn(i64) -> u64)
+                } else {
+                    (8u8, unident as fn(u64) -> i64, ident as fn(i64) -> u64)
+                };
+                smt::with_fresh(|| {
+                    let base = smt::var(w);
+                    let sym = smt::var(32);
+                    let bi = smt::index(base);
+                    let si = smt::index(sym);
+                    for e in pow_exponents() {
+                        let env = |i: u32| {
+                            if i == bi {
+                                None
+                            } else if i == si {
+                                Some(u64::from(e))
+                            } else {
+                                None
+                            }
+                        };
+                        let constant = smt::word(u64::from(e), 32);
+                        for xb in 0..(1u64 << w) {
+                            let read = |outcome: Outcome| match outcome {
+                                Outcome::Value(v) => (smt::evaluate(v, |i| {
+                                    if i == bi { Some(xb) } else { env(i) }
+                                }), None, None),
+                                Outcome::Option { tag, payload } => (
+                                    smt::evaluate(payload, |i| if i == bi { Some(xb) } else { env(i) }),
+                                    smt::evaluate(tag, |i| if i == bi { Some(xb) } else { env(i) }),
+                                    None,
+                                ),
+                                Outcome::Tuple { value, overflowed } => (
+                                    smt::evaluate(value, |i| if i == bi { Some(xb) } else { env(i) }),
+                                    None,
+                                    smt::evaluate_pred(overflowed, |i| if i == bi { Some(xb) } else { env(i) }),
+                                ),
+                            };
+                            let from_const = eval(Intrinsic::Pow(family), base, constant, w, signed, w)
+                                .unwrap_or_else(|| panic!("{family:?} const must be modelled"));
+                            let from_sym = eval(Intrinsic::Pow(family), base, sym, w, signed, w)
+                                .unwrap_or_else(|| panic!("{family:?} symbolic must be modelled"));
+                            assert_eq!(
+                                read(from_const),
+                                read(from_sym),
+                                "{family:?} signed={signed} base={} exp={e}: the constant-exponent \
+                                 fast path and the symbolic fold disagree",
+                                to_bits(to_signed(xb))
+                            );
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    /// `pow` is modelled only where a product is, and the exponent's width is a
+    /// check rather than an assumption.
+    #[test]
+    fn pow_is_modelled_only_where_a_product_is() {
+        // `pow`'s every step is a widened multiply, so it shares `MUL_MAX_WIDTH`.
+        assert!(is_modelled(Intrinsic::Pow(Family::Wrapping), MUL_MAX_WIDTH, false));
+        assert!(!is_modelled(Intrinsic::Pow(Family::Wrapping), MUL_MAX_WIDTH + 1, false));
+        assert!(eval(
+            Intrinsic::Pow(Family::Overflowing),
+            smt::var(MUL_MAX_WIDTH),
+            smt::var(32),
+            MUL_MAX_WIDTH,
+            false,
+            MUL_MAX_WIDTH
+        )
+        .is_some());
+        assert!(eval(
+            Intrinsic::Pow(Family::Overflowing),
+            smt::var(MUL_MAX_WIDTH + 1),
+            smt::var(32),
+            MUL_MAX_WIDTH + 1,
+            false,
+            MUL_MAX_WIDTH + 1
+        )
+        .is_none());
+        // The fold runs 32 steps, so a `u32` exponent is the whole domain and a
+        // wider one would be silently truncated.
+        assert!(pow_exponent_fits(32));
+        assert!(!pow_exponent_fits(33));
+        assert!(!pow_exponent_fits(64));
+    }
+
+    /// The `pow` names classify into the four families, and their neighbours do
+    /// not.
+    ///
+    /// `pow` is matched before the operator table, so the thing to pin is that
+    /// the family prefix is read and that a name *containing* `pow` -- or the
+    /// panic-on-overflow `pow` itself -- does not silently become a modelled call.
+    #[test]
+    fn the_pow_names_classify_and_their_neighbours_do_not() {
+        assert_eq!(classify("wrapping_pow"), Some(Intrinsic::Pow(Family::Wrapping)));
+        assert_eq!(classify("saturating_pow"), Some(Intrinsic::Pow(Family::Saturating)));
+        assert_eq!(classify("checked_pow"), Some(Intrinsic::Pow(Family::Checked)));
+        assert_eq!(classify("overflowing_pow"), Some(Intrinsic::Pow(Family::Overflowing)));
+        // The qualified path rustc prints resolves to the same item.
+        assert_eq!(
+            classify("core::num::<impl u8>::wrapping_pow"),
+            Some(Intrinsic::Pow(Family::Wrapping))
+        );
+        // The plain `pow` panics on overflow and has no family prefix, so it is
+        // refused rather than modelled -- and so is `pow` under a prefix that is
+        // not one of the four.
+        assert_eq!(classify("pow"), None);
+        assert_eq!(classify("core::num::<impl u8>::pow"), None);
+        assert_eq!(classify("unchecked_pow"), None);
+        assert_eq!(classify("powf"), None);
+        assert_eq!(classify("next_power_of_two"), None);
+    }
+
+
 
     /// The `overflowing_*` family, two-operand, against `core` over all of `u8`
     /// and `i8`.
@@ -1186,9 +1745,9 @@ mod tests {
     /// `is_modelled`/`eval`. Both must refuse; neither may approximate.
     #[test]
     fn unmodelled_names_are_refused() {
-        // Unknown operator: `pow` and `shl` are not in the operator table, so the
-        // whole suffix fails to match.
-        assert!(classify("saturating_pow").is_none());
+        // Unknown operator: `shl` is not in the operator table, so the whole
+        // suffix fails to match. (`pow` *is* modelled now -- it is its own shape,
+        // not an operator -- so it is no longer an example here.)
         assert!(classify("wrapping_shl").is_none());
         assert!(classify("checked_shl").is_none());
         assert!(classify("unchecked_add").is_none());
@@ -1575,8 +2134,9 @@ mod tests {
         assert!(classify("abs").is_none());
         assert!(classify("wrapping_neg_signed").is_none());
         assert!(classify("checked_abs_signed").is_none());
-        assert!(classify("saturating_pow").is_none());
-        assert!(classify("wrapping_pow").is_none());
+        // `pow` classifies now (as `Intrinsic::Pow`, its own shape), so the
+        // unmodelled examples here are the names that stay unmodelled.
+        assert!(classify("powf").is_none());
         assert!(classify("count_zeros").is_none());
         assert!(classify("count_ones_signed").is_none());
     }

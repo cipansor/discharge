@@ -2202,6 +2202,74 @@ fn the_zero_counts_are_modelled() {
     );
 }
 
+/// The four `pow` families are modelled, and the exponent is a `u32` *beside* a
+/// base of the method's own width.
+///
+/// `pow` is the first modelled call whose two operands have different types. The
+/// verifying entries pin the fold where the base's width matters (`2^7 == 128`
+/// fits a `u8`, `2^8` wraps), and each tripwire states a *neighbouring* value --
+/// one step off the true result -- so a model that folded at the wrong width, or
+/// stopped a step early, refutes it. The signed entries pin the *clamp
+/// direction*: `saturating_pow` of a negative base with an odd exponent clamps to
+/// `MIN`, and a "clamp everything to `MAX`" model proves the `MAX` tripwire
+/// instead of refuting it.
+///
+/// Every tripwire must be `Failed`, not `Skipped`: a `Skipped` would mean the
+/// name is not modelled at all.
+#[test]
+fn the_pow_families_are_modelled_with_a_wide_exponent() {
+    let Some(report) = verify_realistic(&[
+        "wrapping_pow_two_to_seven_is_128",
+        "checked_pow_two_to_seven_is_some_128",
+        "saturating_pow_three_to_five_is_243",
+        "overflowing_pow_two_to_seven_did_not_overflow",
+        "wrapping_pow_negative_two_to_seven_is_min",
+        "saturating_pow_negative_base_clamps_to_min",
+        "wrapping_pow_zero_exponent_is_one",
+    ]) else {
+        return;
+    };
+    for name in [
+        "wrapping_pow_two_to_seven_is_128",
+        "checked_pow_two_to_seven_is_some_128",
+        "saturating_pow_three_to_five_is_243",
+        "overflowing_pow_two_to_seven_did_not_overflow",
+        "wrapping_pow_negative_two_to_seven_is_min",
+        "saturating_pow_negative_base_clamps_to_min",
+        "wrapping_pow_zero_exponent_is_one",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+
+    let Some(report) = verify_realistic(&[
+        "wrapping_pow_two_to_eight_is_256_tripwire",
+        "checked_pow_two_to_eight_is_none_tripwire",
+        "saturating_pow_three_to_six_clamps_tripwire",
+        "overflowing_pow_two_to_eight_flag_tripwire",
+        "wrapping_pow_negative_two_to_eight_wraps_tripwire",
+        "saturating_pow_negative_base_to_max_tripwire",
+        "wrapping_pow_one_exponent_is_one_tripwire",
+    ]) else {
+        return;
+    };
+    for name in [
+        "wrapping_pow_two_to_eight_is_256_tripwire",
+        "checked_pow_two_to_eight_is_none_tripwire",
+        "saturating_pow_three_to_six_clamps_tripwire",
+        "overflowing_pow_two_to_eight_flag_tripwire",
+        "wrapping_pow_negative_two_to_eight_wraps_tripwire",
+        "saturating_pow_negative_base_to_max_tripwire",
+        "wrapping_pow_one_exponent_is_one_tripwire",
+    ] {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` must FAIL: a `Skipped` means the name is not modelled, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
 /// The four unary `neg`/`abs` families are modelled, and they disagree about
 /// `MIN` -- which is what proves each is the right one and not a shared stand-in.
 ///
