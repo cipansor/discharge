@@ -1354,8 +1354,10 @@ of a signed type. A unary `-` binds *tighter* than `as` (`-x as u8` is
 than `==`, so `!x == 5` is `(!x) == 5` (`x == 250` for a `u8`), not `!(x == 5)`; on a
 parenthesized *predicate* it negates, so `!(x == 5)` is `x != 5`. A cast *extends*:
 `-1i8 as i16` is `-1`, and `-1i8 as u16`
-is `65535`, not `255`. A shift amount must be a constant; a symbolic amount is a
-barrel shifter in the body and is refused in a contract rather than guessed at.
+is `65535`, not `255`. A shift amount must be a *constant expression* — `x >> 1 + 1` is
+`x >> 2` — and a *symbolic* amount is a barrel shifter in the body and is refused in a
+contract rather than guessed at. A divisor of constant zero is refused however it is
+spelled (`0`, `1 - 1`, `2 - 2`), matching rustc's `unconditional_panic` lint.
 
 The engine's words are 64 bits, so a `u128`/`i128` type is refused rather than
 mis-modelled: a function with a 128-bit argument, local or return, and a contract

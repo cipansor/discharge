@@ -1821,7 +1821,14 @@ impl<'a> Parser<'a> {
         let (mut left, sgn) = self.parse_add()?;
         while let Some(op) = self.eat_any(&["<<", ">>"]) {
             let (r, _) = self.parse_add()?;
-            let Some(k) = smt::const_of(r) else {
+            // The amount must be *constant*, but not necessarily a bare literal:
+            // `x >> 1 + 1` is `x >> 2` in Rust, and the additive level above has
+            // already folded it. `const_value` evaluates a variable-free term, so a
+            // folded constant is accepted while a symbolic amount still falls
+            // through to the refusal below. Using the raw-literal `const_of` here
+            // instead made `x >> 1 + 1` unreadable -- a dropped obligation on a
+            // shape rustc accepts, and one the README's own examples use.
+            let Some(k) = self.const_value(r) else {
                 return Err(self.err("a shift amount in a contract must be a constant"));
             };
             let w = smt::bits(left);
@@ -1863,16 +1870,23 @@ impl<'a> Parser<'a> {
     /// Division and remainder take the *signed* engine when either operand is
     /// signed, the same choice the body makes and for the same reason: the
     /// unsigned divider returns a huge positive quotient for `-7 / 2`, a wrong
-    /// value rather than a weaker proof. A literal zero divisor is refused --
-    /// Rust rejects it at compile time, so a contract carrying one is malformed,
-    /// not merely imprecise. A *symbolic* divisor is modelled exactly (the
-    /// engine's divider is total), which mirrors the body.
+    /// value rather than a weaker proof. A *constant* zero divisor is refused, in
+    /// whatever form it is written -- `0`, `1 - 1`, `2 - 2` -- because Rust rejects
+    /// it at compile time, so a contract carrying one is malformed, not merely
+    /// imprecise. A *symbolic* divisor is modelled exactly (the engine's divider is
+    /// total), which mirrors the body.
     fn parse_mul(&mut self) -> Result<(Var, bool), SpecError> {
         let (mut left, mut sgn) = self.parse_cast()?;
         while let Some(op) = self.eat_any(&["*", "/", "%"]) {
             let (r, rs) = self.parse_cast()?;
-            if op != "*" && smt::const_of(r) == Some(0) {
-                return Err(self.err("a division or remainder by a literal zero"));
+            // The divisor must be checked for *zero*, not for "is a bare zero
+            // literal". `x % (1 - 1)` folds to `x % 0` at the additive level, and
+            // the raw-literal `const_of` missed it, so the reader built `srem(x, 0)`
+            // -- an undefined operation the engine nevertheless evaluates -- and
+            // produced a definite verdict from it. A *constant* zero is refused
+            // however it is spelled; a symbolic divisor is still modelled exactly.
+            if op != "*" && self.const_value(r) == Some(0) {
+                return Err(self.err("a division or remainder by a constant zero"));
             }
             // Same width rule as the other operators: a literal product, divisor
             // or mask is sized to the operand it meets.
@@ -2908,6 +2922,47 @@ mod tests {
         // (the comparison holds, so its negation does not), true at 250.
         assert!(!pred("!(x == 5)", 5), "`!(x == 5)` is `x != 5`: false at 5");
         assert!(pred("!(x == 5)", 250), "`!(x == 5)` is `x != 5`: true at 250");
+    }
+
+    /// A shift amount or a divisor may be a *constant expression*, and the reader
+    /// must fold it before asking whether it is constant or zero.
+    ///
+    /// `const_of` answers "is this node a literal", which is the wrong question for
+    /// both: `x >> 1 + 1` folds to `x >> 2` (constant, so the shift is fine), and
+    /// `x % (1 - 1)` folds to `x % 0` (zero, so it must be refused). Asking the
+    /// literal question misclassified the first as symbolic -- a barrel shifter in
+    /// the body, an undecided query -- and let the second past the zero guard, so
+    /// the reader built `srem(x, 0)` and returned a *definite verdict* from an
+    /// undefined operation. `const_value` folds instead, which is what both want.
+    #[test]
+    fn a_constant_expression_is_folded_before_it_is_classified() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::var(8));
+        args.insert("y".to_string(), smt::var(8));
+        let unsigned = BTreeSet::new();
+        let parse = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let (v, _) = p.parse_expr().expect("parses");
+            p.expect_end().expect("no trailing tokens");
+            v
+        };
+        // A folded shift amount is a constant shift: `x >> 1 + 1` is `x >> 2`.
+        let folded = parse("x >> 1 + 1");
+        let literal = parse("x >> 2");
+        assert_eq!(smt::evaluate(folded, |_| Some(8)), Some(2));
+        assert_eq!(
+            smt::evaluate(folded, |_| Some(8)),
+            smt::evaluate(literal, |_| Some(8)),
+            "`x >> 1 + 1` must read as `x >> 2`"
+        );
+        // A *symbolic* amount is still refused, not modelled as a barrel shifter.
+        let mut p = Parser::new("x >> y", &args, None, &unsigned, false);
+        assert!(p.parse_expr().is_err(), "a symbolic shift amount is refused");
+        // A divisor of constant zero is refused however it is spelled.
+        let mut p = Parser::new("x % (1 - 1)", &args, None, &unsigned, false);
+        assert!(p.parse_expr().is_err(), "a folded zero divisor is refused");
+        // A constant, non-zero divisor folds and reads: `4 / (1 + 1)` is `2`.
+        assert_eq!(smt::evaluate(parse("x / (1 + 1)"), |_| Some(4)), Some(2));
     }
 
     /// An explicit discriminant sets the variant's value and the next continues

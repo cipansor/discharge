@@ -4005,3 +4005,35 @@ that must refute under both readings, which shows the tool is not simply verifyi
 everything. The false-proof direction for `!` is the bare `!x`, and that one was a
 dropped obligation rather than a wrong verdict, because it did not parse.
 
+## A constant expression is not a literal: fold it, then classify it
+
+Probing the precedence grid after the `!` fix found a fifth bug, and it is about *when*
+a value is inspected rather than *how* it is parsed. `const_of` answers "is this term a
+literal node", and two places asked it where the right question was "does this term
+*fold* to a constant":
+
+- **A shift amount.** `x >> 1 + 1` is `x >> 2`; Rust folds the amount. The reader
+  tested the operand with `const_of`, saw an add rather than a literal, and refused the
+  contract ("a shift amount in a contract must be a constant") — a *dropped obligation*
+  on a shape rustc compiles. The body side had the same test, so `x >> 1 + 1` in a body
+  became a symbolic barrel shifter and the query came back `Incomplete`.
+- **A divisor.** `x % (1 - 1)` is `x % 0`; Rust folds it and the `unconditional_panic`
+  lint rejects it at compile time. The zero guard used `const_of`, so it recognised the
+  literal `0` but *not* the folded `1 - 1`. The reader built `srem(x, 0)` — an undefined
+  operation the engine nonetheless evaluates — and returned a **definite verdict** from
+  it. That is a wrong verdict, the one outcome a verifier must not produce, and it is
+  the same class as the `!x == 5` bug: a decision made where a refusal was owed.
+
+The fix is to fold before classifying, with the helpers the parser already has:
+`const_value` in the contract reader (which is `smt::evaluate` with no assignment) and
+`smt::evaluate` in the body. A *symbolic* shift amount is still refused and a *symbolic*
+divisor is still modelled exactly, so the conservative behaviours are unchanged; only
+the misclassified *constant* moves.
+
+Pinned by four corpus entries, one integration test (`a_folded_constant_is_read_as_a_
+constant`) that asserts both the read case and the refusal case, and one unit test that
+checks the parse directly. Both halves are sensitive: reverting the divisor guard makes
+the integration test fail with `FAILED: postcondition — v1:u8 = 3`, the verdict built on
+`srem(x, 0)`. rustc treats `x % 0`, `x % (1 - 1)` and `x % (2 - 2)` identically under
+`unconditional_panic`, which is the evidence that refusing them alike is right.
+

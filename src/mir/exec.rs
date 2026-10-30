@@ -2824,7 +2824,14 @@ fn eval_binary(op: BinOp, a: Val, b: Val, width: Option<u8>) -> Val {
                     // unsigned one; an unprinted sign is a refusal, because the
                     // two differ for every negative value.
                     let Some(signed) = signed else { return Val::Unknown };
-                    match smt::const_of(y) {
+                    // `evaluate` with no assignment is `Some(k)` for any term that
+                    // folds to a constant -- `x >> 1 + 1` reaches here as an add of
+                    // two constants -- and `None` for a symbolic amount. Using the
+                    // raw-literal `const_of` here classified a folded constant as
+                    // symbolic, so the body built a barrel shifter for an amount
+                    // rustc knows at compile time and the engine could not decide
+                    // the query. A symbolic amount still takes `shift_var` below.
+                    match smt::evaluate(y, |_| None) {
                         // rustc's guard says `k < w`; a constant outside that range
                         // is a compile error, so this is defensive only.
                         Some(k) if k < w as u64 => {

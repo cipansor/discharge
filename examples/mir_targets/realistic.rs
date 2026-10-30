@@ -1517,6 +1517,44 @@ pub fn contract_bang_still_negates_a_predicate(x: u8) -> u8 {
     1
 }
 
+/// A shift *amount* may be a constant expression, not only a bare literal:
+/// `x >> 1 + 1` is `x >> 2` in Rust. The reader accepted only a raw literal, so
+/// this shape was unreadable -- a dropped obligation on something rustc compiles.
+/// The body shifts by `2`, so this verifies exactly when the amount folds.
+/// requires: x == 8
+/// ensures: ret == x >> 1 + 1
+pub fn contract_shift_amount_is_folded(x: u8) -> u8 {
+    x >> 2
+}
+
+/// The same folding on the *body* side: the amount `1 + 1` is constant, so the
+/// body must lower it to a constant shift rather than a barrel shifter. It was
+/// classified symbolic, which left the query undecided; folding it makes the
+/// function prove.
+/// requires: x == 8
+/// ensures: ret == 2
+pub fn body_shift_amount_is_folded(x: u8) -> u8 {
+    x >> 1 + 1
+}
+
+/// A divisor of *zero* must be refused however it is spelled. `1 - 1` folds to
+/// `0`, and checking only for a bare `0` literal let it through, so the reader
+/// built `srem(x, 0)` -- an undefined operation -- and returned a definite verdict
+/// from it. Refusing the folded zero turns that into a visible skip.
+/// requires: x == 3
+/// ensures: ret == x % (1 - 1)
+pub fn contract_divisor_zero_is_folded(x: u8) -> u8 {
+    x % 3
+}
+
+/// A *constant, non-zero* divisor in folded form still reads and models exactly:
+/// `4 / (1 + 1)` is `4 / 2` is `2`, the same as the body.
+/// requires: x == 4
+/// ensures: ret == x / (1 + 1)
+pub fn contract_divisor_folded_is_read(x: u8) -> u8 {
+    x / 2
+}
+
 // ---------------------------------------------------------------------------
 // The contract operators that were missing, and the *precedence* they need.
 //

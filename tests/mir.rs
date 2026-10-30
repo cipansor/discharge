@@ -2872,6 +2872,12 @@ fn the_contract_reader_agrees_with_rustc_on_a_grid() {
         // two readings differ at every point but one.
         ("!x", "u8", "u8", &[0, 1, 5, 250, 255], Some(5)),
         ("!x", "u8", "u8", &[0, 1, 5, 250, 255], Some(4)),
+        // A shift amount is a constant *expression*: the reader and the body must
+        // both fold `1 + 1` to `2`, not treat it as a symbolic barrel-shifter
+        // amount. The value mode builds `x >> 1 + 1` as the body *and* the
+        // postcondition, so an unreadable contract (a non-folded reader) shows up
+        // as a non-verified outcome here.
+        ("x >> 1 + 1", "u8", "u8", &[0, 1, 2, 4, 8, 16, 128, 255], None),
     ];
 
     let mut checked = 0u32;
@@ -2924,5 +2930,72 @@ fn the_contract_reader_agrees_with_rustc_on_a_grid() {
     }
     // A run that checked nothing is not evidence.
     assert!(checked >= 60, "the oracle checked only {checked} points");
+}
+
+/// A shift amount or a divisor may be a *constant expression*, not only a bare
+/// literal, and the reader must fold it before deciding what it is.
+///
+/// `x >> 1 + 1` is `x >> 2` and `x % (1 - 1)` is `x % 0`; Rust evaluates both
+/// amounts at compile time. The reader tested the raw operand with `const_of`,
+/// which only recognises a literal node, so a folded amount was misclassified in
+/// two opposite directions: a constant shift amount looked symbolic (the body built
+/// a barrel shifter and the engine could not decide), and a constant *zero* divisor
+/// slipped past the divide-by-zero guard and produced a definite verdict from an
+/// undefined `srem(x, 0)` -- a wrong verdict, the one outcome a verifier must not
+/// produce. The fix folds with `const_value`/`evaluate` on both sides.
+#[test]
+fn a_folded_constant_is_read_as_a_constant() {
+    // A folded shift amount verifies: the body shifts by the same constant.
+    let Some(o) = verify_src(
+        "folded_shift_amount",
+        "/// requires: x == 8\n/// ensures: ret == x >> 1 + 1\n\
+         pub fn folded_shift_amount(x: u8) -> u8 { x >> 2 }\n",
+    ) else {
+        return;
+    };
+    assert!(o.is_verified(), "a folded shift amount must be read, got: {o}");
+
+    // A folded *zero* divisor is refused, exactly as the literal `0` is. The
+    // requirement is that it is not *decided*: a verdict built on `srem(x, 0)`
+    // would be a verdict about nothing.
+    let Some(o) = verify_src(
+        "folded_zero_divisor",
+        "/// requires: x == 3\n/// ensures: ret == x % (1 - 1)\n\
+         pub fn folded_zero_divisor(x: u8) -> u8 { x % 3 }\n",
+    ) else {
+        return;
+    };
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "a folded zero divisor must be refused, not decided, got: {o}"
+    );
+
+    // A folded *non-zero* divisor still reads and models exactly: `4 / (1 + 1)`
+    // is `4 / 2` is `2`, the same as the body, so the two agree.
+    let Some(o) = verify_src(
+        "folded_nonzero_divisor",
+        "/// requires: x == 4\n/// ensures: ret == x / (1 + 1)\n\
+         pub fn folded_nonzero_divisor(x: u8) -> u8 { x / 2 }\n",
+    ) else {
+        return;
+    };
+    assert!(
+        o.is_verified(),
+        "a folded non-zero divisor must be read and modelled, got: {o}"
+    );
+
+    // And the *body* folds the same way: `x >> 1 + 1` lowers to a constant shift,
+    // not a barrel shifter, so the query is decided rather than left incomplete.
+    let Some(o) = verify_src(
+        "folded_body_shift",
+        "/// requires: x == 8\n/// ensures: ret == 2\n\
+         pub fn folded_body_shift(x: u8) -> u8 { x >> 1 + 1 }\n",
+    ) else {
+        return;
+    };
+    assert!(
+        o.is_verified(),
+        "a folded shift amount in the body must be lowered as a constant, got: {o}"
+    );
 }
 
