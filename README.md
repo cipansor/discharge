@@ -1319,6 +1319,17 @@ reported incomplete for a reason that had nothing to do with its body. A literal
 large for the operand's width is refused rather than truncated: `a <= 300` for a
 `u8` must not become `a <= 44`.
 
+The fit check is against the operand's *signed* range when the operand is signed,
+not merely its bit width. `128` for an `i8` fits in eight bits, but those bits are
+`0x80`, which is `-128` signed — so a check that only asked "does this fit in eight
+unsigned bits?" accepted it and read `x <= 128` as `x <= -128`. rustc rejects
+`x <= 128` for an `i8` ("literal out of range for `i8`"), and the wrong reading is a
+false proof: `requires: x <= 128` with `ensures: ret != 127` *held*. The same holds
+for a negation, where `-129` for an `i8` wraps to `127` at eight bits and `x >= -129`
+became `x >= 127`. Both are refused now. The `i8::MIN` bound shares the bit pattern
+`0x80` and still reads, which is why the fix distinguishes a non-negative literal
+from a signed constant instead of refusing every `0x80`.
+
 A literal is read at the radix it is written in. `0xFF` is `255`, `0b1010` is `10`
 and `0o17` is `15`, in any width and with underscores or a type suffix (`0xFFu8`,
 `0xFF_FF`). Reading every literal as decimal silently made `0xFF` equal `0` — the

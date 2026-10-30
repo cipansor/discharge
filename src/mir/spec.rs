@@ -1697,31 +1697,52 @@ impl<'a> Parser<'a> {
     /// for a `u8` would become `a <= 44` if the value were truncated -- so a
     /// value that does not fit is an error and the function is skipped, not a
     /// weaker proof.
-    fn resize_const(&self, v: Var, wide: u8, signed: bool) -> Result<Var, SpecError> {
+    ///
+    /// The check runs at *equal* width too, which is what `own_signed` is for. A
+    /// bare literal is non-negative, but a signed bound (`i8::MIN`) or a negation
+    /// (`-1`) is its two's-complement value; `128` and `i8::MIN` share the bit
+    /// pattern `0x80` and mean different things. Without the distinction, `128`
+    /// meeting an `i8` was accepted as the bit pattern for `-128`, so `x <= 128`
+    /// was read as `x <= -128` -- a wrong value, and a false proof (`ensures: x !=
+    /// 127` "held"). `own_signed` tells the two apart: a non-negative literal is
+    /// checked as `+val`, a signed one as its two's-complement value.
+    fn resize_const(
+        &self,
+        v: Var,
+        wide: u8,
+        signed: bool,
+        own_signed: bool,
+    ) -> Result<Var, SpecError> {
         let w = smt::bits(v);
         let val = self.const_value(v).expect("resize_const is only called on a constant");
-        if wide >= w {
-            return Ok(if signed && wide > w { smt::sign_extend(v, wide) } else { smt::word(val, wide) });
-        }
-        let fits = if signed {
-            // Interpret the value as a signed `w`-bit number, then test it against
-            // the signed `wide`-bit range. `i128` keeps `1 << 63` in range.
-            let sval = if w >= 64 {
+        // The value the constant denotes, at its own width. A literal written
+        // without a type is non-negative; a signed bound or a negation is its
+        // two's-complement value.
+        let sval: i128 = if own_signed {
+            if w >= 64 {
                 val as i64 as i128
             } else if val & (1u64 << (w - 1)) != 0 {
                 val as i128 - (1i128 << w)
             } else {
                 val as i128
-            };
+            }
+        } else {
+            val as i128
+        };
+        let fits = if signed {
             let lo = -(1i128 << (wide - 1));
             let hi = (1i128 << (wide - 1)) - 1;
             sval >= lo && sval <= hi
         } else {
-            val < (1u64 << wide)
+            sval >= 0 && (sval as u128) < (1u128 << wide)
         };
         if !fits {
+            // Report the value as written: a signed constant (`-129`, `i8::MIN`)
+            // reads as its negative value, not the two's-complement bit pattern,
+            // so the message names the number the contract author wrote.
+            let shown: i128 = if own_signed { sval } else { val as i128 };
             return Err(self.err(format!(
-                "literal {val} does not fit the operand's {wide}-bit width"
+                "literal {shown} does not fit the operand's {wide}-bit width"
             )));
         }
         // Truncate rather than rebuild from `val`. A negative literal is the bit
@@ -1730,7 +1751,11 @@ impl<'a> Parser<'a> {
         // ill-formed flag -- turning a valid contract into `Unknown`. Truncation
         // takes the low `wide` bits, which is the same bit pattern the value
         // denotes, and the `fits` check above is what keeps it from being silent.
-        Ok(smt::truncate(v, wide))
+        if wide >= w {
+            Ok(if signed && wide > w { smt::sign_extend(v, wide) } else { smt::word(val, wide) })
+        } else {
+            Ok(smt::truncate(v, wide))
+        }
     }
 
     /// Make two operands agree in width, by resizing the *constant* one.
@@ -1746,23 +1771,44 @@ impl<'a> Parser<'a> {
     /// of its type, and changing it would change what the term means. Two
     /// non-constant operands of different widths cannot arise from Rust that
     /// compiles, so that is refused rather than coerced.
-    fn align_widths(&self, a: Var, b: Var, signed: bool) -> Result<(Var, Var), SpecError> {
+    fn align_widths(
+        &self,
+        a: Var,
+        sa: bool,
+        b: Var,
+        sb: bool,
+        signed: bool,
+    ) -> Result<(Var, Var), SpecError> {
         let (wa, wb) = (smt::bits(a), smt::bits(b));
-        if wa == wb {
-            return Ok((a, b));
-        }
         match (self.const_value(a), self.const_value(b)) {
-            (Some(_), None) => Ok((self.resize_const(a, wb, signed)?, b)),
-            (None, Some(_)) => Ok((a, self.resize_const(b, wa, signed)?)),
+            // Both constants: neither is being compared against a typed operand,
+            // so there is no width to check against. Align to the narrower for a
+            // well-formed term.
             (Some(_), Some(_)) => {
                 if wa > wb {
-                    Ok((self.resize_const(a, wb, signed)?, b))
+                    Ok((self.resize_const(a, wb, signed, sa)?, b))
+                } else if wb > wa {
+                    Ok((a, self.resize_const(b, wa, signed, sb)?))
                 } else {
-                    Ok((a, self.resize_const(b, wa, signed)?))
+                    Ok((a, b))
                 }
             }
+            // One constant: resize it to the other operand's width. This runs at
+            // *equal* width too, where the resize is the identity term but the
+            // range check is not: `128` meeting an `i8` must be refused, not read
+            // as the bit pattern for `-128`. Skipping the call at equal width is
+            // what let `x <= 128` mean `x <= -128` -- a wrong value and a false
+            // proof. `sa`/`sb` carry each constant's own signedness, so a bare
+            // literal (non-negative) is told apart from a signed bound that
+            // happens to share its bit pattern.
+            (Some(_), None) => Ok((self.resize_const(a, wb, signed, sa)?, b)),
+            (None, Some(_)) => Ok((a, self.resize_const(b, wa, signed, sb)?)),
             (None, None) => {
-                Err(self.err("comparison between operands of different widths"))
+                if wa == wb {
+                    Ok((a, b))
+                } else {
+                    Err(self.err("comparison between operands of different widths"))
+                }
             }
         }
     }
@@ -1807,7 +1853,7 @@ impl<'a> Parser<'a> {
                 // array length is also in scope, and an 8-bit `ret` against a
                 // 64-bit constant is ill-formed -- which poisons *every*
                 // obligation in the run, not just this one.
-                let (left, right) = self.align_widths(left, right, signed)?;
+                let (left, right) = self.align_widths(left, ls, right, rs, signed)?;
                 return Ok(match op {
                     "==" => smt::eq(left, right),
                     "!=" => smt::not(smt::eq(left, right)),
@@ -1846,7 +1892,7 @@ impl<'a> Parser<'a> {
         let (mut left, mut sgn) = self.parse_bitxor()?;
         while self.eat_op("|") {
             let (r, rs) = self.parse_bitxor()?;
-            let (l, r) = self.align_widths(left, r, sgn || rs)?;
+            let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
             left = smt::bor(l, r);
             sgn = sgn || rs;
         }
@@ -1857,7 +1903,7 @@ impl<'a> Parser<'a> {
         let (mut left, mut sgn) = self.parse_bitand()?;
         while self.eat_op("^") {
             let (r, rs) = self.parse_bitand()?;
-            let (l, r) = self.align_widths(left, r, sgn || rs)?;
+            let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
             left = smt::bxor(l, r);
             sgn = sgn || rs;
         }
@@ -1868,7 +1914,7 @@ impl<'a> Parser<'a> {
         let (mut left, mut sgn) = self.parse_shift()?;
         while self.eat_op("&") {
             let (r, rs) = self.parse_shift()?;
-            let (l, r) = self.align_widths(left, r, sgn || rs)?;
+            let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
             left = smt::band(l, r);
             sgn = sgn || rs;
         }
@@ -1933,7 +1979,7 @@ impl<'a> Parser<'a> {
             // scope adds an 8-bit `a` to a 64-bit `5`, which `bin_word` reports
             // as ill-formed -- and that poisons every obligation in the run, so
             // the function is undecided for a reason unrelated to its body.
-            let (l, r) = self.align_widths(left, r, sgn || rs)?;
+            let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
             left = if op == "+" { smt::add(l, r) } else { smt::sub(l, r) };
             sgn = sgn || rs;
         }
@@ -1965,7 +2011,7 @@ impl<'a> Parser<'a> {
             }
             // Same width rule as the other operators: a literal product, divisor
             // or mask is sized to the operand it meets.
-            let (l, r) = self.align_widths(left, r, sgn || rs)?;
+            let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
             left = match op {
                 "*" => smt::mul(l, r),
                 "/" if sgn || rs => smt::sdiv(l, r),
@@ -2020,6 +2066,22 @@ impl<'a> Parser<'a> {
         if self.eat_op("-") {
             let (v, _) = self.parse_neg()?;
             let w = smt::bits(v);
+            // A negated *constant* is widened by one bit when its magnitude does
+            // not fit signed at its own width, so the true value survives for the
+            // later range check. `-129` for an `i8` is a Rust error ("literal out
+            // of range"), but at 8 bits the two's-complement `-129` *is* `127`, so
+            // the negation alone would hand the check a value that fits and
+            // `x >= -129` would silently mean `x >= 127` -- a false proof, the
+            // mirror of the bare-literal wrap. One spare bit keeps `-129` as
+            // `-129`, which the check then refuses. `-128` (i8::MIN) still fits at
+            // 8 bits, so it is left alone.
+            if let Some(mag) = self.const_value(v) {
+                // `-mag` fits signed at `w` bits iff `mag <= 2^(w-1)`.
+                let fits = w >= 64 || mag <= (1u64 << (w - 1));
+                if !fits {
+                    return Ok((smt::sub(smt::word(0, w + 1), smt::word(mag, w + 1)), true));
+                }
+            }
             return Ok((smt::sub(smt::word(0, w), v), true));
         }
         // `!` is a unary prefix on a *value* here, because `bang_is_predicate`
@@ -3094,6 +3156,43 @@ mod tests {
         assert!(refuses("0xg"), "`0xg` has no hex digits");
         assert!(refuses("0xFFg"), "`0xFFg` has an unknown suffix");
         assert!(refuses("18446744073709551616"), "past `u64` is refused");
+    }
+
+    /// A literal that does not fit the operand's *signed* width is refused, even
+    /// though its bit pattern does.
+    ///
+    /// `128` for an `i8` is `0x80`, which is exactly the bit pattern of `-128`, so
+    /// a reader that only asks "does this fit in eight *unsigned* bits?" accepts it
+    /// and reads `x <= 128` as `x <= -128`. rustc rejects `x <= 128` for an `i8`
+    /// ("literal out of range for `i8`"), and the wrong reading is a false proof:
+    /// `requires: x <= 128` with `ensures: x != 127` *held*. The `i8::MIN` bound
+    /// shares the bit pattern and must still be accepted, which is why the fix
+    /// distinguishes a non-negative literal from a signed constant rather than
+    /// refusing every `0x80`.
+    #[test]
+    fn an_out_of_range_literal_is_refused_at_the_operand_width() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::var(8));
+        let mut signed = BTreeSet::new();
+        signed.insert("x".to_string());
+        // A whole *predicate*, so the comparison and its width alignment run.
+        let reads = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            let pr = p.parse_or().expect("parses");
+            p.expect_end().expect("no trailing tokens");
+            smt::evaluate_pred(pr, |_| Some(0))
+        };
+        // `x <= 128` and `x >= -129` are both Rust errors for an `i8`, so they are
+        // refused, not read as `x <= -128` / `x >= 127`.
+        let mut p = Parser::new("x <= 128", &args, None, &signed, false);
+        assert!(p.parse_or().is_err(), "`x <= 128` must be refused for an `i8`");
+        let mut p = Parser::new("x >= -129", &args, None, &signed, false);
+        assert!(p.parse_or().is_err(), "`x >= -129` must be refused for an `i8`");
+        // The boundaries that *do* fit still read, and mean what they say.
+        assert_eq!(reads("x <= 127"), Some(true), "127 is i8::MAX");
+        assert_eq!(reads("x >= -128"), Some(true), "-128 is i8::MIN");
+        let mut p = Parser::new("x == 128", &args, None, &signed, false);
+        assert!(p.parse_or().is_err(), "`x == 128` is refused too");
     }
 
     /// An explicit discriminant sets the variant's value and the next continues

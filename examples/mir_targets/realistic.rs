@@ -1681,6 +1681,51 @@ pub fn contract_uppercase_hex_prefix(x: u8) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// A literal that does not fit the operand's *signed* width.
+//
+// `128` for an `i8` is `0x80`, the bit pattern of `-128`, so a reader that asks
+// only "does this fit in eight unsigned bits?" accepts it and reads `x <= 128` as
+// `x <= -128`. rustc rejects `x <= 128` for an `i8` ("literal out of range"), and
+// the wrong reading is a *false proof*: `requires: x <= 128` with `ensures: x !=
+// 127` held, because `-128..=127` excludes nothing that `<= -128` admits. The same
+// holds for a negation: `-129` for an `i8` wraps to `127` at eight bits.
+
+/// `128` does not fit an `i8` (it is `i8::MAX + 1`), so `x <= 128` is a Rust error
+/// and the reader must refuse it. The body returns `x`, so if the literal were
+/// wrapped to `-128` this would *verify* (`x <= -128` implies `x <= 127`); the
+/// honest outcome is a skip.
+/// requires: x <= 128
+/// ensures: ret <= 127
+pub fn contract_out_of_range_literal_is_refused(x: i8) -> i8 {
+    x
+}
+
+/// The `i8::MIN` boundary shares the bit pattern `0x80` with `128` and must still
+/// read: `x >= -128` is true for every `i8`.
+/// requires: x >= -128
+/// ensures: ret >= -128
+pub fn contract_min_bound_still_reads(x: i8) -> i8 {
+    x
+}
+
+/// `-129` does not fit an `i8` either, so `x >= -129` is refused. Wrapping it to
+/// `127` would make `x >= 0` hold for the whole (empty) precondition set, a false
+/// proof; the refusal keeps it visible.
+/// requires: x >= -129
+/// ensures: ret >= 0
+pub fn contract_out_of_range_negation_is_refused(x: i8) -> i8 {
+    x
+}
+
+/// The `i16` case is legal and must still read: `-129` fits an `i16`, so
+/// `x >= -129` is a real (non-vacuous) precondition.
+/// requires: x >= -129
+/// ensures: ret >= -129
+pub fn contract_negative_bound_reads_at_i16(x: i16) -> i16 {
+    x
+}
+
+// ---------------------------------------------------------------------------
 // The contract operators that were missing, and the *precedence* they need.
 //
 // The expression language had `+ - * & | ^` but no `/ % << >>`, so a contract

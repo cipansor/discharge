@@ -3099,6 +3099,45 @@ fn a_radix_literal_is_read_at_its_radix() {
     assert!(detail.contains("= 255"), "the witness should be `255`, got: {detail}");
 }
 
+/// A literal that does not fit the operand's signed width is refused, and the
+/// false proof it used to allow is the point.
+///
+/// `128` for an `i8` is the bit pattern `0x80`, which is `-128` signed. A reader
+/// that asked only whether the literal fits in eight *unsigned* bits accepted it, so
+/// `x <= 128` was read as `x <= -128` and `ensures: ret <= 127` was *proved* for a
+/// body returning `x`. rustc rejects `x <= 128` for an `i8` ("literal out of range
+/// for `i8`"), so the correct outcome is a refusal. The `i8::MIN` boundary shares
+/// the bit pattern and must still read, which is what keeps the fix from refusing
+/// every `0x80`.
+#[test]
+fn an_out_of_range_literal_is_refused_not_wrapped() {
+    let refused = [
+        "contract_out_of_range_literal_is_refused",
+        "contract_out_of_range_negation_is_refused",
+    ];
+    let Some(report) = verify_realistic(&refused) else { return };
+    for name in refused {
+        let o = outcome(&report, name);
+        assert!(
+            !o.is_verified(),
+            "`{name}` must be refused, not verified -- verifying it is the false proof, got: {o}"
+        );
+        assert!(
+            matches!(o, FnOutcome::Skipped { .. }),
+            "`{name}` must be skipped (unreadable contract), got: {o}"
+        );
+    }
+    let read = [
+        "contract_min_bound_still_reads",
+        "contract_negative_bound_reads_at_i16",
+    ];
+    let Some(report) = verify_realistic(&read) else { return };
+    for name in read {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must still read and verify, got: {o}");
+    }
+}
+
 /// The corpus entries that pin *where* `!` binds, asserted end to end.
 ///
 /// `!` is bitwise NOT on a value and negation on a predicate, and it binds tighter

@@ -4119,3 +4119,51 @@ disagreement, not as a silent pass. Reverting the radix read makes the grid fail
 `0xFF` expected `verified=true`, got `skipped` -- the oracle is sensitive.
 
 Coverage **115/195 to 120/201**, test-count 540 to 542. Gate green.
+
+## Bug 7: a signed-width literal wrapped instead of being refused -- a false proof
+
+The seventh bug is the second *false proof*, and it is Bug 6's mirror image. The
+tokenizer was fixed to read the right *number*, but the width check that decides
+whether that number fits the operand asked only about *unsigned* bits. `128` for an
+`i8` fits in eight bits, so it was accepted -- and the eight bits are `0x80`, which
+`i8` reads as `-128`:
+
+```rust
+/// requires: x <= 128     // read as `x <= -128`
+/// ensures: ret != 127    // "proved", because `x <= -128` excludes nothing
+pub fn f(x: i8) -> i8 { x }
+```
+
+rustc rejects `x <= 128` for an `i8` ("literal out of range for `i8`"), and the tool
+reported **verified**. The wrapping was invisible because the literal was built at
+exactly the operand's width and `align_widths` returned early on equal widths -- the
+signed-range check in `resize_const` never ran. The negation path had the same hole
+from the other side: `-129` for an `i8` is `127` at eight bits, so `x >= -129` was
+read as `x >= 127` and `ensures: ret >= 0` "held" under a precondition that admits
+nothing.
+
+The fix has two halves:
+
+* `align_widths` no longer short-circuits on equal widths; it resizes the constant
+  operand (a no-op term at equal width, but the range check runs) and carries each
+  operand's own signedness. `resize_const` takes that flag: a bare literal is
+  non-negative and is checked as `+val`, while a signed bound (`i8::MIN`) or a
+  negation is checked as its two's-complement value. That distinction is what lets
+  `128` be refused while `i8::MIN` -- the same bit pattern `0x80` -- still reads.
+* `parse_neg` widens a negated constant by one bit when its magnitude does not fit
+  signed at its own width, so `-129` survives as `-129` for the check to refuse
+  instead of wrapping to `127`.
+
+`i8::MIN` is unaffected because it is a *named* bound built by `type_bound`, not a
+bare literal; a fix that refused every `0x80` would have broken it, which is why the
+corpus pins both sides.
+
+Evidence: `an_out_of_range_literal_is_refused_at_the_operand_width` (spec unit test,
+parse-level), `an_out_of_range_literal_is_refused_not_wrapped` (integration, four
+corpus entries -- two refusals and the two legal boundaries), four corpus entries.
+The integration test is sensitive in both halves: reverting the `align_widths`
+change makes `contract_out_of_range_literal_is_refused` *verify* (the false proof),
+and reverting the `parse_neg` widening makes `contract_out_of_range_negation_is_refused`
+verify. Both were checked by reverting each half alone.
+
+Coverage **125/206 to 127/210**, test-count 542 to 544. Gate green.
