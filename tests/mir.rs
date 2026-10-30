@@ -2599,6 +2599,14 @@ fn contract_operators_and_their_precedence() {
         "contract_precedence_and_over_add_tripwire",
         "contract_precedence_add_over_shl",
         "contract_precedence_add_over_shl_tripwire",
+        "contract_precedence_and_over_or",
+        "contract_precedence_and_over_or_tripwire",
+        "contract_precedence_shift_over_eq",
+        "contract_precedence_shift_over_eq_tripwire",
+        "contract_precedence_cast_over_add",
+        "contract_precedence_neg_over_cast",
+        "contract_precedence_neg_over_rem",
+        "contract_precedence_mul_rem_left_assoc",
     ]) else {
         return;
     };
@@ -2612,6 +2620,12 @@ fn contract_operators_and_their_precedence() {
         "contract_srem",
         "contract_precedence_and_over_add",
         "contract_precedence_add_over_shl",
+        "contract_precedence_and_over_or",
+        "contract_precedence_shift_over_eq",
+        "contract_precedence_cast_over_add",
+        "contract_precedence_neg_over_cast",
+        "contract_precedence_neg_over_rem",
+        "contract_precedence_mul_rem_left_assoc",
     ] {
         let o = outcome(&report, name);
         assert!(o.is_verified(), "`{name}` must verify, got: {o}");
@@ -2623,6 +2637,8 @@ fn contract_operators_and_their_precedence() {
         "contract_sdiv_tripwire",
         "contract_precedence_and_over_add_tripwire",
         "contract_precedence_add_over_shl_tripwire",
+        "contract_precedence_and_over_or_tripwire",
+        "contract_precedence_shift_over_eq_tripwire",
     ] {
         let o = outcome(&report, name);
         let FnOutcome::Failed { kind, .. } = o else {
@@ -2848,6 +2864,15 @@ fn the_contract_reader_agrees_with_rustc_on_a_grid() {
         ("x & 1 + 1", "u8", "u8", &[0, 1, 2, 3, 255], None),
         ("x + 1 << 1", "u8", "u8", &[0, 1, 63, 126], None),
         ("x | 1 ^ 1", "u8", "u8", &[0, 1, 255], None),
+        ("x & 3 | 4", "u8", "u8", &[0, 1, 3, 255], None),
+        ("x ^ 1 & 3", "u8", "u8", &[0, 1, 3, 255], None),
+        // A cast binds tighter than `+`, and unary `-` binds tighter than a cast. The
+        // guard mode reads the *type* of the result, which is where `(x as i16) + 1`
+        // and `x as (i16 + 1)` would differ. (`*` is left out: an `i16 * i16` body has
+        // an overflow assert the engine declines to model at that width, so the probe
+        // itself is undecided and the guard mode cannot read the comparison.)
+        ("x as i16 + 1", "i8", "i16", &[-1, 0, 5, 126], Some(6)),
+        ("-x as i16", "i8", "i16", &[-1, 0, 1, 127], None),
         ("x << 2", "u8", "u8", &[0, 1, 63, 255], None),
         ("8 - 4 - 2", "i32", "i32", &[0], None),
         ("8 / 4 / 2", "u32", "u32", &[0], None),

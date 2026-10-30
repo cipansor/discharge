@@ -1788,6 +1788,79 @@ pub fn contract_precedence_add_over_shl_tripwire(x: u8) -> u8 {
     (x + 1) << 1
 }
 
+/// Precedence between `&` and `|`: `x & 3 | 4` is `(x & 3) | 4`, because `&` binds
+/// tighter. The two readings differ at `x == 0`, where the correct one is `4` and
+/// `x & (3 | 4)` is `0`. The body computes the correct `4`.
+/// requires: x == 0
+/// ensures: ret == x & 3 | 4
+pub fn contract_precedence_and_over_or(x: u8) -> u8 {
+    (x & 3) | 4
+}
+
+/// The tripwire: at `x == 0` the `|`-binds-first reading gives `0`, which the body
+/// does not, so it is refuted -- unless the parser took that reading, in which case
+/// this would verify.
+/// requires: x == 0
+/// ensures: ret == 0
+pub fn contract_precedence_and_over_or_tripwire(x: u8) -> u8 {
+    (x & 3) | 4
+}
+
+/// Precedence between a shift and a comparison: `x >> 1 == 2` is `(x >> 1) == 2`,
+/// because `<<`/`>>` bind tighter than `==`. The body returns `1` iff the comparison
+/// holds, so the contract is the comparison itself at a pinned point.
+/// requires: x == 4
+/// ensures: x >> 1 == 2
+pub fn contract_precedence_shift_over_eq(x: u8) -> u8 {
+    0
+}
+
+/// The false direction of the same shape: `x >> 1 == 2` at `x == 8` is `4 == 2`,
+/// which is false, so the body returning `1` is refuted. Together with the entry
+/// above this pins that the comparison is *decided*, not merely read: a reader that
+/// dropped the shift and compared `x == 2` would also refute here, but a reader that
+/// read the shift as `x >> (1 == 2)` = `x >> 0` = `x` and then proved the equality
+/// would have proved a false thing. The verifying entry is the one that separates
+/// those, because only the correct reading is true there.
+/// requires: x == 8
+/// ensures: x >> 1 == 2
+pub fn contract_precedence_shift_over_eq_tripwire(x: u8) -> u8 {
+    1
+}
+
+/// Precedence between a cast and `+`: `x as i16 + 1` is `(x as i16) + 1`, because a
+/// cast binds tighter than arithmetic. The body computes `(x as i16) + 1`.
+/// requires: x == 5
+/// ensures: ret == x as i16 + 1
+pub fn contract_precedence_cast_over_add(x: i8) -> i16 {
+    x as i16 + 1
+}
+
+/// Precedence between unary `-` and a cast: `-x as i16` is `(-x) as i16`, because
+/// unary operators bind tighter than `as`. The body computes `(-x) as i16`.
+/// requires: x == 1
+/// ensures: ret == -x as i16
+pub fn contract_precedence_neg_over_cast(x: i8) -> i16 {
+    -x as i16
+}
+
+/// Precedence between unary `-` and `%`, and the *sign* of a remainder: `-x % 2` is
+/// `(-x) % 2`, and Rust truncates toward zero, so at `x == 3` it is `-1`. The body
+/// computes `-3 % 2`.
+/// requires: x == 3
+/// ensures: ret == -x % 2
+pub fn contract_precedence_neg_over_rem(x: i8) -> i8 {
+    -3 % 2
+}
+
+/// Left associativity at equal precedence: `2 * 3 % 4` is `(2 * 3) % 4`, i.e. `2`,
+/// not `2 * (3 % 4)` which is `6`. A constant, so there is no input to vary.
+/// requires: true
+/// ensures: ret == 2 * 3 % 4
+pub fn contract_precedence_mul_rem_left_assoc() -> u8 {
+    2
+}
+
 // ---------------------------------------------------------------------------
 // 128-bit types: wider than the engine, and refused as a whole function.
 //
