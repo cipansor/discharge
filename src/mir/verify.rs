@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::mir::exec;
-use crate::mir::parse::{self, MirFn, MirProgram};
+use crate::mir::parse::{self, MirFn, MirProgram, Ty};
 
 // The report types are part of the public verdict surface -- `FnOutcome`
 // carries a `MirReport` -- so they are re-exported here rather than leaving a
@@ -168,9 +168,35 @@ impl std::fmt::Display for FnOutcome {
 
 /// Verify one function from a parsed program plus its source contracts.
 pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome {
+    // A 128-bit type is wider than the engine, whose every width-taking
+    // constructor asserts `1..=64`. Refusing here, before any of them runs, is
+    // what keeps the refusal whole: the argument seeding, the loop havoc and the
+    // contract bindings all consult a type's width, and a 128-bit local would be a
+    // panic in whichever came first. A panic is not a refusal -- it takes the run
+    // down and reports nothing -- so this guard must precede them all.
+    if let Some(ty) = f.first_unrepresentable_type() {
+        return FnOutcome::Skipped {
+            reason: format!(
+                "`{ty:?}` is wider than the engine's 64-bit words, so the function is not modelled"
+            ),
+        };
+    }
     let contract = specs.get(&f.name);
     let arg_vars = spec::arg_vars(f);
     let signed = spec::signed_args(f);
+    // Fields of struct-typed arguments, bound to their own symbolic inputs. The
+    // same bindings are handed to the executor as seeds, so `c.lo` in a contract
+    // and `((*_1).0)` in the body name one variable.
+    let mut fields = spec::field_env(f, &specs.structs, &specs.enums);
+    // Slice element references a contract names, bound before the rewrite runs so
+    // each `xs[k]` has a binding to rewrite to. Done here, once, rather than on
+    // demand, because the postcondition is evaluated inside a closure that cannot
+    // hold a `&mut`.
+    if let Some(c) = contract {
+        for text in c.requires.iter().chain(c.ensures.iter()).chain(c.invariants.iter()) {
+            fields.bind_index_refs(text, &arg_vars);
+        }
+    }
     let ret_signed = f.ret_ty.is_signed();
 
     // A loop invariant. The clause carries no loop label, so it can only be
@@ -200,7 +226,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     let mut pre = None;
     if let Some(c) = contract {
         for r in &c.requires {
-            match spec::eval_requires(r, &arg_vars, &signed) {
+            match spec::eval_requires(r, &arg_vars, &signed, &fields) {
                 Ok(p) => pre = Some(match pre {
                     None => p,
                     Some(prev) => smt::and(prev, p),
@@ -212,6 +238,77 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
                 }
             }
         }
+    }
+
+    // A symbolic subscript is modelled as an ite chain, which is an honest model
+    // of the element only where the index is in range. The chain cannot make that
+    // true on its own, so the *precondition* has to establish it: if `requires`
+    // does not imply the bound, the subscript is refused rather than checked
+    // against a chain that quietly returned the wrong element for an
+    // out-of-range index.
+    //
+    // Conjoining the bound into the precondition instead would be unsound in the
+    // direction that matters: it would strengthen what the source asked to be
+    // checked, so a contract proved under `i < 4` would claim to hold without it.
+    //
+    // A slice needs *two* facts. `i < len` says the named index is in range, and
+    // `len <= MAX_INDEX_CHAIN` says the enumeration covers the whole slice -- so
+    // a read at some *other* index the body uses is also covered rather than
+    // falling through the chain to a wrong value. The second is a fact about the
+    // length, not the index, which is why bounding the index alone is not enough.
+    for (idx, bound) in fields.index_guards() {
+        // Two facts, checked separately so the refusal names the one that is
+        // missing. A combined message would leave a user who wrote one of the two
+        // bounds unable to tell which one the checker wanted.
+        let (cond, what) = match bound {
+            spec::IndexBound::Const(n) => (smt::ult_const(idx, n), format!("`i < {n}`")),
+            spec::IndexBound::Len(len) => (
+                smt::and(smt::ult(idx, len), smt::ule_const(len, spec::MAX_INDEX_CHAIN)),
+                format!("`i < xs.len()` and `xs.len() <= {}`", spec::MAX_INDEX_CHAIN),
+            ),
+        };
+        let established = match pre {
+            Some(p) => smt::prove(smt::implies(p, cond)) == smt::Verdict::Valid,
+            None => false,
+        };
+        if established {
+            continue;
+        }
+        // Which half is missing, for a slice. An array has only the one fact, so
+        // it keeps the plain message.
+        let detail = match bound {
+            spec::IndexBound::Const(_) => String::new(),
+            spec::IndexBound::Len(len) => {
+                let in_range = match pre {
+                    Some(p) => smt::prove(smt::implies(p, smt::ult(idx, len)))
+                        == smt::Verdict::Valid,
+                    None => false,
+                };
+                let bounded = match pre {
+                    Some(p) => {
+                        smt::prove(smt::implies(p, smt::ule_const(len, spec::MAX_INDEX_CHAIN)))
+                            == smt::Verdict::Valid
+                    }
+                    None => false,
+                };
+                match (in_range, bounded) {
+                    (false, false) => " (neither `i < xs.len()` nor `xs.len() <= 64` holds)",
+                    (false, true) => " (`i < xs.len()` does not hold)",
+                    (true, false) => {
+                        " (`xs.len() <= 64` does not hold: the slice may be longer than the \
+                         enumeration covers)"
+                    }
+                    (true, true) => "",
+                }
+                .to_string()
+            }
+        };
+        return FnOutcome::Skipped {
+            reason: format!(
+                "a symbolic index is not known to be in range: the precondition does not \
+                 imply {what}{detail}, and the subscript is only modelled there"
+            ),
+        };
     }
 
     // Build the postcondition as a closure over the return value.
@@ -230,25 +327,111 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     // unsound in the other direction.
     let ensures: Vec<String> = contract.map(|c| c.ensures.clone()).unwrap_or_default();
     if !ensures.is_empty() {
-        // Local `_0` is the return place; `Ty::width` is `Some` for every type a
-        // contract can name, and the fallback only keeps the probe total.
-        let probe_ret = smt::var_named(0, f.ret_ty.width().unwrap_or(1).clamp(1, 64));
-        if let Some(err) = ensures
-            .iter()
-            .find_map(|e| spec::eval_ensures(e, &arg_vars, probe_ret, &signed, ret_signed).err())
-        {
+        // Local `_0` is the return place; `Ty::width` is `Some` for a scalar
+        // return, which is the only case where a bare `ret` can be read. For an
+        // aggregate there is no single word, so the probe must pass `None` here
+        // exactly as the run does -- a fabricated one-bit word would let a bare
+        // `ret` in an aggregate contract parse against it, and the width then
+        // comes out as 1, so `ret <= 5` is refused with a message about a
+        // "1-bit width" that has nothing to do with the function.
+        let probe_ret = f.ret_ty.width().map(|w| smt::var_named(0, w.clamp(1, 64)));
+        // The probe must resolve exactly what the real postcondition will, so
+        // `ret.N` is bound here too. Leaving it out would make the probe fail on a
+        // contract the run could have handled, and the function would be skipped
+        // for a reason that is not true of it.
+        //
+        // Only the components a contract *names* are probed. Binding every
+        // declared component made a `(u8, &u8)` return unprobeable -- component 1
+        // is a reference with no bit-vector width -- so a contract about `ret.0`
+        // alone skipped the whole function. A component the contract does name and
+        // that has no width is still refused, because then the name really cannot
+        // be resolved.
+        let mut probe_fields = fields.clone();
+        let named_components = spec::named_ret_components(&ensures);
+        if let Ty::Tuple(ts) = &f.ret_ty {
+            for i in &named_components {
+                match ts.get(*i as usize) {
+                    Some(ty) if probe_fields.probe_ret_slot(*i, ty).is_some() => {}
+                    _ => {
+                        return FnOutcome::Skipped {
+                            reason: format!(
+                                "cannot bind `ret.{i}`: the component's type has no bit-vector width"
+                            ),
+                        };
+                    }
+                }
+            }
+        }
+        // The probe's `ret` is `None` exactly when the return type has no single
+        // word, so the aggregate message is the honest one here.
+        let probe_absent =
+            if probe_ret.is_some() { spec::RET_IS_UNKNOWN } else { spec::RET_IS_AGGREGATE };
+        if let Some(err) = ensures.iter().find_map(|e| {
+            spec::eval_ensures(
+                e,
+                &arg_vars,
+                probe_ret,
+                probe_absent,
+                &signed,
+                ret_signed,
+                &probe_fields,
+            )
+            .err()
+        }) {
             return FnOutcome::Skipped { reason: format!("unreadable `ensures`: {err}") };
         }
     }
     let args_for_post = arg_vars.clone();
+    let fields_for_post = fields.clone();
+    // The return type's components, for a postcondition that names `ret.N`. The
+    // type comes from the MIR (`-> (u8, u8)`), so the binding is to the declared
+    // shape rather than to whichever elements a particular path happened to
+    // write: a path that leaves `_0.1` unwritten must make `ret.1` a refusal, not
+    // a silently dropped conjunct.
+    let ret_components: Vec<Ty> = match &f.ret_ty {
+        Ty::Tuple(ts) => ts.clone(),
+        _ => Vec::new(),
+    };
+    // Which refusal to give when a bare `ret` is unbound. It is decided from the
+    // return *type*: a scalar return can only be unbound because its value is
+    // unknown on this path, while an aggregate has no single word to bind at all.
+    let ret_absent = if f.ret_ty.width().is_some() {
+        spec::RET_IS_UNKNOWN
+    } else {
+        spec::RET_IS_AGGREGATE
+    };
     let post = if ensures.is_empty() {
         None
     } else {
-        Some(move |ret| {
+        Some(move |ret: Option<smt::Var>, projs: &[(u32, smt::Var)]| {
+            // Bind each declared component that this path actually produced.
+            let mut fields = fields_for_post.clone();
+            for (i, ty) in ret_components.iter().enumerate() {
+                let i = i as u32;
+                // Declared but unwritten on this path: binding a *fresh*
+                // unconstrained variable would be wrong, because a postcondition
+                // about `ret.1` would then pass vacuously. Leaving it unbound makes
+                // the parser refuse the name instead.
+                if let Some((_, v)) = projs.iter().find(|(k, _)| *k == i) {
+                    fields.bind_ret(i, ty, *v);
+                }
+            }
+            // `ret` is `None` when the return value is an aggregate: there is no
+            // single word to stand for it, and the parser refuses a bare `ret`
+            // rather than checking it against a fabricated value. Components are
+            // still reachable as `ret.0`, `ret.1` through `fields`.
             let mut acc: Option<crate::smt::Pred> = None;
             for e in &ensures {
-                let p = spec::eval_ensures(e, &args_for_post, ret, &signed, ret_signed)
-                    .map_err(|err| err.to_string())?;
+                let p = spec::eval_ensures(
+                    e,
+                    &args_for_post,
+                    ret,
+                    ret_absent,
+                    &signed,
+                    ret_signed,
+                    &fields,
+                )
+                .map_err(|err| err.to_string())?;
                 acc = Some(match acc {
                     None => p,
                     Some(prev) => smt::and(prev, p),
@@ -258,7 +441,22 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         })
     };
 
-    let report = exec::verify_fn(prog, f, pre, post, invariant);
+    let report = exec::verify_fn(
+        prog,
+        f,
+        pre,
+        post,
+        invariant,
+        &exec::Seeds {
+            fields: fields.seeds.clone(),
+            lens: fields.len_seeds.clone(),
+            array_lens: fields.array_lens.clone(),
+            slice_steps: fields.slice_chain_steps(),
+            elems: fields.elem_seeds.clone(),
+            tags: fields.tag_seeds.clone(),
+            payload_seeds: fields.payload_seeds.clone(),
+        },
+    );
 
     // A definite failure outranks incompleteness: a counterexample is a result.
     // The polarity is per-kind, so this cannot just look for `Counterexample`:
@@ -357,7 +555,7 @@ pub fn verify_file_with(
         .map_err(|e| format!("could not read {}: {e}", source.display()))?;
     let specs = spec::extract(&text);
     let mir = emit_mir_with(rustc, source)?;
-    let prog = parse::parse_program(&mir);
+    let prog = parse::parse_program_with(&mir, &enum_layouts(&specs));
 
     let mut report = FileReport { source: source.to_path_buf(), ..Default::default() };
 
@@ -385,13 +583,32 @@ pub fn verify_file_with(
     Ok(report)
 }
 
+/// The executor's view of each enum: names in declaration order, so a
+/// `(base as Variant)` downcast resolves to the discriminant the `switchInt`
+/// compares against.
+///
+/// The spec reader carries payload types the parser has no use for, so only the
+/// names cross over. Both views are read from the same source in the same pass,
+/// which is what keeps a downcast's index and a contract's `Enum::Variant`
+/// constant in step by construction rather than by convention.
+fn enum_layouts(specs: &Specs) -> BTreeMap<String, parse::EnumLayout> {
+    specs
+        .enums
+        .iter()
+        .map(|(name, def)| {
+            let variants = def.variants.iter().map(|(v, _, d)| (v.clone(), *d)).collect();
+            (name.clone(), parse::EnumLayout { variants })
+        })
+        .collect()
+}
+
 /// Verify a whole MIR dump, using contracts from a companion source file.
 pub fn verify_mir_text(
     mir: &str,
     specs: &Specs,
     only: &[String],
 ) -> Result<FileReport, String> {
-    let prog = parse::parse_program(mir);
+    let prog = parse::parse_program_with(mir, &enum_layouts(specs));
     let mut report = FileReport::default();
     for name in specs.by_fn.keys() {
         if prog.get(name).is_none() {

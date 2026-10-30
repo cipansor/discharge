@@ -56,8 +56,44 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::mir::parse::Ty;
+use crate::mir::parse::{split_top_level, Ty, USIZE_WIDTH};
 use crate::smt::{self, Pred, Var};
+
+/// How long an array may be before a symbolic subscript is refused.
+///
+/// `a[i]` is modelled as an ite chain over the array's whole domain, so the cost
+/// is linear in the length. A bound keeps a very large array from turning a
+/// contract into a term the solver cannot handle; past it the subscript is
+/// refused rather than silently approximated.
+pub const MAX_INDEX_CHAIN: u64 = 64;
+
+/// The bound a symbolic subscript's ite chain is valid under.
+///
+/// The chain is built by enumerating a *finite* range and selecting the element
+/// whose index matches. An array's range is its type length, a constant. A
+/// slice's length is a symbolic input, so its range is the length variable --
+/// but the chain can only enumerate a bounded number of steps, so a slice's
+/// chain is valid only where the length is within that bound.
+///
+/// Carrying the bound as a type rather than as a `u64` is what keeps the two
+/// from being confused: a slice has no constant to put in the `u64`, and writing
+/// one would be a guess about the caller.
+#[derive(Clone, Copy, Debug)]
+pub enum IndexBound {
+    /// An array: the length is in the type, so the bound is that constant, and
+    /// `i < n` is the whole obligation.
+    Const(u64),
+    /// A slice: the length is a symbolic input, and the chain enumerates
+    /// `0..MAX_INDEX_CHAIN`, so the chain is exact only where
+    /// `len <= MAX_INDEX_CHAIN`. The obligation is that *and* `i < len`.
+    ///
+    /// The length bound is what makes the chain exact for *every* index in the
+    /// slice rather than only for the index the contract named: with
+    /// `i < len <= MAX` any index the body reads is one the enumeration covers.
+    /// Bounding the index alone would leave a read at some other index falling
+    /// through the chain to a wrong value.
+    Len(Var),
+}
 
 /// A contract attached to a function.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -90,6 +126,101 @@ pub struct Specs {
     /// contract, which means "check panic freedom on every input" rather than
     /// "skip it".
     pub by_fn: BTreeMap<String, FnContract>,
+    /// Struct layouts read from the same source, keyed by struct name.
+    ///
+    /// A contract that names a field (`c.lo`) needs two things the MIR dump does
+    /// not carry: which *index* that name is (declaration order), and the field's
+    /// width and signedness. The dump prints `_1: &Config` and nothing about
+    /// `Config`, so the layout has to come from the source — the same place the
+    /// contract text itself comes from, which keeps the two consistent by
+    /// construction. A struct with no entry here has no readable fields, and a
+    /// contract naming one is refused rather than guessed.
+    pub structs: BTreeMap<String, StructDef>,
+    /// Enum layouts read from the same source, keyed by enum name.
+    ///
+    /// An enum argument has no width of its own, but its *tag* does, and the
+    /// `switchInt` a `match` lowers to compares that tag against the variant
+    /// indices. Those indices are not in the MIR dump -- it prints `_2 =
+    /// discriminant(_1)` and `switchInt(move _2) -> [0: bb4, 1: bb3, 2: bb2]`,
+    /// which is a number per arm and no name at all. So the same reasoning as
+    /// [`Specs::structs`] applies: the layout has to come from the source, and a
+    /// contract naming a variant is refused rather than guessed at when it is not
+    /// there.
+    pub enums: BTreeMap<String, EnumDef>,
+}
+
+/// An enum's variants, in declaration order.
+///
+/// The *discriminant* is stored per variant, not taken from the vector position.
+/// rustc numbers variants by declaration order *unless* the source gives an
+/// explicit value (`B = 3`), and then a later variant's discriminant is neither
+/// its position nor its predecessor's value. A reader numbering by position puts
+/// a contract naming `E::C` on the wrong tag, and -- because the `match` arm
+/// constants come from rustc, not from this reader -- the contract and the arm
+/// then disagree about which variant a value is.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnumDef {
+    /// `(name, payload types, discriminant)` per variant, in declaration order.
+    /// A unit variant has an empty payload; a struct variant records no payload
+    /// types, so a contract naming one of its fields is refused rather than bound
+    /// to the wrong thing.
+    pub variants: Vec<(String, Vec<Ty>, u64)>,
+}
+
+impl EnumDef {
+    /// The discriminant for `name`, or `None` if the enum has no such variant.
+    pub fn index_of(&self, name: &str) -> Option<u64> {
+        self.variants.iter().find(|(n, _, _)| n == name).map(|(_, _, d)| *d)
+    }
+
+    /// The width that can hold every discriminant, and no more.
+    ///
+    /// A tag's domain is the set of discriminants, so the width is the largest
+    /// one's. Taking the variant *count*'s width instead is only the same thing
+    /// when the discriminants are `0..count`, which an explicit discriminant
+    /// breaks: `A, B = 3, C` needs three bits for the tag `4`, not the two bits a
+    /// count of three would give.
+    pub fn tag_width(&self) -> u8 {
+        let max = self.variants.iter().map(|(_, _, d)| *d).max().unwrap_or(0);
+        (64 - max.leading_zeros()).max(1) as u8
+    }
+
+    /// The predicate that a value of this enum's tag is one of its variants.
+    ///
+    /// This is what the run may *assume* about a symbolic tag, and it has to be
+    /// exact rather than a count. `tag < arity` is a fact about the type only when
+    /// the discriminants are consecutive from zero; with `A, B = 3, C` the real
+    /// tags are `0`, `3` and `4`, and `tag < 3` would exclude `4` -- excluding a
+    /// value the type admits. An assumed bound that is *false* for a real input is
+    /// the unsound direction: it can make a proof vacuous. The disjunction of
+    /// equalities is exact for any numbering.
+    pub fn tag_bound(&self, tag: Var) -> Pred {
+        let mut acc: Option<Pred> = None;
+        for (_, _, d) in &self.variants {
+            let p = smt::eq_const(tag, *d);
+            acc = Some(match acc {
+                None => p,
+                Some(prev) => smt::or(prev, p),
+            });
+        }
+        acc.unwrap_or_else(|| smt::truth(false))
+    }
+}
+
+/// A struct's fields, in declaration order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StructDef {
+    /// `(name, type)` for each field. The index in this vector *is* the MIR field
+    /// index, because a struct without `repr(transparent)`/reordering has its
+    /// fields in declaration order and rustc prints `.0` for the first one.
+    pub fields: Vec<(String, Ty)>,
+}
+
+impl StructDef {
+    /// The field index for `name`, or `None` if the struct has no such field.
+    pub fn index_of(&self, name: &str) -> Option<u32> {
+        self.fields.iter().position(|(n, _)| n == name).map(|i| i as u32)
+    }
 }
 
 impl Specs {
@@ -115,6 +246,16 @@ pub fn extract(source: &str) -> Specs {
     let mut pending = FnContract::default();
     let mut in_block_comment = false;
 
+    // Struct layouts, read in the same pass. The MIR dump names a struct
+    // (`_1: &Config`) but never prints its fields, so a contract like
+    // `c.lo <= c.hi` has no way to learn that `lo` is field 0 of width 8 unless
+    // the layout is read here.
+    let mut cur_struct: Option<(String, StructDef)> = None;
+    // Enum layouts, read in the same pass. An enum body is a list of variants
+    // rather than a list of fields, so it needs its own cursor; a struct and an
+    // enum cannot be open at once, so the two cursors never interleave.
+    let mut cur_enum: Option<(String, EnumDef)> = None;
+
     for (lineno, raw_line) in source.lines().enumerate() {
         let line = raw_line.trim();
         if in_block_comment {
@@ -126,6 +267,64 @@ pub fn extract(source: &str) -> Specs {
         if line.starts_with("/*") {
             if !line.contains("*/") {
                 in_block_comment = true;
+            }
+            continue;
+        }
+        // Inside an enum body: read variants until the closing brace.
+        if cur_enum.is_some() {
+            if line.starts_with('}') {
+                let (name, def) = cur_enum.take().unwrap();
+                specs.enums.insert(name, def);
+                continue;
+            }
+            match enum_variant(line) {
+                VariantLine::Variant { name: vname, payload, explicit } => {
+                    if let Some((_, def)) = cur_enum.as_mut() {
+                        push_variant(def, vname, payload, explicit);
+                    }
+                }
+                VariantLine::NotAVariant => {}
+                // An explicit discriminant this reader cannot evaluate: the whole
+                // layout is refused, because dropping the variant would shift
+                // every later discriminant and guessing one would put a contract
+                // on the wrong tag. Removing the enum makes a contract naming any
+                // of its variants a refusal, which is the safe direction.
+                VariantLine::UnreadableDiscriminant => {
+                    cur_enum = None;
+                }
+            }
+            continue;
+        }
+        // Inside a struct body: read fields until the closing brace.
+        if cur_struct.is_some() {
+            if line.starts_with('}') {
+                let (name, def) = cur_struct.take().unwrap();
+                specs.structs.insert(name, def);
+                continue;
+            }
+            if let Some((fname, fty)) = struct_field(line) {
+                if let Some((_, def)) = cur_struct.as_mut() {
+                    def.fields.push((fname, Ty::parse(&fty)));
+                }
+            }
+            continue;
+        }
+        if let Some(name) = struct_head(line) {
+            cur_struct = Some((name, StructDef::default()));
+            continue;
+        }
+        if let Some((name, head)) = enum_head(line) {
+            match head {
+                // A one-line body is complete already; it needs no cursor.
+                EnumHead::Inline(variants) => {
+                    specs.enums.insert(name, EnumDef { variants });
+                }
+                EnumHead::MultiLine => cur_enum = Some((name, EnumDef::default())),
+                // The body was refused *and* closed on this line. Opening a
+                // cursor here would run past the brace and consume every
+                // following line -- contracts included -- as enum contents, so
+                // the layout is dropped and the cursor stays shut.
+                EnumHead::Refused => {}
             }
             continue;
         }
@@ -201,10 +400,912 @@ pub struct SpecError {
     pub reason: String,
 }
 
+impl SpecError {
+    /// Re-point the error at the *source* contract text.
+    ///
+    /// The parser reads the text *after* the field rewrite, so its errors quote
+    /// mangled names (`a__chain`, `c__f0`) that appear nowhere in the source.
+    /// Reporting those to the user is a diagnosability bug, not just a cosmetic
+    /// one: the name in the message cannot be searched for. The reason is kept as
+    /// is -- it is about the rewritten form -- and only the quoted text is the
+    /// source's.
+    fn about(self, text: &str) -> Self {
+        Self { text: text.to_string(), reason: self.reason }
+    }
+}
+
 impl std::fmt::Display for SpecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "cannot read contract `{}`: {}", self.text, self.reason)
     }
+}
+
+/// The fields a contract may name, resolved to symbolic variables.
+///
+/// A contract writes `c.lo`, but the expression language knows only flat
+/// identifiers. Rather than grow the grammar with a projection operator, each
+/// readable field is *rewritten* to a mangled identifier (`c.lo` → `c__f0`) and
+/// bound to a variable of the field's own width and signedness. The grammar stays
+/// a comparison of arithmetic expressions over names, and the projection is a
+/// binding decision made before parsing — one place, not one per operator.
+///
+/// The rewrite is textual and runs on the whole contract, so it must not fire
+/// inside a longer identifier: `xs.len()` is handled separately (a length is a
+/// property of the argument, not a field), and `myc.lo` must not match `c.lo`.
+/// The scanner is therefore token-aware rather than a `replace`.
+#[derive(Clone, Debug, Default)]
+pub struct FieldEnv {
+    /// Mangled name → the variable standing for that field.
+    pub vars: BTreeMap<String, Var>,
+    /// Which mangled names are signed, for comparison signedness.
+    pub signed: BTreeSet<String>,
+    /// `arg.field` → mangled name, so the rewrite can be driven by what actually
+    /// exists rather than by a pattern.
+    pub paths: BTreeMap<String, String>,
+    /// The argument names known to be aggregates. Used only to *diagnose*: a
+    /// contract naming `c.lo` where `c` is a struct but `lo` is not a field gets
+    /// "unknown field `lo`" rather than a parser error about the `.` it cannot
+    /// reduce. Both refuse; one says why.
+    pub known_args: BTreeSet<String>,
+    /// The first variable slot this environment may use. It is one past the
+    /// highest local the function declares, so a field variable can never take an
+    /// index a local already holds.
+    ///
+    /// A *fixed* base would be a soundness assumption about the input ("no
+    /// function has 200 locals"). Two variables at one index is not a missing
+    /// proof but a wrong one, so the base is derived from the function instead of
+    /// assumed about it. If the fields do not fit below `MAX_VARS`, the field is
+    /// refused rather than aliased.
+    base: u32,
+    /// How many fields have been bound, which is also the next variable slot.
+    next_slot: u32,
+    /// Base slot for `ret.N` bindings, so they cannot collide with argument
+    /// field slots. The return value's own variable is allocated by the caller
+    /// (it is a real local), so only the *projections* get slots here.
+    next_ret_slot: u32,
+    /// `(local, field index, variable)` for each bound field.
+    ///
+    /// The executor reads `_1.0` out of its own `fields` map, so the *same*
+    /// variable the contract names as `c.lo` has to be seeded there under
+    /// `(_1, 0)`. If the two disagreed, the contract would be about one symbolic
+    /// input and the body about another, and every proof would be vacuous in the
+    /// direction that matters. These seeds are how the two are made to agree by
+    /// construction rather than by convention.
+    /// The `bool` is the field's signedness, carried here so the executor can
+    /// build a `Val::Sym` that *knows* its sign. A seed without one would force
+    /// the executor to guess, which is the bug class this closes.
+    pub seeds: Vec<(u32, u32, Var, bool)>,
+    /// `(local, fixed length)` for each *array* argument, so the executor can
+    /// enumerate the domain a symbolic subscript needs. A slice has no entry:
+    /// there is no fixed domain, so its `xs[i]` stays refused.
+    pub array_lens: Vec<(u32, u64)>,
+    /// `(local, length variable, element width)` for each slice or array
+    /// argument.
+    ///
+    /// A slice has no length in its type, so the length is a symbolic input, and
+    /// `xs.len()` in a contract and `PtrMetadata(_1)` in the body must name the
+    /// same one. An array's length *is* in its type, so there it is the constant
+    /// `N`, and the contract's `a.len()` and the body's `const N_usize` agree by
+    /// being the same word. This is the indexed analogue of `seeds`.
+    pub len_seeds: Vec<(u32, Var, u8, bool)>,
+    /// `(local, index, element variable)` for each slice or array element the
+    /// contract names. The body's `(*_1)[0]` reads the same variable, so `xs[0]`
+    /// in a contract and `xs[0]` in the body are one value, not two that look
+    /// alike.
+    pub elem_seeds: Vec<(u32, u64, Var, bool)>,
+    /// `(local, tag variable, tag width, discriminants)` for each enum-typed
+    /// argument.
+    ///
+    /// An enum argument has no bit width of its own, but its *tag* does, and the
+    /// tag is the only thing a contract can say about an enum without naming a
+    /// variant. It is a symbolic input whose domain is the set of variant
+    /// discriminants — a fact about the type, so the run may assume it. The
+    /// discriminants travel with the seed rather than a variant count, because
+    /// `tag < count` is only the same domain when the numbering is `0..count`,
+    /// which an explicit discriminant (`B = 3`) breaks. Seeding the tag here is
+    /// what makes the contract's `m` and the body's `discriminant(_1)` one
+    /// variable.
+    pub tag_seeds: Vec<(u32, Var, u8, Vec<u64>)>,
+    /// `(local, variant, variable, width, signed)` for each variant payload.
+    ///
+    /// A payload is a symbolic input like any other: the frontend cannot know what
+    /// the caller put in it, so assuming a relation would be unsound. Seeding it
+    /// means the body's `((_1 as Data).0)` and a contract's `m.Data` name one
+    /// variable rather than two that look alike.
+    pub payload_seeds: Vec<(u32, u64, Var, u8, bool)>,
+    /// `Enum::Variant` → `(discriminant, tag width)`, so a contract can write
+    /// `m == Mode::Idle` and have it mean the tag equals that variant's index.
+    /// A name not in here is refused, which keeps a misspelled variant from being
+    /// read as an unrelated integer.
+    pub variant_consts: BTreeMap<String, (u64, u8)>,
+    /// `arg.Variant` → the mangled payload name, so a contract can name a payload
+    /// the way the body's downcast reads it.
+    pub payload_paths: BTreeMap<String, String>,
+    /// The names of enum-typed arguments, for diagnostics: a contract naming
+    /// `m.Nope` where `Nope` is not a variant gets a message about the variant.
+    pub enum_args: BTreeSet<String>,
+    /// Indexed arguments (slices and arrays): name → (local, element width, the
+    /// array's fixed length if it is one), so a contract's `xs.len()` and `xs[0]`
+    /// can be bound without the IR's `Ty` in hand.
+    ///
+    /// The length is `Some(n)` for an array and `None` for a slice, which is what
+    /// lets a contract naming `a[9]` on a `[u8; 4]` be refused as out of range
+    /// rather than bound to a fresh variable for an element that does not exist.
+    indexed: BTreeMap<String, (u32, u8, Option<u64>, bool)>,
+    /// `arg -> index variable` for an array argument a contract subscripts with a
+    /// *symbolic* index (`a[i]`).
+    ///
+    /// An array has a finite domain, so a symbolic subscript can be *modelled*
+    /// rather than refused: `a[i]` becomes the ite chain over `0..N`, which is
+    /// exact. The index variable is a fresh input, and the chain is built by the
+    /// parser from the element variables in [`elem_seeds`](Self::elem_seeds) so
+    /// the contract's `a[i]` and the body's `a[i]` are the same expression.
+    ///
+    /// A *slice* gets no entry: its length is a symbolic input, so there is no
+    /// finite domain to enumerate and `xs[i]` stays a refusal. That is the honest
+    /// boundary -- an array's length is in its type, a slice's is not.
+    sym_index: BTreeMap<String, Var>,
+    /// `arg -> every index spelling` for an array a contract subscripts
+    /// symbolically, so the rewrite can tell `a[i]` (which has a chain) from
+    /// `a[j]` (which does not) instead of rewriting both to the same chain.
+    ///
+    /// A *set*, not one name: one index variable can be spelled more than once —
+    /// `a[i]` and `a[k]` where `let k = i`, or the same name twice — and every
+    /// spelling of the bound index names the same element, so every spelling has
+    /// to rewrite to the same chain. Keeping only the first left the second
+    /// subscript unrewritten and the whole contract unreadable, which skipped a
+    /// function that should have verified.
+    sym_index_names: BTreeMap<String, BTreeSet<String>>,
+    /// `arg -> the ite chain` for an array a contract subscripts symbolically.
+    ///
+    /// Built once by [`bind_sym_index`](Self::bind_sym_index) from the element
+    /// variables, so the rewrite can replace `a[i]` with a *name* the parser
+    /// resolves, and the chain is the same term every time it is used. An array
+    /// argument has no variable of its own (its type has no bit width), so
+    /// without this the parser would refuse `a` as an unknown name.
+    sym_chain: BTreeMap<String, Var>,
+    /// `arg -> the bound its chain is valid under` for an array or slice a
+    /// contract subscripts symbolically.
+    ///
+    /// An array's bound is its type length; a slice's is its length *variable*,
+    /// which is symbolic, so the chain is exact only under `len <=
+    /// MAX_INDEX_CHAIN`. The caller turns this into the obligations the
+    /// precondition must establish, and the executor takes the same bound so its
+    /// own chain covers the same range the contract's does.
+    sym_bound: BTreeMap<String, IndexBound>,
+    /// Every *source* name in scope: the argument names.
+    ///
+    /// The bindings above are named by mangling (`a__len`, `c__f0`,
+    /// `a__chain`), and those names are handed to the parser alongside the
+    /// arguments. If a real argument happens to be called `a__chain`, the
+    /// generated binding would shadow it: `eval_requires` extends the argument
+    /// names with the generated ones, so the later insert wins and a contract
+    /// naming that argument silently reads the array's chain instead. That is a
+    /// false proof, not a parse error. Every generated name is therefore checked
+    /// against this set before it is inserted, and the binding is refused rather
+    /// than allowed to shadow an argument.
+    declared: BTreeSet<String>,
+}
+
+impl FieldEnv {
+    /// Whether `name` may be introduced as a generated binding.
+    ///
+    /// It may not when a *source* name already holds it: the generated binding is
+    /// inserted after the arguments when a contract is parsed, so a collision
+    /// would let the generated value shadow the argument and a contract naming
+    /// that argument would be checked against the wrong input.
+    fn name_is_free(&self, name: &str) -> bool {
+        !self.declared.contains(name)
+    }
+
+    /// Bind a field of an argument to a variable.
+    ///
+    /// The slot is handed out sequentially, not derived from a hash of the path.
+    /// A hash can collide, and two fields sharing a variable is not a missing
+    /// proof but a *wrong* one — `c.lo <= c.hi` would become `x <= x`. A counter
+    /// cannot collide, so there is nothing to argue about.
+    pub fn bind(&mut self, local: u32, arg: &str, field: &str, index: u32, ty: &Ty) -> Option<()> {
+        self.bind_bits(local, arg, field, index, ty.width()?, ty.is_signed())
+    }
+
+    /// Record that `name` is an aggregate argument, so a contract naming a field
+    /// it does not have gets a message about the field rather than about the dot.
+    pub fn declare_arg(&mut self, name: &str) {
+        self.known_args.insert(name.to_string());
+        self.declared.insert(name.to_string());
+    }
+
+    /// [`bind`] by width and signedness, for callers outside the crate that
+    /// cannot name the IR's `Ty`.
+    ///
+    /// This is the primitive; `bind` is the typed wrapper. Keeping the IR
+    /// internal is deliberate (see the module docs), so the public entry point
+    /// takes a width rather than a `Ty` and does not leak the parse tree.
+    pub fn bind_bits(
+        &mut self,
+        local: u32,
+        arg: &str,
+        field: &str,
+        index: u32,
+        w: u8,
+        signed: bool,
+    ) -> Option<()> {
+        if !(1..=64).contains(&w) {
+            return None;
+        }
+        // A field is a distinct symbolic input from the argument's own variable.
+        // `var_named` keys on the *local index*, so a field needs an index no
+        // local of this function can use; the base is past the range rustc prints
+        // for these corpora and `var_named` refuses anything at or above
+        // `MAX_VARS`, which keeps a very large field count a refusal rather than
+        // an alias.
+        let slot = self.base + self.next_slot;
+        if slot as usize >= crate::smt::MAX_VARS {
+            return None;
+        }
+        let mangled = format!("{arg}__f{index}");
+        if !self.name_is_free(&mangled) {
+            return None;
+        }
+        self.next_slot += 1;
+        let v = smt::var_named(slot, w);
+        self.vars.insert(mangled.clone(), v);
+        self.seeds.push((local, index, v, signed));
+        if signed {
+            self.signed.insert(mangled.clone());
+        }
+        self.paths.insert(format!("{arg}.{field}"), mangled);
+        self.known_args.insert(arg.to_string());
+        Some(())
+    }
+
+    /// Bind an enum-typed argument: its tag, and each variant's payloads.
+    ///
+    /// The tag is the only thing a contract can compare against a variant, so it
+    /// is always bound when the enum's layout is known. The payloads are bound
+    /// too, so `m.Data` in a contract names the same input the body's downcast
+    /// reads. A payload whose type has no bit width (a nested enum, a reference)
+    /// is skipped, and a contract naming it is then refused rather than bound to
+    /// a fabricated word.
+    ///
+    /// The tag's width is the *discriminants'*, not the dump's `isize`: the
+    /// `switchInt` compares it against the variant constants, so the width only
+    /// has to hold them. Using the discriminants' width keeps the tag and the
+    /// payload in a width that `discriminant` reads back consistently.
+    pub fn bind_enum(
+        &mut self,
+        local: u32,
+        arg: &str,
+        enum_name: &str,
+        def: &EnumDef,
+    ) -> Option<()> {
+        if def.variants.is_empty() {
+            return None;
+        }
+        // The tag needs enough bits for the *largest discriminant*, which an
+        // explicit value can push past the variant count: `A, B = 3, C` needs
+        // three bits for `4`, not the two a count of three would give.
+        let width = def.tag_width();
+        let tag_slot = self.base + self.next_slot;
+        if tag_slot as usize >= crate::smt::MAX_VARS {
+            return None;
+        }
+        let tag_name = format!("{arg}__tag");
+        if !self.name_is_free(&tag_name) {
+            return None;
+        }
+        self.next_slot += 1;
+        let tag = smt::var_named(tag_slot, width);
+        self.vars.insert(tag_name, tag);
+        // The argument's own name is the tag, so `m == Mode::Idle` reads the tag
+        // without a projection. Bound after the tag variable exists so the two are
+        // the same word.
+        self.vars.insert(arg.to_string(), tag);
+        // The seeds carry the width and the *discriminant list*, because the
+        // executor has to assume exactly the tag's domain -- a disjunction of the
+        // real discriminants, not a `0..count` bound.
+        let discs: Vec<u64> = def.variants.iter().map(|(_, _, d)| *d).collect();
+        self.tag_seeds.push((local, tag, width, discs));
+        self.enum_args.insert(arg.to_string());
+        for (vname, payload, d) in def.variants.iter() {
+            // The variant name is a constant of the tag's width, holding the
+            // *discriminant* rustc assigned -- the same number a `match` arm
+            // compares against. Numbering by position here is what put a contract
+            // and an arm in disagreement.
+            self.variant_consts.insert(format!("{enum_name}::{vname}"), (*d, width));
+            self.variant_consts.insert(format!("{arg}::{vname}"), (*d, width));
+            // A payload: `m.Data` is field 0 of variant `Data`. Only the first
+            // payload is bound, because the MIR downcast this frontend models
+            // reads `.0`; a second field would need a tuple projection the
+            // executor does not carry for payloads.
+            let Some(first) = payload.first() else { continue };
+            let Some(w) = first.width() else { continue };
+            let slot = self.base + self.next_slot;
+            if slot as usize >= crate::smt::MAX_VARS {
+                continue;
+            }
+            let mangled = format!("{arg}__v{d}_0");
+            if !self.name_is_free(&mangled) {
+                continue;
+            }
+            self.next_slot += 1;
+            let v = smt::var_named(slot, w);
+            self.vars.insert(mangled.clone(), v);
+            // Keyed by the *discriminant*, because that is what a `Downcast`
+            // projection carries: the executor stores and reads payloads under the
+            // same number, and a positional key would not match a variant after an
+            // explicit discriminant.
+            self.payload_seeds.push((local, *d, v, w, first.is_signed()));
+            if first.is_signed() {
+                self.signed.insert(mangled.clone());
+            }
+            self.payload_paths.insert(format!("{arg}.{vname}"), mangled);
+        }
+        Some(())
+    }
+}
+
+
+impl FieldEnv {
+    /// Bind `ret.N` to a variable, for a postcondition that names a component of
+    /// a tuple return.
+    ///
+    /// Unlike an argument field, the variable here is not fresh: it is whatever
+    /// the executor holds for element `N` of the return place, so the contract's
+    /// `ret.0` and the body's `_0.0` are the same value. `slot` is only used by
+    /// the up-front parse probe, which needs *some* variable of the right width
+    /// and does not care which.
+    pub fn bind_ret(&mut self, index: u32, ty: &Ty, v: Var) -> Option<()> {
+        // The component's own type decides. A `&T` component is *not* read
+        // through to its referent here, because the executor seeds a scalar `&T`
+        // argument as `Unknown` (`Ty::width` is `None` for `Ref`), so a `ret.1`
+        // of type `&u8` has no value to bind. Reading through would make the probe
+        // accept a component the run then cannot resolve -- the probe exists to
+        // refuse exactly what the run would refuse, so it must refuse here too.
+        ty.width()?;
+        let mangled = format!("ret__f{index}");
+        self.vars.insert(mangled.clone(), v);
+        if ty.is_signed() {
+            self.signed.insert(mangled.clone());
+        }
+        self.paths.insert(format!("ret.{index}"), mangled);
+        Some(())
+    }
+
+    /// A fresh variable for the `index`-th return projection, for the parse probe.
+    ///
+    /// Only called for a component a contract actually *names* (see
+    /// [`named_ret_components`]). Binding every declared component instead made a
+    /// `(u8, &u8)` return unprobeable -- component 1 is a reference with no
+    /// bit-vector width -- so the whole function was skipped for a component no
+    /// contract asked about, even when the contract only mentioned `ret.0`.
+    pub fn probe_ret_slot(&mut self, index: u32, ty: &Ty) -> Option<Var> {
+        let w = ty.width()?;
+        // Past the field slots, so a return component and an argument field never
+        // share an index.
+        let slot = self.base + self.next_slot + self.next_ret_slot;
+        if slot as usize >= crate::smt::MAX_VARS {
+            return None;
+        }
+        self.next_ret_slot += 1;
+        let v = smt::var_named(slot, w);
+        self.bind_ret(index, ty, v)?;
+        Some(v)
+    }
+
+    /// Bind a slice argument's length to a fresh symbolic variable.
+    ///
+    /// `xs.len()` has no constant value — the length is whatever the caller
+    /// passed — so it is an input, exactly like the elements. The same variable
+    /// is handed to the executor as a `len_seed`, which is what makes the
+    /// contract's `xs.len()` and the body's `PtrMetadata(_1)` one value.
+    pub fn bind_indexed_len(
+        &mut self,
+        local: u32,
+        arg: &str,
+        elem_w: u8,
+        elem_signed: bool,
+    ) -> Option<Var> {
+        if !(1..=64).contains(&elem_w) {
+            return None;
+        }
+        let len_name = format!("{arg}__len");
+        if !self.name_is_free(&len_name) {
+            return None;
+        }
+        let slot = self.base + self.next_slot;
+        if slot as usize >= crate::smt::MAX_VARS {
+            return None;
+        }
+        self.next_slot += 1;
+        let v = smt::var_named(slot, USIZE_WIDTH);
+        self.vars.insert(len_name, v);
+        self.paths.insert(format!("{arg}.len()"), format!("{arg}__len"));
+        self.indexed.insert(arg.to_string(), (local, elem_w, None, elem_signed));
+        self.len_seeds.push((local, v, elem_w, elem_signed));
+        self.known_args.insert(arg.to_string());
+        Some(v)
+    }
+
+    /// Bind an array argument's length to its *constant*, `N`.
+    ///
+    /// Unlike a slice, an array's length is part of its type, so `a.len()` is the
+    /// constant `N` and not an input: there is nothing for the caller to choose.
+    /// Binding it to a fresh variable would be the unsound direction — it would
+    /// admit lengths the type excludes, so a contract proved at length 4 would
+    /// claim to hold at any length.
+    pub fn bind_array_len(
+        &mut self,
+        local: u32,
+        arg: &str,
+        elem_w: u8,
+        elem_signed: bool,
+        n: u64,
+    ) -> Option<()> {
+        if !(1..=64).contains(&elem_w) {
+            return None;
+        }
+        let len_name = format!("{arg}__len");
+        if !self.name_is_free(&len_name) {
+            return None;
+        }
+        let v = smt::word(n, USIZE_WIDTH);
+        self.vars.insert(len_name, v);
+        self.paths.insert(format!("{arg}.len()"), format!("{arg}__len"));
+        self.indexed.insert(arg.to_string(), (local, elem_w, Some(n), elem_signed));
+        self.len_seeds.push((local, v, elem_w, elem_signed));
+        self.array_lens.push((local, n));
+        self.known_args.insert(arg.to_string());
+        Some(())
+    }
+
+    /// Bind one element of a slice or array argument to a fresh symbolic variable.
+    ///
+    /// `xs[k]` is a distinct input per index — two indices are two variables, so
+    /// `xs[0] == xs[1]` is not provable — and the same index twice is the same
+    /// variable. The element width is the *referent* width (`u8` for `[u8; 4]`),
+    /// not the length's.
+    ///
+    /// An array index past its length is refused rather than bound: the element
+    /// does not exist, so a contract naming it is about nothing, and a fresh
+    /// variable there would make a meaningless precondition look like a real one.
+    fn bind_indexed_elem(&mut self, arg: &str, index: u64) -> Option<Var> {
+        let (local, elem_w, fixed_len, elem_signed) = *self.indexed.get(arg)?;
+        if !(1..=64).contains(&elem_w) {
+            return None;
+        }
+        if let Some(n) = fixed_len {
+            if index >= n {
+                return None;
+            }
+        }
+        // Already bound (the same index twice in one contract): reuse it, so
+        // `xs[0] <= xs[0]` is `x <= x` rather than two unrelated inputs.
+        let mangled = format!("{arg}__e{index}");
+        if let Some(v) = self.vars.get(&mangled) {
+            return Some(*v);
+        }
+        if !self.name_is_free(&mangled) {
+            return None;
+        }
+        let slot = self.base + self.next_slot;
+        if slot as usize >= crate::smt::MAX_VARS {
+            return None;
+        }
+        self.next_slot += 1;
+        let v = smt::var_named(slot, elem_w);
+        self.vars.insert(mangled.clone(), v);
+        self.paths.insert(format!("{arg}[{index}]"), mangled);
+        self.elem_seeds.push((local, index, v, elem_signed));
+        Some(v)
+    }
+
+    /// Bind a symbolic index: the index variable, and every element of the array
+    /// or slice, so the parser can build the ite chain from bindings that already
+    /// exist.
+    ///
+    /// The index is a fresh input (whatever the caller passed) and the elements
+    /// are the same ones a literal `a[k]` would bind, so `a[i]` and `a[0]` share
+    /// their element variables and the two cannot disagree. The *range* is not
+    /// checked here: the bound is recorded in `sym_bound`, and the contract is
+    /// refused unless the precondition establishes it.
+    ///
+    /// The range enumerated is [`IndexBound::Const`] for an array (its type
+    /// length) and [`IndexBound::Len`] for a slice (its length variable, which is
+    /// symbolic), so a slice's chain enumerates `0..MAX_INDEX_CHAIN` and is exact
+    /// only where the length is within that.
+    ///
+    /// Every element is bound up front rather than on first use because the
+    /// postcondition is evaluated in a closure that cannot hold a `&mut`, and
+    /// because the executor is handed the same element variables as seeds: an
+    /// element the contract did not bind would be created fresh by the body and
+    /// the two `a[i]` would then be different values that look alike.
+    pub fn bind_sym_index(
+        &mut self,
+        arg: &str,
+        elem_w: u8,
+        bound: IndexBound,
+        index_name: &str,
+        index: Var,
+    ) -> Option<Var> {
+        if !(1..=64).contains(&elem_w) {
+            return None;
+        }
+        // A slice has no length in its type, so the chain enumerates
+        // `0..MAX_INDEX_CHAIN` and is exact only where the length is within that.
+        // The obligation is recorded in `sym_bound` and established by the caller.
+        let steps = match bound {
+            IndexBound::Const(n) if n <= MAX_INDEX_CHAIN => n,
+            IndexBound::Const(_) => return None,
+            IndexBound::Len(_) => MAX_INDEX_CHAIN,
+        };
+        if let Some(v) = self.sym_index.get(arg) {
+            // The same array subscripted by two different indices has no single
+            // chain to rewrite to. Refusing keeps the second subscript a refusal
+            // rather than silently reusing the first chain.
+            //
+            // The comparison is on the *bound index variable*, not on the name, so
+            // two spellings of one index (`a[i]` and `a[k]` where `let k = i`)
+            // share a chain rather than colliding. That is what makes an alias a
+            // rename and nothing more.
+            if *v != index {
+                return None;
+            }
+            // The same index under a new spelling: it names the same element, so
+            // record the spelling and let the rewrite replace it too. Returning
+            // early here left the second spelling unrewritten, and the parser then
+            // refused the whole contract as an unknown name.
+            self.sym_index_names.entry(arg.to_string()).or_default().insert(index_name.to_string());
+            return Some(*v);
+        }
+        // The elements first, so the chain has all of them to build from.
+        let mut elems = Vec::with_capacity(steps as usize);
+        for k in 0..steps {
+            elems.push(self.bind_indexed_elem(arg, k)?);
+        }
+        let v = index;
+        self.sym_index.insert(arg.to_string(), v);
+        self.sym_index_names.entry(arg.to_string()).or_default().insert(index_name.to_string());
+        // `ite(i == 0, e0, ite(i == 1, e1, ... ite(i == N-1, e_{N-1}, 0)))`.
+        // The fall-through is unreachable: every use of the chain is guarded by
+        // `i < N` (conjoined by `eval_*`, or assumed from the body's own bounds
+        // assert), so the value chosen for `i >= N` is never observed.
+        let mut chain = smt::word(0, elem_w);
+        for k in (0..steps).rev() {
+            chain = smt::ite(smt::eq_const(v, k), elems[k as usize], chain);
+        }
+        self.sym_chain.insert(arg.to_string(), chain);
+        // The rewrite replaces `a[i]` with this name, and the parser resolves it
+        // from `vars`, so the chain has to be reachable by name.
+        let chain_name = format!("{arg}__chain");
+        if !self.name_is_free(&chain_name) {
+            return None;
+        }
+        self.vars.insert(chain_name.clone(), chain);
+        self.paths.insert(chain_name.clone(), chain_name);
+        self.sym_bound.insert(arg.to_string(), bound);
+        Some(v)
+    }
+
+    /// `(index variable, bound)` for every indexed argument a contract
+    /// subscripts symbolically, so the caller can require that the precondition
+    /// establishes each index is in range.
+    ///
+    /// The ite chain has a fall-through for an out-of-range index (it has to
+    /// return *something*), so the chain is only an honest model where the index
+    /// is in range. Rather than refuse the subscript, the caller proves the
+    /// precondition implies the bound; if it does not, the contract is refused.
+    /// Conjoining the bound into the precondition instead would be unsound,
+    /// because it would quietly strengthen what the source asked to be checked.
+    ///
+    /// The bound is an [`IndexBound`] rather than a `u64` because a slice's is a
+    /// *term*: its length is a symbolic input. An array's is still the constant
+    /// from its type, wrapped so the two travel as one shape.
+    pub fn index_guards(&self) -> Vec<(Var, IndexBound)> {
+        self.sym_index
+            .iter()
+            .filter_map(|(arg, v)| {
+                let bound = *self.sym_bound.get(arg)?;
+                Some((*v, bound))
+            })
+            .collect()
+    }
+
+    /// `(local, steps)` for every *slice* the contract subscripts symbolically,
+    /// so the executor can build its own chain over the same range.
+    ///
+    /// Only slices appear here. An array's chain comes from its type length, which
+    /// the executor already has from `array_lens`; a slice's has no type length,
+    /// so the executor can only build one when the contract established
+    /// `len <= MAX_INDEX_CHAIN`, which is exactly what `sym_bound` records. A
+    /// slice whose bound the contract did *not* establish is absent, and its
+    /// symbolic subscript stays refused rather than becoming a chain that
+    /// enumerates a range the length may exceed.
+    pub fn slice_chain_steps(&self) -> Vec<(u32, u64)> {
+        self.sym_bound
+            .iter()
+            .filter_map(|(arg, bound)| {
+                let (local, _, _, _) = self.indexed.get(arg)?;
+                match bound {
+                    IndexBound::Len(_) => Some((*local, MAX_INDEX_CHAIN)),
+                    IndexBound::Const(_) => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Bind every indexed element a contract text names, so the rewrite has a
+    /// binding for each and the run needs no mutable access to the environment.
+    ///
+    /// Scanning the text up front rather than binding on demand keeps
+    /// `eval_requires` / `eval_ensures` taking `&FieldEnv`: the postcondition is
+    /// evaluated inside an `Fn` closure the executor calls on every returning
+    /// path, and that closure cannot hold a `&mut`. It also means an element the
+    /// body reads but the contract does not is bound by the *executor* (through
+    /// `index_elem`), and the two agree because both key on the same index.
+    pub fn bind_index_refs(&mut self, text: &str, args: &BTreeMap<String, Var>) {
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i].is_alphabetic() || chars[i] == '_' {
+                let start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let ident: String = chars[start..i].iter().collect();
+                if chars.get(i) == Some(&'[') {
+                    let mut j = i + 1;
+                    let digits: String = chars[j..].iter().take_while(|c| c.is_ascii_digit()).collect();
+                    j += digits.len();
+                    if !digits.is_empty() && chars.get(j) == Some(&']') {
+                        if let Ok(k) = digits.parse::<u64>() {
+                            self.bind_indexed_elem(&ident, k);
+                        }
+                        i = j + 1;
+                        continue;
+                    }
+                    // Not a literal index: a symbolic subscript of an *array*,
+                    // `a[i]`. Only an array has a finite domain to enumerate; a
+                    // slice's length is a symbolic input, so `xs[i]` is left
+                    // unbound and the parser refuses it. Binding here (rather
+                    // than in the parser) keeps the element variables in
+                    // `elem_seeds`, so the executor is handed the same ones.
+                    // Anything that is not a name the contract may use is left
+                    // unbound and refused by the parser -- a refusal, not a
+                    // wrong value.
+                    let close = chars[j..].iter().position(|c| *c == ']').map(|p| p + j);
+                    if let Some(close) = close {
+                        let inner: String = chars[i + 1..close].iter().collect();
+                        // The index has to be a name the contract may use -- an
+                        // argument, or a local that is a direct alias of one
+                        // (`let k = i; a[k]`). A compound index (`a[i + 1]`) is
+                        // left unbound and refused by the parser rather than
+                        // mis-modelled.
+                        if let Some(&index) = args.get(&inner) {
+                            // The bound is the array's type length or, for a
+                            // slice, the length *variable* -- which is why the
+                            // argument's length has to be bound before this runs.
+                            // A slice whose length the contract never named has
+                            // no variable to bound the chain by, so it is left
+                            // unbound and refused.
+                            if let Some((_, elem_w, fixed_len, _)) =
+                                self.indexed.get(&ident).copied()
+                            {
+                                let bound = match fixed_len {
+                                    Some(n) => Some(IndexBound::Const(n)),
+                                    None => self.vars.get(&format!("{ident}__len")).map(|l| {
+                                        IndexBound::Len(*l)
+                                    }),
+                                };
+                                if let Some(bound) = bound {
+                                    self.bind_sym_index(
+                                        &ident, elem_w, bound, &inner, index,
+                                    );
+                                }
+                            }
+                        }
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                continue;
+            }
+            i += 1;
+        }
+    }
+}
+
+/// Rewrite `arg.field` to its mangled binding, token-aware.
+///
+/// Only whole `ident.ident` runs that match a *bound* path are replaced, so an
+/// unrelated `x.y` is left for the parser to refuse as an unknown name rather
+/// than silently becoming something else.
+/// The `ret.N` components the given contract texts name.
+/// The up-front parse probe uses this to bind only what a contract can mention.
+/// Binding *every* declared component of the return type makes a `(u8, &u8)`
+/// return unprobeable: component 1 is a reference with no bit-vector width, so
+/// the probe refuses and the function is `Skipped` -- for a component the
+/// contract never named. `(u8, &u8)` and `(bool, &T)` returns are ordinary, so
+/// that skip silently loses the proof.
+///
+/// Only `ret.N` is matched, not `result.N`: the rewrite that gives a component
+/// its binding emits `ret.N`, so `result.N` was never resolvable and is left to
+/// the parser to refuse rather than half-supported here.
+pub fn named_ret_components(texts: &[String]) -> BTreeSet<u32> {
+    let mut out = BTreeSet::new();
+    for text in texts {
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i].is_alphabetic() || chars[i] == '_' {
+                let start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let ident: String = chars[start..i].iter().collect();
+                if ident == "ret" && chars.get(i) == Some(&'.') {
+                    let j = i + 1;
+                    let digits: String =
+                        chars[j..].iter().take_while(|c| c.is_ascii_digit()).collect();
+                    if !digits.is_empty() {
+                        if let Ok(k) = digits.parse::<u32>() {
+                            out.insert(k);
+                        }
+                    }
+                }
+                continue;
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+fn rewrite_fields(text: &str, fields: &FieldEnv) -> Result<String, SpecError> {
+    // A payload path is a rewrite target too, so an enum-only contract must not
+    // take the early return: `m.Data` would be left spelled as a field access the
+    // parser cannot reduce.
+    if fields.paths.is_empty()
+        && fields.known_args.is_empty()
+        && fields.payload_paths.is_empty()
+    {
+        return Ok(text.to_string());
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_alphabetic() || c == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let ident: String = chars[start..i].iter().collect();
+            // A field access: `ident.ident`, where the tail is alphanumeric.
+            if chars.get(i) == Some(&'.') {
+                let dot = i;
+                let mut j = i + 1;
+                while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                let field: String = chars[dot + 1..j].iter().collect();
+                // An enum payload: `m.Data`. It is rewritten to the mangled
+                // payload name the executor seeds, so the contract's `m.Data` and
+                // the body's `((_1 as Data).0)` are one variable.
+                if let Some(mangled) = fields.payload_paths.get(&format!("{ident}.{field}")) {
+                    out.push_str(mangled);
+                    i = j;
+                    continue;
+                }
+                // A variant of an enum argument that has *no* payload (a unit
+                // variant, or a struct variant whose fields are not modelled).
+                // There is nothing to bind, so this is refused with a message
+                // that names the variant rather than left for the parser to
+                // report as a missing comparison operator. Refusing is the
+                // honest answer: binding a fabricated value would let a false
+                // contract about a payload that does not exist be proved.
+                if fields.enum_args.contains(&ident)
+                    && fields.variant_consts.contains_key(&format!("{ident}::{field}"))
+                {
+                    return Err(SpecError {
+                        text: text.to_string(),
+                        reason: format!(
+                            "`{field}` is a variant of `{ident}` with no payload to read; \
+                             compare the tag instead (`{ident} == ...`)"
+                        ),
+                    });
+                }
+                // `xs.len()` — the slice length. The parens are required, so a
+                // bare `xs.len` (a field named `len`) is not silently accepted.
+                let is_call = chars.get(j) == Some(&'(');
+                if field == "len" && is_call {
+                    let close = j + 1;
+                    if chars.get(close) == Some(&')') {
+                        if let Some(mangled) = fields.paths.get(&format!("{ident}.len()")) {
+                            out.push_str(mangled);
+                            i = close + 1;
+                            continue;
+                        }
+                        if fields.known_args.contains(&ident) {
+                            return Err(SpecError {
+                                text: text.to_string(),
+                                reason: format!(
+                                    "`{ident}` is not a slice or array, so `len()` has no meaning here"
+                                ),
+                            });
+                        }
+                    }
+                }
+                let key = format!("{ident}.{field}");
+                if !is_call && !field.is_empty() {
+                    if let Some(mangled) = fields.paths.get(&key) {
+                        out.push_str(mangled);
+                        i = j;
+                        continue;
+                    }
+                    // A field of a known aggregate that has no binding: the struct
+                    // has no such field, or its layout was not readable. Refuse
+                    // with a message that names the field, rather than letting the
+                    // `.` reach the parser and produce "expected a comparison
+                    // operator" — the same refusal, a diagnosable one.
+                    if fields.known_args.contains(&ident) {
+                        return Err(SpecError {
+                            text: text.to_string(),
+                            reason: format!("unknown field `{field}` of `{ident}`"),
+                        });
+                    }
+                }
+            }
+            // `xs[k]` — a slice element. Only a literal index is rewritten; a
+            // symbolic subscript has no binding to rewrite to and is left for the
+            // parser to refuse, which is the same answer for a slice as for an
+            // array.
+            if chars.get(i) == Some(&'[') {
+                let mut j = i + 1;
+                let digits: String = chars[j..].iter().take_while(|c| c.is_ascii_digit()).collect();
+                j += digits.len();
+                if !digits.is_empty() && chars.get(j) == Some(&']') {
+                    if let Some(mangled) = fields.paths.get(&format!("{ident}[{digits}]")) {
+                        out.push_str(mangled);
+                        i = j + 1;
+                        continue;
+                    }
+                }
+                // `a[i]` on an array: replace the whole subscript with the ite
+                // chain bound for `a`. The chain is an exact function of `i`, so
+                // this is a definitional rewrite, not an approximation. The index
+                // itself is left in place: the range guard (`i < N`) is conjoined
+                // by the caller, which is what makes the chain's fall-through
+                // unreachable.
+                if let Some(close) = chars[j..].iter().position(|c| *c == ']').map(|p| p + j) {
+                    let inner: String = chars[i + 1..close].iter().collect();
+                    // The chain bound for `ident` is only `ident[inner]` when
+                    // `inner` is the very index that chain was built from. A
+                    // different index (`a[j]` where the chain is `a[i]`) has no
+                    // chain, so it is left for the parser to refuse rather than
+                    // rewritten to the wrong subscript.
+                    let is_bound_index = fields
+                        .sym_index_names
+                        .get(&ident)
+                        .map(|names| names.contains(&inner))
+                        .unwrap_or(false);
+                    if is_bound_index {
+                        if let Some(mangled) = fields.paths.get(&format!("{ident}__chain")) {
+                            out.push_str(mangled);
+                            i = close + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            out.push_str(&ident);
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    Ok(out)
 }
 
 /// Turn a `requires` contract into a predicate over the named arguments.
@@ -212,24 +1313,57 @@ pub fn eval_requires(
     text: &str,
     args: &BTreeMap<String, Var>,
     signed: &BTreeSet<String>,
+    fields: &FieldEnv,
 ) -> Result<Pred, SpecError> {
-    let mut p = Parser::new(text, args, None, signed, false);
-    let pred = p.parse_or()?;
-    p.expect_end()?;
+    let orig = text;
+    let text = rewrite_fields(text, fields)?;
+    let mut names = args.clone();
+    names.extend(fields.vars.iter().map(|(k, v)| (k.clone(), *v)));
+    let mut sgn = signed.clone();
+    sgn.extend(fields.signed.iter().cloned());
+    let mut p = Parser::new(&text, &names, None, &sgn, false);
+    p.variant_consts = fields.variant_consts.clone();
+    p.enum_args = fields.enum_args.clone();
+    let pred = p.parse_or().map_err(|e| e.about(orig))?;
+    p.expect_end().map_err(|e| e.about(orig))?;
     Ok(pred)
 }
+
+/// The refusal when a bare `ret` names an aggregate return, which has no single
+/// word. The contract has to name a component instead.
+pub const RET_IS_AGGREGATE: &str =
+    "the return type is an aggregate, so `ret` has no single value; name a component such as `ret.0`";
+
+/// The refusal when a bare `ret` names a scalar return whose value the run does
+/// not know on this path -- an unmodelled read, or a deref with no backing.
+///
+/// It is a *different* problem from an aggregate return, and saying "the return
+/// type is an aggregate" here would be false: the return type is a plain `u8`,
+/// and the reader would go looking for a tuple that does not exist.
+pub const RET_IS_UNKNOWN: &str = "the return value is not known on this path";
 
 /// Turn an `ensures` contract into a predicate over the arguments and `ret`.
 pub fn eval_ensures(
     text: &str,
     args: &BTreeMap<String, Var>,
-    ret: Var,
+    ret: Option<Var>,
+    ret_absent: &'static str,
     signed: &BTreeSet<String>,
     ret_signed: bool,
+    fields: &FieldEnv,
 ) -> Result<Pred, SpecError> {
-    let mut p = Parser::new(text, args, Some(ret), signed, ret_signed);
-    let pred = p.parse_or()?;
-    p.expect_end()?;
+    let orig = text;
+    let text = rewrite_fields(text, fields)?;
+    let mut names = args.clone();
+    names.extend(fields.vars.iter().map(|(k, v)| (k.clone(), *v)));
+    let mut sgn = signed.clone();
+    sgn.extend(fields.signed.iter().cloned());
+    let mut p = Parser::new(&text, &names, ret, &sgn, ret_signed);
+    p.ret_absent = ret_absent;
+    p.variant_consts = fields.variant_consts.clone();
+    p.enum_args = fields.enum_args.clone();
+    let pred = p.parse_or().map_err(|e| e.about(orig))?;
+    p.expect_end().map_err(|e| e.about(orig))?;
     Ok(pred)
 }
 
@@ -268,12 +1402,38 @@ struct Parser<'a> {
     signed: &'a BTreeSet<String>,
     /// Whether `ret` is signed.
     ret_signed: bool,
+    /// What to say when `ret` has no value to name. It is supplied by the
+    /// caller because only the caller knows *why*: outside an `ensures` the name
+    /// is meaningless, an aggregate return has no single word, and a scalar
+    /// return can be unbound because the value is not known on this path. These
+    /// are three different problems and the message must not describe the wrong
+    /// one -- a scalar return reported as an aggregate sends the reader looking
+    /// for a tuple that is not there.
+    ret_absent: &'static str,
+    /// `Enum::Variant` → `(discriminant, tag width)`. Empty outside a contract
+    /// evaluation, which is what makes `eval_invariant` (which has no enum
+    /// layouts in hand) refuse such a name rather than guess a constant.
+    variant_consts: BTreeMap<String, (u64, u8)>,
+    /// The enum-typed argument names, so a variant name that is *not* in
+    /// `variant_consts` can be reported as a bad variant rather than an unknown
+    /// constant.
+    enum_args: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Tok {
     Ident(String),
     Num(u64),
+    /// A numeric literal the tokenizer could not read *exactly* -- a digit that
+    /// is invalid for its radix, or a value past `u64`.
+    ///
+    /// It is a distinct token so the parser refuses it rather than reading it as
+    /// `0`. Reading every literal as decimal silently truncated `0xFF` to `0`
+    /// (the digit run stopped at `x` and the rest was skipped as a type suffix),
+    /// and a mis-read constant in a precondition is a false proof: `requires: x
+    /// == 0xFF` became `x == 0`, so `ensures: ret == 0` was "proved" for a
+    /// function returning `255`. A refusal is safe; a wrong number is not.
+    BadNum,
     Op(String),
 }
 
@@ -288,18 +1448,83 @@ fn tokenize(s: &str) -> Vec<Tok> {
             continue;
         }
         if c.is_ascii_digit() {
-            let mut n = String::new();
-            while i < b.len() && (b[i].is_ascii_digit() || b[i] == '_') {
+            // A radix prefix, or a plain decimal. `0x`/`0b`/`0o` is always a prefix
+            // when it starts a literal: `0xg` is a malformed hex literal, not a
+            // decimal `0` followed by an identifier, and reading it as the latter
+            // would be the same silent truncation this scan exists to avoid.
+            let radix = if c == '0' {
+                match b.get(i + 1) {
+                    Some('x' | 'X') => {
+                        i += 2;
+                        16
+                    }
+                    Some('b' | 'B') => {
+                        i += 2;
+                        2
+                    }
+                    Some('o' | 'O') => {
+                        i += 2;
+                        8
+                    }
+                    _ => 10,
+                }
+            } else {
+                10
+            };
+            // Take the longest run of digits and `_` separators. A `_` between
+            // digits is a separator; the run stops at anything else, which is how a
+            // type suffix (`100u32`) is left for the loop below.
+            let mut digits = String::new();
+            while i < b.len() && (b[i].is_digit(radix) || b[i] == '_') {
                 if b[i] != '_' {
-                    n.push(b[i]);
+                    digits.push(b[i]);
                 }
                 i += 1;
             }
-            // Skip a type suffix (`100u32`) so the literal stays a number.
-            while i < b.len() && (b[i].is_alphanumeric()) {
-                i += 1;
+            // Skip a type suffix (`100u32`, `0xFF_i32`) so the literal stays a
+            // number. It must be one of the integer type names: `0xFFg` is
+            // malformed, and swallowing the `g` as a suffix would read the literal
+            // as a well-formed `255` -- the same silent mis-read this scan exists
+            // to avoid. A trailing `_` (`100_`) is a separator, not a suffix, and
+            // Rust accepts it.
+            if b.get(i).is_some_and(|d| d.is_ascii_alphabetic()) {
+                let sfx_start = i;
+                while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_') {
+                    i += 1;
+                }
+                let sfx: String = b[sfx_start..i].iter().collect();
+                if !matches!(
+                    sfx.as_str(),
+                    "i8" | "i16"
+                        | "i32"
+                        | "i64"
+                        | "i128"
+                        | "isize"
+                        | "u8"
+                        | "u16"
+                        | "u32"
+                        | "u64"
+                        | "u128"
+                        | "usize"
+                ) {
+                    out.push(Tok::BadNum);
+                    continue;
+                }
             }
-            out.push(Tok::Num(n.parse().unwrap_or(0)));
+            // Anything the run did not consume is a malformed literal: a digit not
+            // valid for the radix (`0b12`, `0o9`), or a value past `u64`. Refuse
+            // rather than take a partial value -- a wrong number in a precondition
+            // is a false proof, a refusal is not.
+            let exact = i == b.len() || (!b[i].is_alphanumeric() && b[i] != '_');
+            let val = if digits.is_empty() {
+                None
+            } else {
+                u64::from_str_radix(&digits, radix).ok()
+            };
+            match (exact, val) {
+                (true, Some(v)) => out.push(Tok::Num(v)),
+                _ => out.push(Tok::BadNum),
+            }
             continue;
         }
         if c.is_alphabetic() || c == '_' {
@@ -312,7 +1537,7 @@ fn tokenize(s: &str) -> Vec<Tok> {
             continue;
         }
         let two: String = b[i..(i + 2).min(b.len())].iter().collect();
-        if ["==", "!=", "<=", ">=", "&&", "||"].contains(&two.as_str()) {
+        if ["==", "!=", "<=", ">=", "<<", ">>", "&&", "||"].contains(&two.as_str()) {
             out.push(Tok::Op(two));
             i += 2;
             continue;
@@ -331,7 +1556,18 @@ impl<'a> Parser<'a> {
         signed: &'a BTreeSet<String>,
         ret_signed: bool,
     ) -> Parser<'a> {
-        Parser { toks: tokenize(s), pos: 0, args, ret, text: s.to_string(), signed, ret_signed }
+        Parser {
+            toks: tokenize(s),
+            pos: 0,
+            args,
+            ret,
+            text: s.to_string(),
+            signed,
+            ret_signed,
+            variant_consts: BTreeMap::new(),
+            enum_args: BTreeSet::new(),
+            ret_absent: "`ret` is only meaningful in `ensures`",
+        }
     }
 
     /// Whether the variable named `name` is signed, for choosing the comparison.
@@ -376,8 +1612,16 @@ impl<'a> Parser<'a> {
     /// `(a + b) == c` the scan returns at the `)` after `b` and never sees the
     /// `==`, so the group stays arithmetic.
     fn paren_is_predicate(&self) -> bool {
+        self.paren_is_predicate_from(self.pos)
+    }
+
+    /// [`Self::paren_is_predicate`], starting at an explicit token index.
+    ///
+    /// The `!` lookahead needs this: to decide whether `!` negates a *predicate* it
+    /// must ask about the `(` that follows the `!`, not the one at the cursor.
+    fn paren_is_predicate_from(&self, start: usize) -> bool {
         let mut depth = 0usize;
-        for t in &self.toks[self.pos..] {
+        for t in &self.toks[start..] {
             match t {
                 Tok::Op(o) if o == "(" => depth += 1,
                 Tok::Op(o) if o == ")" => {
@@ -396,6 +1640,18 @@ impl<'a> Parser<'a> {
             }
         }
         false
+    }
+
+    /// Whether the `!` at the cursor applies to a *predicate* rather than a value.
+    ///
+    /// True for `!(a == b)` (a parenthesized predicate) and `!true`/`!false`; false
+    /// for `!x`, `!7` and `!x == 5`, where `!` is the unary prefix on a value.
+    fn bang_is_predicate(&self) -> bool {
+        match self.toks.get(self.pos + 1) {
+            Some(Tok::Op(o)) if o == "(" => self.paren_is_predicate_from(self.pos + 1),
+            Some(Tok::Ident(n)) if n == "true" || n == "false" => true,
+            _ => false,
+        }
     }
 
     fn expect_end(&self) -> Result<(), SpecError> {
@@ -424,6 +1680,146 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
+    /// The value of a term that has no free variable, if it is constant.
+    ///
+    /// `Op::Const` is the common case, but a literal is not always a single node:
+    /// `-10` is `0 - 10`, and `1 + 1` is an `Add`. Evaluating the term catches
+    /// those too, so a negative or folded literal is resized like any other
+    /// rather than treated as an opaque non-constant.
+    fn const_value(&self, v: Var) -> Option<u64> {
+        smt::evaluate(v, |_| None)
+    }
+
+    /// Resize a constant operand to `wide` bits, refusing one that does not fit.
+    ///
+    /// Widening is exact: zero-extend unsigned, sign-extend signed. Narrowing is
+    /// where a contract can be wrong rather than merely imprecise -- `a <= 300`
+    /// for a `u8` would become `a <= 44` if the value were truncated -- so a
+    /// value that does not fit is an error and the function is skipped, not a
+    /// weaker proof.
+    ///
+    /// The check runs at *equal* width too, which is what `own_signed` is for. A
+    /// bare literal is non-negative, but a signed bound (`i8::MIN`) or a negation
+    /// (`-1`) is its two's-complement value; `128` and `i8::MIN` share the bit
+    /// pattern `0x80` and mean different things. Without the distinction, `128`
+    /// meeting an `i8` was accepted as the bit pattern for `-128`, so `x <= 128`
+    /// was read as `x <= -128` -- a wrong value, and a false proof (`ensures: x !=
+    /// 127` "held"). `own_signed` tells the two apart: a non-negative literal is
+    /// checked as `+val`, a signed one as its two's-complement value.
+    fn resize_const(
+        &self,
+        v: Var,
+        wide: u8,
+        signed: bool,
+        own_signed: bool,
+    ) -> Result<Var, SpecError> {
+        let w = smt::bits(v);
+        let val = self.const_value(v).expect("resize_const is only called on a constant");
+        // The value the constant denotes, at its own width. A literal written
+        // without a type is non-negative; a signed bound or a negation is its
+        // two's-complement value.
+        let sval: i128 = if own_signed {
+            if w >= 64 {
+                val as i64 as i128
+            } else if val & (1u64 << (w - 1)) != 0 {
+                val as i128 - (1i128 << w)
+            } else {
+                val as i128
+            }
+        } else {
+            val as i128
+        };
+        let fits = if signed {
+            let lo = -(1i128 << (wide - 1));
+            let hi = (1i128 << (wide - 1)) - 1;
+            sval >= lo && sval <= hi
+        } else {
+            sval >= 0 && (sval as u128) < (1u128 << wide)
+        };
+        if !fits {
+            // Report the value as written: a signed constant (`-129`, `i8::MIN`)
+            // reads as its negative value, not the two's-complement bit pattern,
+            // so the message names the number the contract author wrote.
+            let shown: i128 = if own_signed { sval } else { val as i128 };
+            return Err(self.err(format!(
+                "literal {shown} does not fit the operand's {wide}-bit width"
+            )));
+        }
+        // Truncate rather than rebuild from `val`. A negative literal is the bit
+        // pattern `2^w - 10` at its *source* width, so `word(val, wide)` would be
+        // handed a value that does not fit `wide` and would set the engine's
+        // ill-formed flag -- turning a valid contract into `Unknown`. Truncation
+        // takes the low `wide` bits, which is the same bit pattern the value
+        // denotes, and the `fits` check above is what keeps it from being silent.
+        if wide >= w {
+            Ok(if signed && wide > w { smt::sign_extend(v, wide) } else { smt::word(val, wide) })
+        } else {
+            Ok(smt::truncate(v, wide))
+        }
+    }
+
+    /// Make two operands agree in width, by resizing the *constant* one.
+    ///
+    /// A contract literal is written without a type, so its width has to come
+    /// from the operand it meets. Sizing it from the widest name in scope instead
+    /// makes `ret <= 255` a 64-bit comparison whenever a slice or array length (a
+    /// `usize`) is also in scope, and an 8-bit `ret` against a 64-bit constant is
+    /// ill-formed -- which the engine reports as `Unknown` for *every* obligation
+    /// in the run, not just that one. So the width is decided here, per use.
+    ///
+    /// Only a constant is resized: a non-constant operand's width is a property
+    /// of its type, and changing it would change what the term means. Two
+    /// non-constant operands of different widths cannot arise from Rust that
+    /// compiles, so that is refused rather than coerced.
+    fn align_widths(
+        &self,
+        a: Var,
+        sa: bool,
+        b: Var,
+        sb: bool,
+        signed: bool,
+    ) -> Result<(Var, Var), SpecError> {
+        let (wa, wb) = (smt::bits(a), smt::bits(b));
+        match (self.const_value(a), self.const_value(b)) {
+            // Both constants: align to the narrower for a well-formed term. The
+            // range check still runs, on *both* operands: a contract that meets no
+            // typed name still has to be one rustc would accept. `128 <= i8::MAX`
+            // is a `literal out of range` error in Rust, and without the check here
+            // it read as `-128 <= 127` -- always true -- so the shape is refused
+            // rather than decided. A bare literal is checked as `+val` and a named
+            // bound as its two's-complement value (see `resize_const`), so
+            // `i8::MIN <= i8::MAX` still reads while `128 <= i8::MAX` does not.
+            (Some(_), Some(_)) => {
+                if wa > wb {
+                    Ok((self.resize_const(a, wb, signed, sa)?, b))
+                } else if wb > wa {
+                    Ok((a, self.resize_const(b, wa, signed, sb)?))
+                } else {
+                    let a = self.resize_const(a, wa, signed, sa)?;
+                    let b = self.resize_const(b, wb, signed, sb)?;
+                    Ok((a, b))
+                }
+            }
+            // One constant: resize it to the other operand's width. This runs at
+            // *equal* width too, where the resize is the identity term but the
+            // range check is not: `128` meeting an `i8` must be refused, not read
+            // as the bit pattern for `-128`. Skipping the call at equal width is
+            // what let `x <= 128` mean `x <= -128` -- a wrong value and a false
+            // proof. `sa`/`sb` carry each constant's own signedness, so a bare
+            // literal (non-negative) is told apart from a signed bound that
+            // happens to share its bit pattern.
+            (Some(_), None) => Ok((self.resize_const(a, wb, signed, sa)?, b)),
+            (None, Some(_)) => Ok((a, self.resize_const(b, wa, signed, sb)?)),
+            (None, None) => {
+                if wa == wb {
+                    Ok((a, b))
+                } else {
+                    Err(self.err("comparison between operands of different widths"))
+                }
+            }
+        }
+    }
+
     fn parse_cmp(&mut self) -> Result<Pred, SpecError> {
         // `true` / `false` as whole predicates, so a contract can say
         // `requires: true` when the function really has no precondition.
@@ -434,7 +1830,7 @@ impl<'a> Parser<'a> {
                 return Ok(smt::truth(v));
             }
         }
-        if self.eat_op("!") {
+        if self.bang_is_predicate() && self.eat_op("!") {
             let inner = self.parse_cmp()?;
             return Ok(smt::not(inner));
         }
@@ -458,6 +1854,13 @@ impl<'a> Parser<'a> {
                 // language will not compare an `i8` with a `u8`), so either flag
                 // decides it, and a literal on one side leaves the other to say.
                 let signed = ls || rs;
+                // A literal is written without a type, so its width comes from
+                // the operand it meets. Sizing it from the widest name in scope
+                // makes `ret <= 255` a 64-bit comparison whenever a slice or
+                // array length is also in scope, and an 8-bit `ret` against a
+                // 64-bit constant is ill-formed -- which poisons *every*
+                // obligation in the run, not just this one.
+                let (left, right) = self.align_widths(left, ls, right, rs, signed)?;
                 return Ok(match op {
                     "==" => smt::eq(left, right),
                     "!=" => smt::not(smt::eq(left, right)),
@@ -476,77 +1879,262 @@ impl<'a> Parser<'a> {
         Err(self.err("expected a comparison operator"))
     }
 
-    /// An additive expression, plus whether it is *signed*.
+    /// An arithmetic expression, plus whether it is *signed*.
     ///
     /// The flag is carried alongside the value because a comparison's meaning
     /// depends on it, and the grammar has no casts or type names to recover it
     /// later. An expression is signed when any name in it is, which is exact:
     /// Rust would reject a mixed-sign arithmetic expression.
+    ///
+    /// The ladder mirrors Rust's precedence, so the entry point is the *loosest*
+    /// level and each level's operands are the next tighter one:
+    /// `|` < `^` < `&` < `<< >>` < `+ -` < `* / %`. Getting this order wrong is
+    /// not a cosmetic matter: `x & 1 + 1` is `x & (1 + 1)` in Rust, and reading it
+    /// as `(x & 1) + 1` makes a contract pass or fail against a different number.
     fn parse_expr(&mut self) -> Result<(Var, bool), SpecError> {
-        let (mut left, mut sgn) = self.parse_term()?;
-        loop {
-            let op = if self.eat_op("+") {
-                "+"
-            } else if self.eat_op("-") {
-                "-"
-            } else if self.eat_op("|") {
-                "|"
-            } else if self.eat_op("^") {
-                "^"
-            } else {
-                return Ok((left, sgn));
+        self.parse_bitor()
+    }
+
+    fn parse_bitor(&mut self) -> Result<(Var, bool), SpecError> {
+        let (mut left, mut sgn) = self.parse_bitxor()?;
+        while self.eat_op("|") {
+            let (r, rs) = self.parse_bitxor()?;
+            let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
+            left = smt::bor(l, r);
+            sgn = sgn || rs;
+        }
+        Ok((left, sgn))
+    }
+
+    fn parse_bitxor(&mut self) -> Result<(Var, bool), SpecError> {
+        let (mut left, mut sgn) = self.parse_bitand()?;
+        while self.eat_op("^") {
+            let (r, rs) = self.parse_bitand()?;
+            let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
+            left = smt::bxor(l, r);
+            sgn = sgn || rs;
+        }
+        Ok((left, sgn))
+    }
+
+    fn parse_bitand(&mut self) -> Result<(Var, bool), SpecError> {
+        let (mut left, mut sgn) = self.parse_shift()?;
+        while self.eat_op("&") {
+            let (r, rs) = self.parse_shift()?;
+            let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
+            left = smt::band(l, r);
+            sgn = sgn || rs;
+        }
+        Ok((left, sgn))
+    }
+
+    /// The shift level: `<<` and `>>`, which bind tighter than `&` but looser
+    /// than `+`.
+    ///
+    /// Two things make a shift unlike the other operators. Its result has the
+    /// *left* operand's width, so the amount is a count rather than a value of
+    /// that width and the two operands are deliberately *not* width-aligned. And
+    /// `>>` means arithmetic or logical according to the left operand's sign, so
+    /// a signed operand is the only thing that separates them -- which is why the
+    /// signedness carried through decides it.
+    ///
+    /// The amount must be a *constant*. A symbolic amount is a barrel shifter
+    /// (see `smt::shift_var`), and modelling one in a contract would mean
+    /// agreeing with the body about what happens when the amount reaches the
+    /// width -- a case rustc turns into a panic before the shift. Rather than
+    /// guess at that interaction, a symbolic amount is refused, which leaves the
+    /// function visibly undecided instead of silently mis-modelled. A constant at
+    /// or above the width is a compile error in Rust and is refused here too.
+    fn parse_shift(&mut self) -> Result<(Var, bool), SpecError> {
+        let (mut left, sgn) = self.parse_add()?;
+        while let Some(op) = self.eat_any(&["<<", ">>"]) {
+            let (r, _) = self.parse_add()?;
+            // The amount must be *constant*, but not necessarily a bare literal:
+            // `x >> 1 + 1` is `x >> 2` in Rust, and the additive level above has
+            // already folded it. `const_value` evaluates a variable-free term, so a
+            // folded constant is accepted while a symbolic amount still falls
+            // through to the refusal below. Using the raw-literal `const_of` here
+            // instead made `x >> 1 + 1` unreadable -- a dropped obligation on a
+            // shape rustc accepts, and one the README's own examples use.
+            let Some(k) = self.const_value(r) else {
+                return Err(self.err("a shift amount in a contract must be a constant"));
             };
-            let (r, rs) = self.parse_term()?;
+            let w = smt::bits(left);
+            if k >= w as u64 {
+                return Err(self.err(format!(
+                    "shift amount {k} is not below the operand width {w}"
+                )));
+            }
+            left = if op == "<<" {
+                smt::shl(left, k as u32)
+            } else if sgn {
+                smt::ashr(left, k as u32)
+            } else {
+                smt::lshr(left, k as u32)
+            };
+        }
+        Ok((left, sgn))
+    }
+
+    /// The additive level: `+` and `-`, tighter than the bitwise operators.
+    fn parse_add(&mut self) -> Result<(Var, bool), SpecError> {
+        let (mut left, mut sgn) = self.parse_mul()?;
+        while let Some(op) = self.eat_any(&["+", "-"]) {
+            let (r, rs) = self.parse_mul()?;
+            // A literal operand is sized to the other one, exactly as in a
+            // comparison. Without this, `ret == a + 5` with a slice length in
+            // scope adds an 8-bit `a` to a 64-bit `5`, which `bin_word` reports
+            // as ill-formed -- and that poisons every obligation in the run, so
+            // the function is undecided for a reason unrelated to its body.
+            let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
+            left = if op == "+" { smt::add(l, r) } else { smt::sub(l, r) };
+            sgn = sgn || rs;
+        }
+        Ok((left, sgn))
+    }
+
+    /// The multiplicative level: `*`, `/` and `%`, the tightest arithmetic.
+    ///
+    /// Division and remainder take the *signed* engine when either operand is
+    /// signed, the same choice the body makes and for the same reason: the
+    /// unsigned divider returns a huge positive quotient for `-7 / 2`, a wrong
+    /// value rather than a weaker proof. A *constant* zero divisor is refused, in
+    /// whatever form it is written -- `0`, `1 - 1`, `2 - 2` -- because Rust rejects
+    /// it at compile time, so a contract carrying one is malformed, not merely
+    /// imprecise. A *symbolic* divisor is modelled exactly (the engine's divider is
+    /// total), which mirrors the body.
+    fn parse_mul(&mut self) -> Result<(Var, bool), SpecError> {
+        let (mut left, mut sgn) = self.parse_cast()?;
+        while let Some(op) = self.eat_any(&["*", "/", "%"]) {
+            let (r, rs) = self.parse_cast()?;
+            // The divisor must be checked for *zero*, not for "is a bare zero
+            // literal". `x % (1 - 1)` folds to `x % 0` at the additive level, and
+            // the raw-literal `const_of` missed it, so the reader built `srem(x, 0)`
+            // -- an undefined operation the engine nevertheless evaluates -- and
+            // produced a definite verdict from it. A *constant* zero is refused
+            // however it is spelled; a symbolic divisor is still modelled exactly.
+            if op != "*" && self.const_value(r) == Some(0) {
+                return Err(self.err("a division or remainder by a constant zero"));
+            }
+            // Same width rule as the other operators: a literal product, divisor
+            // or mask is sized to the operand it meets.
+            let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
             left = match op {
-                "+" => smt::add(left, r),
-                "-" => smt::sub(left, r),
-                "|" => smt::bor(left, r),
-                _ => smt::bxor(left, r),
+                "*" => smt::mul(l, r),
+                "/" if sgn || rs => smt::sdiv(l, r),
+                "/" => smt::udiv(l, r),
+                "%" if sgn || rs => smt::srem(l, r),
+                _ => smt::urem(l, r),
             };
             sgn = sgn || rs;
         }
+        Ok((left, sgn))
     }
 
-    fn parse_term(&mut self) -> Result<(Var, bool), SpecError> {
-        let (mut left, mut sgn) = self.parse_atom()?;
-        loop {
-            let op = if self.eat_op("*") {
-                "*"
-            } else if self.eat_op("&") {
-                "&"
-            } else {
-                return Ok((left, sgn));
-            };
-            let (r, rs) = self.parse_atom()?;
-            left = if op == "*" { smt::mul(left, r) } else { smt::band(left, r) };
-            sgn = sgn || rs;
+    /// Consume whichever of `ops` is at the cursor, returning the one matched.
+    fn eat_any<'b>(&mut self, ops: &[&'b str]) -> Option<&'b str> {
+        if let Some(Tok::Op(o)) = self.peek() {
+            for op in ops {
+                if o == op {
+                    self.pos += 1;
+                    return Some(op);
+                }
+            }
         }
+        None
     }
 
-    /// An atom, plus whether it is signed.
-    fn parse_atom(&mut self) -> Result<(Var, bool), SpecError> {
-        // A unary minus is folded into the literal or the name it precedes, so
-        // `-10` and `-a` are both expressible. It is a *value* negation, not a
-        // subtraction, which is what makes `a >= -10` read the way it looks.
+    /// The cast level: a unary-negated primary, then any `as <type>` chain.
+    ///
+    /// Rust binds unary `-` *tighter* than `as`, so `-x as u8` is `(-x) as u8`,
+    /// not `-(x as u8)`. The two readings agree on the *value* here (negation and
+    /// truncation commute) but not on the *type*: Rust's is `u8`, and `-(...)` is
+    /// signed. That difference is observable — `-x as u8 > 127` is satisfiable
+    /// (`x == 1` gives `255`), where the signed reading is `i8 > 127`, which no
+    /// input satisfies, so the function is reported *vacuous* instead of verified.
+    /// Hence the negation is applied to the primary first, and the cast chain runs
+    /// after it.
+    fn parse_cast(&mut self) -> Result<(Var, bool), SpecError> {
+        let (v, sgn) = self.parse_neg()?;
+        self.cast_chain(v, sgn)
+    }
+
+    /// A unary negation, applied to the primary below it and *before* any cast.
+    ///
+    /// The result is signed whatever the operand was. Negation is only defined on
+    /// a signed type in Rust (`let x: u32 = -1;` does not compile), so a negation
+    /// *is* the evidence that the expression is signed. The operand's own flag
+    /// cannot be used: `-7` negates the literal `7`, which is unsigned, and
+    /// reading the flag through would make `-7 % 3` take the unsigned remainder
+    /// (`4294967289 % 3`, i.e. `0`) where Rust says `-1`. Only `% / >>` and the
+    /// comparisons consult the flag, so the mistake is a *wrong value* rather than
+    /// a refusal -- the one outcome a verifier must not produce silently.
+    fn parse_neg(&mut self) -> Result<(Var, bool), SpecError> {
         if self.eat_op("-") {
-            let (v, s) = self.parse_atom()?;
+            let (v, _) = self.parse_neg()?;
             let w = smt::bits(v);
-            return Ok((smt::sub(smt::word(0, w), v), s));
+            // A negated *constant* is widened by one bit when its magnitude does
+            // not fit signed at its own width, so the true value survives for the
+            // later range check. `-129` for an `i8` is a Rust error ("literal out
+            // of range"), but at 8 bits the two's-complement `-129` *is* `127`, so
+            // the negation alone would hand the check a value that fits and
+            // `x >= -129` would silently mean `x >= 127` -- a false proof, the
+            // mirror of the bare-literal wrap. One spare bit keeps `-129` as
+            // `-129`, which the check then refuses. `-128` (i8::MIN) still fits at
+            // 8 bits, so it is left alone.
+            if let Some(mag) = self.const_value(v) {
+                // `-mag` fits signed at `w` bits iff `mag <= 2^(w-1)`.
+                let fits = w >= 64 || mag <= (1u64 << (w - 1));
+                if !fits {
+                    return Ok((smt::sub(smt::word(0, w + 1), smt::word(mag, w + 1)), true));
+                }
+            }
+            return Ok((smt::sub(smt::word(0, w), v), true));
         }
+        // `!` is a unary prefix on a *value* here, because `bang_is_predicate`
+        // ruled out the predicate reading above. On an integer it is bitwise NOT,
+        // which is `x ^ all_ones` -- the same term the body builds for `UnOp::Not`
+        // in `mir/exec.rs`. Reading it at the predicate level instead made
+        // `!x == 5` mean `!(x == 5)` (`x != 5`) where Rust means `(!x) == 5`
+        // (`x == 250`): a different predicate, so a wrong verdict, not a refusal.
+        if self.eat_op("!") {
+            let (v, sgn) = self.parse_neg()?;
+            let w = smt::bits(v);
+            return Ok((smt::bxor(v, smt::all_ones(w)), sgn));
+        }
+        self.parse_atom()
+    }
+
+    fn parse_atom(&mut self) -> Result<(Var, bool), SpecError> {
         match self.peek().cloned() {
             Some(Tok::Num(n)) => {
                 self.pos += 1;
-                // The width is taken from the widest argument, so a literal in a
-                // contract is a constant at the arguments' width. A contract
-                // whose literal does not fit that width is refused by the engine
-                // as ill-formed, which surfaces as `Unknown`.
-                let w = self.args.values().chain(self.ret.iter()).map(|v| smt::bits(*v)).max().unwrap_or(64);
+                // A literal is built wide enough to *hold* its own value, and at
+                // least as wide as the widest name in scope. Both halves matter:
+                //
+                // * Holding the value keeps the number exact, so the width
+                //   decision can be made later, per use, by `align_widths`.
+                //   Building it at the scope's width instead would mask `300` to
+                //   `44` for a `u8` and set the engine's ill-formed flag -- the
+                //   term would then decide `Unknown`, with no hint that the
+                //   contract, not the body, was at fault.
+                // * The scope's width keeps the common case (`a <= 5` for a `u32`)
+                //   from building a needlessly wide constant.
+                let need = (u64::BITS - n.leading_zeros()).max(1) as u8;
+                let scope = self
+                    .args
+                    .values()
+                    .chain(self.ret.iter())
+                    .map(|v| smt::bits(*v))
+                    .max()
+                    .unwrap_or(64);
+                let w = scope.max(need).min(64);
                 Ok((smt::word(n, w), false))
             }
             Some(Tok::Ident(name)) => {
                 self.pos += 1;
                 if name == "ret" || name == "result" {
-                    let v = self.ret.ok_or_else(|| self.err("`ret` is only meaningful in `ensures`"))?;
+                    let v = self.ret.ok_or_else(|| self.err(self.ret_absent))?;
                     return Ok((v, self.ret_signed));
                 }
                 if name == "true" || name == "false" {
@@ -579,8 +2167,28 @@ impl<'a> Parser<'a> {
                     None
                 };
                 if let Some((ty, a)) = assoc {
-                    if let Some(k) = type_bound(&ty, &a) {
-                        let w = self.args.values().chain(self.ret.iter()).map(|v| smt::bits(*v)).max().unwrap_or(64);
+                    // `Mode::Idle` — an enum variant named in a contract, which is
+                    // a constant of the tag's width. Checked before `type_bound`
+                    // because a variant name is not an integer bound, and the two
+                    // spellings (`i8::MIN`, `Mode::Idle`) are distinguished by
+                    // which table has the name.
+                    let key = format!("{ty}::{a}");
+                    if let Some((k, w)) = self.variant_consts.get(&key).copied() {
+                        return Ok((smt::word(k, w), false));
+                    }
+                    if self.enum_args.contains(&ty) {
+                        return Err(self.err(format!(
+                            "`{ty}` has no variant `{a}` (or its layout was not readable)"
+                        )));
+                    }
+                    if let Some((k, w)) = type_bound(&ty, &a) {
+                        // The bound is built at the width of the type it *names*,
+                        // not at the widest name in scope. `i8::MIN` is the bit
+                        // pattern `0x80`, which is exactly 8 bits; widening it to
+                        // a 64-bit `128` and then narrowing it back would test
+                        // `128 <= i8::MAX` and refuse the constant as out of range
+                        // for a signed 8-bit operand -- a refusal of a bound that
+                        // is by definition in range.
                         return Ok((smt::word(k, w), ty.starts_with('i')));
                     }
                     return Err(self.err(format!("unknown constant `{ty}::{a}`")));
@@ -604,18 +2212,558 @@ impl<'a> Parser<'a> {
                 }
                 Ok((v, s))
             }
+            Some(Tok::BadNum) => {
+                Err(self.err("a numeric literal that is not an exact integer (bad digit for its radix, or past u64)"))
+            }
             Some(t) => Err(self.err(format!("unexpected token {t:?}"))),
             None => Err(self.err("unexpected end of contract")),
         }
     }
+
+    /// Apply any `as <type>` casts that immediately follow an atom, returning the
+    /// value and its signedness.
+    ///
+    /// The result of `x as T` has `T`'s width and `T`'s sign, and it *extends*
+    /// rather than reinterprets: `-1i8 as i16` is `-1`, not `255`. A widening cast
+    /// of a signed source sign-extends; an unsigned one zero-fills, which is
+    /// `truncate`; a narrowing cast keeps the low bits, which `sign_extend` and
+    /// `truncate` both do when the target is no wider.
+    ///
+    /// An unknown source sign is a refusal, not a guess, for the same reason the
+    /// body refuses one: zero-filling a signed value would prove `-1i8 as i16 ==
+    /// 255`, a reachable false proof, and sign-extending an unsigned one would
+    /// turn `255u8 as u16` into `65535`. Guessing the sign is exactly the failure
+    /// this crate exists to avoid.
+    ///
+    /// A cast *chain* (`x as u16 as u32`) applies left to right, and each step's
+    /// source sign is the previous step's *target* sign -- which the cast just
+    /// set, so it is always known. That is what makes the chain well-defined even
+    /// when the first source's sign was not.
+    fn cast_chain(&mut self, v: Var, sgn: bool) -> Result<(Var, bool), SpecError> {
+        let (mut v, mut sgn) = (v, sgn);
+        while matches!(self.peek(), Some(Tok::Ident(n)) if n == "as") {
+            let Some(Tok::Ident(ty_name)) = self.toks.get(self.pos + 1).cloned() else {
+                // `as` with no type after it is not a cast; leave it for the
+                // caller to report as a trailing token rather than consuming it.
+                break;
+            };
+            let ty = Ty::parse(&ty_name);
+            let Some(w) = ty.width() else {
+                break;
+            };
+            // The engine's words are 1..=64 bits, so a cast to `u128`/`i128` has
+            // no width to truncate or extend to. Refusing it here is what stops
+            // the cast from reaching `truncate`, whose width assertion would take
+            // the whole run down with a panic instead of reporting this function
+            // as undecided. A `break` would be wrong: it would leave `as` as a
+            // trailing token and blame the syntax, when the cast is well-formed
+            // Rust and it is the *engine* that cannot hold the result.
+            if w > 64 {
+                return Err(self.err(format!(
+                    "`{ty_name}` is wider than the engine's 64-bit words, so a cast to it is not \
+                     modelled"
+                )));
+            }
+            self.pos += 2;
+            v = if sgn { smt::sign_extend(v, w) } else { smt::truncate(v, w) };
+            sgn = ty.is_signed();
+        }
+        Ok((v, sgn))
+    }
+}
+
+/// Pull the struct name out of a `pub struct Name {` head line.
+///
+/// Only a *braced* struct is recognised. A tuple struct or a unit struct has no
+/// named fields to project, so reading it as a struct with no fields would turn a
+/// contract naming `.0` into an "unknown field" refusal rather than a "this shape
+/// is not modelled" one — the same outcome, and no false layout.
+fn struct_head(line: &str) -> Option<String> {
+    let t = line.trim_start_matches("pub(crate) ").trim_start_matches("pub ").trim();
+    let rest = t.strip_prefix("struct ")?;
+    // Only a brace body on this line is a named-field struct.
+    if !rest.contains('{') {
+        return None;
+    }
+    let name = rest.split(|c: char| c == '{' || c == '<' || c.is_whitespace()).next()?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Pull `(field, type)` out of one line of a struct body.
+///
+/// The line looks like `pub lo: u8,` or `lo: u8,`. A line that is not a
+/// `name: type` pair (a nested item, a comment, an attribute) is skipped, so an
+/// unexpected shape loses a field rather than inventing one — and a lost field
+/// makes a contract naming it a refusal, which is the safe direction.
+fn struct_field(line: &str) -> Option<(String, String)> {
+    let t = line.trim();
+    if t.is_empty() || t.starts_with("//") || t.starts_with('#') {
+        return None;
+    }
+    let t = t.trim_start_matches("pub(crate) ").trim_start_matches("pub ").trim();
+    let (name, ty) = t.split_once(':')?;
+    let name = name.trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    // Strip a trailing comma and any `#[...]` attribute tail.
+    let ty = ty.split(',').next().unwrap_or(ty).trim();
+    if ty.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), ty.to_string()))
+}
+/// The parsed head of an `enum` declaration.
+///
+/// The three cases are distinct on purpose. A *one-line* body carries its
+/// variants already; a *multi-line* body needs a cursor to collect them; and a
+/// body whose explicit discriminant cannot be read is *refused* -- and, because
+/// its closing brace has already been seen, that refusal must not be mistaken for
+/// "a cursor is needed". Returning the multi-line case for a refused one-line body
+/// would leave the cursor open past the brace and swallow every following line,
+/// including contracts, so those functions would silently leave the check set.
+enum EnumHead {
+    /// A one-line body, fully parsed.
+    Inline(Vec<(String, Vec<Ty>, u64)>),
+    /// A multi-line body whose `{` opens the last thing on the line.
+    MultiLine,
+    /// A body this reader refuses (an unreadable discriminant). The layout is
+    /// dropped, and the enum is *closed*: nothing after it belongs to it.
+    Refused,
+}
+
+/// Pull the enum name out of a `pub enum Name {` head line.
+///
+/// Only a *braced* enum is recognised, and only when the body opens on the same
+/// line. An enum whose variants are all written inline on the head line
+/// (`pub enum E { A, B }`) is not read: the variants would have to be split out of
+/// the head text, and getting that wrong would number the variants wrongly, which
+/// is the one thing this layout must not do. A missing layout makes a contract
+/// naming a variant a refusal, which is the safe direction.
+fn enum_head(line: &str) -> Option<(String, EnumHead)> {
+    let t = line.trim_start_matches("pub(crate) ").trim_start_matches("pub ").trim();
+    let rest = t.strip_prefix("enum ")?;
+    // A generic enum (`enum E<T>`) is read for its name, but a variant payload
+    // naming `T` has no bit width and is skipped downstream.
+    let name = rest.split(|c: char| c == '{' || c == '<' || c.is_whitespace()).next()?;
+    if name.is_empty() {
+        return None;
+    }
+    let open = rest.find('{')?;
+    let after = &rest[open + 1..];
+    // A one-line body (`pub enum E { A, B }`): the variants are split out of the
+    // head text itself. Splitting on top-level commas is exactly what the
+    // multi-line reader does per line, so the two agree on numbering by
+    // construction.
+    if let Some(close) = after.rfind('}') {
+        let inner = &after[..close];
+        let mut def = EnumDef::default();
+        for v in split_top_level(inner, ',') {
+            match enum_variant(&v) {
+                VariantLine::Variant { name, payload, explicit } => {
+                    push_variant(&mut def, name, payload, explicit);
+                }
+                VariantLine::NotAVariant => {}
+                // An unreadable discriminant on a one-line body refuses the whole
+                // enum, the same as the multi-line path. The body is already
+                // closed, so this is a *refusal*, not an open cursor.
+                VariantLine::UnreadableDiscriminant => {
+                    return Some((name.to_string(), EnumHead::Refused))
+                }
+            }
+        }
+        return Some((name.to_string(), EnumHead::Inline(def.variants)));
+    }
+    // A multi-line body: the brace must end the line, so nothing but the brace
+    // follows it.
+    if !after.trim().is_empty() {
+        return None;
+    }
+    Some((name.to_string(), EnumHead::MultiLine))
+}
+
+/// One line of an enum body, as far as the layout reader can tell.
+enum VariantLine {
+    /// A variant, with the explicit discriminant when the source wrote a literal
+    /// one (`B = 3`).
+    Variant {
+        /// The variant's name.
+        name: String,
+        /// Its payload types; empty for a unit or struct variant.
+        payload: Vec<Ty>,
+        /// The explicit discriminant, when the source gave a literal one.
+        explicit: Option<u64>,
+    },
+    /// A line that is not a variant (a comment, an attribute, a nested item).
+    NotAVariant,
+    /// A variant whose explicit discriminant is not a literal this reader can
+    /// evaluate. The *whole* layout is refused: dropping the variant would shift
+    /// every later discriminant, and guessing one would put a contract on the
+    /// wrong tag. A refused layout makes a contract naming any of its variants a
+    /// refusal, which is the safe direction.
+    UnreadableDiscriminant,
+}
+
+/// Pull one variant out of a line of an enum body.
+///
+/// The line looks like `Off,`, `Idle,`, `Data(u8),`, `Pair { x: u8, y: u8 },` or
+/// `B = 3,`. A unit variant and a tuple variant are both modelled; a *struct*
+/// variant records no payload types, so a contract naming one of its fields is
+/// refused rather than bound to a wrong index. A line that is not a variant (a
+/// nested item, an attribute, a comment) is skipped, which loses a variant rather
+/// than inventing one -- and a lost variant shifts every discriminant after it, so
+/// the skip is restricted to lines that clearly are not variants.
+fn enum_variant(line: &str) -> VariantLine {
+    // A trailing line comment is not part of the variant. Stripping it *first*
+    // matters because the comma that ends the variant sits before the comment:
+    // `B = 3, // tag` would otherwise keep the comma (the line no longer ends in
+    // one) and the discriminant reader would reject the whole line, dropping the
+    // layout and skipping every contract that names one of its variants.
+    let line = strip_line_comment(line);
+    let t = line.trim().trim_end_matches(',').trim();
+    if t.is_empty() || t.starts_with("//") || t.starts_with('#') || t.starts_with("}") {
+        return VariantLine::NotAVariant;
+    }
+    let t = t.trim_start_matches("pub(crate) ").trim_start_matches("pub ").trim();
+    // The variant name is the leading identifier.
+    let name: String = t.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+    if name.is_empty() || !name.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false)
+    {
+        return VariantLine::NotAVariant;
+    }
+    let after = t[name.len()..].trim_start();
+    let (payload, rest) = if after.is_empty() {
+        // A unit variant: nothing follows the name.
+        (Vec::new(), "")
+    } else if let Some(inner_rest) = after.strip_prefix('(') {
+        // A tuple variant: `Name(u8, u16)`. The payload types are what a `match`
+        // arm's downcast reads, so they are recorded even though the tag does not
+        // need them.
+        let Some(close) = inner_rest.find(')') else { return VariantLine::NotAVariant };
+        let inner = inner_rest[..close].trim();
+        let tys = if inner.is_empty() {
+            Vec::new()
+        } else {
+            split_top_level(inner, ',').iter().map(|t| Ty::parse(t.trim())).collect()
+        };
+        (tys, inner_rest[close + 1..].trim_start())
+    } else if after.starts_with('{') {
+        // A struct variant: the fields are not modelled, but the *variant* is, so
+        // it still takes its discriminant.
+        let Some(close) = after.rfind('}') else { return VariantLine::NotAVariant };
+        (Vec::new(), after[close + 1..].trim_start())
+    } else if after.starts_with('=') {
+        (Vec::new(), after)
+    } else {
+        return VariantLine::NotAVariant;
+    };
+    // An explicit discriminant: `B = 3`. Only a literal is accepted; an
+    // expression (`= 1 << 4`) would have to be evaluated, and evaluating it wrongly
+    // is exactly the failure this reader exists to avoid, so the layout is refused
+    // instead.
+    if rest.is_empty() {
+        return VariantLine::Variant { name, payload, explicit: None };
+    }
+    let Some(expr) = rest.strip_prefix('=') else { return VariantLine::NotAVariant };
+    match parse_discriminant_literal(expr) {
+        Some(d) => VariantLine::Variant { name, payload, explicit: Some(d) },
+        None => VariantLine::UnreadableDiscriminant,
+    }
+}
+
+/// A discriminant literal: decimal, `0x`/`0b`/`0o`, with an optional type suffix.
+///
+/// Only a literal is accepted. Anything else -- an expression, a `const` path, a
+/// negative value under a signed `repr` -- returns `None`, and the caller refuses
+/// the whole layout rather than guessing a number.
+fn parse_discriminant_literal(s: &str) -> Option<u64> {
+    let s = s.trim().trim_end_matches(';').trim();
+    if s.is_empty() {
+        return None;
+    }
+    // A negative literal (`= -1` under a signed `repr`) is refused: its value
+    // depends on the tag's width, which the reader does not know here.
+    if s.starts_with('-') {
+        return None;
+    }
+    let body = strip_int_suffix(s);
+    let (radix, digits) = if let Some(r) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        (16u32, r)
+    } else if let Some(r) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
+        (2, r)
+    } else if let Some(r) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
+        (8, r)
+    } else {
+        (10, body)
+    };
+    // The whole remainder must be digits (underscores allowed), so `1 << 4` is
+    // refused rather than silently read as `1`. A partial read is exactly the
+    // kind of wrong number this reader exists to avoid.
+    let mut seen = false;
+    for c in digits.chars() {
+        if c == '_' {
+            continue;
+        }
+        if !c.is_digit(radix) {
+            return None;
+        }
+        seen = true;
+    }
+    if !seen {
+        return None;
+    }
+    let digits: String = digits.chars().filter(|c| *c != '_').collect();
+    u64::from_str_radix(&digits, radix).ok()
+}
+
+/// Drop a trailing `// …` line comment, respecting string and char literals.
+///
+/// The enum reader is handed one trimmed source line at a time, and a comment on
+/// that line is not part of the variant. A `//` inside a string or character
+/// literal is not a comment, so the scan tracks those; a variant line has no such
+/// literal in practice, but the scan keeps the rule true by construction rather
+/// than by luck.
+fn strip_line_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut in_str = false;
+    let mut in_char = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_str = false;
+            }
+        } else if in_char {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == b'\'' {
+                in_char = false;
+            }
+        } else if c == b'"' {
+            in_str = true;
+        } else if c == b'\'' {
+            in_char = true;
+        } else if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            return &line[..i];
+        }
+        i += 1;
+    }
+    line
+}
+
+/// Drop a trailing integer type suffix (`3u8`, `0x10_i32`) if one is present.
+fn strip_int_suffix(s: &str) -> &str {
+    for suf in [
+        "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
+    ] {
+        if let Some(head) = s.strip_suffix(suf) {
+            return head.trim_end_matches('_');
+        }
+    }
+    s
+}
+
+/// Push a variant, computing its discriminant.
+///
+/// Without an explicit value the discriminant is the previous one plus one,
+/// starting at zero -- rustc's rule. The explicit value is stored as written, so
+/// a variant after it continues from *that* value and not from its position.
+fn push_variant(def: &mut EnumDef, name: String, payload: Vec<Ty>, explicit: Option<u64>) {
+    let d = match explicit {
+        Some(d) => d,
+        None => def.variants.last().map(|(_, _, d)| d + 1).unwrap_or(0),
+    };
+    def.variants.push((name, payload, d));
+}
+
+/// The layout of `Option<T>` or `Result<T, E>`, reconstructed from the type's
+/// own generic arguments.
+///
+/// These are the two enums a real function reads without any source file
+/// declaring them: `checked_add` returns `Option<u8>`, and `?` threads a
+/// `Result`. `variant_index` already knows their fixed numbering
+/// (`None`/`Ok` = 0, `Some`/`Err` = 1) for a *construction*; this gives an
+/// *argument* of the same type a tag and payload seeds, so a `match` on it is
+/// modelled instead of refused as an unmodelled switch discriminant.
+///
+/// `Option`'s payload type is the type argument (`Option<u8>` → `Some(u8)`);
+/// `Result`'s is its two type arguments in order (`Result<T, E>` → `Ok(T)`,
+/// `Err(E)`). The split is top-level, so a nested type (`Result<Option<u8>, u8>`)
+/// stays one argument rather than being cut at its own comma.
+///
+/// A *declared* enum always wins — the caller consults `enums` first — so a user
+/// `enum E { Some, None }` is not read as `Option`. An unrecognised spelling
+/// yields `None`, which leaves the argument unbound and the function refused, the
+/// conservative direction.
+pub fn std_enum_def(name: &str) -> Option<EnumDef> {
+    let name = name.trim();
+    let inner = |head: &str| -> Option<String> {
+        let rest = name.strip_prefix(head)?.trim_start();
+        if !rest.starts_with('<') {
+            return None;
+        }
+        // The opening `<` is still in `rest`, so the scan starts at depth 0 and
+        // the matching `>` is the index where the depth returns to 0.
+        let close = {
+            let mut d = 0i32;
+            let mut end = None;
+            for (i, c) in rest.char_indices() {
+                match c {
+                    '<' => d += 1,
+                    '>' => {
+                        d -= 1;
+                        if d == 0 {
+                            end = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            end?
+        };
+        let args = &rest[1..close];
+        // Reject anything after the closing `>` that is not whitespace, so a
+        // spelling like `Option<u8>X` is not silently read as `Option<u8>`.
+        if !rest[close + 1..].trim().is_empty() {
+            return None;
+        }
+        Some(args.to_string())
+    };
+    let variant = |vname: &str, payload: Vec<Ty>, d: u64| (vname.to_string(), payload, d);
+    if let Some(args) = inner("Option") {
+        let t = Ty::parse(args.trim());
+        return Some(EnumDef {
+            variants: vec![variant("None", vec![], 0), variant("Some", vec![t], 1)],
+        });
+    }
+    if let Some(args) = inner("Result") {
+        let parts = split_top_level(&args, ',');
+        if parts.len() != 2 {
+            return None;
+        }
+        let ok = Ty::parse(parts[0].trim());
+        let err = Ty::parse(parts[1].trim());
+        return Some(EnumDef {
+            variants: vec![variant("Ok", vec![ok], 0), variant("Err", vec![err], 1)],
+        });
+    }
+    None
+}
+
+/// Bind every field of every struct-typed argument to a symbolic variable.
+///
+/// A struct argument has no width of its own (`Ty::Other("Config")`), so it gets
+/// no variable in [`arg_vars`] and a contract that names it directly is refused.
+/// Its *fields* do have widths, and those are what a contract wants to talk
+/// about. Each field becomes its own symbolic input, so `c.lo` and `c.hi` are
+/// independent — which is the honest model: the frontend has no way to know the
+/// caller's invariant relating them, so assuming one would be unsound.
+///
+/// The struct's layout comes from `structs`, read from the same source as the
+/// contract. A struct that is not there yields no bindings, and a contract naming
+/// one of its fields is then refused by the parser as an unknown name.
+pub fn field_env(
+    f: &crate::mir::parse::MirFn,
+    structs: &BTreeMap<String, StructDef>,
+    enums: &BTreeMap<String, EnumDef>,
+) -> FieldEnv {
+    // `base` is one past the highest local the function declares. Every local is
+    // seeded at its own index before any field variable is read, so starting here
+    // keeps the two index spaces disjoint for any function, not just a small one.
+    let mut env =
+        FieldEnv { base: f.locals.keys().max().map(|m| m + 1).unwrap_or(0), ..Default::default() };
+    // Every source name in scope, recorded before any binding is generated: the
+    // mangled names are checked against this set, so a generated binding can
+    // never shadow an argument of the same name.
+    for &l in &f.arg_locals {
+        env.declared.insert(f.name_of(l));
+    }
+    for &l in &f.arg_locals {
+        let Some(ty) = f.ty_of(l) else { continue };
+        // A reference to a struct is read through: `&Config` and `Config` have the
+        // same fields, and the executor treats `*_1` as `_1`.
+        let base = match ty {
+            Ty::Ref(inner) => inner.as_ref(),
+            other => other,
+        };
+        let arg = f.name_of(l);
+        // A slice argument: `&[u8]`. Its length is a symbolic input, and its
+        // elements are bound on demand (by `bind_index_refs` for the contract and
+        // by the executor for the body).
+        if let Ty::Slice(elem) = base {
+            if let Some(w) = elem.width() {
+                env.bind_indexed_len(l, &arg, w, elem.is_signed());
+            }
+            continue;
+        }
+        // An array argument: `[u8; 4]`. Its length is the constant in its type,
+        // so unlike a slice there is nothing for the caller to choose; the
+        // elements are still distinct inputs per index.
+        if let Ty::Array(elem, n) = base {
+            if let Some(w) = elem.width() {
+                env.bind_array_len(l, &arg, w, elem.is_signed(), *n);
+            }
+            continue;
+        }
+        let Ty::Other(name) = base else { continue };
+        // An enum argument: its tag is a symbolic input with the enum's arity as
+        // its domain, and each variant's payload is its own input. Checked before
+        // the struct path because an enum name is an `Other` too, and binding it
+        // as a struct with no fields would silently lose the tag.
+        //
+        // A *declared* layout always wins. `Option` and `Result` are the two the
+        // reader knows without a declaration, because `checked_*` and the `?`
+        // operator hand them to real functions and no source file declares them;
+        // `std_enum_def` reconstructs their layout from the type's generic
+        // arguments. `Shadow` is a declared `enum { Some, None }` and is not
+        // `Option`, so it must reach `enums` first.
+        if let Some(def) = enums.get(name) {
+            env.bind_enum(l, &arg, name, def);
+            continue;
+        }
+        if let Some(def) = std_enum_def(name) {
+            env.bind_enum(l, &arg, name, &def);
+            continue;
+        }
+        // Recorded whether or not a layout was found, so a contract naming a field
+        // gets a message about the field even when the struct's definition was not
+        // readable.
+        env.declare_arg(&arg);
+        let Some(def) = structs.get(name) else { continue };
+        for (i, (fname, fty)) in def.fields.iter().enumerate() {
+            env.bind(l, &arg, fname, i as u32, fty);
+        }
+    }
+    env
 }
 
 /// The argument names whose declared type is signed, for comparison signedness.
+///
+/// Alias names are included for the same reason they are in [`arg_vars`]: `k` in
+/// `let k = i;` stands for `i`, so a signed `i` makes `k` signed too. Omitting
+/// them would make `k < 0` an unsigned comparison — the exact class of bug the
+/// `Sign` type was introduced to prevent.
 pub fn signed_args(f: &crate::mir::parse::MirFn) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for &l in &f.arg_locals {
         if f.ty_of(l).map(|t| t.is_signed()).unwrap_or(false) {
             out.insert(f.name_of(l));
+        }
+    }
+    for (name, local) in f.alias_locals() {
+        if f.ty_of(local).map(|t| t.is_signed()).unwrap_or(false) {
+            out.insert(name);
         }
     }
     out
@@ -626,7 +2774,7 @@ pub fn signed_args(f: &crate::mir::parse::MirFn) -> BTreeSet<String> {
 /// A contract says `a != i16::MIN`, and the parser has no way to look the value
 /// up except here. Returning `None` for an unknown type keeps an unrecognized
 /// name a refusal rather than a zero.
-fn type_bound(ty: &str, assoc: &str) -> Option<u64> {
+fn type_bound(ty: &str, assoc: &str) -> Option<(u64, u8)> {
     let signed = ty.starts_with('i');
     let unsigned = ty.starts_with('u');
     if !signed && !unsigned {
@@ -640,19 +2788,35 @@ fn type_bound(ty: &str, assoc: &str) -> Option<u64> {
         "isize" | "usize" => 64,
         _ => return None,
     };
-    match assoc {
-        "MAX" if signed => Some((1u64 << (bits - 1)) - 1),
-        "MAX" => Some(if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 }),
+    // The value is the bit pattern at the named type's own width, which is what
+    // lets `i8::MIN` be `0x80` rather than an out-of-range 64-bit `128`.
+    let v = match assoc {
+        "MAX" if signed => (1u64 << (bits - 1)) - 1,
+        "MAX" => {
+            if bits == 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            }
+        }
         // `MIN` for a signed type is the most negative value, which as a bit
         // pattern is the top bit alone.
-        "MIN" if signed => Some(1u64 << (bits - 1)),
-        "MIN" => Some(0),
-        _ => None,
-    }
+        "MIN" if signed => 1u64 << (bits - 1),
+        "MIN" => 0,
+        _ => return None,
+    };
+    Some((v, bits as u8))
 }
 
 /// The argument names and widths of a function, in declaration order, as they
-/// appear in the MIR dump.
+/// appear in the MIR dump, plus any source name that is a direct alias of an
+/// argument.
+///
+/// The alias names are added here rather than only to the index binder because
+/// they are ordinary contract names: `let k = i;` makes `k` usable wherever `i`
+/// is, so a `requires: k < 4` has to resolve too. `MirFn::alias_locals` decides
+/// which names qualify, and it only ever names an argument that the body never
+/// writes, so every entry here stands for the very value the body uses.
 pub fn arg_vars(f: &crate::mir::parse::MirFn) -> BTreeMap<String, Var> {
     let mut out = BTreeMap::new();
     for &l in &f.arg_locals {
@@ -661,5 +2825,506 @@ pub fn arg_vars(f: &crate::mir::parse::MirFn) -> BTreeMap<String, Var> {
             out.insert(f.name_of(l), smt::var_named(l, w));
         }
     }
+    for (name, local) in f.alias_locals() {
+        let ty = f.ty_of(local).cloned().unwrap_or(Ty::Other("?".into()));
+        if let Some(w) = ty.width() {
+            out.insert(name, smt::var_named(local, w));
+        }
+    }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn def(src: &str) -> EnumDef {
+        let specs = extract(src);
+        specs.enums.get("E").cloned().unwrap_or_default()
+    }
+
+    /// The two standard enums a real function reads are reconstructed from the
+    /// type's own generic arguments, with the payloads at their declared widths.
+    #[test]
+    fn a_standard_enum_argument_gets_a_layout() {
+        let o = std_enum_def("Option<u8>").expect("Option<u8> has a layout");
+        assert_eq!(o.index_of("None"), Some(0));
+        assert_eq!(o.index_of("Some"), Some(1));
+        assert_eq!(o.tag_width(), 1);
+        assert_eq!(o.variants[1].1, vec![Ty::U8], "`Some` carries the type argument");
+
+        let r = std_enum_def("Result<u8, u16>").expect("Result<u8, u16> has a layout");
+        assert_eq!(r.index_of("Ok"), Some(0));
+        assert_eq!(r.index_of("Err"), Some(1));
+        assert_eq!(r.variants[0].1, vec![Ty::U8], "`Ok` carries the first argument");
+        assert_eq!(r.variants[1].1, vec![Ty::U16], "`Err` carries the second");
+    }
+
+    /// The argument split is top-level, so a nested type stays one argument.
+    #[test]
+    fn a_nested_standard_enum_payload_is_one_type() {
+        let r = std_enum_def("Result<Option<u8>, u8>").expect("nested Result has a layout");
+        assert_eq!(r.variants[0].1, vec![Ty::Other("Option<u8>".into())]);
+        assert_eq!(r.variants[1].1, vec![Ty::U8]);
+    }
+
+    /// A spelling that is not `Option`/`Result`, or is malformed, is refused
+    /// rather than guessed -- an unrecognised type must leave the argument
+    /// unbound so the function is refused, not modelled at the wrong width.
+    #[test]
+    fn a_non_standard_or_malformed_name_is_refused() {
+        assert!(std_enum_def("Mode").is_none());
+        assert!(std_enum_def("Option").is_none(), "no type argument is not Option<T>");
+        assert!(std_enum_def("Option<u8>X").is_none(), "trailing text is not Option<u8>");
+        assert!(std_enum_def("Result<u8>").is_none(), "Result needs two arguments");
+    }
+
+    /// A contract cast sets the target's width *and* sign, and a chain applies
+    /// left to right. Pinned here, not only in the nightly-gated MIR tests, so
+    /// the parse rule has a guard that runs without a toolchain.
+    #[test]
+    fn a_contract_cast_sets_the_target_width_and_sign() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::word(0, 8));
+        let unsigned = BTreeSet::new();
+        let signed: BTreeSet<String> = ["x".to_string()].into_iter().collect();
+
+        // `x as u32` from an unsigned source: 32 bits, unsigned.
+        let mut p = Parser::new("x as u32", &args, None, &unsigned, false);
+        let (v, s) = p.parse_expr().expect("`x as u32` parses");
+        assert_eq!(smt::bits(v), 32);
+        assert!(!s);
+
+        // `x as i32` from a *signed* source: 32 bits, signed.
+        let mut p = Parser::new("x as i32", &args, None, &signed, false);
+        let (v, s) = p.parse_expr().expect("`x as i32` parses");
+        assert_eq!(smt::bits(v), 32);
+        assert!(s);
+
+        // A chain applies left to right: the last cast decides width and sign.
+        let mut p = Parser::new("x as u16 as i32", &args, None, &unsigned, false);
+        let (v, s) = p.parse_expr().expect("the chain parses");
+        assert_eq!(smt::bits(v), 32);
+        assert!(s);
+    }
+
+    /// The operator precedence must match Rust's, because a contract is Rust
+    /// syntax. The earlier reader put `|`/`^` with `+`/`-` and `&` with `*`, so
+    /// `x & 1 + 1` was read as `(x & 1) + 1` where Rust means `x & (1 + 1)` -- a
+    /// different *value*, not a different proof. The values below are evaluated
+    /// on the engine, so a wrong tree shows up as a wrong number.
+    #[test]
+    fn a_contract_expression_uses_rust_precedence() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::word(1, 8));
+        let unsigned = BTreeSet::new();
+        let eval = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let (v, _) = p.parse_expr().expect("parses");
+            p.expect_end().expect("no trailing tokens");
+            smt::evaluate(v, |_| None).expect("a constant")
+        };
+        // `1 & (1 + 1)` is `1 & 2` is `0`; `(1 & 1) + 1` would be `2`.
+        assert_eq!(eval("x & 1 + 1"), 0, "`&` must bind looser than `+`");
+        // `(1 + 1) << 1` is `4`; `1 + (1 << 1)` would be `3`, so `+` binds
+        // tighter than `<<`.
+        assert_eq!(eval("x + 1 << 1"), 4, "`+` must bind tighter than `<<`");
+        // `1 | 1 ^ 1` is `1 | (1 ^ 1)` is `1`; `(1 | 1) ^ 1` would be `0`.
+        assert_eq!(eval("x | 1 ^ 1"), 1, "`^` must bind tighter than `|`");
+        // `8 / 4 / 2` is left-associative: `(8 / 4) / 2` is `1`.
+        assert_eq!(eval("8 / 4 / 2"), 1, "`/` is left-associative");
+    }
+
+    /// A negated literal is *signed*, and the flag has to say so or `%`, `/` and
+    /// `>>` pick the unsigned engine and return a different number.
+    ///
+    /// This is the shape the precedence test cannot reach: signedness is read from
+    /// the *names* in an expression, and `-7 % 3` has no name. The operand of the
+    /// negation is the literal `7`, which is unsigned, so passing the operand's own
+    /// flag through made the whole expression unsigned. Only `%`, `/` and `>>`
+    /// consult the flag, so the mistake produced a *wrong value* rather than a
+    /// refusal: `4294967289 % 3` is `0`, where Rust says `-1`. The flag is asserted
+    /// directly here, because the values are what the corpus entries cover.
+    #[test]
+    fn a_negated_literal_is_signed() {
+        // An 8-bit name in scope, so a bare literal is built 8 bits wide and the
+        // value below is the readable `0xF9` rather than a 64-bit pattern.
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::word(1, 8));
+        let unsigned = BTreeSet::new();
+        let parse = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let (v, sgn) = p.parse_expr().expect("parses");
+            p.expect_end().expect("no trailing tokens");
+            (v, sgn)
+        };
+        // A negation is only defined on a signed type, so `-7` is signed even
+        // though the `7` it negates is not.
+        let (_, sgn) = parse("-7");
+        assert!(sgn, "a negated literal is signed");
+        let (_, sgn) = parse("-7 % 3");
+        assert!(sgn, "a remainder of a negated literal is signed");
+        // A bare literal stays unsigned, or `x % 3` for an unsigned `x` would
+        // take the signed engine -- the mirror of the same mistake.
+        let (_, sgn) = parse("7 % 3");
+        assert!(!sgn, "a bare literal is unsigned");
+        // The value is still a *value* negation: `-7` is the two's-complement
+        // `7` subtracted from `0`, so it evaluates to `-1` at 8 bits.
+        let (v, _) = parse("-7");
+        assert_eq!(smt::evaluate(v, |_| None).expect("a constant"), 0xF9);
+    }
+
+    /// Unary `-` binds *tighter* than `as`, so `-x as u8` is `(-x) as u8` and its
+    /// type is `u8` — unsigned — not the signed `-(x as u8)`.
+    ///
+    /// The values agree (negation and truncation commute), so the flag is what
+    /// separates the readings, and the flag is what the operators and comparisons
+    /// read. Getting it backwards made `-x as u8 > 127` unsatisfiable — an `i8` is
+    /// never `> 127` — which reported a verifiable function as *vacuous*. Rust
+    /// rejects `-x as u8` for an unsigned `x` with "cannot apply unary operator
+    /// `-`", which is the language telling you the negation happens on `x` before
+    /// the cast, not on the cast's result.
+    #[test]
+    fn a_negation_binds_tighter_than_a_cast() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::word(0, 8));
+        let unsigned = BTreeSet::new();
+        let parse = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let (v, sgn) = p.parse_expr().expect("parses");
+            p.expect_end().expect("no trailing tokens");
+            (v, sgn)
+        };
+        // `(-x) as u8` is unsigned; `-(x as u8)` would be signed.
+        let (_, sgn) = parse("-x as u8");
+        assert!(!sgn, "`-x as u8` is `(-x) as u8`, an unsigned type");
+        // The cast target decides the width, whichever way the negation is read,
+        // so the value of the negation is not where the two readings differ.
+        let (v, _) = parse("-x as u8");
+        assert_eq!(smt::bits(v), 8, "the cast target is the width");
+        // A cast *after* a parenthesized negation is the same thing, and is what
+        // the explicit spelling looks like.
+        let (_, sgn) = parse("(-x) as u8");
+        assert!(!sgn, "`(-x) as u8` is unsigned too");
+        // A negation with no cast is still signed, or the fix above would have
+        // undone the previous one.
+        let (_, sgn) = parse("-x");
+        assert!(sgn, "a negation with no cast is signed");
+    }
+
+    /// Unary `!` on a value is *bitwise* NOT and binds *tighter* than `==`, so
+    /// `!x == 5` is `(!x) == 5`, not `!(x == 5)`.
+    ///
+    /// The parser handled `!` only at the *predicate* level, so `!x == 5` was read
+    /// as the predicate `!(x == 5)` — `x != 5` — where Rust means `x == 250` for a
+    /// `u8`. That is a different predicate, so it is a *wrong verdict*, not a
+    /// refusal, and a bare `!x` was not readable at all. The fix splits the two:
+    /// `bang_is_predicate` decides which reading applies, a predicate `!` stays at
+    /// `parse_cmp`, and a value `!` is a prefix at `parse_neg` (bitwise NOT, the
+    /// same term `mir/exec.rs` builds for `UnOp::Not`).
+    #[test]
+    fn a_bang_on_a_value_is_bitwise_not_and_binds_tight() {
+        let mut args = BTreeMap::new();
+        // A real variable, so the assignment below is what `x` reads.
+        args.insert("x".to_string(), smt::var(8));
+        let unsigned = BTreeSet::new();
+        let eval_const = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let (v, _) = p.parse_expr().expect("parses");
+            p.expect_end().expect("no trailing tokens");
+            smt::evaluate(v, |_| None).expect("a constant")
+        };
+        // The value of an expression under an assignment to `x`.
+        let eval_at = |text: &str, x: u64| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let (v, _) = p.parse_expr().expect("parses");
+            p.expect_end().expect("no trailing tokens");
+            smt::evaluate(v, |_| Some(x)).expect("decides")
+        };
+        // The expression as a *predicate*, so a comparison is decided as a whole.
+        let pred = |text: &str, x: u64| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let pr = p.parse_or().expect("parses as a predicate");
+            p.expect_end().expect("no trailing tokens");
+            smt::evaluate_pred(pr, |_| Some(x)).expect("decides")
+        };
+        // `!0` is `255` at 8 bits: bitwise NOT, not a boolean.
+        assert_eq!(eval_const("!0"), 0xFF, "`!` on a value is bitwise NOT");
+        // `!!0` is `0`: the complement of the complement.
+        assert_eq!(eval_const("!!0"), 0, "a double `!` is the identity");
+        // `!1 + 1` is `(!1) + 1` = `254 + 1` = `255`. Read at the predicate level
+        // it would not even parse as arithmetic.
+        assert_eq!(eval_const("!1 + 1"), 0xFF, "`!` binds tighter than `+`");
+        // `0 & !1` is `0 & 254` = `0`; the prefix applies to the literal `1`.
+        assert_eq!(eval_const("0 & !1"), 0, "`!` applies to the operand, not the `&`");
+        assert_eq!(eval_at("!x", 0), 0xFF, "a bare `!x` reads, and is bitwise");
+        assert_eq!(eval_at("!x", 250), 5, "`!250` is `5` at 8 bits");
+        // `!x & 1` is `(!x) & 1`; at `x == 0` that is `255 & 1 == 1`. If `&` bound
+        // first the value would be `!(0 & 1) == 254`, so this separates the two.
+        assert_eq!(eval_at("!x & 1", 0), 1, "`!` binds tighter than `&`");
+
+        // `!x == 5` is decided at the *predicate* level, so assert the predicate
+        // itself: `(!x) == 5` holds at `x == 250` and not at `x == 5`, which is the
+        // opposite of what `!(x == 5)` would say.
+        assert!(pred("!x == 5", 250), "`!x == 5` is `(!x) == 5`: true at 250");
+        assert!(!pred("!x == 5", 5), "`!x == 5` is `(!x) == 5`: false at 5");
+        // `!(x == 5)` is the predicate reading, and must still negate: false at 5
+        // (the comparison holds, so its negation does not), true at 250.
+        assert!(!pred("!(x == 5)", 5), "`!(x == 5)` is `x != 5`: false at 5");
+        assert!(pred("!(x == 5)", 250), "`!(x == 5)` is `x != 5`: true at 250");
+        // `!(x + 1)` holds *arithmetic*, so `!` is the value form here even though a
+        // `(` follows: `!` is bitwise NOT, and `!(x + 1) == 5` is `(!(x + 1)) == 5`,
+        // which holds at `x == 249` and not at `x == 5`. This is the case that
+        // separates `bang_is_predicate`'s lookahead from "a `(` follows".
+        assert!(pred("!(x + 1) == 5", 249), "`!(x + 1)` is `(!(x + 1))`, a value");
+        assert!(!pred("!(x + 1) == 5", 5), "`!(x + 1)` is not a predicate negation");
+    }
+
+    /// A shift amount or a divisor may be a *constant expression*, and the reader
+    /// must fold it before asking whether it is constant or zero.
+    ///
+    /// `const_of` answers "is this node a literal", which is the wrong question for
+    /// both: `x >> 1 + 1` folds to `x >> 2` (constant, so the shift is fine), and
+    /// `x % (1 - 1)` folds to `x % 0` (zero, so it must be refused). Asking the
+    /// literal question misclassified the first as symbolic -- a barrel shifter in
+    /// the body, an undecided query -- and let the second past the zero guard, so
+    /// the reader built `srem(x, 0)` and returned a *definite verdict* from an
+    /// undefined operation. `const_value` folds instead, which is what both want.
+    #[test]
+    fn a_constant_expression_is_folded_before_it_is_classified() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::var(8));
+        args.insert("y".to_string(), smt::var(8));
+        let unsigned = BTreeSet::new();
+        let parse = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let (v, _) = p.parse_expr().expect("parses");
+            p.expect_end().expect("no trailing tokens");
+            v
+        };
+        // A folded shift amount is a constant shift: `x >> 1 + 1` is `x >> 2`.
+        let folded = parse("x >> 1 + 1");
+        let literal = parse("x >> 2");
+        assert_eq!(smt::evaluate(folded, |_| Some(8)), Some(2));
+        assert_eq!(
+            smt::evaluate(folded, |_| Some(8)),
+            smt::evaluate(literal, |_| Some(8)),
+            "`x >> 1 + 1` must read as `x >> 2`"
+        );
+        // A *symbolic* amount is still refused, not modelled as a barrel shifter.
+        let mut p = Parser::new("x >> y", &args, None, &unsigned, false);
+        assert!(p.parse_expr().is_err(), "a symbolic shift amount is refused");
+        // A divisor of constant zero is refused however it is spelled.
+        let mut p = Parser::new("x % (1 - 1)", &args, None, &unsigned, false);
+        assert!(p.parse_expr().is_err(), "a folded zero divisor is refused");
+        // A constant, non-zero divisor folds and reads: `4 / (1 + 1)` is `2`.
+        assert_eq!(smt::evaluate(parse("x / (1 + 1)"), |_| Some(4)), Some(2));
+    }
+
+    /// A radix literal is read at its *radix*, and one that is not an exact
+    /// integer is refused rather than truncated.
+    ///
+    /// Every literal used to be read as decimal: the digit run stopped at the `x`
+    /// of `0xFF` and the rest was skipped as a type suffix, so the value was `0`.
+    /// That is a wrong *value*, and a wrong value in a precondition is a false
+    /// proof -- `requires: x == 0xFF` became `x == 0`, and `ensures: ret == 0` was
+    /// "proved" for a function returning `255`. Reading at the radix fixes the
+    /// value; refusing the malformed shapes (`0b12`, `0o9`, `0xg`, `0xFFg`, past
+    /// `u64`) keeps the fix from trading one silent number for another.
+    #[test]
+    fn a_radix_literal_is_read_at_its_radix_or_refused() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::var(16));
+        let unsigned = BTreeSet::new();
+        let val = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let (v, _) = p.parse_expr().expect("parses");
+            p.expect_end().expect("no trailing tokens");
+            smt::evaluate(v, |_| None).expect("a constant")
+        };
+        let refuses = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            p.parse_expr().is_err() || p.expect_end().is_err()
+        };
+        // Each radix reads at its own radix, not decimal.
+        assert_eq!(val("0xFF"), 255, "`0xFF` is 255, not 0");
+        assert_eq!(val("0x10"), 16, "`0x10` is 16, not 0");
+        assert_eq!(val("0b1010"), 10, "`0b1010` is 10, not 0");
+        assert_eq!(val("0o17"), 15, "`0o17` is 15, not 0");
+        assert_eq!(val("0xFFFF"), 65535);
+        // Underscores are separators in any radix, and a type suffix is dropped.
+        assert_eq!(val("0xFF_FF"), 65535);
+        assert_eq!(val("1_000"), 1000);
+        assert_eq!(val("0xFFu8"), 255);
+        assert_eq!(val("100_"), 100, "a trailing `_` is a separator");
+        // A malformed literal is refused, never partially read.
+        assert!(refuses("0b12"), "`0b12` has a non-binary digit");
+        assert!(refuses("0o9"), "`0o9` has a non-octal digit");
+        assert!(refuses("0xg"), "`0xg` has no hex digits");
+        assert!(refuses("0xFFg"), "`0xFFg` has an unknown suffix");
+        assert!(refuses("18446744073709551616"), "past `u64` is refused");
+    }
+
+    /// A literal that does not fit the operand's *signed* width is refused, even
+    /// though its bit pattern does.
+    ///
+    /// `128` for an `i8` is `0x80`, which is exactly the bit pattern of `-128`, so
+    /// a reader that only asks "does this fit in eight *unsigned* bits?" accepts it
+    /// and reads `x <= 128` as `x <= -128`. rustc rejects `x <= 128` for an `i8`
+    /// ("literal out of range for `i8`"), and the wrong reading is a false proof:
+    /// `requires: x <= 128` with `ensures: x != 127` *held*. The `i8::MIN` bound
+    /// shares the bit pattern and must still be accepted, which is why the fix
+    /// distinguishes a non-negative literal from a signed constant rather than
+    /// refusing every `0x80`.
+    #[test]
+    fn an_out_of_range_literal_is_refused_at_the_operand_width() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::var(8));
+        let mut signed = BTreeSet::new();
+        signed.insert("x".to_string());
+        // A whole *predicate*, so the comparison and its width alignment run.
+        let reads = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            let pr = p.parse_or().expect("parses");
+            p.expect_end().expect("no trailing tokens");
+            smt::evaluate_pred(pr, |_| Some(0))
+        };
+        // `x <= 128` and `x >= -129` are both Rust errors for an `i8`, so they are
+        // refused, not read as `x <= -128` / `x >= 127`.
+        let mut p = Parser::new("x <= 128", &args, None, &signed, false);
+        assert!(p.parse_or().is_err(), "`x <= 128` must be refused for an `i8`");
+        let mut p = Parser::new("x >= -129", &args, None, &signed, false);
+        assert!(p.parse_or().is_err(), "`x >= -129` must be refused for an `i8`");
+        // The boundaries that *do* fit still read, and mean what they say.
+        assert_eq!(reads("x <= 127"), Some(true), "127 is i8::MAX");
+        assert_eq!(reads("x >= -128"), Some(true), "-128 is i8::MIN");
+        let mut p = Parser::new("x == 128", &args, None, &signed, false);
+        assert!(p.parse_or().is_err(), "`x == 128` is refused too");
+        // Two *constants* have no typed name to take a width from, but the fit
+        // check still runs: `128 <= i8::MAX` is a `literal out of range` error, and
+        // reading `128` as `0x80` made it `-128 <= 127` -- always true. The in-range
+        // counterpart and the named bound both still read.
+        let mut p = Parser::new("128 <= i8::MAX", &args, None, &signed, false);
+        assert!(
+            p.parse_or().is_err(),
+            "`128 <= i8::MAX` must be refused (literal out of range for `i8`)"
+        );
+        let mut p = Parser::new("127 <= i8::MAX", &args, None, &signed, false);
+        assert!(p.parse_or().is_ok(), "`127 <= i8::MAX` is well-typed and must read");
+        let mut p = Parser::new("i8::MIN <= i8::MAX", &args, None, &signed, false);
+        assert!(p.parse_or().is_ok(), "`i8::MIN <= i8::MAX` must read");
+    }
+
+    /// An explicit discriminant sets the variant's value and the next continues
+    /// from it, not from the variant's position.
+    #[test]
+    fn an_explicit_discriminant_renumbers_the_rest() {
+        let d = def("pub enum E { A, B = 3, C }\n");
+        assert_eq!(d.index_of("A"), Some(0));
+        assert_eq!(d.index_of("B"), Some(3));
+        assert_eq!(d.index_of("C"), Some(4));
+        // The tag has to hold `4`, which needs three bits, not the two a count of
+        // three would give.
+        assert_eq!(d.tag_width(), 3);
+    }
+
+    /// A hex, binary or octal literal is read at its own radix.
+    #[test]
+    fn a_radix_prefixed_discriminant_is_read() {
+        let d = def("pub enum E { A = 0x10, B = 0b101, C = 0o7, D }\n");
+        assert_eq!(d.index_of("A"), Some(16));
+        assert_eq!(d.index_of("B"), Some(5));
+        assert_eq!(d.index_of("C"), Some(7));
+        assert_eq!(d.index_of("D"), Some(8));
+    }
+
+    /// A non-literal discriminant refuses the whole layout, so a contract naming
+    /// any variant of the enum is a refusal rather than a guess.
+    #[test]
+    fn an_unreadable_discriminant_refuses_the_whole_layout() {
+        let specs = extract("pub enum E { A, B = 1 << 4, C }\n");
+        assert!(!specs.enums.contains_key("E"), "the layout must not be recorded at all");
+    }
+
+    /// A struct variant still takes its discriminant, so a later variant's value
+    /// is right.
+    #[test]
+    fn a_struct_variant_still_takes_a_discriminant() {
+        let d = def("pub enum E {\n    A,\n    Pair { x: u8 },\n    C,\n}\n");
+        assert_eq!(d.index_of("A"), Some(0));
+        assert_eq!(d.index_of("Pair"), Some(1));
+        assert_eq!(d.index_of("C"), Some(2));
+    }
+
+    /// The domain assumed for a tag is the set of discriminants, so a gap is not
+    /// excluded.
+    #[test]
+    fn the_tag_domain_is_the_discriminants() {
+        let d = def("pub enum E { A, B = 3, C }\n");
+        assert_eq!(d.variants.iter().map(|(_, _, d)| *d).collect::<Vec<_>>(), vec![0, 3, 4]);
+    }
+
+    /// An unreadable discriminant on a *one-line* enum must not leave the enum
+    /// cursor open.
+    ///
+    /// The one-line reader returns the variants when it can read them and, for an
+    /// unreadable discriminant, used to answer "a multi-line body follows". That
+    /// answer opened a cursor *after* the closing brace had already been seen, so
+    /// every following line -- including `///` contracts and the `fn` items they
+    /// belong to -- was consumed as enum contents. Those functions then had no
+    /// contract at all, so they were neither verified nor reported as skipped:
+    /// they silently left the check set.
+    #[test]
+    fn an_unreadable_one_line_enum_does_not_swallow_the_next_contract() {
+        let src = "pub enum E { A, B = 1 << 4 }\n\n\
+                   /// ensures: ret == 1\n\
+                   pub fn f() -> u8 { 0 }\n";
+        let specs = extract(src);
+        assert!(!specs.enums.contains_key("E"), "the refused layout must not be recorded");
+        assert!(
+            specs.by_fn.contains_key("f"),
+            "the contract after a refused enum must still be read, got: {:?}",
+            specs.by_fn.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// The same for the multi-line path: the refusal must close the cursor at the
+    /// brace, not at whatever `}` comes next.
+    #[test]
+    fn a_refused_multi_line_enum_does_not_swallow_the_next_contract() {
+        let src = "pub enum E {\n    A,\n    B = 1 << 4,\n}\n\n\
+                   /// ensures: ret == 1\n\
+                   pub fn f() -> u8 { 0 }\n";
+        let specs = extract(src);
+        assert!(!specs.enums.contains_key("E"), "the refused layout must not be recorded");
+        assert!(
+            specs.by_fn.contains_key("f"),
+            "the contract after a refused multi-line enum must still be read, got: {:?}",
+            specs.by_fn.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A trailing line comment on a variant line is not part of the variant.
+    ///
+    /// `B = 3, // special` puts the comma *before* the comment, so trimming a
+    /// trailing comma off the raw line leaves `B = 3, // special` -- the comma is
+    /// no longer last. The discriminant reader then rejected the whole line and
+    /// the layout was dropped, taking every contract that named a variant with it.
+    #[test]
+    fn a_trailing_comment_on_a_variant_is_not_part_of_it() {
+        let src = "pub enum E {\n    A,\n    B = 3, // special\n    C,\n}\n";
+        let d = def(src);
+        assert_eq!(d.index_of("A"), Some(0));
+        assert_eq!(d.index_of("B"), Some(3));
+        assert_eq!(d.index_of("C"), Some(4), "C follows B's explicit value, not its position");
+    }
+
+    /// A comment after an implicit variant must not change its numbering either.
+    #[test]
+    fn a_trailing_comment_on_an_implicit_variant_is_ignored() {
+        let src = "pub enum E {\n    A, // first\n    B,\n}\n";
+        let d = def(src);
+        assert_eq!(d.index_of("A"), Some(0));
+        assert_eq!(d.index_of("B"), Some(1));
+    }
 }

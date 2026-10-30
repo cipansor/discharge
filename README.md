@@ -1229,14 +1229,165 @@ so the state after the loop is *any* state satisfying the invariant and the exit
 condition, not the state of the first pass. Omitting that step would prove false
 postconditions; `AGENTS.md` records the measured case.
 
+A contract may name a field of a struct argument, and a component of a tuple
+return, by the same syntax the Rust body uses:
+
+```rust,ignore
+struct Bounds { lo: u8, hi: u8 }
+
+/// requires: b.lo <= b.hi
+/// ensures: ret >= b.lo && ret <= b.hi
+pub fn clamp_bounds(b: &Bounds, v: u8) -> u8 {
+    if v < b.lo { b.lo } else if v > b.hi { b.hi } else { v }
+}
+
+/// requires: a <= b
+/// ensures: ret.0 <= a
+pub fn split(a: u8, b: u8) -> (u8, u8) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+```
+
+The MIR dump names the struct but never prints its layout — `_1: &Bounds` and
+nothing more — so the field *indices and widths* are read from the source, the
+same place the contract text comes from. That keeps the two consistent by
+construction: a field the layout reader does not find cannot be named by a
+contract that would otherwise be checked against it.
+
+Each field is its own symbolic input. This is the honest model, not a
+convenience: the frontend cannot see the caller's invariant relating two fields,
+so assuming `lo <= hi` would be unsound. `examples/mir_targets/realistic.rs`
+carries a `field_alias_tripwire` whose *failure* is the evidence that the two
+fields are distinct variables rather than one aliased one; `tests/mir.rs`
+requires that failure.
+
+A projection that cannot be resolved is refused, never dropped. `c.lo` where `lo`
+is not a field of `Bounds` is an error naming the field, and a projection on a
+non-aggregate return is refused too — if the conjunct vanished instead, the
+function would verify against a weaker contract than the source states.
+
+A slice argument is named by its length and by its elements:
+
+```rust,ignore
+/// requires: xs.len() > 0
+/// ensures: ret == xs[0]
+pub fn first_of(xs: &[u8]) -> u8 {
+    xs[0]
+}
+```
+
+A slice has no length in its type, so `xs.len()` is a *symbolic input* — whatever
+the caller passed — not a constant. The same variable is what the body's
+`PtrMetadata(_1)` reads and what the `assert` before `(*_1)[_2]` checks, so the
+bounds check is discharged from the precondition rather than assumed. Each element
+is its own input per index: `xs[0]` and `xs[1]` are two variables, and a
+`slice_alias_tripwire` in `examples/mir_targets/realistic.rs` fails precisely
+because of it. Only a literal index is modelled; `xs[i]` with `i` a parameter is
+refused rather than resolved to an arbitrary element.
+
+A fixed-size array is named the same way, but its length is not an input:
+
+```rust,ignore
+/// requires: a[0] <= a[1]
+/// ensures: ret == a[1]
+pub fn max_of_pair(a: [u8; 4]) -> u8 {
+    if a[0] > a[1] { a[0] } else { a[1] }
+}
+```
+
+An array's length is part of its type, so `a.len()` is the *constant* `4` and not a
+fresh variable — binding it to an input would admit lengths the type excludes, so a
+contract proved at length 4 would claim to hold at any length. The body's bounds
+check is against that same literal (`Lt(_2, const 4_usize)`), so it is discharged
+from the index being a literal. Elements are inputs per index exactly as a slice's
+are, and `array_alias_tripwire` fails to show it. An index past the length is
+refused rather than bound, since the element does not exist.
+
+A literal in a contract takes its width from the operand it meets, not from the
+widest name in scope:
+
+```rust,ignore
+/// requires: true
+/// ensures: ret <= 255
+pub fn idx(a: [u8; 4]) -> u8 { a[0] }
+```
+
+Here `a` contributes a 64-bit length, but `ret` is 8 bits, so `255` has to be read
+at 8 bits. Sizing it from the length instead made the comparison ill-formed, and an
+ill-formed term makes *every* obligation in the run `Unknown` — so the function was
+reported incomplete for a reason that had nothing to do with its body. A literal too
+large for the operand's width is refused rather than truncated: `a <= 300` for a
+`u8` must not become `a <= 44`.
+
+The fit check is against the operand's *signed* range when the operand is signed,
+not merely its bit width. `128` for an `i8` fits in eight bits, but those bits are
+`0x80`, which is `-128` signed — so a check that only asked "does this fit in eight
+unsigned bits?" accepted it and read `x <= 128` as `x <= -128`. rustc rejects
+`x <= 128` for an `i8` ("literal out of range for `i8`"), and the wrong reading is a
+false proof: `requires: x <= 128` with `ensures: ret != 127` *held*. The same holds
+for a negation, where `-129` for an `i8` wraps to `127` at eight bits and `x >= -129`
+became `x >= 127`. Both are refused now. The `i8::MIN` bound shares the bit pattern
+`0x80` and still reads, which is why the fix distinguishes a non-negative literal
+from a signed constant instead of refusing every `0x80`. The check runs even when
+both operands are constants and no typed name is present: `128 <= i8::MAX` is a
+`literal out of range` error, and reading `128` as `0x80` made it `-128 <= 127`,
+always true — so it is refused, while `127 <= i8::MAX` and `i8::MIN <= i8::MAX` read.
+
+A literal is read at the radix it is written in. `0xFF` is `255`, `0b1010` is `10`
+and `0o17` is `15`, in any width and with underscores or a type suffix (`0xFFu8`,
+`0xFF_FF`). Reading every literal as decimal silently made `0xFF` equal `0` — the
+digit run stopped at the `x` and the rest was skipped as a type suffix — and a wrong
+value in a precondition is a *false proof*, not a refusal: `requires: x == 0xFF`
+became `x == 0`, so `ensures: ret == 0` was proved for a function returning `255`. A
+literal that is not an exact integer — a digit invalid for its radix (`0b12`, `0o9`),
+no digits (`0xg`), an unknown suffix (`0xFFg`), or a value past `u64` — is refused,
+so the fix does not trade one silent number for another.
+
 The scanner is deliberately strict. A `requires:`, `ensures:` or `invariant:` that sits before a
 `const`, a `struct` or a module comment is *not* attached to the next function, so
 a misplaced contract is dropped rather than silently applied to the wrong item.
-A contract expression outside the small grammar — a function call, a cast, an
-unknown name — is refused rather than approximated. An `invariant:` clause
-carries no loop label, so a function may have at most one; a second is refused
-rather than guessed at, since pairing the wrong text with the wrong loop would
-check an obligation that does not mean what the source says.
+A contract expression outside the grammar — a function call, an unknown name, a
+shift by a symbolic amount — is refused rather than approximated. An `invariant:`
+clause carries no loop label, so a function may have at most one; a second is
+refused rather than guessed at, since pairing the wrong text with the wrong loop
+would check an obligation that does not mean what the source says.
+
+The expression grammar is Rust's own subset, with Rust's precedence, so a contract
+reads like the code it describes:
+
+| Level (loosest first) | Operators |
+|---|---|
+| bitwise or | `\|` |
+| bitwise xor | `^` |
+| bitwise and | `&` |
+| shift | `<<` `>>` |
+| additive | `+` `-` |
+| multiplicative | `*` `/` `%` |
+| unary | `-` (negation) `!` (bitwise NOT on a value, negation on a predicate) |
+| comparison | `==` `!=` `<` `<=` `>` `>=` |
+| logical | `&&` `\|\|` |
+| cast | `as u8` … `as u64` (an atom followed by one or more `as <type>`) |
+
+`>>` is arithmetic on a signed operand and logical on an unsigned one, and `/`/`%`
+take the signed quotient or remainder when either operand is signed — the same
+choices the body makes. A *negated literal* is signed, so `-7 % 3` is `-1` (the sign
+follows the dividend), `-7 / 2` is `-3` (truncated toward zero) and `-7 < 3` is
+true — Rust does not compile `let x: u32 = -1;`, so a negation is its own evidence
+of a signed type. A unary `-` binds *tighter* than `as` (`-x as u8` is
+`(-x) as u8`, type `u8`). A unary `!` on a *value* is bitwise NOT and binds tighter
+than `==`, so `!x == 5` is `(!x) == 5` (`x == 250` for a `u8`), not `!(x == 5)`; on a
+parenthesized *predicate* it negates, so `!(x == 5)` is `x != 5`. A cast *extends*:
+`-1i8 as i16` is `-1`, and `-1i8 as u16`
+is `65535`, not `255`. A shift amount must be a *constant expression* — `x >> 1 + 1` is
+`x >> 2` — and a *symbolic* amount is a barrel shifter in the body and is refused in a
+contract rather than guessed at. A divisor of constant zero is refused however it is
+spelled (`0`, `1 - 1`, `2 - 2`), matching rustc's `unconditional_panic` lint.
+
+The engine's words are 64 bits, so a `u128`/`i128` type is refused rather than
+mis-modelled: a function with a 128-bit argument, local or return, and a contract
+casting *to* one, both report the function as skipped. This is a refusal, not a
+crash — a width the engine cannot hold is decided before any width-taking
+constructor runs.
 
 ### What is read from where, and why
 
@@ -1245,6 +1396,41 @@ check an obligation that does not mean what the source says.
 | the body | `rustc --emit=mir` | the real lowering, including the checks `rustc` inserts |
 | the contract | the source text | MIR carries no attributes or doc comments |
 | the compiler | `DISCHARGE_RUSTC`, else `rustc` | `--emit=mir` needs nightly; naming it separately keeps cargo's `rustc` alone |
+
+The five differential oracles (z3, Kani, Lean, Coq, Verus) all build their terms
+with `smt::` calls, so they start *below* the contract reader. That left the reader
+— the layer that turns contract text into terms — with no independent check, and
+three parser bugs in a row (a negated literal read as unsigned, so `-7 % 3` was `0`;
+a cast applied before a negation, so `-x as u8` had the wrong type) were found by
+hand rather than by a gate. `the_contract_reader_agrees_with_rustc_on_a_grid` in
+`tests/mir.rs` closes it against `rustc` itself: a *value* construction (the body is
+the expression, so `ret == <expr>` is the agreement claim) and a *guard*
+construction (`x == v && <expr> > t`, which is where a wrong *type* shows up, since
+the value of `-x as u8` is the same under both readings but its type is not). The
+oracle is itself checked by reverting each fix and confirming it fails.
+
+### The edition and the minimum compiler
+
+The crates are **edition 2024**, and `rust-version = "1.85"` in both manifests.
+Edition 2024 is what the language is now: `gen` is reserved, `unsafe_op_in_unsafe_fn`
+is on, and the pattern binding modes are the strict ones. Since 1.85 is exactly the
+release that stabilised the edition, the floor and the edition are the same
+decision — there is no version that takes one without the other.
+
+The floor is a *lower* bound, not a pin. Everything here builds on the current
+stable (1.99 at the time of writing) and the frontend runs a nightly, so the
+crate is exercised on recent compilers rather than held back to an old one. The
+toolchains the oracles pin are newer still and move independently: Verus tracks
+stable (`channel = "1.99.1"`), Kani tracks a nightly, and Ferrocene — the
+qualified compiler, which is the one whose ceiling could matter for a safety
+build — is currently downstream of Rust 1.96, comfortably above 1.85. So no
+oracle forces the floor down, and none is held back by it.
+
+The MSRV is deliberately *not* raised to follow them. A `no_std` crate that ships
+into a bare-metal safety build is the one place a high floor costs something real:
+it locks out qualified and long-term-support toolchains that lag upstream. 1.85
+buys the current edition at the oldest version that has it, and every later
+compiler still works, so nothing is given up by staying there.
 
 ### The arithmetic, and one new primitive
 
@@ -1338,7 +1524,21 @@ The frontend refuses far more than it accepts, and every refusal is reported:
   `saturating_*` and `wrapping_*` for `add`/`sub`/`mul`/`div`/`rem` and the
   bitwise ops are computed from their operands (see below). Every other
   intrinsic, and every trait method, is still a call the frontend cannot model.
-- **Aggregates, slices, references.** No pointer model.
+- **A symbolic index into a *slice*, or a mutable reference write.** An array
+  subscripted by a parameter (`a[i]` on `[u8; 4]`) *is* modelled: the length is in
+  the type, so `a[i]` is the exact ite chain over `0..N`, admitted only when the
+  precondition establishes `i < N`. A slice has no such bound — its length is a
+  symbolic input — so `xs[i]` is refused rather than resolved to an arbitrary
+  element. `*r = v` is the aliasing model the crate does not claim. Fields and
+  elements of by-value aggregates, and elements and lengths of slices and
+  fixed-size arrays, *are* modelled — only the pointer arithmetic is not.
+
+A subscript whose index is a *local* that aliases an argument is resolved to that
+argument. `let k = i; a[k]` on a `Copy` index lowers to no local at all — the
+body's `a[k]` really is `a[i]` — so the contract's `k` names the same index, and
+`a[k]` builds the same ite chain `a[i]` would. The name resolves only when the
+aliased local is an argument that the body never writes, so `let k = i; i = 2;`
+does not alias `k` to the reassigned `i`; that subscript is refused instead.
 
 ### Signedness is a value question, not a display one
 
@@ -1378,7 +1578,10 @@ says "I could not decide" is worth more than one that guesses.
 2. **The dump is textual.** The frontend parses `--emit=mir` output rather than
    linking `rustc-dev`. That keeps the dependency count at zero and makes the
    input inspectable, but it means a rustc release that changes the pretty-printer
-   can break the parser. It fails closed when that happens.
+   can break the parser. It fails closed when that happens, and the
+   `rustc_public` oracle in `tools/mir-oracle` (gate 9) checks the parser's
+   reading against rustc's own typed MIR, so the breakage is caught by CI rather
+   than by a user.
 3. **Contracts are checked at entry and exit only.** A loop invariant written as a
    contract is not an invariant; it is an assertion at two points.
 4. **The verifier is not inside the artifact.** `gnatprove` and this crate's own
@@ -1494,10 +1697,11 @@ is instantaneous while a 12-bit multiplier equality is not.
 ├── Cargo.lock          committed, and a single package: the dependency set is empty
 ├── README.md           this file
 ├── AGENTS.md           notes for agents, including the traps that cost the most time
-├── LICENSE             MIT OR Apache-2.0
+├── LICENSE             Apache-2.0
+├── SECURITY.md         how to report a vulnerability (GitHub private advisories)
 ├── .github/
 │   └── workflows/
-│       └── ci.yml      the gates, plus Kani and Verus as hard-gate jobs
+│       └── ci.yml      the gates, plus Kani, Verus and the MIR oracle as jobs
 ├── src/
 │   ├── lib.rs          crate root: module map, prelude, the three proof routes
 │   ├── smt.rs          the decision procedure (the heart of the crate)
@@ -1520,6 +1724,7 @@ is instantaneous while a 12-bit multiplier equality is not.
 │       ├── parse.rs    rustc's textual MIR -> a small IR, failing closed
 │       ├── exec.rs     symbolic execution of that IR, with a frame stack for calls
 │       ├── intrinsics.rs  the `checked_*`/`saturating_*`/`wrapping_*` model
+│       ├── shape.rs    per-function summary the rustc_public oracle compares
 │       ├── spec.rs     contract scanner + the small contract-expression grammar
 │       └── verify.rs   driver: emit MIR, extract contracts, discharge, report
 ├── tests/
@@ -1550,11 +1755,21 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   │                      (needs `cargo kani`; a development tool, not a dependency)
 │   ├── verusdiff.rs       differential harness: engine vs Verus on a spec fn
 │   │                      (needs the Verus driver; a development tool, not a dependency)
-│   ├── support/           the IR the two engine harnesses share, so they check the
+│   ├── leandiff.rs        differential harness: engine vs Lean 4's `bv_decide`
+│   │                      (needs Lean via elan; a development tool, not a dependency)
+│   ├── coqdiff.rs         differential harness: engine vs Coq's kernel, by enumeration
+│   │                      (needs `coqc`; a development tool, not a dependency)
+│   ├── bare_metal.rs      the prover as `#![no_std]` code, built for the target by
+│   │                      Ferrocene, the qualified toolchain (a `lib` example, no `main`)
+│   ├── support/           the IR the engine harnesses share, so they check the
 │   │                      same formulas rather than two drifting corpora
 │   ├── mir_demo.rs        verifies real Rust read from MIR, end to end
 │   └── mir_targets/
 │       └── actuator.rs    the Rust under verification; imports no `discharge`
+├── tools/
+│   └── mir-oracle/     the `rustc_public` oracle: checks the text-MIR frontend
+│                       against rustc's own typed MIR. Nightly + `rustc-dev`,
+│                       its own workspace, and never a dependency of `discharge`.
 └── scripts/
     ├── gate.sh            every gate in one command, failing loudly
     └── test-count.sh      the exact passing-test count, only when all pass
@@ -1578,27 +1793,60 @@ cargo build --no-default-features --target thumbv7em-none-eabihf
 `no_std` build, a zero-dependency check, and the z3 differential oracle. It exists because
 the gates were previously five separate commands quoted in prose, which is how a gate
 quietly stops being run. It also refuses to report success when the z3 oracle is not
-installed: an oracle that did not run is not evidence about the exporter. Two further gates
-run the Kani and Verus differential oracles when those tools are present and *skip them
-loudly* when they are not, because both are large downloads (Kani: a pinned nightly plus
-CBMC; Verus: a self-contained bundle with its own z3) that a normal local run should not pay
-for; CI installs them and runs them as hard gates.
+installed: an oracle that did not run is not evidence about the exporter. Five further gates
+run the Kani, Verus, Lean and Coq differential oracles and the `rustc_public` MIR oracle when those
+tools are present and *skip them loudly* when they are not, because all three are large
+downloads (Kani: a pinned nightly plus CBMC; Verus: a self-contained bundle with its own z3;
+the MIR oracle: a nightly with the `rustc-dev` and `llvm-tools-preview` components) that a normal local run should not
+pay for; CI installs them and runs them as hard gates.
 
-### Two more oracles, for the engine instead of the exporter
+### The third oracle: rustc's own MIR, against the parser
+
+`z3diff` checks the exporter and `kanidiff`/`verusdiff` check the engine. The MIR frontend
+has a third failure mode, and it is the one gap 2 below names: it reads rustc's *textual*
+`--emit=mir` dump, so a rustc release that changes the pretty-printer can break the parser,
+and the parser is the only thing that would notice. `tools/mir-oracle` closes that loop. It
+asks `rustc_public` — the compiler's own public API, which needs a nightly with the
+`rustc-dev` and `llvm-tools-preview` components — for the same programs' **typed** MIR, reduces each function to a
+small comparable shape (how many basic blocks it lowered to, and which panic guards `rustc`
+inserted, in block order), and fails if that disagrees with what the frontend's parser read
+out of the text. The comparison is structural on purpose: the two dumps are not
+byte-identical (the typed one omits `copy` qualifiers and nests `scope` blocks), and
+comparing text would fail on cosmetics and prove nothing. The oracle lives in
+`tools/mir-oracle`, outside the workspace, so the nightly and the `rustc_private` feature
+never touch a crate that must build on stable with zero dependencies; the dependency arrow
+points one way, from the oracle to `discharge`. Gate 9 of `scripts/gate.sh` runs it, and the
+`mir-oracle` CI job makes it a hard gate.
+
+### Four more oracles, for the engine instead of the exporter
 
 `z3diff` checks the *exporter*: it prints a query and asks z3 to agree about that text.
-`examples/kanidiff.rs` and `examples/verusdiff.rs` check the *engine*. Each takes predicates
-the engine proved, compiles them into real programs, and asks an independent verifier to
-prove the same property of that program:
+`examples/kanidiff.rs`, `examples/verusdiff.rs`, `examples/leandiff.rs` and
+`examples/coqdiff.rs` check the *engine*. Each takes predicates the engine proved, compiles
+them into a real program or goal, and asks an independent verifier to establish the same
+property:
 
 * `kanidiff` compiles each case into a Rust function and asks **Kani** (AWS's model checker,
   over CBMC) to verify it.
 * `verusdiff` compiles each case into a Verus `spec fn` and asks **Verus** (Viper plus SMT,
   with bit-vector reasoning) to verify it.
+* `leandiff` compiles each case into a Lean 4 theorem and asks **`bv_decide`** to prove it.
+  This is the strongest of the four, and for a structural reason: `bv_decide` bit-blasts the
+  goal, runs a SAT solver, and then *replays the solver's refutation as a Lean proof term that
+  the kernel type-checks*. The verdict is not "a solver said so", it is a machine-checked
+  theorem about the same 8-bit words this crate blasts.
+* `coqdiff` asks **Coq's kernel** to check a different thing from the other three: not "does
+  the engine decide this formula the same way" but "does the engine's arithmetic, transcribed
+  into `Z` with explicit masks, evaluate to the same truth value on every point of the 8-bit
+  domain". Coq has no machine word in its standard library, so the generator spells every
+  operator out over `Z` and the harness enumerates the domain with `vm_compute`. That makes it
+  the only oracle that checks the *transcription* rather than the verdict, and it is the
+  slowest by a wide margin (three variables is 16.7M evaluations), so it runs a selected
+  subset of the corpus — see `SELECTED` in `examples/coqdiff.rs`.
 
-Neither backend ever sees a symbolic term or an SMT-LIB string, and the two are built on
-different foundations, so agreement is agreement between three independently built decision
-procedures. A blasting bug now has to survive agreement with *both* of them, which is a much
+No backend ever sees a symbolic term or an SMT-LIB string, and the four are built on
+different foundations, so agreement is agreement between five independently built decision
+procedures. A blasting bug now has to survive agreement with all four, which is a much
 narrower coincidence than surviving one.
 
 The design detail that matters is that the predicate and the generated program are *not*
@@ -1611,13 +1859,21 @@ formulas and every disagreement would be noise.
 The harnesses have been checked for teeth by mutation, which is the only way to know they ask
 a real question. Dropping the `+1` from the `Sub` blast (`borrow = TRUE` → `FALSE`) makes the
 engine reject three true identities (`sub_self`, `add_sub_cancel`, `sub_zero`); changing the
-`Eq` blast from `and` to `or` over the per-bit equalities makes it prove false ones. Both
-mutations are caught by both harnesses, the second as `MISMATCH rand_N` on the random sweep.
+`Eq` blast from `and` to `or` over the per-bit equalities makes it prove false ones. The
+first of those is caught by `kanidiff` and `verusdiff`; the second by both as `MISMATCH
+rand_N` on the random sweep. `leandiff` and `coqdiff` were checked against a mutation of
+their own — the `Sub` blast wired to `Op::Add` instead, a blasting bug the engine then
+*blesses* rather than rejects — and both catch it: the negative control flips from refuted to
+proved (`control_ok=false`), and each reports `refuted_identity=2` plus three `MISMATCH`
+lines naming `sub_self`, `add_sub_cancel` and the control. So every harness here has been
+observed to fail on a broken engine, which is the only evidence that a green run means
+anything.
+
 Each harness also carries a negative control — `a - b == b - a`, false by construction — and
 fails if either side *proves* it, so a run where "everything agreed" because nothing was
 really asked cannot pass.
 
-Four divergences surfaced while building these, and all are worth stating because they are
+Eight divergences surfaced while building these, and all are worth stating because they are
 where a plausible harness would have quietly lied:
 
 1. **Arena sharing.** One engine arena for all cases exhausted the node budget after about a
@@ -1637,6 +1893,34 @@ where a plausible harness would have quietly lied:
    arithmetic through spec helpers that wrap via `as u8`. And Verus's
    `verification results:: N verified, M errors` counts non-case items such as `main`, so the
    accounting check is on error *locations*, not on that sum.
+5. **Lean's `setWidth` changes the type.** `setWidth 4` on a `BitVec 8` returns a `BitVec 4`,
+   and `==` is homogeneous, so a bare truncation cannot be compared against a `BitVec 8` at
+   all. The first `lean_word` emitted exactly that and every masked case came back as a
+   `Type mismatch` rather than a verdict — a harness bug that would have read as "the engine
+   and Lean disagree about masking" if the harness had counted non-verdicts as disagreement.
+   Widening back with `.setWidth 8` is the engine's `truncate`-then-widen `Mask`.
+6. **Lean diagnostics are multi-line, and the line number is the second-to-last field.**
+   `bv_decide` and `native_decide` report a refutation in two different wordings
+   ("The prover found a counterexample" vs "the proposition … is false"), and the second
+   only appears on a continuation line — so the classifier has to collect the whole
+   diagnostic block before it can judge it. Reading the first line alone called every
+   `native_decide` refutation "hard", i.e. unverifiable. The line number itself is the field
+   *before* the column, not the last one; taking the last one attributed every verdict to the
+   wrong case and produced 47 spurious mismatches against a correct engine.
+7. **`first | bv_decide | decide` does not work, and the failure is silent.** `first` commits
+   to the first tactic that produces a proof *or an error*, and `bv_decide` reporting a
+   counterexample counts as an error — so `decide` then runs on every refuted goal, including
+   the wide arithmetic ones, where it exceeds the heartbeat limit. The case is then reported
+   as undecidable rather than refuted, which is a *lost* verdict rather than a wrong one, but
+   it makes the oracle look weaker than it is. `native_decide` compiles the decision instead
+   of reducing in the kernel and finishes those in under a second. The trade is real and
+   stated in the harness: `native_decide` is Lean's trusted-native escape hatch, so the
+   fallback verdicts are trusted rather than kernel-checked, which is why `bv_decide` is tried
+   first and applies to all but the out-of-fragment handful.
+8. **Coq applies by juxtaposition, not by comma.** `add_eng(a, b)` is a type error —
+   `add_eng` has type `Z -> Z -> Z` but is applied to a single argument — and every case
+   failed to compile until the generator emitted `add_eng a b`. The harness refused to read
+   the failed compile as a set of verdicts, which is the behaviour that made it visible.
 
 Two corpus entries were also wrong — a bare `Not(And(..))` is not De Morgan, and
 `guard <=> ite(guard,a,b)==a` fails at `a==b` — and the engine correctly refuted both. The
@@ -1678,26 +1962,34 @@ The honest split:
 
 | | `discharge` | Kani / Verus / Creusot / Prusti | `contracts` crate |
 |---|---|---|---|
-| What is verified | a model of the program, as an AST you build | the Rust function itself (MIR/IR) | nothing — runtime `assert` |
+| What is verified | the Rust function itself, from its MIR (plus a `Stmt` AST for the older frontend) | the Rust function itself (MIR/IR) | nothing — runtime `assert` |
 | Needs external solver | no | yes (Z3 / CBMC) | no |
 | Toolchain | stable, `no_std`, zero deps | nightly or bespoke driver | stable |
 | Runs on the target | yes (compiled in) | no (host-side) | yes (but unchecked) |
 | Scope | bit-vectors, booleans, bounded quantifiers | first-order + arithmetic + more | — |
 | Maturity | a sketch | industrial | widely used |
 
-Two things follow. First, `discharge` does not compete with Kani or Verus on
-verifying real Rust; it does not read your MIR. It verifies programs written in
-its own `Stmt` AST (see `wp::Stmt`) — except for `exhaustive`, which runs real
-functions over small domains and is the one place a claim is about compiled
-code. Second, the niche it does occupy — a checked contract that can be
-discharged *on the target*, with no solver in the loop — is not one the big
-tools aim at, and it is the same niche a `no_std` flight build actually needs.
+Two things follow. First, `discharge` does compete with the big tools on the
+question that matters — *is the proof about the code or about a model of it?* —
+and the answer is the code: `src/mir/` reads the actual MIR that `rustc` lowers a
+real function to, symbolically executes it, and discharges the overflow, shift and
+divide-by-zero `assert`s `rustc` emits plus the pre- and postconditions you wrote
+as doc comments. Nothing is re-modelled by hand, so nothing can drift. What it
+does *not* match is **scale and scope**: it decides small, deterministic functions
+(a few locals, bounded arithmetic, loops that carry an invariant) and declines the
+rest rather than guessing, where Kani and Verus take on trait-heavy, generic,
+iterator-driven code that this frontend reports as `incomplete`. The older
+`Stmt` AST frontend (`wp::Stmt`) is still there and still useful for programs you
+want to state directly, but it is no longer the only way in. Second, the niche it
+does occupy — a checked contract that can be discharged *on the target*, with no
+solver in the loop — is not one the big tools aim at, and it is the same niche a
+`no_std` flight build actually needs.
 
 They are not rivals here so much as a second opinion. The crate uses Kani and
-Verus as *differential oracles* in its test suite (`examples/kanidiff.rs`,
-`examples/verusdiff.rs`): the engine's verdict on a predicate is checked against
-each tool's verdict on the equivalent compiled program, so the three decision
-procedures have to agree. They are invoked as subprocesses and are never
+Verus, Lean and Coq as *differential oracles* in its test suite (`examples/kanidiff.rs`,
+`examples/verusdiff.rs`, `examples/leandiff.rs`, `examples/coqdiff.rs`): the engine's verdict
+on a predicate is checked against each tool's verdict on the equivalent compiled program or
+goal, so the five decision procedures have to agree. They are invoked as subprocesses and are never
 dependencies — the shipped crate still has none — but "an independent verifier
 agrees" is a much stronger claim than "the tests pass", and it is available
 precisely because these tools exist.
@@ -1750,17 +2042,56 @@ compiles into the artifact you ship.
 | Memory model | pointer/aliasing analysis | none |
 | Scaling | industrial, handles large systems | good on masks/bounds/shifts, weak on wide multipliers |
 | Qualification | extensive certification evidence | none |
+| Qualified compiler | AdaCore's qualified toolchain | **Ferrocene**, checked in CI |
 
 The interesting part is not that `discharge` beats `gnatprove` — it does not, and
 cannot, on scope. The interesting part is the *shape*: a prover that is a
 library, a proof that is a value, and a contract that compiles into the artifact
 you ship. Rust can do that, and this crate is a working sketch of how.
 
+### The qualified toolchain
+
+Rust's answer to AdaCore's qualified toolchain is [Ferrocene], qualified to
+ISO 26262 ASIL D, IEC 61508 SIL 3, EN 50128 and IEC 62304. This repository builds
+its `no_std` crates with Ferrocene for `thumbv7em-none-eabihf` — a target
+Ferrocene itself qualifies — so the qualified compiler is exercised against the
+same sources this crate ships. That is gate 3 of `scripts/gate.sh` and the
+`ferrocene` job in CI; `tools/ferrocene/` has the manifest and the script.
+
+Be precise about what that does and does not buy, because the distinction is the
+whole point of this section. It checks that the *qualified compiler accepts the
+sources unchanged*. It does not qualify `discharge` itself: a qualified compiler
+is not a qualified verifier, and this crate's decision procedure is not in
+Ferrocene's scope. The README's own statement still stands — no qualification
+evidence, no DO-178C tool qualification — and building with Ferrocene does not
+change it.
+
+Ferrocene is commercial, and its archives require a customer-portal token that
+does not allow programmatic access, so the gate reports and skips when the
+toolchain is absent rather than passing in silence — the same convention Kani,
+Verus, Lean and Coq follow here. A skipped oracle is not evidence, and the gate
+says so.
+
+The build that matters most is `examples/bare_metal.rs`. It is `#![no_std]`, it
+has no `main`, and it *calls the decision procedure* — so compiling it for
+`thumbv7em-none-eabihf` is what shows the prover itself, and not just the types
+around it, is code the qualified compiler accepts for the target. The target has
+no test harness, so its verdict tests run on the host instead, under
+`cargo test --workspace --features std`.
+
+[Ferrocene]: https://ferrocene.dev/
+
 ## License
 
-MIT OR Apache-2.0.
+Apache-2.0. The full text is in [`LICENSE`](LICENSE).
 
 Copyright 2026 Yayasan Pesantren Cipansor and contributors. Developed with
 contributions from OpenHands agents; the copyright notice in `LICENSE` records
 the foundation and the contributor base together, which is the arrangement the
 project's authorship follows.
+
+This project was previously offered under `MIT OR Apache-2.0`. It is now
+Apache-2.0 only, which is the single license the `LICENSE` file has always
+carried; the dual-license option in the manifest and this section is what was
+removed. Recipients of a prior release keep the rights that release granted
+them; Apache-2.0 is the license for this version and every version after it.

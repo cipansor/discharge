@@ -41,6 +41,16 @@ pub const MAX_BITS: usize = 64;
 
 /// Blast `t` into `out[..width]`, adding gates to `cnf`.
 pub(crate) fn blast(ctx: &mut Ctx, cnf: &mut Cnf, t: Term, out: &mut [Lit; MAX_BITS]) {
+    // Charge a step and stop once the budget is spent, exactly as the BDD blaster does.
+    // A fold-built term is a shared DAG, so an unmemoised walk costs one visit per path;
+    // stopping leaves the caller's `overflow` path to report `Unknown`, which is sound
+    // because a truncated encoding proves nothing.
+    if ctx.charge_sat_step() {
+        cnf.mark_overflow();
+        let f = cnf.false_lit();
+        out.fill(f);
+        return;
+    }
     // Same stale rule as the BDD blaster: one stale touch poisons the whole traversal,
     // because a constructor can read a stale node and build a current node that points
     // back at it, leaving a cycle whose every node looks current.
@@ -416,5 +426,44 @@ mod tests {
             found,
             "the divergence check never reported a difference, so it cannot be detecting any"
         );
+    }
+
+    /// A query past the BDD's node capacity must *return* a verdict, not walk the
+    /// rest of the term graph.
+    ///
+    /// The guard in `smt::Ctx::blast` stops the traversal the moment the node table
+    /// is full. Without it the walk continues over a fan-out DAG whose *unrolled*
+    /// size is exponential in the number of steps -- `udiv` and `pow` are both
+    /// built that way -- and the query never reaches the SAT fallback that would
+    /// have answered it. That is a hang, which is worse than a refusal: the caller
+    /// asked a question and got no answer at all.
+    ///
+    /// The assertion is only that a verdict came back, not which one: the table
+    /// filling is a capacity fact, and whether the SAT engine then decides the
+    /// query is its business. A regression makes this test hang, which the harness
+    /// reports as a timeout.
+    #[test]
+    fn a_query_past_the_bdd_capacity_returns_instead_of_hanging() {
+        smt::with_fresh(|| {
+            let x = smt::var(8);
+            let y = smt::var(8);
+            let q = smt::udiv(x, y);
+            let _ = smt::prove(smt::eq(q, smt::word(1, 8)));
+        });
+        smt::with_fresh(|| {
+            let base = smt::var(8);
+            let r = crate::mir::intrinsics::eval(
+                crate::mir::intrinsics::Intrinsic::Pow(crate::mir::intrinsics::Family::Wrapping),
+                base,
+                smt::word(7, 32),
+                8,
+                false,
+                8,
+            );
+            let Some(crate::mir::intrinsics::Outcome::Value(out)) = r else {
+                panic!("`wrapping_pow` at a `u8` must be modelled");
+            };
+            let _ = smt::prove(smt::eq(out, smt::word(128, 8)));
+        });
     }
 }

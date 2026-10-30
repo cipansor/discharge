@@ -1,20 +1,28 @@
 //! Shared IR for the differential oracles.
 //!
-//! This module is compiled into two separate example binaries, `kanidiff` and `verusdiff`.
-//! Each uses one of the two source generators (`rust_word`/`rust_pred` for Kani,
-//! `verus_word`/`verus_pred` for Verus) and sees the other as unused, so `dead_code` is
-//! allowed here rather than at each call site.
+//! This module is compiled into four separate example binaries: `kanidiff`, `verusdiff`,
+//! `leandiff` and `coqdiff`. Each uses one of the four source generators
+//! (`rust_word`/`rust_pred` for Kani, `verus_word`/`verus_pred` for Verus,
+//! `lean_word`/`lean_pred` for Lean 4, `coq_word`/`coq_pred` for Coq) and sees the others as
+//! unused, so `dead_code` is allowed here rather than at each call site.
 //!
 //! `z3diff` checks the *exporter* (does the printed query mean what the engine proved?).
-//! The `kanidiff` and `verusdiff` harnesses check the *engine*, by compiling each predicate
-//! the engine proved into a real program and asking an independent verifier (Kani, or
-//! Verus) to prove the same property of that program.
+//! The other harnesses check the *engine*, by turning each predicate the engine proved into
+//! a program or a goal for an independent verifier -- Kani, Verus, Lean's `bv_decide`, Coq's
+//! `vm_compute` -- and asking that verifier to establish the same property.
 //!
 //! The cases live here, in one place, for one reason: if each harness carried its own
-//! corpus and generator, "the engine agrees with Kani" and "the engine agrees with Verus"
+//! corpus and generator, "the engine agrees with Kani" and "the engine agrees with Lean"
 //! would be claims about two different sets of formulas, and neither would say much. One
-//! IR, three backends (the engine, Kani, Verus) means a case that any backend mishandles is
-//! visible as a disagreement rather than as a harness-specific blind spot.
+//! IR, five backends (the engine, Kani, Verus, Lean, Coq) means a case that any backend
+//! mishandles is visible as a disagreement rather than as a harness-specific blind spot.
+//!
+//! The four generators are deliberately *not* one parameterised printer. Kani and Verus
+//! read Rust-shaped text, Lean reads `BitVec`, and Coq has no machine word at all: its
+//! generator emits the engine's own arithmetic over `Z` and lets the harness enumerate the
+//! 8-bit domain. Those are four different transcriptions of one tree, and that is the
+//! point -- a transcription that quietly says something else shows up as a disagreement,
+//! which is what the negative control in every harness is there to prove is detectable.
 //!
 //! The IR is also why the generated code describes the *same* property as the predicate:
 //! the two are interpretations of one tree, not two independent generations. Generating
@@ -154,8 +162,219 @@ pub fn verus_pred(e: &PExpr) -> String {
     }
 }
 
+/// Interpret a word tree as a Lean 4 `BitVec 8` expression.
+///
+/// Lean is the strongest oracle here, and for a structural reason rather than a
+/// performance one: `bv_decide` proves a bitvector goal by emitting CNF and handing it to
+/// a SAT solver, and it *replays the solver's refutation as a Lean proof term* that the
+/// kernel then checks. So the verdict is not "a solver said so", it is a machine-checked
+/// theorem about the same 8-bit words the engine blasts. That is a genuinely independent
+/// decision procedure, which is the property the `z3diff` header notes a printer-agreement
+/// check does not have.
+///
+/// `BitVec` arithmetic is already wrapping, and Lean's shifts are defined at and beyond the
+/// width (`a >>> 8 = 0`), so unlike [`rust_word`] there is no need to route through
+/// helpers to reproduce the engine's shift rule -- the language's own rule is the engine's.
+pub fn lean_word(e: &WExpr) -> String {
+    match e {
+        WExpr::Const(k) => format!("({k} : BitVec 8)"),
+        WExpr::Param(i) => PARAMS[*i].to_string(),
+        WExpr::Add(x, y) => format!("({} + {})", lean_word(x), lean_word(y)),
+        WExpr::Sub(x, y) => format!("({} - {})", lean_word(x), lean_word(y)),
+        WExpr::Mul(x, y) => format!("({} * {})", lean_word(x), lean_word(y)),
+        WExpr::Band(x, y) => format!("({} &&& {})", lean_word(x), lean_word(y)),
+        WExpr::Bor(x, y) => format!("({} ||| {})", lean_word(x), lean_word(y)),
+        WExpr::Bxor(x, y) => format!("({} ^^^ {})", lean_word(x), lean_word(y)),
+        WExpr::Shl(x, k) => format!("({} <<< {k})", lean_word(x)),
+        WExpr::Lshr(x, k) => format!("({} >>> {k})", lean_word(x)),
+        WExpr::Ashr(x, k) => format!("({}.sshiftRight {k})", lean_word(x)),
+        WExpr::Mask(x, k) => {
+            if *k >= 8 {
+                lean_word(x)
+            } else {
+                // `.setWidth 8` is load-bearing, not decoration. Lean's `setWidth` returns a
+                // `BitVec` of the *new* width, and `==` is homogeneous, so a bare
+                // `(x).setWidth 4` cannot be compared against a `BitVec 8` at all -- the
+                // first version of this generator emitted that and every masked case came
+                // back as a `Type mismatch` rather than a verdict. Widening back to 8 zero
+                // extends, which is exactly the engine's `truncate`-then-widen `Mask`.
+                format!("((({}).setWidth {k}).setWidth 8)", lean_word(x))
+            }
+        }
+        WExpr::Ite(c, t, f) => {
+            format!("(if {} then {} else {})", lean_pred(c), lean_word(t), lean_word(f))
+        }
+    }
+}
+
+/// Interpret a predicate tree as a Lean 4 `Bool` expression, for `bv_decide`.
+///
+/// Lean's `==`/`!=`/`<`/`<=` on `BitVec` are *decidable propositions* (`DecidableEq`), not
+/// `Bool`, and the two do not mix: `(a == b) && c` is a type error. Spelling the predicate
+/// out in `Bool` and then asserting `= true` is the way to keep it composable -- and it is
+/// the same shape [`rust_pred`] and [`verus_pred`] produce, so all three generators describe
+/// one boolean tree rather than three.
+pub fn lean_pred(e: &PExpr) -> String {
+    match e {
+        PExpr::Eq(x, y) => format!("({} == {})", lean_word(x), lean_word(y)),
+        PExpr::Ne(x, y) => format!("({} != {})", lean_word(x), lean_word(y)),
+        PExpr::Ult(x, y) => format!("({} < {})", lean_word(x), lean_word(y)),
+        PExpr::Ule(x, y) => format!("({} <= {})", lean_word(x), lean_word(y)),
+        PExpr::And(x, y) => format!("({} && {})", lean_pred(x), lean_pred(y)),
+        PExpr::Or(x, y) => format!("({} || {})", lean_pred(x), lean_pred(y)),
+        PExpr::Xor(x, y) => format!("({} != {})", lean_pred(x), lean_pred(y)),
+        PExpr::Not(x) => format!("(!{})", lean_pred(x)),
+        PExpr::Iff(x, y) => format!("({} == {})", lean_pred(x), lean_pred(y)),
+    }
+}
+
+/// Interpret a word tree as a Coq `Z` expression, masked to 8 bits.
+///
+/// Coq has no machine word in its standard library, so this generator does the arithmetic
+/// the engine does -- over unbounded `Z`, with every operation masked back to `[0, 256)` --
+/// and the harness enumerates all 256 values per variable with `vm_compute`. That makes Coq
+/// a *different kind* of oracle from the other three: it does not decide the formula, it
+/// evaluates it on every point of the domain, which is exactly what
+/// `discharge-arithmetic`'s own enumeration proofs do but in a kernel that was not written
+/// by this crate. Agreement is therefore evidence about the engine's *transcription* into
+/// `Z` as much as about its verdicts.
+///
+/// Every operator is spelled `Z.land`/`Z.shiftl`/... explicitly, and every result is masked,
+/// so the generated file is auditable against the engine's documented semantics line by
+/// line. The helpers are emitted by [`coq_preamble`].
+pub fn coq_word(e: &WExpr) -> String {
+    match e {
+        WExpr::Const(k) => format!("{k}"),
+        WExpr::Param(i) => PARAMS[*i].to_string(),
+        // Coq applies by juxtaposition, not by comma: `add_eng a b`, not `add_eng(a, b)`.
+        // The first version of this generator emitted the Rust/C style and every case failed
+        // to compile with "The term add_eng has type Z -> Z -> Z while it is expected to have
+        // type Z", which the harness correctly refused to read as a verdict.
+        WExpr::Add(x, y) => format!("(add_eng {} {})", coq_word(x), coq_word(y)),
+        WExpr::Sub(x, y) => format!("(sub_eng {} {})", coq_word(x), coq_word(y)),
+        WExpr::Mul(x, y) => format!("(mul_eng {} {})", coq_word(x), coq_word(y)),
+        WExpr::Band(x, y) => format!("(band_eng {} {})", coq_word(x), coq_word(y)),
+        WExpr::Bor(x, y) => format!("(bor_eng {} {})", coq_word(x), coq_word(y)),
+        WExpr::Bxor(x, y) => format!("(bxor_eng {} {})", coq_word(x), coq_word(y)),
+        WExpr::Shl(x, k) => format!("(shl_eng {} {k})", coq_word(x)),
+        WExpr::Lshr(x, k) => format!("(lshr_eng {} {k})", coq_word(x)),
+        WExpr::Ashr(x, k) => format!("(ashr_eng {} {k})", coq_word(x)),
+        WExpr::Mask(x, k) => {
+            if *k >= 8 {
+                coq_word(x)
+            } else {
+                format!("(band_eng {} {})", coq_word(x), (1u16 << k) - 1)
+            }
+        }
+        WExpr::Ite(c, t, f) => {
+            format!("(if {} then {} else {})", coq_pred(c), coq_word(t), coq_word(f))
+        }
+    }
+}
+
+/// Interpret a predicate tree as a Coq `bool` expression.
+pub fn coq_pred(e: &PExpr) -> String {
+    match e {
+        PExpr::Eq(x, y) => format!("(Z.eqb {} {})", coq_word(x), coq_word(y)),
+        PExpr::Ne(x, y) => format!("(negb (Z.eqb {} {}))", coq_word(x), coq_word(y)),
+        PExpr::Ult(x, y) => format!("(Z.ltb {} {})", coq_word(x), coq_word(y)),
+        PExpr::Ule(x, y) => format!("(Z.leb {} {})", coq_word(x), coq_word(y)),
+        PExpr::And(x, y) => format!("(andb {} {})", coq_pred(x), coq_pred(y)),
+        PExpr::Or(x, y) => format!("(orb {} {})", coq_pred(x), coq_pred(y)),
+        PExpr::Xor(x, y) => format!("(xorb {} {})", coq_pred(x), coq_pred(y)),
+        PExpr::Not(x) => format!("(negb {})", coq_pred(x)),
+        PExpr::Iff(x, y) => format!("(Bool.eqb {} {})", coq_pred(x), coq_pred(y)),
+    }
+}
+
+/// The Coq preamble every generated file needs: the enumeration domain and one helper per
+/// operator, each spelling out the engine's rule.
+///
+/// `coq_word`/`coq_pred` emit calls to these, so this is where the transcription actually
+/// lives and it is written to be read against the engine's own documentation. The two
+/// interesting rules are the shift-at-or-past-width rule (`shl_eng`/`lshr_eng`/`ashr_eng`
+/// return 0 or the sign fill, where Rust would not even define the operation) and `ashr_eng`
+/// itself, which needs the sign bit of the *8-bit* value, not of the unbounded `Z`.
+pub fn coq_preamble() -> &'static str {
+    "Require Import ZArith List Bool.\n\
+     Open Scope Z_scope.\n\
+     \n\
+     Definition r256 : list Z := List.map Z.of_nat (List.seq 0 256).\n\
+     Definition forall256 (f : Z -> bool) : bool := List.forallb f r256.\n\
+     \n\
+     Definition add_eng (x y : Z) : Z := Z.land (Z.add x y) 255.\n\
+     Definition sub_eng (x y : Z) : Z := Z.land (Z.sub x y) 255.\n\
+     Definition mul_eng (x y : Z) : Z := Z.land (Z.mul x y) 255.\n\
+     Definition band_eng (x y : Z) : Z := Z.land x y.\n\
+     Definition bor_eng (x y : Z) : Z := Z.lor x y.\n\
+     Definition bxor_eng (x y : Z) : Z := Z.lxor x y.\n\
+     Definition shl_eng (x k : Z) : Z := if Z.leb 8 k then 0 else Z.land (Z.shiftl x k) 255.\n\
+     Definition lshr_eng (x k : Z) : Z := if Z.leb 8 k then 0 else Z.shiftr x k.\n\
+     Definition ashr_eng (x k : Z) : Z :=\n\
+     \x20 if Z.leb 8 k then (if Z.leb 128 x then 255 else 0)\n\
+     \x20 else (if Z.leb 128 x then Z.land (Z.lor (Z.shiftr x k) (Z.land (Z.shiftl (-1) (8 - k)) 255)) 255\n\
+     \x20 else Z.shiftr x k).\n"
+}
+
+/// Which of [`PARAMS`] a predicate actually mentions, in order.
+///
+/// The Coq harness enumerates the domain, and enumerating a variable a case never reads
+/// multiplies the work by 256 for no verdict. `mask_8_identity` mentions only `a`, so it is
+/// 256 evaluations rather than 16.7M, and the result is the same. This matters because it
+/// is the difference between the Coq oracle running in a gate and not: three-variable cases
+/// are minutes, two-variable ones are under a second.
+pub fn params_used(e: &PExpr) -> Vec<usize> {
+    fn word(e: &WExpr, seen: &mut Vec<usize>) {
+        match e {
+            WExpr::Const(_) => {}
+            WExpr::Param(i) => {
+                if !seen.contains(i) {
+                    seen.push(*i);
+                }
+            }
+            WExpr::Add(x, y)
+            | WExpr::Sub(x, y)
+            | WExpr::Mul(x, y)
+            | WExpr::Band(x, y)
+            | WExpr::Bor(x, y)
+            | WExpr::Bxor(x, y) => {
+                word(x, seen);
+                word(y, seen);
+            }
+            WExpr::Shl(x, _) | WExpr::Lshr(x, _) | WExpr::Ashr(x, _) | WExpr::Mask(x, _) => {
+                word(x, seen)
+            }
+            WExpr::Ite(c, t, f) => {
+                pred(c, seen);
+                word(t, seen);
+                word(f, seen);
+            }
+        }
+    }
+    fn pred(e: &PExpr, seen: &mut Vec<usize>) {
+        match e {
+            PExpr::Eq(x, y) | PExpr::Ne(x, y) | PExpr::Ult(x, y) | PExpr::Ule(x, y) => {
+                word(x, seen);
+                word(y, seen);
+            }
+            PExpr::And(x, y)
+            | PExpr::Or(x, y)
+            | PExpr::Xor(x, y)
+            | PExpr::Iff(x, y) => {
+                pred(x, seen);
+                pred(y, seen);
+            }
+            PExpr::Not(x) => pred(x, seen),
+        }
+    }
+    let mut seen = Vec::new();
+    pred(e, &mut seen);
+    seen
+}
+
 /// Word expressions. One tree, interpreted into the engine ([`to_word`]) and into each
-/// backend's source ([`rust_word`] for Kani, [`verus_word`] for Verus).
+/// backend's source ([`rust_word`] for Kani, [`verus_word`] for Verus, [`lean_word`] for
+/// Lean, [`coq_word`] for Coq).
 pub enum WExpr {
     Const(u64),
     Param(usize),

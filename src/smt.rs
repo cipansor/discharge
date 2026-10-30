@@ -31,6 +31,29 @@ use core::cell::RefCell;
 /// Node budget for the arena. This is the only tuning knob.
 pub const CAP: usize = 1 << 14;
 
+/// Slots in each bit-blaster's memo, rounded to a power of two.
+///
+/// The blasters walk a term as a tree, but a term built by a fold (`pow`, the divider) is
+/// a *DAG*: a shared subterm is re-walked once per path to it, and for a 32-step fold that
+/// is 2^32 walks of the same few hundred nodes. The arena never fills, so the existing
+/// overflow guard never fires, and the query simply never returns. A memo on the blasted
+/// value of each term collapses those paths: the same query drops from more than 10^8
+/// visits to a few hundred. 128 slots is enough for the fold terms a single query touches;
+/// it is deliberately small because the table lives in the arena (see `Ctx`), which is
+/// allocated once and must stay well inside a thread's stack.
+const BLAST_MEMO_N: usize = 128;
+
+/// Step budget for one bit-blasting pass, the companion to [`BLAST_MEMO_N`].
+///
+/// A memo makes the fold walks cheap, but a memo is a cache, not a guarantee: a term shape
+/// that evicts its own entries could still recompute. This bounds the *work* directly. When
+/// it trips, the pass stops and the query degrades exactly as an arena overflow does -- the
+/// BDD pass hands off to the SAT engine, the SAT pass reports `Unknown` -- so the answer
+/// stays sound and the call always returns. The value is far above every query in the test
+/// corpus (the largest measured pass is a few thousand steps) and far below the 10^8-step
+/// blow-up it exists to stop.
+pub(crate) const MAX_BLAST_STEPS: u32 = 1 << 22;
+
 /// Worst-case arena memory in bytes, so an integrator can budget statically.
 pub const ARENA_BYTES: usize =
     CAP * (core::mem::size_of::<Node>() + 2 * core::mem::size_of::<u32>());
@@ -342,6 +365,17 @@ pub(crate) struct Ctx {
     var_width: [u8; MAX_VARS],
     n_vars: usize,
     overflow: bool,
+    /// Memo for the BDD blaster: the blasted bits of a term, keyed by term id.
+    ///
+    /// Validity is scoped by the arena [`Ctx::generation`]: the key stores the term id
+    /// *including* its generation bits, and a reset recycles slots under a new generation,
+    /// so a stale entry can never be read as a current term's value. Cleared with the arena.
+    blast_memo_key: [u32; BLAST_MEMO_N],
+    blast_memo_bits: [[u32; 64]; BLAST_MEMO_N],
+    /// Steps taken by the BDD blaster in the current query, against [`MAX_BLAST_STEPS`].
+    blast_steps: u32,
+    /// Steps taken by the SAT blaster in the current query, against [`MAX_BLAST_STEPS`].
+    sat_blast_steps: u32,
     /// Set when a variable index past `MAX_VARS` was requested.
     ///
     /// `overflow` alone is not enough to decide whether to fall back to the SAT engine.
@@ -397,6 +431,41 @@ pub(crate) struct Ctx {
 /// Sentinel: variable `i` has no replacement.
 const NO_SUBST: u32 = u32::MAX;
 
+/// A compile-time gate that [`Ctx`] is `!Send` and `!Sync`.
+///
+/// The bare-metal [`with_ctx`] hands out `&'static mut Ctx` from a single global
+/// `static mut CTX`, which is sound only while nothing else can reach that
+/// context -- no second thread, and no re-entrant call. The `_not_shared` marker
+/// is what makes that true, and until now only a comment said so: delete the
+/// marker and `Ctx` is auto-`Send` and auto-`Sync` (every remaining field is a
+/// plain array or integer), the crate still builds, and the safety argument is
+/// quietly false. This turns "the marker is load-bearing" into something the
+/// compiler checks on every build.
+///
+/// The mechanism is inference ambiguity, not a reading of the impls. The trait is
+/// implemented for *every* type at `AmbiguousIfImpl<()>`, and again at
+/// `AmbiguousIfImpl<InvalidSend>` for every `Send` type. If `Ctx` is `!Send` only
+/// the first applies, so the `_` below infers to `()` and this compiles. If `Ctx`
+/// *were* `Send`, both would apply and `_` would have no unique value -- an
+/// inference error, which is the gate firing. `Sync` is checked the same way, so
+/// the fact that this file compiles *is* the proof.
+const _: fn() = || {
+    trait AmbiguousIfImpl<A> {
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+
+    #[allow(dead_code)]
+    enum InvalidSend {}
+    impl<T: ?Sized + Send> AmbiguousIfImpl<InvalidSend> for T {}
+
+    #[allow(dead_code)]
+    enum InvalidSync {}
+    impl<T: ?Sized + Sync> AmbiguousIfImpl<InvalidSync> for T {}
+
+    let _ = <Ctx as AmbiguousIfImpl<_>>::some_item;
+};
+
 impl Ctx {
     const fn new() -> Self {
         Ctx {
@@ -424,6 +493,10 @@ impl Ctx {
             var_width: [0; MAX_VARS],
             n_vars: 0,
             overflow: false,
+            blast_memo_key: [0; BLAST_MEMO_N],
+            blast_memo_bits: [[FALSE; 64]; BLAST_MEMO_N],
+            blast_steps: 0,
+            sat_blast_steps: 0,
             var_overflow: false,
             ready: false,
             subst_val: [NO_SUBST; MAX_VARS],
@@ -446,6 +519,11 @@ impl Ctx {
         self.n_nodes = 2;
         self.n_vars = 0;
         self.overflow = false;
+        // The memo is keyed by term id *including* its generation, and the generation is
+        // bumped below, so the old keys can never match a term in the new arena. Nothing to
+        // clear -- only the counters, which are per query, not per arena.
+        self.blast_steps = 0;
+        self.sat_blast_steps = 0;
         self.var_overflow = false;
         self.ready = false;
         for i in 0..CAP {
@@ -803,6 +881,14 @@ impl Ctx {
     /// Poison the traversal, exactly as `blast` does on a stale touch.
     pub(crate) fn mark_stale(&mut self) {
         self.stale = true;
+    }
+
+    /// Charge one step to the SAT blaster, returning `true` once [`MAX_BLAST_STEPS`] is
+    /// spent. The SAT blaster runs after the BDD pass has given up, so it gets its own
+    /// counter; both are reset per query.
+    pub(crate) fn charge_sat_step(&mut self) -> bool {
+        self.sat_blast_steps = self.sat_blast_steps.saturating_add(1);
+        self.sat_blast_steps > MAX_BLAST_STEPS
     }
 
     /// Mark the query ill-formed, so it answers `Unknown`. Used by the SAT blaster for the
@@ -1207,13 +1293,41 @@ impl Ctx {
     // ------------------------- bit-blasting -------------------------
 
     fn blast(&mut self, t: Term, out: &mut [u32; 64]) {
+        // Bound the work before doing any of it. See `MAX_BLAST_STEPS`: the memo below
+        // makes the fold walks cheap, but only this counter makes the pass *guaranteed* to
+        // end. Tripping it sets `overflow`, which routes the query to the SAT engine and
+        // from there to `Unknown` -- never to a verdict about a half-built diagram.
+        self.blast_steps = self.blast_steps.saturating_add(1);
+        if self.blast_steps > MAX_BLAST_STEPS {
+            self.overflow = true;
+            out.fill(FALSE);
+            return;
+        }
         // Check `stale` first, so once any stale handle has been touched the whole
         // traversal stops. Checking only the current node is not enough: a constructor can
         // read a stale node and then *build* a current node that refers back to the stale
         // id, so the graph contains a cycle whose every node is current. Stopping the
         // whole traversal on the first stale touch is what breaks it.
+        //
+        // `overflow` is checked here for the same reason and it is not optional: once the
+        // node table is full every `mk_node` returns `FALSE` *without* setting `overflow`
+        // again, so nothing below this point can notice, and the traversal keeps recursing.
+        // A term built by a fold (`pow`, the divider) is a DAG with heavy sharing, and
+        // walking it to completion visits a shared subterm once per path to it -- millions
+        // of times for a 32-step fold. That is not a slow answer, it is a hang: the query
+        // never returns to the caller that would have fallen back to the SAT engine. The
+        // check turns "the arena is full" into "stop now", and the caller's `overflow` test
+        // then routes the query to the fallback.
         if self.stale || t.gen_bits() != self.gen_masked() {
             self.stale = true;
+            out.fill(FALSE);
+            return;
+        }
+        // `overflow` stops the walk too, but it is *not* `stale`: an overflowed arena is a
+        // full one, not a wrong one, and the caller routes it to the SAT fallback rather
+        // than refusing. Setting `stale` here would turn a fallback into a refusal and
+        // would hide the SAT engine behind a query that never reaches it.
+        if self.overflow {
             out.fill(FALSE);
             return;
         }
@@ -1229,6 +1343,14 @@ impl Ctx {
         if w == 0 || w > 64 {
             self.ill_formed = true;
             out.fill(FALSE);
+            return;
+        }
+        // The memo turns the shared-DAG walk from exponential into linear. See
+        // `BLAST_MEMO_N`. A hit is always sound: the key is the term id, and identical ids
+        // mean identical terms, whose blasted bits are deterministic.
+        let memo_i = (t.0 as usize) & (BLAST_MEMO_N - 1);
+        if self.blast_memo_key[memo_i] == t.0 {
+            out[..w].copy_from_slice(&self.blast_memo_bits[memo_i][..w]);
             return;
         }
         match n.op {
@@ -1391,6 +1513,12 @@ impl Ctx {
                 }
             }
         }
+        // Memoise the result, but never after an overflow: an overflowed pass produced a
+        // truncated diagram, and caching it would hand that truncation to a later query.
+        if !self.overflow {
+            self.blast_memo_key[memo_i] = t.0;
+            self.blast_memo_bits[memo_i] = *out;
+        }
     }
 
     fn blast_bool(&mut self, t: Term) -> u32 {
@@ -1450,6 +1578,8 @@ impl Ctx {
     }
 
     fn query_valid(&mut self, t: Term) -> Verdict {
+        self.blast_steps = 0;
+        self.sat_blast_steps = 0;
         let node = self.blast_bool(t);
         if self.stale || self.ill_formed || self.var_overflow {
             return Verdict::Unknown;
@@ -1468,6 +1598,8 @@ impl Ctx {
     }
 
     fn query_model(&mut self, t: Term) -> Verdict {
+        self.blast_steps = 0;
+        self.sat_blast_steps = 0;
         let node = self.blast_bool(t);
         if self.stale || self.ill_formed || self.var_overflow {
             return Verdict::Unknown;
@@ -1701,7 +1833,71 @@ pub fn bits(v: Var) -> u8 {
 /// constant amount stored in the node, and `Shr` is arithmetic (the sign bit
 /// replicates), matching the bit-blaster exactly.
 pub fn evaluate(t: Var, value: impl Fn(u32) -> Option<u64>) -> Option<u64> {
-    with_ctx(|c| eval_term(c, t.0, &value))
+    // The memo is local to this call, so it needs no invalidation: it cannot
+    // outlive the assignment it was computed under, and a later call starts from
+    // an empty table. It is bounded and small so that `Ctx` -- whose size the
+    // crate budgets statically -- does not grow by an arena's worth of memo.
+    let mut memo = EvalMemo::new();
+    with_ctx(|c| eval_term(c, t.0, &value, &mut memo))
+}
+
+/// A bounded memo for one [`evaluate`] walk.
+///
+/// `eval_term` walks a term's DAG, and a term built by a fold (`pow`, the
+/// divider) shares subterms heavily: without a memo the walk visits a shared
+/// subterm once per path to it, which is exponential in the number of steps. It
+/// is the same blow-up the BDD `neg` cache exists for, one layer up.
+///
+/// The table is direct-indexed by term slot with linear probing. A collision
+/// evicts the older entry rather than failing, which is sound because a miss only
+/// costs a recomputation -- the value is a pure function of the term and the
+/// assignment. The size is a working-set estimate: a `pow` fold is a few hundred
+/// terms, and the probe bound stops a pathological case from turning a memo miss
+/// into a linear scan.
+struct EvalMemo {
+    /// Term slot, or [`EVAL_MEMO_EMPTY`] when the entry is free.
+    slot: [u32; EVAL_MEMO_SLOTS],
+    val: [u64; EVAL_MEMO_SLOTS],
+}
+
+const EVAL_MEMO_SLOTS: usize = 1024;
+const EVAL_MEMO_EMPTY: u32 = u32::MAX;
+/// How far a lookup probes before giving up. A miss recomputes; it never fails.
+const EVAL_MEMO_PROBES: usize = 8;
+
+impl EvalMemo {
+    fn new() -> Self {
+        EvalMemo { slot: [EVAL_MEMO_EMPTY; EVAL_MEMO_SLOTS], val: [0; EVAL_MEMO_SLOTS] }
+    }
+
+    fn get(&self, slot: u32) -> Option<u64> {
+        let mut i = (slot as usize) & (EVAL_MEMO_SLOTS - 1);
+        for _ in 0..EVAL_MEMO_PROBES {
+            let k = self.slot[i];
+            if k == EVAL_MEMO_EMPTY {
+                return None;
+            }
+            if k == slot {
+                return Some(self.val[i]);
+            }
+            i = (i + 1) & (EVAL_MEMO_SLOTS - 1);
+        }
+        None
+    }
+
+    fn put(&mut self, slot: u32, val: u64) {
+        let mut i = (slot as usize) & (EVAL_MEMO_SLOTS - 1);
+        for _ in 0..EVAL_MEMO_PROBES {
+            if self.slot[i] == EVAL_MEMO_EMPTY || self.slot[i] == slot {
+                self.slot[i] = slot;
+                self.val[i] = val;
+                return;
+            }
+            i = (i + 1) & (EVAL_MEMO_SLOTS - 1);
+        }
+        // Every probe in the window is taken by another slot; drop the entry.
+        // Losing a memo costs time, never an answer.
+    }
 }
 
 /// [`evaluate`] for a predicate. `None` when some input is unknown.
@@ -1709,25 +1905,45 @@ pub fn evaluate_pred(p: Pred, value: impl Fn(u32) -> Option<u64>) -> Option<bool
     evaluate(Var(p.0), value).map(|v| v != 0)
 }
 
-fn eval_term(ctx: &mut Ctx, t: Term, value: &impl Fn(u32) -> Option<u64>) -> Option<u64> {
+fn eval_term(
+    ctx: &mut Ctx,
+    t: Term,
+    value: &impl Fn(u32) -> Option<u64>,
+    memo: &mut EvalMemo,
+) -> Option<u64> {
     if !ctx.is_current_term(t) {
         // A stale handle has no meaning to evaluate; `None` is "cannot say", which is
         // what `evaluate` already means by it.
         return None;
     }
+    let slot = t.slot() as u32;
+    if let Some(v) = memo.get(slot) {
+        return Some(v);
+    }
+    let v = eval_term_body(ctx, t, value, memo)?;
+    memo.put(slot, v);
+    Some(v)
+}
+
+fn eval_term_body(
+    ctx: &mut Ctx,
+    t: Term,
+    value: &impl Fn(u32) -> Option<u64>,
+    memo: &mut EvalMemo,
+) -> Option<u64> {
     let n = ctx.node_of(t);
     let w = n.width;
     let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
     let v = match n.op {
         Op::Var => return value(n.a).map(|x| x & mask),
         Op::Const => (n.a as u64) | ((n.hi as u64) << 32),
-        Op::Not => !eval_term(ctx, Term(n.a), value)? & mask,
-        Op::And => eval_term(ctx, Term(n.a), value)? & eval_term(ctx, Term(n.b), value)? & mask,
-        Op::Or => eval_term(ctx, Term(n.a), value)? | eval_term(ctx, Term(n.b), value)? & mask,
-        Op::Xor => eval_term(ctx, Term(n.a), value)? ^ eval_term(ctx, Term(n.b), value)? & mask,
+        Op::Not => !eval_term(ctx, Term(n.a), value, memo)? & mask,
+        Op::And => eval_term(ctx, Term(n.a), value, memo)? & eval_term(ctx, Term(n.b), value, memo)? & mask,
+        Op::Or => eval_term(ctx, Term(n.a), value, memo)? | eval_term(ctx, Term(n.b), value, memo)? & mask,
+        Op::Xor => eval_term(ctx, Term(n.a), value, memo)? ^ eval_term(ctx, Term(n.b), value, memo)? & mask,
         // The shift amount lives in the node, not in a term; see `shift`.
         Op::Shl => {
-            let a = eval_term(ctx, Term(n.a), value)?;
+            let a = eval_term(ctx, Term(n.a), value, memo)?;
             let sh = n.b;
             if sh >= 64 {
                 0
@@ -1736,7 +1952,7 @@ fn eval_term(ctx: &mut Ctx, t: Term, value: &impl Fn(u32) -> Option<u64>) -> Opt
             }
         }
         Op::LShr => {
-            let a = eval_term(ctx, Term(n.a), value)?;
+            let a = eval_term(ctx, Term(n.a), value, memo)?;
             let sh = n.b;
             if sh >= 64 {
                 0
@@ -1746,7 +1962,7 @@ fn eval_term(ctx: &mut Ctx, t: Term, value: &impl Fn(u32) -> Option<u64>) -> Opt
         }
         Op::Shr => {
             // Arithmetic: replicate the sign bit, matching the bit-blaster.
-            let a = eval_term(ctx, Term(n.a), value)? & mask;
+            let a = eval_term(ctx, Term(n.a), value, memo)? & mask;
             let sh = n.b;
             if sh >= w as u32 {
                 if a >> (w - 1) & 1 == 1 {
@@ -1759,29 +1975,29 @@ fn eval_term(ctx: &mut Ctx, t: Term, value: &impl Fn(u32) -> Option<u64>) -> Opt
                 (a >> sh) | (sign_fill & !(mask >> sh))
             }
         }
-        Op::Add => eval_term(ctx, Term(n.a), value)?.wrapping_add(eval_term(ctx, Term(n.b), value)?) & mask,
-        Op::Sub => eval_term(ctx, Term(n.a), value)?.wrapping_sub(eval_term(ctx, Term(n.b), value)?) & mask,
-        Op::Mul => eval_term(ctx, Term(n.a), value)?.wrapping_mul(eval_term(ctx, Term(n.b), value)?) & mask,
+        Op::Add => eval_term(ctx, Term(n.a), value, memo)?.wrapping_add(eval_term(ctx, Term(n.b), value, memo)?) & mask,
+        Op::Sub => eval_term(ctx, Term(n.a), value, memo)?.wrapping_sub(eval_term(ctx, Term(n.b), value, memo)?) & mask,
+        Op::Mul => eval_term(ctx, Term(n.a), value, memo)?.wrapping_mul(eval_term(ctx, Term(n.b), value, memo)?) & mask,
         Op::Eq => {
-            u64::from(eval_term(ctx, Term(n.a), value)? == eval_term(ctx, Term(n.b), value)?)
+            u64::from(eval_term(ctx, Term(n.a), value, memo)? == eval_term(ctx, Term(n.b), value, memo)?)
         }
         Op::Ult => {
-            u64::from(eval_term(ctx, Term(n.a), value)? < eval_term(ctx, Term(n.b), value)?)
+            u64::from(eval_term(ctx, Term(n.a), value, memo)? < eval_term(ctx, Term(n.b), value, memo)?)
         }
         Op::Ule => {
-            u64::from(eval_term(ctx, Term(n.a), value)? <= eval_term(ctx, Term(n.b), value)?)
+            u64::from(eval_term(ctx, Term(n.a), value, memo)? <= eval_term(ctx, Term(n.b), value, memo)?)
         }
         Op::Ite => {
-            let c = eval_term(ctx, Term(n.a), value)?;
+            let c = eval_term(ctx, Term(n.a), value, memo)?;
             if c != 0 {
-                eval_term(ctx, Term(n.b), value)?
+                eval_term(ctx, Term(n.b), value, memo)?
             } else {
-                eval_term(ctx, Term(n.c), value)?
+                eval_term(ctx, Term(n.c), value, memo)?
             }
         }
         Op::Trunc => {
             // Keep the low bits, zero-fill the rest.
-            let a = eval_term(ctx, Term(n.a), value)?;
+            let a = eval_term(ctx, Term(n.a), value, memo)?;
             let src = n.b;
             if src >= 64 {
                 a & mask
@@ -1930,6 +2146,21 @@ pub fn negative(x: Var) -> Pred {
     let w = bits(x);
     // `x >= 2^(w-1)` is exactly "the top bit is set".
     uge_const(x, 1u64 << (w - 1))
+}
+/// Whether bit `k` of `x` is set. `k` is a *constant*, so bit 0 is the `& 1`
+/// test and bit `k` is a constant shift followed by the same test.
+///
+/// A shift is used rather than a comparison against `2^k` because the two differ
+/// at the top bit: `x >= 2^(w-1)` and `bit(w-1)` agree, but a reader that took
+/// `x >= 2^k` as "bit `k`" would be right only up to the width, and the shift
+/// spelling has no such edge. A `k` past the width yields `false` rather than a
+/// shift the engine would have to define.
+pub fn bit_set(x: Var, k: u32) -> Pred {
+    let w = bits(x);
+    if k >= u32::from(w) {
+        return truth(false);
+    }
+    eq_const(band(lshr(x, k), word(1, w)), 1)
 }
 /// `x < y` (signed, two's complement).
 ///
@@ -2158,8 +2389,10 @@ pub fn mul_eq(x: Var, y: Var, z: Var) -> Pred {
 ///
 /// `None` for anything else. The MIR frontend uses this to keep a shift by a
 /// *constant* amount on the cheap `Op::Shl` path instead of paying for a barrel
-/// shifter; both paths agree, but only one of them is free. Gated on `std` because
-/// the frontend that calls it is: without it this is dead code, and the bare-metal
+/// shifter; both paths agree, but only one of them is free. `pow_fold` uses it for
+/// the same reason: a constant exponent lets the fold skip the steps that cannot
+/// run instead of building them behind a zero gate. Gated on `std` because the
+/// frontend that calls it is: without it this is dead code, and the bare-metal
 /// gate builds with warnings denied.
 #[cfg(feature = "std")]
 pub(crate) fn const_of(v: Var) -> Option<u64> {

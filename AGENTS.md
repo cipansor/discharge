@@ -49,6 +49,13 @@ DISCHARGE_RUSTC="$(rustup which --toolchain nightly rustc)" \
 `clippy` was installed with `rustup component add clippy`; the bare-metal target
 with `rustup target add thumbv7em-none-eabihf`.
 
+```bash
+# The qualified-toolchain gate, in isolation. Exits 0 on a build, 1 on a real
+# failure, 2 when no Ferrocene toolchain is present (which `gate.sh` reports and
+# skips). See `tools/ferrocene/README.md`.
+FERROCENE_RUSTC=/path/to/ferrocene/bin/rustc sh tools/ferrocene/run.sh
+```
+
 ## Verifying real Rust: the MIR frontend (`src/mir/`)
 
 The rest of the crate proves things about *models*: a formula, or a `wp` program.
@@ -1278,6 +1285,51 @@ claim by asserting the trait bound in a scratch test and watching it fail. A com
 names a mechanism the type system enforces will survive refactoring; one that names an
 intention will not.
 
+**Follow-up: the scratch test was not enough, so it is now a gate.** A scratch test that
+was run once and deleted leaves the marker exactly as unprotected as the comment was — the
+next refactor that drops `_not_shared` builds clean and the safety argument is false again,
+with nothing to notice. `smt.rs` now carries a permanent `const _: fn() = || { ... }` that
+fails the *build* if `Ctx` ever becomes `Send` or `Sync`. The mechanism is inference
+ambiguity: `AmbiguousIfImpl<()>` is implemented for every type, and
+`AmbiguousIfImpl<InvalidSend>` again for every `Send` type, so a `let _ = <Ctx as
+AmbiguousIfImpl<_>>::some_item;` compiles only while `Ctx` is `!Send` (one applicable impl)
+and is an `E0283` inference error the moment it is `Send` (two). `Sync` is checked the same
+way. Teeth confirmed the only way that counts: removing `_not_shared` fails the build with
+`multiple impls satisfying Ctx: AmbiguousIfImpl<_>`, and restoring it builds. The general
+rule this is an instance of: a one-off verification of an invariant is not the same as a
+gate, and only the gate survives the next change.
+
+## The front end is total, and "it has never panicked" is not the same as "it cannot"
+
+The MIR reader parses text the crate did not write — rustc's `-Zunpretty=mir` output, or
+anything a caller hands `parse_program` directly. A panic on a shape it did not expect is a
+crash in the caller's process, not a refusal, and the crate's whole posture is that an
+unmodelled input is a refusal. So "the reader is total" is a property the safety story leans
+on, and it was, until now, only an observation: nobody had seen it panic.
+
+It is now a test, `mir::parse::tests::no_input_panics_the_reader`. The interesting choice is
+the *input distribution*. A random token soup is cheap and reaches almost no parser state —
+it fails at the first unexpected token, which is the easy path. What reaches the boundary
+between states is a **valid dump with a few characters mutated**, so the corpus is two real
+dumps with 1-12 single-character insertions, deletions and substitutions from a pool of
+characters the reader actually reacts to. 20,000 such inputs, deterministic and seeded.
+
+The test asserts three things, not one, because "did not panic" alone can pass for the wrong
+reason:
+
+* it does not panic (the property);
+* the same text parses to the same structure twice (so the reader is a function, not a
+  side-effecting accumulator — this is what makes the survival evidence rather than luck);
+* at least one mutation still produced a parsed function (a positive control, so the test
+  cannot pass by the reader refusing everything — the same trap as the export-checker test
+  above).
+
+The contract reader (`spec::extract`) reads the same text and is checked for the panic
+property too. It survived 300,000 token-soup inputs and 700,000 mutation inputs across the
+two entry points while this was being written, so the property appears to hold rather than
+merely to be untested. Nothing was found, which is the honest result: a robustness test that
+finds nothing has still converted an assumption into a check.
+
 ## A number in a document is a claim that must reproduce
 
 The README said "77 of 800 random predicates" were ill-sorted by the old exporter. The
@@ -1333,6 +1385,24 @@ Ordered BDD. Invariants that are easy to break and hard to debug:
 7. **`with_fresh` must not be nested.** The inner call wipes the arena while the
    outer scope still holds live `Var`s. The symptom is unbounded recursion, not a
    clean panic.
+8. **`blast` must stop on `overflow`, not walk to completion.** Once the node
+   table is full every `mk_node` returns `FALSE` without setting `overflow` again,
+   so nothing downstream notices. A fold-built term (`pow`, `udiv`) is a fan-out
+   DAG whose *unrolled* size is exponential in its step count, and `blast` visits
+   a shared subterm once per path to it -- so the walk runs for minutes on a query
+   that should have fallen back to SAT. The `overflow` check in `Ctx::blast` turns
+   "arena full" into "stop now"; the caller's `overflow` test then routes the query
+   to the SAT engine. `overflow` is checked *separately* from `stale`: marking the
+   query stale on overflow would refuse it (`Unknown`) instead of falling back.
+9. **A fold over a constant must not build the steps that cannot run.** The
+   general `pow_fold` gates every step with an `ite`, which is correct and also
+   exponential in the unrolled DAG; a literal exponent is known up front, so the
+   `smt::const_of` fast path skips the dead steps entirely. The two paths are the
+   same recurrence and `a_constant_exponent_agrees_with_a_symbolic_one` pins that
+   they agree, because "same recurrence" is an argument and not a measurement.
+   Note the symbolic path is still intractable at the BDD wall, so a corpus entry
+   with a *symbolic* exponent and a wide base cannot be posed; pin constant
+   exponents there.
 
 ## Conventions
 
@@ -1476,6 +1546,45 @@ This is the same lesson as the two tooling defects above, one level up: **a gate
 not run is not a gate you passed**, and the only way to keep that honest is to make "run
 all the gates" a single command whose exit code is the claim. A summary that says "gates
 green" should quote that command's output, not a memory of running the pieces.
+
+## A skipped oracle is not a passed oracle: the Ferrocene gate
+
+The crate's whole pitch is the safety-critical corner -- a `no_std`, no-solver prover you
+can ship on an MCU. The one piece of that pitch that cannot be self-certified is the
+*compiler*: SPARK's story rests on a qualified toolchain, and Rust's is Ferrocene (ISO
+26262 ASIL D, IEC 61508 SIL 3, EN 50128, IEC 62304). So `scripts/gate.sh` builds both
+crates with Ferrocene for `thumbv7em-none-eabihf` -- a target Ferrocene itself qualifies --
+in gate 3, and CI has a matching `ferrocene` job.
+
+Three things had to be true for that gate to be honest, and each is a rule worth keeping:
+
+- **It must not become a dependency.** Ferrocene is invoked as a subprocess through
+  `RUSTC=...`, exactly like Kani, Verus, Lean and Coq, so gate 5's zero-external-dependency
+  check still passes when it runs. A qualified *toolchain* that leaked into `Cargo.toml`
+  would defeat the point of a zero-dependency crate.
+- **"Absent" and "failed" must be different exit codes.** `tools/ferrocene/run.sh` exits
+  `2` when no toolchain is found and `1` on a real build failure; `gate.sh` skips on `2` and
+  fails on anything else. The mirror-image trap is the one gate 10's comment already names:
+  conflate them and a broken install reads as "skipped", which reads as green.
+- **A skip must be *visible*.** Ferrocene is commercial -- a subscription plus a
+  customer-portal token whose archives "don't allow programmatic access" (User Manual
+  3.2.1) -- so a public CI job genuinely cannot install it. The gate prints the skip and the
+  CI job raises a warning annotation, so "Ferrocene did not run" is on the run summary
+  rather than being an absence nobody notices.
+
+The build that carries the weight is `examples/bare_metal.rs`: `#![no_std]`, no `main`, and
+it *calls the decision procedure*, so compiling it for the target is what shows the prover
+itself is code the qualified compiler accepts. It is a `crate-type = ["lib"]` example with
+`test = true`, because the target has no test harness but the verdicts still need checking
+somewhere -- the `lib` shape lets the bare-metal build exist, and `test = true` makes
+`cargo test --workspace` run the host-side verdict tests rather than building and ignoring
+them, which is the "gate that silently did not run" trap again.
+
+What the gate buys is narrow and worth stating plainly: it checks the *qualified compiler
+accepts the sources unchanged*. It does not qualify `discharge`. A qualified compiler is not
+a qualified verifier, and this crate's decision procedure is outside Ferrocene's scope. The
+README's "no qualification evidence" line is still true after this gate runs, and the gate's
+comment says so at the definition site.
 
 ## An untyped generator is a second program, and it needs its own type discipline
 
@@ -2252,3 +2361,1818 @@ the call (it fails on the pre-fix code), and `an_inlined_call_does_not_rescue_a_
 requires the same loop with `ensures: ret == 0` to still be refuted. Restoring the cut must
 restore the proof the invariant actually carries, not resurrect one that was never there.
 
+
+## The `rustc_public` oracle: what the text parser is checked against, and why it is a separate crate
+
+The MIR frontend reads the **textual** `--emit=mir` dump. That is the crate's stated gap 2:
+a rustc release that reprints the dump can break the parser, and the parser is the only thing
+that reads the dump, so nothing else notices. `tools/mir-oracle` closes that loop by asking
+`rustc_public` — the compiler's own public API — for the same programs' **typed** MIR and
+comparing a per-function *shape*: block count plus the panic guards `rustc` inserted, in block
+order. Structural, not textual, because the two dumps are not byte-identical (the typed one
+omits `copy` qualifiers, prints `let  _4` with different spacing, and nests `scope` blocks),
+so a text diff fails on cosmetics and proves nothing.
+
+Traps that cost time, in the order they cost it:
+
+* **`rustc_private` needs four `extern crate`s, not one.** `extern crate rustc_public;` alone
+  fails to link; `rustc_driver`, `rustc_interface` and `rustc_middle` must be declared too,
+  because the `run!` macro expands to code naming all three. The error is `cannot find module
+  or crate rustc_middle in this scope` pointing at the macro invocation, which reads as a
+  missing dependency rather than a missing `extern crate`.
+* **`run!` wants `&args`, and argv[0] is the program name.** `run!(&args, …)`, not
+  `run!(args, …)`. Passing a `Vec<String>` is a type error against `&[String]`; passing a
+  slice with the file first (no program name) makes rustc read the file as the program name.
+* **`--out-dir` is mandatory.** `rustc_public` runs a real rustc; without `--out-dir` it drops
+  `lib<stem>.rlib` next to the source file, so every oracle run litters the repository. The
+  oracle points it at a temp directory. This is easy to miss because the run still *succeeds*.
+* **The binary needs the sysroot on its runtime path.** A `rustc_private` binary links
+  `librustc_driver-*.so` but cargo does not add the sysroot to its rpath, so it builds and then
+  dies with `cannot open shared object file`. `build.rs` bakes `-Wl,-rpath,$(rustc --print
+  sysroot)/lib` in, using the `RUSTC` cargo is building with. `run.sh` sets both `RUSTC` (what
+  cargo builds *with*) and `DISCHARGE_RUSTC` (what the frontend *runs*) to the same nightly.
+* **`rustc-dev` alone is not enough: `llvm-tools-preview` is required too, and the error
+  misreports the cause.** `rustc` links `libLLVM`, and cargo puts
+  `<sysroot>/lib/rustlib/<target>/lib` on the build script's `LD_LIBRARY_PATH`. A bare
+  toolchain keeps `libLLVM` in `<sysroot>/lib`; it reaches `rustlib/<target>/lib` only via
+  `llvm-tools-preview`. That directory *takes precedence* over the `$ORIGIN/../lib` RUNPATH in
+  the `rustc` binary, so with only `rustc-dev` the `build.rs` cannot even start
+  `rustc --print sysroot` — and the visible symptom is the *linker* failing with `unable to
+  find library -lLLVM-...`, two steps later. A `-L <sysroot>/lib` flag cannot fix it (the
+  failure is `rustc` failing to start, not `ld`), so `build.rs` now panics naming the
+  component instead of returning quietly. Install
+  `rustup component add rustc-dev llvm-tools-preview --toolchain nightly`.
+* **`cargo clippy` ignores `RUSTC` when choosing its driver.** `RUSTC=<nightly> cargo clippy`
+  still runs the *default* toolchain's `clippy-driver`, so it checks a `rustc_private` crate
+  with the stable driver and reports `can't find crate for rustc_driver` — which reads like a
+  missing component and is not. Use `cargo +nightly clippy`, and install `clippy` onto the
+  nightly (a `--profile minimal` toolchain does not ship it). `cargo build` and `cargo test`
+  *do* honor `RUSTC`, so only the lint step needs this.
+* **`cargo install` is not idempotent, which makes a warm cache a trap.** The Kani job cached
+  `~/.cargo/bin/cargo-kani` and then ran `cargo install` unconditionally; `cargo install`
+  refuses to overwrite (`binary cargo-kani already exists in destination`), so the job could
+  only pass on a cold cache. Guard the install on the binary being absent, and version the
+  cache key so a cache left in the broken state is dropped.
+* **The crate is `exclude`d from the workspace, not a member.** A member would make
+  `cargo build --workspace` require a nightly, which breaks the stable zero-dependency build
+  that is the whole point of the crate. `exclude = ["tools/mir-oracle"]` plus `cargo build`
+  from inside `tools/mir-oracle`. `cargo metadata` lists exactly `discharge` and
+  `discharge-arithmetic`, so gate 4 still sees a two-line tree.
+* **`rustc_public::mir::body` is private but glob-re-exported.** Import from
+  `rustc_public::mir::{…}`, not `rustc_public::mir::body::{…}`. `Local` is `pub type Local =
+  usize`, not a tuple struct, so `Local(0)` does not compile — use `Place::from(0usize)`.
+
+The oracle has teeth and it was checked: flipping one arm of `PanicKind::from_text_message`
+(Add -> Mul) makes the run exit 1 with 7 actuator functions and 4 realistic functions named
+and their two panic lists printed. A tool that can only say "agree" is not evidence.
+
+### Two things the first version of the shape could not see
+
+Both were gaps in the *checker*, which is the worst place for one, and both are the same
+mistake: reducing a function to a summary that is not injective, then comparing summaries.
+
+* **The shape recorded a guard's kind but not its polarity.** `assert(!move _3, "…overflow")`
+  and `assert(move _3, "…overflow")` shaped identically, though they describe opposite
+  programs. A printer change that flipped a leading `!` therefore passed. The parser had
+  always carried `negated`; the shape — the thing compared — did not. `FnShape.panics` is now
+  `Vec<AssertShape>` with `AssertShape { kind, polarity }`. On the typed side the source is the
+  `Assert` terminator's `expected` flag, which is the value for which control *continues*, so
+  it is the **inverse** of the text side's `!` — `polarity_of` is a one-line function and
+  getting it backwards makes 21 actuator and 6 realistic functions disagree, which is how it
+  was checked. A useful side effect: the real asymmetry shows up, that `Bounds` is `True` while
+  every arithmetic guard is `Negated`.
+* **The gate's cost was the test profile, not the algorithm.** `prove::ENUM_BUDGET`
+  is documented as "about two seconds of tight loop", but that figure is a *release*
+  calibration. Cargo's default test profile is unoptimised, and the enumerations are
+  tight integer loops, so the same `2^32` walk cost ~21 s in the gate against ~2.6 s
+  optimised — and three sibling tests did it. The fix is `[profile.test] opt-level = 2`
+  in the workspace root, which took `scripts/test-count.sh` from 1m50s to 15.5 s
+  without touching a single proof. Two things to keep in mind: `[profile.test]` only
+  takes effect in the workspace root manifest (a profile in a member is ignored, and
+  cargo does not warn), and it applies to the *library* the integration tests link,
+  which is where the hot loop actually lives. Do not buy the speed with
+  `debug-assertions = false` — this is an arithmetic crate, and the `checked_*` tests
+  are where a silent wrap would hide; `the_test_profile_is_optimised_without_losing_its_checks`
+  fails if someone tries.
+* **A budget in cases is not a budget in seconds.** `ENUM_BUDGET` bounds the *count*
+  of cases, not the wall-clock cost. An obligation that does more work per case, or a
+  build without optimisation, is slower for the same count. Calibrating a case budget
+  in release and enforcing it in debug is exactly how a "2 second" bound became a
+  20 second gate.
+* **A coverage check that compared first counterexamples.** `fixed_add_no_overflow`
+  skips the points its precondition rejects, which is only sound if the rectangle it
+  walks is *exactly* the precondition's set. The first version of the check ran both
+  walks on one goal and compared their verdicts — but a walk stops at its **first**
+  counterexample, and two different rectangles can share one. At width 8, bounds 200
+  and 199 both fail first at `(1, 198)`, so the check passed while the 199 rectangle
+  omitted every pair containing 200 that the precondition admits. Coverage is a
+  property of the *domains*, so it has to be checked on the domains, with no goal in
+  sight. The replacement compares the two bounds directly and is O(1): for a square
+  precondition (`a <= k && b <= k`) the two sets are equal exactly when the bounds
+  are equal, since neither can be a proper subset of the other. The general lesson is
+  the same one the shape gaps taught: a check whose verdict depends on the thing it
+  is checking is not a check. A brute-force sweep of the domain was written first,
+  agreed with the O(1) version everywhere, and was thrown away — it cost 11 s and
+  added no evidence.
+* **Bare names were treated as unique keys.** `impl A { fn check }` and `impl B { fn check }`
+  in one file both reduce to `check`, and both sides used a single-slot map, so the first was
+  silently replaced by the second. Dropping it from the text parser produced *zero*
+  differences. Both sides now keep a `Vec<FnShape>` per name and compare it sorted, as a
+  multiset: the enumeration order differs between the two sources and is not worth asserting,
+  but the set of shapes under a name is exactly what a lost method changes.
+
+Exit codes are four-way on purpose: `0` agree, `1` a shape disagreed, `2` the oracle could
+not run (no nightly, or a missing `rustc-dev` / `llvm-tools-preview` component), `3` the
+oracle could not be *built* though the components are present. Gate 9 skips only on `2` and
+fails on everything else, so "the toolchain is missing" is never reported as a parser failure
+nor as a pass — and, the mirror-image bug, a compile error in the oracle is never reported as
+a missing toolchain and quietly skipped. `run.sh` decides between 2 and 3 by probing for
+`librustc_driver-*.so` and `libLLVM-*` in `$sysroot/lib/rustlib/$host/lib` directly, rather
+than by asking `rustup component list` (which answers for a toolchain *named* `nightly`, and
+`DISCHARGE_RUSTC` may point elsewhere).
+
+## A projection is a binding decision, not a grammar rule
+
+Contracts could name arguments and `ret`, and nothing else. `requires: b.lo <= b.hi` on a
+`&Bounds` argument was `skipped` with "unknown name", because the expression language had no
+dot operator and no notion of a field. Two of the fourteen functions in
+`examples/mir_targets/realistic.rs` were lost to that — `pick_from` and `clamp_by_value` — and
+a tuple return (`split`, `ensures: ret.0 <= a`) was lost to the same gap one level down.
+
+The first idea was to add a projection operator to the parser. That is the wrong shape: it
+puts the same decision (which field is this, how wide is it) at every operator that can
+appear next to a place. Instead each readable field is *rewritten* to a mangled identifier
+(`c.lo` → `c__f0`) before parsing, and bound to a variable of the field's own width and
+signedness. The grammar stays "arithmetic over names"; the projection is one binding decision,
+made in one place.
+
+What makes this work, and the parts that would have been silent bugs:
+
+* **The layout is not in the MIR.** The dump prints `_1: &Bounds` and never the fields, so
+  both the field *index* (declaration order) and the *width* have to come from the source.
+  That is consistent with how contracts are already read (doc comments, since attributes need
+  a proc-macro and a proc-macro is a dependency), and it means a contract and the layout it
+  names come from the same bytes. A struct the layout reader does not find yields no bindings,
+  and a contract naming one of its fields is refused — not checked against a guessed width.
+* **Two fields must not alias, and a hash is how they would.** The first version derived the
+  field's variable slot from an FNV-1a hash of `arg.field`. A collision there is not a missing
+  proof but a *wrong* one: `c.lo <= c.hi` becomes `x <= x` and verifies vacuously. A sequential
+  counter cannot collide, so there is nothing left to argue about. The tripwire is
+  `field_alias_tripwire` in `realistic.rs` — same shape as `clamp_bounds` but claiming
+  `ret >= c.hi`, which is false whenever `v < c.lo <= c.hi`. It must FAIL, and its
+  counterexample names two distinct variable indices; `tests/mir.rs` requires both the failure
+  and the two distinct names.
+* **The contract's field and the body's field must be the same variable.** The contract binds
+  `c.lo` to a variable; the body reads `((*_1).0)`. If those were two fresh variables the proof
+  would be vacuous in the direction that matters. `FieldEnv.seeds` carries `(local, field,
+  var)` to the executor, which seeds its `fields` map with exactly those variables, so the two
+  are made to agree by construction rather than by convention.
+* **A deref is transparent only as a whole place.** `*_1` for a `&T` argument names the same
+  value `_1` does, because `Ty::Ref` is modelled as its referent. The gate has to be `i == 0`
+  as well as "the local is a reference": `*(_1.0)`, a field that is itself a reference, is a
+  *different* pointee and `deref_ok` says nothing about it. Reading the field as though it were
+  the argument's referent is a wrong value, not a missing one.
+* **A projection that cannot be resolved is refused, never dropped.** `c.lo` where `lo` is not
+  a field is an error naming the field (not the parser's "expected a comparison operator",
+  which is what the `.` produced before the diagnostic was added), and `ret.0` on a
+  non-aggregate return is refused. A dropped conjunct would verify the function against a
+  weaker contract than the source states — the same class of bug as a skipped function
+  reporting `ok`.
+* **`ret` for an aggregate is `None`, not a fabricated word.** A tuple return has no single
+  word, so `post` receives `Option<Var>` and the parser refuses a bare `ret` while still
+  resolving `ret.0`. Passing a fresh unconstrained word would have let `ensures: ret == k`
+  pass on a tuple return by luck.
+
+Coverage on `realistic.rs` went from 10 of 14 decided to 13 of 14 when field and tuple support
+landed. `clamp_bounds` was added to `actuator.rs`, the regression corpus where *every* function
+must be decided, so a regression in field support is a failing test rather than a quietly lower
+number. The `rustc_public` oracle (gate 9) agrees on 31 actuator and 15 realistic functions with
+the new shapes.
+
+## A slice length is an input, and its elements are indexed by value
+
+The last `realistic.rs` skip was `first_of(xs: &[u8]) -> u8 { xs[0] }` with
+`requires: xs.len() > 0` / `ensures: ret == xs[0]`. It is the same class of gap as a field —
+a contract naming something the expression language had no way to name — but the *shape* of
+the fix is different, and the difference is the interesting part.
+
+A slice has no length in its type. `&[u8]` is the whole type; the length is whatever the caller
+passed, so `xs.len()` cannot be a constant the frontend computes. It is a *symbolic input*, on
+the same footing as an argument. The body agrees: rustc lowers `xs[0]` to `_3 =
+PtrMetadata(copy _1)` (the length), `assert(Lt(_2, _3))` (the bounds check), then `(*_1)[_2]`.
+The contract's `xs.len()` and the body's `PtrMetadata(_1)` have to be one variable or the
+bounds check cannot be discharged from the precondition, so the length is bound once in
+`FieldEnv` and handed to the executor as a `len_seed` — the slice analogue of the field seeds.
+
+The parts that would have been silent bugs:
+
+* **Elements are indexed by value, not one variable per slice.** The tempting model gives a
+  slice a single "element" variable. Then `xs[0] == xs[1]`, and `slice_alias_tripwire`
+  (`ensures: ret == xs[1]` on a body returning `xs[0]`) would verify. Elements are keyed by
+  `(local, index)` instead, so two indices are two inputs. The tripwire must FAIL, and its
+  counterexample assigns the two elements different values; `tests/mir.rs` requires both.
+* **A symbolic subscript is refused on a slice, and modelled on an array.** `xs[i]` with `i` a
+  parameter has no single element to name on a slice, and reading "some element" would make
+  `xs[i]` a different value per read — a wrong proof, not a missing one. An *array* is
+  different: its length is in its type, so `a[i]` is the exact ite chain over `0..N` and is
+  modelled (see the symbolic-index section below). The distinction is the domain being finite,
+  not the subscript being symbolic.
+* **The element width is the referent's, not the length's.** `&[u8]` has `u8` elements and a
+  `usize` length. Taking the element width from the length variable sizes every read at 64 bits
+  and mis-models the bounds check.
+* **The element is created on first read, which `get` cannot do.** `Env::get` takes `&self`, and
+  the first read of `xs[0]` has no variable yet. A `read_slice_index(&mut self, …)` on the
+  operand path creates it; the second read of the same index finds the same variable. Binding
+  the *contract's* element references up front (`bind_slice_refs`) keeps the postcondition
+  closure — which cannot hold a `&mut` — evaluating against the same bindings.
+
+Coverage on `realistic.rs` is now complete: every function is decided, and the three
+tripwires (`field_`, `slice_`, `array_alias_tripwire`) are decided *and must fail*, which is
+what makes them evidence rather than decoration. `first_of` was added to `tests/mir.rs` as a
+must-verify case, so a regression in slice support fails a test.
+
+### An array's length is a constant, not an input
+
+`[u8; 4]` and `&[u8]` look alike at the use site and are not alike at all. A slice's length is
+whatever the caller passed, so it is a fresh input. An array's length is *in the type*: `4` is
+the only length the value can have. Binding it to a fresh variable would be the unsound
+direction — the contract would be proved for some length the caller chose, when there was
+nothing to choose, and a contract proved at length 4 would appear to hold at any length. So
+`bind_array_len` binds `a.len()` to the constant word `4`, and the body's bounds check
+(`assert(Lt(_2, const 4_usize))`) is discharged from the index being a literal below 4.
+
+The rest of the machinery is shared with slices, deliberately: `FieldEnv::indexed` maps a name
+to `(local, elem_w, Option<fixed_len>)`, where the length is `Some(n)` for an array and `None`
+for a slice. One map, one element model, one scanner (`bind_index_refs`) — an array is not a
+second feature bolted on, it is the same feature with the length known. `bind_indexed_elem`
+refuses an index `>= n` for an array rather than binding a fresh variable, because the element
+does not exist and a fresh variable there would make a meaningless contract look meaningful.
+
+### A literal's width comes from the operand, not from the scope
+
+This is the bug array support exposed, and it is worth recording because the symptom pointed
+nowhere near the cause. `arr_pre(a: [u8; 4]) -> u8` with `ensures: ret <= 255` came back
+`incomplete`. The body was trivially fine. The cause: a contract literal was built at the width
+of the *widest name in scope*, and an array or slice length is a `usize`. So `255` was a 64-bit
+constant compared against an 8-bit `ret`. `smt::cmp` refuses mismatched widths by setting the
+engine's `ill_formed` flag, and **an ill-formed term makes every obligation in the run
+`Unknown`** — so the function was undecided for a reason that had nothing to do with it. The
+same bug had been silently present for slices: `slice_le` was `incomplete` at HEAD.
+
+The fix is a per-use width decision, in three parts, and each part is a separate way to be
+wrong:
+
+* **Build the literal wide enough to hold its own value.** Sizing it at the scope's width
+  instead masks it: `a <= 300` for a `u8` becomes `a <= 44`, which is a weaker claim that could
+  pass. So the constant keeps its exact value and the width is chosen later.
+* **Resize the constant to the other operand's width (`align_widths`).** Zero-extend for an
+  unsigned operand, sign-extend for a signed one. A value that does not fit is *refused*, not
+  truncated: `a <= 300` for a `u8` is an error naming the value and the width, because the
+  alternative is a proof of the wrong proposition.
+* **Narrow by truncation, not by rebuilding from the value.** A negative literal is the bit
+  pattern `2^w - 10` at its source width. Rebuilding `word(val, wide)` from that value hands
+  `wide` a number that does not fit and sets `ill_formed` again — the very flag being avoided.
+  Taking the low `wide` bits is the same bit pattern, and the `fits` check is what keeps it
+  from being silent.
+
+`i8::MIN` and friends are the same lesson from the other side: the bound must carry the width of
+the type it *names*. `i8::MIN` is `0x80`, exactly 8 bits. Building it at a wide scope width and
+narrowing back tested a 64-bit `128` against the signed 8-bit range and refused a bound that is
+in range by construction.
+
+Each of these has a test in `tests/mir.rs` written against the *evaluator*, so it does not
+depend on a corpus function happening to be skipped for an unrelated reason. Two of them failed
+when first written and found the masking and truncation bugs above.
+
+The rule is not a comparison rule, it is a *meet* rule, and it applies wherever two operands meet:
+the arithmetic levels (`parse_add`, `parse_mul`, …) call the same `align_widths` the comparison
+does. `ret == a + 5` with a slice length in scope had the identical failure — an 8-bit `a` added
+to a 64-bit `5` — and was `incomplete` for the same reason. That the first fix was written only in
+`parse_cmp` is what made the arithmetic case a separate bug rather than the same one.
+
+### A symbolic subscript is modelled on an array and refused on a slice
+
+`a[i]` and `xs[i]` are the same source shape and are not the same problem. The difference is
+not that one is symbolic and one is not — both are — but that one has a *finite domain*. An
+array's length is in its type, so `a[i]` ranges over a set the frontend can enumerate:
+`ite(i == 0, a0, ite(i == 1, a1, … ite(i == N-1, a_{N-1}, 0)))`. That is not an approximation of
+`a[i]`, it is a *definition* of it. A slice's length is a symbolic input, so there is no domain
+to enumerate and `xs[i]` stays the refusal it always was. The feature is drawn at the domain,
+and `MAX_INDEX_CHAIN` bounds it so a large array is refused rather than turned into a term the
+solver cannot hold.
+
+Three things had to be true for the chain to be sound, and each is a separate trap:
+
+* **The chain is only `a[i]` where `i < N`, so the precondition must establish that.** The chain
+  has to return *something* for `i >= N` (it falls through to the last element). Checking a
+  contract there would check it against a value that is not `a[i]`. So `index_guards` reports
+  `(index var, N)` for every symbolic subscript, and `verify_function` *proves* `pre ⇒ i < N`.
+  If it does not hold, the function is `Skipped` with a reason naming the bound. The tempting
+  alternative — conjoin `i < N` into the precondition — is unsound in the direction that
+  matters: it strengthens what the source asked to be verified, so a contract proved under
+  `i < 4` would be claimed to hold without it.
+* **The chain must be built from the *same* element variables the body reads.** The parser
+  rewrites `a[i]` to the chain, and the chain is built from `elem_seeds` — the very variables
+  the executor is seeded with. If the contract's `a[i]` were built from fresh variables, the
+  postcondition would be about one array and the body about another, and every proof would be
+  vacuous in the direction that matters. `bind_sym_index` therefore binds *every* element of
+  the array up front, not on demand: an element the contract did not bind would be created
+  fresh by the body's first read.
+* **Only the index that was bound has a chain.** `a[j]` where only `a[i]` was bound must not be
+  rewritten to the `a[i]` chain — that would prove `a[j] == a[i]`, false for every `i != j`. The
+  rewrite checks `sym_index_name` for the exact index argument before replacing, so a name that
+  merely looks like the bound one is left for the parser to refuse.
+
+The index is a *name the contract may use* — an argument — and it is bound to that argument's
+own variable, so `requires: i < 4` and the chain's guard are the same `i`. A compound index
+(`a[i + 1]`) has no name to bind and is refused rather than mis-modelled.
+
+`tests/mir.rs` pins all four sides: the chain verifies, an unbounded index is refused, a
+different index is refused, a slice subscript is still refused, and a *false* postcondition
+about `a[i]` fails with a counterexample (so "verified" cannot be the chain being a constant
+the postcondition happened to accept). The corpus entries are
+`array_symbolic_index`, `array_unbounded_index_refused`, `array_wrong_index_refused` and
+`slice_symbolic_index_refused`.
+
+### A write has to land where the read looks
+
+The three soundness holes below were all the same shape: the environment held a
+value for a place in *two* places, and a write updated one of them. Each produced
+a *false proof* — a contract that does not hold, reported `verified` — which is
+worse than a refusal, because it is the answer that gets trusted. They were found
+by a review that read `Env::set` and `index_elem` side by side, not by a test; the
+tests that now pin them were written after.
+
+* **An element write went to the wrong store.** `Env` kept slice and array
+  *arguments*' elements in `indexed[local].elems` (seeded from `elem_seeds`, and
+  what the ite chain is built from) but stored a write with `elems.insert((local,
+  index), v)` — the map for array *literals*. The read consulted the first, the
+  write updated the second, so `a[0] = 0; a[i]` read the pre-write `a[0]` and
+  `ensures: ret == a[i]` under `i == 0` was *proved*. `set` now routes an element
+  write through `write_elem`, which picks the same store the read picks, and the
+  `(*_1)[0] = v` and `_1[_2] = v` forms are handled too. The general rule: the
+  write path and the read path must key on the same distinction, and when there
+  are two stores the code that writes has to know which one the reader will use.
+
+* **A write the store cannot represent has to poison, not be dropped.** An element
+  write of an aggregate, or through a *symbolic* index (`_1[_2] = v`), has no
+  per-index slot: the first has no word to store and the second would have to
+  update every element the chain could select. Dropping it leaves the seeded value
+  readable — the same stale read, one level down. `Indexed::poisoned` marks every
+  element unknown instead, keeping the *length* (a write does not change a type's
+  length). `index_elem`, `read_indexed` and both `get` arms check it. An unknown
+  element fails a postcondition as an unreadable contract; it does not silently
+  become the old value.
+
+* **A whole-place assignment left the parts behind.** `c = d` wrote `locals[c]`
+  and left `fields[(c, 0)]` holding the *argument's* field, so `c = d; c.lo` read
+  the stale `c.lo` and `ensures: ret == c.lo` was proved against the wrong struct.
+  `set` now calls `forget_parts` on a whole-place write, dropping the field,
+  element, payload and tag maps for that local (and poisoning its elements).
+  `Val::Agg` is the deliberate exception: an aggregate rvalue (`_0 = (a, b)`, the
+  `(result, overflowed)` of a `checked_*`) writes its own parts inside
+  `eval_rvalue` and then returns `Val::Agg`, so clearing there would delete the
+  parts that were just written and turn a modelled tuple back into an unknown one.
+  Clearing the derived state on a whole-value write is the conservative direction;
+  the exception is the one case where the derived state *is* the value.
+
+* **A generated name must not be able to shadow a real one.** Bindings are named
+  by mangling (`a__len`, `c__f0`, `a__chain`) and handed to the parser *after* the
+  arguments, so an argument that happens to be called `a__chain` would be shadowed
+  by the chain and a contract naming it would be checked against the array. The
+  fix is not a less guessable separator — any scheme is guessable — but to record
+  every source name in `FieldEnv::declared` and refuse a generated name that
+  collides (`name_is_free`), so the binding is dropped rather than allowed to
+  shadow. The collision is a refusal, which is the honest answer: the source
+  chose a name the mangling wanted.
+
+The `&mut [u8]` *slice* argument used to be a separate gap: a write lowers
+through `&raw const (fake) (*_1)`, whose `PtrMetadata` the frontend did not model,
+so the function was `incomplete` before any write was reached. That is now closed
+(see the section below): the parser reads `&raw const (fake) (place)` as the place
+it names, so the slice shape is modelled like the `&mut [u8; 4]` one — which goes
+through a plain reborrow and was modelled all along.
+
+`tests/mir.rs` pins each hole by name: `an_element_write_reaches_the_symbolic_chain`
+(requires `Failed`, so a counterexample is the evidence the chain saw the write),
+`an_element_write_through_a_mutable_reference_reaches_the_chain`,
+`a_slice_element_write_reaches_the_store_the_read_consults` (the true half must
+verify and its tripwire must fail), `a_slice_element_write_reaches_the_symbolic_chain`,
+`a_whole_struct_assignment_invalidates_its_fields` (requires *not* `Verified` — the
+write poisons the field, so the postcondition is unreadable),
+`a_generated_binding_cannot_shadow_an_argument` and
+`a_generated_length_binding_cannot_shadow_an_argument`, plus
+`a_write_cannot_prove_a_stale_contract` over the corpus entries
+`array_write_then_symbolic_read`, `mut_ref_array_write_then_symbolic_read`,
+`generated_name_shadows_argument` and `struct_reassign_then_field_read`.
+
+## A call boundary is a real boundary: what crosses it and what must not
+
+Four soundness holes and two completeness holes lived at the same place — the
+inlined call — and in the same shape of mistake: a value or a type was carried
+across the boundary when it should have died with the frame, or dropped when it
+should have crossed.
+
+**A by-value aggregate is the callee's copy; a reference is the caller's storage.**
+The frontend models `&T` as its referent (the single-owner reading, not an aliasing
+model), so a `&mut [T; N]` argument and the caller's local denote the same store:
+the callee's post-state *is* the caller's post-state and is copied back on return
+(`Frame::by_ref_indexed`). A by-value `[T; N]` is the opposite: the callee got its
+own copy, its writes must die with the frame, and nothing is copied back
+(`Frame::by_value_indexed` records the pair only so the return-merge can tell the
+two apart). Sharing the copy — the tempting way to make a callee's element read
+agree with the caller's — makes `let b = f(a)` mutate `a`, so a caller contract
+about `a` is checked against a value that never existed. The corpus tripwires are
+`caller_of_written_copy` (by-value write must **not** leak; `ret == 0` is false, so
+it must fail) against `caller_of_clear_head` (a `&mut` write **must** be visible).
+
+**A constant operand carries its own signedness.** `0 < a` lowers to
+`Lt(const 0_i8, copy _1)` — the constant is the *left* operand, and `Const::UInt`'s
+type suffix is the only place the signedness appears. Reading a constant as
+unsigned made `0 < a` unsigned, under which `i8::MIN` (`0x80`) is the *largest*
+value, so `requires: a == i8::MIN; ensures: ret == 1` on `if 0 < a { 1 } else { 0 }`
+was **proved** — a reachable false proof, since `i8::MIN` is negative and the
+branch is never taken. The fix is `operand_signedness`, which returns `Option<bool>`
+and *refuses* (`None`) when the type cannot be resolved rather than defaulting to
+unsigned; every caller (`eval_binary`, the checked intrinsics, `try_intrinsic`)
+propagates the refusal as `Val::Unknown`. A wrong signedness is not a missed proof
+but a wrong branch, which is a wrong answer. The unit test
+`a_constants_signedness_comes_from_its_suffix` pins all three answers, because the
+bug was a *default* and a test that only checked the signed case would pass the
+moment the default came back.
+
+**A tuple component and a struct field are two spellings of "component N".**
+`_3 = (a, b)` stores the components under an *index* projection (`elems`), but rustc
+prints the read back as `_3.0` — a *field* projection (`fields`). The two have to
+meet in one store (`Env::get`'s `Proj::Field` arm falls back to `elems`), or
+`let t = (a, b); t.0` reads `Unknown`. A local is a struct or a tuple and never
+both, so the fallback can only hit for the tuple case; a struct field that is
+genuinely unwritten finds nothing in either store and stays `Unknown`.
+
+**A tuple return's components cross the call boundary with the aggregate.** The
+callee stores its result in its *own* return place (`_0.0`, `_0.1`); the caller's
+`min2(a, b).0` reads `_2.0`. Carrying only the aggregate loses the components and a
+contract about them is unreadable rather than checked. They are copied under the
+*destination's* local, and only the ones the callee wrote — a path that left `_0.1`
+unwritten leaves the caller's `dest.1` unknown rather than inventing a value. The
+tripwires `tuple_component_tripwire` and `min_call_tripwire` claim the *wrong*
+component and must fail.
+
+**A tuple-return postcondition is checked on the components a contract names.**
+`ret.0` of a `(bool, u8)` is a `bool` in the type but a one-bit word in the
+postcondition, so the component is widened on read-out (`Val::Bool` →
+`ite(p, 1, 0)`) — without it the name is unbound and the contract is refused. And
+the up-front parse probe (`verify::verify_fn`) binds only the components the
+contract *names* (`spec::named_ret_components`): binding every declared component
+made a `(u8, &u8)` return unprobeable (component 1 is a reference with no bit
+width), so a contract about `ret.0` alone skipped the whole function. A component
+the contract names and that has no width is still refused — then the name really
+cannot be resolved.
+
+`tests/mir.rs` pins each by name:
+`a_helper_that_indexes_its_parameter_reaches_the_caller_element`,
+`a_write_through_a_reference_reaches_the_caller`,
+`a_by_value_helper_cannot_write_the_callers_array`,
+`a_constant_left_signed_compare_is_signed_not_unsigned`,
+`a_postcondition_can_name_a_bool_tuple_component`,
+`a_reference_component_the_contract_does_not_name_does_not_skip_the_function`,
+`a_tuple_locals_component_can_be_read_back`,
+`a_tuple_returning_calls_component_reaches_the_caller` and
+`a_tuple_component_read_cannot_prove_the_wrong_component`, over the corpus entries
+`head`/`caller_of_head`, `clear_head`/`caller_of_clear_head`,
+`caller_of_written_copy`/`clear_copy`, `signed_const_left_false`/`_true`,
+`bool_component`, `first_component_only`, `tuple_local_component`, `min2`/`min_call`
+and the two tuple tripwires.
+
+## A widening cast needs the *source's* signedness, and `truncate` is not it
+
+`Rvalue::Cast` used `smt::truncate` for every target width. `truncate` zero-fills,
+so `-1i8 as i16` was modelled as the bit pattern `255` — and
+`requires: a == -1; ensures: ret == 255` on `a as i16` was **proved**, a second
+reachable false proof of the same family as the constant-left comparison: a value
+operation that silently lost its sign.
+
+The two widening directions need *opposite* rules, so no single rule is right:
+`i8 as i16` sign-extends (`-1` stays `-1`), `u8 as u16` zero-fills (`255` stays
+`255`). The source operand's signedness decides, via the same `operand_signedness`
+the comparison and shift paths use — `Some(true)` → `smt::sign_extend`,
+`Some(false)` → `smt::truncate`, and `None` (the source type could not be read) →
+refuse, because zero-filling a signed value is the false proof above and
+sign-extending an unsigned one turns `255u8 as u16` into `65535`. `sign_extend`
+truncates first when the target is no wider, so a *narrowing* cast (`300i16 as u8`
+→ `44`) is unaffected and `truncate`'s behaviour is unchanged for it.
+
+`tests/mir.rs::a_widening_cast_respects_the_sources_signedness` pins all four
+directions — the two true contracts must verify and the two false ones must fail —
+over `widen_signed_true`/`_false` and `widen_unsigned_true`/`_false`, because a
+test that only checked the signed case would pass again the moment the rule went
+back to a single default.
+
+## Next stage: the signedness work is a *rule*, so let the engine state it
+
+Both false proofs fixed in this round were the same bug wearing different
+clothes. A value operation silently dropped the signedness of its operand:
+`0 < a` compared `const 0_i8` as unsigned, and `a as i16` zero-filled a signed
+source. The repair went in at each *call site* of `operand_signedness`. That is
+the shape of fix that leaves a third case behind, so the next stage is to make
+the rule structural rather than per-site.
+
+**Stage 1 — make the width-and-signedness rule a type, not a habit.** DONE.
+`Val::Sym` is now `Val::Sym(Var, Sign)`, and `Sign` has *three* cases:
+`Signed`, `Unsigned`, and `Unknown` for a value whose dump printed no type. The
+third case is the whole point. With only two cases, a site that could not read
+the sign had somewhere to fall back to, and both false proofs were exactly that
+fallback: a suffix-less `const 0_i8` read as unsigned, and a cast source whose
+sign was dropped. With three cases, every signedness-sensitive site has to say
+what it does when the sign is missing, and the compiler names the ones that do
+not -- which is how the four sites below were found rather than remembered:
+
+* `eval_binary` -- a relational comparison (`<`, `<=`, `>`, `>=`) and the signed
+  divider/`srem` refuse an `Unknown` sign. `==`/`!=`, `+`, `&` and the rest do
+  not read the sign, so they still compute.
+* `overflow_pred` -- an `Unknown` sign has no sound predicate, so it returns
+  `None` and the path is reported unmodelled rather than proved.
+* `try_intrinsic` -- `sdiv`/`srem` on an `Unknown` sign are refused.
+* `Rvalue::Cast` -- an `Unknown` *source* sign refuses the cast. This is the
+  `-1i8 as i16` bug's home; zero-filling a signed source and sign-extending an
+  unsigned one are both wrong, so neither may be guessed.
+
+The sign travels with the seed too: `FieldEnv::seeds`, `len_seeds`, `elem_seeds`
+and the `Indexed` element store all carry it, so an array element read out of the
+store is a signed value on an `&[i8]` without any site having to look the type up
+again. `operand_signedness` is *deleted* -- the lookup it performed no longer has
+a caller to get wrong, because the sign is a field of the value it describes.
+
+The regression net is the corpus (`signed_const_left_false`, `widen_signed_false`,
+`signed_mul_negative`, `ashr_signed_false`) plus the two new entries
+`signed_slice_element_is_signed` / `signed_slice_element_tripwire`, which pin the
+element-side case: `i8::MIN` is the most negative `i8` and the largest `u8`, so
+`xs[0] < 0` proves the opposite branch under the unsigned reading. A unit test
+(`a_comparison_on_an_unprinted_sign_is_refused`) pins the refusal directly.
+
+**Stage 2 — close the remaining `Rvalue` gaps, one at a time, each with a
+tripwire.** The list below was written from reading the `Rvalue` enum, before
+measuring which variants real rustc actually *prints*. Measuring first changed it:
+two of the six items were not gaps at all, and the real ones were smaller and
+differently shaped than the enum suggested. The lesson is the same one the
+signedness round taught -- a gap list inferred from a type is a hypothesis, and
+the corpus is the experiment that tests it. (`examples/mir_coverage` takes an
+optional file argument, which is what made the measurement cheap.)
+
+* **`Rvalue::Cast` to `bool` — not a gap.** `a as bool` does not compile
+  (`E0054`: `cannot cast u8 as bool`); the idiom is `a != 0`, which lowers to
+  `Ne`, already modelled. Nothing to do, and the item was removed rather than
+  implemented.
+* **`Rvalue::Len` — not a gap.** Modern rustc does not print `Len(` at all: a
+  `.len()` lowers to `PtrMetadata`, and `grep -c 'Len('` over a full dump is `0`.
+  The real work was in `PtrMetadata`, below, not in the variant the enum names.
+* **`Rvalue::Struct` for a struct literal — DONE.** `Config { lo, hi }` is a
+  *struct-literal* rvalue, not an array/tuple `Aggregate`. The two write different
+  stores: an aggregate writes `Proj::Index` (tuple components, which a contract
+  cannot name) and a struct literal writes `Proj::Field` (which a contract *does*
+  name, as `c.lo`). The fields are printed in **declaration** order, which is the
+  order the `Field(N)` projections count in, so a positional store is sound -- and
+  the tripwire pins exactly that: `struct_literal_order_tripwire` writes `hi`
+  first and must be refuted with a witness that is the `hi` operand, not `lo`.
+* **`Rvalue::Ref` and dereference — DONE.** `&place` records the place it
+  addresses, and `Env::resolve` rewrites a `*_2` whose `_2` is addressed into that
+  place. This is a *substitution*, so a write through the reference and a read of
+  the target meet in one store: `reference_write_reaches_target` verifies because
+  the write is seen, and `reference_write_tripwire` fails because a snapshot model
+  would have proved it. The same store fixed a parser bug: `strip_annot` stripped
+  the parentheses off a bare `(*_2)`, leaving `*_2`, which no place parser reads.
+* **`PtrMetadata` of an unsized array — DONE.** `a.len()` on `a: [u8; 4]` lowers
+  to `_3 = &_1; _2 = _3 as &[u8]; PtrMetadata(_2)`. The reference-to-reference
+  cast carries the address across, and `PtrMetadata` follows it to the array,
+  whose length is the *type's constant* -- not a fresh variable, so `a.len() == 4`
+  has something to agree with. `Env::pointee` is the one-level value step that
+  `resolve` deliberately does not take, because metadata belongs to the pointee,
+  not the pointer.
+* **A whole-struct reassignment — DONE.** `c = d` copies a value the frontend
+  models as its *parts*, so `Env::copy_parts` moves the field/element/payload/tag
+  maps. It reports whether anything moved, which is what lets `set` keep the parts
+  (the same `Val::Agg` convention an aggregate literal uses) instead of clearing
+  them. `struct_reassign_then_field_read` moved from *incomplete* to **refuted**:
+  the false contract is now a counterexample, not a shrug.
+* **`Rvalue::Discriminant` and `Downcast` for a real enum match — DONE.**
+  A `match` on an enum lowers to `_2 = discriminant(_1); switchInt(move _2)`,
+  so the tag is a symbolic input whose *domain is the set of variant
+  discriminants*. That bound is a fact about the type, not an assumption about
+  the caller, so the run may assume it -- and it is what makes the `otherwise`
+  arm (lowered to `unreachable` for an exhaustive `match`) genuinely unreachable
+  instead of a spurious panic. Three pieces make it work:
+  - `spec::EnumDef` / `EnumLayout` carry each variant's **discriminant** from the
+    same source pass as the contracts, so a `(base as Variant)` downcast's tag
+    and a contract's `Mode::Run` constant agree by construction rather than by
+    convention. The discriminant is rustc's value, not the vector position: an
+    explicit `B = 3` renumbers `C` to `4`, and numbering by position would put a
+    contract naming `Gap::C` on the wrong tag. A one-line body
+    (`pub enum E { A, B }`) and a multi-line one are read by the same
+    top-level-comma split, so the numbering cannot drift between them.
+  - `FieldEnv::bind_enum` binds the argument's own name to the tag, so a
+    contract writes `m == Mode::Run`; each variant's first payload is bound
+    separately (keyed by discriminant), so `m.Data` names the same variable the
+    body's `((_1 as Data).0)` downcast reads.
+  - `Seeds::tag_seeds` seeds the tag with its discriminants and
+    `Seeds::payload_seeds` the payloads, and the run conjoins the *disjunction of
+    the discriminants* onto the initial path -- `tag < count` is only the same
+    domain when the numbering is `0..count`, which an explicit discriminant
+    breaks.
+  The tripwires pin the model rather than its presence: `enum_match_tripwire`
+  claims every arm returns `2` and must be refuted with the tag in the witness
+  (a constant tag would prove it), `enum_explicit_discriminant_tripwire` claims
+  the `B` arm ran for `Gap::C` and must be refuted (a positional reader proves
+  it), and `enum_payload_tripwire` names a *unit* variant's payload, which is
+  refused rather than bound to a fabricated value. A variant with no payload is
+  refused with a message naming the variant.
+* **A locally constructed variant has a *known* tag — DONE.** `let m = Mode::Idle;`
+  lowers to `_1 = Mode::Idle;`, a bare path constant with **no `const ` prefix**,
+  which the rvalue parser did not recognise: it fell through to `Rvalue::Unknown`
+  and the tag was never written, so `let m = Mode::Idle; match m` stayed
+  `incomplete` even once a tag read from an *argument* worked. Two changes close
+  it. `parse_rvalue` recognises a bare `Enum::Variant` path as a constant, and
+  `eval_rvalue::Use` resolves it against the program's enum layouts -- the same
+  table a `match`'s downcast reads -- writing a *constant* tag rather than
+  seeding a symbolic one. The tag's width is the enum's *discriminants'*, taken
+  from the destination's type, not the dump's `isize`: `Env::tag_widths` records
+  it so `discriminant` reads the tag back at the width the contract's comparison
+  was checked at. A payload construction (`Msg::Data(9)`) is `Rvalue::Variant`:
+  the tag is the variant's discriminant and the operands are written as the
+  variant's fields, so the match's `((_1 as Data).0)` downcast reads what the
+  construction wrote. `enum_constructed_locally` verifies and
+  `enum_constructed_locally_tripwire` is refuted; the payload case
+  (`enum_constructed_payload_reads_through`) verifies.
+* **A variant's tag is rustc's *discriminant*, not its position — DONE.** The
+  reader used to number variants by their position in the declaration
+  (`EnumDef::index_of` returned the vector index, the tag's width was the
+  variant *count*'s, and payloads were keyed by position). An explicit
+  discriminant breaks all three: `pub enum Gap { A, B = 3, C }` gives `C` the
+  discriminant `4`, so a positional reader calls it `1`, puts a contract naming
+  `Gap::C` on the wrong tag, and -- because the `match` arm constants come from
+  rustc -- lets the contract and the arm disagree, which is a **false proof**
+  (`enum_explicit_discriminant_tripwire` was *verified* before the fix). The
+  data model now carries `(name, payload, discriminant)` per variant,
+  `parse_discriminant_literal` reads a decimal/hex/binary/octal literal (an
+  unreadable one refuses the *whole* layout rather than guessing), `tag_width`
+  is the largest discriminant's width, the tag's assumed domain is the
+  *disjunction of the discriminants* rather than `tag < count`, and payloads are
+  keyed by discriminant. Two related built-in hazards were closed at the same
+  time: a *declared* layout now wins over the built-in `Option`/`Result`
+  numbering for a qualified name (`Shadow::Some` is tag `0` for a user
+  `enum Shadow { Some, None }`, not `Option`'s `1` --
+  `enum_user_variant_not_option_constructed_tripwire` was verified before this
+  fix), and a qualified name whose enum is unknown is refused rather than
+  answered by another layout that happens to share the variant name.
+* **`// MIR FOR CTFE` is a copy, not a second function — DONE.** Building a
+  tuple-variant constructor in a `let` (`Msg::Data(9)`) makes rustc print a
+  *second*, `// MIR FOR CTFE`-marked body for the constructor. It is a copy of an
+  item already printed above it, and the typed MIR has one body per item, so
+  parsing it made the text side count 69 functions where `rustc_public` counted
+  68 -- a `rustc_public` MIR-oracle failure (gate 9) over a function that is
+  really there once. The parser now skips a `// MIR FOR CTFE` marker and the body
+  that follows it. This is exactly the class of printer change gate 9 exists to
+  catch: the frontend's own verdicts were unaffected, and only the oracle
+  noticed.
+* **`Rvalue::Unary(Not)` on a word operand — DONE.** The mask now comes from
+  the *operand's* width (`smt::bits`), with `dest_w` kept as a cross-check that
+  refuses a disagreement. Measured first: rustc lowers `!x` at `u8`/`i8`/`u32`
+  to `_0 = Not(copy _1)` with `dest_w` equal to the operand's width, so the
+  reachable behaviour is unchanged -- this removes a way to be wrong, it does not
+  change an answer. The real gap was coverage: `!x` had *no* corpus entry. Five
+  now carry it (`not_of_zero_is_all_ones`, `not_of_zero_u32_is_all_ones`,
+  `not_of_zero_is_minus_one`, `not_is_255_minus_x` and
+  `not_is_always_255_tripwire`, refuted with witness `v1 = 1`), taking coverage
+  from 71/123 to **75/128**. See the section below.
+
+Corpus coverage went from 33/51 to 44/67 decided across this round; the new
+entries are `struct_literal_reads_its_field`, `struct_literal_order` (+ its
+tripwire), `reference_reads_through`, `reference_write_reaches_target` (+ its
+tripwire), `array_len_is_the_type_constant`, `struct_reassign_reads_new_field`,
+the five enum entries (`enum_match_is_bounded`, `enum_match_selects_by_tag`,
+`enum_payload_reads_through` and their tripwires) and the two construction
+entries (`enum_constructed_locally` + tripwire,
+`enum_constructed_payload_reads_through`).
+
+**Stage 3 — the contract language's two deliberate refusals.** `xs[i]` with a
+symbolic `i` on a *slice*, and `a[k]` where `k` is a local rather than an
+argument. Both halves are DONE.
+
+*The local half is DONE.* `let k = i; a[k]` was refused because the contract's
+`k` resolved to nothing. The refusal was misdiagnosed as "there is no local":
+`rustc` prints no local for `k` at all. A `Copy` argument copied into a `let`
+lowers to the argument's *own* local, and `k` survives only as a scoped
+`debug k => _2;` — the body's `a[k]` really is `_1[_2]`. So the fix is to resolve
+the name, not to bind a new variable.
+
+The parser keeps every `debug` binding in `MirFn::debug_aliases` (the existing
+`local_names` map cannot: it keeps the *first* binding per local, so that a scoped
+alias does not rename the parameter, and it therefore drops `k`). `MirFn::
+alias_locals` then decides which of those names may resolve, and it resolves a
+name only when the aliased local is an argument, is never written by the body, is
+not already an argument's own name, and does not alias two different arguments.
+The `written` set is collected from the parsed blocks, so a `mut i` that the body
+reassigns makes `k` unresolvable — the conservative direction, which loses a
+proof rather than inventing one.
+
+The names flow through `arg_vars` and `signed_args`, so `a[k]` builds the same
+ite chain `a[i]` would *and* a signed `i` makes `k` signed in a comparison. Two
+corpus entries carry it — `array_local_index_through_alias` (verifies) and
+`array_local_index_tripwire` (must fail, and its witness pins `k` to a real index)
+— and `array_local_index_written_refused` pins the `written` gate. Coverage went
+from 44/67 to 45/69.
+
+*The slice half is DONE.* The design note below had a soundness hole and it is worth
+recording, because the hole is the interesting part.
+
+A slice's length is a symbolic input, so `xs[i]` cannot be enumerated over a type
+length the way an array can. The note proposed enumerating `0..MAX_INDEX_CHAIN` and
+guarding each step with `k == n && k < len_var`, with the obligation that the
+precondition imply `i < xs.len()`. That obligation is *not enough*. The chain has to
+return something for `i >= MAX_INDEX_CHAIN`, and an index in `[64, len)` is in range
+and past the enumeration, so it would fall through to a wrong element. The obligation
+that closes it is on the *length*: `xs.len() <= MAX_INDEX_CHAIN`, which makes the
+enumeration cover every index the slice can hold, not just the one the contract named.
+Bounding the index alone leaves the body's read at some other index unmodelled.
+
+So a slice's subscript has two obligations, not one, and they are checked separately so
+the refusal names the missing one:
+
+* `i < xs.len()` — the named index is in range.
+* `xs.len() <= MAX_INDEX_CHAIN` — the enumeration covers the whole slice.
+
+The machinery: `IndexBound` (`Const(n)` for an array, `Len(v)` for a slice) replaces the
+`u64` that `index_guards` used to yield, so the bound travels as one shape whether it is
+a constant or a term. `FieldEnv::sym_bound` records it; `bind_sym_index` enumerates
+`steps` accordingly. On the executor side a slice's chain length cannot come from
+`fixed_len` (there is none), so `Seeds::slice_steps` carries it — and it is populated
+*only* when the contract established `len <= MAX_INDEX_CHAIN`, which is what keeps a
+slice subscript a refusal when it is not bounded. `Indexed` gained `slice_steps` and
+`index_chain` now takes `fixed_len.or(slice_steps)`.
+
+Three corpus entries carry it and each pins a different half: `slice_symbolic_index`
+(verifies, both bounds present), `slice_symbolic_index_tripwire` (must FAIL on the
+postcondition, with `i` pinned non-zero — the evidence the chain depends on the index),
+and `slice_unbounded_length_refused` / `slice_unbounded_index_refused` (each supplies one
+bound and withholds the other, so a rule checking only one would model what it must
+refuse). The tripwire names `xs[i]` *and* `xs[0]`: naming only the literal leaves the
+body's symbolic read unmodelled and the entry comes back a refusal rather than a
+refutation, which a `!is_verified` assertion would accept for the wrong reason — so the
+test asserts `Failed`, not `!is_verified()`.
+
+One shape is left out on purpose. A body reading a *different* symbolic index than the
+contract bounded (`xs[j]` under a contract about `xs[i]`) is modelled, but with two
+64-deep chains the engine returns `Unknown` rather than a refutation, so it is a
+completeness cliff and not a corpus entry: an entry that neither verifies nor refutes is
+not evidence. Coverage went from **51/82 to 52/85** and the test count from 488 to
+**490**.
+
+A second boundary is a consequence of the design and worth stating: a slice's chain
+exists only when the *contract* bounded the length, because `sym_bound` is what the
+executor's `slice_steps` is derived from. So a function whose body reads `xs[i]`
+symbolically but whose contract never names a slice subscript gets no chain and that read
+stays a refusal. An array does not have this coupling — `array_lens` comes from the type,
+not the contract — so a body-only symbolic array read is modelled where the slice one is
+not. The asymmetry loses a proof rather than inventing one, and closing it would mean
+walking the body for slice reads and then proving `len <= 64` for functions that never
+needed slice modelling, so it is left as the honest boundary.
+
+**Stage 4 — the missing intrinsics.** `wrapping_neg`, `wrapping_div`,
+`wrapping_rem`, `leading_zeros`, `trailing_zeros`, `count_ones`, `pow`. The
+`wrapping_*` family is the same arithmetic the `checked_*` arms already do, minus
+the overflow obligation, so it is mostly plumbing. `count_ones` and the zero-counts
+are small bit-vector loops and belong in `discharge-arithmetic` beside the other
+proved primitives, not in the frontend. All of these are now modelled except `pow`
+and the division families that cannot express a zero divisor as a value (see below).
+
+**Stage 4 progress: the two-operand families and the whole unary surface are
+modelled.** `checked_*`, `saturating_*`, `wrapping_*` and `overflowing_*` are all
+computed in the frontend from their operands: the two-operand `overflowing_*`
+shapes share the `failure` predicate the other families read, and were checked
+against `core` over the whole `u8`/`i8` domain. `count_ones`, `leading_zeros` and
+`trailing_zeros` are the bit counts; `neg` and `abs` are modelled in all four
+families. The `Intrinsic` enum was restructured to say so: `Bits(BitKind)` for the
+counts, `Unary(Family, UnOp)` for the operators, and `Overflowing(BinOp)` for the
+`(T, bool)` family. Findings worth more than the coverage:
+
+* **`count_ones`, `leading_zeros` and `trailing_zeros` are the modelled calls whose
+  result width differs from their operand's** (`u8::count_ones` returns `u32`). The
+  model builds the count at the operand's width and zero-extends it to the
+  destination's; the executor reads the destination's width for exactly this reason,
+  and the `eval` signature takes the operand width and the result width separately.
+  Every other shape passes the same value for both, so the change is inert outside
+  these three.
+* **`saturating_neg` and every `abs` do not exist on the unsigned types**, while
+  `wrapping_neg`, `checked_neg` and `overflowing_neg` do -- where negation is modular
+  and the failure case is `x != 0`. So `is_modelled` reads the sign for the unary
+  operators rather than assuming one, and the unsigned `neg` families are modelled
+  rather than refused. This is the one place the four families have different
+  *membership*, not just different definitions.
+* **`MIN` is where the four families separate, and the model has no `MIN` special
+  case anywhere.** `neg` and `abs` share the `0 - x` core; `wrapping_*` return `MIN`
+  there because `0 - MIN` wraps, `saturating_*` clamp to `MAX` through the same
+  overflow predicate, `checked_*` return `None` through it, and `overflowing_*`
+  report it as the flag. One expression plus one predicate, four answers -- so the
+  four cannot drift apart.
+* **An off-by-one in `leading_zeros` was caught by the exhaustive walk.** Counting
+  `x < 2^k` from `k == 1` reports `w - 1` for `x == 0`, where `core` reports `w`.
+  That is one wrong input out of `2^w`, and it is exactly the input the corpus
+  tripwire names -- a sample-based test would have missed it.
+
+* **The `overflowing_*` return is a `(T, bool)` whose components a modelled call
+  writes *field by field*, and the `ret.N` reader had to learn that.** A literal
+  `_0 = (a, b)` stores components under `Proj::Index`; a modelled call writes
+  `_0.0`/`_0.1` under `Proj::Field`. `Env::get` already met both spellings, but two
+  other readers did not: the return-component collector read `elems` only, and
+  `Env::get` itself returned `Unknown` early for a local with no whole value before
+  ever consulting the projected store. The symptom was a `ret.1` contract refused as
+  "the return type is an aggregate, so `ret` has no single value" -- a message about
+  the wrong problem, since the answer was to read the component, not to give up on
+  it. Both readers now go through `get`.
+* **`overflowing_div`/`overflowing_rem` panic on a zero divisor and are refused.**
+  The flag reports `MIN / -1`, which makes the family look like a total form of
+  division -- and the previous session modelled it as one. A differential test
+  against `core` is what exposed it: `7u8.overflowing_div(0)` *unwinds*, it does not
+  return `(_, true)`. So the flag is not the whole failure predicate, and treating
+  the call as total would have let a function that divides by zero be *proved
+  panic-free*. `is_modelled` now admits only `checked_div`/`checked_rem`, and the
+  corpus records why.
+
+`wrapping_div`/`wrapping_rem`/`saturating_div`/`saturating_rem` are *not* reachable
+by design, because they panic on a zero divisor and modelling them as total would
+hide that panic; `overflowing_div`/`overflowing_rem` join them for the same reason.
+`pow` remains reachable and unmodelled. The bit-count proofs do **not** go in `discharge-arithmetic`: their oracle here is Rust's own method, checked
+exhaustively over the whole operand domain, which is a stronger oracle than a
+small-domain enumeration would be. A third engine with less coverage is not a proof,
+so the split the roadmap proposed is not made.
+
+**Ordering rationale.** Stage 1 first because it is the *class* of bug, not one
+bug; doing Stages 2–4 first multiplies the call sites that can forget the sign.
+Stage 2's enum item before Stage 3 because an enum match appears in almost every
+real function and the slice-index case appears in almost none. Stage 4 last
+because it is additive coverage with no soundness content.
+
+**Standing tripwire rule for every stage.** A new shape is not "supported" until
+there is a corpus entry that *verifies* and a tripwire that *fails*. The tripwire
+is the evidence: a shape that only ever verifies is a shape whose model has never
+been contradicted.
+
+## Ferrocene gate: what was verified end to end
+
+The Ferrocene work landed as three commits on `license-arith-mir-oracle` (PR #3):
+
+- `af8818e` — the gate itself: `tools/ferrocene/run.sh` (exit 0 built / 1 real failure /
+  2 no toolchain), `criticalup.toml`, `tools/ferrocene/README.md`, gate 3 in
+  `scripts/gate.sh`, and the `ferrocene` job in `.github/workflows/ci.yml`.
+- `18681e1` — `examples/bare_metal.rs`, the `#![no_std]` `lib` example that *calls the
+  decision procedure*, so the qualified compiler builds the prover itself and not just the
+  types around it. Wired into gate 4 and `run.sh`; `test = true` so the host verdict tests
+  actually run. Test count 463 -> 466.
+- `5bed9d4` — the token goes to CriticalUp on stdin, not as an argument, so it never
+  reaches the process table.
+
+Verified, not assumed:
+
+- Full `scripts/gate.sh`: **12/12 green** on the final head.
+- `run.sh` exercised in all three modes: no toolchain (exit 2, reports and skips), stable
+  rustc named via `FERROCENE_RUSTC` (exit 0, all three builds), bad path (exit 2).
+- `examples/bare_metal.rs` builds for `thumbv7em-none-eabihf` with `--no-default-features`,
+  and its three host tests pass (proved / refuted / refused).
+- `actionlint` clean on `.github/workflows/ci.yml`.
+- CI on `5bed9d4`: **all seven jobs success**. The `ferrocene` job ran and reported its skip
+  rather than passing quietly — steps 5 and 6 `skipped`, step 7 emits the `::warning::`
+  annotation, log reads "No FERROCENE_TOKEN secret; skipping the qualified-toolchain build.
+  This is reported, not passed: the gate did not run." The token is masked (`token: ***`).
+
+`cargo test --workspace` *without* `--features std` fails in `src/smt.rs` lib tests
+(`std::panic::catch_unwind`). That is pre-existing — confirmed identical on a stashed tree —
+and this repository only ever runs tests with `--features std`.
+
+What Ferrocene does *not* buy, stated in the README, the tool's README and here: a qualified
+compiler is not a qualified verifier, and `discharge`'s engine is outside Ferrocene's
+qualification scope. The gate checks the qualified compiler accepts the sources unchanged.
+
+## Stage 3, first half: a contract may name a local that aliases an argument
+
+The roadmap's Stage 3 listed two refusals. The smaller one — `a[k]` where `k` is a
+local — turned out to be a misdiagnosis, and the misdiagnosis is the interesting
+part.
+
+The entry was documented as "there is no variable to build a chain for `k`", with
+`k` assumed to be a local the contract language could not reach. rustc prints no
+local for `k` at all. `let k = i;` where `i: usize` is `Copy` lowers to *no
+instruction*: `a[k]` is `_1[_2]`, and the name `k` survives only as a scoped
+`debug k => _2;` inside `scope 1`. So the body already used the argument as the
+index; only the contract text had `k`. The fix is to resolve the name, not to bind
+anything.
+
+**The parser could not see it.** `MirFn::local_names` keeps the *first* `debug`
+binding per local, and that rule is load-bearing: a scoped `debug s => _1;` after
+`let s = a;` would otherwise rename the parameter `a` to `s`, and a contract
+saying `a <= 127` would find only `s` and be skipped. Keeping the first binding is
+what makes `a` keep meaning `a`. But it means the scoped binding for `k` is
+dropped, so `k` reached the contract parser as nothing.
+
+`MirFn::debug_aliases` now keeps every binding, in printed order, and
+`MirFn::alias_locals` decides which ones may resolve. A name resolves only when
+all four hold:
+
+* the aliased local is an argument — never a temporary;
+* the body never writes that local;
+* the name is not already an argument's own name, so an alias cannot shadow a
+  parameter; and
+* the name does not alias two different arguments.
+
+The `written` set is collected from the *parsed blocks* rather than from the text,
+so it is the parser — which alone knows which lines became statements — that
+decides. This is what makes the rule sound on the dump alone rather than on an
+assumption about what rustc prints today.
+
+**The divergence case, measured.** `let k = i; i = 2;` does *not* print
+`debug k => _2;`. rustc materialises a real local (`let _3: usize;`) and prints
+`debug k => _3;`, so `k` is not an argument alias and is refused — correctly, and
+for a reason the frontend can see rather than one it has to be told. The
+`written` check still has to exist for the case where rustc *does* print the
+alias against a written argument, which is a dump shape this frontend must not
+trust. A parser-level unit test constructs exactly that dump and asserts the name
+is withheld, so a refactor cannot drop the check unnoticed.
+
+**Sign flow.** The alias names go into both `arg_vars` and `signed_args`. The
+second matters as much as the first: a signed `i` aliased as `k` must make `k < 0`
+a signed comparison, which is the class of bug the three-case `Sign` type exists
+to prevent.
+
+**Evidence.** `array_local_index_through_alias` verifies and
+`array_local_index_tripwire` fails with a witness that pins the index — which only
+happens if `k` resolved to the real index variable. `array_local_index_written_refused`
+pins the divergence gate. Two parser unit tests pin the alias rule and the
+`written` gate with no nightly needed. Coverage went from **44/67 to 45/69**, and
+the test count from 466 to **470** (two parser unit tests, one integration test,
+and the renamed corpus entries). Full `scripts/gate.sh`: **12/12 green**.
+
+The slice half of Stage 3 landed in the same branch. Its own section above records the
+soundness hole the original roadmap note had — an index-only bound is not enough, because
+the chain must be exact for *every* index the slice holds, which needs `len <=
+MAX_INDEX_CHAIN` as a second obligation — and the machinery that closes it.
+
+## Stage 3 — enum discriminants are rustc's values, not declaration positions
+
+The enum model numbered variants by their position in the declaration. That is
+right for the common case and wrong the moment the source gives an explicit
+discriminant, and the wrongness is a *false proof* rather than a refusal, because
+the `match` arm constants come from rustc while the contract's variant constant
+came from this reader.
+
+**The bug, measured.** `pub enum Gap { A, B = 3, C }` gives `C` the discriminant
+`4`. The reader dropped the `B = 3` line (it matched no known shape), so its
+layout became `[A, C]` with `C` at position `1`. A contract `requires: g ==
+Gap::C` then pinned the tag to `1`, the body's `switchInt` compared against the
+real constants (`0`, `3`, `4`), and the contract landed on the `B` arm. The
+tripwire `enum_explicit_discriminant_tripwire` — which claims the `B` arm ran —
+was **verified**, i.e. a false contract proved. Before the fix the corpus read
+`decided 46 of 74` with both new tests failing; after, `49 of 78` with both
+refuted.
+
+**Three places carried the position, and all three moved to the discriminant.**
+`EnumDef.variants` is now `(name, payload, discriminant)` and `index_of` returns
+the stored discriminant; `tag_width` is the largest discriminant's width (three
+bits for `4`, not the two a count of three gives); and the tag's assumed domain
+is the *disjunction of the discriminants* rather than `tag < count` — because an
+assumed bound that is *false* for a real input is the unsound direction, it can
+make a proof vacuous. Payload seeds are keyed by discriminant too, matching what
+a `Downcast` projection carries.
+
+**An unreadable discriminant refuses the whole layout.** Only a literal is read
+(decimal, `0x`/`0b`/`0o`, optional type suffix). `B = 1 << 4` is not evaluated:
+dropping the variant would shift every later discriminant and guessing one would
+put a contract on the wrong tag, so the enum is dropped from the map entirely and
+a contract naming any of its variants becomes a refusal. The literal reader
+requires the *whole* remainder to be digits, so `1 << 4` is refused rather than
+silently read as `1`.
+
+**Two built-in hazards closed at the same time.** A qualified name
+(`Shadow::Some`) now resolves against the *declared* layout first, so a user
+`enum Shadow { Some, None }` is not mistaken for `Option` — pre-fix,
+`enum_user_variant_not_option_constructed_tripwire` was **verified** because the
+built-in `Option` numbering put `Some` on tag `1`. And a qualified name whose
+qualifier is not a declared enum *and* not one of the two built-in enums
+(`Option`, `Result`) is refused rather than answered by another layout that
+happens to share the variant name. (The built-in case is the follow-up in the
+next section: a qualified `Option::<u8>::Some` must still resolve, and a
+declared layout must still win over it.)
+
+**Evidence.** Four corpus entries: `enum_explicit_discriminant_selects_by_tag`
+(verifies) with `enum_explicit_discriminant_tripwire` (refuted), and
+`enum_user_variant_not_option` / `..._constructed` (verify) with their two
+tripwires (refuted). Eight unit tests pin the parser and the layout reader with no
+nightly needed, plus two integration tests pinning the earlier array-spelling
+work. Coverage went from **45/69 to 49/78**, the test count from 470 to **480**.
+
+## Stage 3 follow-up — three reader bugs a review found after the discriminant landed
+
+The discriminant work above fixed the *value* a variant has. Three defects in the
+same reader survived it, and all three fail in the same direction: a function
+that should have been checked is instead dropped from the check set or refused,
+and the user is never told. They were found by review, then reproduced against the
+real code before anything was changed.
+
+**1. A refused one-line enum swallowed everything after it.** `enum_head` returns
+the parsed head of an `enum` line. For a one-line body whose discriminant is
+unreadable (`pub enum E { A, B = 1 << 4 }`) it returned "a multi-line body
+follows" — but the closing brace was already on that line. The caller then opened
+an enum *cursor*, and every following line, including `///` contracts and the `fn`
+items they belong to, was consumed as enum contents. Those functions had no
+contract at all, so they were neither verified nor reported as skipped: they
+silently left the check set, which is the worst failure mode a verifier has. The
+head is now a three-way enum — `Inline(variants)`, `MultiLine`, `Refused` — and
+`Refused` drops the layout *without* opening a cursor. The multi-line path already
+closed its cursor at the brace; the one-line path now does too.
+
+**2. A qualified standard construction resolved to nothing.** rustc prints a
+standard construction with its generic arguments: `let o: Option<u8> =
+Option::<u8>::Some(9)` lowers to `_1 = Option::<u8>::Some(const 9_u8)`. The
+qualifier branch split the name on `::`, so the segment before the variant was
+`u8` — the generic argument, not the enum — and `enums.get("u8")` found no layout.
+The construction became an unmodelled read and the `match` an *unmodelled switch
+discriminant*, losing a shape the unqualified spelling (`Some(9)`) handles. The
+fix strips balanced `<…>` generic arguments before splitting, so the qualifier is
+`Option`. Since no source file declares `Option` or `Result`, those two qualifiers
+now resolve to the fixed numbering (`Some`/`Err` = 1, `None`/`Ok` = 0), but only
+*after* a declared layout has had its chance — so a user `enum E { Some, None }`
+still wins over `Option`'s numbering.
+
+**3. A trailing line comment erased the whole enum layout.** `B = 3, // special`
+puts the comma *before* the comment. The variant reader trimmed a trailing comma
+off the raw line, but the line now ends in the comment, so no comma was trimmed
+and `3, // special` went to the discriminant reader, which rejected it — and a
+rejected discriminant drops the *entire* layout. Every contract naming a variant
+of that enum then became a refusal. The comment is not part of the variant, so it
+is stripped first, with string and character literals tracked so a `//` inside one
+is not mistaken for a comment.
+
+**Evidence.** Four corpus entries: `option_qualified_some_payload` and
+`enum_trailing_comment_keeps_the_layout` (verify) with their tripwires (refuted),
+plus six unit tests and two integration tests. Coverage went from **49/78 to
+51/82**, the test count from 480 to **488**. Each fix was checked for teeth by
+reverting it and watching its test fail: without fix 1 the contract after a
+refused enum is gone (`by_fn` is empty); without fix 2 the qualified construction
+is `incomplete (1 reason) - unmodelled switch discriminant`; without fix 3 the
+layout is dropped and the contract is `skipped: unknown name`.
+
+## Toolchain — edition 2024 and the MSRV floor (1.85)
+
+Both manifests are **edition 2024** with `rust-version = "1.85"`. The two numbers
+are one decision, not two: cargo refuses edition 2024 on any compiler below 1.85,
+and 1.85 is the release that stabilised it, so there is no version that takes the
+edition without the floor. Raising one means raising the other.
+
+The floor is a *lower* bound, not a pin. The crate is exercised on current stable
+(1.99 at the time of writing) and the MIR frontend runs a nightly. The oracle
+toolchains move independently and none of them forces the floor down: Verus tracks
+stable (`channel = "1.99.1"`), Kani tracks a nightly (`nightly-2026-10-23`), and
+Ferrocene — the qualified compiler, whose lag is the only one that could matter
+for a safety build — is downstream of Rust 1.96. The MSRV is deliberately *not*
+raised to follow them: a `no_std` crate that ships into a bare-metal safety build
+is the one place a high floor costs something real, because it locks out qualified
+and long-term-support toolchains that lag upstream.
+
+**The migration was three edits, all found by compiling rather than by reading:**
+
+1. `examples/verusdiff.rs` — `filter(|(_, &l)| …)` is rejected in edition 2024
+   ("cannot explicitly dereference within an implicitly-borrowing pattern"); it
+   becomes `filter(|&(_, &l)| …)`.
+2. `tests/loopdiff.rs` — `gen` is a reserved keyword in edition 2024, so `fn gen(`
+   was renamed to `fn make_steps(`.
+3. `discharge-arithmetic/src/prove.rs` — three `.map_or(true, |c| …)` calls became
+   `.is_none_or(|c| …)`. This one is *caused by the MSRV bump*, not by the
+   edition: clippy only suggests `is_none_or` (1.82+) once `rust-version` permits
+   it, so the lint appears exactly when the floor moves. Worth knowing before
+   touching `rust-version` again.
+
+**The floor is now a gate, not a claim.** `scripts/gate.sh` step 13 builds with
+`1.85` (overridable via `DISCHARGE_MSRV`) so a feature newer than the floor fails
+in CI rather than in a downstream build. It follows the Ferrocene/Kani convention:
+an absent toolchain, or a `thumbv7em-none-eabihf` target not installed *for that
+toolchain*, is reported and skipped rather than folded into a pass. CI installs
+both the 1.85 toolchain and that target for it so the gate actually runs. The gate
+numbering is now **13 steps**, not 12; the README and `ci.yml` were renumbered
+with it.
+
+## The bit-blaster walked a DAG as a tree, and no budget noticed
+
+`wrapping_pow` at a *symbolic* exponent hung. Not slowly: the query never returned, so
+`prove` printed no verdict at all, which the previous section already established is worse
+than any verdict. The shape is small -- `u4`, one base variable, one `u32` exponent -- and
+the arena stayed nearly empty, so nothing in the existing guards fired.
+
+The cause is a mismatch between how the term is *built* and how the blaster *walks* it.
+`pow` is a 32-step fold, and every step rebuilds the running product from the same shared
+subterms, so the term is a DAG with heavy sharing. `blast` recurses as if it were a tree:
+it visits a shared subterm once per path to it. For a 32-step fold that is up to 2^32 paths
+through a graph of a few hundred nodes. Instrumenting the walk confirmed it directly --
+u4 needed **more than 10^8 visits** to finish, and the count was identical for the BDD pass
+and the SAT pass because both recurse the same way. That is not a slow answer; it is a hang,
+and the query never reaches the code that would have fallen back.
+
+Two plausible explanations were checked and were wrong before the right one landed:
+
+1. **"The arena overflows."** No. The `overflow` guard at the top of `blast` was added for
+   exactly this fold, but it fires on a *full* node table, and this walk fills nothing --
+   it recomputes. Measurement showed `overflow == false` throughout.
+2. **"The SAT fallback will finish it."** No. The fallback has the same tree-walk recursion
+   over the same DAG, so it hangs identically. A BDD-only memo was tried first and *still
+   hung on `u8`* -- the BDD pass stopped (correctly, via its arena cap) and the SAT pass
+   then hung, with no bound of its own. That is what put a budget on *both* passes; it was
+   only visible by measuring each pass separately.
+
+The fix has two parts, and they are not redundant:
+
+- **A memo on the BDD pass** (`BLAST_MEMO_N` slots in `Ctx`). A hit collapses the paths:
+  the same u4 query drops from more than 10^8 visits to **540**. It is keyed by the term id
+  *including* its generation bits, so the arena reset that recycles slots also invalidates
+  the memo -- no clearing pass, and a stale key can never match a current term. This is the
+  half that buys *capability*: without it a `pow` at any width answers `Unknown`, because
+  the budget below stops the walk before it finishes.
+- **A step budget on both passes** (`MAX_BLAST_STEPS`). The memo is a cache, not a
+  guarantee: a term whose working set exceeds the memo would evict its own entries and
+  recompute. The budget bounds the *work*, and it is the part that makes "never hangs" true
+  rather than likely. When it trips it sets the same `overflow` flag the arena cap sets, so
+  the query degrades along the path that already exists -- BDD to SAT, SAT to `Unknown` --
+  instead of inventing a new one. The SAT pass additionally calls `Cnf::mark_overflow`,
+  because a step-truncated CNF must read as `Unknown`, never as a satisfiable one.
+
+The SAT pass gets the budget but *not* a memo, and that asymmetry is deliberate. The BDD
+memo's soundness is free: the arena is wiped by `with_fresh`, and the memo key carries the
+generation, so a stale entry cannot match. The SAT blaster has no equivalent -- it appends
+gates to a `Cnf` that is reset per query, and a memo of `Lit`s would have to reason about
+whether those gate slots were reused. That is a real obligation, and measurement says it
+buys nothing: a SAT memo changed no verdict, only the latency of the fallback (the same u8
+query took ~80ms with it and ~860ms with the budget alone). So the budget alone carries the
+SAT pass, and no cross-query cache does.
+
+Measured after the fix: `u4` **Valid in ~34ms**, `u6` Valid in ~1.7s, `u8` **Unknown in
+~80ms** -- all three *return*, and none is a wrong answer. `Unknown` at `u8` is honest: the
+BDD diagram genuinely exceeds its cap there, which is the case the SAT fallback exists for,
+and the fallback's own budget then declines rather than guessing.
+
+The regression test is `a_symbolic_pow_returns_a_verdict_instead_of_hanging` in
+`src/mir/intrinsics.rs`. It is *verified to hang without the fix* -- with both the memo and
+the budget neutralised it ran past 90s and was killed -- which is the only thing that makes
+it a regression test rather than a test that happens to pass. Two details matter: it uses a
+*symbolic* exponent, because a concrete exponent unrolls the fold to one path and never
+showed the blow-up; and it accepts `Valid` or `Unknown` but rejects a `Counterexample` or
+`Unsat`, so it pins both termination and that the budget did not let a truncated encoding
+masquerade as a complete one.
+
+The size of the memo is a real constraint, not a free parameter. `Ctx` is already ~1.8 MB
+and lives in a thread-local, so it sits close to the test harness's thread stack: growing it
+by 512 KB overflows that stack. The memo is therefore small on purpose -- 128 slots, about
+33 KB -- and the measurement says that is enough for the fold terms a single query touches
+(`N=64` and `N=256` behave identically to `N=128` on the corpus).
+
+## Stage 2, last bullet: the complement's width comes from the operand, not the destination
+
+The roadmap's final Stage 2 item was one line: `Rvalue::Unary(Not)` is "handled,
+but `!x` is `all_ones ^ x` only when `dest_w` is the operand's width; assert the
+width rather than trusting `dest_w`. Small, and not yet measured against the
+corpus."
+
+Measuring it first, as the roadmap insists, changed the shape of the work. A MIR
+probe of `!x` at `u8`, `i8`, `u32` and `bool` shows rustc always lowers it to
+`_0 = Not(copy _1)` with the destination local declared at the operand's type, so
+`dest_w` *is* the operand's width for every well-typed body. The code was
+therefore not producing wrong answers -- a six-function probe decided 5 of 6, with
+the tripwire correctly refuted and both `!x == 255 - x` and `!x == x ^ 255`
+verified. What the bullet names is a *defensive* concern, not a live bug: the
+mask was derived from `dest_w`, so a body where the dump and the value disagreed
+about the type would have been masked at the wrong width rather than refused.
+
+The fix derives the mask from the operand -- `smt::bits(s)`, the width the value
+actually carries -- and treats `dest_w` as a cross-check: a destination local that
+disagrees is refused (`Val::Unknown`) rather than masked at a width the value does
+not have. The reachable behaviour is unchanged, which is the point: the change
+removes a way to be wrong, it does not change an answer.
+
+**The bigger finding is that the shape had no corpus entry at all.** `!x` is
+common in real Rust and was modelled, but nothing pinned it -- the exact
+"supported until contradicted" gap the standing tripwire rule exists to close.
+Five entries now carry it, and each pins a different half of the model:
+
+* `not_of_zero_is_all_ones` (`u8`) and `not_of_zero_u32_is_all_ones` (`u32`) state
+  the operand's width at two widths, so a mask taken at the wrong width fails the
+  wide one.
+* `not_of_zero_is_minus_one` (`i8`) pins the sign the value keeps -- the same bit
+  pattern read as the operand's type.
+* `not_is_255_minus_x` states the identity symbolically, so the operand is read
+  rather than the answer being a constant.
+* `not_is_always_255_tripwire` is the evidence the operand is read at all: a
+  model that ignored it (a constant `255`, or `all_ones ^ 0`) would prove it. It
+  is refuted with witness `v1:u8 = 1`.
+
+Coverage went from **71/123 to 75/128** decided, and the test
+`the_bitwise_complement_reads_the_operands_width` pins the verdicts so a
+regression is a failure rather than a quiet false proof.
+
+The honest boundary: the *refusal* branch (a `dest_w` that disagrees with the
+operand) is not reachable from well-typed MIR, so it is defensive and untested by
+construction -- no corpus entry can exercise it, because rustc will not emit it.
+The corpus entries pin the reachable half; the refusal is the belt to the
+suspender, kept because the alternative to a refusal is a wrong mask.
+
+## The `&mut [T]` slice argument: `&raw const (fake)` is a reference, not an unknown
+
+A `&mut [u8]` argument was the last open item on the roadmap: `s[0] = v` was
+`incomplete` *before* any write was reached, with `unmodelled assert condition:
+index out of bounds`. Measuring first (the roadmap's rule) is what made the cause
+visible. The frontend reads rustc's *unoptimised* `--emit=mir`, and at that
+setting the bounds check on a mutable slice lowers differently from the immutable
+one:
+
+```
+fn first_of(_1: &[u8]) -> u8            fn first_of_mut(_1: &mut [u8]) -> u8
+    _3 = PtrMetadata(copy _1);              _3 = &raw const (fake) (*_1);
+                                            _4 = PtrMetadata(move _3);
+    _4 = Lt(copy _2, copy _3);              _5 = Lt(copy _2, copy _4);
+```
+
+The immutable form hands `PtrMetadata` the slice local directly; the mutable form
+first takes a *raw reborrow* of the deref, `&raw const (fake) (*_1)`, and asks
+`PtrMetadata` of that. Two pieces of that string were unparsed:
+
+* `&raw const` / `&raw mut` — the raw-borrow prefix. The parser's reference arm
+  stripped only `&` and `&mut`, so it was left with `raw const (fake) (*_1)`,
+  which is not a place.
+* `(fake)` — a marker rustc prints on the place of a raw reborrow that does not
+  correspond to a real local. It names the same place as its operand, so it is not
+  a projection.
+
+Either one alone was enough to make `_3` an unknown, and an unknown length makes
+the bounds-check `assert` unmodellable, which refuses the whole function. The fix
+is two small parses: `&raw const ` / `&raw mut ` are read as `Rvalue::Ref` (both
+name a place, exactly as `&` does), and a leading `(fake)` is stripped from the
+place. The `(fake)` strip has to happen in `parse_rvalue`, *before* `parse_place`:
+`strip_annot` sees `(fake) (*_1)`, reads it as an annotated place, and strips the
+outer parentheses to `fake) (*_1)` — so the marker is removed at the reference arm
+where the raw prefix is already known.
+
+This is the conservative reading: `(fake)` is dropped because it carries no
+projection, and the raw borrow is a `Ref` because it names a place — the same
+`Rvalue::Ref` an `&` produces. Nothing is guessed about what a pointer *is*; the
+mapping `resolve` consults is recorded exactly as for `&`.
+
+**Corpus.** Three entries now carry the slice shape, and they separate the two
+things a write can get wrong:
+
+* `mut_ref_slice_write_then_read` (`requires: s.len() > 0`) *verifies* — a write
+  then a read of the same index returns what was written, and the length
+  precondition discharges the bounds check. This is the entry that proves the
+  write reaches the store the read consults: had it landed anywhere else, the read
+  would find the seeded element and the contract would be refuted.
+* `mut_ref_slice_write_then_read_tripwire` is the same body claiming the
+  *pre-write* value (`ret == s[0]`), which is false — a model that dropped the
+  write would leave the seed readable and prove it. It is refuted.
+* `mut_ref_slice_write_then_symbolic_read` (`i == 0`) is the symbolic-index half:
+  the ite chain must be evaluated against the written element, so the false
+  contract is refuted rather than left undecided.
+
+Coverage went from **75/128 to 76/131** decided. `tests/mir.rs` pins the verdicts
+by name (`a_slice_element_write_reaches_the_store_the_read_consults`,
+`a_slice_element_write_reaches_the_symbolic_chain`), and a unit test
+(`a_raw_fake_reborrow_parses_as_a_reference`) pins the parse itself, so the guard
+runs even without a nightly toolchain.
+
+The honest boundary: only the *write-through-`&mut`* path was the gap. The
+immutable `&[T]` read (`first_of`) already worked, and `&mut [T; N]` already
+worked through a plain reborrow — the raw form appears only for a `&mut` *slice*,
+which is why the array tripwire (`mut_ref_array_write_then_symbolic_read`) and the
+slice one are separate entries rather than one.
+
+## A `match` on a standard-library enum *argument*: the layout no source declares
+
+Stage 3 taught the reader that `Option` and `Result` have a fixed numbering no
+source file declares, so a *construction* (`Option::<u8>::Some(9)`) resolves
+without a layout. The *argument* form was still missing: `match x { Some(_) => …,
+None => … }` where `x: Option<u8>` came back `incomplete: unmodelled switch
+discriminant`. A `match` on a declared enum argument (`Mode`) verified, and a
+locally constructed `Option` verified — only the standard enum **as an argument**
+was refused, which is the shape a real function has when it takes `Option<T>` or
+threads a `Result`.
+
+The cause is in `field_env`'s argument dispatch. An enum argument's tag is a
+symbolic input, seeded from the argument's `EnumDef`; the dispatch looks that
+layout up in `enums`, which is keyed by enums *declared in the source*. `Option`
+and `Result` are never declared, so the lookup missed, no tag was seeded, and the
+`switchInt` on `discriminant(_1)` had nothing to compare against. The
+construction path already had the fixed numbering; the argument path had no
+layout at all.
+
+The fix reconstructs the layout from the type's own generic arguments
+(`std_enum_def`): `Option<T>` is `None`/`Some(T)` at tags `0`/`1`, and
+`Result<T, E>` is `Ok(T)`/`Err(E)`. The argument list is split at the *top level*,
+so a nested payload (`Result<Option<u8>, u8>`) stays one type rather than being
+cut at its own comma and read as two. A *declared* layout is consulted first, so
+`Shadow { Some, None }` is still `Shadow` and not `Option` — the same ordering
+`variant_index` already pins for constructions. Anything else (`Mode`, a malformed
+`Option<u8>X`, a one-argument `Result<u8>`) yields no layout, which leaves the
+argument unbound and the function refused — the conservative direction.
+
+**Corpus.** Six entries, and they separate the tag from the payload:
+
+* `option_arg_match` and `result_arg_match` verify (`ret <= 1` for both arms),
+  which only holds if the tag is seeded and the `switchInt` decides.
+* `option_arg_match_tripwire` and `result_arg_match_tripwire` claim one arm's
+  value and are refuted — a *constant* tag would take one arm always and prove
+  them.
+* `option_arg_payload_passthrough` (`ensures: ret <= x.Some`) and
+  `option_arg_payload_tripwire` (`ret == x.Some + 1`) pin the *payload*: the
+  body's downcast read `((_1 as Some).0)` must name the same seeded variable the
+  contract's `x.Some` does. A tautology such as `ret <= 255` would hold even if
+  the payload came back unconstrained, so it would pin nothing.
+
+Coverage went from **76/131 to 79/137** decided. `tests/mir.rs` pins the corpus
+verdicts by name, and a second test writes the shape to an isolated file so the
+fix is pinned even if the corpus entry is edited; `spec::tests` pins
+`std_enum_def` directly (both enums, the nested split, and the refusals), so the
+guard runs without a nightly toolchain.
+
+The honest boundary: only `Option` and `Result` are reconstructed, because they
+are the two the reader already names in `variant_index`. A user enum is declared
+and read normally; a *different* standard-library enum (`Poll`, `ControlFlow`)
+still has no layout, so an argument of one is refused rather than guessed — the
+right answer, since guessing a numbering is exactly the failure `Shadow` guards
+against.
+
+## A cast in a *contract*: the same extension rule the body already obeys
+
+The body has modelled `as` for a while — it is what lets a narrow argument meet a
+wide return — but the contract language had no cast at all, so `ret == x as u32`
+came back `cannot read contract`. Any contract that related a narrow argument to a
+wide return was therefore unreadable, which is a dropped obligation: a contract the
+parser cannot read is a function that never gets checked. The corpus never used a
+cast in a contract, so nothing tripped over it; the probe found it.
+
+`cast_chain` applies `as <type>` to an atom, left to right, and returns the value
+with the target's width and sign. The rule is *extension*, not reinterpretation:
+`-1i8 as i16` is `-1`, not `255`. A widening cast of a signed source sign-extends;
+an unsigned source zero-fills (`truncate`); a narrowing cast keeps the low bits.
+This is the same rule the body's `Rvalue::Cast` already implements, and for the
+same reason: zero-filling a signed value would prove `-1i8 as i16 == 255`, a
+reachable false proof.
+
+A cast chain is well-defined even when the first source's sign is not, because each
+step's source sign is the previous step's *target* sign — which the cast just set.
+So `x as u16 as u32` is two zero-fills from an unsigned source and two sign-fills
+from a signed one, and the chain always carries a known sign after the first cast.
+
+**The rule pinned by the corpus, not by a claim.** Nine entries, five true and four
+tripwires. The one that matters is the pair
+`contract_cast_signed_to_unsigned` (`-1i8 as u16 == 65535`, verifying) and
+`contract_cast_signed_to_unsigned_tripwire` (`== 255`, refuted, witness `x == -1`).
+Rust sign-extends through a widening cast *even when the target is unsigned*, so a
+contract cast that zero-filled would refute the true entry and prove the false one —
+the pair separates the two rules. `contract_cast_narrows_tripwire`
+(`256 as u8 == 1` is false; `256` keeps the low byte `0`) pins *which* bits
+narrowing keeps, and the chain pair pins left-to-right application.
+
+Coverage went from **79/137 to 84/146** decided. `tests/mir.rs` pins the corpus
+verdicts and writes the shape to an isolated file; a `spec::tests` unit test pins
+the width-and-sign rule (`x as u32` is 32-bit unsigned, `x as i32` is 32-bit
+signed, `x as u16 as i32` ends 32-bit signed), so the parse rule has a guard that
+runs without a nightly toolchain.
+
+The honest boundary: the target is read as a *simple* type name, so a cast to a
+generic or path type (`x as Vec<u8>`, `x as T`) is not applied — the `as` is left
+unconsumed and reported as a trailing token, a refusal rather than a guess. That is
+the right direction: a cast whose target width is unknown cannot be sized, and
+sizing it wrongly is the failure the whole rule exists to prevent.
+
+## The missing contract operators, and the precedence they exposed
+
+The contract expression language had `+ - * & | ^` but no `/ % << >>`, so a
+contract that named a quotient, a remainder or a shift was *unreadable* — a
+dropped obligation, since a contract the parser cannot read is a function that
+silently leaves the check set. The SMT layer already had every one of them
+(`shl`, `lshr`, `ashr`, `udiv`, `urem`, `sdiv`, `srem`) and the body used them;
+only the parser never reached them.
+
+Adding them exposed a second, quieter problem. The reader had just **two** levels
+and put `|`/`^` beside `+`/`-` and `&` beside `*`, which is not Rust's order. So
+`x & 1 + 1` was read as `(x & 1) + 1` where Rust means `x & (1 + 1)` — a
+*different value*, not a different proof. That is a correctness trap rather than
+a convenience: a contract can pass or fail against the wrong number. It had
+stayed latent only because no contract in the corpus mixed the levels.
+
+The parser is now a proper ladder, Rust's own order from loosest to tightest:
+`|` < `^` < `&` < `<< >>` < `+ -` < `* / %`. Each level's operands are the next
+tighter one, `parse_expr` is the entry point at the loosest level, and the width
+`align_widths` and sign propagation are unchanged at every level.
+
+Four rules came with the new operators, each mirroring a choice the body already
+makes:
+
+* **A shift's result has the left operand's width**, so the amount is a *count*
+  and the two operands are deliberately not width-aligned — the one place the
+  `align_widths` rule does not apply.
+* **`>>` follows the left operand's sign.** `-8i8 >> 1` is `-4` (arithmetic), not
+  a large positive (logical). The sign the parser carries through decides it, the
+  same as the body's `shift_kind`.
+* **The shift amount must be a constant.** A symbolic amount is a barrel shifter
+  (`smt::shift_var`), and modelling one in a contract would mean agreeing with the
+  body about the amount reaching the width — a case rustc turns into a panic
+  first. Rather than guess at that interaction, a symbolic amount is refused, so
+  the function stays visibly undecided. A constant at or above the width is a
+  compile error in Rust and is refused too.
+* **`/` and `%` take the signed engine when either operand is signed**, the same
+  choice the body makes: the unsigned divider returns a huge positive quotient for
+  `-7 / 2`, a wrong value rather than a weaker proof. A literal zero divisor is
+  refused — Rust rejects it at compile time, so such a contract is malformed.
+
+**Pinned by evidence, not by a claim.** Sixteen corpus entries, nine true and
+seven tripwires. The signed pair with teeth is
+`contract_shr_signed_is_arithmetic` (`-8i8 >> 1 == -4`, verifying) and its
+tripwire (`== -1`, refuted, witness `x == -8` as the bit pattern `248`) — a
+*logical* shift would give a large positive and could never be `-1`. The
+precedence pairs are the ones that catch a wrong tree: `contract_precedence_and_over_add`
+(`x & 1 + 1 == x & 2`) verifies while its tripwire is refuted at `x == 1`, the one
+input where `x & (1 + 1)` and `(x & 1) + 1` differ. `contract_sdiv`/`contract_srem`
+(`-7 / 2 == -3`, `-7 % 2 == -1`) separate the signed divider from the unsigned.
+
+Coverage went from **84/146 to 93/161** decided. `tests/mir.rs` pins the corpus
+verdicts and writes each operator shape to an isolated file; a `spec::tests` unit
+test evaluates `x & 1 + 1`, `x + 1 << 1`, `x | 1 ^ 1` and `8 / 4 / 2` on the
+engine, so a wrong tree shows up as a wrong *number* with no toolchain needed.
+
+Two of my own assertions were wrong first and the tests caught them: I initially
+put the additive level at the *bottom* of the ladder (reading `x & 1 + 1` as
+`(x & 1) + 1`, which the tripwire refuted), and I wrote the unit test expecting
+`x + 1 << 1` to be `3` when Rust makes it `4`. The code was right the second time
+only because the tripwire disagreed with it first.
+
+The honest boundary: `<<`/`>>` with a *symbolic* amount are refused, as above, and
+a division or remainder by a literal zero is refused. Both are refusals rather
+than guesses, which is the direction this crate always takes.
+
+## A 128-bit type was a panic, not a refusal
+
+Adding the contract operators put `as u128` within reach of a probe, and the tool
+*died* on it: `panicked at src/smt.rs:2546: width must be 1..=64`. That is the
+worst failure mode in a verifier — not a wrong answer, not a refusal, but a crash
+that reports nothing and takes the run down. It was **pre-existing**: `x as u128`
+in a *body* panicked too, and so did a `u128` argument, a `u128` local in a loop,
+and a `u128` return. My new contract path only made it easier to reach.
+
+The cause is one line. `Ty::width()` reports `128` for `u128`/`i128`, but every
+width-taking constructor in the engine (`smt::var`, `var_named`, `truncate`, …)
+asserts `1..=64`. So a 128-bit type parses, claims a width, and then asserts in
+whichever constructor reaches it first — the argument seeding in `exec`, the loop
+havoc, or the contract bindings. The fix is to decide the question *before* any of
+them: `Ty::has_unrepresentable_leaf` (recursive, so `[u128; 4]`, `(u128, u8)` and
+`&u128` are caught by their leaf) and a guard at the top of `verify_function` that
+refuses the whole function. Refusing at that one point is what makes the refusal
+*whole*; a partial patch would leave the other paths panicking.
+
+The guard has to come from **two** places, because a 128-bit type can enter from
+either side:
+
+* the **function's own types** — argument, local, return — via
+  `first_unrepresentable_type` at the top of `verify_function`;
+* the **contract text**, where `ret == x as u128` names no 128-bit local at all.
+  `cast_chain` now returns a `Result` and refuses a target wider than 64 bits, with
+  a message that blames the engine rather than the syntax — a `break` would have
+  left `as` as a trailing token and reported a parse error for well-formed Rust.
+
+`Ty::width()` still reports 128 on purpose: the *constant reader* needs it to
+compute `u128::MAX` and the two's-complement pattern of a negative literal, and
+refusing the width there would turn a readable constant into `Other`. It is the
+*local*, not the constant, that must never reach a width assertion, and
+`has_unrepresentable_leaf` is the one place that is decided.
+
+Pinned by five corpus entries and two tests. Four entries refuse (`wide_arg`,
+`wide_return`, `wide_local_in_loop`, `wide_cast_in_contract`) and one,
+`narrow_64_still_works`, verifies — so the guard is about the function's width, not
+a blanket refusal of anything mentioning 128 bits. `tests/mir.rs` asserts each of
+the four is a `Skipped` carrying a reason (a panic would fail the run rather than
+the assertion), and a `spec`-level test writes `ret == x as u128` to an isolated
+file so the parser refusal does not depend on the corpus. Coverage went from
+**93/161 to 94/166** decided; the five new entries are four refusals and one
+verification, which is why the decided *count* moved by one and the total by five.
+
+The honest boundary: a function with any 128-bit type, or a contract casting to
+one, is refused outright. Modelling 128-bit arithmetic would need the engine's
+words widened past 64 bits, which is a change to the engine rather than to the
+frontend, and is not attempted here.
+
+## A negated literal reported itself unsigned, and `/ % >>` read a different number
+
+The signedness flag is what `%`, `/` and `>>` consult to choose the signed engine
+over the unsigned one, and it is inferred from the **names** in an expression: an
+expression is signed when any name in it is. That is exact for the shapes the
+corpus had, because every signed entry pinned a symbolic argument (`requires: x ==
+-7; ensures: ret == -1`). It is not exact for `-7 % 3`, which has no name at all.
+
+`parse_atom`'s unary minus passed the *operand's* flag through, and the operand of
+`-7` is the literal `7`, which is unsigned. So `-7 % 3` came out unsigned and took
+`urem`: `4294967289 % 3`, which is `0`, where Rust says `-1`. Same for `-7 / 2`
+(`2147483641` instead of `-3`) and `-8 >> 1` (`2147483644` instead of `-4`).
+
+The failure mode is the one that matters most here. It was not a refusal and not a
+`Skipped` — it was a **wrong value**, and it pointed the dangerous way: a *false*
+postcondition would have been refuted (fine), but the tripwires I wrote to catch a
+wrong engine would have **verified**, which manufactures a false proof. A verifier
+that returns a confident `verified` on a false statement is worse than one that
+crashes, and that is exactly the direction this bug leaned.
+
+The fix is one line, and the reasoning is what makes it safe rather than a patch:
+**negation is only defined on a signed type in Rust** (`let x: u32 = -1;` does not
+compile), so a negation is itself the evidence that the expression is signed. The
+flag is set to `true` unconditionally, not `operand_sgn || true` — the operand's
+flag is discarded because it is about the wrong thing.
+
+It was found the same way the 128-bit crash was: the earlier fix (`/ % << >>`) made
+a shape *reachable* that nothing had reached, and probing it against values I could
+check by hand showed three "postcondition holds for no input" results where rustc
+says the postcondition is true on every input.
+
+Pinned by seven corpus entries (four that must verify, three tripwires that must be
+refuted or vacuous) and two tests. The `spec` unit test asserts the flag
+*directly* — `-7` is signed, `7` is not — because the flag, not the value, is the
+thing that broke; and it checks the value is still a value negation (`0xF9` at 8
+bits), so a "fix" that made negation mean something else fails. The `tests/mir.rs`
+test writes each pair to an isolated file and asserts **both** directions, so
+flipping the flag the wrong way fails there too. The same flag also decides a
+*comparison* (`slt` versus `ult`), which is why `-7 < 3` was unsatisfiable rather
+than false, and two of the entries pin that second family. Coverage **94/166 to
+98/173** decided.
+
+## Unary `-` binds tighter than `as`, and the parser had it the other way round
+
+The same probing that found the signedness bug found this one immediately after:
+the fix made `-x as u8` reachable, and it read as `-(x as u8)` where Rust means
+`(-x) as u8`.
+
+The **value** is the same either way — negation and truncation commute — so no
+value-based test could see it. The **type** is not: Rust's is `u8`, and `-(...)` is
+signed. That difference is observable through a comparison, because the flag is
+what `slt`/`ult` read. `-x as u8 > 127` is satisfiable under the unsigned reading
+(`x == 1` gives `255`), and unsatisfiable under the signed one (`i8` is never
+`> 127`), so the tool reported a *verifiable* function as **vacuous**.
+
+Rust states the precedence itself: `let x: u32 = 0; let y = -x as u8;` fails with
+"cannot apply unary operator `-` to type `u32`", which is only true if the negation
+is applied to `x` *before* the cast. (Against a signed `x` it compiles, and there
+the negation is on the signed value, still before the cast.)
+
+The fix splits the old single `parse_atom` level into `parse_neg` (the unary minus,
+applied to the primary) and `parse_cast` (that result, then the `as` chain), with
+`parse_mul` now entering at `parse_cast`. The four `cast_chain` calls that used to
+sit on `parse_atom`'s leaves are gone, so a cast has one home.
+
+Pinned by three corpus entries and two tests. The corpus tripwire is the one to
+watch: `requires: x == 1; ensures: -x as u8 < 127` is *false* on the unsigned `u8`
+(`255 < 127`), so it must be refuted — under the signed reading it would **verify**,
+which is a false proof. The `spec` unit test asserts the flag on `-x as u8` (must be
+unsigned), on `(-x) as u8` (also unsigned), and on a bare `-x` (still signed, so the
+previous fix stands). Coverage **98/173 to 100/176** decided.
+
+Three bugs, one shape: each fix made a shape reachable that nothing had reached, and
+probing it against hand-checked answers found the next. The first two were refusals
+or crashes; this one and the signedness bug were *wrong values*, which is the
+direction a verifier must never fail in.
+
+## The gap that let the early bugs through: no oracle covered the contract reader
+
+The crate has five differential oracles (z3, Kani, Lean, Coq, Verus) and every one
+of them builds its terms with `smt::` calls directly. They all start *below* the
+contract reader — the layer where the first three bugs above lived. So a whole layer had
+no independent check, and those bugs were found by hand-probing rather than by a gate.
+
+`the_contract_reader_agrees_with_rustc_on_a_grid` in `tests/mir.rs` closes that gap
+using the one decision procedure that *defines* Rust: `rustc` itself. Two
+constructions, because the bugs needed different ones:
+
+* **Value.** The function's body *is* the expression, so `ret` is rustc's value; the
+  postcondition `ret == <expr>` asserts the reader's value at the same point. The
+  function verifies exactly when they agree. This catches a wrong *value* — the
+  signedness bug, where `-7 % 3` was read as `0`.
+* **Guard.** The precondition is `x == v && <expr> > t` and the body returns `1`, so
+  the function verifies iff rustc says the comparison holds. This catches a wrong
+  *type*: `-x as u8` and `-(x as u8)` have the same value, so no value check can see
+  the difference, but only one is `u8`, and the comparison is what reads the type.
+
+The oracle did not stop at three. It made the next bugs *reachable*: with the reader
+now trusted on the shapes the grid already covered, probing the neighbouring shapes —
+`!` on a value, a constant *expression* where a literal was expected — found two more
+(a wrong verdict from `!x == 5`, and a definite verdict built on `srem(x, 0)`), both
+of which the grid now pins. That is the point of an oracle over a hand-written test
+list: it makes the next shape a single line to add rather than a new investigation.
+
+The grid is the point: one value per expression would have missed the signedness bug.
+Each case runs the type's extremes, `-1`, `0`, `1`.
+
+**The oracle is checked against the bugs it exists for.** A test that passes on both
+the fixed and the broken code is decoration, so each fix was reverted in turn and the
+oracle confirmed to fail: reverting the signedness fix makes it report `-7 % 3` at
+`x == 0` as a disagreement; reverting the cast precedence makes it report `-x as u8`
+at `x == 1` as vacuous where rustc says satisfiable. That the *guard* construction was
+needed for the second one is itself the finding — the value construction passes on the
+broken cast code, which is exactly why no value-based test caught that bug.
+
+What it does not cover, stated plainly: the grid is finite, so it is not a proof of
+completeness; and it checks the reader's direct evaluation, not the translation to
+SMT, which the z3 oracle covers. Together they span contract text to verdict.
+
+## `!` on a value is bitwise NOT, and it binds tighter than `==`
+
+The oracle above earned its keep immediately. Probing `!` found a fourth bug, and it
+is the same shape as the other three: the parser picked a different meaning than Rust
+for the same characters.
+
+`!` was handled only at the *predicate* level, where it negates a comparison. But in
+Rust `!` is a unary prefix on a *value*, binding tighter than `==`, and on an integer
+it is *bitwise* NOT. So `!x == 5` was read as the predicate `!(x == 5)` — that is,
+`x != 5` — where Rust means `(!x) == 5`, which for a `u8` is `x == 250`. Two different
+predicates: a **wrong verdict**, not a refusal. And a bare `!x` was not readable at
+all, which *dropped* the obligation.
+
+The fix splits the two readings. `bang_is_predicate` looks at the token after the `!`:
+`!(...)` with a comparator inside, or `!true`/`!false`, is the predicate form and stays
+at `parse_cmp`; anything else is a value form, handled as a prefix in `parse_neg`,
+where it is `x ^ all_ones` — the same term `mir/exec.rs` builds for `UnOp::Not`. The
+`!` is a prefix on the operand, so `!1 + 1` is `(!1) + 1` and `x & !1` is `x & (!1)`.
+
+Pinned by four corpus entries (verify / refute / verify / verify) and one unit test
+that asserts both readings of `!x == 5` as *predicates*, so the discriminator is the
+predicate itself rather than a value. Coverage **100/176 to 103/180**.
+
+One honest note on the corpus entry that looks like a tripwire but is not. The two
+readings of `!x == 5` are `x == 250` (Rust) and `x != 5` (the bug), and the second is
+*broader* — it admits every input the first does, and more. A broader precondition can
+only produce false *refutations*, never a false proof, so there is no reverse-tripwire
+direction to pin here; the entry that accompanies the verifiable one is a *control*
+that must refute under both readings, which shows the tool is not simply verifying
+everything. The false-proof direction for `!` is the bare `!x`, and that one was a
+dropped obligation rather than a wrong verdict, because it did not parse.
+
+## A constant expression is not a literal: fold it, then classify it
+
+Probing the precedence grid after the `!` fix found a fifth bug, and it is about *when*
+a value is inspected rather than *how* it is parsed. `const_of` answers "is this term a
+literal node", and two places asked it where the right question was "does this term
+*fold* to a constant":
+
+- **A shift amount.** `x >> 1 + 1` is `x >> 2`; Rust folds the amount. The reader
+  tested the operand with `const_of`, saw an add rather than a literal, and refused the
+  contract ("a shift amount in a contract must be a constant") — a *dropped obligation*
+  on a shape rustc compiles. The body side had the same test, so `x >> 1 + 1` in a body
+  became a symbolic barrel shifter and the query came back `Incomplete`.
+- **A divisor.** `x % (1 - 1)` is `x % 0`; Rust folds it and the `unconditional_panic`
+  lint rejects it at compile time. The zero guard used `const_of`, so it recognised the
+  literal `0` but *not* the folded `1 - 1`. The reader built `srem(x, 0)` — an undefined
+  operation the engine nonetheless evaluates — and returned a **definite verdict** from
+  it. That is a wrong verdict, the one outcome a verifier must not produce, and it is
+  the same class as the `!x == 5` bug: a decision made where a refusal was owed.
+
+The fix is to fold before classifying, with the helpers the parser already has:
+`const_value` in the contract reader (which is `smt::evaluate` with no assignment) and
+`smt::evaluate` in the body. A *symbolic* shift amount is still refused and a *symbolic*
+divisor is still modelled exactly, so the conservative behaviours are unchanged; only
+the misclassified *constant* moves.
+
+Pinned by four corpus entries, one integration test (`a_folded_constant_is_read_as_a_
+constant`) that asserts both the read case and the refusal case, and one unit test that
+checks the parse directly. Both halves are sensitive: reverting the divisor guard makes
+the integration test fail with `FAILED: postcondition — v1:u8 = 3`, the verdict built on
+`srem(x, 0)`. rustc treats `x % 0`, `x % (1 - 1)` and `x % (2 - 2)` identically under
+`unconditional_panic`, which is the evidence that refusing them alike is right.
+
+
+## After a fix, probe the neighbours — and be honest when they are already right
+
+The two bugs above came out of probing the shapes *around* a fix. So after the folded-
+constant fix I probed the four neighbouring precedences against `rustc` directly: `&`
+vs `|`, `>>` vs `==`, a cast vs `+`, and unary `-` vs a cast and `%`. All four were
+already correct. That is a coverage result, not a fix, and the write-up says so — a
+changelog that called each probe a "bug found" would be dishonest, and the next reader
+would not know which commits to trust.
+
+What the batch adds is *evidence* for shapes that were "supported until contradicted":
+six corpus entries with their tripwires, asserted end to end in
+`contract_operators_and_their_precedence`, and four rows in the rustc grid. Coverage
+**109/187 to 115/195**.
+
+Two shapes are left out of the grid on purpose, and the source says why, because a
+silent omission reads as an oversight:
+
+- `x >> 1 == 2` in *guard* mode would append `> 0` and produce `x >> 1 == 2 > 0`, a
+  chained comparison rustc rejects. The comparison is already a predicate, so value
+  mode is the only construction that fits.
+- `x as i16 * 2` in guard mode builds an `i16 * i16` body, whose overflow assert the
+  engine declines to model (`wide > 16`). The probe is then undecided and the guard
+  cannot read the comparison. That is the documented BDD scaling wall, not a gap.
+
+The general rule: a grid row is only evidence when *both* the probe and the assertion
+are decided. A row that fails for a reason unrelated to the property under test is
+worse than no row, because it looks like a check and is not one.
+
+## Bug 6: a radix literal was read as decimal -- a false proof
+
+The sixth bug is the worst family in this file, and the first *false proof*: the
+tokenizer read every numeric literal as decimal. The digit run stopped at the `x` of
+`0xFF` and the rest was skipped as a type suffix, so the value was `0`. In a
+precondition that is not a refusal, it is a wrong *number*:
+
+```rust
+/// requires: x == 0xFF     // read as `x == 0`
+/// ensures: ret == 0       // "proved" for a body returning `255`
+pub fn f(x: u8) -> u8 { x }
+```
+
+The tool reported **verified**. `0b1010` became `0`, `0o17` became `0`. A false proof
+is the one outcome the whole crate exists to prevent, so this is the most serious
+entry in the series; the earlier five were dropped obligations or, in the folded-zero
+case, a definite verdict from an undefined operation -- bad, but not a proof of
+something untrue.
+
+The fix reads each literal at its radix (`0x`/`0b`/`0o`, underscores, an optional
+integer suffix) and, just as important, *refuses* one that is not an exact integer
+rather than taking a partial value: `0b12`, `0o9`, `0xg`, `0xFFg`, and anything past
+`u64` are `Skipped`, not silently truncated. A new `Tok::BadNum` carries that
+refusal, so the parser reports "a numeric literal that is not an exact integer"
+instead of `0`. The fix is worth nothing without the refusal half: reading at the
+radix but still swallowing a bad digit would have traded one silent number for
+another.
+
+Found by a *discriminating* probe, which is the lesson. My first literal probes
+(`requires: x == 0xFF`, `ensures: ret == 255`, body `255`) **verified** -- and would
+have verified under either reading, so they proved nothing. The probe only had teeth
+when the body returned the argument and the postcondition named the value: correct
+reading gives `x == 255`, body `255`, holds; truncating reading gives `x == 0`, body
+`0`, refuted. A test that passes under the bug is not a test. Every literal probe in
+the corpus now has the `_control` companion that returns the argument, so the
+truncated reading is a *refutation*, not a pass.
+
+Evidence: `a_radix_literal_is_read_at_its_radix` (spec unit test, parse-level),
+`a_radix_literal_is_read_at_its_radix` (integration, corpus + the `_control`),
+six corpus entries, six rows in the rustc grid. The grid rows are the differential
+form: `expr` is both the body (compiled by rustc to the true value) and the
+postcondition (parsed by the reader), so a decimal-only reader shows up as a
+disagreement, not as a silent pass. Reverting the radix read makes the grid fail with
+`0xFF` expected `verified=true`, got `skipped` -- the oracle is sensitive.
+
+Coverage **115/195 to 120/201**, test-count 540 to 542. Gate green.
+
+## Bug 7: a signed-width literal wrapped instead of being refused -- a false proof
+
+The seventh bug is the second *false proof*, and it is Bug 6's mirror image. The
+tokenizer was fixed to read the right *number*, but the width check that decides
+whether that number fits the operand asked only about *unsigned* bits. `128` for an
+`i8` fits in eight bits, so it was accepted -- and the eight bits are `0x80`, which
+`i8` reads as `-128`:
+
+```rust
+/// requires: x <= 128     // read as `x <= -128`
+/// ensures: ret != 127    // "proved", because `x <= -128` excludes nothing
+pub fn f(x: i8) -> i8 { x }
+```
+
+rustc rejects `x <= 128` for an `i8` ("literal out of range for `i8`"), and the tool
+reported **verified**. The wrapping was invisible because the literal was built at
+exactly the operand's width and `align_widths` returned early on equal widths -- the
+signed-range check in `resize_const` never ran. The negation path had the same hole
+from the other side: `-129` for an `i8` is `127` at eight bits, so `x >= -129` was
+read as `x >= 127` and `ensures: ret >= 0` "held" under a precondition that admits
+nothing.
+
+The fix has two halves:
+
+* `align_widths` no longer short-circuits on equal widths; it resizes the constant
+  operand (a no-op term at equal width, but the range check runs) and carries each
+  operand's own signedness. `resize_const` takes that flag: a bare literal is
+  non-negative and is checked as `+val`, while a signed bound (`i8::MIN`) or a
+  negation is checked as its two's-complement value. That distinction is what lets
+  `128` be refused while `i8::MIN` -- the same bit pattern `0x80` -- still reads.
+* `parse_neg` widens a negated constant by one bit when its magnitude does not fit
+  signed at its own width, so `-129` survives as `-129` for the check to refuse
+  instead of wrapping to `127`.
+
+`i8::MIN` is unaffected because it is a *named* bound built by `type_bound`, not a
+bare literal; a fix that refused every `0x80` would have broken it, which is why the
+corpus pins both sides.
+
+A third site had the same hole: a comparison between *two constants*, where neither
+operand is a typed name and the width comes from the literal itself. `align_widths`
+aligned the two and returned without a fit check, so `128 <= i8::MAX` -- a `literal
+out of range for i8` error in Rust -- read as `-128 <= 127`, always true. The check
+now runs on both operands even when both are constants, so the shape is refused while
+`127 <= i8::MAX` and `i8::MIN <= i8::MAX` still read.
+
+Evidence: `an_out_of_range_literal_is_refused_at_the_operand_width` (spec unit test,
+parse-level), `an_out_of_range_literal_is_refused_not_wrapped` (integration, six
+corpus entries -- three refusals and the three legal boundaries), six corpus entries.
+The integration test is sensitive in every half: reverting the `align_widths`
+change makes `contract_out_of_range_literal_is_refused` *verify* (the false proof),
+reverting the `parse_neg` widening makes `contract_out_of_range_negation_is_refused`
+verify, and reverting the two-constant check makes
+`contract_constant_vs_constant_out_of_range` verify. Each was checked by reverting
+that half alone.
+
+Coverage **125/206 to 128/212**, test-count 542 to 544. Gate green.

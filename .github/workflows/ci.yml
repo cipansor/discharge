@@ -1,11 +1,13 @@
 # CI for the `discharge` crate.
 #
-# Three jobs on purpose. The first runs `scripts/gate.sh` -- the same script a human runs --
-# so "the gates are green" means the same thing locally and in CI, and there is no second
-# copy of the commands to drift. The other two install Kani and Verus and run their
-# differential oracles as hard gates, because both are large downloads (a pinned nightly
-# plus CBMC, and a self-contained bundle with its own z3) that a normal `gate.sh` run should
-# not pay for, but that CI can.
+# The first job runs `scripts/gate.sh` -- the same script a human runs -- so "the gates are
+# green" means the same thing locally and in CI, and there is no second copy of the commands
+# to drift. The rest install one oracle each and run it as a hard gate, because each is a
+# large download (a pinned nightly plus CBMC for Kani; a self-contained bundle with its own
+# z3 for Verus; elan for Lean; apt for Coq) that a normal `gate.sh` run should not pay for,
+# but that CI can. The `ferrocene` job is the one that cannot run without a secret -- the
+# qualified toolchain is commercial -- so it reports and skips when `FERROCENE_TOKEN` is
+# absent, exactly as `gate.sh` does.
 #
 # No job adds a dependency to the crate: z3, Kani and Verus are oracles, invoked as
 # subprocesses, and `gate.sh`'s zero-dependency check would fail if that ever changed.
@@ -38,12 +40,20 @@ jobs:
       # the per-kind discharge polarity (`Obligation::is_discharged`) came to have no teeth
       # in CI. The in-module oracle in `src/mir/exec.rs` covers that logic ungated; this
       # makes the end-to-end tests run too.
-      - name: Install Rust (stable, nightly, bare-metal target)
+      - name: Install Rust (stable, nightly, MSRV, bare-metal target)
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup toolchain install nightly --profile minimal --no-self-update
+          # The MSRV gate in `scripts/gate.sh` builds with the oldest compiler the manifests
+          # promise to support. It is installed here so the gate *runs* rather than skipping:
+          # a floor that is never exercised is the claim this gate exists to stop trusting.
+          # It must match `rust-version` in `Cargo.toml` and `discharge-arithmetic/Cargo.toml`.
+          rustup toolchain install 1.85 --profile minimal --no-self-update
           rustup default stable
           rustup target add thumbv7em-none-eabihf
+          # The bare-metal target has to be present for the MSRV toolchain too, or the
+          # gate's no_std half skips and the floor is only half-checked.
+          rustup target add thumbv7em-none-eabihf --toolchain 1.85
 
       # `gate.sh` treats an absent z3 as a failure, on purpose: an oracle that did not run
       # is not evidence about the exporter. setup-python gives a pip that is not externally
@@ -63,6 +73,72 @@ jobs:
           export DISCHARGE_RUSTC
           sh scripts/gate.sh
 
+  ferrocene:
+    name: ferrocene (qualified toolchain) build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      # Ferrocene is commercial: a subscription plus a customer-portal token, and its release
+      # archives "require authentication through the customer portal, and don't allow
+      # programmatic access" (Ferrocene User Manual 3.2.1). So this job can only run when a
+      # `FERROCENE_TOKEN` secret is configured. It is checked *before* anything is installed,
+      # and the job reports and exits cleanly when the secret is absent -- a skipped oracle is
+      # not evidence, and it must never be confused with a passing one. `tools/ferrocene/run.sh`
+      # keeps the same distinction with its exit codes, which is what lets this job be honest
+      # about which of the two happened.
+      - name: Is a Ferrocene subscription configured?
+        id: have_token
+        env:
+          FERROCENE_TOKEN: ${{ secrets.FERROCENE_TOKEN }}
+        run: |
+          if [ -n "$FERROCENE_TOKEN" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No FERROCENE_TOKEN secret; skipping the qualified-toolchain build."
+            echo "This is reported, not passed: the gate did not run."
+          fi
+
+      # CriticalUp is Ferrocene's rustup-like installer. It installs the *tool*; the toolchain
+      # itself is fetched on first use against the token, from `tools/ferrocene/criticalup.toml`.
+      - name: Install CriticalUp
+        if: steps.have_token.outputs.present == 'true'
+        run: |
+          set -e
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/ferrocene/criticalup/releases/latest/download/criticalup-installer.sh | sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # The token goes in on stdin rather than as an argument. CriticalUp accepts either
+      # (`criticalup auth set [TOKEN]`), but an argument would put the token in the process
+      # table, where any process on the runner can read it; on a non-TTY stdin CriticalUp
+      # reads a single line, which is what the pipe provides. Nothing echoes the token, and
+      # `set -x` is deliberately not used anywhere in this job.
+      - name: Authenticate CriticalUp and build with the qualified toolchain
+        if: steps.have_token.outputs.present == 'true'
+        env:
+          FERROCENE_TOKEN: ${{ secrets.FERROCENE_TOKEN }}
+        run: |
+          set -e
+          printf '%s\n' "$FERROCENE_TOKEN" | criticalup auth set
+          sh tools/ferrocene/run.sh
+
+      # The skip is announced rather than left implicit: a job that quietly did nothing is
+      # the failure mode this whole pattern exists to avoid. A warning annotation shows up on
+      # the run summary, so "Ferrocene did not run" is visible without reading the log.
+      - name: Report the skip explicitly when no token is configured
+        if: steps.have_token.outputs.present != 'true'
+        run: |
+          echo "::warning::The Ferrocene qualified-toolchain build did not run (no FERROCENE_TOKEN)."
+          echo "The crate's no_std builds were checked by the stable toolchain in the 'gate' job,"
+          echo "but the *qualified* toolchain was not exercised."
+
   kani:
     name: kani differential oracle
     runs-on: ubuntu-latest
@@ -76,6 +152,13 @@ jobs:
 
       # Cache the Kani install: `cargo kani setup` fetches a pinned nightly and CBMC, and
       # re-downloading them on every run is most of the job's wall time.
+      #
+      # The key is versioned because the first version of this job cached `~/.cargo/bin/cargo-kani`
+      # and then unconditionally ran `cargo install`, which *refuses* to overwrite an existing
+      # binary ("binary `cargo-kani` already exists in destination"). A restored cache therefore
+      # turned the install step into a hard failure on every run after the first, which is what
+      # broke this job. The install below is now conditional, so a warm cache is a fast path
+      # rather than a trap; the versioned key drops any cache left in the broken state.
       - name: Cache Kani's toolchain download
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -84,11 +167,18 @@ jobs:
             ~/.cargo/bin/kani
             ~/.cargo/registry
             ~/.cargo/git
-          key: kani-${{ runner.os }}-0.68.0
+          key: kani-${{ runner.os }}-0.68.0-v2
 
       - name: Install Kani
         run: |
-          cargo install --locked kani-verifier
+          # `cargo install` is not idempotent -- it errors instead of replacing -- so skip it
+          # when the cached binary is already there. The cache key pins the version, so a hit
+          # means the right Kani.
+          if [ ! -x "$HOME/.cargo/bin/cargo-kani" ]; then
+            cargo install --locked kani-verifier
+          else
+            echo "cargo-kani already installed (cache hit); skipping install"
+          fi
           cargo kani setup
 
       # The oracle is a hard gate here: if it disagrees with the engine, CI fails. It exits
@@ -130,3 +220,110 @@ jobs:
         env:
           VERUS_BIN: ${{ github.workspace }}/verus-x86-linux/verus
         run: cargo run -q --features std --example verusdiff -- 64
+
+  mir-oracle:
+    name: rustc_public MIR oracle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # This job is the whole reason `tools/mir-oracle` exists: it links `rustc_public`,
+      # which needs a nightly plus the `rustc-dev` component. Neither may leak into
+      # `discharge` -- the crate builds on stable with no dependencies -- so the oracle is a
+      # separate, excluded workspace member and only this job pays for the nightly.
+      #
+      # `llvm-tools-preview` is required too, and its absence is not obvious from the error.
+      # It is the component that ships `libLLVM` next to `rustc`; without it `rustc` cannot
+      # even start under the `LD_LIBRARY_PATH` cargo sets for build scripts, so the oracle's
+      # `build.rs` silently fails to read the sysroot and the link dies later with
+      # `unable to find library -lLLVM-...`. `rustc-dev` alone is not enough.
+      #
+      # `clippy` is installed onto the *nightly* rather than the stable toolchain because the
+      # lint step must run the nightly's `clippy-driver`; see the note there.
+      - name: Install Rust (stable + nightly with rustc-dev, llvm-tools and clippy)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup toolchain install nightly --profile minimal --no-self-update
+          rustup component add rustc-dev --toolchain nightly
+          rustup component add llvm-tools-preview --toolchain nightly
+          rustup component add clippy --toolchain nightly
+          rustup default stable
+
+      # The frontend reads *textual* MIR; this checks that reading against rustc's own typed
+      # MIR, function by function. A rustc release that reprints the dump would otherwise
+      # break the parser silently, because the parser is the only thing that reads the dump.
+      # `run.sh` exits 2 if the toolchain is missing and 1 on a real disagreement; only the
+      # latter should fail CI, so a missing nightly is surfaced by the component step above
+      # rather than being swallowed here.
+      - name: Run the MIR oracle
+        run: |
+          DISCHARGE_RUSTC="$(rustup which --toolchain nightly rustc)"
+          export DISCHARGE_RUSTC
+          sh tools/mir-oracle/run.sh
+
+      - name: Run the oracle's own tests
+        run: |
+          cd tools/mir-oracle
+          RUSTC="$(rustup which --toolchain nightly rustc)" cargo test
+
+      - name: Lint the oracle
+        run: |
+          cd tools/mir-oracle
+          # `RUSTC=<nightly> cargo clippy` is not enough, and fails in a way that looks like a
+          # missing component: `cargo clippy` runs the *default* toolchain's `clippy-driver`
+          # and ignores `RUSTC` for that choice, so it tries to check a `rustc_private` crate
+          # with the stable driver and reports `can't find crate for rustc_driver`. Selecting
+          # the nightly for the whole command is what picks up the matching driver.
+          cargo +nightly clippy --all-targets -- -D warnings
+
+  lean:
+    name: lean differential oracle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      # Lean via elan, the official installer. It is pinned to a release rather than
+      # tracking latest because `bv_decide` and `native_decide` are the interface this job
+      # depends on, and a nightly that renames or moves them would look like a disagreement
+      # with the engine rather than a toolchain change. Bumping this pin is the deliberate
+      # act of moving the oracle.
+      - name: Install Lean 4 (elan)
+        run: |
+          set -e
+          curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            -o elan-init.sh
+          sh elan-init.sh -y --default-toolchain leanprover/lean4:v4.35.0
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      # Hard gate, same as Kani and Verus: a disagreement, a refuted identity, a missing
+      # verdict, or a case Lean could not decide all fail the run.
+      - name: Run the Lean oracle
+        run: cargo run -q --features std --example leandiff -- 64
+
+  coq:
+    name: coq differential oracle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      # Coq from the distribution rather than opam: the oracle needs only `coqc` and the
+      # standard library, and the apt package is a fraction of an opam switch's install time.
+      - name: Install Coq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends coq
+
+      # Hard gate. This one enumerates the 8-bit domain, so it takes a selected subset of
+      # the corpus (see `SELECTED` in examples/coqdiff.rs) and is the slowest job here.
+      - name: Run the Coq oracle
+        run: cargo run -q --features std --example coqdiff
