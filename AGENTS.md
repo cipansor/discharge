@@ -2645,10 +2645,10 @@ depend on a corpus function happening to be skipped for an unrelated reason. Two
 when first written and found the masking and truncation bugs above.
 
 The rule is not a comparison rule, it is a *meet* rule, and it applies wherever two operands meet:
-`parse_expr` and `parse_term` call the same `align_widths`. `ret == a + 5` with a slice length in
-scope had the identical failure — an 8-bit `a` added to a 64-bit `5` — and was `incomplete` for
-the same reason. That the first fix was written only in `parse_cmp` is what made the arithmetic
-case a separate bug rather than the same one.
+the arithmetic levels (`parse_add`, `parse_mul`, …) call the same `align_widths` the comparison
+does. `ret == a + 5` with a slice length in scope had the identical failure — an 8-bit `a` added
+to a 64-bit `5` — and was `incomplete` for the same reason. That the first fix was written only in
+`parse_cmp` is what made the arithmetic case a separate bug rather than the same one.
 
 ### A symbolic subscript is modelled on an array and refused on a slice
 
@@ -3744,4 +3744,120 @@ generic or path type (`x as Vec<u8>`, `x as T`) is not applied — the `as` is l
 unconsumed and reported as a trailing token, a refusal rather than a guess. That is
 the right direction: a cast whose target width is unknown cannot be sized, and
 sizing it wrongly is the failure the whole rule exists to prevent.
+
+## The missing contract operators, and the precedence they exposed
+
+The contract expression language had `+ - * & | ^` but no `/ % << >>`, so a
+contract that named a quotient, a remainder or a shift was *unreadable* — a
+dropped obligation, since a contract the parser cannot read is a function that
+silently leaves the check set. The SMT layer already had every one of them
+(`shl`, `lshr`, `ashr`, `udiv`, `urem`, `sdiv`, `srem`) and the body used them;
+only the parser never reached them.
+
+Adding them exposed a second, quieter problem. The reader had just **two** levels
+and put `|`/`^` beside `+`/`-` and `&` beside `*`, which is not Rust's order. So
+`x & 1 + 1` was read as `(x & 1) + 1` where Rust means `x & (1 + 1)` — a
+*different value*, not a different proof. That is a correctness trap rather than
+a convenience: a contract can pass or fail against the wrong number. It had
+stayed latent only because no contract in the corpus mixed the levels.
+
+The parser is now a proper ladder, Rust's own order from loosest to tightest:
+`|` < `^` < `&` < `<< >>` < `+ -` < `* / %`. Each level's operands are the next
+tighter one, `parse_expr` is the entry point at the loosest level, and the width
+`align_widths` and sign propagation are unchanged at every level.
+
+Four rules came with the new operators, each mirroring a choice the body already
+makes:
+
+* **A shift's result has the left operand's width**, so the amount is a *count*
+  and the two operands are deliberately not width-aligned — the one place the
+  `align_widths` rule does not apply.
+* **`>>` follows the left operand's sign.** `-8i8 >> 1` is `-4` (arithmetic), not
+  a large positive (logical). The sign the parser carries through decides it, the
+  same as the body's `shift_kind`.
+* **The shift amount must be a constant.** A symbolic amount is a barrel shifter
+  (`smt::shift_var`), and modelling one in a contract would mean agreeing with the
+  body about the amount reaching the width — a case rustc turns into a panic
+  first. Rather than guess at that interaction, a symbolic amount is refused, so
+  the function stays visibly undecided. A constant at or above the width is a
+  compile error in Rust and is refused too.
+* **`/` and `%` take the signed engine when either operand is signed**, the same
+  choice the body makes: the unsigned divider returns a huge positive quotient for
+  `-7 / 2`, a wrong value rather than a weaker proof. A literal zero divisor is
+  refused — Rust rejects it at compile time, so such a contract is malformed.
+
+**Pinned by evidence, not by a claim.** Sixteen corpus entries, nine true and
+seven tripwires. The signed pair with teeth is
+`contract_shr_signed_is_arithmetic` (`-8i8 >> 1 == -4`, verifying) and its
+tripwire (`== -1`, refuted, witness `x == -8` as the bit pattern `248`) — a
+*logical* shift would give a large positive and could never be `-1`. The
+precedence pairs are the ones that catch a wrong tree: `contract_precedence_and_over_add`
+(`x & 1 + 1 == x & 2`) verifies while its tripwire is refuted at `x == 1`, the one
+input where `x & (1 + 1)` and `(x & 1) + 1` differ. `contract_sdiv`/`contract_srem`
+(`-7 / 2 == -3`, `-7 % 2 == -1`) separate the signed divider from the unsigned.
+
+Coverage went from **84/146 to 93/161** decided. `tests/mir.rs` pins the corpus
+verdicts and writes each operator shape to an isolated file; a `spec::tests` unit
+test evaluates `x & 1 + 1`, `x + 1 << 1`, `x | 1 ^ 1` and `8 / 4 / 2` on the
+engine, so a wrong tree shows up as a wrong *number* with no toolchain needed.
+
+Two of my own assertions were wrong first and the tests caught them: I initially
+put the additive level at the *bottom* of the ladder (reading `x & 1 + 1` as
+`(x & 1) + 1`, which the tripwire refuted), and I wrote the unit test expecting
+`x + 1 << 1` to be `3` when Rust makes it `4`. The code was right the second time
+only because the tripwire disagreed with it first.
+
+The honest boundary: `<<`/`>>` with a *symbolic* amount are refused, as above, and
+a division or remainder by a literal zero is refused. Both are refusals rather
+than guesses, which is the direction this crate always takes.
+
+## A 128-bit type was a panic, not a refusal
+
+Adding the contract operators put `as u128` within reach of a probe, and the tool
+*died* on it: `panicked at src/smt.rs:2546: width must be 1..=64`. That is the
+worst failure mode in a verifier — not a wrong answer, not a refusal, but a crash
+that reports nothing and takes the run down. It was **pre-existing**: `x as u128`
+in a *body* panicked too, and so did a `u128` argument, a `u128` local in a loop,
+and a `u128` return. My new contract path only made it easier to reach.
+
+The cause is one line. `Ty::width()` reports `128` for `u128`/`i128`, but every
+width-taking constructor in the engine (`smt::var`, `var_named`, `truncate`, …)
+asserts `1..=64`. So a 128-bit type parses, claims a width, and then asserts in
+whichever constructor reaches it first — the argument seeding in `exec`, the loop
+havoc, or the contract bindings. The fix is to decide the question *before* any of
+them: `Ty::has_unrepresentable_leaf` (recursive, so `[u128; 4]`, `(u128, u8)` and
+`&u128` are caught by their leaf) and a guard at the top of `verify_function` that
+refuses the whole function. Refusing at that one point is what makes the refusal
+*whole*; a partial patch would leave the other paths panicking.
+
+The guard has to come from **two** places, because a 128-bit type can enter from
+either side:
+
+* the **function's own types** — argument, local, return — via
+  `first_unrepresentable_type` at the top of `verify_function`;
+* the **contract text**, where `ret == x as u128` names no 128-bit local at all.
+  `cast_chain` now returns a `Result` and refuses a target wider than 64 bits, with
+  a message that blames the engine rather than the syntax — a `break` would have
+  left `as` as a trailing token and reported a parse error for well-formed Rust.
+
+`Ty::width()` still reports 128 on purpose: the *constant reader* needs it to
+compute `u128::MAX` and the two's-complement pattern of a negative literal, and
+refusing the width there would turn a readable constant into `Other`. It is the
+*local*, not the constant, that must never reach a width assertion, and
+`has_unrepresentable_leaf` is the one place that is decided.
+
+Pinned by five corpus entries and two tests. Four entries refuse (`wide_arg`,
+`wide_return`, `wide_local_in_loop`, `wide_cast_in_contract`) and one,
+`narrow_64_still_works`, verifies — so the guard is about the function's width, not
+a blanket refusal of anything mentioning 128 bits. `tests/mir.rs` asserts each of
+the four is a `Skipped` carrying a reason (a panic would fail the run rather than
+the assertion), and a `spec`-level test writes `ret == x as u128` to an isolated
+file so the parser refusal does not depend on the corpus. Coverage went from
+**93/161 to 94/166** decided; the five new entries are four refusals and one
+verification, which is why the decided *count* moved by one and the total by five.
+
+The honest boundary: a function with any 128-bit type, or a contract casting to
+one, is refused outright. Modelling 128-bit arithmetic would need the engine's
+words widened past 64 bits, which is a change to the engine rather than to the
+frontend, and is not attempted here.
 

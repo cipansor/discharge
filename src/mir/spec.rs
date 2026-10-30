@@ -1462,7 +1462,7 @@ fn tokenize(s: &str) -> Vec<Tok> {
             continue;
         }
         let two: String = b[i..(i + 2).min(b.len())].iter().collect();
-        if ["==", "!=", "<=", ">=", "&&", "||"].contains(&two.as_str()) {
+        if ["==", "!=", "<=", ">=", "<<", ">>", "&&", "||"].contains(&two.as_str()) {
             out.push(Tok::Op(two));
             i += 2;
             continue;
@@ -1731,60 +1731,155 @@ impl<'a> Parser<'a> {
         Err(self.err("expected a comparison operator"))
     }
 
-    /// An additive expression, plus whether it is *signed*.
+    /// An arithmetic expression, plus whether it is *signed*.
     ///
     /// The flag is carried alongside the value because a comparison's meaning
     /// depends on it, and the grammar has no casts or type names to recover it
     /// later. An expression is signed when any name in it is, which is exact:
     /// Rust would reject a mixed-sign arithmetic expression.
+    ///
+    /// The ladder mirrors Rust's precedence, so the entry point is the *loosest*
+    /// level and each level's operands are the next tighter one:
+    /// `|` < `^` < `&` < `<< >>` < `+ -` < `* / %`. Getting this order wrong is
+    /// not a cosmetic matter: `x & 1 + 1` is `x & (1 + 1)` in Rust, and reading it
+    /// as `(x & 1) + 1` makes a contract pass or fail against a different number.
     fn parse_expr(&mut self) -> Result<(Var, bool), SpecError> {
-        let (mut left, mut sgn) = self.parse_term()?;
-        loop {
-            let op = if self.eat_op("+") {
-                "+"
-            } else if self.eat_op("-") {
-                "-"
-            } else if self.eat_op("|") {
-                "|"
-            } else if self.eat_op("^") {
-                "^"
-            } else {
-                return Ok((left, sgn));
+        self.parse_bitor()
+    }
+
+    fn parse_bitor(&mut self) -> Result<(Var, bool), SpecError> {
+        let (mut left, mut sgn) = self.parse_bitxor()?;
+        while self.eat_op("|") {
+            let (r, rs) = self.parse_bitxor()?;
+            let (l, r) = self.align_widths(left, r, sgn || rs)?;
+            left = smt::bor(l, r);
+            sgn = sgn || rs;
+        }
+        Ok((left, sgn))
+    }
+
+    fn parse_bitxor(&mut self) -> Result<(Var, bool), SpecError> {
+        let (mut left, mut sgn) = self.parse_bitand()?;
+        while self.eat_op("^") {
+            let (r, rs) = self.parse_bitand()?;
+            let (l, r) = self.align_widths(left, r, sgn || rs)?;
+            left = smt::bxor(l, r);
+            sgn = sgn || rs;
+        }
+        Ok((left, sgn))
+    }
+
+    fn parse_bitand(&mut self) -> Result<(Var, bool), SpecError> {
+        let (mut left, mut sgn) = self.parse_shift()?;
+        while self.eat_op("&") {
+            let (r, rs) = self.parse_shift()?;
+            let (l, r) = self.align_widths(left, r, sgn || rs)?;
+            left = smt::band(l, r);
+            sgn = sgn || rs;
+        }
+        Ok((left, sgn))
+    }
+
+    /// The shift level: `<<` and `>>`, which bind tighter than `&` but looser
+    /// than `+`.
+    ///
+    /// Two things make a shift unlike the other operators. Its result has the
+    /// *left* operand's width, so the amount is a count rather than a value of
+    /// that width and the two operands are deliberately *not* width-aligned. And
+    /// `>>` means arithmetic or logical according to the left operand's sign, so
+    /// a signed operand is the only thing that separates them -- which is why the
+    /// signedness carried through decides it.
+    ///
+    /// The amount must be a *constant*. A symbolic amount is a barrel shifter
+    /// (see `smt::shift_var`), and modelling one in a contract would mean
+    /// agreeing with the body about what happens when the amount reaches the
+    /// width -- a case rustc turns into a panic before the shift. Rather than
+    /// guess at that interaction, a symbolic amount is refused, which leaves the
+    /// function visibly undecided instead of silently mis-modelled. A constant at
+    /// or above the width is a compile error in Rust and is refused here too.
+    fn parse_shift(&mut self) -> Result<(Var, bool), SpecError> {
+        let (mut left, sgn) = self.parse_add()?;
+        while let Some(op) = self.eat_any(&["<<", ">>"]) {
+            let (r, _) = self.parse_add()?;
+            let Some(k) = smt::const_of(r) else {
+                return Err(self.err("a shift amount in a contract must be a constant"));
             };
-            let (r, rs) = self.parse_term()?;
+            let w = smt::bits(left);
+            if k >= w as u64 {
+                return Err(self.err(format!(
+                    "shift amount {k} is not below the operand width {w}"
+                )));
+            }
+            left = if op == "<<" {
+                smt::shl(left, k as u32)
+            } else if sgn {
+                smt::ashr(left, k as u32)
+            } else {
+                smt::lshr(left, k as u32)
+            };
+        }
+        Ok((left, sgn))
+    }
+
+    /// The additive level: `+` and `-`, tighter than the bitwise operators.
+    fn parse_add(&mut self) -> Result<(Var, bool), SpecError> {
+        let (mut left, mut sgn) = self.parse_mul()?;
+        while let Some(op) = self.eat_any(&["+", "-"]) {
+            let (r, rs) = self.parse_mul()?;
             // A literal operand is sized to the other one, exactly as in a
             // comparison. Without this, `ret == a + 5` with a slice length in
             // scope adds an 8-bit `a` to a 64-bit `5`, which `bin_word` reports
             // as ill-formed -- and that poisons every obligation in the run, so
             // the function is undecided for a reason unrelated to its body.
             let (l, r) = self.align_widths(left, r, sgn || rs)?;
-            left = match op {
-                "+" => smt::add(l, r),
-                "-" => smt::sub(l, r),
-                "|" => smt::bor(l, r),
-                _ => smt::bxor(l, r),
-            };
+            left = if op == "+" { smt::add(l, r) } else { smt::sub(l, r) };
             sgn = sgn || rs;
         }
+        Ok((left, sgn))
     }
 
-    fn parse_term(&mut self) -> Result<(Var, bool), SpecError> {
+    /// The multiplicative level: `*`, `/` and `%`, the tightest arithmetic.
+    ///
+    /// Division and remainder take the *signed* engine when either operand is
+    /// signed, the same choice the body makes and for the same reason: the
+    /// unsigned divider returns a huge positive quotient for `-7 / 2`, a wrong
+    /// value rather than a weaker proof. A literal zero divisor is refused --
+    /// Rust rejects it at compile time, so a contract carrying one is malformed,
+    /// not merely imprecise. A *symbolic* divisor is modelled exactly (the
+    /// engine's divider is total), which mirrors the body.
+    fn parse_mul(&mut self) -> Result<(Var, bool), SpecError> {
         let (mut left, mut sgn) = self.parse_atom()?;
-        loop {
-            let op = if self.eat_op("*") {
-                "*"
-            } else if self.eat_op("&") {
-                "&"
-            } else {
-                return Ok((left, sgn));
-            };
+        while let Some(op) = self.eat_any(&["*", "/", "%"]) {
             let (r, rs) = self.parse_atom()?;
-            // Same width rule as the additive operators: a literal product or
-            // mask is sized to the operand it meets.
+            if op != "*" && smt::const_of(r) == Some(0) {
+                return Err(self.err("a division or remainder by a literal zero"));
+            }
+            // Same width rule as the other operators: a literal product, divisor
+            // or mask is sized to the operand it meets.
             let (l, r) = self.align_widths(left, r, sgn || rs)?;
-            left = if op == "*" { smt::mul(l, r) } else { smt::band(l, r) };
+            left = match op {
+                "*" => smt::mul(l, r),
+                "/" if sgn || rs => smt::sdiv(l, r),
+                "/" => smt::udiv(l, r),
+                "%" if sgn || rs => smt::srem(l, r),
+                _ => smt::urem(l, r),
+            };
             sgn = sgn || rs;
         }
+        Ok((left, sgn))
+    }
+
+    /// Consume whichever of `ops` is at the cursor, returning the one matched.
+    fn eat_any<'b>(&mut self, ops: &[&'b str]) -> Option<&'b str> {
+        if let Some(Tok::Op(o)) = self.peek() {
+            for op in ops {
+                if o == op {
+                    self.pos += 1;
+                    return Some(op);
+                }
+            }
+        }
+        None
     }
 
     /// An atom, plus whether it is signed.
@@ -1820,13 +1915,13 @@ impl<'a> Parser<'a> {
                     .max()
                     .unwrap_or(64);
                 let w = scope.max(need).min(64);
-                Ok(self.cast_chain(smt::word(n, w), false))
+                self.cast_chain(smt::word(n, w), false)
             }
             Some(Tok::Ident(name)) => {
                 self.pos += 1;
                 if name == "ret" || name == "result" {
                     let v = self.ret.ok_or_else(|| self.err(self.ret_absent))?;
-                    return Ok(self.cast_chain(v, self.ret_signed));
+                    return self.cast_chain(v, self.ret_signed);
                 }
                 if name == "true" || name == "false" {
                     // A boolean literal is a one-bit word, so a `bool`-returning
@@ -1890,7 +1985,7 @@ impl<'a> Parser<'a> {
                     .copied()
                     .ok_or_else(|| self.err(format!("unknown name `{name}` (not an argument)")))?;
                 let s = self.is_signed_name(&name);
-                Ok(self.cast_chain(v, s))
+                self.cast_chain(v, s)
             }
             Some(Tok::Op(o)) if o == "(" => {
                 self.pos += 1;
@@ -1901,7 +1996,7 @@ impl<'a> Parser<'a> {
                 if !self.eat_op(")") {
                     return Err(self.err("missing `)`"));
                 }
-                Ok(self.cast_chain(v, s))
+                self.cast_chain(v, s)
             }
             Some(t) => Err(self.err(format!("unexpected token {t:?}"))),
             None => Err(self.err("unexpected end of contract")),
@@ -1927,7 +2022,7 @@ impl<'a> Parser<'a> {
     /// source sign is the previous step's *target* sign -- which the cast just
     /// set, so it is always known. That is what makes the chain well-defined even
     /// when the first source's sign was not.
-    fn cast_chain(&mut self, v: Var, sgn: bool) -> (Var, bool) {
+    fn cast_chain(&mut self, v: Var, sgn: bool) -> Result<(Var, bool), SpecError> {
         let (mut v, mut sgn) = (v, sgn);
         while matches!(self.peek(), Some(Tok::Ident(n)) if n == "as") {
             let Some(Tok::Ident(ty_name)) = self.toks.get(self.pos + 1).cloned() else {
@@ -1939,11 +2034,24 @@ impl<'a> Parser<'a> {
             let Some(w) = ty.width() else {
                 break;
             };
+            // The engine's words are 1..=64 bits, so a cast to `u128`/`i128` has
+            // no width to truncate or extend to. Refusing it here is what stops
+            // the cast from reaching `truncate`, whose width assertion would take
+            // the whole run down with a panic instead of reporting this function
+            // as undecided. A `break` would be wrong: it would leave `as` as a
+            // trailing token and blame the syntax, when the cast is well-formed
+            // Rust and it is the *engine* that cannot hold the result.
+            if w > 64 {
+                return Err(self.err(format!(
+                    "`{ty_name}` is wider than the engine's 64-bit words, so a cast to it is not \
+                     modelled"
+                )));
+            }
             self.pos += 2;
             v = if sgn { smt::sign_extend(v, w) } else { smt::truncate(v, w) };
             sgn = ty.is_signed();
         }
-        (v, sgn)
+        Ok((v, sgn))
     }
 }
 
@@ -2581,6 +2689,33 @@ mod tests {
         let (v, s) = p.parse_expr().expect("the chain parses");
         assert_eq!(smt::bits(v), 32);
         assert!(s);
+    }
+
+    /// The operator precedence must match Rust's, because a contract is Rust
+    /// syntax. The earlier reader put `|`/`^` with `+`/`-` and `&` with `*`, so
+    /// `x & 1 + 1` was read as `(x & 1) + 1` where Rust means `x & (1 + 1)` -- a
+    /// different *value*, not a different proof. The values below are evaluated
+    /// on the engine, so a wrong tree shows up as a wrong number.
+    #[test]
+    fn a_contract_expression_uses_rust_precedence() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::word(1, 8));
+        let unsigned = BTreeSet::new();
+        let eval = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let (v, _) = p.parse_expr().expect("parses");
+            p.expect_end().expect("no trailing tokens");
+            smt::evaluate(v, |_| None).expect("a constant")
+        };
+        // `1 & (1 + 1)` is `1 & 2` is `0`; `(1 & 1) + 1` would be `2`.
+        assert_eq!(eval("x & 1 + 1"), 0, "`&` must bind looser than `+`");
+        // `(1 + 1) << 1` is `4`; `1 + (1 << 1)` would be `3`, so `+` binds
+        // tighter than `<<`.
+        assert_eq!(eval("x + 1 << 1"), 4, "`+` must bind tighter than `<<`");
+        // `1 | 1 ^ 1` is `1 | (1 ^ 1)` is `1`; `(1 | 1) ^ 1` would be `0`.
+        assert_eq!(eval("x | 1 ^ 1"), 1, "`^` must bind tighter than `|`");
+        // `8 / 4 / 2` is left-associative: `(8 / 4) / 2` is `1`.
+        assert_eq!(eval("8 / 4 / 2"), 1, "`/` is left-associative");
     }
 
     /// An explicit discriminant sets the variant's value and the next continues

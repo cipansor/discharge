@@ -1442,6 +1442,201 @@ pub fn contract_cast_chain_tripwire(x: u8) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// The contract operators that were missing, and the *precedence* they need.
+//
+// The expression language had `+ - * & | ^` but no `/ % << >>`, so a contract
+// that named a shift, a quotient or a remainder was unreadable -- a dropped
+// obligation. The SMT layer already had every one of them (`shl`, `lshr`,
+// `ashr`, `udiv`, `urem`, `sdiv`, `srem`) and the body used them; only the
+// parser never reached them.
+//
+// Adding the shifts exposed a second, quieter problem: the reader had just two
+// levels and put `|`/`^` beside `+`/`-` and `&` beside `*`, which is *not*
+// Rust's order. `x & 1 + 1` was read as `(x & 1) + 1` where Rust means
+// `x & (1 + 1)` -- a different number, so a contract could pass or fail against
+// the wrong value. That was latent only because no contract mixed the levels;
+// the ladder below is now Rust's own, `| ^ & << >> + - * / %` from loosest to
+// tightest.
+
+/// A logical right shift of an unsigned value: `x >> 1` is `x / 2`.
+/// requires: true
+/// ensures: ret == x >> 1
+pub fn contract_shr_unsigned(x: u8) -> u8 {
+    x >> 1
+}
+
+/// The tripwire: `>>` is a value, not a free variable, so naming it one too high
+/// is false for every input.
+/// requires: true
+/// ensures: ret == (x >> 1) + 1
+pub fn contract_shr_unsigned_tripwire(x: u8) -> u8 {
+    x >> 1
+}
+
+/// A left shift: `x << 2` is `x * 4` for the values that do not overflow.
+/// requires: x <= 63
+/// ensures: ret == x << 2
+pub fn contract_shl(x: u8) -> u8 {
+    x << 2
+}
+
+/// A *signed* right shift is arithmetic, not logical: `-8 >> 1` is `-4`, where a
+/// logical shift would give a large positive. This is the entry that separates
+/// the two, and the reason the parser reads the left operand's sign.
+/// requires: x == -8
+/// ensures: ret == -4
+pub fn contract_shr_signed_is_arithmetic(x: i8) -> i8 {
+    x >> 1
+}
+
+/// The tripwire: `-8 >> 1` is never `-1`, so a logical reading (which would give
+/// a large positive) or a wrong amount cannot make this true.
+/// requires: x == -8
+/// ensures: ret == -1
+pub fn contract_shr_signed_is_arithmetic_tripwire(x: i8) -> i8 {
+    x >> 1
+}
+
+/// An unsigned quotient: `x / 3`.
+/// requires: true
+/// ensures: ret == x / 3
+pub fn contract_udiv(x: u32) -> u32 {
+    x / 3
+}
+
+/// An unsigned remainder: `x % 10`.
+/// requires: true
+/// ensures: ret == x % 10
+pub fn contract_urem(x: u32) -> u32 {
+    x % 10
+}
+
+/// The tripwire for division: the quotient is not the dividend, so `ret == x`
+/// is false whenever `x >= 3`.
+/// requires: true
+/// ensures: ret == x
+pub fn contract_udiv_tripwire(x: u32) -> u32 {
+    x / 3
+}
+
+/// A *signed* division must use the signed engine: `-7 / 2` is `-3`, where the
+/// unsigned one would give a huge positive. The witness is `-7` and the true
+/// value `-3`, so a wrong engine is caught.
+/// requires: x == -7
+/// ensures: ret == -3
+pub fn contract_sdiv(x: i32) -> i32 {
+    x / 2
+}
+
+/// A signed remainder: `-7 % 2` is `-1` in Rust (the sign follows the dividend).
+/// requires: x == -7
+/// ensures: ret == -1
+pub fn contract_srem(x: i32) -> i32 {
+    x % 2
+}
+
+/// The tripwire for signed division: `-7 / 2` is never `3` (the truncation is
+/// toward zero, so the sign is negative).
+/// requires: x == -7
+/// ensures: ret == 3
+pub fn contract_sdiv_tripwire(x: i32) -> i32 {
+    x / 2
+}
+
+/// Precedence: Rust reads `x & 1 + 1` as `x & (1 + 1)`, i.e. `x & 2`. The body
+/// computes `x & 2`, so a parser that read `(x & 1) + 1` would refute this.
+/// requires: true
+/// ensures: ret == x & 1 + 1
+pub fn contract_precedence_and_over_add(x: u8) -> u8 {
+    x & 2
+}
+
+/// The tripwire that separates the two readings. At `x == 1`, `1 & 2` is `0`
+/// while `(1 & 1) + 1` is `2`; the body computes `0`, so the `2` reading is
+/// refuted with witness `x == 1`.
+/// requires: x == 1
+/// ensures: ret == 2
+pub fn contract_precedence_and_over_add_tripwire(x: u8) -> u8 {
+    x & 2
+}
+
+/// Precedence between `+` and `<<`: `x + 1 << 1` is `(x + 1) << 1` in Rust,
+/// because `+` binds tighter than `<<`. The body computes `(x + 1) << 1`. The
+/// bound keeps both the `x + 1` and the `<< 1` in range, so the body does not
+/// panic -- an unbounded `u8` would make the function *panic* rather than verify,
+/// which is a true result but not the one this entry is about.
+/// requires: x <= 126
+/// ensures: ret == x + 1 << 1
+pub fn contract_precedence_add_over_shl(x: u8) -> u8 {
+    (x + 1) << 1
+}
+
+/// The tripwire: `(x + 1) << 1` is `2x + 2`, never `2x + 1`, so a reading that
+/// shifted the wrong side is refuted.
+/// requires: x <= 126
+/// ensures: ret == x * 2 + 1
+pub fn contract_precedence_add_over_shl_tripwire(x: u8) -> u8 {
+    (x + 1) << 1
+}
+
+// ---------------------------------------------------------------------------
+// 128-bit types: wider than the engine, and refused as a whole function.
+//
+// The engine's words are 1..=64 bits, and every width-taking constructor
+// (`smt::var`, `truncate`, …) asserts that. A `u128`/`i128` argument, local,
+// return or *cast target* therefore has no width to model, and the function is
+// refused rather than half-modelled. The refusal is a `Skipped`, not a panic:
+// the guard runs before the argument seeding, the loop havoc and the contract
+// bindings, any of which would otherwise assert in whichever ran first and take
+// the whole run down with it. These entries pin that the *tool survives* a
+// 128-bit function and reports it, which is the property a crash would break.
+
+/// A `u128` argument: refused, not panicked.
+/// requires: true
+/// ensures: ret == x
+pub fn wide_arg(x: u128) -> u128 {
+    x
+}
+
+/// A `u128` return with an ordinary argument: refused on the return type alone.
+/// requires: true
+/// ensures: true
+pub fn wide_return(x: u8) -> u128 {
+    x as u128
+}
+
+/// A `u128` *local* inside a loop: the loop havoc consults the type's width, so
+/// this is the path that would panic without the guard.
+/// requires: true
+/// invariant: x == 0
+/// ensures: ret == 0
+pub fn wide_local_in_loop() -> u8 {
+    let mut x: u128 = 0;
+    let mut i = 0u8;
+    while i < 3 {
+        x = x + 1;
+        i += 1;
+    }
+    0
+}
+
+/// A contract casting to `u128`, with no 128-bit local at all: the refusal has to
+/// come from the *parser*, since the function's own types are all 64-bit.
+/// requires: true
+/// ensures: ret == x as u128
+pub fn wide_cast_in_contract(x: u8) -> u64 {
+    x as u64
+}
+
+/// A `u64` function next to the 128-bit ones, to show the guard does not spill:
+/// this one still verifies.
+/// requires: true
+/// ensures: ret == x as u64
+pub fn narrow_64_still_works(x: u8) -> u64 {
+    x as u64
+}
+
+// ---------------------------------------------------------------------------
 // `count_ones` and `wrapping_abs`: the two `core::num` methods that are neither
 // a two-operand family nor an `Option`. `count_ones` widens its result (`u8` ->
 // `u32`), which is the one place a modelled call's result width differs from its

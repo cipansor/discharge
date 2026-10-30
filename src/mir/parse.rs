@@ -75,6 +75,28 @@ impl Ty {
         })
     }
 
+    /// True when this type is, or contains, one the 64-bit engine cannot
+    /// represent — today only `u128`/`i128`.
+    ///
+    /// Separate from `width()` on purpose. `width()` still reports 128, because
+    /// the *constant reader* needs that number to compute `u128::MAX` and the
+    /// two's-complement pattern of a negative literal; refusing the width there
+    /// would turn a readable constant into `Other`. What must not happen is that a
+    /// 128-bit *local* reaches a width-taking constructor, and this predicate is
+    /// the one place that is decided. Descends into aggregates because a
+    /// `[u128; 4]` argument is bound field by field, and it is the leaf that
+    /// panics.
+    pub fn has_unrepresentable_leaf(&self) -> bool {
+        match self {
+            Ty::U128 | Ty::I128 => true,
+            Ty::Tuple(xs) => xs.iter().any(Ty::has_unrepresentable_leaf),
+            Ty::Array(inner, _) | Ty::Slice(inner) | Ty::Ref(inner) => {
+                inner.has_unrepresentable_leaf()
+            }
+            _ => false,
+        }
+    }
+
     /// True for the signed integers, whose comparisons differ from the unsigned ones.
     pub fn is_signed(&self) -> bool {
         matches!(
@@ -416,6 +438,33 @@ pub struct MirFn {
 impl MirFn {
     pub fn ty_of(&self, local: LocalIdx) -> Option<&Ty> {
         self.locals.get(&local)
+    }
+
+    /// The first type in this function the bit-level engine cannot represent, if
+    /// any.
+    ///
+    /// The engine is 64-bit; `u128`/`i128` are wider, and every constructor that
+    /// takes a width (`smt::var`, `truncate`, …) asserts `1..=64`. A 128-bit type
+    /// therefore cannot be modelled at all, and the honest answer is to refuse the
+    /// whole function rather than model part of it. Refusing at this one place is
+    /// what keeps the refusal *whole*: `arg_vars`, the argument seeding in `exec`
+    /// and the loop havoc each consult a type's width, and a 128-bit local would
+    /// otherwise be a panic in whichever of them ran first. A panic is not a
+    /// refusal — it takes the run down and reports nothing — so the guard has to
+    /// come before any of them.
+    ///
+    /// The check descends into aggregates, because a `[u128; 4]` or a `(u128, u8)`
+    /// argument is bound field by field and each field's width is consulted
+    /// separately — so the 128-bit leaf is what panics, not the aggregate.
+    pub fn first_unrepresentable_type(&self) -> Option<&Ty> {
+        if self.ret_ty.has_unrepresentable_leaf() {
+            return Some(&self.ret_ty);
+        }
+        self.arg_locals
+            .iter()
+            .filter_map(|&l| self.ty_of(l))
+            .chain(self.locals.values())
+            .find(|t| t.has_unrepresentable_leaf())
     }
 
     /// Source name → the *argument* local it is a direct alias of.
@@ -1853,6 +1902,28 @@ fn add(_1: u32, _2: u32) -> u32 {
     fn a_declared_enum_still_wins_over_the_standard_numbering() {
         let enums = layout(&[("Some", 0), ("None", 5)]);
         assert_eq!(variant_index("E::Some", &enums), Some(0));
+    }
+
+    /// A 128-bit type is, or contains, one the engine cannot model, and the guard
+    /// must see it through an aggregate: `[u128; 4]` is bound field by field, so
+    /// the 128-bit *leaf* is what would reach a width assertion, not the array.
+    #[test]
+    fn an_unrepresentable_leaf_is_seen_through_an_aggregate() {
+        let wide = |t: &Ty| t.has_unrepresentable_leaf();
+        assert!(wide(&Ty::U128));
+        assert!(wide(&Ty::I128));
+        assert!(wide(&Ty::Array(Box::new(Ty::U128), 4)));
+        assert!(wide(&Ty::Tuple(vec![Ty::U8, Ty::I128])));
+        assert!(wide(&Ty::Ref(Box::new(Ty::U128))));
+        assert!(wide(&Ty::Slice(Box::new(Ty::U128))));
+        // The ordinary widths are modelled and must *not* trip the guard, or
+        // every function would be refused.
+        for t in [Ty::Bool, Ty::U8, Ty::U16, Ty::U32, Ty::U64, Ty::Usize, Ty::I64, Ty::Isize] {
+            assert!(!wide(&t), "{t:?} is modelled");
+        }
+        assert!(!wide(&Ty::Array(Box::new(Ty::U64), 8)));
+        assert!(!wide(&Ty::Tuple(vec![Ty::U8, Ty::I32])));
+        assert!(!wide(&Ty::Other("MyStruct".into())));
     }
 
     /// The front end is total: no input, however mangled, may panic.

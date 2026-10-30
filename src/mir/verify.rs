@@ -168,6 +168,19 @@ impl std::fmt::Display for FnOutcome {
 
 /// Verify one function from a parsed program plus its source contracts.
 pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome {
+    // A 128-bit type is wider than the engine, whose every width-taking
+    // constructor asserts `1..=64`. Refusing here, before any of them runs, is
+    // what keeps the refusal whole: the argument seeding, the loop havoc and the
+    // contract bindings all consult a type's width, and a 128-bit local would be a
+    // panic in whichever came first. A panic is not a refusal -- it takes the run
+    // down and reports nothing -- so this guard must precede them all.
+    if let Some(ty) = f.first_unrepresentable_type() {
+        return FnOutcome::Skipped {
+            reason: format!(
+                "`{ty:?}` is wider than the engine's 64-bit words, so the function is not modelled"
+            ),
+        };
+    }
     let contract = specs.get(&f.name);
     let arg_vars = spec::arg_vars(f);
     let signed = spec::signed_args(f);

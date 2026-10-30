@@ -2571,3 +2571,144 @@ fn a_contract_cast_is_read_and_proved() {
     assert!(o.is_verified(), "`narrow` must verify, got: {o}");
 }
 
+/// The contract operators that were missing (`/ % << >>`), and the precedence
+/// they need. A missing operator is a dropped obligation -- the contract is
+/// unreadable and the function silently leaves the check set -- so each entry
+/// pairs a true contract with a tripwire, and the precedence entries pin the
+/// *order*, not merely that the operator parses.
+///
+/// The signed entries are the ones with teeth: `>>` on a signed value must be
+/// arithmetic (`-8 >> 1 == -4`, not a large positive) and `/` must be the signed
+/// quotient (`-7 / 2 == -3`, not a huge positive). The unsigned engine would give
+/// a wrong value, so those entries separate the two engines.
+#[test]
+fn contract_operators_and_their_precedence() {
+    let Some(report) = verify_realistic(&[
+        "contract_shr_unsigned",
+        "contract_shr_unsigned_tripwire",
+        "contract_shl",
+        "contract_shr_signed_is_arithmetic",
+        "contract_shr_signed_is_arithmetic_tripwire",
+        "contract_udiv",
+        "contract_urem",
+        "contract_udiv_tripwire",
+        "contract_sdiv",
+        "contract_srem",
+        "contract_sdiv_tripwire",
+        "contract_precedence_and_over_add",
+        "contract_precedence_and_over_add_tripwire",
+        "contract_precedence_add_over_shl",
+        "contract_precedence_add_over_shl_tripwire",
+    ]) else {
+        return;
+    };
+    for name in [
+        "contract_shr_unsigned",
+        "contract_shl",
+        "contract_shr_signed_is_arithmetic",
+        "contract_udiv",
+        "contract_urem",
+        "contract_sdiv",
+        "contract_srem",
+        "contract_precedence_and_over_add",
+        "contract_precedence_add_over_shl",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in [
+        "contract_shr_unsigned_tripwire",
+        "contract_shr_signed_is_arithmetic_tripwire",
+        "contract_udiv_tripwire",
+        "contract_sdiv_tripwire",
+        "contract_precedence_and_over_add_tripwire",
+        "contract_precedence_add_over_shl_tripwire",
+    ] {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` must FAIL: a `Skipped` means the operator is not modelled, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+    // `-8 >> 1` is `-4`, so a *logical* reading (a large positive) is what the
+    // tripwire refutes; the witness `248` is the `-8` bit pattern, which pins
+    // that the parser read the sign, not merely the value.
+    let o = outcome(&report, "contract_shr_signed_is_arithmetic_tripwire");
+    let FnOutcome::Failed { detail, .. } = o else { panic!("got: {o}") };
+    assert!(detail.contains("= 248"), "the witness should be the `-8` pattern, got: {detail}");
+    // The `&`/`+` precedence tripwire must be refuted at `x == 1`, the input
+    // where `x & (1 + 1)` and `(x & 1) + 1` differ.
+    let o = outcome(&report, "contract_precedence_and_over_add_tripwire");
+    let FnOutcome::Failed { detail, .. } = o else { panic!("got: {o}") };
+    assert!(detail.contains("= 1"), "the witness should be `x == 1`, got: {detail}");
+}
+
+/// A `u128`/`i128` function must be *refused*, not panicked. The engine's words
+/// are 1..=64 bits and every width-taking constructor asserts that, so a 128-bit
+/// argument, return, local or cast target has no width to model. Before the
+/// guard, whichever of the argument seeding, the loop havoc or the contract
+/// bindings ran first hit that assertion and took the whole run down — a panic
+/// reports nothing, where a refusal reports the function. This pins the refusal
+/// on each path, and that a 64-bit neighbour still verifies.
+#[test]
+fn a_128_bit_function_is_refused_not_panicked() {
+    let Some(report) = verify_realistic(&[
+        "wide_arg",
+        "wide_return",
+        "wide_local_in_loop",
+        "wide_cast_in_contract",
+        "narrow_64_still_works",
+    ]) else {
+        return;
+    };
+    for name in ["wide_arg", "wide_return", "wide_local_in_loop", "wide_cast_in_contract"] {
+        let o = outcome(&report, name);
+        let FnOutcome::Skipped { reason } = o else {
+            panic!("`{name}` must be refused, got: {o}");
+        };
+        assert!(
+            reason.contains("64-bit") || reason.contains("wider"),
+            "`{name}` should say why, got: {reason}"
+        );
+    }
+    // The guard must be about the function's own width, not a blanket refusal of
+    // anything mentioning 128 bits: a `u64` neighbour still verifies.
+    let o = outcome(&report, "narrow_64_still_works");
+    assert!(o.is_verified(), "a 64-bit function must still verify, got: {o}");
+}
+
+/// The contract parser must refuse a cast *to* a 128-bit type on its own, since a
+/// function whose own types are all 64-bit would otherwise reach `truncate` and
+/// panic there. Pinned in isolation so the refusal does not depend on the corpus.
+#[test]
+fn a_contract_cast_to_128_bits_is_refused() {
+    let src = "/// requires: true\n/// ensures: ret == x as u128\n\
+               pub fn f(x: u8) -> u64 { x as u64 }";
+    let Some(o) = verify_src("f", src) else { return };
+    let FnOutcome::Skipped { reason } = o else {
+        panic!("a cast to `u128` must be refused, got: {o}");
+    };
+    assert!(reason.contains("u128"), "the refusal should name the type, got: {reason}");
+}
+
+/// The operator shapes in an isolated file, so the *parse* is pinned even if the
+/// corpus entry is edited. Each is one line, so a regression says exactly which
+/// operator stopped being read.
+#[test]
+fn contract_operators_parse_in_isolation() {
+    let cases: &[(&str, &str)] = &[
+        ("shr", "/// requires: true\n/// ensures: ret == x >> 1\npub fn shr(x: u8) -> u8 { x >> 1 }"),
+        ("shl", "/// requires: true\n/// ensures: ret == x << 2\npub fn shl(x: u8) -> u8 { x << 2 }"),
+        ("udiv", "/// requires: true\n/// ensures: ret == x / 3\npub fn udiv(x: u32) -> u32 { x / 3 }"),
+        ("urem", "/// requires: true\n/// ensures: ret == x % 10\npub fn urem(x: u32) -> u32 { x % 10 }"),
+        (
+            "prec",
+            "/// requires: true\n/// ensures: ret == x & 1 + 1\npub fn prec(x: u8) -> u8 { x & 2 }",
+        ),
+    ];
+    for (name, src) in cases {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+}
+

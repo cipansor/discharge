@@ -1322,11 +1322,39 @@ large for the operand's width is refused rather than truncated: `a <= 300` for a
 The scanner is deliberately strict. A `requires:`, `ensures:` or `invariant:` that sits before a
 `const`, a `struct` or a module comment is *not* attached to the next function, so
 a misplaced contract is dropped rather than silently applied to the wrong item.
-A contract expression outside the small grammar — a function call, a cast, an
-unknown name — is refused rather than approximated. An `invariant:` clause
-carries no loop label, so a function may have at most one; a second is refused
-rather than guessed at, since pairing the wrong text with the wrong loop would
-check an obligation that does not mean what the source says.
+A contract expression outside the grammar — a function call, an unknown name, a
+shift by a symbolic amount — is refused rather than approximated. An `invariant:`
+clause carries no loop label, so a function may have at most one; a second is
+refused rather than guessed at, since pairing the wrong text with the wrong loop
+would check an obligation that does not mean what the source says.
+
+The expression grammar is Rust's own subset, with Rust's precedence, so a contract
+reads like the code it describes:
+
+| Level (loosest first) | Operators |
+|---|---|
+| bitwise or | `\|` |
+| bitwise xor | `^` |
+| bitwise and | `&` |
+| shift | `<<` `>>` |
+| additive | `+` `-` |
+| multiplicative | `*` `/` `%` |
+| unary | `-` `!` (on predicates) |
+| comparison | `==` `!=` `<` `<=` `>` `>=` |
+| logical | `&&` `\|\|` |
+| cast | `as u8` … `as u64` (an atom followed by one or more `as <type>`) |
+
+`>>` is arithmetic on a signed operand and logical on an unsigned one, and `/`/`%`
+take the signed quotient or remainder when either operand is signed — the same
+choices the body makes. A cast *extends*: `-1i8 as i16` is `-1`, and `-1i8 as u16`
+is `65535`, not `255`. A shift amount must be a constant; a symbolic amount is a
+barrel shifter in the body and is refused in a contract rather than guessed at.
+
+The engine's words are 64 bits, so a `u128`/`i128` type is refused rather than
+mis-modelled: a function with a 128-bit argument, local or return, and a contract
+casting *to* one, both report the function as skipped. This is a refusal, not a
+crash — a width the engine cannot hold is decided before any width-taking
+constructor runs.
 
 ### What is read from where, and why
 
