@@ -3447,3 +3447,75 @@ toolchain*, is reported and skipped rather than folded into a pass. CI installs
 both the 1.85 toolchain and that target for it so the gate actually runs. The gate
 numbering is now **13 steps**, not 12; the README and `ci.yml` were renumbered
 with it.
+
+## The bit-blaster walked a DAG as a tree, and no budget noticed
+
+`wrapping_pow` at a *symbolic* exponent hung. Not slowly: the query never returned, so
+`prove` printed no verdict at all, which the previous section already established is worse
+than any verdict. The shape is small -- `u4`, one base variable, one `u32` exponent -- and
+the arena stayed nearly empty, so nothing in the existing guards fired.
+
+The cause is a mismatch between how the term is *built* and how the blaster *walks* it.
+`pow` is a 32-step fold, and every step rebuilds the running product from the same shared
+subterms, so the term is a DAG with heavy sharing. `blast` recurses as if it were a tree:
+it visits a shared subterm once per path to it. For a 32-step fold that is up to 2^32 paths
+through a graph of a few hundred nodes. Instrumenting the walk confirmed it directly --
+u4 needed **more than 10^8 visits** to finish, and the count was identical for the BDD pass
+and the SAT pass because both recurse the same way. That is not a slow answer; it is a hang,
+and the query never reaches the code that would have fallen back.
+
+Two plausible explanations were checked and were wrong before the right one landed:
+
+1. **"The arena overflows."** No. The `overflow` guard at the top of `blast` was added for
+   exactly this fold, but it fires on a *full* node table, and this walk fills nothing --
+   it recomputes. Measurement showed `overflow == false` throughout.
+2. **"The SAT fallback will finish it."** No. The fallback has the same tree-walk recursion
+   over the same DAG, so it hangs identically. A BDD-only memo was tried first and *still
+   hung on `u8`* -- the BDD pass stopped (correctly, via its arena cap) and the SAT pass
+   then hung, with no bound of its own. That is what put a budget on *both* passes; it was
+   only visible by measuring each pass separately.
+
+The fix has two parts, and they are not redundant:
+
+- **A memo on the BDD pass** (`BLAST_MEMO_N` slots in `Ctx`). A hit collapses the paths:
+  the same u4 query drops from more than 10^8 visits to **540**. It is keyed by the term id
+  *including* its generation bits, so the arena reset that recycles slots also invalidates
+  the memo -- no clearing pass, and a stale key can never match a current term. This is the
+  half that buys *capability*: without it a `pow` at any width answers `Unknown`, because
+  the budget below stops the walk before it finishes.
+- **A step budget on both passes** (`MAX_BLAST_STEPS`). The memo is a cache, not a
+  guarantee: a term whose working set exceeds the memo would evict its own entries and
+  recompute. The budget bounds the *work*, and it is the part that makes "never hangs" true
+  rather than likely. When it trips it sets the same `overflow` flag the arena cap sets, so
+  the query degrades along the path that already exists -- BDD to SAT, SAT to `Unknown` --
+  instead of inventing a new one. The SAT pass additionally calls `Cnf::mark_overflow`,
+  because a step-truncated CNF must read as `Unknown`, never as a satisfiable one.
+
+The SAT pass gets the budget but *not* a memo, and that asymmetry is deliberate. The BDD
+memo's soundness is free: the arena is wiped by `with_fresh`, and the memo key carries the
+generation, so a stale entry cannot match. The SAT blaster has no equivalent -- it appends
+gates to a `Cnf` that is reset per query, and a memo of `Lit`s would have to reason about
+whether those gate slots were reused. That is a real obligation, and measurement says it
+buys nothing: a SAT memo changed no verdict, only the latency of the fallback (the same u8
+query took ~80ms with it and ~860ms with the budget alone). So the budget alone carries the
+SAT pass, and no cross-query cache does.
+
+Measured after the fix: `u4` **Valid in ~34ms**, `u6` Valid in ~1.7s, `u8` **Unknown in
+~80ms** -- all three *return*, and none is a wrong answer. `Unknown` at `u8` is honest: the
+BDD diagram genuinely exceeds its cap there, which is the case the SAT fallback exists for,
+and the fallback's own budget then declines rather than guessing.
+
+The regression test is `a_symbolic_pow_returns_a_verdict_instead_of_hanging` in
+`src/mir/intrinsics.rs`. It is *verified to hang without the fix* -- with both the memo and
+the budget neutralised it ran past 90s and was killed -- which is the only thing that makes
+it a regression test rather than a test that happens to pass. Two details matter: it uses a
+*symbolic* exponent, because a concrete exponent unrolls the fold to one path and never
+showed the blow-up; and it accepts `Valid` or `Unknown` but rejects a `Counterexample` or
+`Unsat`, so it pins both termination and that the budget did not let a truncated encoding
+masquerade as a complete one.
+
+The size of the memo is a real constraint, not a free parameter. `Ctx` is already ~1.8 MB
+and lives in a thread-local, so it sits close to the test harness's thread stack: growing it
+by 512 KB overflows that stack. The memo is therefore small on purpose -- 128 slots, about
+33 KB -- and the measurement says that is enough for the fold terms a single query touches
+(`N=64` and `N=256` behave identically to `N=128` on the corpus).

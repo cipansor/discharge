@@ -41,6 +41,16 @@ pub const MAX_BITS: usize = 64;
 
 /// Blast `t` into `out[..width]`, adding gates to `cnf`.
 pub(crate) fn blast(ctx: &mut Ctx, cnf: &mut Cnf, t: Term, out: &mut [Lit; MAX_BITS]) {
+    // Charge a step and stop once the budget is spent, exactly as the BDD blaster does.
+    // A fold-built term is a shared DAG, so an unmemoised walk costs one visit per path;
+    // stopping leaves the caller's `overflow` path to report `Unknown`, which is sound
+    // because a truncated encoding proves nothing.
+    if ctx.charge_sat_step() {
+        cnf.mark_overflow();
+        let f = cnf.false_lit();
+        out.fill(f);
+        return;
+    }
     // Same stale rule as the BDD blaster: one stale touch poisons the whole traversal,
     // because a constructor can read a stale node and build a current node that points
     // back at it, leaving a cycle whose every node looks current.

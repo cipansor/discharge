@@ -31,6 +31,29 @@ use core::cell::RefCell;
 /// Node budget for the arena. This is the only tuning knob.
 pub const CAP: usize = 1 << 14;
 
+/// Slots in each bit-blaster's memo, rounded to a power of two.
+///
+/// The blasters walk a term as a tree, but a term built by a fold (`pow`, the divider) is
+/// a *DAG*: a shared subterm is re-walked once per path to it, and for a 32-step fold that
+/// is 2^32 walks of the same few hundred nodes. The arena never fills, so the existing
+/// overflow guard never fires, and the query simply never returns. A memo on the blasted
+/// value of each term collapses those paths: the same query drops from more than 10^8
+/// visits to a few hundred. 128 slots is enough for the fold terms a single query touches;
+/// it is deliberately small because the table lives in the arena (see `Ctx`), which is
+/// allocated once and must stay well inside a thread's stack.
+const BLAST_MEMO_N: usize = 128;
+
+/// Step budget for one bit-blasting pass, the companion to [`BLAST_MEMO_N`].
+///
+/// A memo makes the fold walks cheap, but a memo is a cache, not a guarantee: a term shape
+/// that evicts its own entries could still recompute. This bounds the *work* directly. When
+/// it trips, the pass stops and the query degrades exactly as an arena overflow does -- the
+/// BDD pass hands off to the SAT engine, the SAT pass reports `Unknown` -- so the answer
+/// stays sound and the call always returns. The value is far above every query in the test
+/// corpus (the largest measured pass is a few thousand steps) and far below the 10^8-step
+/// blow-up it exists to stop.
+pub(crate) const MAX_BLAST_STEPS: u32 = 1 << 22;
+
 /// Worst-case arena memory in bytes, so an integrator can budget statically.
 pub const ARENA_BYTES: usize =
     CAP * (core::mem::size_of::<Node>() + 2 * core::mem::size_of::<u32>());
@@ -342,6 +365,17 @@ pub(crate) struct Ctx {
     var_width: [u8; MAX_VARS],
     n_vars: usize,
     overflow: bool,
+    /// Memo for the BDD blaster: the blasted bits of a term, keyed by term id.
+    ///
+    /// Validity is scoped by the arena [`Ctx::generation`]: the key stores the term id
+    /// *including* its generation bits, and a reset recycles slots under a new generation,
+    /// so a stale entry can never be read as a current term's value. Cleared with the arena.
+    blast_memo_key: [u32; BLAST_MEMO_N],
+    blast_memo_bits: [[u32; 64]; BLAST_MEMO_N],
+    /// Steps taken by the BDD blaster in the current query, against [`MAX_BLAST_STEPS`].
+    blast_steps: u32,
+    /// Steps taken by the SAT blaster in the current query, against [`MAX_BLAST_STEPS`].
+    sat_blast_steps: u32,
     /// Set when a variable index past `MAX_VARS` was requested.
     ///
     /// `overflow` alone is not enough to decide whether to fall back to the SAT engine.
@@ -459,6 +493,10 @@ impl Ctx {
             var_width: [0; MAX_VARS],
             n_vars: 0,
             overflow: false,
+            blast_memo_key: [0; BLAST_MEMO_N],
+            blast_memo_bits: [[FALSE; 64]; BLAST_MEMO_N],
+            blast_steps: 0,
+            sat_blast_steps: 0,
             var_overflow: false,
             ready: false,
             subst_val: [NO_SUBST; MAX_VARS],
@@ -481,6 +519,11 @@ impl Ctx {
         self.n_nodes = 2;
         self.n_vars = 0;
         self.overflow = false;
+        // The memo is keyed by term id *including* its generation, and the generation is
+        // bumped below, so the old keys can never match a term in the new arena. Nothing to
+        // clear -- only the counters, which are per query, not per arena.
+        self.blast_steps = 0;
+        self.sat_blast_steps = 0;
         self.var_overflow = false;
         self.ready = false;
         for i in 0..CAP {
@@ -838,6 +881,14 @@ impl Ctx {
     /// Poison the traversal, exactly as `blast` does on a stale touch.
     pub(crate) fn mark_stale(&mut self) {
         self.stale = true;
+    }
+
+    /// Charge one step to the SAT blaster, returning `true` once [`MAX_BLAST_STEPS`] is
+    /// spent. The SAT blaster runs after the BDD pass has given up, so it gets its own
+    /// counter; both are reset per query.
+    pub(crate) fn charge_sat_step(&mut self) -> bool {
+        self.sat_blast_steps = self.sat_blast_steps.saturating_add(1);
+        self.sat_blast_steps > MAX_BLAST_STEPS
     }
 
     /// Mark the query ill-formed, so it answers `Unknown`. Used by the SAT blaster for the
@@ -1242,6 +1293,16 @@ impl Ctx {
     // ------------------------- bit-blasting -------------------------
 
     fn blast(&mut self, t: Term, out: &mut [u32; 64]) {
+        // Bound the work before doing any of it. See `MAX_BLAST_STEPS`: the memo below
+        // makes the fold walks cheap, but only this counter makes the pass *guaranteed* to
+        // end. Tripping it sets `overflow`, which routes the query to the SAT engine and
+        // from there to `Unknown` -- never to a verdict about a half-built diagram.
+        self.blast_steps = self.blast_steps.saturating_add(1);
+        if self.blast_steps > MAX_BLAST_STEPS {
+            self.overflow = true;
+            out.fill(FALSE);
+            return;
+        }
         // Check `stale` first, so once any stale handle has been touched the whole
         // traversal stops. Checking only the current node is not enough: a constructor can
         // read a stale node and then *build* a current node that refers back to the stale
@@ -1282,6 +1343,14 @@ impl Ctx {
         if w == 0 || w > 64 {
             self.ill_formed = true;
             out.fill(FALSE);
+            return;
+        }
+        // The memo turns the shared-DAG walk from exponential into linear. See
+        // `BLAST_MEMO_N`. A hit is always sound: the key is the term id, and identical ids
+        // mean identical terms, whose blasted bits are deterministic.
+        let memo_i = (t.0 as usize) & (BLAST_MEMO_N - 1);
+        if self.blast_memo_key[memo_i] == t.0 {
+            out[..w].copy_from_slice(&self.blast_memo_bits[memo_i][..w]);
             return;
         }
         match n.op {
@@ -1444,6 +1513,12 @@ impl Ctx {
                 }
             }
         }
+        // Memoise the result, but never after an overflow: an overflowed pass produced a
+        // truncated diagram, and caching it would hand that truncation to a later query.
+        if !self.overflow {
+            self.blast_memo_key[memo_i] = t.0;
+            self.blast_memo_bits[memo_i] = *out;
+        }
     }
 
     fn blast_bool(&mut self, t: Term) -> u32 {
@@ -1503,6 +1578,8 @@ impl Ctx {
     }
 
     fn query_valid(&mut self, t: Term) -> Verdict {
+        self.blast_steps = 0;
+        self.sat_blast_steps = 0;
         let node = self.blast_bool(t);
         if self.stale || self.ill_formed || self.var_overflow {
             return Verdict::Unknown;
@@ -1521,6 +1598,8 @@ impl Ctx {
     }
 
     fn query_model(&mut self, t: Term) -> Verdict {
+        self.blast_steps = 0;
+        self.sat_blast_steps = 0;
         let node = self.blast_bool(t);
         if self.stale || self.ill_formed || self.var_overflow {
             return Verdict::Unknown;

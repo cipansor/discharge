@@ -1317,6 +1317,45 @@ mod tests {
         assert!(!pow_exponent_fits(64));
     }
 
+    /// A *symbolic* `pow` must return a verdict instead of hanging the blaster.
+    ///
+    /// `pow` is a 32-step fold, and its term is a DAG with heavy sharing: a shared subterm
+    /// sits on many paths, so a walk that does not memoise re-visits it once per path --
+    /// 2^32 visits for a 32-step fold. The arena does not fill on the way, so the old
+    /// overflow guard never fired, and `prove` simply never returned. This is the shape
+    /// that regressed: a `pow` whose *exponent* is a variable, which is the only way the
+    /// fold's control flow is symbolic at all. A concrete exponent is unrolled to one path
+    /// and never showed the blow-up.
+    ///
+    /// The assertion is deliberately weak -- any verdict is accepted, `Unknown` included.
+    /// The property being pinned is termination, not the answer: before the fix the call
+    /// did not return, so reaching the assertion at all is the whole test. Demanding
+    /// `Valid` here would fail on the widths where the honest answer *is* `Unknown`.
+    #[test]
+    fn a_symbolic_pow_returns_a_verdict_instead_of_hanging() {
+        for w in [4u8, 6, 8] {
+            smt::with_fresh(|| {
+                let base = smt::var(w);
+                let exp = smt::var(32);
+                let outcome = eval(Intrinsic::Pow(Family::Wrapping), base, exp, w, false, w)
+                    .expect("`wrapping_pow` at a small width must be modelled");
+                let Outcome::Value(value) = outcome else {
+                    panic!("`wrapping_pow` yields a value, not an option or a tuple");
+                };
+                // `x^e == x^e` is a tautology, so the only sound outcomes are `Valid` and
+                // `Unknown`. A `Counterexample` or an `Unsat` here would be a *wrong*
+                // answer, and one that a step budget could in principle manufacture if it
+                // let a truncated encoding through as a complete one -- so this pins both
+                // that the call returns and that the budget did not corrupt the verdict.
+                let verdict = smt::prove(smt::eq(value, value));
+                assert!(
+                    matches!(verdict, crate::smt::Verdict::Valid | crate::smt::Verdict::Unknown),
+                    "a symbolic `pow` on a tautology must be `Valid` or `Unknown`, got {verdict:?}"
+                );
+            });
+        }
+    }
+
     /// The `pow` names classify into the four families, and their neighbours do
     /// not.
     ///
