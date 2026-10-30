@@ -3074,6 +3074,11 @@ fn a_radix_literal_is_read_at_its_radix() {
         "contract_octal_literal_is_fifteen",
         "contract_hex_underscore_is_65535",
         "contract_hex_with_suffix_is_255",
+        "contract_hex_arithmetic_is_folded",
+        "contract_hex_shift_amount",
+        "contract_hex_mask_keeps_low_nibble",
+        "contract_negative_hex_literal",
+        "contract_uppercase_hex_prefix",
     ];
     let Some(report) = verify_realistic(&verified) else { return };
     for name in verified {

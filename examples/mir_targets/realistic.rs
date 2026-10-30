@@ -1641,6 +1641,45 @@ pub fn contract_hex_literal_is_not_zero_control(x: u8) -> u8 {
     x
 }
 
+/// A radix literal is a *value* in arithmetic too, not only a bare atom: `0x10 + 1`
+/// is `17`, and the reader must fold it the same way it folds a decimal.
+/// requires: x == 0x10 + 0x01
+/// ensures: ret == 17
+pub fn contract_hex_arithmetic_is_folded(x: u8) -> u8 {
+    x
+}
+
+/// A radix literal as a *shift amount*: `x >> 0x1` is `x >> 1`. The shift-amount
+/// path folds the operand, so the literal has to be a constant there too.
+/// requires: x == 4
+/// ensures: ret == x >> 0x1
+pub fn contract_hex_shift_amount(x: u8) -> u8 {
+    x >> 1
+}
+
+/// A radix literal in a mask: `x & 0x0F` keeps the low nibble. At `x == 0xAB`
+/// that is `0x0B == 11`.
+/// requires: x == 0xAB
+/// ensures: ret == x & 0x0F
+pub fn contract_hex_mask_keeps_low_nibble(x: u8) -> u8 {
+    x & 0x0F
+}
+
+/// A *negative* radix literal: `-0xFF` is `-255`, so the prefix binds before the
+/// value is negated. The body returns `x` at `x == -255`.
+/// requires: x == -0xFF
+/// ensures: ret == -255
+pub fn contract_negative_hex_literal(x: i16) -> i16 {
+    x
+}
+
+/// An uppercase prefix is the same radix: `0XFF` is `255`.
+/// requires: x == 0XFF
+/// ensures: ret == 255
+pub fn contract_uppercase_hex_prefix(x: u8) -> u8 {
+    x
+}
+
 // ---------------------------------------------------------------------------
 // The contract operators that were missing, and the *precedence* they need.
 //
