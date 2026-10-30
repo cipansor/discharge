@@ -3114,6 +3114,7 @@ fn an_out_of_range_literal_is_refused_not_wrapped() {
     let refused = [
         "contract_out_of_range_literal_is_refused",
         "contract_out_of_range_negation_is_refused",
+        "contract_constant_vs_constant_out_of_range",
     ];
     let Some(report) = verify_realistic(&refused) else { return };
     for name in refused {
@@ -3130,6 +3131,7 @@ fn an_out_of_range_literal_is_refused_not_wrapped() {
     let read = [
         "contract_min_bound_still_reads",
         "contract_negative_bound_reads_at_i16",
+        "contract_constant_vs_constant_in_range",
     ];
     let Some(report) = verify_realistic(&read) else { return };
     for name in read {

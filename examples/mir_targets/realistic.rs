@@ -1725,6 +1725,24 @@ pub fn contract_negative_bound_reads_at_i16(x: i16) -> i16 {
     x
 }
 
+/// A comparison between two *constants* has no typed name to take its width from,
+/// but it still has to be one rustc would accept. `128 <= i8::MAX` is a `literal
+/// out of range for i8` error, and reading `128` as the bit pattern `0x80` made it
+/// `-128 <= 127` -- always true -- so the shape is refused, not decided.
+/// requires: 128 <= i8::MAX && x == 7
+/// ensures: ret == 0
+pub fn contract_constant_vs_constant_out_of_range(x: i8) -> i8 {
+    x
+}
+
+/// The in-range counterpart, so the refusal above is pinned to the value and not
+/// to the shape: `127 <= i8::MAX` is well-typed and must read.
+/// requires: 127 <= i8::MAX && x == 7
+/// ensures: ret == 7
+pub fn contract_constant_vs_constant_in_range(x: i8) -> i8 {
+    x
+}
+
 // ---------------------------------------------------------------------------
 // The contract operators that were missing, and the *precedence* they need.
 //

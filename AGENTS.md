@@ -4158,12 +4158,21 @@ The fix has two halves:
 bare literal; a fix that refused every `0x80` would have broken it, which is why the
 corpus pins both sides.
 
-Evidence: `an_out_of_range_literal_is_refused_at_the_operand_width` (spec unit test,
-parse-level), `an_out_of_range_literal_is_refused_not_wrapped` (integration, four
-corpus entries -- two refusals and the two legal boundaries), four corpus entries.
-The integration test is sensitive in both halves: reverting the `align_widths`
-change makes `contract_out_of_range_literal_is_refused` *verify* (the false proof),
-and reverting the `parse_neg` widening makes `contract_out_of_range_negation_is_refused`
-verify. Both were checked by reverting each half alone.
+A third site had the same hole: a comparison between *two constants*, where neither
+operand is a typed name and the width comes from the literal itself. `align_widths`
+aligned the two and returned without a fit check, so `128 <= i8::MAX` -- a `literal
+out of range for i8` error in Rust -- read as `-128 <= 127`, always true. The check
+now runs on both operands even when both are constants, so the shape is refused while
+`127 <= i8::MAX` and `i8::MIN <= i8::MAX` still read.
 
-Coverage **125/206 to 127/210**, test-count 542 to 544. Gate green.
+Evidence: `an_out_of_range_literal_is_refused_at_the_operand_width` (spec unit test,
+parse-level), `an_out_of_range_literal_is_refused_not_wrapped` (integration, six
+corpus entries -- three refusals and the three legal boundaries), six corpus entries.
+The integration test is sensitive in every half: reverting the `align_widths`
+change makes `contract_out_of_range_literal_is_refused` *verify* (the false proof),
+reverting the `parse_neg` widening makes `contract_out_of_range_negation_is_refused`
+verify, and reverting the two-constant check makes
+`contract_constant_vs_constant_out_of_range` verify. Each was checked by reverting
+that half alone.
+
+Coverage **125/206 to 128/212**, test-count 542 to 544. Gate green.

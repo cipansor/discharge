@@ -1781,15 +1781,22 @@ impl<'a> Parser<'a> {
     ) -> Result<(Var, Var), SpecError> {
         let (wa, wb) = (smt::bits(a), smt::bits(b));
         match (self.const_value(a), self.const_value(b)) {
-            // Both constants: neither is being compared against a typed operand,
-            // so there is no width to check against. Align to the narrower for a
-            // well-formed term.
+            // Both constants: align to the narrower for a well-formed term. The
+            // range check still runs, on *both* operands: a contract that meets no
+            // typed name still has to be one rustc would accept. `128 <= i8::MAX`
+            // is a `literal out of range` error in Rust, and without the check here
+            // it read as `-128 <= 127` -- always true -- so the shape is refused
+            // rather than decided. A bare literal is checked as `+val` and a named
+            // bound as its two's-complement value (see `resize_const`), so
+            // `i8::MIN <= i8::MAX` still reads while `128 <= i8::MAX` does not.
             (Some(_), Some(_)) => {
                 if wa > wb {
                     Ok((self.resize_const(a, wb, signed, sa)?, b))
                 } else if wb > wa {
                     Ok((a, self.resize_const(b, wa, signed, sb)?))
                 } else {
+                    let a = self.resize_const(a, wa, signed, sa)?;
+                    let b = self.resize_const(b, wb, signed, sb)?;
                     Ok((a, b))
                 }
             }
@@ -3193,6 +3200,19 @@ mod tests {
         assert_eq!(reads("x >= -128"), Some(true), "-128 is i8::MIN");
         let mut p = Parser::new("x == 128", &args, None, &signed, false);
         assert!(p.parse_or().is_err(), "`x == 128` is refused too");
+        // Two *constants* have no typed name to take a width from, but the fit
+        // check still runs: `128 <= i8::MAX` is a `literal out of range` error, and
+        // reading `128` as `0x80` made it `-128 <= 127` -- always true. The in-range
+        // counterpart and the named bound both still read.
+        let mut p = Parser::new("128 <= i8::MAX", &args, None, &signed, false);
+        assert!(
+            p.parse_or().is_err(),
+            "`128 <= i8::MAX` must be refused (literal out of range for `i8`)"
+        );
+        let mut p = Parser::new("127 <= i8::MAX", &args, None, &signed, false);
+        assert!(p.parse_or().is_ok(), "`127 <= i8::MAX` is well-typed and must read");
+        let mut p = Parser::new("i8::MIN <= i8::MAX", &args, None, &signed, false);
+        assert!(p.parse_or().is_ok(), "`i8::MIN <= i8::MAX` must read");
     }
 
     /// An explicit discriminant sets the variant's value and the next continues

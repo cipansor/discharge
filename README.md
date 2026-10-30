@@ -1328,7 +1328,10 @@ false proof: `requires: x <= 128` with `ensures: ret != 127` *held*. The same ho
 for a negation, where `-129` for an `i8` wraps to `127` at eight bits and `x >= -129`
 became `x >= 127`. Both are refused now. The `i8::MIN` bound shares the bit pattern
 `0x80` and still reads, which is why the fix distinguishes a non-negative literal
-from a signed constant instead of refusing every `0x80`.
+from a signed constant instead of refusing every `0x80`. The check runs even when
+both operands are constants and no typed name is present: `128 <= i8::MAX` is a
+`literal out of range` error, and reading `128` as `0x80` made it `-128 <= 127`,
+always true — so it is refused, while `127 <= i8::MAX` and `i8::MIN <= i8::MAX` read.
 
 A literal is read at the radix it is written in. `0xFF` is `255`, `0b1010` is `10`
 and `0o17` is `15`, in any width and with underscores or a type suffix (`0xFFu8`,
