@@ -1441,6 +1441,40 @@ pub fn contract_cast_chain_tripwire(x: u8) -> u32 {
     x as u16 as u32
 }
 
+/// Unary `-` binds *tighter* than `as` in Rust, so `-x as u8` is `(-x) as u8`,
+/// not `-(x as u8)`. The two readings agree on the value here — negation and
+/// truncation commute — but not on the *type*: Rust's is `u8`, the other is
+/// signed. This precondition is satisfiable only under the unsigned reading
+/// (`x == 1` gives `255`, which is `> 127`); a signed `i8` is never `> 127`, so
+/// reading the negation outside the cast makes the function *vacuous*. The body
+/// returns `1` unconditionally, so it verifies exactly when the precondition is
+/// satisfiable.
+/// requires: -x as u8 > 127
+/// ensures: ret == 1
+pub fn contract_neg_binds_tighter_than_cast(x: i8) -> u8 {
+    1
+}
+
+/// The value reading, which both parses agree on (negation and truncation
+/// commute), so this guards against a fix that broke the *value* while fixing the
+/// type: at `x == -5`, `-x` is `5`, and `5 as u8` is `5`.
+/// requires: x == -5
+/// ensures: ret == -x as u8
+pub fn contract_neg_cast_value(x: i8) -> u8 {
+    -x as u8
+}
+
+/// The tripwire, and the direction that matters: `255 < 127` is *false* on the
+/// unsigned `u8` that Rust produces, so the tool must refute this. Under the
+/// signed reading (`-1 < 127`) it would be *true* and the function would verify —
+/// a false proof. That is the failure the precedence bug produced, so this entry
+/// failing to refute is the alarm.
+/// requires: x == 1
+/// ensures: -x as u8 < 127
+pub fn contract_neg_binds_tighter_than_cast_tripwire(x: i8) -> u8 {
+    1
+}
+
 // ---------------------------------------------------------------------------
 // The contract operators that were missing, and the *precedence* they need.
 //

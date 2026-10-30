@@ -2753,3 +2753,40 @@ fn a_constant_signed_expression_uses_the_signed_engine() {
     }
 }
 
+/// Unary `-` binds *tighter* than `as`, so `-x as u8` has type `u8` — unsigned.
+/// Reading it the other way (`-(x as u8)`, signed) made `-x as u8 > 127`
+/// unsatisfiable, so a function that is verifiable was reported *vacuous*. Both
+/// directions are asserted: the satisfiable one must verify, and the tripwire —
+/// which the signed reading would wrongly *verify* — must be refuted.
+#[test]
+fn a_negation_binds_tighter_than_a_cast() {
+    let cases = [
+        (
+            "neg_cast_gt",
+            "/// requires: -x as u8 > 127\n/// ensures: ret == 1\n\
+             pub fn neg_cast_gt(x: i8) -> u8 { 1 }",
+            true,
+        ),
+        (
+            "neg_cast_lt_tripwire",
+            "/// requires: x == 1\n/// ensures: -x as u8 < 127\n\
+             pub fn neg_cast_lt_tripwire(x: i8) -> u8 { 1 }",
+            false,
+        ),
+        (
+            "neg_cast_value",
+            "/// requires: x == -5\n/// ensures: ret == -x as u8\n\
+             pub fn neg_cast_value(x: i8) -> u8 { -x as u8 }",
+            true,
+        ),
+    ];
+    for (name, src, want_verified) in cases {
+        let Some(o) = verify_src(name, src) else { return };
+        assert_eq!(
+            o.is_verified(),
+            want_verified,
+            "`{name}`: expected verified={want_verified}, got: {o}"
+        );
+    }
+}
+

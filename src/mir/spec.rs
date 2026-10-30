@@ -1848,9 +1848,9 @@ impl<'a> Parser<'a> {
     /// not merely imprecise. A *symbolic* divisor is modelled exactly (the
     /// engine's divider is total), which mirrors the body.
     fn parse_mul(&mut self) -> Result<(Var, bool), SpecError> {
-        let (mut left, mut sgn) = self.parse_atom()?;
+        let (mut left, mut sgn) = self.parse_cast()?;
         while let Some(op) = self.eat_any(&["*", "/", "%"]) {
-            let (r, rs) = self.parse_atom()?;
+            let (r, rs) = self.parse_cast()?;
             if op != "*" && smt::const_of(r) == Some(0) {
                 return Err(self.err("a division or remainder by a literal zero"));
             }
@@ -1882,25 +1882,41 @@ impl<'a> Parser<'a> {
         None
     }
 
-    /// An atom, plus whether it is signed.
-    fn parse_atom(&mut self) -> Result<(Var, bool), SpecError> {
-        // A unary minus is folded into the literal or the name it precedes, so
-        // `-10` and `-a` are both expressible. It is a *value* negation, not a
-        // subtraction, which is what makes `a >= -10` read the way it looks.
+    /// The cast level: a unary-negated primary, then any `as <type>` chain.
+    ///
+    /// Rust binds unary `-` *tighter* than `as`, so `-x as u8` is `(-x) as u8`,
+    /// not `-(x as u8)`. The two readings agree on the *value* here (negation and
+    /// truncation commute) but not on the *type*: Rust's is `u8`, and `-(...)` is
+    /// signed. That difference is observable — `-x as u8 > 127` is satisfiable
+    /// (`x == 1` gives `255`), where the signed reading is `i8 > 127`, which no
+    /// input satisfies, so the function is reported *vacuous* instead of verified.
+    /// Hence the negation is applied to the primary first, and the cast chain runs
+    /// after it.
+    fn parse_cast(&mut self) -> Result<(Var, bool), SpecError> {
+        let (v, sgn) = self.parse_neg()?;
+        self.cast_chain(v, sgn)
+    }
+
+    /// A unary negation, applied to the primary below it and *before* any cast.
+    ///
+    /// The result is signed whatever the operand was. Negation is only defined on
+    /// a signed type in Rust (`let x: u32 = -1;` does not compile), so a negation
+    /// *is* the evidence that the expression is signed. The operand's own flag
+    /// cannot be used: `-7` negates the literal `7`, which is unsigned, and
+    /// reading the flag through would make `-7 % 3` take the unsigned remainder
+    /// (`4294967289 % 3`, i.e. `0`) where Rust says `-1`. Only `% / >>` and the
+    /// comparisons consult the flag, so the mistake is a *wrong value* rather than
+    /// a refusal -- the one outcome a verifier must not produce silently.
+    fn parse_neg(&mut self) -> Result<(Var, bool), SpecError> {
         if self.eat_op("-") {
-            let (v, _) = self.parse_atom()?;
+            let (v, _) = self.parse_neg()?;
             let w = smt::bits(v);
-            // The result is signed whatever the operand was. Negation is only
-            // defined on a signed type in Rust (`let x: u32 = -1;` does not
-            // compile), so a negation *is* the evidence that the expression is
-            // signed. The operand's own flag cannot be used: `-7` negates the
-            // literal `7`, which is unsigned, and reading the flag through would
-            // make `-7 % 3` take the unsigned remainder (`4294967289 % 3`, i.e.
-            // `0`) where Rust says `-1`. Only `% / >>` consult the flag, so the
-            // mistake is a *wrong value* rather than a refusal -- the one
-            // outcome a verifier must not produce silently.
             return Ok((smt::sub(smt::word(0, w), v), true));
         }
+        self.parse_atom()
+    }
+
+    fn parse_atom(&mut self) -> Result<(Var, bool), SpecError> {
         match self.peek().cloned() {
             Some(Tok::Num(n)) => {
                 self.pos += 1;
@@ -1924,13 +1940,13 @@ impl<'a> Parser<'a> {
                     .max()
                     .unwrap_or(64);
                 let w = scope.max(need).min(64);
-                self.cast_chain(smt::word(n, w), false)
+                Ok((smt::word(n, w), false))
             }
             Some(Tok::Ident(name)) => {
                 self.pos += 1;
                 if name == "ret" || name == "result" {
                     let v = self.ret.ok_or_else(|| self.err(self.ret_absent))?;
-                    return self.cast_chain(v, self.ret_signed);
+                    return Ok((v, self.ret_signed));
                 }
                 if name == "true" || name == "false" {
                     // A boolean literal is a one-bit word, so a `bool`-returning
@@ -1994,7 +2010,7 @@ impl<'a> Parser<'a> {
                     .copied()
                     .ok_or_else(|| self.err(format!("unknown name `{name}` (not an argument)")))?;
                 let s = self.is_signed_name(&name);
-                self.cast_chain(v, s)
+                Ok((v, s))
             }
             Some(Tok::Op(o)) if o == "(" => {
                 self.pos += 1;
@@ -2005,7 +2021,7 @@ impl<'a> Parser<'a> {
                 if !self.eat_op(")") {
                     return Err(self.err("missing `)`"));
                 }
-                self.cast_chain(v, s)
+                Ok((v, s))
             }
             Some(t) => Err(self.err(format!("unexpected token {t:?}"))),
             None => Err(self.err("unexpected end of contract")),
@@ -2764,6 +2780,44 @@ mod tests {
         // `7` subtracted from `0`, so it evaluates to `-1` at 8 bits.
         let (v, _) = parse("-7");
         assert_eq!(smt::evaluate(v, |_| None).expect("a constant"), 0xF9);
+    }
+
+    /// Unary `-` binds *tighter* than `as`, so `-x as u8` is `(-x) as u8` and its
+    /// type is `u8` — unsigned — not the signed `-(x as u8)`.
+    ///
+    /// The values agree (negation and truncation commute), so the flag is what
+    /// separates the readings, and the flag is what the operators and comparisons
+    /// read. Getting it backwards made `-x as u8 > 127` unsatisfiable — an `i8` is
+    /// never `> 127` — which reported a verifiable function as *vacuous*. Rust
+    /// rejects `-x as u8` for an unsigned `x` with "cannot apply unary operator
+    /// `-`", which is the language telling you the negation happens on `x` before
+    /// the cast, not on the cast's result.
+    #[test]
+    fn a_negation_binds_tighter_than_a_cast() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::word(0, 8));
+        let unsigned = BTreeSet::new();
+        let parse = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let (v, sgn) = p.parse_expr().expect("parses");
+            p.expect_end().expect("no trailing tokens");
+            (v, sgn)
+        };
+        // `(-x) as u8` is unsigned; `-(x as u8)` would be signed.
+        let (_, sgn) = parse("-x as u8");
+        assert!(!sgn, "`-x as u8` is `(-x) as u8`, an unsigned type");
+        // The cast target decides the width, whichever way the negation is read,
+        // so the value of the negation is not where the two readings differ.
+        let (v, _) = parse("-x as u8");
+        assert_eq!(smt::bits(v), 8, "the cast target is the width");
+        // A cast *after* a parenthesized negation is the same thing, and is what
+        // the explicit spelling looks like.
+        let (_, sgn) = parse("(-x) as u8");
+        assert!(!sgn, "`(-x) as u8` is unsigned too");
+        // A negation with no cast is still signed, or the fix above would have
+        // undone the previous one.
+        let (_, sgn) = parse("-x");
+        assert!(sgn, "a negation with no cast is signed");
     }
 
     /// An explicit discriminant sets the variant's value and the next continues

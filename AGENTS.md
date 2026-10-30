@@ -3903,3 +3903,38 @@ flipping the flag the wrong way fails there too. The same flag also decides a
 than false, and two of the entries pin that second family. Coverage **94/166 to
 98/173** decided.
 
+## Unary `-` binds tighter than `as`, and the parser had it the other way round
+
+The same probing that found the signedness bug found this one immediately after:
+the fix made `-x as u8` reachable, and it read as `-(x as u8)` where Rust means
+`(-x) as u8`.
+
+The **value** is the same either way — negation and truncation commute — so no
+value-based test could see it. The **type** is not: Rust's is `u8`, and `-(...)` is
+signed. That difference is observable through a comparison, because the flag is
+what `slt`/`ult` read. `-x as u8 > 127` is satisfiable under the unsigned reading
+(`x == 1` gives `255`), and unsatisfiable under the signed one (`i8` is never
+`> 127`), so the tool reported a *verifiable* function as **vacuous**.
+
+Rust states the precedence itself: `let x: u32 = 0; let y = -x as u8;` fails with
+"cannot apply unary operator `-` to type `u32`", which is only true if the negation
+is applied to `x` *before* the cast. (Against a signed `x` it compiles, and there
+the negation is on the signed value, still before the cast.)
+
+The fix splits the old single `parse_atom` level into `parse_neg` (the unary minus,
+applied to the primary) and `parse_cast` (that result, then the `as` chain), with
+`parse_mul` now entering at `parse_cast`. The four `cast_chain` calls that used to
+sit on `parse_atom`'s leaves are gone, so a cast has one home.
+
+Pinned by three corpus entries and two tests. The corpus tripwire is the one to
+watch: `requires: x == 1; ensures: -x as u8 < 127` is *false* on the unsigned `u8`
+(`255 < 127`), so it must be refuted — under the signed reading it would **verify**,
+which is a false proof. The `spec` unit test asserts the flag on `-x as u8` (must be
+unsigned), on `(-x) as u8` (also unsigned), and on a bare `-x` (still signed, so the
+previous fix stands). Coverage **98/173 to 100/176** decided.
+
+Three bugs, one shape: each fix made a shape reachable that nothing had reached, and
+probing it against hand-checked answers found the next. The first two were refusals
+or crashes; this one and the signedness bug were *wrong values*, which is the
+direction a verifier must never fail in.
+
