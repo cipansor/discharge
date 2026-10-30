@@ -2872,6 +2872,11 @@ fn the_contract_reader_agrees_with_rustc_on_a_grid() {
         // two readings differ at every point but one.
         ("!x", "u8", "u8", &[0, 1, 5, 250, 255], Some(5)),
         ("!x", "u8", "u8", &[0, 1, 5, 250, 255], Some(4)),
+        // Parentheses do not make it a predicate: `!(x + 1)` holds *arithmetic*, so
+        // `!` is still the value form and `!(x + 1) == 5` is `(!(x + 1)) == 5`, not a
+        // negation of `(x + 1) == 5` (which is not even well-typed). This is the case
+        // that separates `bang_is_predicate`'s lookahead from "a `(` follows".
+        ("!(x + 1)", "u8", "u8", &[0, 1, 5, 249, 254], None),
         // A shift amount is a constant *expression*: the reader and the body must
         // both fold `1 + 1` to `2`, not treat it as a symbolic barrel-shifter
         // amount. The value mode builds `x >> 1 + 1` as the body *and* the
@@ -2997,5 +3002,37 @@ fn a_folded_constant_is_read_as_a_constant() {
         o.is_verified(),
         "a folded shift amount in the body must be lowered as a constant, got: {o}"
     );
+}
+
+/// The corpus entries that pin *where* `!` binds, asserted end to end.
+///
+/// `!` is bitwise NOT on a value and negation on a predicate, and it binds tighter
+/// than `==`, `&` and `as`. Each entry below separates one of those bindings, so a
+/// reader that got one wrong would either fail to parse or return the other value.
+/// The control is the `==` case: it is *false* under Rust's reading and must be
+/// refuted, which is what makes the verifying entry next to it evidence rather than
+/// a tool that proves everything.
+#[test]
+fn a_bang_binds_by_rusts_precedence_in_the_corpus() {
+    let verified = [
+        "contract_bang_binds_tighter_than_eq",
+        "contract_bang_is_bitwise_not",
+        "contract_bang_still_negates_a_predicate",
+        "contract_bang_binds_tighter_than_a_cast",
+        "contract_bang_binds_tighter_than_and",
+        "contract_bang_paren_arithmetic_is_a_value",
+    ];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let Some(report) = verify_realistic(&["contract_bang_binds_tighter_than_eq_control"]) else {
+        return;
+    };
+    let o = outcome(&report, "contract_bang_binds_tighter_than_eq_control");
+    let FnOutcome::Failed { .. } = o else {
+        panic!("`contract_bang_binds_tighter_than_eq_control` is false and must be refuted, got: {o}");
+    };
 }
 

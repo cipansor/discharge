@@ -2887,6 +2887,20 @@ mod tests {
             p.expect_end().expect("no trailing tokens");
             smt::evaluate(v, |_| None).expect("a constant")
         };
+        // The value of an expression under an assignment to `x`.
+        let eval_at = |text: &str, x: u64| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let (v, _) = p.parse_expr().expect("parses");
+            p.expect_end().expect("no trailing tokens");
+            smt::evaluate(v, |_| Some(x)).expect("decides")
+        };
+        // The expression as a *predicate*, so a comparison is decided as a whole.
+        let pred = |text: &str, x: u64| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let pr = p.parse_or().expect("parses as a predicate");
+            p.expect_end().expect("no trailing tokens");
+            smt::evaluate_pred(pr, |_| Some(x)).expect("decides")
+        };
         // `!0` is `255` at 8 bits: bitwise NOT, not a boolean.
         assert_eq!(eval_const("!0"), 0xFF, "`!` on a value is bitwise NOT");
         // `!!0` is `0`: the complement of the complement.
@@ -2896,32 +2910,27 @@ mod tests {
         assert_eq!(eval_const("!1 + 1"), 0xFF, "`!` binds tighter than `+`");
         // `0 & !1` is `0 & 254` = `0`; the prefix applies to the literal `1`.
         assert_eq!(eval_const("0 & !1"), 0, "`!` applies to the operand, not the `&`");
-
-        // The value of `!x` under an assignment, which is the bitwise complement.
-        let eval_at = |text: &str, x: u64| {
-            let mut p = Parser::new(text, &args, None, &unsigned, false);
-            let (v, _) = p.parse_expr().expect("parses");
-            p.expect_end().expect("no trailing tokens");
-            smt::evaluate(v, |_| Some(x)).expect("decides")
-        };
         assert_eq!(eval_at("!x", 0), 0xFF, "a bare `!x` reads, and is bitwise");
         assert_eq!(eval_at("!x", 250), 5, "`!250` is `5` at 8 bits");
+        // `!x & 1` is `(!x) & 1`; at `x == 0` that is `255 & 1 == 1`. If `&` bound
+        // first the value would be `!(0 & 1) == 254`, so this separates the two.
+        assert_eq!(eval_at("!x & 1", 0), 1, "`!` binds tighter than `&`");
 
-        // The two readings of `!x == 5` are decided at the *predicate* level, so
-        // assert the predicate itself: `(!x) == 5` holds at `x == 250` and not at
-        // `x == 5`, which is the opposite of what `!(x == 5)` would say.
-        let pred = |text: &str, x: u64| {
-            let mut p = Parser::new(text, &args, None, &unsigned, false);
-            let pr = p.parse_or().expect("parses as a predicate");
-            p.expect_end().expect("no trailing tokens");
-            smt::evaluate_pred(pr, |_| Some(x)).expect("decides")
-        };
+        // `!x == 5` is decided at the *predicate* level, so assert the predicate
+        // itself: `(!x) == 5` holds at `x == 250` and not at `x == 5`, which is the
+        // opposite of what `!(x == 5)` would say.
         assert!(pred("!x == 5", 250), "`!x == 5` is `(!x) == 5`: true at 250");
         assert!(!pred("!x == 5", 5), "`!x == 5` is `(!x) == 5`: false at 5");
         // `!(x == 5)` is the predicate reading, and must still negate: false at 5
         // (the comparison holds, so its negation does not), true at 250.
         assert!(!pred("!(x == 5)", 5), "`!(x == 5)` is `x != 5`: false at 5");
         assert!(pred("!(x == 5)", 250), "`!(x == 5)` is `x != 5`: true at 250");
+        // `!(x + 1)` holds *arithmetic*, so `!` is the value form here even though a
+        // `(` follows: `!` is bitwise NOT, and `!(x + 1) == 5` is `(!(x + 1)) == 5`,
+        // which holds at `x == 249` and not at `x == 5`. This is the case that
+        // separates `bang_is_predicate`'s lookahead from "a `(` follows".
+        assert!(pred("!(x + 1) == 5", 249), "`!(x + 1)` is `(!(x + 1))`, a value");
+        assert!(!pred("!(x + 1) == 5", 5), "`!(x + 1)` is not a predicate negation");
     }
 
     /// A shift amount or a divisor may be a *constant expression*, and the reader

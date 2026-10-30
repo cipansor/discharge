@@ -1555,6 +1555,35 @@ pub fn contract_divisor_folded_is_read(x: u8) -> u8 {
     x / 2
 }
 
+/// Value-level `!` binds tighter than a cast, so `!x as u8` is `(!x) as u8`: at
+/// `x == 0` that is `255`. Reading it as `!(x as u8)` would make the `!` a predicate
+/// negation and this would not parse at all, so the entry pins the binding.
+/// requires: x == 0
+/// ensures: ret == !x as u8
+pub fn contract_bang_binds_tighter_than_a_cast(x: u8) -> u8 {
+    !x
+}
+
+/// Value-level `!` binds tighter than `&`, so `!x & 1` is `(!x) & 1`: at `x == 0`
+/// that is `255 & 1 == 1`. A reading that let `&` bind first would compute
+/// `!(x & 1)`, which is `254` here.
+/// requires: x == 0
+/// ensures: ret == !x & 1
+pub fn contract_bang_binds_tighter_than_and(x: u8) -> u8 {
+    !x & 1
+}
+
+/// A parenthesis does not turn `!` into a predicate negation: `!(x + 1)` holds
+/// *arithmetic*, so `!(x + 1) == 5` is `(!(x + 1)) == 5`, i.e. `x == 249`, not the
+/// negation of `(x + 1) == 5` (which is not even well-typed). Contrast
+/// `contract_bang_still_negates_a_predicate`, where the parenthesis holds a
+/// *comparison* and the `!` does negate.
+/// requires: x == 249
+/// ensures: !(x + 1) == 5
+pub fn contract_bang_paren_arithmetic_is_a_value(x: u8) -> u8 {
+    0
+}
+
 // ---------------------------------------------------------------------------
 // The contract operators that were missing, and the *precedence* they need.
 //
