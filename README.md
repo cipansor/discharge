@@ -1333,6 +1333,21 @@ both operands are constants and no typed name is present: `128 <= i8::MAX` is a
 `literal out of range` error, and reading `128` as `0x80` made it `-128 <= 127`,
 always true — so it is refused, while `127 <= i8::MAX` and `i8::MIN <= i8::MAX` read.
 
+A constant *arithmetic* expression is folded exactly, so one that overflows its
+operand width is refused rather than wrapped. `200u8 + 100u8` is a rustc const-eval
+error, but folding it mod 256 gave `44`, so `x <= 200 + 100` read as `x <= 44` — a
+*stronger* precondition than the author wrote (`x <= 300`, which admits every `u8`)
+— and `ensures: ret <= 44` was proved for a body that fails at `x == 100`: a false
+proof. The same applies to `0 - 1` (underflow), `255 + 1`, `200 * 2`, and to a
+constant `i8::MIN / -1` or `% -1`, which overflow the signed operand. The fold
+widens past the operand width to keep the value exact, so the ordinary fit check
+refuses the shape when the operand it meets is too narrow, while a sum whose overflow
+is legal because a wider operand types it (`x as u16 <= 200 + 100` is `300`) still
+reads. The widening is at the *expression's* signedness, so `i8::MAX + 1` is refused
+too: `128` fits an unsigned byte but not a signed one, and an unsigned widening would
+have left it at eight bits where it read as `-128` — a false proof in place of the one
+being fixed.
+
 A literal is read at the radix it is written in. `0xFF` is `255`, `0b1010` is `10`
 and `0o17` is `15`, in any width and with underscores or a type suffix (`0xFFu8`,
 `0xFF_FF`). Reading every literal as decimal silently made `0xFF` equal `0` — the

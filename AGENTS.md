@@ -4176,3 +4176,63 @@ verify, and reverting the two-constant check makes
 that half alone.
 
 Coverage **125/206 to 128/212**, test-count 542 to 544. Gate green.
+
+## A constant expression that overflows is folded exactly, not mod width
+
+A fourth site, one level up from the literal: constant *arithmetic* in a contract.
+
+```rust
+/// requires: x <= 200 + 100   // a rustc const-eval error: `200u8 + 100u8`
+/// ensures: ret <= 44         // "proved", because the sum was folded mod 256
+pub fn f(x: u8) -> u8 { x }
+```
+
+rustc rejects `200u8 + 100u8` as an `arithmetic_overflow`. The reader folded the
+width-8 sum the same way the engine does, giving `44`, so `x <= 200 + 100` read as
+`x <= 44` -- a *stronger* precondition than the author wrote (`x <= 300`, which admits
+every `u8`) -- and `ensures: ret <= 44` was reported **verified** for a body that
+fails at `x == 100`. A false proof, and the opposite direction from the literal
+cases: those *widened* a precondition until it excluded nothing; this one *narrowed*
+it until the postcondition held.
+
+The mechanism is `parse_add`/`parse_mul` handing the constant operands to the
+width-`w` engine operator, which wraps. The fit check in `resize_const` cannot catch
+it because it only ever sees the wrapped result. The fix folds the exact value in
+`i128` (`fold_const_arith`) and widens to the narrowest width that holds it, so the
+ordinary fit check refuses the shape when the operand it meets is too narrow. Three
+consequences:
+
+* An unsigned expression that goes negative (`0 - 1`) is refused outright: the
+  reader's own model says such an expression is unsigned, and `0u8 - 1u8` is a rustc
+  error, so handing the comparison a negative value would only make it read the wrong
+  predicate.
+* A result that fits a *wider* operand still reads: `x as u16 <= 200 + 100` is `300`,
+  which rustc accepts, so the fix does not refuse legal constant arithmetic.
+* The widening is at the *expression's* signedness, not the result's. `i8::MAX + 1` is
+  `128`, which fits an unsigned byte but not a signed one, and rustc rejects it. A
+  first version of the fix widened by "does this fit *unsigned*", which left `128` at
+  eight bits where it read as `-128` -- a *new* false proof in place of the one being
+  fixed, caught by probing `i8::MAX + 1` after the fix rather than before it. The
+  corpus now pins that case too.
+* A constant `i8::MIN / -1` or `% -1` overflows the signed operand -- rustc rejects
+  it at compile time and panics at runtime -- and the engine's divider would wrap it
+  to `MIN` and `0`. The fold refuses it.
+
+A constant *shift* is left alone, deliberately: rustc does not treat `2u8 << 7` as an
+overflow (the value wraps to `0` at runtime), only a shift *amount* at or above the
+width, and `parse_shift` already refuses that.
+
+Evidence: `an_overflowing_constant_expression_is_refused_not_wrapped` and
+`an_overflowing_constant_division_is_refused` (spec unit tests, parse-level), plus
+six corpus entries wired into `an_out_of_range_literal_is_refused_not_wrapped` --
+`contract_constant_sum_overflow_is_refused`, `contract_constant_underflow_is_refused`,
+`contract_constant_div_overflow_is_refused` and
+`contract_constant_signed_sum_overflow_is_refused` (refusals), and
+`contract_constant_sum_in_range_reads`, `contract_constant_sum_wider_operand_reads`
+(which must read). Sensitivity was checked by reverting the fold wiring alone: the
+spec tests fail and `contract_constant_sum_overflow_is_refused` *verifies* -- the
+false proof -- so the test is not passing for an unrelated reason. Reverting the
+signedness of the widening alone makes the `i8::MAX + 1` assertion fail, so the trap
+in the fix is pinned too.
+
+Coverage **128/212 to 130/218**, test-count 544 to 546. Gate green.

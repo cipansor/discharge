@@ -1743,6 +1743,61 @@ pub fn contract_constant_vs_constant_in_range(x: i8) -> i8 {
     x
 }
 
+/// A constant *arithmetic* expression that overflows its operand width is a rustc
+/// const-eval error (`200u8 + 100u8`), so it must be refused rather than folded
+/// mod 256. Folding made `x <= 200 + 100` read as `x <= 44` -- a *stronger*
+/// precondition than the author wrote (`x <= 300`, which admits every `u8`), and
+/// `ensures: ret <= 44` was then proved for a body that fails at `x == 100`: a
+/// false proof.
+/// requires: x <= 200 + 100
+/// ensures: ret <= 44
+pub fn contract_constant_sum_overflow_is_refused(x: u8) -> u8 {
+    x
+}
+
+/// An unsigned constant expression that goes negative is a rustc error too
+/// (`0u8 - 1u8`), and the reader refuses it rather than wrapping to `255`.
+/// requires: x >= 0 - 1
+/// ensures: ret >= 0
+pub fn contract_constant_underflow_is_refused(x: u8) -> u8 {
+    x
+}
+
+/// `i8::MIN / -1` and `i8::MIN % -1` overflow the signed operand, which rustc
+/// rejects; the engine's divider would wrap them to `MIN` and `0`.
+/// requires: true
+/// ensures: ret == i8::MIN / -1
+pub fn contract_constant_div_overflow_is_refused() -> i8 {
+    -128
+}
+
+/// The in-range counterpart: a constant sum that *does* fit reads as written, so
+/// the refusal above is pinned to the overflow and not to constant arithmetic.
+/// requires: x <= 100 + 44
+/// ensures: ret <= 144
+pub fn contract_constant_sum_in_range_reads(x: u8) -> u8 {
+    x
+}
+
+/// A constant sum that overflows its *narrow* operand but fits a wider one is
+/// legal in rustc (`200 + 100` is `300` for a `u16`), so it must still read.
+/// requires: x as u16 <= 200 + 100
+/// ensures: ret == x
+pub fn contract_constant_sum_wider_operand_reads(x: u8) -> u8 {
+    x
+}
+
+/// The signed trap: `i8::MAX + 1` is `128`, which fits an *unsigned* byte but not
+/// a signed one, and rustc rejects it. Widening the exact result at the
+/// expression's own signedness is what refuses it; an unsigned widening left it at
+/// eight bits where it read as `-128` -- a false proof of the same kind the fold
+/// exists to prevent.
+/// requires: x <= i8::MAX + 1
+/// ensures: ret <= 0
+pub fn contract_constant_signed_sum_overflow_is_refused(x: i8) -> i8 {
+    x
+}
+
 // ---------------------------------------------------------------------------
 // The contract operators that were missing, and the *precedence* they need.
 //

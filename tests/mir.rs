@@ -3115,6 +3115,10 @@ fn an_out_of_range_literal_is_refused_not_wrapped() {
         "contract_out_of_range_literal_is_refused",
         "contract_out_of_range_negation_is_refused",
         "contract_constant_vs_constant_out_of_range",
+        "contract_constant_sum_overflow_is_refused",
+        "contract_constant_underflow_is_refused",
+        "contract_constant_div_overflow_is_refused",
+        "contract_constant_signed_sum_overflow_is_refused",
     ];
     let Some(report) = verify_realistic(&refused) else { return };
     for name in refused {
@@ -3132,6 +3136,8 @@ fn an_out_of_range_literal_is_refused_not_wrapped() {
         "contract_min_bound_still_reads",
         "contract_negative_bound_reads_at_i16",
         "contract_constant_vs_constant_in_range",
+        "contract_constant_sum_in_range_reads",
+        "contract_constant_sum_wider_operand_reads",
     ];
     let Some(report) = verify_realistic(&read) else { return };
     for name in read {

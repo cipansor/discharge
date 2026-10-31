@@ -1690,6 +1690,128 @@ impl<'a> Parser<'a> {
         smt::evaluate(v, |_| None)
     }
 
+    /// The value a constant *denotes*, at its own width.
+    ///
+    /// A bare literal is non-negative, so its bit pattern is its value. A signed
+    /// constant (`i8::MIN`) or a negation (`-1`) is two's-complement, so the top
+    /// bit is a sign bit and the value is negative when it is set. `128` and
+    /// `i8::MIN` share the bit pattern `0x80` and mean different things, which is
+    /// why the flag is passed rather than inferred.
+    fn signed_value(&self, v: Var, sgn: bool) -> i128 {
+        let w = smt::bits(v);
+        let val = self.const_value(v).unwrap_or(0);
+        if !sgn {
+            return val as i128;
+        }
+        if w >= 64 {
+            val as i64 as i128
+        } else if val & (1u64 << (w - 1)) != 0 {
+            val as i128 - (1i128 << w)
+        } else {
+            val as i128
+        }
+    }
+
+    /// Fold a constant `+`, `-` or `*` *exactly*, widening past the operand width
+    /// when the true result does not fit it.
+    ///
+    /// Rust const-eval rejects a constant expression that overflows its type --
+    /// `200u8 + 100u8` is an error, `0u8 - 1u8` too -- and the range check in
+    /// [`Self::resize_const`] is what turns that into a refusal. But the check
+    /// only sees the value the fold produced, and letting the width-`w` engine
+    /// wrap first produced the *wrong* value: `200 + 100` became `44`, so
+    /// `x <= 200 + 100` for a `u8` read as `x <= 44` -- a *stronger* precondition
+    /// than the author wrote, and `ensures: ret <= 44` was proved for a body that
+    /// fails at `x == 100`. That is a false proof, not a refusal.
+    ///
+    /// Widening keeps the value exact so the later check refuses the shape when
+    /// the operand it meets is too narrow, and still reads a result that fits a
+    /// wider operand (`x as u16 <= 200 + 100` is `300`, which rustc accepts). An
+    /// unsigned expression that goes negative is refused outright: the reader's
+    /// own model says such an expression is unsigned, and `0u8 - 1u8` is a
+    /// rustc error, so handing the comparison a negative value would only make it
+    /// read the wrong predicate.
+    ///
+    /// Returns `None` when the exact result already fits, in which case the
+    /// ordinary wrapping operator produces the same term and nothing changes.
+    fn fold_const_arith(
+        &self,
+        op: &str,
+        a: Var,
+        sa: bool,
+        b: Var,
+        sb: bool,
+    ) -> Result<Option<(Var, bool)>, SpecError> {
+        // Only a fold of two constants can be decided here; a symbolic operand
+        // leaves the operation to the engine.
+        let (Some(_), Some(_)) = (self.const_value(a), self.const_value(b)) else {
+            return Ok(None);
+        };
+        let w = smt::bits(a);
+        let signed = sa || sb;
+        let (va, vb) = (self.signed_value(a, sa), self.signed_value(b, sb));
+        // The signed minimum, which is the one value a division can overflow on.
+        let min = -(1i128 << (w - 1));
+        if matches!(op, "/" | "%") {
+            // `i8::MIN / -1` and `i8::MIN % -1` are a rustc *panic*/const-eval
+            // error; the engine's divider would wrap them to `MIN` and `0`, a
+            // wrong value rather than a refusal.
+            if signed && vb == -1 && va == min {
+                return Err(self.err(format!(
+                    "a constant `{op}` overflows the {w}-bit signed operand width"
+                )));
+            }
+            return Ok(None);
+        }
+        if !matches!(op, "+" | "-" | "*") {
+            return Ok(None);
+        }
+        let r: i128 = match op {
+            "+" => va + vb,
+            "-" => va - vb,
+            _ => va * vb,
+        };
+        let fits = if signed {
+            let hi = (1i128 << (w - 1)) - 1;
+            r >= min && r <= hi
+        } else {
+            r >= 0 && (r as u128) < (1u128 << w)
+        };
+        if fits {
+            return Ok(None);
+        }
+        if !signed && r < 0 {
+            return Err(self.err(format!(
+                "a constant expression underflows the {w}-bit unsigned operand width"
+            )));
+        }
+        // The narrowest width that holds the exact result, *at the expression's
+        // own signedness*. The signed case matters: `i8::MAX + 1` is `128`, which
+        // fits an unsigned `u8` but not a signed one, and an unsigned test here
+        // would leave it at eight bits where it reads as `-128` -- a new false
+        // proof in place of the one being fixed.
+        let mut width = 1u8;
+        let mut holds = false;
+        while width <= 64 {
+            holds = if signed {
+                r >= -(1i128 << (width - 1)) && r < (1i128 << (width - 1))
+            } else {
+                (r as u128) < (1u128 << width)
+            };
+            if holds {
+                break;
+            }
+            width += 1;
+        }
+        if !holds {
+            // Wider than any engine word: nothing to compare against.
+            return Err(self
+                .err("a constant expression is wider than the engine's 64-bit words"));
+        }
+        let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
+        Ok(Some((smt::word(r as u64 & mask, width), signed)))
+    }
+
     /// Resize a constant operand to `wide` bits, refusing one that does not fit.
     ///
     /// Widening is exact: zero-extend unsigned, sign-extend signed. Narrowing is
@@ -1987,6 +2109,15 @@ impl<'a> Parser<'a> {
             // as ill-formed -- and that poisons every obligation in the run, so
             // the function is undecided for a reason unrelated to its body.
             let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
+            // A constant sum or difference is folded *exactly*, so a result that
+            // overflows the operand width is refused (as rustc refuses the
+            // constant expression) instead of wrapping to a wrong value. A result
+            // that fits is left to the ordinary operator.
+            if let Some((v, s)) = self.fold_const_arith(op, l, sgn, r, rs)? {
+                left = v;
+                sgn = s;
+                continue;
+            }
             left = if op == "+" { smt::add(l, r) } else { smt::sub(l, r) };
             sgn = sgn || rs;
         }
@@ -2019,6 +2150,15 @@ impl<'a> Parser<'a> {
             // Same width rule as the other operators: a literal product, divisor
             // or mask is sized to the operand it meets.
             let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
+            // A constant `/` or `%` can overflow (`i8::MIN / -1`), which rustc
+            // rejects; the fold refuses it rather than wrapping. `*` is folded
+            // exactly, so a constant product too wide for the operand is refused
+            // instead of wrapping to a wrong value.
+            if let Some((v, s)) = self.fold_const_arith(op, l, sgn, r, rs)? {
+                left = v;
+                sgn = s;
+                continue;
+            }
             left = match op {
                 "*" => smt::mul(l, r),
                 "/" if sgn || rs => smt::sdiv(l, r),
@@ -3213,6 +3353,78 @@ mod tests {
         assert!(p.parse_or().is_ok(), "`127 <= i8::MAX` is well-typed and must read");
         let mut p = Parser::new("i8::MIN <= i8::MAX", &args, None, &signed, false);
         assert!(p.parse_or().is_ok(), "`i8::MIN <= i8::MAX` must read");
+    }
+
+    /// A constant *arithmetic* expression is folded exactly, so one that overflows
+    /// its operand width is refused rather than wrapping to a wrong value.
+    ///
+    /// `200u8 + 100u8` is a rustc const-eval error. Folding it mod 256 gave `44`,
+    /// so `x <= 200 + 100` read as `x <= 44` -- a *stronger* precondition than the
+    /// author wrote (`x <= 300`, which admits every `u8`) -- and `ensures: ret <= 44`
+    /// was proved for a body that fails at `x == 100`. The check has to see the
+    /// exact value, so the fold widens past the operand width instead of wrapping;
+    /// the ordinary range check then refuses the shape when the operand it meets is
+    /// too narrow, while a result that fits a wider operand still reads.
+    #[test]
+    fn an_overflowing_constant_expression_is_refused_not_wrapped() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::var(8));
+        let signed: BTreeSet<String> = BTreeSet::new();
+        // A whole predicate, so the comparison's width alignment runs too.
+        let parses = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            p.parse_or().is_ok()
+        };
+        // Overflowing sums, differences and products are all rustc errors, so
+        // they are refused rather than folded to `44`, `255` and `1`.
+        assert!(!parses("x <= 200 + 100"), "`200 + 100` overflows a `u8`");
+        assert!(!parses("x >= 0 - 1"), "`0 - 1` underflows a `u8`");
+        assert!(!parses("x == 255 + 1"), "`255 + 1` overflows a `u8`");
+        assert!(!parses("x <= 200 * 2"), "`200 * 2` overflows a `u8`");
+        // A sum that *does* fit reads as written, and a sum whose overflow is
+        // legal because a wider operand types it still reads.
+        assert!(parses("x <= 100 + 44"), "`100 + 44` fits a `u8` and must read");
+        assert!(parses("x as u16 <= 200 + 100"), "`300` fits a `u16` and must read");
+        assert!(parses("x <= 2 * 3 % 4"), "a fold that fits must still read");
+        // The signed case is the trap: `i8::MAX + 1` is `128`, which fits an
+        // unsigned byte but not a signed one. Widening at the *expression's*
+        // signedness is what refuses it; an unsigned widening left it at eight bits
+        // where it read as `-128` -- a new false proof in place of the old one.
+        let mut sargs = BTreeMap::new();
+        sargs.insert("y".to_string(), smt::var(8));
+        let mut sset = BTreeSet::new();
+        sset.insert("y".to_string());
+        let sparses = |text: &str| {
+            let mut p = Parser::new(text, &sargs, None, &sset, false);
+            p.parse_or().is_ok()
+        };
+        assert!(!sparses("y <= i8::MAX + 1"), "`i8::MAX + 1` overflows an `i8`");
+        assert!(!sparses("y <= 127 + 1"), "`127 + 1` overflows an `i8`");
+        assert!(sparses("y <= i8::MAX"), "`i8::MAX` must read");
+        assert!(sparses("y >= i8::MIN"), "`i8::MIN` must read");
+    }
+
+    /// A constant `/` or `%` that overflows the signed operand is refused.
+    ///
+    /// `i8::MIN / -1` is `128`, which does not fit an `i8`; rustc rejects it at
+    /// compile time (and panics at runtime). The engine's divider wraps it to
+    /// `MIN`, a wrong value, so the fold refuses the shape instead of handing the
+    /// comparison a number the author never wrote.
+    #[test]
+    fn an_overflowing_constant_division_is_refused() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::var(8));
+        let mut signed = BTreeSet::new();
+        signed.insert("x".to_string());
+        let parses = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            p.parse_or().is_ok()
+        };
+        assert!(!parses("x == i8::MIN / -1"), "`i8::MIN / -1` overflows an `i8`");
+        assert!(!parses("x == i8::MIN % -1"), "`i8::MIN % -1` overflows an `i8`");
+        // In-range constant division still reads.
+        assert!(parses("x == 100 / 2"), "`100 / 2` is `50` and must read");
+        assert!(parses("x == -100 / 2"), "`-100 / 2` is `-50` and must read");
     }
 
     /// An explicit discriminant sets the variant's value and the next continues
