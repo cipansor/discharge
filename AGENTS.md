@@ -1547,6 +1547,14 @@ not run is not a gate you passed**, and the only way to keep that honest is to m
 all the gates" a single command whose exit code is the claim. A summary that says "gates
 green" should quote that command's output, not a memory of running the pieces.
 
+A practical consequence in a container that is rebuilt between sessions: the `z3-solver`
+Python module does not survive it, so gate 6 fails with "the `z3` Python module is not
+importable" on a fresh container even though the last run was green. That is the gate
+working -- it refuses to pass without its oracle -- not a regression, and the fix is
+`python3 -m pip install z3-solver` before re-running. Read the failure line before
+suspecting the change under test; twice now the gate "failure" was a missing module and
+the code was fine.
+
 ## A skipped oracle is not a passed oracle: the Ferrocene gate
 
 The crate's whole pitch is the safety-critical corner -- a `no_std`, no-solver prover you
