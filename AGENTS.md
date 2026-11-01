@@ -4294,3 +4294,50 @@ bug's earlier corpus addition (`signed_slice_element_ensures_tripwire`) is also 
 proved the second.
 
 Coverage **130/218 to 131/222**, test-count 512 to 514 (lib 179 to 180). Gate green.
+
+## The comparison-level refusal did not cover the arithmetic levels
+
+The mixed-sign fix above was written at `parse_cmp`, on the reasoning that a
+comparison is where a signed constant meets an unsigned name. Probing the shape
+next door showed that was too narrow. `x + -1` for a `u8` is the same rustc error
+("cannot apply unary operator `-` to type `u8`") and the same wrong reading (`-1`
+carried as `255`), and it is a *worse* proof: `requires: x + -1 >= 0` becomes
+`x + 255 >= 0`, trivially true, so the precondition admits every input and *any*
+postcondition is proved. `requires: x + -1 >= 0` with `ensures: ret != 0` verified
+for a body returning `x`, which is false at `x == 0`. The comparison check never
+ran, because the constant meets the name at `+`, not at `>=`.
+
+The refusal is now one helper, `refuse_signed_const_vs_unsigned_name`, called at
+every level where two operands of one operator meet. That turned out to be *four*,
+not three: `parse_cmp`, the additive level, the multiplicative level, and the
+bitwise levels (`parse_bitand`/`parse_bitxor`/`parse_bitor`) that sit between the
+comparison and the additive levels. The first draft of this section asserted the
+bitwise levels "do not carry a negation of their own, so no separate site was
+needed" -- and a probe disproved it immediately: `x ^ -1 <= 255` for a `u8` was
+read as `x ^ 255 <= 255`, always true, and *verified* for a body returning `x`. The
+claim had been reasoned, not tested, and the reasoning was wrong; the probe is what
+found the fourth level. The helper's doc comment carries the narrowness argument
+once instead of four times. The legal shapes still read: `x + 255 >= 0` (unsigned
+constant), `x - 1 <= 255`, `x & 255 == x`, `y + -1 <= 0` and `y ^ -1 == 0` (signed
+name with a signed constant).
+
+The lesson generalises past this bug: a signedness refusal is only as wide as the
+*operator* it was written on. The reader meets two operands at four levels
+(comparison, additive, multiplicative, bitwise), and a fix at one of them leaves the
+other three reading the wrong value. The original comparison-level fix was found
+too narrow by probing the level next door; the arithmetic fix was found too narrow
+the same way, one level further out. The pattern is to *enumerate the levels and
+probe each*, not to reason that a neighbour is safe.
+
+Evidence: the spec test gained the arithmetic and bitwise cases (`x + -1`,
+`x - -1`, `x % -1`, `x * -1`, `x & -1`, `x | -1`, `x ^ -1` refused; `x + 255`,
+`x - 1`, `x & 255`, `x ^ 255`, `y + -1`, `y ^ -1` read), and four corpus entries
+(`contract_signed_constant_sum_vs_unsigned_is_refused` and
+`contract_signed_constant_mask_vs_unsigned_is_refused`, refused;
+`contract_unsigned_constant_sum_still_reads` and `contract_unsigned_mask_still_reads`,
+must read). Sensitivity was checked by reverting each of the three new call sites
+alone: with `parse_add`'s removed,
+`contract_signed_constant_sum_vs_unsigned_is_refused` *verifies* -- the false proof;
+with `parse_mul`'s removed, `requires: x % -1 == 0` reads and refutes; with the
+bitwise check removed, `x ^ -1 <= 255` reads as always true and verifies. Coverage
+**131/222 to 133/226**, test-count 514 held. Gate green.

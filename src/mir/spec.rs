@@ -1706,6 +1706,43 @@ impl<'a> Parser<'a> {
         smt::evaluate(v, |_| None)
     }
 
+    /// Refuse a *signed* constant meeting an *unsigned* name, in either order.
+    ///
+    /// Rust infers a literal's type from the operand beside it and never lets the
+    /// two differ, so `x == -1` and `x + -1` for a `u8` are both compile errors
+    /// ("cannot apply unary operator `-` to type `u8`"). The reader carries a
+    /// negation as a bit pattern at the operand's width, which reads `-1` as
+    /// `255`: a wrong *value*, and a wrong value in a precondition is a false
+    /// proof (`requires: x + -1 >= 0` is trivially true, so any postcondition is
+    /// proved). The shape is refused wherever two operands of one operator can
+    /// meet, which is the comparison *and* the arithmetic levels.
+    ///
+    /// The check is narrow. A bare literal is unsigned, so `0xFF` and `255` are
+    /// not this shape. Two constants are aligned and range-checked by
+    /// `align_widths`/`fold_const_arith` instead. And `x <= 127` for an `i8` is
+    /// legal with the constant on the *unsigned* side. Only a signed *constant*
+    /// against an unsigned *name* triggers it -- exactly what rustc rejects.
+    fn refuse_signed_const_vs_unsigned_name(
+        &self,
+        l: Var,
+        ls: bool,
+        r: Var,
+        rs: bool,
+    ) -> Result<(), SpecError> {
+        if ls == rs {
+            return Ok(());
+        }
+        let lconst = self.const_value(l).is_some();
+        let rconst = self.const_value(r).is_some();
+        let mixed = (rs && !ls && rconst && !lconst) || (ls && !rs && lconst && !rconst);
+        if mixed {
+            return Err(self.err(
+                "a signed constant cannot be combined with an unsigned operand",
+            ));
+        }
+        Ok(())
+    }
+
     /// The value a constant *denotes*, at its own width.
     ///
     /// A bare literal is non-negative, so its bit pattern is its value. A signed
@@ -2000,22 +2037,7 @@ impl<'a> Parser<'a> {
                 // read `x == -1` as `x == 255` -- a wrong *value*, and
                 // `ensures: ret == 255` was verified for a body returning `x`,
                 // which is a false proof. So the shape is refused.
-                //
-                // The signed side must be the constant and the unsigned side a
-                // non-constant name: a bare literal is unsigned (`0xFF` for a
-                // `u8` must still read as `255`), two constants are aligned and
-                // range-checked by `align_widths`, and `x <= 127` for an `i8` is
-                // legal with the constant on the *unsigned* side. Only a signed
-                // constant against an unsigned name triggers this.
-                if ls != rs {
-                    let lconst = self.const_value(left).is_some();
-                    let rconst = self.const_value(right).is_some();
-                    if (rs && !ls && rconst && !lconst) || (ls && !rs && lconst && !rconst) {
-                        return Err(self.err(
-                            "a signed constant cannot be compared with an unsigned operand",
-                        ));
-                    }
-                }
+                self.refuse_signed_const_vs_unsigned_name(left, ls, right, rs)?;
                 // A literal is written without a type, so its width comes from
                 // the operand it meets. Sizing it from the widest name in scope
                 // makes `ret <= 255` a 64-bit comparison whenever a slice or
@@ -2061,6 +2083,7 @@ impl<'a> Parser<'a> {
         let (mut left, mut sgn) = self.parse_bitxor()?;
         while self.eat_op("|") {
             let (r, rs) = self.parse_bitxor()?;
+            self.refuse_signed_const_vs_unsigned_name(left, sgn, r, rs)?;
             let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
             left = smt::bor(l, r);
             sgn = sgn || rs;
@@ -2072,6 +2095,7 @@ impl<'a> Parser<'a> {
         let (mut left, mut sgn) = self.parse_bitand()?;
         while self.eat_op("^") {
             let (r, rs) = self.parse_bitand()?;
+            self.refuse_signed_const_vs_unsigned_name(left, sgn, r, rs)?;
             let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
             left = smt::bxor(l, r);
             sgn = sgn || rs;
@@ -2083,6 +2107,7 @@ impl<'a> Parser<'a> {
         let (mut left, mut sgn) = self.parse_shift()?;
         while self.eat_op("&") {
             let (r, rs) = self.parse_shift()?;
+            self.refuse_signed_const_vs_unsigned_name(left, sgn, r, rs)?;
             let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
             left = smt::band(l, r);
             sgn = sgn || rs;
@@ -2143,6 +2168,11 @@ impl<'a> Parser<'a> {
         let (mut left, mut sgn) = self.parse_mul()?;
         while let Some(op) = self.eat_any(&["+", "-"]) {
             let (r, rs) = self.parse_mul()?;
+            // A signed constant added to an unsigned name (`x + -1` for a `u8`) is
+            // a rustc error, and reading the negation as `255` would prove
+            // `x + -1 >= 0` for every `x` -- a false proof, exactly as at the
+            // comparison level. Refused before the operands are aligned.
+            self.refuse_signed_const_vs_unsigned_name(left, sgn, r, rs)?;
             // A literal operand is sized to the other one, exactly as in a
             // comparison. Without this, `ret == a + 5` with a slice length in
             // scope adds an 8-bit `a` to a 64-bit `5`, which `bin_word` reports
@@ -2187,6 +2217,11 @@ impl<'a> Parser<'a> {
             if op != "*" && self.const_value(r) == Some(0) {
                 return Err(self.err("a division or remainder by a constant zero"));
             }
+            // A signed constant divisor with an unsigned name (`x % -1` for a
+            // `u8`) is a rustc error, and the negation read as `255` would build
+            // `urem(x, 255)` -- a value the author never wrote. Same refusal as the
+            // additive and comparison levels.
+            self.refuse_signed_const_vs_unsigned_name(left, sgn, r, rs)?;
             // Same width rule as the other operators: a literal product, divisor
             // or mask is sized to the operand it meets.
             let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
@@ -3494,11 +3529,28 @@ mod tests {
         assert!(!parses("x == -1"), "`-1` against a `u8` does not compile");
         assert!(!parses("x >= -1"), "`-1` against a `u8` does not compile");
         assert!(!parses("x <= -1"), "`-1` against a `u8` does not compile");
+        // The same shape at the *arithmetic* levels, where it is equally a rustc
+        // error and equally a false proof if read: `x + -1 >= 0` is trivially true
+        // when `-1` is read as `255`.
+        assert!(!parses("x + -1 >= 0"), "`x + -1` for a `u8` does not compile");
+        assert!(!parses("x - -1 <= 0"), "`x - -1` for a `u8` does not compile");
+        assert!(!parses("x % -1 == 0"), "`x % -1` for a `u8` does not compile");
+        assert!(!parses("x * -1 == 255"), "`x * -1` for a `u8` does not compile");
+        // And at the bitwise levels, where the same negation is the same rustc error.
+        assert!(!parses("x & -1 == 255"), "`x & -1` for a `u8` does not compile");
+        assert!(!parses("x | -1 == 0"), "`x | -1` for a `u8` does not compile");
+        assert!(!parses("x ^ -1 == 0"), "`x ^ -1` for a `u8` does not compile");
         // The legal cases must still read.
         assert!(parses("x <= 0xFF"), "a bare literal is unsigned and must read");
         assert!(parses("x <= 255"), "a bare literal is unsigned and must read");
+        assert!(parses("x + 255 >= 0"), "an unsigned constant still adds and reads");
+        assert!(parses("x - 1 <= 255"), "an unsigned difference still reads");
+        assert!(parses("x & 255 == x"), "an unsigned mask still reads");
+        assert!(parses("x ^ 255 == 0"), "an unsigned xor still reads");
         assert!(parses("y <= -1"), "a signed name against a signed literal reads");
         assert!(parses("y >= i8::MIN"), "a signed bound against a signed name reads");
+        assert!(parses("y + -1 <= 0"), "a signed name with a signed constant reads");
+        assert!(parses("y ^ -1 == 0"), "a signed name with a signed mask reads");
     }
 
     /// An explicit discriminant sets the variant's value and the next continues

@@ -1850,6 +1850,41 @@ pub fn contract_unsigned_literal_still_reads(x: u8) -> u8 {
     x
 }
 
+/// The same mixed-sign shape at the *arithmetic* level, where it is equally a
+/// rustc error and equally a false proof if read. `x + -1 >= 0` for a `u8` is
+/// trivially true when the negation is read as `255`, so this postcondition was
+/// *proved* for a body returning `x` -- a false proof the comparison-level check
+/// alone did not close.
+/// requires: x + -1 >= 0
+/// ensures: ret != 0
+pub fn contract_signed_constant_sum_vs_unsigned_is_refused(x: u8) -> u8 {
+    x
+}
+
+/// The legal counterpart at the arithmetic level: an *unsigned* constant still
+/// adds and reads, so the refusal is not a blanket ban on constants in sums.
+/// requires: x + 255 >= 0
+/// ensures: ret == x
+pub fn contract_unsigned_constant_sum_still_reads(x: u8) -> u8 {
+    x
+}
+
+/// And at the *bitwise* level, where the same negation is the same rustc error and
+/// the same wrong reading: `x ^ -1 <= 255` read as `x ^ 255 <= 255`, always true,
+/// so it was *proved* for a body returning `x`.
+/// requires: x ^ -1 <= 255
+/// ensures: ret != 0
+pub fn contract_signed_constant_mask_vs_unsigned_is_refused(x: u8) -> u8 {
+    x
+}
+
+/// The legal counterpart at the bitwise level: an unsigned mask still reads.
+/// requires: x & 255 == x
+/// ensures: ret == x
+pub fn contract_unsigned_mask_still_reads(x: u8) -> u8 {
+    x
+}
+
 // ---------------------------------------------------------------------------
 // The contract operators that were missing, and the *precedence* they need.
 //

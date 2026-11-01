@@ -3120,6 +3120,8 @@ fn an_out_of_range_literal_is_refused_not_wrapped() {
         "contract_constant_div_overflow_is_refused",
         "contract_constant_signed_sum_overflow_is_refused",
         "contract_signed_literal_vs_unsigned_is_refused",
+        "contract_signed_constant_sum_vs_unsigned_is_refused",
+        "contract_signed_constant_mask_vs_unsigned_is_refused",
     ];
     let Some(report) = verify_realistic(&refused) else { return };
     for name in refused {
@@ -3140,6 +3142,8 @@ fn an_out_of_range_literal_is_refused_not_wrapped() {
         "contract_constant_sum_in_range_reads",
         "contract_constant_sum_wider_operand_reads",
         "contract_unsigned_literal_still_reads",
+        "contract_unsigned_constant_sum_still_reads",
+        "contract_unsigned_mask_still_reads",
     ];
     let Some(report) = verify_realistic(&read) else { return };
     for name in read {

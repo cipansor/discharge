@@ -1348,17 +1348,23 @@ too: `128` fits an unsigned byte but not a signed one, and an unsigned widening 
 have left it at eight bits where it read as `-128` — a false proof in place of the one
 being fixed.
 
-A *signed* constant compared with an *unsigned* operand is refused, because Rust does
-not type it either. A literal takes its type from the operand it meets, so `x == -1`
-for a `u8` does not compile ("cannot apply unary operator `-` to type `u8`"), and
-`x <= -1` is the same shape. The reader carries the negation as a bit pattern at the
-operand's width, so it read `x == -1` as `x == 255` — a wrong *value*, and
-`ensures: ret == 255` was *proved* for a body returning `x`, a false proof. Refusing
-the shape is the only sound answer: the wrong reading is a proof, and a proof cannot be
-a warning. The refusal is narrow — a bare literal is unsigned, so `0xFF` for a `u8`
-still reads as `255`, and `x <= 127` for an `i8` is legal with the constant on the
-unsigned side. Only a signed *constant* against an unsigned *name* (in either order)
-triggers it, which is exactly the shape Rust rejects.
+A *signed* constant meeting an *unsigned* operand is refused, because Rust does not
+type it either — at every level where two operands meet. A literal takes its type
+from the operand it meets, so `x == -1` for a `u8` does not compile ("cannot apply
+unary operator `-` to type `u8`"), and `x + -1`, `x - -1`, `x % -1`, `x * -1`,
+`x & -1` and `x ^ -1` are the same shape. The reader carries the negation as a bit
+pattern at the operand's width, so it read `x == -1` as `x == 255`, `x + -1 >= 0` as
+`x + 255 >= 0`, and `x ^ -1 <= 255` as `x ^ 255 <= 255`. The first made
+`ensures: ret == 255` *proved* for a body returning `x`; the second made
+`requires: x + -1 >= 0` trivially true, so *any* postcondition was proved; the third
+was always true. All false proofs, and the arithmetic and bitwise ones survive a
+comparison-only check — the refusal has to sit at each operator, because that is
+where the constant meets the name. Refusing the shape is the only sound answer: the
+wrong reading is a proof, and a proof cannot be a warning. The refusal is narrow — a
+bare literal is unsigned, so `0xFF` for a `u8` still reads as `255`, `x + 255 >= 0`
+and `x & 255 == x` still read, and `x <= 127` for an `i8` is legal with the constant
+on the unsigned side. Only a signed *constant* against an unsigned *name* (in either
+order) triggers it, which is exactly the shape Rust rejects.
 
 A slice or array element is read at the element type's signedness in the *contract*,
 not only in the body. `bind_indexed_elem` recorded an `i8` element's sign for the
