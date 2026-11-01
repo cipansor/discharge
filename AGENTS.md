@@ -4339,5 +4339,21 @@ must read). Sensitivity was checked by reverting each of the three new call site
 alone: with `parse_add`'s removed,
 `contract_signed_constant_sum_vs_unsigned_is_refused` *verifies* -- the false proof;
 with `parse_mul`'s removed, `requires: x % -1 == 0` reads and refutes; with the
-bitwise check removed, `x ^ -1 <= 255` reads as always true and verifies. Coverage
-**131/222 to 133/226**, test-count 514 held. Gate green.
+bitwise check removed, `x ^ -1 <= 255` reads as always true and verifies.
+
+Then the enumeration was made exhaustive, because "one level at a time" is how the
+hole kept being found and reasoning about the next level is what kept being wrong.
+The spec test now loops over all sixteen operators: `x <op> -1` must be refused and
+`x <op> 1` must read, for `<op>` in `== != < <= > >= + - * / % & | ^ << >>`. A
+comparison stands alone as a predicate; a value operator is wrapped in `== 0`, which
+the crate's precedence parses inner-first, so the refusal fires before the outer
+comparison. The ground truth is rustc: `x <op> -1` for a `u8` is a compile error for
+every one of the sixteen, checked with the compiler itself rather than assumed.
+
+With the matrix in place, each of the *six* call sites was reverted one at a time and
+the test failed every time -- comparison, additive, multiplicative, and all three
+bitwise levels are individually load-bearing. The six are: `parse_cmp`'s, the
+additive pair (`+`/`-`), the multiplicative triple (`*`/`/`/`%`), and
+`parse_bitand`/`parse_bitxor`/`parse_bitor`.
+
+Coverage **131/222 to 133/226**, test-count 514 held. Gate green.

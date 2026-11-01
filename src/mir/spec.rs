@@ -3551,6 +3551,37 @@ mod tests {
         assert!(parses("y >= i8::MIN"), "a signed bound against a signed name reads");
         assert!(parses("y + -1 <= 0"), "a signed name with a signed constant reads");
         assert!(parses("y ^ -1 == 0"), "a signed name with a signed mask reads");
+        // Enumerate *every* operator, because the hole this test closes was found
+        // one level at a time: a fix written at the comparison level left the
+        // additive level reading `x + -1` as `x + 255`, and a fix written there
+        // left the bitwise level reading `x ^ -1` as `x ^ 255`. The reader meets
+        // two operands at all of these, so each is asserted rather than reasoned
+        // safe. rustc rejects `x <op> -1` for a `u8` for all sixteen.
+        //
+        // A comparison *is* a predicate, so it stands alone; a value operator is
+        // wrapped in `== 0` to make one. The wrap respects the crate's precedence
+        // for every wrapped operator, so the inner term is parsed (and refused)
+        // before the outer comparison runs.
+        for op in ["==", "!=", "<", "<=", ">", ">="] {
+            assert!(
+                !parses(&format!("x {op} -1")),
+                "`x {op} -1` for a `u8` does not compile and must be refused"
+            );
+            assert!(
+                parses(&format!("x {op} 1")),
+                "`x {op} 1` for a `u8` is legal and must still read"
+            );
+        }
+        for op in ["+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>"] {
+            assert!(
+                !parses(&format!("(x {op} -1) == 0")),
+                "`x {op} -1` for a `u8` does not compile and must be refused"
+            );
+            assert!(
+                parses(&format!("(x {op} 1) == 0")),
+                "`x {op} 1` for a `u8` is legal and must still read"
+            );
+        }
     }
 
     /// An explicit discriminant sets the variant's value and the next continues
