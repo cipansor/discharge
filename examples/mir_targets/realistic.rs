@@ -2656,3 +2656,36 @@ pub fn not_of_zero_is_minus_one(x: i8) -> i8 {
 pub fn not_of_zero_u32_is_all_ones(x: u32) -> u32 {
     !x
 }
+
+// ---------------------------------------------------------------------------
+// A contract written above a struct belongs to the struct, not the next function.
+//
+// The reader matched a `struct`/`enum` head and `continue`d *without* clearing the
+// pending contract, so a doc comment above a layout carried over to the next `fn`.
+// A leaked `requires` is a false proof when it is satisfiable: the postcondition is
+// only checked for the inputs the precondition admits.
+//
+// `leaked_requires_tripwire` carries the shape and must be refuted, not verified.
+// `leaked_requires_is_dropped` is the same function with the struct removed -- the
+// two must agree, which is what makes the tripwire evidence rather than a reading
+// of one file.
+/// requires: x == 0
+pub struct LeakSource {
+    pub v: u8,
+}
+
+/// The tripwire: `x` is arbitrary, so `ret == 0` is false at `x != 0`. If the
+/// struct's `requires: x == 0` leaked in, the check would be made only at `x == 0`
+/// and this would *verify* -- the false proof.
+/// ensures: ret == 0
+pub fn leaked_requires_tripwire(x: u8) -> u8 {
+    x
+}
+
+/// The control: the identical function and contract with no struct above it. It
+/// must be refuted for the same reason, so the tripwire's refutation is the
+/// reader dropping the leak and not some other reading.
+/// ensures: ret == 0
+pub fn leaked_requires_is_dropped(x: u8) -> u8 {
+    x
+}

@@ -3266,3 +3266,29 @@ fn a_bang_binds_by_rusts_precedence_in_the_corpus() {
     };
 }
 
+
+/// A contract above a struct or enum belongs to that item, not the next function.
+///
+/// The reader matched a `struct`/`enum` head and `continue`d without clearing the
+/// pending contract, so a doc comment above a layout carried over to the next `fn`.
+/// A leaked `requires` is a false proof when it is satisfiable: `requires: x == 0`
+/// above a struct made `ensures: ret == 0` for a body returning `x` *verify*,
+/// because the check is only made for the inputs the precondition admits.
+///
+/// Both entries below carry the identical function and contract; the first has a
+/// struct above it with a `requires: x == 0`, the second does not. Both must be
+/// refuted, and refuted the *same way*. The pair is the evidence: verifying the
+/// tripwire would be the false proof, and refuting only the control would not show
+/// the leak was dropped.
+#[test]
+fn a_contract_above_a_layout_does_not_leak_into_the_next_function() {
+    let names = ["leaked_requires_tripwire", "leaked_requires_is_dropped"];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in names {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` proves a false contract; got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "`{name}` must fail on its postcondition, got: {o}");
+    }
+}

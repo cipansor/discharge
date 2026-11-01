@@ -1378,6 +1378,14 @@ silently left the check set. A body that does not close on the line still opens 
 cursor. The same distinction the enum reader already made for a refused one-line
 body now applies to a readable one-line struct body.
 
+A contract written above a struct or enum belongs to that item, not the next
+function. The layout heads used to match and move on without clearing the pending
+contract, so a doc comment above a struct carried over to the next `fn`. A leaked
+`requires` is a false proof when it is satisfiable, because it narrows the inputs the
+postcondition is checked for: `requires: x == 0` above a struct made
+`ensures: ret == 0` for a body returning `x` verify. The contract now attaches only
+to the item it was written above.
+
 A slice or array element is read at the element type's signedness in the *contract*,
 not only in the body. `bind_indexed_elem` recorded an `i8` element's sign for the
 executor's seeds but not for the parser, so `xs[0] >= 0` over a `&[i8]` read as an

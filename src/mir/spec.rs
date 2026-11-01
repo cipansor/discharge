@@ -310,6 +310,12 @@ pub fn extract(source: &str) -> Specs {
             continue;
         }
         if let Some((name, closed_inline)) = struct_head(line) {
+            // A doc comment above a struct documents the struct, not a function.
+            // The pending contract is dropped here for the same reason the
+            // catch-all below drops it: a contract must attach to the item it was
+            // written above. Carrying it to the next `fn` was a false proof when
+            // the leaked `requires` was satisfiable.
+            pending = FnContract::default();
             // A one-line body is complete already; opening a cursor would run
             // past the closing brace and consume every following line -- contracts
             // and functions included -- as fields, so the functions would silently
@@ -334,6 +340,10 @@ pub fn extract(source: &str) -> Specs {
             continue;
         }
         if let Some((name, head)) = enum_head(line) {
+            // Same as the struct head: a doc comment above an enum is the enum's,
+            // not a function's, so the pending contract is dropped rather than
+            // carried to the next `fn`.
+            pending = FnContract::default();
             match head {
                 // A one-line body is complete already; it needs no cursor.
                 EnumHead::Inline(variants) => {
@@ -3731,6 +3741,44 @@ mod tests {
             "the contract after a refused multi-line enum must still be read, got: {:?}",
             specs.by_fn.keys().collect::<Vec<_>>()
         );
+    }
+
+    /// A contract written above a struct must not attach to the next function.
+    ///
+    /// `struct_head` and `enum_head` matched their line and `continue`d without
+    /// clearing the pending contract, so a doc comment above a struct -- which is
+    /// the struct's documentation, not a function's contract -- carried over to
+    /// the next `fn`. A leaked `requires` is a false proof when it is satisfiable:
+    /// `requires: x == 0` above a struct makes `ensures: ret == 0` for a body
+    /// returning `x` *verify*, because the check is only made for `x == 0`. The
+    /// same contract with no struct above it is correctly refuted.
+    #[test]
+    fn a_contract_above_a_struct_does_not_attach_to_the_next_function() {
+        let src = "/// requires: x == 0\n\
+                   pub struct S { pub v: u8 }\n\
+                   /// ensures: ret == 0\n\
+                   pub fn f(x: u8) -> u8 { x }\n";
+        let specs = extract(src);
+        let c = specs.by_fn.get("f").expect("`f` must carry a contract");
+        assert!(
+            c.requires.is_empty(),
+            "the struct's doc comment leaked into `f`: {:?}",
+            c.requires
+        );
+        assert_eq!(c.ensures, vec!["ret == 0"], "the function's own `ensures` must survive");
+    }
+
+    /// The same leak through an enum head, which had the identical shape.
+    #[test]
+    fn a_contract_above_an_enum_does_not_attach_to_the_next_function() {
+        let src = "/// requires: x == 0\n\
+                   pub enum E { A, B }\n\
+                   /// ensures: ret == 0\n\
+                   pub fn f(x: u8) -> u8 { x }\n";
+        let specs = extract(src);
+        let c = specs.by_fn.get("f").expect("`f` must carry a contract");
+        assert!(c.requires.is_empty(), "the enum's doc comment leaked into `f`: {:?}", c.requires);
+        assert_eq!(c.ensures, vec!["ret == 0"]);
     }
 
     /// A trailing line comment on a variant line is not part of the variant.

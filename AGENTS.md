@@ -3463,6 +3463,37 @@ caller to always open a cursor: the spec test fails with `structs` empty. Covera
 held at **133/226** (no corpus file uses a one-line struct, so no live result
 moved); test-count **514 to 516**. Gate green.
 
+## A contract above a struct leaked into the next function
+
+The `struct_head`/`enum_head` branches in `spec::extract` matched their line and
+`continue`d *without* clearing the pending contract. The catch-all at the bottom of
+the loop clears `pending` on "any other non-comment line", precisely so a contract
+attaches to the item it was written above — but the struct and enum heads `continue`
+before reaching it. So a doc comment above a struct or enum carried over to the next
+`fn`, and the two contracts were merged.
+
+**This was a false proof, not just a wrong refusal.** A leaked `requires` restricts
+the inputs the postcondition is checked for, so it can only make a proof *easier*:
+`requires: x == 0` above a struct made `ensures: ret == 0` for a body returning `x`
+verify — the check was made only at `x == 0`. The identical function and contract
+with no struct above it is refuted at `x == 1`. A leaked `ensures` was caught by the
+existing vacuous-precondition detector (it made the merged precondition unsatisfiable,
+`x > 100 && x < 50`), so the satisfiable direction is the one that slipped through —
+and the satisfiable direction is the false proof.
+
+The fix is one line at each head: `pending = FnContract::default();`, the same
+assignment the catch-all already performs. The comment says why: a contract must
+attach to the item it was written above.
+
+**Evidence.** Two unit tests (`a_contract_above_a_struct_does_not_attach_to_the_next_function`,
+`..._an_enum_...`) and a corpus test with a tripwire/control pair
+(`leaked_requires_tripwire` with a struct above it, `leaked_requires_is_dropped`
+without); both must be refuted. Sensitivity was checked by reverting the two resets:
+the corpus tripwire *verifies* — the false proof — and the unit tests fail with the
+leaked `["x == 0"]` visible in `f`'s requires. Coverage **133/226 to 133/228**
+(the two new corpus functions are tripwires, so `decided` is unchanged); test-count
+**516 to 519**. Gate green.
+
 ## Toolchain — edition 2024 and the MSRV floor (1.85)
 
 Both manifests are **edition 2024** with `rust-version = "1.85"`. The two numbers
