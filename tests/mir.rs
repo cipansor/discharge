@@ -1883,11 +1883,19 @@ fn a_slice_subscript_missing_either_bound_is_refused() {
 /// for an arbitrary `u8` element, which is false, so it must FAIL -- and the
 /// counterexample must show the element's value, which only exists if the chain
 /// selected a real element variable.
-/// Verify a one-function source file and return the single outcome.
+/// Verify one function from an inline source and return its outcome.
 ///
-/// Each of the tests below needs its own file, because the property under test is
-/// about what the *frontend* does with a specific shape and the corpus is shared.
+/// Each test below needs its own file, because the property under test is about
+/// what the *frontend* does with a specific shape and the corpus is shared.
 /// Writing the source to a temp dir keeps that shape next to its assertion.
+///
+/// Returns `None` only when no nightly `rustc` is configured, which is the one
+/// legitimate reason to skip. A named function that is *absent* from the report
+/// is a panic, not a skip: it means the frontend dropped it, and a test written
+/// as `let Some(o) = verify_src(..) else { return }` would then pass without
+/// checking anything. That is how `a_whole_struct_assignment_invalidates_its_fields`
+/// hid a one-line struct that swallowed every following function. A vacuous pass
+/// is worse than a failure, so this refuses to be quiet about it.
 fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
     let rustc = rustc()?;
     let dir = std::env::temp_dir().join(format!("discharge-{name}-{}", std::process::id()));
@@ -1901,6 +1909,11 @@ fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
         .find(|(n, _)| n == name)
         .map(|(_, o)| o);
     let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        o.is_some() || report.missing.iter().any(|m| m == name) || !src.contains("///"),
+        "`{name}` was dropped from the report: it has a contract but no outcome, so this test \
+         would have passed without checking anything"
+    );
     o
 }
 
@@ -2033,6 +2046,36 @@ pub fn reassigned_then_field(mut c: B, d: B) -> u8 {
         !o.is_verified(),
         "a reassigned struct's field binding is stale and must not prove a contract; got: {o}"
     );
+}
+
+/// A one-line struct body must not swallow the functions that follow it.
+///
+/// `struct_head` accepted any line containing `{` and opened a multi-line field
+/// cursor, so `pub struct B { pub lo: u8 }` left the cursor open with no closing
+/// brace left to read: every following line -- including the `///` contracts and
+/// the functions -- was consumed as struct fields. The functions then vanished
+/// from the spec table and were silently *not checked at all*, which is worse
+/// than a wrong verdict because nothing reports it. The test above used a one-line
+/// struct and was therefore passing vacuously.
+///
+/// The struct path now mirrors the enum path: a body that closes on the head line
+/// is read inline, and a cursor is opened only for a body that does not. This
+/// pins the function after the struct as still present and still decided.
+#[test]
+fn a_one_line_struct_does_not_swallow_the_functions_after_it() {
+    let src = r#"
+pub struct B { pub lo: u8 }
+
+/// requires: true
+/// ensures: ret == 0
+pub fn after_inline_struct(x: u8) -> u8 {
+    0
+}
+"#;
+    let Some(o) = verify_src("after_inline_struct", src) else {
+        panic!("the function after a one-line struct was dropped from the spec table");
+    };
+    assert!(o.is_verified(), "the function must still be read and decided; got: {o}");
 }
 
 /// A generated binding name must not be able to shadow a real argument.

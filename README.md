@@ -1364,7 +1364,19 @@ wrong reading is a proof, and a proof cannot be a warning. The refusal is narrow
 bare literal is unsigned, so `0xFF` for a `u8` still reads as `255`, `x + 255 >= 0`
 and `x & 255 == x` still read, and `x <= 127` for an `i8` is legal with the constant
 on the unsigned side. Only a signed *constant* against an unsigned *name* (in either
-order) triggers it, which is exactly the shape Rust rejects.
+order) triggers it, which is exactly the shape Rust rejects. The test that pins this
+enumerates all sixteen operators (`== != < <= > >= + - * / % & | ^ << >>`) rather
+than the levels a human remembered, because the hole was found one level at a time
+and reasoning about the next level is what kept being wrong.
+
+A struct or enum whose body closes on its declaration line is read from that line,
+not by opening a cursor. `pub struct B { pub lo: u8 }` used to leave a field cursor
+open with no closing brace left to read, so every following line — the `///`
+contracts and the `fn` items — was consumed as struct fields. Those functions then
+had no contract at all and were neither verified nor reported as skipped: they
+silently left the check set. A body that does not close on the line still opens a
+cursor. The same distinction the enum reader already made for a refused one-line
+body now applies to a readable one-line struct body.
 
 A slice or array element is read at the element type's signedness in the *contract*,
 not only in the body. `bind_indexed_elem` recorded an `i8` element's sign for the

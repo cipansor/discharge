@@ -3426,6 +3426,43 @@ refused enum is gone (`by_fn` is empty); without fix 2 the qualified constructio
 is `incomplete (1 reason) - unmodelled switch discriminant`; without fix 3 the
 layout is dropped and the contract is `skipped: unknown name`.
 
+## A one-line struct body swallowed every function after it
+
+The struct cursor had the same defect as the refused one-line enum above, in the
+mirror image. `struct_head` accepted *any* line containing `{` and opened a
+multi-line field cursor. For a body that closes on the head line
+(`pub struct B { pub lo: u8 }`) there is no closing brace left to read, so the
+cursor stayed open and every following line — the `///` contracts and the `fn`
+items they belong to — was consumed as a struct field. The functions then had no
+contract at all, so they were neither verified nor reported as skipped: they
+silently left the check set, the worst failure mode a verifier has. The enum
+reader has distinguished an inline body from a multi-line one all along
+(`EnumHead::Inline`); the struct reader did not.
+
+`struct_head` now returns `(name, closed_inline)`, and the caller reads a
+one-line body's fields out of the head line (splitting on top-level commas, the
+same helper the enum path uses) instead of opening a cursor. A multi-line body
+still opens one. Found while probing the signedness-recording paths: a struct
+field read is one of them, and the probe file's `decided 0 of 0` — no functions
+at all — was the tell.
+
+**The bug also made a test vacuous, and that is the deeper lesson.** The existing
+`a_whole_struct_assignment_invalidates_its_fields` used a one-line struct, so its
+function was dropped and `let Some(o) = verify_src(..) else { return }` returned
+early — the test passed without checking anything. A drop is *silent* in a way a
+failure is not. So `verify_src` in `tests/mir.rs` is now strict: it returns `None`
+only when no nightly `rustc` is configured, and panics if a named function with a
+contract is absent from the report. That converts the whole class of
+"the frontend dropped it and the test shrugged" into a failure, across all 23
+tests that use the helper, rather than fixing one call site.
+
+**Evidence.** Two unit tests (`a_one_line_struct_does_not_swallow_the_next_contract`
+at the spec level, `a_one_line_struct_does_not_swallow_the_functions_after_it`
+end to end) plus the strict `verify_src`. Sensitivity was checked by reverting the
+caller to always open a cursor: the spec test fails with `structs` empty. Coverage
+held at **133/226** (no corpus file uses a one-line struct, so no live result
+moved); test-count **514 to 516**. Gate green.
+
 ## Toolchain — edition 2024 and the MSRV floor (1.85)
 
 Both manifests are **edition 2024** with `rust-version = "1.85"`. The two numbers

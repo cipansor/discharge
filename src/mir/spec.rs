@@ -309,8 +309,28 @@ pub fn extract(source: &str) -> Specs {
             }
             continue;
         }
-        if let Some(name) = struct_head(line) {
-            cur_struct = Some((name, StructDef::default()));
+        if let Some((name, closed_inline)) = struct_head(line) {
+            // A one-line body is complete already; opening a cursor would run
+            // past the closing brace and consume every following line -- contracts
+            // and functions included -- as fields, so the functions would silently
+            // disappear from the spec table. Read the fields out of the head line
+            // instead, exactly as the enum path reads an `Inline` body.
+            if closed_inline {
+                let t = line.trim_start_matches("pub(crate) ").trim_start_matches("pub ").trim();
+                let mut def = StructDef::default();
+                if let Some(open) = t.find('{') {
+                    if let Some(close) = t[open + 1..].rfind('}') {
+                        for f in split_top_level(&t[open + 1..open + 1 + close], ',') {
+                            if let Some((fname, fty)) = struct_field(&f) {
+                                def.fields.push((fname, Ty::parse(&fty)));
+                            }
+                        }
+                    }
+                }
+                specs.structs.insert(name, def);
+            } else {
+                cur_struct = Some((name, StructDef::default()));
+            }
             continue;
         }
         if let Some((name, head)) = enum_head(line) {
@@ -2487,24 +2507,32 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Pull the struct name out of a `pub struct Name {` head line.
+/// Pull the struct name out of a `pub struct Name {` head line, and say whether
+/// the body closes on that same line.
 ///
 /// Only a *braced* struct is recognised. A tuple struct or a unit struct has no
 /// named fields to project, so reading it as a struct with no fields would turn a
 /// contract naming `.0` into an "unknown field" refusal rather than a "this shape
 /// is not modelled" one — the same outcome, and no false layout.
-fn struct_head(line: &str) -> Option<String> {
+///
+/// The returned flag is what keeps a one-line body (`pub struct B { pub lo: u8 }`)
+/// from opening a multi-line cursor: with the brace already closed on the head
+/// line there is no closing brace left to read, so an open cursor would consume
+/// every following line as a field and swallow the functions that come after —
+/// which silently drops them from the spec table rather than mis-verifying them.
+/// The enum reader has had this distinction (`EnumHead::Inline`) all along.
+fn struct_head(line: &str) -> Option<(String, bool)> {
     let t = line.trim_start_matches("pub(crate) ").trim_start_matches("pub ").trim();
     let rest = t.strip_prefix("struct ")?;
     // Only a brace body on this line is a named-field struct.
-    if !rest.contains('{') {
-        return None;
-    }
+    let open = rest.find('{')?;
     let name = rest.split(|c: char| c == '{' || c == '<' || c.is_whitespace()).next()?;
     if name.is_empty() {
         return None;
     }
-    Some(name.to_string())
+    // Closed on the head line iff a `}` follows the `{`.
+    let closed_inline = rest[open + 1..].contains('}');
+    Some((name.to_string(), closed_inline))
 }
 
 /// Pull `(field, type)` out of one line of a struct body.
@@ -3653,6 +3681,38 @@ mod tests {
         assert!(
             specs.by_fn.contains_key("f"),
             "the contract after a refused enum must still be read, got: {:?}",
+            specs.by_fn.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A one-line *struct* body must not swallow the functions after it either.
+    ///
+    /// `struct_head` accepted any line containing `{` and opened a multi-line field
+    /// cursor, so `pub struct B { pub lo: u8 }` left the cursor open with the brace
+    /// already closed: every following line -- the `///` contracts and the `fn`
+    /// items -- was consumed as struct fields. Those functions then had no contract
+    /// at all, so they were neither verified nor reported as skipped; they silently
+    /// left the check set. The enum reader has distinguished an inline body from a
+    /// multi-line one all along; the struct reader did not.
+    #[test]
+    fn a_one_line_struct_does_not_swallow_the_next_contract() {
+        let src = "pub struct B { pub lo: u8 }\n\n\
+                   /// ensures: ret == 1\n\
+                   pub fn f() -> u8 { 0 }\n";
+        let specs = extract(src);
+        assert!(
+            specs.structs.contains_key("B"),
+            "a one-line struct body must still be recorded, got: {:?}",
+            specs.structs.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            specs.structs["B"].fields.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["lo"],
+            "the one-line body's field must be read out of the head line"
+        );
+        assert!(
+            specs.by_fn.contains_key("f"),
+            "the contract after a one-line struct must still be read, got: {:?}",
             specs.by_fn.keys().collect::<Vec<_>>()
         );
     }
