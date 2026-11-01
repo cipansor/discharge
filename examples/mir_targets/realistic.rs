@@ -2689,3 +2689,33 @@ pub fn leaked_requires_tripwire(x: u8) -> u8 {
 pub fn leaked_requires_is_dropped(x: u8) -> u8 {
     x
 }
+
+// ---------------------------------------------------------------------------
+// Two names of different signedness are refused, because rustc refuses them.
+//
+// `a > b` for an `i8` and a `u8` is `E0308: mismatched types`. The reader used to
+// read it as signed; the body reads each operand at its own signedness, so the two
+// could disagree. Refusing keeps "the tool could not run" distinct from a verdict.
+//
+// These are `skipped`, not `verified` and not `failed`: a program rustc rejects
+// gets no verdict.
+/// requires: a > b
+/// ensures: ret != 0
+pub fn contract_mixed_signedness_compare_is_refused(a: i8, b: u8) -> u8 {
+    b
+}
+
+/// The same at an arithmetic level, where the reader also picks a sign.
+/// requires: a + b == 0
+/// ensures: ret != 0
+pub fn contract_mixed_signedness_add_is_refused(a: i8, b: u8) -> u8 {
+    b
+}
+
+/// The legal counterpart: two names of the *same* signedness compare and read, so
+/// the refusal is not a blanket ban on two-name comparisons.
+/// requires: a < b
+/// ensures: ret == a
+pub fn contract_same_signedness_compare_still_reads(a: i8, b: i8) -> i8 {
+    a
+}

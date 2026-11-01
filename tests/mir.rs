@@ -3292,3 +3292,34 @@ fn a_contract_above_a_layout_does_not_leak_into_the_next_function() {
         assert_eq!(kind, "postcondition", "`{name}` must fail on its postcondition, got: {o}");
     }
 }
+
+/// Two names of different signedness are refused, and the same-signedness pair
+/// still reads.
+///
+/// `a > b` for an `i8` and a `u8` is `E0308: mismatched types` in rustc. The
+/// reader used to pick a sign and decide it; the body reads each operand at its
+/// own signedness, so the contract and the body could disagree about the operator's
+/// meaning. Refusing keeps the answer "the tool could not run" rather than a verdict
+/// on a program that does not compile. The control is the same comparison with both
+/// operands `i8`: it is legal and must still verify, so the refusal is not a blanket
+/// ban on two-name comparisons.
+#[test]
+fn a_mixed_signedness_comparison_is_refused_and_the_same_signedness_pair_reads() {
+    let refused = [
+        "contract_mixed_signedness_compare_is_refused",
+        "contract_mixed_signedness_add_is_refused",
+    ];
+    let Some(report) = verify_realistic(&refused) else { return };
+    for name in refused {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Skipped { .. }),
+            "`{name}` must be refused (skipped), not given a verdict, got: {o}"
+        );
+    }
+    let Some(report) = verify_realistic(&["contract_same_signedness_compare_still_reads"]) else {
+        return;
+    };
+    let o = outcome(&report, "contract_same_signedness_compare_still_reads");
+    assert!(o.is_verified(), "the same-signedness control must still verify, got: {o}");
+}

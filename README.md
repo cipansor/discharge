@@ -1369,6 +1369,14 @@ enumerates all sixteen operators (`== != < <= > >= + - * / % & | ^ << >>`) rathe
 than the levels a human remembered, because the hole was found one level at a time
 and reasoning about the next level is what kept being wrong.
 
+Two *names* of different signedness are refused for the same reason: `a > b` for an
+`i8` and a `u8` is `E0308: mismatched types`, and the body reads each operand at its
+own signedness, so a contract that picked one sign could disagree with the body about
+what the operator means. Refusing keeps the answer "the tool could not run" rather
+than a verdict on a program that does not compile. The refusal is narrow: two names of
+the *same* signedness still compare, and a name against a literal of either value
+still reads. A shift is exempt, because Rust lets the shift amount have its own type.
+
 A struct or enum whose body closes on its declaration line is read from that line,
 not by opening a cursor. `pub struct B { pub lo: u8 }` used to leave a field cursor
 open with no closing brace left to read, so every following line — the `///`

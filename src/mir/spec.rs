@@ -1736,23 +1736,34 @@ impl<'a> Parser<'a> {
         smt::evaluate(v, |_| None)
     }
 
-    /// Refuse a *signed* constant meeting an *unsigned* name, in either order.
+    /// Refuse a *signed* operand meeting an *unsigned* one, in either order.
     ///
-    /// Rust infers a literal's type from the operand beside it and never lets the
-    /// two differ, so `x == -1` and `x + -1` for a `u8` are both compile errors
-    /// ("cannot apply unary operator `-` to type `u8`"). The reader carries a
-    /// negation as a bit pattern at the operand's width, which reads `-1` as
-    /// `255`: a wrong *value*, and a wrong value in a precondition is a false
-    /// proof (`requires: x + -1 >= 0` is trivially true, so any postcondition is
-    /// proved). The shape is refused wherever two operands of one operator can
-    /// meet, which is the comparison *and* the arithmetic levels.
+    /// Rust never lets the two sides of a comparison or an arithmetic operator
+    /// differ in signedness. A literal takes its type from the operand it meets,
+    /// so `x == -1` and `x + -1` for a `u8` are compile errors ("cannot apply
+    /// unary operator `-` to type `u8`"). The reader carries a negation as a bit
+    /// pattern at the operand's width, which reads `-1` as `255`: a wrong *value*,
+    /// and a wrong value in a precondition is a false proof (`requires: x + -1 >= 0`
+    /// is trivially true, so any postcondition is proved). So the shape is refused
+    /// wherever two operands of one operator can meet, which is the comparison
+    /// *and* the arithmetic levels.
+    ///
+    /// Two *names* of different signedness are the same mistake. `a > b` for an
+    /// `i8` and a `u8` is `E0308: mismatched types`, and the reader has to read it
+    /// as *some* sign. It picks signed (`ls || rs`), which is a real reading and
+    /// not a false proof, but it is a reading of a program rustc rejects -- so the
+    /// shape is refused rather than decided, the same answer as the constant case.
+    /// It also closes a semantic hole between this parser and the body: the body
+    /// reads each operand at *its own* signedness, so the contract and the body
+    /// could disagree about which of `a > b` or `ule(b, a)` is meant.
     ///
     /// The check is narrow. A bare literal is unsigned, so `0xFF` and `255` are
     /// not this shape. Two constants are aligned and range-checked by
     /// `align_widths`/`fold_const_arith` instead. And `x <= 127` for an `i8` is
     /// legal with the constant on the *unsigned* side. Only a signed *constant*
-    /// against an unsigned *name* triggers it -- exactly what rustc rejects.
-    fn refuse_signed_const_vs_unsigned_name(
+    /// against an unsigned *name*, or a signed *name* against an unsigned *name*,
+    /// triggers it -- exactly the pairs rustc rejects.
+    fn refuse_mixed_signedness(
         &self,
         l: Var,
         ls: bool,
@@ -1764,6 +1775,11 @@ impl<'a> Parser<'a> {
         }
         let lconst = self.const_value(l).is_some();
         let rconst = self.const_value(r).is_some();
+        // Both sides are typed names: `a > b` for an `i8` and a `u8`.
+        if !lconst && !rconst {
+            return Err(self.err("operands of different signedness cannot be combined"));
+        }
+        // One side is a signed constant and the other an unsigned name.
         let mixed = (rs && !ls && rconst && !lconst) || (ls && !rs && lconst && !rconst);
         if mixed {
             return Err(self.err(
@@ -2067,7 +2083,7 @@ impl<'a> Parser<'a> {
                 // read `x == -1` as `x == 255` -- a wrong *value*, and
                 // `ensures: ret == 255` was verified for a body returning `x`,
                 // which is a false proof. So the shape is refused.
-                self.refuse_signed_const_vs_unsigned_name(left, ls, right, rs)?;
+                self.refuse_mixed_signedness(left, ls, right, rs)?;
                 // A literal is written without a type, so its width comes from
                 // the operand it meets. Sizing it from the widest name in scope
                 // makes `ret <= 255` a 64-bit comparison whenever a slice or
@@ -2113,7 +2129,7 @@ impl<'a> Parser<'a> {
         let (mut left, mut sgn) = self.parse_bitxor()?;
         while self.eat_op("|") {
             let (r, rs) = self.parse_bitxor()?;
-            self.refuse_signed_const_vs_unsigned_name(left, sgn, r, rs)?;
+            self.refuse_mixed_signedness(left, sgn, r, rs)?;
             let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
             left = smt::bor(l, r);
             sgn = sgn || rs;
@@ -2125,7 +2141,7 @@ impl<'a> Parser<'a> {
         let (mut left, mut sgn) = self.parse_bitand()?;
         while self.eat_op("^") {
             let (r, rs) = self.parse_bitand()?;
-            self.refuse_signed_const_vs_unsigned_name(left, sgn, r, rs)?;
+            self.refuse_mixed_signedness(left, sgn, r, rs)?;
             let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
             left = smt::bxor(l, r);
             sgn = sgn || rs;
@@ -2137,7 +2153,7 @@ impl<'a> Parser<'a> {
         let (mut left, mut sgn) = self.parse_shift()?;
         while self.eat_op("&") {
             let (r, rs) = self.parse_shift()?;
-            self.refuse_signed_const_vs_unsigned_name(left, sgn, r, rs)?;
+            self.refuse_mixed_signedness(left, sgn, r, rs)?;
             let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
             left = smt::band(l, r);
             sgn = sgn || rs;
@@ -2202,7 +2218,7 @@ impl<'a> Parser<'a> {
             // a rustc error, and reading the negation as `255` would prove
             // `x + -1 >= 0` for every `x` -- a false proof, exactly as at the
             // comparison level. Refused before the operands are aligned.
-            self.refuse_signed_const_vs_unsigned_name(left, sgn, r, rs)?;
+            self.refuse_mixed_signedness(left, sgn, r, rs)?;
             // A literal operand is sized to the other one, exactly as in a
             // comparison. Without this, `ret == a + 5` with a slice length in
             // scope adds an 8-bit `a` to a 64-bit `5`, which `bin_word` reports
@@ -2251,7 +2267,7 @@ impl<'a> Parser<'a> {
             // `u8`) is a rustc error, and the negation read as `255` would build
             // `urem(x, 255)` -- a value the author never wrote. Same refusal as the
             // additive and comparison levels.
-            self.refuse_signed_const_vs_unsigned_name(left, sgn, r, rs)?;
+            self.refuse_mixed_signedness(left, sgn, r, rs)?;
             // Same width rule as the other operators: a literal product, divisor
             // or mask is sized to the operand it meets.
             let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
@@ -3620,6 +3636,60 @@ mod tests {
                 "`x {op} 1` for a `u8` is legal and must still read"
             );
         }
+    }
+
+    /// Two *names* of different signedness are refused, because rustc refuses them.
+    ///
+    /// `a > b` for an `i8` and a `u8` is `E0308: mismatched types`. The reader used
+    /// to read it as signed, which is a real reading and not a false proof, but it
+    /// is a reading of a program rustc rejects -- and the body reads each operand
+    /// at *its own* signedness, so the two could disagree about the operator's
+    /// meaning. Refusing keeps the answer "the tool could not run" rather than
+    /// "the code is wrong" or a verdict on a program that does not compile.
+    #[test]
+    fn two_names_of_different_signedness_are_refused() {
+        let mut args = BTreeMap::new();
+        args.insert("s".to_string(), smt::var(8));
+        args.insert("u".to_string(), smt::var(8));
+        let mut signed = BTreeSet::new();
+        signed.insert("s".to_string());
+        let parses = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            p.parse_or().is_ok()
+        };
+        // Every operator where two operands meet, both orders. A comparison is a
+        // predicate and stands alone; a value operator is wrapped to make one.
+        for op in ["==", "!=", "<=", ">=", "<", ">"] {
+            assert!(
+                !parses(&format!("s {op} u")),
+                "`s {op} u` for an `i8` and a `u8` does not compile and must be refused"
+            );
+            assert!(
+                !parses(&format!("u {op} s")),
+                "`u {op} s` is the same mismatched comparison and must be refused"
+            );
+        }
+        for op in ["+", "-", "*", "/", "%", "&", "|", "^"] {
+            assert!(
+                !parses(&format!("(s {op} u) == 0")),
+                "`s {op} u` for an `i8` and a `u8` does not compile and must be refused"
+            );
+            assert!(
+                !parses(&format!("(u {op} s) == 0")),
+                "`u {op} s` is the same mismatched operation and must be refused"
+            );
+        }
+        // The legal cases must still read: two names of the *same* signedness, and
+        // a name with a literal of either value.
+        assert!(parses("s <= s"), "two signed names read");
+        assert!(parses("u <= u"), "two unsigned names read");
+        assert!(parses("s < 0"), "a signed name against a bare literal reads");
+        assert!(parses("u < 255"), "an unsigned name against a bare literal reads");
+        assert!(parses("s < 0 && u > 0"), "both halves legal, the conjunction reads");
+        // A shift is exempt: Rust lets the amount have its own type, so `s << u`
+        // is legal (the amount must be constant in a contract, but its
+        // *signedness* is free).
+        assert!(parses("(s >> 1) == 0"), "a signed shift by a constant reads");
     }
 
     /// An explicit discriminant sets the variant's value and the next continues

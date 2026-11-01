@@ -3494,6 +3494,39 @@ leaked `["x == 0"]` visible in `f`'s requires. Coverage **133/226 to 133/228**
 (the two new corpus functions are tripwires, so `decided` is unchanged); test-count
 **516 to 519**. Gate green.
 
+## Two names of different signedness are refused, not decided
+
+The signed-constant refusal above closed the case where a *constant* meets an
+unsigned name. The same mistake with two *names* was still decided. `a > b` for an
+`i8` and a `u8` is `E0308: mismatched types`, and the reader picked signed
+(`ls || rs`). That is a real reading and not a false proof, but it is a reading of a
+program rustc rejects — and it opened a hole between the contract and the body: the
+body reads each operand at *its own* signedness, so a contract saying `a > b` (signed)
+and a body doing `ule(b, a)` (unsigned) could disagree about the same comparison.
+The body's reading decides the verdict, so the contract could be checking a different
+relation than it appears to.
+
+`refuse_signed_const_vs_unsigned_name` became `refuse_mixed_signedness`: when the two
+operands differ in signedness and *neither* is a constant, the shape is refused with
+"operands of different signedness cannot be combined". A constant/name mix keeps the
+original message. Both are `skipped` — a refusal, never a verdict — which is the core
+invariant: a program rustc rejects is "the tool could not run", not "the code is
+wrong".
+
+**The check is narrow, and the narrowness is the test.** Two names of the *same*
+signedness still compare; a name against a literal of either value still reads; and a
+shift is exempt, because Rust lets the shift amount have its own type (`a << b` with
+`a: i8, b: u8` compiles). The unit test enumerates every operator where two operands
+meet, both orders, plus the legal counterparts, so a fix that refused too much would
+fail it.
+
+**Evidence.** A unit test (`two_names_of_different_signedness_are_refused`) and a
+corpus test with two refused entries and a same-signedness control
+(`contract_same_signedness_compare_still_reads`). Sensitivity checked by deleting the
+two-name branch: the corpus entry gets a verdict (FAILED) instead of `skipped`, and
+the unit test fails. Coverage **133/228 to 134/231** (the control verifies; the two
+refusals are skipped, as they must be); test-count **519 to 521**. Gate green.
+
 ## Toolchain — edition 2024 and the MSRV floor (1.85)
 
 Both manifests are **edition 2024** with `rust-version = "1.85"`. The two numbers
