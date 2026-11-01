@@ -859,6 +859,35 @@ pub fn signed_slice_element_tripwire(xs: &[i8]) -> i8 {
     }
 }
 
+/// The signed-element read on the *postcondition* side, which is where the
+/// missing sign record actually produced a false proof.
+///
+/// `bind_indexed_elem` recorded an element's signedness for the executor's seeds
+/// but not for the parser, so `is_signed_name` said an `i8` element was unsigned.
+/// `xs[0] >= 0` then read as an unsigned comparison, which is *always true*, and
+/// this contract -- false at `xs[0] == i8::MIN` -- was reported verified. The
+/// element's sign now reaches the parser, so it is refuted with the negative
+/// element as the witness. The earlier `signed_slice_element_tripwire` did not
+/// catch this: the body's own reading of `xs[0]` dominated its verdict, so the
+/// bug hid behind a verdict that was already FAILED for another reason.
+/// requires: xs.len() > 0
+/// ensures: xs[0] >= 0
+pub fn signed_slice_element_ensures_tripwire(xs: &[i8]) -> i8 {
+    xs[0]
+}
+
+/// The same hole on the *symbolic* index chain.
+///
+/// `a[i]` is rewritten to an ite chain over the elements, and the chain was
+/// inserted into the name table without the element's sign -- so `a[i] >= 0` over
+/// an `i8` array read as unsigned and was proved for a body returning `a[i]`. It
+/// is refuted now, with `a[i] == i8::MIN` as the witness.
+/// requires: i < 4
+/// ensures: a[i] >= 0
+pub fn signed_array_chain_ensures_tripwire(a: [i8; 4], i: usize) -> i8 {
+    a[i]
+}
+
 /// A struct literal builds a value whose *fields* the body can read back.
 ///
 /// `Config { lo: 7, hi: 9 }` lowers to a struct-literal rvalue, which this
@@ -1795,6 +1824,29 @@ pub fn contract_constant_sum_wider_operand_reads(x: u8) -> u8 {
 /// requires: x <= i8::MAX + 1
 /// ensures: ret <= 0
 pub fn contract_constant_signed_sum_overflow_is_refused(x: i8) -> i8 {
+    x
+}
+
+/// A *signed* constant compared with an *unsigned* operand is refused.
+///
+/// Rust infers a literal's type from the operand it meets, and `x == -1` for a
+/// `u8` does not compile ("cannot apply unary operator `-` to type `u8`"). The
+/// reader carries the negation as a bit pattern at the operand's width, so it read
+/// `x == -1` as `x == 255` -- a wrong *value*, and `ensures: ret == 255` was
+/// *proved* for a body returning `x`, which is a false proof. Refusing the shape is
+/// the only sound answer; the wrong reading is a proof, so it cannot be a warning.
+/// requires: x == -1
+/// ensures: ret == 255
+pub fn contract_signed_literal_vs_unsigned_is_refused(x: u8) -> u8 {
+    x
+}
+
+/// The legal counterpart: a bare literal is unsigned, so `0xFF` against a `u8`
+/// must still read as `255`. Refusing every literal would be as wrong as refusing
+/// none, and this is the case that keeps the check from being a blanket ban.
+/// requires: x <= 0xFF
+/// ensures: ret == x
+pub fn contract_unsigned_literal_still_reads(x: u8) -> u8 {
     x
 }
 

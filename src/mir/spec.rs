@@ -895,6 +895,16 @@ impl FieldEnv {
         self.next_slot += 1;
         let v = smt::var_named(slot, elem_w);
         self.vars.insert(mangled.clone(), v);
+        // The element's signedness has to reach the *parser* too, not only the
+        // executor's seeds. Every other binding site records it here, and this one
+        // did not, so `is_signed_name("xs__e0")` was false for an `i8` element and
+        // a contract read `xs[0] < 0` as unsigned -- never true -- which is the
+        // exact confusion `signed_slice_element_is_signed` exists to catch. The
+        // false reading also refused `xs[0] == i8::MIN` as a signed/unsigned mix
+        // once that check was added, so the missing insert showed up twice.
+        if elem_signed {
+            self.signed.insert(mangled.clone());
+        }
         self.paths.insert(format!("{arg}[{index}]"), mangled);
         self.elem_seeds.push((local, index, v, elem_signed));
         Some(v)
@@ -982,6 +992,12 @@ impl FieldEnv {
             return None;
         }
         self.vars.insert(chain_name.clone(), chain);
+        // The chain stands for an element of `arg`, so the parser must know the
+        // element's signedness for the same reason `bind_indexed_elem` does: a
+        // `a[i]` over `[i8; N]` read as unsigned makes `a[i] < 0` never true.
+        if self.indexed.get(arg).is_some_and(|&(_, _, _, es)| es) {
+            self.signed.insert(chain_name.clone());
+        }
         self.paths.insert(chain_name.clone(), chain_name);
         self.sym_bound.insert(arg.to_string(), bound);
         Some(v)
@@ -1976,6 +1992,30 @@ impl<'a> Parser<'a> {
                 // language will not compare an `i8` with a `u8`), so either flag
                 // decides it, and a literal on one side leaves the other to say.
                 let signed = ls || rs;
+                // A *signed* constant cannot meet an *unsigned* typed operand.
+                // Rust infers a literal's type from the operand it is compared
+                // with, and `x == -1` for a `u8` does not compile ("cannot apply
+                // unary operator `-` to type `u8`"). The reader carries the
+                // negation as a bit pattern at the operand's width, so it would
+                // read `x == -1` as `x == 255` -- a wrong *value*, and
+                // `ensures: ret == 255` was verified for a body returning `x`,
+                // which is a false proof. So the shape is refused.
+                //
+                // The signed side must be the constant and the unsigned side a
+                // non-constant name: a bare literal is unsigned (`0xFF` for a
+                // `u8` must still read as `255`), two constants are aligned and
+                // range-checked by `align_widths`, and `x <= 127` for an `i8` is
+                // legal with the constant on the *unsigned* side. Only a signed
+                // constant against an unsigned name triggers this.
+                if ls != rs {
+                    let lconst = self.const_value(left).is_some();
+                    let rconst = self.const_value(right).is_some();
+                    if (rs && !ls && rconst && !lconst) || (ls && !rs && lconst && !rconst) {
+                        return Err(self.err(
+                            "a signed constant cannot be compared with an unsigned operand",
+                        ));
+                    }
+                }
                 // A literal is written without a type, so its width comes from
                 // the operand it meets. Sizing it from the widest name in scope
                 // makes `ret <= 255` a 64-bit comparison whenever a slice or
@@ -3425,6 +3465,40 @@ mod tests {
         // In-range constant division still reads.
         assert!(parses("x == 100 / 2"), "`100 / 2` is `50` and must read");
         assert!(parses("x == -100 / 2"), "`-100 / 2` is `-50` and must read");
+    }
+
+    /// A signed constant compared with an unsigned operand is refused.
+    ///
+    /// Rust infers a literal's type from the operand it meets, so `x == -1` for a
+    /// `u8` does not compile. The reader carries the negation as a bit pattern at
+    /// the operand's width, which made `x == -1` read as `x == 255` -- a wrong
+    /// value, and `ensures: ret == 255` was *proved* for a body returning `x`. The
+    /// shape is refused rather than read, because the wrong reading is a proof and
+    /// a proof cannot be a warning.
+    ///
+    /// The refusal is narrow on purpose: a bare literal is unsigned (`x <= 0xFF`
+    /// for a `u8` is `255`, not a signed constant), and a signed *name* against an
+    /// unsigned constant is not this shape.
+    #[test]
+    fn a_signed_constant_against_an_unsigned_operand_is_refused() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::var(8));
+        args.insert("y".to_string(), smt::var(8));
+        let mut signed = BTreeSet::new();
+        signed.insert("y".to_string());
+        let parses = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            p.parse_or().is_ok()
+        };
+        // `x` is unsigned, the right-hand constant is signed: refused.
+        assert!(!parses("x == -1"), "`-1` against a `u8` does not compile");
+        assert!(!parses("x >= -1"), "`-1` against a `u8` does not compile");
+        assert!(!parses("x <= -1"), "`-1` against a `u8` does not compile");
+        // The legal cases must still read.
+        assert!(parses("x <= 0xFF"), "a bare literal is unsigned and must read");
+        assert!(parses("x <= 255"), "a bare literal is unsigned and must read");
+        assert!(parses("y <= -1"), "a signed name against a signed literal reads");
+        assert!(parses("y >= i8::MIN"), "a signed bound against a signed name reads");
     }
 
     /// An explicit discriminant sets the variant's value and the next continues

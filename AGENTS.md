@@ -4244,3 +4244,53 @@ signedness of the widening alone makes the `i8::MAX + 1` assertion fail, so the 
 in the fix is pinned too.
 
 Coverage **128/212 to 130/218**, test-count 544 to 546. Gate green.
+
+## A signed constant meeting an unsigned operand is refused, and an element's sign must reach the *parser*
+
+Two holes in one sitting, both of the same kind: a signedness the reader *knew* but
+did not *use*, so a comparison asked the unsigned question and answered "always true".
+
+**The mixed-sign comparison.** `parse_cmp` decided a comparison's signedness with
+`signed = ls || rs`, and the `||` is a disjunction over operands that Rust never lets
+meet. A literal takes its type from the operand beside it, so `x == -1` for a `u8`
+does not compile ("cannot apply unary operator `-` to type `u8`"), yet the reader
+carried the negation as a bit pattern at the operand's width and read `x == -1` as
+`x == 255`. That is a wrong *value*, and `ensures: ret == 255` was **proved** for a
+body returning `x` -- the false proof, caught by probing `x == -1` against a `u8`
+after a probe script showed rustc rejecting the shape. The shape is now refused
+before alignment. The refusal is deliberately narrow: a bare literal is unsigned, so
+`0xFF` for a `u8` still reads as `255`; two constants are already range-checked by
+`align_widths`; and `x <= 127` for an `i8` is legal with the constant on the
+*unsigned* side. Only a signed *constant* against an unsigned *name*, in either
+order, triggers it -- which is exactly the shape rustc rejects.
+
+**The element's sign in the contract.** `bind_indexed_elem` recorded an element's
+signedness in `elem_seeds` for the executor but never in the parser's `signed` set,
+so `is_signed_name` said an `i8` element was unsigned. `xs[0] >= 0` over a `&[i8]`
+then read as an unsigned comparison -- always true -- and was **proved** for a body
+returning the element, with `i8::MIN` as the counterexample. The symbolic-index chain
+(`a[i]` over `[i8; 4]`) had the identical hole, because `bind_sym_index` inserted the
+chain into `vars` without inserting it into `signed`. Both sites now record the sign,
+the way every other binding site (`bind_bits`, payloads, `ret` fields) already did.
+
+The instructive part is that the corpus *hid* the second bug. The pre-existing
+`signed_slice_element_tripwire` already reported FAILED, so a coverage count said the
+entry was "handled" -- but it was FAILED because the *body's* reading of the element
+dominated the verdict, and the body's reading is executor-side and was correct. The
+parser-side bug is only visible when the element appears on the contract side alone
+(`ensures: xs[0] >= 0`). A verdict that is already the expected one for a different
+reason is not coverage; the new entries put the element *only* in the contract, which
+is the shape the old entry could not reach. Baseline confirmed: both new entries
+`verified` before the fix and `FAILED` (witness `128`) after, and removing either sign
+record alone makes them verify again.
+
+Evidence: spec test `a_signed_constant_against_an_unsigned_operand_is_refused`
+(parse-level, refusal + the legal `0xFF`/`255`/signed-name cases), integration test
+`a_signed_element_is_read_as_signed_in_the_contract` (refutes both tripwires and
+asserts the `128` witness), and corpus entries
+`contract_signed_literal_vs_unsigned_is_refused` (refused),
+`contract_unsigned_literal_still_reads` (must read), and the two tripwires. The first
+bug's earlier corpus addition (`signed_slice_element_ensures_tripwire`) is also what
+proved the second.
+
+Coverage **130/218 to 131/222**, test-count 512 to 514 (lib 179 to 180). Gate green.

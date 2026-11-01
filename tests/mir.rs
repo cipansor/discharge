@@ -3119,6 +3119,7 @@ fn an_out_of_range_literal_is_refused_not_wrapped() {
         "contract_constant_underflow_is_refused",
         "contract_constant_div_overflow_is_refused",
         "contract_constant_signed_sum_overflow_is_refused",
+        "contract_signed_literal_vs_unsigned_is_refused",
     ];
     let Some(report) = verify_realistic(&refused) else { return };
     for name in refused {
@@ -3138,11 +3139,51 @@ fn an_out_of_range_literal_is_refused_not_wrapped() {
         "contract_constant_vs_constant_in_range",
         "contract_constant_sum_in_range_reads",
         "contract_constant_sum_wider_operand_reads",
+        "contract_unsigned_literal_still_reads",
     ];
     let Some(report) = verify_realistic(&read) else { return };
     for name in read {
         let o = outcome(&report, name);
         assert!(o.is_verified(), "`{name}` must still read and verify, got: {o}");
+    }
+}
+
+/// A signed element of a slice or array must be read as signed *in the contract*.
+///
+/// `bind_indexed_elem` (and the symbolic-index chain) recorded an element's
+/// signedness for the executor's seeds but not for the parser's name table, so
+/// `is_signed_name` reported an `i8` element as unsigned. A postcondition that
+/// compares it with zero then reads as an unsigned comparison, which is *always
+/// true* -- so `ensures: xs[0] >= 0` was reported verified for a body that returns
+/// the element, a false proof with `i8::MIN` as the counterexample.
+///
+/// The existing `signed_slice_element_tripwire` did not catch this: its body reads
+/// the element itself, so the *body's* (correct, executor-side) reading dominated
+/// the verdict and it was already FAILED for the right reason. The bug only shows
+/// when the element appears on the contract side alone, which is what these two
+/// entries pin. Both are sensitive: removing either sign record makes them verify.
+#[test]
+fn a_signed_element_is_read_as_signed_in_the_contract() {
+    let refuted = [
+        "signed_slice_element_ensures_tripwire",
+        "signed_array_chain_ensures_tripwire",
+    ];
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, detail, .. } = o else {
+            panic!(
+                "`{name}` is false at `i8::MIN` and must be refuted -- verifying it is \
+                 the unsigned-reading false proof, got: {o}"
+            );
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+        // The witness is `128`, the bit pattern of `i8::MIN`. Under the unsigned
+        // reading the comparison is trivially true and there is no witness at all.
+        assert!(
+            detail.contains("= 128"),
+            "the witness should be `128` (`i8::MIN`), got: {detail}"
+        );
     }
 }
 

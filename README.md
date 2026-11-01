@@ -1348,6 +1348,28 @@ too: `128` fits an unsigned byte but not a signed one, and an unsigned widening 
 have left it at eight bits where it read as `-128` — a false proof in place of the one
 being fixed.
 
+A *signed* constant compared with an *unsigned* operand is refused, because Rust does
+not type it either. A literal takes its type from the operand it meets, so `x == -1`
+for a `u8` does not compile ("cannot apply unary operator `-` to type `u8`"), and
+`x <= -1` is the same shape. The reader carries the negation as a bit pattern at the
+operand's width, so it read `x == -1` as `x == 255` — a wrong *value*, and
+`ensures: ret == 255` was *proved* for a body returning `x`, a false proof. Refusing
+the shape is the only sound answer: the wrong reading is a proof, and a proof cannot be
+a warning. The refusal is narrow — a bare literal is unsigned, so `0xFF` for a `u8`
+still reads as `255`, and `x <= 127` for an `i8` is legal with the constant on the
+unsigned side. Only a signed *constant* against an unsigned *name* (in either order)
+triggers it, which is exactly the shape Rust rejects.
+
+A slice or array element is read at the element type's signedness in the *contract*,
+not only in the body. `bind_indexed_elem` recorded an `i8` element's sign for the
+executor's seeds but not for the parser, so `xs[0] >= 0` over a `&[i8]` read as an
+unsigned comparison — always true — and was *proved* for a body returning the element,
+with `i8::MIN` as the counterexample. The symbolic-index chain (`a[i]` over `[i8; 4]`)
+had the same hole. The existing `signed_slice_element_tripwire` did not catch it: its
+body reads the element, and the body's own (correct) reading dominated the verdict, so
+it was already FAILED for another reason. Both sign records are now made, and both
+entries verify→refute when either is removed.
+
 A literal is read at the radix it is written in. `0xFF` is `255`, `0b1010` is `10`
 and `0o17` is `15`, in any width and with underscores or a type suffix (`0xFFu8`,
 `0xFF_FF`). Reading every literal as decimal silently made `0xFF` equal `0` — the
