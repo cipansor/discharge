@@ -4718,3 +4718,72 @@ constant, then an unsigned constant — and each time the probe that found it wa
 rustc rejects but the reader decided. The pattern is to state the *type* invariant and test
 both directions, not to patch the direction a single counterexample came from.
 
+
+## A fixed-width constant may not meet a partner of another width
+
+The mask work above was found by hand, one counterexample at a time. This one was found
+by a *differential sweep*: enumerate the operand shapes a contract can write, ask `rustc`
+whether the shape is well-typed, ask the reader what it decides, and report every shape
+rustc rejects but the reader decides. Across 722 comparison shapes the sweep found exactly
+one soundness hole, and it was a *new class*, not another mask:
+
+`-1i8 < (x as i16)` was **verified**. `-1i8` is an `i8` and `x as i16` is an `i16`, so the
+comparison is `E0308` (`expected i8, found i16`). Both operands are *signed*, so
+`refuse_mixed_signedness` — the gate that refuses `i8` vs `u8` — passes them and the
+verdict is read. Signedness was not the only type evidence, and the remaining evidence,
+the *width*, was being erased: `align_widths` resizes a constant to its partner's width so
+that a bare literal can be sized per use, and it did the same to `-1i8`, narrowing the
+`i16` side down and deciding a program rustc rejects. The same shape appears with no name
+at all — `1i8 == 1i16` — and with a bound — `(x as i16) < i8::MIN`.
+
+The fix separates the two reasons a constant can be untyped-and-adaptable from the reason
+it cannot be resized. A *bare* literal has no type of its own, so Rust infers its width
+from the operand it meets — and so does a *bare negation*, `-1`, which is why
+`-1 < (x as i16)` is well-typed. A suffixed literal (`1i8`), a named bound (`i8::MIN`), a
+cast, or a fold with a typed operand has a width of its own, and a mismatch with a typed
+partner is `E0308`. So the `Sign` model gained a `NegLiteral` state, distinct from
+`Signed`:
+
+- `eval()` is true for `Signed` and `NegLiteral` — both are signed, so `%`, `/` and `>>`
+  take the signed forms (`-7 % 3` is `-1`).
+- `adapts()` is true for every state whose width is inferred rather than fixed —
+  `Literal`, `NegLiteral`, and `Opaque` (the complement of a literal, or a fold of
+  untyped operands: `!0`, `(!0 + 1)`) — and is what `align_widths` now keys on, so a
+  fixed-width constant is refused rather than resized. It is `!fixes_type()`: the
+  first cut listed only `Literal` and `NegLiteral`, which wrongly refused the
+  well-typed `(!0 + 1) == y`.
+- `typed()` is `Some(true)` for `NegLiteral`, so it still forces a partner's signedness;
+  `fixes_type()` is true only for `Signed`/`Unsigned`, which is what a width mismatch
+  needs.
+
+`combine` was rewritten to match: a pair with a *fixed* operand takes its sign; with
+neither fixed the result keeps the pair's own nature — `Opaque` for a width-dependent
+untyped constant, `NegLiteral` for a signed-but-adaptive value, `Literal` otherwise.
+
+**Evidence.** The differential sweep (`rustc` as the oracle on the shape, the reader's
+verdict against it) over a *wider* operand set — 900 shapes including casts, bounds,
+masks, shifts and folds — reports **0** soundness holes after the fix, down from **26**
+before it, with **no new** hole introduced. The 10 refusals of well-typed shapes in the
+smaller set are all pre-existing and intentional (an untyped `!0` with no typed partner is
+sign-ambiguous). A unit test
+(`a_fixed_width_constant_may_not_meet_a_partner_of_another_width`) pins both directions —
+four refused shapes and three that must read — and a corpus test asserts the tripwires
+`contract_fixed_width_constant_vs_wider_cast_is_refused` and
+`contract_two_fixed_width_constants_are_refused` are not decided against the control
+`contract_bare_negation_meets_a_wider_operand`, which must verify. Test-count **542 →
+544**; corpus **144/252 → 145/255**. Gate green.
+
+**Still open, and named so it is not mistaken for fixed.** The same sweep shows five
+shapes where an *untyped fold that overflows at the partner's width* is still decided:
+`(!0 + 1) < 1u8` (and four like it) is a rustc `arithmetic operation will overflow` error,
+because `!0` is `-1` and `-1 + 1` at a `u8` is `0`, not the `256` the reader holds at the
+scope's width. That is a *different* axis from this fix — the fold's value is wrong at the
+width a typed operand forces, not its type erased — and it was already decided before this
+change (the five are a subset of the parent's 26). Fixing it needs the fold to range-check
+its result at the partner's width, which the `Opaque`-stays-narrow design deliberately
+defers; it is left for its own change rather than folded into this one.
+
+The lesson: signedness was never the whole type. The earlier fixes asked "same
+signedness?" and the sweep asked the *pair* of questions rustc asks — same signedness
+**and** same width — and only the second found this. When a gate models one axis of a
+type, sweep the other axis too.

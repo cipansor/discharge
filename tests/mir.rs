@@ -3575,6 +3575,41 @@ fn a_symbolic_mask_keeps_its_type_but_a_constant_mask_still_widens() {
     );
 }
 
+/// A constant whose *type is fixed* may not meet a partner of another width.
+///
+/// `-1i8` is an `i8`, so `-1i8 < (x as i16)` is `E0308` even though both operands
+/// are signed; `refuse_mixed_signedness` passes them, so the width is the only
+/// remaining evidence, and `align_widths` used to resize the constant and erase it
+/// — *verifying* the contract. A *bare* negation (`-1`) has no width of its own, so
+/// it still meets a wider operand. The mismatch and the valid control are asserted
+/// together, because the rule must refuse only a fixed width.
+#[test]
+fn a_fixed_width_constant_may_not_meet_a_partner_of_another_width() {
+    let Some(report) = verify_realistic(&[
+        "contract_fixed_width_constant_vs_wider_cast_is_refused",
+        "contract_two_fixed_width_constants_are_refused",
+        "contract_bare_negation_meets_a_wider_operand",
+    ]) else {
+        return;
+    };
+    for name in [
+        "contract_fixed_width_constant_vs_wider_cast_is_refused",
+        "contract_two_fixed_width_constants_are_refused",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            !o.is_verified(),
+            "{name} compares a fixed-width constant with a differently-sized operand \
+             (`E0308`) and must be refused, got: {o}"
+        );
+    }
+    let o = outcome(&report, "contract_bare_negation_meets_a_wider_operand");
+    assert!(
+        o.is_verified(),
+        "a bare negation infers its width and is well-typed, so it must verify, got: {o}"
+    );
+}
+
 /// A *typed* constant mask keeps its type, so a pairing of the other signedness is
 /// refused rather than decided — in **both** directions.
 ///

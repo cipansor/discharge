@@ -1454,6 +1454,11 @@ pub fn eval_invariant(
 enum Sign {
     Signed,
     Unsigned,
+    /// A negated *bare* literal, `-1` or `-128`: signed, but — like a literal —
+    /// its width is inferred from the operand it meets (`-1 < (x as i16)` is
+    /// well-typed). A suffixed or bound constant (`-1i8`, `i8::MIN`) is `Signed`
+    /// and carries its own width, so a mismatch with a typed partner is `E0308`.
+    NegLiteral,
     Literal,
     Opaque,
 }
@@ -1470,12 +1475,28 @@ impl Sign {
     /// unsigned agree there, so an untyped operand may take the other side's sign
     /// (or unsigned, which is a literal's natural reading).
     fn eval(self) -> bool {
-        self == Sign::Signed
+        matches!(self, Sign::Signed | Sign::NegLiteral)
+    }
+    /// Whether the operand's *width* is inferred from the other side rather than
+    /// fixed by its own type. A bare literal, a bare negation of one, and an
+    /// untyped constant that is not a bare literal (the complement of one, or a
+    /// fold of untyped operands -- `!0`, `(!0 + 1)`) all have no type of their own,
+    /// so Rust infers their width from the operand they meet. Only a value whose
+    /// type is fixed (`1i8`, `i8::MIN`, a cast, a name) has a width of its own, and
+    /// a mismatch between it and a typed partner is `E0308`.
+    fn adapts(self) -> bool {
+        !self.fixes_type()
+    }
+    /// Whether the operand's type is *fixed* by its own form (`1i8`, `i8::MIN`, a
+    /// cast, a name) rather than inferred from context. Such a value cannot meet
+    /// an operand of another width or signedness.
+    fn fixes_type(self) -> bool {
+        matches!(self, Sign::Signed | Sign::Unsigned)
     }
     /// The sign a *typed* operand forces on an untyped partner, if any.
     fn typed(self) -> Option<bool> {
         match self {
-            Sign::Signed => Some(true),
+            Sign::Signed | Sign::NegLiteral => Some(true),
             Sign::Unsigned => Some(false),
             Sign::Literal | Sign::Opaque => None,
         }
@@ -1485,11 +1506,24 @@ impl Sign {
         a.typed().or_else(|| b.typed())
     }
     /// The sign of `a <op> b`: the typed operand's, or the untyped pair's own.
+    ///
+    /// A pair with a *fixed* operand takes that operand's sign. With neither fixed
+    /// the result keeps the pair's own nature: `Opaque` when a width-dependent
+    /// untyped constant is involved (`!0 + 2`), `NegLiteral` when the pair is a
+    /// signed but width-adaptive value (`-1 + 1`), and `Literal` otherwise.
     fn combine(a: Sign, b: Sign) -> Sign {
-        match Sign::resolve(a, b) {
-            Some(b) => Sign::from_bool(b),
-            None if a == Sign::Opaque || b == Sign::Opaque => Sign::Opaque,
-            None => Sign::Literal,
+        if a.fixes_type() || b.fixes_type() {
+            if a == Sign::Signed || b == Sign::Signed {
+                Sign::Signed
+            } else {
+                Sign::Unsigned
+            }
+        } else if a == Sign::Opaque || b == Sign::Opaque {
+            Sign::Opaque
+        } else if a == Sign::NegLiteral || b == Sign::NegLiteral {
+            Sign::NegLiteral
+        } else {
+            Sign::Literal
         }
     }
     /// Is this a sign-*ambiguous* operand: an untyped constant that is not a bare
@@ -2165,6 +2199,20 @@ impl<'a> Parser<'a> {
     ) -> Result<(Var, Var), SpecError> {
         let signed = signed.eval();
         let (wa, wb) = (smt::bits(a), smt::bits(b));
+        // Which operand is a *bare* literal, or a bare negation of one, and so
+        // has no type of its own: Rust infers its width from the operand it meets,
+        // and only such a value may be resized to the other side (`Sign::Literal`).
+        //
+        // Every other constant carries a type of its own -- a suffix (`1i8`), a
+        // named bound (`i8::MIN`), a cast, or a fold with a typed operand -- and a
+        // width mismatch between it and a typed partner is a Rust error (`E0308`),
+        // not a resize. Resizing it instead let `-1i8 < (x as i16)` and
+        // `1i8 == 1i16` *verify* although rustc rejects both: the signedness gate
+        // sees two signed operands and passes, so the width was the only remaining
+        // evidence, and it was being erased.
+        let a_adapts = sa.adapts();
+        let b_adapts = sb.adapts();
+        let mismatch = || self.err("operands of different widths cannot be combined");
         match (self.const_value(a), self.const_value(b)) {
             // Both constants: give the pair one width. The range check runs on
             // whichever operand is resized: a contract that meets no typed name
@@ -2181,10 +2229,23 @@ impl<'a> Parser<'a> {
             // instead resized the *wider* side down -- `128i16 as i32 == 128`,
             // where the cast result is 32 bits and the literal is 8, narrowed the
             // 32-bit `128` to eight bits and refused a valid comparison.
-            (Some(_), Some(_)) => match (sa == Sign::Literal, sb == Sign::Literal) {
+            //
+            // With *neither* operand a bare literal the two types are both fixed,
+            // so a width mismatch is the Rust error and is refused; at equal width
+            // the resize is the identity term but the range check still runs.
+            (Some(_), Some(_)) => match (a_adapts, b_adapts) {
                 (true, false) => Ok((self.resize_const(a, wb, signed, sa)?, b)),
                 (false, true) => Ok((a, self.resize_const(b, wa, signed, sb)?)),
-                _ => {
+                (false, false) => {
+                    if wa == wb {
+                        let a = self.resize_const(a, wa, signed, sa)?;
+                        let b = self.resize_const(b, wb, signed, sb)?;
+                        Ok((a, b))
+                    } else {
+                        Err(mismatch())
+                    }
+                }
+                (true, true) => {
                     if wa > wb {
                         Ok((self.resize_const(a, wb, signed, sa)?, b))
                     } else if wb > wa {
@@ -2204,13 +2265,28 @@ impl<'a> Parser<'a> {
             // proof. `sa`/`sb` carry each constant's own signedness, so a bare
             // literal (non-negative) is told apart from a signed bound that
             // happens to share its bit pattern.
-            (Some(_), None) => Ok((self.resize_const(a, wb, signed, sa)?, b)),
-            (None, Some(_)) => Ok((a, self.resize_const(b, wa, signed, sb)?)),
+            //
+            // A constant whose type is *fixed* (not a bare literal) may only meet
+            // a name of its own width; a mismatch is refused, as above.
+            (Some(_), None) => {
+                if a_adapts || wa == wb {
+                    Ok((self.resize_const(a, wb, signed, sa)?, b))
+                } else {
+                    Err(mismatch())
+                }
+            }
+            (None, Some(_)) => {
+                if b_adapts || wa == wb {
+                    Ok((a, self.resize_const(b, wa, signed, sb)?))
+                } else {
+                    Err(mismatch())
+                }
+            }
             (None, None) => {
                 if wa == wb {
                     Ok((a, b))
                 } else {
-                    Err(self.err("comparison between operands of different widths"))
+                    Err(mismatch())
                 }
             }
         }
@@ -2443,7 +2519,7 @@ impl<'a> Parser<'a> {
                 left
             } else {
                 match sgn {
-                    Sign::Signed => smt::ashr(left, k as u32),
+                    Sign::Signed | Sign::NegLiteral => smt::ashr(left, k as u32),
                     // An untyped *bare literal* (a small non-negative value) shifts
                     // the same either way, so the unsigned reading is exact.
                     Sign::Unsigned | Sign::Literal => smt::lshr(left, k as u32),
@@ -2619,6 +2695,11 @@ impl<'a> Parser<'a> {
                 return Err(self.err("cannot apply unary `-` to an unsigned operand"));
             }
             let w = smt::bits(v);
+            // The negation of a *bare* literal keeps the literal's adaptive width
+            // (`-1 < (x as i16)` is well-typed), so it is `NegLiteral`; the
+            // negation of a suffixed or bound constant (`-1i8`, `-i8::MIN`) keeps
+            // that constant's fixed width, so it is `Signed`. Both are signed.
+            let out = if sgn == Sign::Literal { Sign::NegLiteral } else { Sign::Signed };
             // A negated *constant* is widened by one bit when its magnitude does
             // not fit signed at its own width, so the true value survives for the
             // later range check. `-129` for an `i8` is a Rust error ("literal out
@@ -2634,11 +2715,11 @@ impl<'a> Parser<'a> {
                 if !fits {
                     return Ok((
                         smt::sub(smt::word(0, w + 1), smt::word(mag, w + 1)),
-                        Sign::Signed,
+                        out,
                     ));
                 }
             }
-            return Ok((smt::sub(smt::word(0, w), v), Sign::Signed));
+            return Ok((smt::sub(smt::word(0, w), v), out));
         }
         // `!` is a unary prefix on a *value* here, because `bang_is_predicate`
         // ruled out the predicate reading above. On an integer it is bitwise NOT,
@@ -3769,6 +3850,45 @@ mod tests {
         // A mask with no *typed* operand stays untyped and may widen.
         let mut p = Parser::new("(!0 & 1) == y", &args, None, &unsigned, false);
         assert!(p.parse_or().is_ok(), "an untyped constant mask still reads");
+    }
+
+    /// A constant whose *type is fixed* may not meet a partner of another width,
+    /// while a bare literal (and a bare negation) infers its width and may.
+    ///
+    /// `1i8`, `i8::MIN` and a cast carry a width of their own, so a comparison with
+    /// a differently-sized operand is `E0308` in Rust, and `refuse_mixed_signedness`
+    /// does not catch it because both operands are signed. `align_widths` used to
+    /// *resize* the constant instead, which erased the only evidence and let
+    /// `-1i8 < (x as i16)` and `1i8 == 1i16` verify. A bare literal (and `-1`, a
+    /// negation of one) has no width of its own -- Rust infers it -- so those must
+    /// still align to the other operand.
+    #[test]
+    fn a_fixed_width_constant_may_not_meet_a_partner_of_another_width() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::var(8));
+        let mut signed = BTreeSet::new();
+        signed.insert("x".to_string());
+        // A fixed-width constant (suffix or bound) against a name of another width
+        // is refused, whatever the comparison.
+        for text in [
+            "(x as i16) == 1i8",
+            "-1i8 < (x as i16)",
+            "(x as i16) < i8::MIN",
+            "1i8 == 1i16",
+        ] {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            let err = p.parse_or().expect_err("a fixed-width mismatch must be refused");
+            let msg = format!("{err}");
+            assert!(msg.contains("different widths"), "`{text}`: got {msg}");
+        }
+        // A bare literal, and a bare negation, have no width of their own and take
+        // the other operand's -- these are well-typed and must read. So does an
+        // untyped fold (`(!0 + 1)`, `Opaque`): like `!0` it has no type of its own,
+        // so it too is sized from the operand it meets.
+        for text in ["(x as i16) == 1", "-1 < (x as i16)", "-1 < x", "(!0 + 1) == x"] {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            assert!(p.parse_or().is_ok(), "`{text}` infers its width and reads");
+        }
     }
 
     /// A typed constant mask against a partner of its *own* signedness reads.

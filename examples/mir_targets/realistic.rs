@@ -1023,6 +1023,42 @@ pub fn contract_unsigned_mask_with_unsigned_partner_reads(y: u8) -> u8 {
     y
 }
 
+/// A constant whose *type is fixed* may not meet a partner of another width.
+///
+/// `-1i8` is an `i8`, so `-1i8 < (x as i16)` is `E0308` (`expected i8, found
+/// i16`) even though both operands are signed -- `refuse_mixed_signedness` sees
+/// two signed operands and passes, so the *width* is the only remaining evidence.
+/// `align_widths` used to resize the constant to the cast's width instead, erasing
+/// it, and the contract was *verified*. It must not be decided.
+/// requires: true
+/// ensures: -1i8 < (x as i16)
+pub fn contract_fixed_width_constant_vs_wider_cast_is_refused(x: u8) -> i16 {
+    x as i16
+}
+
+/// A bare negation has no width of its own, so it *does* meet a wider operand.
+///
+/// The valid control for the width rule: `-1` is a negation of a bare literal, so
+/// Rust infers its type from `(x as i16)` and `-1 < (x as i16)` is well-typed
+/// (`-1` is less than any `x as i16`, so it holds for every `x`). The rule must
+/// refuse only a *fixed* width, not every negation.
+/// requires: true
+/// ensures: -1 < (x as i16)
+pub fn contract_bare_negation_meets_a_wider_operand(x: u8) -> i16 {
+    x as i16
+}
+
+/// Two fixed-width constants of different widths may not be compared.
+///
+/// The both-constant counterpart: `1i8 == 1i16` is `E0308` in Rust. With neither
+/// operand a bare literal there is no operand to infer a width from, so the
+/// mismatch is the Rust error and the contract must not be decided.
+/// requires: true
+/// ensures: 1i8 == 1i16
+pub fn contract_two_fixed_width_constants_are_refused() -> i16 {
+    0
+}
+
 /// A comparison of a *signed* array element is a signed comparison.
 ///
 /// This is the element-side counterpart of the `const 0_i8` case. The element's
