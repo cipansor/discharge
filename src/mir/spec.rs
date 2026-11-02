@@ -1643,12 +1643,11 @@ fn tokenize(s: &str) -> Vec<Tok> {
                 // dropping the *width* built `128i16` at the scope's width, which a
                 // later widening cast sign-extended to `-128` -- a false proof.
                 let ty = Ty::parse(&sfx);
-                let (signed, width) = match (ty.is_signed(), ty.width()) {
-                    // `u128`/`i128` have no engine width; keep the sign, let the
-                    // width check refuse them (the value still has to fit `u64`).
-                    (s, None) => (s, 64),
-                    (s, Some(w)) => (s, w),
-                };
+                // The width is recorded as the suffix's *own* width, including
+                // `u128`/`i128`'s 128: the reader refuses that width in `parse_atom`
+                // (the engine's words stop at 64), and keeping the true number here
+                // is what lets the refusal name it. A `usize`/`isize` suffix is 64.
+                let (signed, width) = (ty.is_signed(), ty.width().unwrap_or(64));
                 suffix = Some((width, signed));
             }
             // Anything the run did not consume is a malformed literal: a digit not
@@ -2362,16 +2361,22 @@ impl<'a> Parser<'a> {
             let (l, r) = self.align_widths(left, sgn, r, rs, Sign::combine(sgn, rs))?;
             left = smt::band(l, r);
             sgn = Sign::combine(sgn, rs);
-            // `a & mask` with a *width-independent* mask (`mask` a bare literal or
-            // a fold of bare literals) is itself width-independent: `&` keeps only
-            // the mask's low bits, which are the same at any width, and clears the
-            // rest, so the result is a non-negative value that may widen exactly
-            // like a literal. Carrying it as an opaque constant instead refused the
-            // widening, so `(x as u16) == (!0 & 1)` -- `1` at any width -- was
-            // dropped. A signed partner is excluded: `x & 128` for an `i8` keeps
-            // bit 7, which is negative.
-            if (sgn == Sign::Literal || rs == Sign::Literal)
-                && Sign::combine(sgn, rs) != Sign::Signed
+            // `a & mask` is a width-independent *value* when the *whole* result
+            // is constant and the mask is width-independent: `&` keeps only the
+            // mask's low bits, which are the same at any width, so `(!0 & 1)` is
+            // `1` at any width and may widen exactly like a literal. Only that
+            // case is marked `Literal` -- carrying it as opaque refused the
+            // widening, dropping `(x as u16) == (!0 & 1)`.
+            //
+            // A *symbolic* masked operand must keep its own sign. Marking it
+            // `Literal` would erase a typed argument's type: `x & 128` for a `u8`
+            // is still a `u8`, and `Literal` made `refuse_mixed_signedness` accept
+            // `(x & 128) == y` for a signed `y`, a pairing rustc rejects (E0308).
+            // A constant result needs no such care: it is range-checked against
+            // the operand's width when it is aligned, so `x & 128` for an `i8` is
+            // refused there (`128` does not fit `i8`), and only a value that fits
+            // -- a genuinely width-independent one -- reaches the widening.
+            if self.const_value(left).is_some() && (sgn == Sign::Literal || rs == Sign::Literal)
             {
                 sgn = Sign::Literal;
             }
@@ -2673,6 +2678,20 @@ impl<'a> Parser<'a> {
                 // `ensures: 128i16 as i32 == -128`. So it is built at its own
                 // width, and the value is range-checked against the suffix.
                 if let Some((w, signed)) = suffix {
+                    // The engine's words are 1..=64 bits, and `smt::word` refuses a
+                    // wider one by flagging the term ill-formed. A `u128`/`i128`
+                    // suffix has to be refused *here*, before the range check: the
+                    // check computes `1u128 << (w - 1)` and `1u128 << w`, and a
+                    // shift of 128 panics in a debug build (it wraps to a wrong
+                    // `max` in release). The reader cannot hold a 128-bit literal,
+                    // so the contract is refused rather than decided -- the same
+                    // answer `cast_chain` gives a cast to `u128`.
+                    if w > 64 {
+                        return Err(self.err(format!(
+                            "a `{w}`-bit type suffix is wider than the engine's 64-bit words, so \
+                             a literal of that type is not modelled"
+                        )));
+                    }
                     // A signed literal is allowed up to `2^(w-1)` because it may
                     // be negated: `-128i8` needs the literal `128i8` to exist
                     // first, and the negation is what makes the min magnitude
@@ -3683,6 +3702,29 @@ mod tests {
         if let Ok(pr) = p.parse_or() {
             assert!(!smt::prove(pr).is_proved(), "`128i16 as i32` is `128`, never `-128`");
         }
+    }
+
+    /// A `u128`/`i128` suffix is *refused* before the range check, which would
+    /// otherwise shift `1u128` by 128 and panic in a debug build.
+    ///
+    /// The suffix records the type's true width (128), so the range check's
+    /// `1u128 << w` overflows; in release the shift wraps and hands a 128-bit
+    /// value to `smt::word`, itself an assertion. Both literals here are small, so
+    /// the refusal must come from the *type*, not the value.
+    #[test]
+    fn a_u128_suffix_is_refused_before_the_range_shift() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::var(8));
+        let unsigned = BTreeSet::new();
+        for text in ["0u128 == 0u128", "0i128 == 0i128", "1u128 == 1"] {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let err = p.parse_or().expect_err("a 128-bit suffix must be refused");
+            let msg = format!("{err}");
+            assert!(msg.contains("128") && msg.contains("64-bit"), "`{text}`: got {msg}");
+        }
+        // A 64-bit suffix beside a 128-bit one is still fine on its own.
+        let mut p = Parser::new("1u64 == 1", &args, None, &unsigned, false);
+        assert!(p.parse_or().is_ok(), "a `u64` suffix is modelled");
     }
 
     /// Unary `-` binds *tighter* than `as`, so `-x as u8` is `(-x) as u8` and its

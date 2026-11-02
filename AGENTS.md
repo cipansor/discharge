@@ -4637,3 +4637,57 @@ additive pair (`+`/`-`), the multiplicative triple (`*`/`/`/`%`), and
 `parse_bitand`/`parse_bitxor`/`parse_bitor`.
 
 Coverage **131/222 to 133/226**, test-count 514 held. Gate green.
+
+## Three follow-ups on the untyped-constant reader: a panic, a lost type, and a vacuous test
+
+Reviewing the signedness work found three more, each a different flavour of the same
+theme — the reader answering a question it had not been asked, and a test that could not
+have caught it.
+
+**A `u128`-suffixed literal was a panic, not a refusal.** The suffix records the type's
+*true* width, and `Ty::width()` returns `128` for `u128`/`i128`. `parse_atom`'s range check
+computes `1u128 << (w - 1)` and `1u128 << w`; at `w == 128` that shift overflows. In a
+**debug** build it panics outright — the worst failure mode, a crash that reports nothing.
+In **release** it wraps to a wrong `max`, so a 128-bit literal slips past the range check
+and reaches `smt::word`, whose `1..=64` assertion is the same crash from the other side.
+`0u128 == 0u128` is the minimal trigger: both literals are *small*, so the value is not the
+problem, the type is. The fix refuses `w > 64` **before** the shift, with a message naming
+the width and the engine limit, which is the answer `cast_chain` already gives a cast to
+`u128`. The tokenizer's comment had claimed `u128`/`i128` "have no engine width" and mapped
+them to 64 — but that arm was dead, because `width()` returns `Some(128)`, so the guard it
+described never ran. The comment now says what the code does.
+
+**A symbolic masked operand lost its type.** The `parse_bitand` refinement that made
+`(!0 & 1)` widen was written on the *presence* of a literal mask, not on the result being
+constant. So `x & 128` for a `u8` — a symbolic operand, still a `u8` — was marked
+`Sign::Literal`, the "untyped, infer me from a partner" state. `refuse_mixed_signedness`
+then saw no typed operand and accepted `(x & 128) == y` for a signed `y`, a pairing rustc
+rejects (E0308), and gave it a signed reading. `&` cannot change its operand's type, so the
+mark is now gated on the *whole result* being constant: `(!0 & 1)` still widens exactly
+(`const_value(left).is_some()`), and `x & 128` keeps `Sign::Unsigned`.
+
+**The strict test guard had a hole of its own.** `verify_src` was made strict in an earlier
+fix — a contracted function absent from the report is a panic, not a silent `None` — but the
+assertion carried `|| report.missing.iter().any(|m| m == name)`, accepting the *same* drop
+when the frontend reported it. `missing` is the drop from the frontend's side, so this
+reopened the hole the guard existed to close: a test whose function the frontend drops, for
+*any* reason, would still assert nothing. The `missing` clause is gone; the only pass without
+an outcome is a source with no `///` at all (a caller mistake, not a drop). The guard is
+split into `assert_not_dropped`, so the exact branch that was vacuous is tested without a
+nightly `rustc`: a `#[should_panic]` test feeds it a `missing` list naming the function.
+
+**Evidence.** Unit tests `a_u128_suffix_is_refused_before_the_range_shift` (three 128-bit
+suffixes refused, `1u64` still reads) and the corpus entry `contract_u128_suffix_literal_is_refused`;
+`a_symbolic_mask_keeps_its_type_but_a_constant_mask_still_widens` with the corpus entry
+`contract_symbolic_mask_keeps_its_type` (refused) against `contract_complement_mask_widens_exactly`
+(still verifies); and `a_dropped_contracted_function_fails_even_when_missing_names_it` +
+`a_present_function_passes_the_drop_guard` for the guard. Test-count **534 → 539**; corpus
+**142/246 → 142/248** (both new entries are refusals, so the decided count holds). Gate
+green: z3 `mismatch=0`, Kani `mismatch=0`.
+
+The lesson the three share: a refinement is only as wide as the *predicate* it was written
+on. The mask fix asked "is there a literal mask?" when the question was "is the *result*
+constant?"; the suffix fix trusted a width the *tokenizer* recorded rather than checking it
+against the engine's limit; the guard accepted a drop because it *had* a name for it. Each
+is the same error — answering the convenient question instead of the necessary one.
+

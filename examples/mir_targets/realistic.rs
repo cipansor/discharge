@@ -944,6 +944,35 @@ pub fn contract_complement_division_with_typed_operand_reads(x: u8) -> u8 {
     x
 }
 
+/// A `u128`-suffixed literal must be *refused*, not panicked.
+///
+/// The suffix carries width 128, and the range check that guards the literal
+/// computes `1u128 << w`; at `w == 128` that shift panics in a debug build (it
+/// wraps to a wrong `max` in release), and `smt::word` has no 128-bit width to
+/// fall back on either. Both literals here are small, so the value is not the
+/// problem -- the *type* is, and the contract has to be refused rather than
+/// decided. This pins that the reader reports the function instead of taking the
+/// run down.
+/// requires: true
+/// ensures: 0u128 == 0u128
+pub fn contract_u128_suffix_literal_is_refused(x: u8) -> u8 {
+    x
+}
+
+/// A *symbolic* masked operand keeps its own type, so a signed/unsigned pairing
+/// is refused.
+///
+/// `x & 128` for a `u8` is still a `u8`: `&` does not change its operand's type,
+/// and masking a symbolic value cannot make it inferable from a partner. Marking
+/// the result untyped let `refuse_mixed_signedness` accept `(x & 128) == y` for a
+/// signed `y`, a pairing rustc rejects (E0308), and give it a signed reading
+/// instead of refusing it. The contract must not be decided.
+/// requires: true
+/// ensures: (x & 128) == y
+pub fn contract_symbolic_mask_keeps_its_type(x: u8, y: i8) -> u8 {
+    x
+}
+
 /// A comparison of a *signed* array element is a signed comparison.
 ///
 /// This is the element-side counterpart of the `const 0_i8` case. The element's

@@ -1896,6 +1896,28 @@ fn a_slice_subscript_missing_either_bound_is_refused() {
 /// checking anything. That is how `a_whole_struct_assignment_invalidates_its_fields`
 /// hid a one-line struct that swallowed every following function. A vacuous pass
 /// is worse than a failure, so this refuses to be quiet about it.
+///
+/// The guard `verify_src` applies: a contracted function that is absent from the
+/// report is a failure, whatever `report.missing` says. `missing` is the same
+/// drop from the frontend's side (a contract with no MIR function), and accepting
+/// it as a pass reopened the hole the guard exists to close: a test whose function
+/// the frontend drops -- for *any* reason, including one a future bug adds --
+/// would assert nothing. The only source without a contract is one that carries no
+/// `///` at all, which is a caller mistake, not a frontend drop.
+///
+/// Split out so the branch that made the guard vacuous -- `missing` naming the
+/// function -- can be tested *without* a nightly `rustc`. The guard is about what
+/// counts as a pass, and a test that needed the frontend could not check the one
+/// case that mattered.
+#[track_caller]
+fn assert_not_dropped(name: &str, src: &str, present: bool, missing: &[String]) {
+    assert!(
+        present || !src.contains("///"),
+        "`{name}` was dropped from the report: it has a contract but no outcome, so this test \
+         would have passed without checking anything (missing: {missing:?})"
+    );
+}
+
 fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
     let rustc = rustc()?;
     let dir = std::env::temp_dir().join(format!("discharge-{name}-{}", std::process::id()));
@@ -1909,12 +1931,31 @@ fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
         .find(|(n, _)| n == name)
         .map(|(_, o)| o);
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(
-        o.is_some() || report.missing.iter().any(|m| m == name) || !src.contains("///"),
-        "`{name}` was dropped from the report: it has a contract but no outcome, so this test \
-         would have passed without checking anything"
-    );
+    assert_not_dropped(name, src, o.is_some(), &report.missing);
     o
+}
+
+/// A contracted function the frontend dropped is a failure, even when the report
+/// names it in `missing`.
+///
+/// `missing` is the drop reported from the frontend's side, and accepting it as a
+/// pass reopened the hole the strict helper exists to close: a test whose function
+/// the frontend drops -- for any reason, including one a future bug adds -- would
+/// assert nothing. The guard must reject the `missing` case, which is what this
+/// pins without needing a nightly `rustc`.
+#[test]
+#[should_panic(expected = "was dropped")]
+fn a_dropped_contracted_function_fails_even_when_missing_names_it() {
+    assert_not_dropped("ghost", "/// ensures: true\npub fn ghost() {}", false, &["ghost".to_string()]);
+}
+
+/// The guard is not a blanket refusal: a function present in the report passes,
+/// and so does a source with no contract at all (which is a caller mistake, not a
+/// frontend drop).
+#[test]
+fn a_present_function_passes_the_drop_guard() {
+    assert_not_dropped("f", "/// ensures: true\npub fn f() {}", true, &[]);
+    assert_not_dropped("f", "pub fn f() {}", false, &[]);
 }
 
 /// An element write must reach the store a *symbolic* read consults.
@@ -3481,4 +3522,55 @@ fn a_complement_fold_widening_is_refused_but_masks_and_shifts_read() {
         let o = outcome(&report, name);
         assert!(o.is_verified(), "{name} is a valid contract and must verify, got: {o}");
     }
+}
+
+/// A `u128`-suffixed literal is *refused*, not panicked.
+///
+/// The suffix records width 128, and the range check that guards the literal
+/// computes `1u128 << w`. At `w == 128` that shift panics in a debug build (it
+/// wraps to a wrong `max` in release, which then lets a 128-bit literal reach
+/// `smt::word` -- itself an assertion). The refusal has to come *before* the
+/// shift. The two literals here are both small, so the value is not the problem;
+/// the *type* is. This pins that the reader reports the function as skipped
+/// instead of taking the run down, which is what a panic does.
+#[test]
+fn a_u128_suffix_literal_is_refused_not_panicked() {
+    let src = "/// requires: true\n/// ensures: 0u128 == 0u128\n\
+               pub fn f(x: u8) -> u8 { x }";
+    let Some(o) = verify_src("f", src) else { return };
+    let FnOutcome::Skipped { reason } = o else {
+        panic!("a `u128`-suffixed literal must be refused, got: {o}");
+    };
+    assert!(
+        reason.contains("128") && reason.contains("64-bit"),
+        "the refusal should name the width and the engine limit, got: {reason}"
+    );
+}
+
+/// A *symbolic* masked operand keeps its type, so a signed/unsigned pairing is
+/// refused rather than given a signed reading.
+///
+/// `x & 128` for a `u8` is a `u8`; masking does not change its operand's type.
+/// Marking the result untyped (`Sign::Literal`) let `refuse_mixed_signedness`
+/// accept `(x & 128) == y` for a signed `y` -- a pairing rustc rejects (E0308) --
+/// and decide it as a signed comparison. The contract must be refused, and the
+/// valid *constant* mask (`(!0 & 1)`, width-independent) must still read.
+#[test]
+fn a_symbolic_mask_keeps_its_type_but_a_constant_mask_still_widens() {
+    let Some(report) = verify_realistic(&[
+        "contract_symbolic_mask_keeps_its_type",
+        "contract_complement_mask_widens_exactly",
+    ]) else {
+        return;
+    };
+    let o = outcome(&report, "contract_symbolic_mask_keeps_its_type");
+    assert!(
+        !o.is_verified(),
+        "`(x & 128) == y` pairs a `u8` with an `i8` and must be refused, got: {o}"
+    );
+    let o = outcome(&report, "contract_complement_mask_widens_exactly");
+    assert!(
+        o.is_verified(),
+        "a constant width-independent mask still widens and must verify, got: {o}"
+    );
 }
