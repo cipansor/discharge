@@ -1403,6 +1403,13 @@ because that is the type Rust infers for it — but the reader holds a complemen
 a `u16` is `65535`, not `255`). So an opaque widening is **refused** rather than guessed;
 a *fold* is a value, not a bit pattern, and still widens exactly.
 
+A numeric literal's **type suffix is kept**: `0u8` is unsigned, so `-1 <= 0u8` is an
+error (a `u8` cannot be negated) and is refused rather than silently read as a signed
+comparison. Dropping the suffix left `0u8` indistinguishable from a bare `0`, so a
+mismatched constant pair was decided; the refusal now covers a signed constant meeting
+an unsigned operand whether the other side is a name or another constant. Valid pairs
+(`-1i8 <= 0i8`, `-1 <= 255`) still read.
+
 A struct or enum whose body closes on its declaration line is read from that line,
 not by opening a cursor. `pub struct B { pub lo: u8 }` used to leave a field cursor
 open with no closing brace left to read, so every following line — the `///`

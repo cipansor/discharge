@@ -1534,7 +1534,15 @@ struct Parser<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Tok {
     Ident(String),
-    Num(u64),
+    /// A numeric literal, with the signedness of its type suffix if it has one.
+    ///
+    /// `0u8` is *unsigned* and `0i8` is *signed*: rustc gives the literal that
+    /// type, so `-1 <= 0u8` is `E0277` (a `u8` cannot be negated) rather than a
+    /// signed comparison. Dropping the suffix left the reader no way to tell
+    /// `0u8` from a bare `0`, so a mismatched constant pair was read as signed and
+    /// an invalid program was silently decided. A bare literal has no suffix and
+    /// stays untyped (`None`).
+    Num(u64, Option<bool>),
     /// A numeric literal the tokenizer could not read *exactly* -- a digit that
     /// is invalid for its radix, or a value past `u64`.
     ///
@@ -1586,6 +1594,8 @@ fn tokenize(s: &str) -> Vec<Tok> {
             // digits is a separator; the run stops at anything else, which is how a
             // type suffix (`100u32`) is left for the loop below.
             let mut digits = String::new();
+            // The signedness of the literal's type suffix, if it has one.
+            let mut suffix: Option<bool> = None;
             while i < b.len() && (b[i].is_digit(radix) || b[i] == '_') {
                 if b[i] != '_' {
                     digits.push(b[i]);
@@ -1621,6 +1631,12 @@ fn tokenize(s: &str) -> Vec<Tok> {
                     out.push(Tok::BadNum);
                     continue;
                 }
+                // The suffix is the literal's *type*, so it is what makes `0u8`
+                // unsigned. It is recorded rather than dropped: dropping it left a
+                // mismatched constant pair (`-1 <= 0u8`) with no unsigned side to
+                // see, so it was read as a signed comparison and an invalid program
+                // was silently decided.
+                suffix = Some(sfx.starts_with('i'));
             }
             // Anything the run did not consume is a malformed literal: a digit not
             // valid for the radix (`0b12`, `0o9`), or a value past `u64`. Refuse
@@ -1633,7 +1649,7 @@ fn tokenize(s: &str) -> Vec<Tok> {
                 u64::from_str_radix(&digits, radix).ok()
             };
             match (exact, val) {
-                (true, Some(v)) => out.push(Tok::Num(v)),
+                (true, Some(v)) => out.push(Tok::Num(v, suffix)),
                 _ => out.push(Tok::BadNum),
             }
             continue;
@@ -1848,14 +1864,16 @@ impl<'a> Parser<'a> {
         if !lconst && !rconst {
             return Err(self.err("operands of different signedness cannot be combined"));
         }
-        // One side is a signed constant and the other an unsigned name.
-        let mixed = (rb && !lb && rconst && !lconst) || (lb && !rb && lconst && !rconst);
-        if mixed {
-            return Err(self.err(
-                "a signed constant cannot be combined with an unsigned operand",
-            ));
-        }
-        Ok(())
+        // At least one side is a constant, and the signs differ. rustc rejects the
+        // pairing whether the other side is a name (`-1 > x` for a `u8`) or another
+        // constant (`-1 > 0u8`, `-1i8 == 0u8`): a signed constant cannot adopt the
+        // unsigned operand's type. The both-constants case used to fall through --
+        // the earlier check required exactly *one* constant -- and was read as a
+        // *signed* comparison, silently deciding an invalid program (`-1 <= 0u8`
+        // "verified" as `-1 <= 0`).
+        Err(self.err(
+            "a signed constant cannot be combined with an unsigned operand",
+        ))
     }
 
     /// The value a constant *denotes*, at its own width.
@@ -2579,7 +2597,7 @@ impl<'a> Parser<'a> {
 
     fn parse_atom(&mut self) -> Result<(Var, Sign), SpecError> {
         match self.peek().cloned() {
-            Some(Tok::Num(n)) => {
+            Some(Tok::Num(n, suffix)) => {
                 self.pos += 1;
                 // A literal is built wide enough to *hold* its own value, and at
                 // least as wide as the widest name in scope. Both halves matter:
@@ -2601,9 +2619,18 @@ impl<'a> Parser<'a> {
                     .max()
                     .unwrap_or(64);
                 let w = scope.max(need).min(64);
-                // A bare literal is *untyped* and non-negative: its value is
-                // unambiguous, but its signedness is not yet known.
-                Ok((smt::word(n, w), Sign::Literal))
+                // A *suffixed* literal (`0u8`, `-1i16`) carries the sign of the
+                // type its suffix names: rustc gives the literal that type, so
+                // `-1 <= 0u8` is an error (a `u8` cannot be negated), and the
+                // reader must see the unsigned side to refuse it. A *bare* literal
+                // is untyped and non-negative: its value is unambiguous, but its
+                // signedness is not yet known.
+                let sign = match suffix {
+                    Some(true) => Sign::Signed,
+                    Some(false) => Sign::Unsigned,
+                    None => Sign::Literal,
+                };
+                Ok((smt::word(n, w), sign))
             }
             Some(Tok::Ident(name)) => {
                 self.pos += 1;
@@ -3940,6 +3967,40 @@ mod tests {
                 "`x {op} 1` for a `u8` is legal and must still read"
             );
         }
+    }
+
+    /// A *suffixed* literal carries its type's signedness, so a mismatched
+    /// constant pair is refused instead of silently read as signed.
+    ///
+    /// `0u8` is unsigned, so `-1 <= 0u8` is `E0277` (a `u8` cannot be negated).
+    /// The tokenizer used to *drop* the suffix, leaving the reader no way to tell
+    /// `0u8` from a bare `0`; the pair then had no unsigned side to see, the
+    /// both-constant branch of `refuse_mixed_signedness` was not reached (it
+    /// required exactly *one* constant), and the comparison was read as *signed*
+    /// and silently decided -- `ensures: -1 <= 0u8` "verified" as `-1 <= 0`. The
+    /// suffix is now kept, so the unsigned side is visible and the shape is refused.
+    #[test]
+    fn a_suffixed_literal_carries_its_type_signedness() {
+        let args = BTreeMap::new();
+        let signed = BTreeSet::new();
+        let parses = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            p.parse_or().is_ok()
+        };
+        // Two constants of different signedness: each is an error, not a decision.
+        assert!(!parses("-1 == 0u8"), "`-1 == 0u8` is `E0277` and must be refused");
+        assert!(!parses("-1 <= 0u8"), "`-1 <= 0u8` is `E0277` and must be refused");
+        assert!(!parses("-1 < 0u8"), "`-1 < 0u8` is `E0277` and must be refused");
+        assert!(!parses("0u8 > -1"), "`0u8 > -1` is `E0277` and must be refused");
+        assert!(!parses("-1i8 == 0u8"), "`-1i8 == 0u8` is `E0308` and must be refused");
+        assert!(!parses("-1i16 == 65535u16"), "`-1i16 == 65535u16` must be refused");
+        // The valid pairs still read: two constants of the *same* signedness, a
+        // bare literal (untyped) against either, and a signed pair.
+        assert!(parses("-1 <= 0"), "`-1 <= 0` is legal and must read");
+        assert!(parses("-1i8 <= 0i8"), "`-1i8 <= 0i8` is legal and must read");
+        assert!(parses("0u8 <= 255u8"), "`0u8 <= 255u8` is legal and must read");
+        assert!(parses("-1 <= 255"), "a bare literal adopts the signed side and reads");
+        assert!(parses("255u8 == 255"), "a bare literal adopts the unsigned side");
     }
 
     /// A `!`-complement of a literal is refused where its sign would change the

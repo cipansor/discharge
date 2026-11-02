@@ -3627,6 +3627,32 @@ FAILs; the two `contract_opaque_widened_*_is_refused` entries must not verify;
 *both* false proofs back (`verified` on a Rust-false equality). Coverage
 **137/237 → 138/240**; test-count **528 → 530**. Gate green.
 
+## A suffixed literal keeps its type — the mismatched constant pair that was decided
+
+The tokenizer *dropped* a numeric literal's type suffix: `0u8` and `0` became the same
+`Tok::Num(0)`. The reader therefore could not see that `0u8` is unsigned, and a
+comparison of two constants of different signedness had no unsigned side to refuse.
+
+`refuse_mixed_signedness` refuses a signed constant against an unsigned operand, but its
+`mixed` clause required *exactly one* side to be a constant — the case of a signed
+constant meeting an unsigned *name* (`x == -1` for a `u8`). Two *constants*
+(`-1 <= 0u8`) fell through the clause and were read as a **signed** comparison and
+silently decided. `-1 <= 0u8` is `E0277` in Rust (a `u8` cannot be negated), yet the
+reader *verified* `ensures: -1 <= 0u8` by reading it as `-1 <= 0`. A whole family
+followed: `-1 == 0u8`, `-1 < 0u8`, `0u8 > -1`, `-1i8 == 0u8`, `-1 <= (0u8 + 0u8)`.
+
+The suffix is now kept as the literal's signedness (`Tok::Num(u64, Option<bool>)`), so
+the unsigned side is visible, and the refusal covers the both-constants case — a signed
+constant cannot adopt an unsigned operand's type whether the other side is a name or a
+constant. Valid pairs still read: two constants of the same signedness (`-1i8 <= 0i8`),
+a bare literal against either (`-1 <= 255`, `255u8 == 255`), and the ordinary cases.
+
+**Evidence.** Unit test `a_suffixed_literal_carries_its_type_signedness` (the invalid
+pairs refused, the valid ones read). Sensitivity: dropping the suffix again makes
+`-1 == 0u8` and its siblings silently decided and fails the test. Test-count
+**530 → 531**; corpus coverage unchanged at **138/240** (the shape is invalid Rust and
+cannot live in the compiled corpus). Gate green.
+
 ## Toolchain — edition 2024 and the MSRV floor (1.85)
 
 Both manifests are **edition 2024** with `rust-version = "1.85"`. The two numbers
