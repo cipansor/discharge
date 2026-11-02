@@ -847,6 +847,35 @@ pub fn contract_literal_widened_to_signed_tripwire(x: u8) -> u8 {
     x
 }
 
+/// The soundness tripwire for an *untyped* (opaque) constant widened to an
+/// unsigned operand.
+///
+/// A complement's value is taken at the *operand's* width, but the reader holds it
+/// at the *scope's*. `!0` against a `u16` is `65535`, so `(x as u16 + !0) == 255`
+/// is false in Rust; the reader held `255` and zero-extended it, and *verified* the
+/// equality -- a false proof. The shape is refused, so this must not verify.
+/// requires: x == 0
+/// ensures: (x as u16 + !0) == 255
+pub fn contract_opaque_widened_to_unsigned_is_refused(x: u8) -> u8 {
+    x
+}
+
+/// The signed counterpart, which fails the same way when the literal's top bit is
+/// clear: `!128` against an `i16` is `-129`, not `127`. Also refused.
+/// requires: x == 0
+/// ensures: (x as i16 + !128) == 127
+pub fn contract_opaque_widened_to_signed_is_refused(x: u8) -> u8 {
+    x
+}
+
+/// The control: a *fold* (`200 + 100` = `300`) is a value, not a width-dependent
+/// bit pattern, so it widens into a `u16` exactly and must verify.
+/// requires: x <= 100
+/// ensures: (x as u16) <= 200 + 100
+pub fn contract_fold_widens_to_unsigned_reads(x: u8) -> u8 {
+    x
+}
+
 /// A comparison of a *signed* array element is a signed comparison.
 ///
 /// This is the element-side counterpart of the `const 0_i8` case. The element's

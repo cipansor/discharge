@@ -1390,12 +1390,18 @@ Unary `-` on an unsigned operand is refused as well: `-x` for a `u8` is `E0600`,
 the reader's `0 - x` is a value Rust never produces. A signed name, and a bare literal
 (Rust defaults it to a signed `i32`), still negate and read.
 
-A constant widened to meet a wider operand fills from its **own** signedness, not the
-operand's. A bare literal is non-negative and zero-extends, so `(x as i16) == 255` for
-a `u8` `x` is true — the same as Rust's `(255u8 as i16)`. Filling from the signed
-operand instead sign-extended the `255` to `65535` and *refuted* a postcondition Rust
-accepts (a false refutation). A signed constant keeps sign-extending, so `-1 as i32`
-is still `-1`.
+A constant widened to meet a wider operand fills from the value it **denotes**, not
+blindly from the operand's sign. A bare literal is non-negative and zero-extends, so
+`(x as i16) == 255` for a `u8` `x` is true — the same as Rust's `(255u8 as i16)`.
+Filling from the signed operand instead sign-extended the `255` to `65535` and
+*refuted* a postcondition Rust accepts (a false refutation). A typed signed constant
+keeps sign-extending, so `-1 as i32` is still `-1`.
+
+An *opaque* constant (`!0`, a fold of untyped operands) takes the operand's sign,
+because that is the type Rust infers for it — but the reader holds a complement at the
+*scope's* width, and no extension of that recovers the operand-width value (`!0` against
+a `u16` is `65535`, not `255`). So an opaque widening is **refused** rather than guessed;
+a *fold* is a value, not a bit pattern, and still widens exactly.
 
 A struct or enum whose body closes on its declaration line is read from that line,
 not by opening a cursor. `pub struct B { pub lo: u8 }` used to leave a field cursor

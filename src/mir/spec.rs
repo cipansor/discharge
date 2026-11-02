@@ -1976,7 +1976,6 @@ impl<'a> Parser<'a> {
             return Err(self
                 .err("a constant expression is wider than the engine's 64-bit words"));
         }
-        let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
         // The widened result keeps a *typed* operand's sign. With two untyped
         // operands there is no type to recover, and a widened fold (`!0 + 1`, or
         // any sum that left the width) is sign-ambiguous, so it is `Opaque`.
@@ -1987,6 +1986,15 @@ impl<'a> Parser<'a> {
         } else {
             Sign::Opaque
         };
+        // An `Opaque` fold is a *value*, not a width-dependent bit pattern: the
+        // arithmetic already produced the exact result. Emit it at the engine's
+        // full width so a later resize *truncates* (which is exact) rather than
+        // *widens* (where the fill would have to guess, and `200 + 100` would be
+        // refused as if it were a complement). A complement (`!0`) is not folded
+        // here; it stays at its scope width, where the top bit is meaningful, and
+        // `resize_const` handles it.
+        let width = if out == Sign::Opaque { 64 } else { width };
+        let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
         Ok(Some((smt::word(r as u64 & mask, width), out)))
     }
 
@@ -2004,21 +2012,30 @@ impl<'a> Parser<'a> {
     /// pattern `0x80` and mean different things. Without the distinction, `128`
     /// meeting an `i8` was accepted as the bit pattern for `-128`, so `x <= 128`
     /// was read as `x <= -128` -- a wrong value, and a false proof (`ensures: x !=
-    /// 127` "held"). `own_signed` tells the two apart: a non-negative literal is
-    /// checked as `+val`, a signed one as its two's-complement value.
+    /// 127` "held"). The constant's `Sign` tells the two apart: a non-negative
+    /// literal is checked as `+val`, a signed one as its two's-complement value, and
+    /// an *opaque* one (`!0`) takes the operand's sign, which is the type Rust infers
+    /// for it.
     fn resize_const(
         &self,
         v: Var,
         wide: u8,
         signed: bool,
-        own_signed: bool,
+        own: Sign,
     ) -> Result<Var, SpecError> {
         let w = smt::bits(v);
         let val = self.const_value(v).expect("resize_const is only called on a constant");
+        // An *opaque* constant (the complement of a literal, or a fold) has no type
+        // of its own: Rust infers it from the operand it meets, so `!0` is `-1`
+        // against an `i16` and `65535` against a `u16`. That is exactly the operand's
+        // sign, `signed`. A *typed* constant -- a bare literal (non-negative) or a
+        // signed bound/negation (two's-complement) -- has its own, and that is what
+        // decides whether it fills or sign-extends.
+        let effective_signed = if own == Sign::Opaque { signed } else { own.eval() };
         // The value the constant denotes, at its own width. A literal written
         // without a type is non-negative; a signed bound or a negation is its
         // two's-complement value.
-        let sval: i128 = if own_signed {
+        let sval: i128 = if effective_signed {
             if w >= 64 {
                 val as i64 as i128
             } else if val & (1u64 << (w - 1)) != 0 {
@@ -2040,10 +2057,27 @@ impl<'a> Parser<'a> {
             // Report the value as written: a signed constant (`-129`, `i8::MIN`)
             // reads as its negative value, not the two's-complement bit pattern,
             // so the message names the number the contract author wrote.
-            let shown: i128 = if own_signed { sval } else { val as i128 };
+            let shown: i128 = if effective_signed { sval } else { val as i128 };
             return Err(self.err(format!(
                 "literal {shown} does not fit the operand's {wide}-bit width"
             )));
+        }
+        // An *opaque* constant widened to a wider operand cannot be modelled: its
+        // value is the complement of a literal taken at the *operand's* width, but
+        // the reader holds that complement at the *scope's* width, and no fixed
+        // extension of it recovers the operand-width result. `!0` against a `u16` is
+        // `65535` where the reader holds `255` and zero-extends -- `ensures: (x as
+        // u16 + !0) == 255` was *verified* for a value Rust calls `65535`, a false
+        // proof. The signed case fails the same way when the literal's top bit is
+        // clear: `!128` against an `i16` is `-129`, but the reader holds `0x7F` and
+        // sign-extends it to `127`, *verifying* `ensures: (x as i16 + !128) == 127`.
+        // Only a complement whose top bit is set (`!0`) happens to survive, and that
+        // is not worth a special case, so the widening is refused outright.
+        if wide > w && own == Sign::Opaque {
+            return Err(self.err(
+                "a widening of an untyped constant is not modelled: the complement is taken at \
+                 the operand's width, not the scope's",
+            ));
         }
         // Truncate rather than rebuild from `val`. A negative literal is the bit
         // pattern `2^w - 10` at its *source* width, so `word(val, wide)` would be
@@ -2052,15 +2086,20 @@ impl<'a> Parser<'a> {
         // takes the low `wide` bits, which is the same bit pattern the value
         // denotes, and the `fits` check above is what keeps it from being silent.
         //
-        // How a *widened* constant fills the new high bits is decided by the
-        // constant's *own* signedness (`own_signed`), not by the operand it meets
-        // (`signed`). A bare literal is non-negative, so it zero-extends: Rust's
-        // `(255u8 as i16) == 255` is *true*, and filling from `signed` instead
-        // sign-extended the `255` to `65535`, so the reader refuted a postcondition
-        // Rust accepts -- a false refutation, the mirror of a false proof. A signed
-        // constant (`-1`, a `MIN` bound) keeps its value by sign-extending.
+        // How a *widened* constant fills the new high bits follows the value it
+        // *denotes*, which is `effective_signed`. A bare literal is non-negative, so
+        // it zero-extends: Rust's `(255u8 as i16) == 255` is *true*, and filling
+        // from the operand's sign instead sign-extended the `255` to `65535` and
+        // *refuted* a postcondition Rust accepts -- a false refutation, the mirror
+        // of a false proof. A typed signed constant (`-1`, a `MIN` bound)
+        // sign-extends. An opaque constant never reaches here: its widening is
+        // refused above.
         if wide >= w {
-            Ok(if own_signed && wide > w { smt::sign_extend(v, wide) } else { smt::word(val, wide) })
+            Ok(if effective_signed && wide > w {
+                smt::sign_extend(v, wide)
+            } else {
+                smt::word(val, wide)
+            })
         } else {
             Ok(smt::truncate(v, wide))
         }
@@ -2087,7 +2126,6 @@ impl<'a> Parser<'a> {
         sb: Sign,
         signed: Sign,
     ) -> Result<(Var, Var), SpecError> {
-        let (sa, sb) = (sa.eval(), sb.eval());
         let signed = signed.eval();
         let (wa, wb) = (smt::bits(a), smt::bits(b));
         match (self.const_value(a), self.const_value(b)) {
@@ -3468,6 +3506,37 @@ mod tests {
         assert_eq!(eval_const("255 as i32"), 255, "a bare literal zero-fills");
         // A *signed* constant must still sign-extend: `-1 as i32` is all ones.
         assert_eq!(eval_const("-1 as i32"), u32::MAX as u64, "a signed constant sign-extends");
+    }
+
+    /// An *opaque* constant is refused where a widening would have to guess its
+    /// value, and a *fold* is not, so the refusal is not over-broad.
+    ///
+    /// A complement's value is the complement of a literal at the *operand's*
+    /// width, but the reader holds it at the *scope's* width. `!0` against a `u16`
+    /// is `65535`; the reader held `255` and zero-extended it, and *verified*
+    /// `ensures: (x as u16 + !0) == 255` -- a false proof. The signed case fails
+    /// the same way when the literal's top bit is clear: `!128` against an `i16` is
+    /// `-129`, but `0x7F` sign-extends to `127`, *verifying* `== 127`. Both are
+    /// refused. A *fold* (`200 + 100`) is a value, not a bit pattern, and is emitted
+    /// at full width so it *truncates* to the operand exactly -- it must still read.
+    #[test]
+    fn an_opaque_constant_widening_is_refused_but_a_fold_is_not() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::var(8));
+        let unsigned = BTreeSet::new();
+        let parses = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            p.parse_or().is_ok()
+        };
+        // A widening that would have to guess a complement's operand-width value.
+        assert!(!parses("(x as u16 + !0) == 255"), "`!0` against a `u16` is `65535`");
+        assert!(!parses("(x as u16 + !0) == 65535"), "the reader cannot model it either way");
+        assert!(!parses("(x as i16 + !128) == 127"), "`!128` against an `i16` is `-129`");
+        // A fold is a value and still reads, even into a wider operand.
+        assert!(parses("x as u16 <= 200 + 100"), "`300` is a value, not a bit pattern");
+        assert!(parses("x <= 100 + 44"), "a fold that fits its operand still reads");
+        // The complement at its *own* width is fine, and the literal zero-extends.
+        assert!(parses("(x as i16) == 255"), "a bare literal zero-extends");
     }
 
     /// Unary `-` binds *tighter* than `as`, so `-x as u8` is `(-x) as u8` and its

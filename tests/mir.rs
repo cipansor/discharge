@@ -3393,3 +3393,35 @@ fn a_literal_widened_to_a_signed_operand_zero_fills() {
     let o = outcome(&report, "contract_literal_widened_to_signed_tripwire");
     assert!(matches!(o, FnOutcome::Failed { .. }), "`254` is neither reading and must FAIL, got: {o}");
 }
+
+/// An *opaque* constant (a complement) widened to a wider operand is refused, and
+/// a *fold* is not.
+///
+/// A complement is taken at the *operand's* width, but the reader holds it at the
+/// *scope's*. `!0` against a `u16` is `65535`, so `(x as u16 + !0) == 255` is false
+/// in Rust; the reader held `255` and zero-extended it, and *verified* the equality
+/// -- a false proof. The signed case fails the same way when the literal's top bit
+/// is clear (`!128` against an `i16` is `-129`, not `127`). Both are refused. A
+/// *fold* (`200 + 100`) is a value and must still verify.
+#[test]
+fn an_opaque_widening_is_refused_but_a_fold_widens() {
+    let Some(report) = verify_realistic(&[
+        "contract_opaque_widened_to_unsigned_is_refused",
+        "contract_opaque_widened_to_signed_is_refused",
+        "contract_fold_widens_to_unsigned_reads",
+    ]) else {
+        return;
+    };
+    for name in [
+        "contract_opaque_widened_to_unsigned_is_refused",
+        "contract_opaque_widened_to_signed_is_refused",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            !o.is_verified(),
+            "{name} must not verify -- the reader cannot model the complement at the operand width, got: {o}"
+        );
+    }
+    let o = outcome(&report, "contract_fold_widens_to_unsigned_reads");
+    assert!(o.is_verified(), "a fold widens exactly and must verify, got: {o}");
+}

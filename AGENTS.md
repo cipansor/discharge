@@ -3578,17 +3578,20 @@ with a tripwire (`contract_unsigned_negation_is_refused`) and a signed control
 tripwire is `verified` and the test fails. Coverage **135/233 to 136/235**;
 test-count **526**.
 
-## A widened literal zero-fills — the false *refutation* the operand's sign caused
+## A widened constant fills from the value it *denotes* — the false refutation, and the false proof it hid
 
-`resize_const` decides how a widened constant fills its new high bits. It filled from
-the **operand it meets** (`signed`), not from the **constant's own** signedness
-(`own_signed`). For a bare literal that is wrong, and wrong in the *refuting*
-direction.
+`resize_const` decides how a widened constant fills its new high bits. The fill has to
+follow the value the constant **denotes**, and that is a three-way question the model
+already answers with `Sign`: a bare literal is non-negative (zero-extend), a typed
+signed constant is two's-complement (sign-extend), and an **opaque** constant (`!0`, a
+fold) takes the **operand's** sign, because that is the type Rust infers for it.
 
-Rust's `(255u8 as i16)` is `255` — the `u8` zero-extends into the `i16`. So
-`ensures: (x as i16) == 255` holds for every `u8` `x`. The reader sign-extended the
-literal `255` to the signed `i16` operand, got `65535`, and **refuted** a
-postcondition Rust accepts:
+Two opposite failures lived in the one line that decided this.
+
+**The false *refutation*.** Filling from the operand's sign (`signed`) instead of the
+constant's own made a bare literal sign-extend. Rust's `(255u8 as i16)` is `255`, so
+`ensures: (x as i16) == 255` holds for every `u8` `x`; the reader sign-extended the
+literal to `65535` and **refuted** it:
 
 ```
 /// requires: x == 255
@@ -3600,17 +3603,29 @@ pub fn f(x: u8) -> u8 { x }
 f    FAILED   postcondition — v1:u8 = 255     <-- false refutation
 ```
 
-The mirror of the false proofs above: a verifier that is *unsound* is one failure, but
-one that rejects valid programs is the other, and this is the second kind. The fill is
-now `own_signed` — a bare literal zero-extends, a signed constant (`-1`, an `i8::MIN`
-bound) keeps sign-extending, so the signed-widening cases are unchanged.
+**The false *proof* it hid.** Switching the fill to the constant's own sign fixed the
+literal, but an *opaque* constant is exactly the case where the operand's sign is the
+right one: Rust infers `!0` as the operand's type, so `!0` against a `u16` is `65535`.
+Holding it at the scope's width (`255`) and zero-extending *verified*
+`ensures: (x as u16 + !0) == 255` for a value Rust calls `65535`. The signed case fails
+the same way whenever the literal's top bit is clear: `!128` against an `i16` is `-129`,
+but `0x7F` sign-extends to `127` and *verified* `== 127`. Only a complement whose top
+bit is set (`!0`) happens to survive sign-extension, and that is not worth a special
+case, so an opaque widening is **refused outright**.
 
-**Evidence.** Unit test `a_literal_widened_to_a_signed_operand_zero_fills` (the
-predicate at `x == 255` is true; `255 as i32` is `255`; `-1 as i32` is all ones), a
-corpus test with a control (`contract_literal_widened_to_signed_zero_fills` verifies,
-`..._tripwire` for `254` FAILs). Sensitivity: reverting to `signed && wide > w` brings
-the tripwire back to `FAILED` on a Rust-true postcondition and fails both tests.
-Coverage **136/235 to 137/237**; test-count **526 to 528**. Gate green.
+**A fold is not opaque.** `200 + 100` is a *value*, not a width-dependent bit pattern,
+so a fold is emitted at the engine's full width and a later resize *truncates* it to the
+operand exactly — `x as u16 <= 200 + 100` still reads. The refusal is therefore narrow:
+only a complement held at the wrong width.
+
+**Evidence.** Unit tests `a_literal_widened_to_a_signed_operand_zero_fills` and
+`an_opaque_constant_widening_is_refused_but_a_fold_is_not`; corpus tests with controls
+(`contract_literal_widened_to_signed_zero_fills` verifies, `..._tripwire` for `254`
+FAILs; the two `contract_opaque_widened_*_is_refused` entries must not verify;
+`contract_fold_widens_to_unsigned_reads` verifies). Sensitivity: reverting the fill to
+`signed && wide > w` brings the false refutation back, and deleting the refusal brings
+*both* false proofs back (`verified` on a Rust-false equality). Coverage
+**137/237 → 138/240**; test-count **528 → 530**. Gate green.
 
 ## Toolchain — edition 2024 and the MSRV floor (1.85)
 
