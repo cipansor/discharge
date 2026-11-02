@@ -2059,16 +2059,36 @@ impl<'a> Parser<'a> {
         } else if sa == Sign::Unsigned || sb == Sign::Unsigned {
             Sign::Unsigned
         } else if sa == Sign::Opaque || sb == Sign::Opaque {
-            Sign::Opaque
+            // An untyped fold whose exact result does not fit the operand width:
+            // `!0 + 1` is `256` at the scope's width, `!0 + 2` is `257`. Its value
+            // depends on the width Rust infers for it, and the reader learns that
+            // width only at the operator that consumes the fold. Carrying the
+            // scope-width value and letting `resize_const` truncate it later was a
+            // false proof: `(!0 + 1) < 1u8` *verified* (`0 < 1`) and
+            // `(!0 + 2) == 1u8` did too (`257` truncated to `1`), though rustc
+            // rejects both as an arithmetic overflow.
+            //
+            // A *signed* partner is no safer, so the refusal cannot be narrowed to
+            // the unsigned case: `(!0 + 200) == x` for an `i8` `x` *verified* with
+            // `x == -57` (the scope-width `!0` is `255`, `255 + 200` is `455`,
+            // truncated to an `i8`'s `-57`), and rustc rejects the fold as `literal
+            // out of range for i8`. The value is simply not known until the width
+            // is, so it is refused.
+            //
+            // Only the overflowing branch is reached here, so a fold that fits (a
+            // value that is the same at any width holding it, like `200 + 100`) is
+            // unaffected -- the control the corpus asserts still reads.
+            return Err(self.err(format!(
+                "a constant `{op}` of an untyped operand is width-dependent and overflows the \
+                 {w}-bit operand width, so its value is not known where it is read"
+            )));
         } else {
             Sign::Literal
         };
         // Emit at the narrowest width that holds the exact result, at the
-        // expression's own signedness. An `Opaque` result stays *narrow* on
-        // purpose: it is the operand-width value, so a later widening cannot
-        // recover it and must be refused rather than truncate a wrong number into
-        // place. (An earlier version emitted `Opaque` at 64, which made every
-        // later resize a truncation and disarmed that refusal.)
+        // expression's own signedness. A fold with a *typed* operand keeps that
+        // operand's type, so this is where its exact value lands. (An untyped
+        // `Opaque` fold was refused above, so it never reaches here.)
         let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
         Ok(Some((smt::word(r as u64 & mask, width), out)))
     }
@@ -3882,12 +3902,45 @@ mod tests {
             assert!(msg.contains("different widths"), "`{text}`: got {msg}");
         }
         // A bare literal, and a bare negation, have no width of their own and take
-        // the other operand's -- these are well-typed and must read. So does an
-        // untyped fold (`(!0 + 1)`, `Opaque`): like `!0` it has no type of its own,
-        // so it too is sized from the operand it meets.
-        for text in ["(x as i16) == 1", "-1 < (x as i16)", "-1 < x", "(!0 + 1) == x"] {
+        // the other operand's -- these are well-typed and must read. So does a
+        // width-independent untyped constant (`!0 & 1`, which is `1` at any width).
+        for text in ["(x as i16) == 1", "-1 < (x as i16)", "-1 < x", "(!0 & 1) == x"] {
             let mut p = Parser::new(text, &args, None, &signed, false);
             assert!(p.parse_or().is_ok(), "`{text}` infers its width and reads");
+        }
+    }
+
+    /// An untyped fold whose exact result *overflows* the operand width is refused,
+    /// while a fold that fits still reads.
+    ///
+    /// `!0 + 1` is `256` at the scope's width. Against an unsigned partner rustc
+    /// rejects it (`!0` is `255`, so `255 + 1` overflows), but the reader carried
+    /// the scope-width value and let a later resize truncate it, reading
+    /// `(!0 + 1) < 1u8` as `0 < 1` -- a *verified* contract for a program rustc
+    /// rejects. The fold's value depends on the width it is read at, so it is
+    /// refused. `200 + 100` is `300` at any width holding it, so it is
+    /// width-independent and still reads -- the control the refusal must not catch.
+    #[test]
+    fn an_untyped_fold_that_overflows_the_operand_width_is_refused() {
+        let mut args = BTreeMap::new();
+        args.insert("y".to_string(), smt::var(8));
+        args.insert("a".to_string(), smt::var(16));
+        let unsigned = BTreeSet::new();
+        let mut signed = BTreeSet::new();
+        signed.insert("y".to_string());
+        for text in ["(!0 + 1) < 1u8", "(!0 + 2) == 1u8", "(!0 + 1) <= y"] {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            let err = p.parse_or().expect_err("an overflowing untyped fold must be refused");
+            assert!(
+                format!("{err}").contains("width-dependent"),
+                "`{text}`: got {err}"
+            );
+        }
+        // A fold that *fits* the partner's width is a value, not a width-dependent
+        // bit pattern, and must still read.
+        for text in ["(200 + 100) <= a", "(200 + 100) == 300"] {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            assert!(p.parse_or().is_ok(), "`{text}` fits and reads");
         }
     }
 

@@ -909,6 +909,40 @@ pub fn contract_complement_fold_widening_is_refused(x: u8) -> u8 {
     x
 }
 
+/// An untyped fold that *overflows* the operand width is refused, not truncated
+/// into a verdict.
+///
+/// `!0 + 1` is `0` against an `i8` but is a rustc `arithmetic operation will
+/// overflow` error against a `u8` (`!0` is `255`). The reader held the fold at the
+/// scope's width (`256`) and truncated it to the `u8` partner's width, so
+/// `(!0 + 1) < 1u8` *verified* (`0 < 1`) for a program rustc rejects. The fold's
+/// value depends on the width it is read at, so it must be refused, not decided.
+/// requires: true
+/// ensures: (!0 + 1) < 1u8
+pub fn contract_untyped_fold_overflow_is_refused() -> u8 {
+    0
+}
+
+/// The equality form of the same shape: `(!0 + 2) == 1u8` was *verified* by
+/// truncating the fold's scope-width `257` to the `u8`'s `1`, again for a program
+/// rustc rejects as an overflow.
+/// requires: true
+/// ensures: (!0 + 2) == 1u8
+pub fn contract_untyped_fold_overflow_equality_is_refused() -> u8 {
+    0
+}
+
+/// The control: a fold that *fits* is width-independent and must still read.
+///
+/// `200 + 100` is `300` at any width holding it, so it widens exactly, and
+/// `(x as u16) <= 200 + 100` holds for every `u8` `x`. Refusing the overflow must
+/// not refuse this.
+/// requires: x <= 100
+/// ensures: (x as u16) <= 200 + 100
+pub fn contract_fitting_fold_still_reads(x: u8) -> u8 {
+    x
+}
+
 /// The valid control the same shape dropped: a complement *masked* to a value that
 /// does not depend on the width is width-independent, so it widens exactly.
 ///

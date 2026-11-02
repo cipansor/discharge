@@ -4773,17 +4773,60 @@ four refused shapes and three that must read — and a corpus test asserts the t
 `contract_bare_negation_meets_a_wider_operand`, which must verify. Test-count **542 →
 544**; corpus **144/252 → 145/255**. Gate green.
 
-**Still open, and named so it is not mistaken for fixed.** The same sweep shows five
-shapes where an *untyped fold that overflows at the partner's width* is still decided:
-`(!0 + 1) < 1u8` (and four like it) is a rustc `arithmetic operation will overflow` error,
-because `!0` is `-1` and `-1 + 1` at a `u8` is `0`, not the `256` the reader holds at the
-scope's width. That is a *different* axis from this fix — the fold's value is wrong at the
-width a typed operand forces, not its type erased — and it was already decided before this
-change (the five are a subset of the parent's 26). Fixing it needs the fold to range-check
-its result at the partner's width, which the `Opaque`-stays-narrow design deliberately
-defers; it is left for its own change rather than folded into this one.
+**Followed up.** The five untyped-fold shapes named below as still open were the *next*
+axis, and the change after this one closes them; see "An untyped fold that overflows its
+operand width is refused" below. The `Opaque` state this fix introduced is what made the
+follow-up small: the fold was already carried untyped, so the overflow only had to be
+*recognised* at the fold, not re-modelled.
 
 The lesson: signedness was never the whole type. The earlier fixes asked "same
 signedness?" and the sweep asked the *pair* of questions rustc asks — same signedness
 **and** same width — and only the second found this. When a gate models one axis of a
 type, sweep the other axis too.
+
+## An untyped fold that overflows its operand width is refused
+
+The width sweep above left five shapes decided that rustc rejects, all one family: an
+*untyped fold* whose exact value does not fit the operand width. `(!0 + 1) < 1u8` was
+**verified**. In Rust `!0` is a `u8` `255` there, so `255 + 1` is a rustc `arithmetic
+operation will overflow` error; the reader held the fold at the *scope's* width (`256`)
+and let a later resize truncate it to the `u8` partner's width, reading `0 < 1`. The
+equality `(!0 + 2) == 1u8` was verified the same way (`257` truncated to `1`).
+
+This is a *different* axis from the width fix. There the fold's *type* was erased and
+resized; here the type is genuinely untyped — a fold of untyped operands has no type of
+its own — and the bug is that the fold's *value* depends on the width it is later read at,
+which the reader does not know when it folds.
+
+The fix is a refusal, not a new value. `fold_const_arith` already computes the exact
+result and only reaches the widen-or-refuse branch when that result does **not** fit the
+operand width; an `Opaque` result there is exactly the width-dependent overflow, so it is
+refused rather than emitted as the scope-width value. A fold that *does* fit — `200 + 100`
+is `300` at any width holding it — never reaches the branch and still reads, which is the
+control the corpus pins.
+
+**Why not narrow the refusal to the unsigned case.** Every false proof the sweep found had
+an unsigned partner, so a rule that refused only unsigned consumers looked tempting. It is
+unsound. A *signed* partner is just as wrong: `(!0 + 200) == x` for an `i8` `x` was
+**verified** with `x == -57` (the scope-width `!0` is `255`, `255 + 200` is `455`,
+truncated to an `i8`'s `-57`), and rustc rejects the fold as `literal out of range for
+i8`. The fold's value is not known until its width is, whichever signedness that width
+has, so the refusal covers both. The cost is real — the wider sweep's completeness misses
+rise from **978** to **1626** of 13254, because the valid shapes `(!0 + 1) == x` for a
+signed `x` are now refused — but a refusal is a skipped function, not a wrong verdict.
+
+**Evidence.** The differential sweep was rewritten to read rustc's diagnostics as JSON, so
+a *warning* is never mistaken for an error and each error is attributed to its primary
+span (the earlier line-based parse counted warnings as errors and inflated the signed-case
+count). On the corrected harness the same 13254 shapes give **0** soundness holes, down
+from **40**. A unit test (`an_untyped_fold_that_overflows_the_operand_width_is_refused`)
+pins three refused shapes and two that must read; a corpus test asserts the tripwires
+`contract_untyped_fold_overflow_is_refused` and
+`contract_untyped_fold_overflow_equality_is_refused` are not decided against the control
+`contract_fitting_fold_still_reads`. Test-count **544 → 546**; corpus **145/255 →
+146/258**. Gate green.
+
+The lesson: a differential sweep is only as good as its oracle. Counting a compiler
+*warning* as a rejection made the fix look incomplete and sent the search after a
+narrower rule that would have re-opened the hole. Read the oracle's structured output, and
+attribute each diagnostic to the span it is really about.

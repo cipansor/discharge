@@ -3524,6 +3524,42 @@ fn a_complement_fold_widening_is_refused_but_masks_and_shifts_read() {
     }
 }
 
+/// An untyped fold that *overflows* the operand width is refused, while a fold
+/// that fits still reads.
+///
+/// `!0 + 1` is `256` at the scope's width; against a `u8` that is a rustc
+/// `arithmetic operation will overflow` error (`!0` is `255`), but the reader
+/// truncated the scope-width fold to the partner's width and read `(!0 + 1) < 1u8`
+/// as `0 < 1` -- *verified* for a program rustc rejects. `(!0 + 2) == 1u8` failed
+/// the same way (`257` truncated to `1`). Both must be refused. `200 + 100` is
+/// `300` at any width holding it, so it is width-independent and must still read.
+#[test]
+fn an_untyped_fold_overflow_is_refused_but_a_fitting_fold_reads() {
+    let Some(report) = verify_realistic(&[
+        "contract_untyped_fold_overflow_is_refused",
+        "contract_untyped_fold_overflow_equality_is_refused",
+        "contract_fitting_fold_still_reads",
+    ]) else {
+        return;
+    };
+    for name in [
+        "contract_untyped_fold_overflow_is_refused",
+        "contract_untyped_fold_overflow_equality_is_refused",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            !o.is_verified(),
+            "{name} folds an untyped constant into a value that overflows the operand width \
+             (`E0308`/overflow in Rust) and must be refused, got: {o}"
+        );
+    }
+    let o = outcome(&report, "contract_fitting_fold_still_reads");
+    assert!(
+        o.is_verified(),
+        "`200 + 100` is width-independent and must verify, got: {o}"
+    );
+}
+
 /// A `u128`-suffixed literal is *refused*, not panicked.
 ///
 /// The suffix records width 128, and the range check that guards the literal
