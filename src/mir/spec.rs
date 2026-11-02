@@ -1434,6 +1434,71 @@ pub fn eval_invariant(
     Ok(pred)
 }
 
+/// The signedness of a subexpression: signed, unsigned, or *not yet known*.
+///
+/// A bare literal has no type of its own -- Rust infers it from the operand it
+/// meets -- so reading it as either sign at the point it is parsed is a guess.
+/// The guess is harmless where signed and unsigned agree (`+`, `&`, `==`) but
+/// wrong where they do not (`>>`, `/`, `%`, an ordering comparison), and the
+/// wrong pick *discharged* `ensures: ret <= (!0 >> 1)` for an `i8` (a false
+/// proof: `!0 >> 1` is `127` unsigned and `-1` signed).
+///
+/// So an untyped operand is carried as `Literal` (a bare, non-negative literal,
+/// whose value is unambiguous) or `Opaque` (an untyped constant that is not a
+/// plain literal -- the complement of one, or a fold of untyped operands -- whose
+/// sign cannot be recovered). An untyped operand adopts the typed operand's sign
+/// at a bitwise or additive operator; a *sign-sensitive* operator (`>>`, `/`,
+/// `%`, an ordering comparison, a widening cast) refuses an `Opaque` operand
+/// rather than guessing, because the two readings disagree there.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Sign {
+    Signed,
+    Unsigned,
+    Literal,
+    Opaque,
+}
+
+impl Sign {
+    fn from_bool(b: bool) -> Sign {
+        if b {
+            Sign::Signed
+        } else {
+            Sign::Unsigned
+        }
+    }
+    /// The sign to *evaluate* with, for a `+ - * & | ^ <<` or `== !=`: signed and
+    /// unsigned agree there, so an untyped operand may take the other side's sign
+    /// (or unsigned, which is a literal's natural reading).
+    fn eval(self) -> bool {
+        self == Sign::Signed
+    }
+    /// The sign a *typed* operand forces on an untyped partner, if any.
+    fn typed(self) -> Option<bool> {
+        match self {
+            Sign::Signed => Some(true),
+            Sign::Unsigned => Some(false),
+            Sign::Literal | Sign::Opaque => None,
+        }
+    }
+    /// Resolve a pair: the typed operand's sign, or `None` when neither is typed.
+    fn resolve(a: Sign, b: Sign) -> Option<bool> {
+        a.typed().or_else(|| b.typed())
+    }
+    /// The sign of `a <op> b`: the typed operand's, or the untyped pair's own.
+    fn combine(a: Sign, b: Sign) -> Sign {
+        match Sign::resolve(a, b) {
+            Some(b) => Sign::from_bool(b),
+            None if a == Sign::Opaque || b == Sign::Opaque => Sign::Opaque,
+            None => Sign::Literal,
+        }
+    }
+    /// Is this a sign-*ambiguous* operand: an untyped constant that is not a bare
+    /// literal, so signed and unsigned readings of it differ?
+    fn ambiguous(self) -> bool {
+        self == Sign::Opaque
+    }
+}
+
 struct Parser<'a> {
     toks: Vec<Tok>,
     pos: usize,
@@ -1750,27 +1815,31 @@ impl<'a> Parser<'a> {
     ///
     /// Two *names* of different signedness are the same mistake. `a > b` for an
     /// `i8` and a `u8` is `E0308: mismatched types`, and the reader has to read it
-    /// as *some* sign. It picks signed (`ls || rs`), which is a real reading and
-    /// not a false proof, but it is a reading of a program rustc rejects -- so the
-    /// shape is refused rather than decided, the same answer as the constant case.
-    /// It also closes a semantic hole between this parser and the body: the body
-    /// reads each operand at *its own* signedness, so the contract and the body
-    /// could disagree about which of `a > b` or `ule(b, a)` is meant.
+    /// as *some* sign. It picks signed, which is a real reading and not a false
+    /// proof, but it is a reading of a program rustc rejects -- so the shape is
+    /// refused rather than decided, the same answer as the constant case. It also
+    /// closes a semantic hole between this parser and the body: the body reads each
+    /// operand at *its own* signedness, so the contract and the body could disagree
+    /// about which of `a > b` or `ule(b, a)` is meant.
     ///
-    /// The check is narrow. A bare literal is unsigned, so `0xFF` and `255` are
-    /// not this shape. Two constants are aligned and range-checked by
-    /// `align_widths`/`fold_const_arith` instead. And `x <= 127` for an `i8` is
-    /// legal with the constant on the *unsigned* side. Only a signed *constant*
-    /// against an unsigned *name*, or a signed *name* against an unsigned *name*,
+    /// The check is narrow. An *untyped* operand (a bare literal, or the complement
+    /// of one) is not this shape -- it adopts the typed operand's sign instead, and
+    /// is resolved by `Sign::combine`. Two constants are aligned and range-checked
+    /// by `align_widths`/`fold_const_arith`. Only a signed *typed* operand against
+    /// an unsigned *typed* operand, or a signed constant against an unsigned name,
     /// triggers it -- exactly the pairs rustc rejects.
     fn refuse_mixed_signedness(
         &self,
         l: Var,
-        ls: bool,
+        ls: Sign,
         r: Var,
-        rs: bool,
+        rs: Sign,
     ) -> Result<(), SpecError> {
-        if ls == rs {
+        // An untyped operand adopts the other side's sign, so it never clashes.
+        let (Some(lb), Some(rb)) = (ls.typed(), rs.typed()) else {
+            return Ok(());
+        };
+        if lb == rb {
             return Ok(());
         }
         let lconst = self.const_value(l).is_some();
@@ -1780,7 +1849,7 @@ impl<'a> Parser<'a> {
             return Err(self.err("operands of different signedness cannot be combined"));
         }
         // One side is a signed constant and the other an unsigned name.
-        let mixed = (rs && !ls && rconst && !lconst) || (ls && !rs && lconst && !rconst);
+        let mixed = (rb && !lb && rconst && !lconst) || (lb && !rb && lconst && !rconst);
         if mixed {
             return Err(self.err(
                 "a signed constant cannot be combined with an unsigned operand",
@@ -1837,18 +1906,18 @@ impl<'a> Parser<'a> {
         &self,
         op: &str,
         a: Var,
-        sa: bool,
+        sa: Sign,
         b: Var,
-        sb: bool,
-    ) -> Result<Option<(Var, bool)>, SpecError> {
+        sb: Sign,
+    ) -> Result<Option<(Var, Sign)>, SpecError> {
         // Only a fold of two constants can be decided here; a symbolic operand
         // leaves the operation to the engine.
         let (Some(_), Some(_)) = (self.const_value(a), self.const_value(b)) else {
             return Ok(None);
         };
         let w = smt::bits(a);
-        let signed = sa || sb;
-        let (va, vb) = (self.signed_value(a, sa), self.signed_value(b, sb));
+        let signed = sa.eval() || sb.eval();
+        let (va, vb) = (self.signed_value(a, sa.eval()), self.signed_value(b, sb.eval()));
         // The signed minimum, which is the one value a division can overflow on.
         let min = -(1i128 << (w - 1));
         if matches!(op, "/" | "%") {
@@ -1908,7 +1977,17 @@ impl<'a> Parser<'a> {
                 .err("a constant expression is wider than the engine's 64-bit words"));
         }
         let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
-        Ok(Some((smt::word(r as u64 & mask, width), signed)))
+        // The widened result keeps a *typed* operand's sign. With two untyped
+        // operands there is no type to recover, and a widened fold (`!0 + 1`, or
+        // any sum that left the width) is sign-ambiguous, so it is `Opaque`.
+        let out = if signed {
+            Sign::Signed
+        } else if sa == Sign::Unsigned || sb == Sign::Unsigned {
+            Sign::Unsigned
+        } else {
+            Sign::Opaque
+        };
+        Ok(Some((smt::word(r as u64 & mask, width), out)))
     }
 
     /// Resize a constant operand to `wide` bits, refusing one that does not fit.
@@ -1995,11 +2074,13 @@ impl<'a> Parser<'a> {
     fn align_widths(
         &self,
         a: Var,
-        sa: bool,
+        sa: Sign,
         b: Var,
-        sb: bool,
-        signed: bool,
+        sb: Sign,
+        signed: Sign,
     ) -> Result<(Var, Var), SpecError> {
+        let (sa, sb) = (sa.eval(), sb.eval());
+        let signed = signed.eval();
         let (wa, wb) = (smt::bits(a), smt::bits(b));
         match (self.const_value(a), self.const_value(b)) {
             // Both constants: align to the narrower for a well-formed term. The
@@ -2072,9 +2153,35 @@ impl<'a> Parser<'a> {
             if self.eat_op(op) {
                 let (right, rs) = self.parse_expr()?;
                 // Both sides of a Rust comparison have the same signedness (the
-                // language will not compare an `i8` with a `u8`), so either flag
-                // decides it, and a literal on one side leaves the other to say.
-                let signed = ls || rs;
+                // language will not compare an `i8` with a `u8`), so the typed
+                // operand decides it and a literal on one side leaves the other to
+                // say. An *ordering* comparison with no typed operand at all -- both
+                // sides untyped constants -- is sign-ambiguous (`!0 < 0` is `true`
+                // signed and `false` unsigned) and is refused rather than guessed;
+                // `==`/`!=` compare bit patterns and are not. This is the shape
+                // behind the false proof: `!0 >> 1` read unsigned is `127`, signed
+                // `-1`, and the reader's wrong pick *discharged* `ensures: ret <=
+                // (!0 >> 1)` for an `i8`.
+                let signed = match Sign::resolve(ls, rs) {
+                    Some(b) => b,
+                    None => {
+                        // No typed operand. An *opaque* untyped constant (the
+                        // complement of a literal, or a fold of untyped operands) is
+                        // sign-ambiguous at an *ordering* comparison -- `!0 < 0` is
+                        // `true` signed and `false` unsigned -- so it is refused
+                        // rather than guessed. Two bare literals are unambiguous, and
+                        // `==`/`!=` compare bit patterns, so both read unsigned.
+                        if matches!(op, "<" | "<=" | ">" | ">=")
+                            && (ls.ambiguous() || rs.ambiguous())
+                        {
+                            return Err(self.err(
+                                "an ordering comparison with no typed operand is sign-ambiguous: \
+                                 it reads differently as signed and as unsigned",
+                            ));
+                        }
+                        false
+                    }
+                };
                 // A *signed* constant cannot meet an *unsigned* typed operand.
                 // Rust infers a literal's type from the operand it is compared
                 // with, and `x == -1` for a `u8` does not compile ("cannot apply
@@ -2090,7 +2197,8 @@ impl<'a> Parser<'a> {
                 // array length is also in scope, and an 8-bit `ret` against a
                 // 64-bit constant is ill-formed -- which poisons *every*
                 // obligation in the run, not just this one.
-                let (left, right) = self.align_widths(left, ls, right, rs, signed)?;
+                let (left, right) =
+                    self.align_widths(left, ls, right, rs, Sign::from_bool(signed))?;
                 return Ok(match op {
                     "==" => smt::eq(left, right),
                     "!=" => smt::not(smt::eq(left, right)),
@@ -2121,42 +2229,42 @@ impl<'a> Parser<'a> {
     /// `|` < `^` < `&` < `<< >>` < `+ -` < `* / %`. Getting this order wrong is
     /// not a cosmetic matter: `x & 1 + 1` is `x & (1 + 1)` in Rust, and reading it
     /// as `(x & 1) + 1` makes a contract pass or fail against a different number.
-    fn parse_expr(&mut self) -> Result<(Var, bool), SpecError> {
+    fn parse_expr(&mut self) -> Result<(Var, Sign), SpecError> {
         self.parse_bitor()
     }
 
-    fn parse_bitor(&mut self) -> Result<(Var, bool), SpecError> {
+    fn parse_bitor(&mut self) -> Result<(Var, Sign), SpecError> {
         let (mut left, mut sgn) = self.parse_bitxor()?;
         while self.eat_op("|") {
             let (r, rs) = self.parse_bitxor()?;
             self.refuse_mixed_signedness(left, sgn, r, rs)?;
-            let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
+            let (l, r) = self.align_widths(left, sgn, r, rs, Sign::combine(sgn, rs))?;
             left = smt::bor(l, r);
-            sgn = sgn || rs;
+            sgn = Sign::combine(sgn, rs);
         }
         Ok((left, sgn))
     }
 
-    fn parse_bitxor(&mut self) -> Result<(Var, bool), SpecError> {
+    fn parse_bitxor(&mut self) -> Result<(Var, Sign), SpecError> {
         let (mut left, mut sgn) = self.parse_bitand()?;
         while self.eat_op("^") {
             let (r, rs) = self.parse_bitand()?;
             self.refuse_mixed_signedness(left, sgn, r, rs)?;
-            let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
+            let (l, r) = self.align_widths(left, sgn, r, rs, Sign::combine(sgn, rs))?;
             left = smt::bxor(l, r);
-            sgn = sgn || rs;
+            sgn = Sign::combine(sgn, rs);
         }
         Ok((left, sgn))
     }
 
-    fn parse_bitand(&mut self) -> Result<(Var, bool), SpecError> {
+    fn parse_bitand(&mut self) -> Result<(Var, Sign), SpecError> {
         let (mut left, mut sgn) = self.parse_shift()?;
         while self.eat_op("&") {
             let (r, rs) = self.parse_shift()?;
             self.refuse_mixed_signedness(left, sgn, r, rs)?;
-            let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
+            let (l, r) = self.align_widths(left, sgn, r, rs, Sign::combine(sgn, rs))?;
             left = smt::band(l, r);
-            sgn = sgn || rs;
+            sgn = Sign::combine(sgn, rs);
         }
         Ok((left, sgn))
     }
@@ -2178,7 +2286,7 @@ impl<'a> Parser<'a> {
     /// guess at that interaction, a symbolic amount is refused, which leaves the
     /// function visibly undecided instead of silently mis-modelled. A constant at
     /// or above the width is a compile error in Rust and is refused here too.
-    fn parse_shift(&mut self) -> Result<(Var, bool), SpecError> {
+    fn parse_shift(&mut self) -> Result<(Var, Sign), SpecError> {
         let (mut left, sgn) = self.parse_add()?;
         while let Some(op) = self.eat_any(&["<<", ">>"]) {
             let (r, _) = self.parse_add()?;
@@ -2199,18 +2307,34 @@ impl<'a> Parser<'a> {
                 )));
             }
             left = if op == "<<" {
+                // A left shift of an untyped constant is sign-insensitive (the bit
+                // pattern is the same either way), so it keeps its `Untyped` state.
                 smt::shl(left, k as u32)
-            } else if sgn {
-                smt::ashr(left, k as u32)
             } else {
-                smt::lshr(left, k as u32)
+                match sgn {
+                    Sign::Signed => smt::ashr(left, k as u32),
+                    // An untyped *bare literal* (a small non-negative value) shifts
+                    // the same either way, so the unsigned reading is exact.
+                    Sign::Unsigned | Sign::Literal => smt::lshr(left, k as u32),
+                    // `>>` of an *opaque* untyped constant (the complement of a
+                    // literal, or a fold of untyped operands) is the false proof's
+                    // shape: with no typed operand the reader has no sign to pick,
+                    // and the two readings differ (`!0 >> 1` is `-1` arithmetic,
+                    // `127` logical). Refuse rather than guess.
+                    Sign::Opaque => {
+                        return Err(self.err(
+                            "a right shift with no typed operand is sign-ambiguous: it reads \
+                             differently as an arithmetic and as a logical shift",
+                        ))
+                    }
+                }
             };
         }
         Ok((left, sgn))
     }
 
     /// The additive level: `+` and `-`, tighter than the bitwise operators.
-    fn parse_add(&mut self) -> Result<(Var, bool), SpecError> {
+    fn parse_add(&mut self) -> Result<(Var, Sign), SpecError> {
         let (mut left, mut sgn) = self.parse_mul()?;
         while let Some(op) = self.eat_any(&["+", "-"]) {
             let (r, rs) = self.parse_mul()?;
@@ -2224,7 +2348,7 @@ impl<'a> Parser<'a> {
             // scope adds an 8-bit `a` to a 64-bit `5`, which `bin_word` reports
             // as ill-formed -- and that poisons every obligation in the run, so
             // the function is undecided for a reason unrelated to its body.
-            let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
+            let (l, r) = self.align_widths(left, sgn, r, rs, Sign::combine(sgn, rs))?;
             // A constant sum or difference is folded *exactly*, so a result that
             // overflows the operand width is refused (as rustc refuses the
             // constant expression) instead of wrapping to a wrong value. A result
@@ -2235,7 +2359,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             left = if op == "+" { smt::add(l, r) } else { smt::sub(l, r) };
-            sgn = sgn || rs;
+            sgn = Sign::combine(sgn, rs);
         }
         Ok((left, sgn))
     }
@@ -2250,7 +2374,7 @@ impl<'a> Parser<'a> {
     /// it at compile time, so a contract carrying one is malformed, not merely
     /// imprecise. A *symbolic* divisor is modelled exactly (the engine's divider is
     /// total), which mirrors the body.
-    fn parse_mul(&mut self) -> Result<(Var, bool), SpecError> {
+    fn parse_mul(&mut self) -> Result<(Var, Sign), SpecError> {
         let (mut left, mut sgn) = self.parse_cast()?;
         while let Some(op) = self.eat_any(&["*", "/", "%"]) {
             let (r, rs) = self.parse_cast()?;
@@ -2268,9 +2392,23 @@ impl<'a> Parser<'a> {
             // `urem(x, 255)` -- a value the author never wrote. Same refusal as the
             // additive and comparison levels.
             self.refuse_mixed_signedness(left, sgn, r, rs)?;
+            // A `/` or `%` with no typed operand and an *opaque* constant (the
+            // complement of a literal, or a fold) is sign-ambiguous: `!4 / 2` is
+            // `125` unsigned and `-2` signed, and the reader would take the unsigned
+            // engine. Refuse rather than guess. A bare literal is unambiguous, and a
+            // typed operand fixes the reading.
+            if op != "*"
+                && !(sgn.eval() || rs.eval())
+                && (sgn.ambiguous() || rs.ambiguous())
+            {
+                return Err(self.err(
+                    "a `/` or `%` with no typed operand is sign-ambiguous: it reads differently \
+                     as signed and as unsigned",
+                ));
+            }
             // Same width rule as the other operators: a literal product, divisor
             // or mask is sized to the operand it meets.
-            let (l, r) = self.align_widths(left, sgn, r, rs, sgn || rs)?;
+            let (l, r) = self.align_widths(left, sgn, r, rs, Sign::combine(sgn, rs))?;
             // A constant `/` or `%` can overflow (`i8::MIN / -1`), which rustc
             // rejects; the fold refuses it rather than wrapping. `*` is folded
             // exactly, so a constant product too wide for the operand is refused
@@ -2280,14 +2418,15 @@ impl<'a> Parser<'a> {
                 sgn = s;
                 continue;
             }
+            let signed = sgn.eval() || rs.eval();
             left = match op {
                 "*" => smt::mul(l, r),
-                "/" if sgn || rs => smt::sdiv(l, r),
+                "/" if signed => smt::sdiv(l, r),
                 "/" => smt::udiv(l, r),
-                "%" if sgn || rs => smt::srem(l, r),
+                "%" if signed => smt::srem(l, r),
                 _ => smt::urem(l, r),
             };
-            sgn = sgn || rs;
+            sgn = Sign::combine(sgn, rs);
         }
         Ok((left, sgn))
     }
@@ -2315,7 +2454,7 @@ impl<'a> Parser<'a> {
     /// input satisfies, so the function is reported *vacuous* instead of verified.
     /// Hence the negation is applied to the primary first, and the cast chain runs
     /// after it.
-    fn parse_cast(&mut self) -> Result<(Var, bool), SpecError> {
+    fn parse_cast(&mut self) -> Result<(Var, Sign), SpecError> {
         let (v, sgn) = self.parse_neg()?;
         self.cast_chain(v, sgn)
     }
@@ -2330,7 +2469,7 @@ impl<'a> Parser<'a> {
     /// (`4294967289 % 3`, i.e. `0`) where Rust says `-1`. Only `% / >>` and the
     /// comparisons consult the flag, so the mistake is a *wrong value* rather than
     /// a refusal -- the one outcome a verifier must not produce silently.
-    fn parse_neg(&mut self) -> Result<(Var, bool), SpecError> {
+    fn parse_neg(&mut self) -> Result<(Var, Sign), SpecError> {
         if self.eat_op("-") {
             let (v, _) = self.parse_neg()?;
             let w = smt::bits(v);
@@ -2347,10 +2486,13 @@ impl<'a> Parser<'a> {
                 // `-mag` fits signed at `w` bits iff `mag <= 2^(w-1)`.
                 let fits = w >= 64 || mag <= (1u64 << (w - 1));
                 if !fits {
-                    return Ok((smt::sub(smt::word(0, w + 1), smt::word(mag, w + 1)), true));
+                    return Ok((
+                        smt::sub(smt::word(0, w + 1), smt::word(mag, w + 1)),
+                        Sign::Signed,
+                    ));
                 }
             }
-            return Ok((smt::sub(smt::word(0, w), v), true));
+            return Ok((smt::sub(smt::word(0, w), v), Sign::Signed));
         }
         // `!` is a unary prefix on a *value* here, because `bang_is_predicate`
         // ruled out the predicate reading above. On an integer it is bitwise NOT,
@@ -2361,12 +2503,23 @@ impl<'a> Parser<'a> {
         if self.eat_op("!") {
             let (v, sgn) = self.parse_neg()?;
             let w = smt::bits(v);
-            return Ok((smt::bxor(v, smt::all_ones(w)), sgn));
+            // A typed operand keeps its sign. The complement of an *untyped*
+            // constant (`!0`, `!4`) has no type of its own -- it is `-1`/`255`
+            // according to the context -- so it is carried as `Opaque` and refused
+            // at a sign-sensitive operator rather than guessed.
+            let out = if sgn.typed().is_some() {
+                sgn
+            } else if self.const_value(v).is_some() {
+                Sign::Opaque
+            } else {
+                sgn
+            };
+            return Ok((smt::bxor(v, smt::all_ones(w)), out));
         }
         self.parse_atom()
     }
 
-    fn parse_atom(&mut self) -> Result<(Var, bool), SpecError> {
+    fn parse_atom(&mut self) -> Result<(Var, Sign), SpecError> {
         match self.peek().cloned() {
             Some(Tok::Num(n)) => {
                 self.pos += 1;
@@ -2390,13 +2543,15 @@ impl<'a> Parser<'a> {
                     .max()
                     .unwrap_or(64);
                 let w = scope.max(need).min(64);
-                Ok((smt::word(n, w), false))
+                // A bare literal is *untyped* and non-negative: its value is
+                // unambiguous, but its signedness is not yet known.
+                Ok((smt::word(n, w), Sign::Literal))
             }
             Some(Tok::Ident(name)) => {
                 self.pos += 1;
                 if name == "ret" || name == "result" {
                     let v = self.ret.ok_or_else(|| self.err(self.ret_absent))?;
-                    return Ok((v, self.ret_signed));
+                    return Ok((v, Sign::from_bool(self.ret_signed)));
                 }
                 if name == "true" || name == "false" {
                     // A boolean literal is a one-bit word, so a `bool`-returning
@@ -2404,7 +2559,7 @@ impl<'a> Parser<'a> {
                     // an error here, which left such contracts unreadable; the
                     // width check then refuses a literal compared against a
                     // wider operand, which is the right refusal.
-                    return Ok((smt::word(u64::from(name == "true"), 1), false));
+                    return Ok((smt::word(u64::from(name == "true"), 1), Sign::Literal));
                 }
                 // `i16::MIN` and friends: the named bound of an integer type,
                 // which is how a contract names the value it must exclude. The
@@ -2435,7 +2590,7 @@ impl<'a> Parser<'a> {
                     // which table has the name.
                     let key = format!("{ty}::{a}");
                     if let Some((k, w)) = self.variant_consts.get(&key).copied() {
-                        return Ok((smt::word(k, w), false));
+                        return Ok((smt::word(k, w), Sign::Literal));
                     }
                     if self.enum_args.contains(&ty) {
                         return Err(self.err(format!(
@@ -2450,7 +2605,7 @@ impl<'a> Parser<'a> {
                         // `128 <= i8::MAX` and refuse the constant as out of range
                         // for a signed 8-bit operand -- a refusal of a bound that
                         // is by definition in range.
-                        return Ok((smt::word(k, w), ty.starts_with('i')));
+                        return Ok((smt::word(k, w), Sign::from_bool(ty.starts_with('i'))));
                     }
                     return Err(self.err(format!("unknown constant `{ty}::{a}`")));
                 }
@@ -2460,7 +2615,7 @@ impl<'a> Parser<'a> {
                     .copied()
                     .ok_or_else(|| self.err(format!("unknown name `{name}` (not an argument)")))?;
                 let s = self.is_signed_name(&name);
-                Ok((v, s))
+                Ok((v, Sign::from_bool(s)))
             }
             Some(Tok::Op(o)) if o == "(" => {
                 self.pos += 1;
@@ -2500,7 +2655,7 @@ impl<'a> Parser<'a> {
     /// source sign is the previous step's *target* sign -- which the cast just
     /// set, so it is always known. That is what makes the chain well-defined even
     /// when the first source's sign was not.
-    fn cast_chain(&mut self, v: Var, sgn: bool) -> Result<(Var, bool), SpecError> {
+    fn cast_chain(&mut self, v: Var, sgn: Sign) -> Result<(Var, Sign), SpecError> {
         let (mut v, mut sgn) = (v, sgn);
         while matches!(self.peek(), Some(Tok::Ident(n)) if n == "as") {
             let Some(Tok::Ident(ty_name)) = self.toks.get(self.pos + 1).cloned() else {
@@ -2526,8 +2681,24 @@ impl<'a> Parser<'a> {
                 )));
             }
             self.pos += 2;
-            v = if sgn { smt::sign_extend(v, w) } else { smt::truncate(v, w) };
-            sgn = ty.is_signed();
+            // A *widening* cast of an untyped operand would have to guess whether
+            // to sign-extend or zero-fill, and the two disagree (`!0 as i16` is
+            // `-1` or `255`), so an opaque untyped operand is refused. A narrowing
+            // cast keeps the low bits either way, so it is exact. A bare literal is
+            // non-negative and zero-extends exactly.
+            let src_signed = if sgn.ambiguous() {
+                if w > smt::bits(v) {
+                    return Err(self.err(
+                        "a widening cast of a sign-ambiguous constant is not modelled: it would \
+                         have to guess whether to sign-extend or zero-fill",
+                    ));
+                }
+                false
+            } else {
+                sgn.eval()
+            };
+            v = if src_signed { smt::sign_extend(v, w) } else { smt::truncate(v, w) };
+            sgn = Sign::from_bool(ty.is_signed());
         }
         Ok((v, sgn))
     }
@@ -3162,19 +3333,19 @@ mod tests {
         let mut p = Parser::new("x as u32", &args, None, &unsigned, false);
         let (v, s) = p.parse_expr().expect("`x as u32` parses");
         assert_eq!(smt::bits(v), 32);
-        assert!(!s);
+        assert!(!s.eval());
 
         // `x as i32` from a *signed* source: 32 bits, signed.
         let mut p = Parser::new("x as i32", &args, None, &signed, false);
         let (v, s) = p.parse_expr().expect("`x as i32` parses");
         assert_eq!(smt::bits(v), 32);
-        assert!(s);
+        assert!(s.eval());
 
         // A chain applies left to right: the last cast decides width and sign.
         let mut p = Parser::new("x as u16 as i32", &args, None, &unsigned, false);
         let (v, s) = p.parse_expr().expect("the chain parses");
         assert_eq!(smt::bits(v), 32);
-        assert!(s);
+        assert!(s.eval());
     }
 
     /// The operator precedence must match Rust's, because a contract is Rust
@@ -3230,13 +3401,13 @@ mod tests {
         // A negation is only defined on a signed type, so `-7` is signed even
         // though the `7` it negates is not.
         let (_, sgn) = parse("-7");
-        assert!(sgn, "a negated literal is signed");
+        assert!(sgn.eval(), "a negated literal is signed");
         let (_, sgn) = parse("-7 % 3");
-        assert!(sgn, "a remainder of a negated literal is signed");
+        assert!(sgn.eval(), "a remainder of a negated literal is signed");
         // A bare literal stays unsigned, or `x % 3` for an unsigned `x` would
         // take the signed engine -- the mirror of the same mistake.
         let (_, sgn) = parse("7 % 3");
-        assert!(!sgn, "a bare literal is unsigned");
+        assert!(!sgn.eval(), "a bare literal is unsigned");
         // The value is still a *value* negation: `-7` is the two's-complement
         // `7` subtracted from `0`, so it evaluates to `-1` at 8 bits.
         let (v, _) = parse("-7");
@@ -3266,7 +3437,7 @@ mod tests {
         };
         // `(-x) as u8` is unsigned; `-(x as u8)` would be signed.
         let (_, sgn) = parse("-x as u8");
-        assert!(!sgn, "`-x as u8` is `(-x) as u8`, an unsigned type");
+        assert!(!sgn.eval(), "`-x as u8` is `(-x) as u8`, an unsigned type");
         // The cast target decides the width, whichever way the negation is read,
         // so the value of the negation is not where the two readings differ.
         let (v, _) = parse("-x as u8");
@@ -3274,11 +3445,11 @@ mod tests {
         // A cast *after* a parenthesized negation is the same thing, and is what
         // the explicit spelling looks like.
         let (_, sgn) = parse("(-x) as u8");
-        assert!(!sgn, "`(-x) as u8` is unsigned too");
+        assert!(!sgn.eval(), "`(-x) as u8` is unsigned too");
         // A negation with no cast is still signed, or the fix above would have
         // undone the previous one.
         let (_, sgn) = parse("-x");
-        assert!(sgn, "a negation with no cast is signed");
+        assert!(sgn.eval(), "a negation with no cast is signed");
     }
 
     /// Unary `!` on a value is *bitwise* NOT and binds *tighter* than `==`, so
@@ -3638,14 +3809,42 @@ mod tests {
         }
     }
 
-    /// Two *names* of different signedness are refused, because rustc refuses them.
+    /// A `!`-complement of a literal is refused where its sign would change the
+    /// meaning.
     ///
-    /// `a > b` for an `i8` and a `u8` is `E0308: mismatched types`. The reader used
-    /// to read it as signed, which is a real reading and not a false proof, but it
-    /// is a reading of a program rustc rejects -- and the body reads each operand
-    /// at *its own* signedness, so the two could disagree about the operator's
-    /// meaning. Refusing keeps the answer "the tool could not run" rather than
-    /// "the code is wrong" or a verdict on a program that does not compile.
+    /// `!0 >> 1` is `127` read unsigned and `-1` read signed, and the reader's old
+    /// default (a literal is unsigned) *discharged* `ensures: ret <= (!0 >> 1)`
+    /// for an `i8` though Rust reads it `ret <= -1`. With no typed operand to fix
+    /// the signedness the shape is refused, not guessed; a typed operand reads it
+    /// exactly, and the operators where the two signs agree still read.
+    #[test]
+    fn a_bang_literal_is_refused_where_its_sign_would_change_the_meaning() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::var(8));
+        let mut signed = BTreeSet::new();
+        signed.insert("x".to_string());
+        let parses = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            p.parse_or().is_ok()
+        };
+        // A `!`-complement of a literal has no type of its own: refused at a
+        // shift, a `/`/`%`, and an ordering comparison.
+        assert!(!parses("(!0 >> 1) == 0"), "`!0 >> 1` has no typed operand");
+        assert!(!parses("(!4 >> 2) == 0"), "`!4 >> 2` has no typed operand");
+        assert!(!parses("(!4 / 2) == 0"), "`!4 / 2` has no typed operand");
+        assert!(!parses("(!4 % 3) == 0"), "`!4 % 3` has no typed operand");
+        assert!(!parses("(!0) < 0"), "`!0 < 0` has no typed operand");
+        assert!(!parses("(!7) >= 0"), "`!7 >= 0` has no typed operand");
+        // The refusal is narrow. A typed operand fixes the signedness, and a bare
+        // literal is non-negative, so both still read.
+        assert!(parses("x >> 1 < 0"), "a shift of a name is exact");
+        assert!(parses("(!x >> 1) < 0"), "a shift of `!x` is exact");
+        assert!(parses("x <= 5"), "a small literal is unambiguous");
+        // (`x & !1` and `x == !4` are refused too, but for the unrelated reason
+        // that `!1`/`!4` are large non-negative values that do not fit a signed
+        // 8-bit operand -- a completeness gap, not a sign guess.)
+    }
+
     #[test]
     fn two_names_of_different_signedness_are_refused() {
         let mut args = BTreeMap::new();
