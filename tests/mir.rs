@@ -3371,3 +3371,25 @@ fn an_unsigned_negation_is_refused_and_a_signed_negation_reads() {
     let o = outcome(&report, "contract_signed_negation_still_reads");
     assert!(o.is_verified(), "a negation of a signed name must still verify, got: {o}");
 }
+
+/// A contract literal widened to meet a *signed* operand zero-fills.
+///
+/// The fill comes from the constant's own signedness, not the operand it meets.
+/// Rust's `(255u8 as i16)` is `255`, so `(x as i16) == 255` holds for every `u8`
+/// `x`. Widening the literal from the operand's signed `i16` sign-extended it to
+/// `65535` and *refuted* a postcondition Rust accepts -- a false refutation. The
+/// control `254` is neither reading and must FAIL, so the fix is not "verify
+/// everything".
+#[test]
+fn a_literal_widened_to_a_signed_operand_zero_fills() {
+    let Some(report) = verify_realistic(&["contract_literal_widened_to_signed_zero_fills"]) else {
+        return;
+    };
+    let o = outcome(&report, "contract_literal_widened_to_signed_zero_fills");
+    assert!(o.is_verified(), "`255` widened to i16 is `255` and must verify, got: {o}");
+    let Some(report) = verify_realistic(&["contract_literal_widened_to_signed_tripwire"]) else {
+        return;
+    };
+    let o = outcome(&report, "contract_literal_widened_to_signed_tripwire");
+    assert!(matches!(o, FnOutcome::Failed { .. }), "`254` is neither reading and must FAIL, got: {o}");
+}

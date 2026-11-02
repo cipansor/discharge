@@ -1390,6 +1390,13 @@ Unary `-` on an unsigned operand is refused as well: `-x` for a `u8` is `E0600`,
 the reader's `0 - x` is a value Rust never produces. A signed name, and a bare literal
 (Rust defaults it to a signed `i32`), still negate and read.
 
+A constant widened to meet a wider operand fills from its **own** signedness, not the
+operand's. A bare literal is non-negative and zero-extends, so `(x as i16) == 255` for
+a `u8` `x` is true — the same as Rust's `(255u8 as i16)`. Filling from the signed
+operand instead sign-extended the `255` to `65535` and *refuted* a postcondition Rust
+accepts (a false refutation). A signed constant keeps sign-extending, so `-1 as i32`
+is still `-1`.
+
 A struct or enum whose body closes on its declaration line is read from that line,
 not by opening a cursor. `pub struct B { pub lo: u8 }` used to leave a field cursor
 open with no closing brace left to read, so every following line — the `///`

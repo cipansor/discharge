@@ -3578,6 +3578,40 @@ with a tripwire (`contract_unsigned_negation_is_refused`) and a signed control
 tripwire is `verified` and the test fails. Coverage **135/233 to 136/235**;
 test-count **526**.
 
+## A widened literal zero-fills — the false *refutation* the operand's sign caused
+
+`resize_const` decides how a widened constant fills its new high bits. It filled from
+the **operand it meets** (`signed`), not from the **constant's own** signedness
+(`own_signed`). For a bare literal that is wrong, and wrong in the *refuting*
+direction.
+
+Rust's `(255u8 as i16)` is `255` — the `u8` zero-extends into the `i16`. So
+`ensures: (x as i16) == 255` holds for every `u8` `x`. The reader sign-extended the
+literal `255` to the signed `i16` operand, got `65535`, and **refuted** a
+postcondition Rust accepts:
+
+```
+/// requires: x == 255
+/// ensures: (x as i16) == 255
+pub fn f(x: u8) -> u8 { x }
+```
+
+```
+f    FAILED   postcondition — v1:u8 = 255     <-- false refutation
+```
+
+The mirror of the false proofs above: a verifier that is *unsound* is one failure, but
+one that rejects valid programs is the other, and this is the second kind. The fill is
+now `own_signed` — a bare literal zero-extends, a signed constant (`-1`, an `i8::MIN`
+bound) keeps sign-extending, so the signed-widening cases are unchanged.
+
+**Evidence.** Unit test `a_literal_widened_to_a_signed_operand_zero_fills` (the
+predicate at `x == 255` is true; `255 as i32` is `255`; `-1 as i32` is all ones), a
+corpus test with a control (`contract_literal_widened_to_signed_zero_fills` verifies,
+`..._tripwire` for `254` FAILs). Sensitivity: reverting to `signed && wide > w` brings
+the tripwire back to `FAILED` on a Rust-true postcondition and fails both tests.
+Coverage **136/235 to 137/237**; test-count **526 to 528**. Gate green.
+
 ## Toolchain — edition 2024 and the MSRV floor (1.85)
 
 Both manifests are **edition 2024** with `rust-version = "1.85"`. The two numbers

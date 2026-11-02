@@ -2051,8 +2051,16 @@ impl<'a> Parser<'a> {
         // ill-formed flag -- turning a valid contract into `Unknown`. Truncation
         // takes the low `wide` bits, which is the same bit pattern the value
         // denotes, and the `fits` check above is what keeps it from being silent.
+        //
+        // How a *widened* constant fills the new high bits is decided by the
+        // constant's *own* signedness (`own_signed`), not by the operand it meets
+        // (`signed`). A bare literal is non-negative, so it zero-extends: Rust's
+        // `(255u8 as i16) == 255` is *true*, and filling from `signed` instead
+        // sign-extended the `255` to `65535`, so the reader refuted a postcondition
+        // Rust accepts -- a false refutation, the mirror of a false proof. A signed
+        // constant (`-1`, a `MIN` bound) keeps its value by sign-extending.
         if wide >= w {
-            Ok(if signed && wide > w { smt::sign_extend(v, wide) } else { smt::word(val, wide) })
+            Ok(if own_signed && wide > w { smt::sign_extend(v, wide) } else { smt::word(val, wide) })
         } else {
             Ok(smt::truncate(v, wide))
         }
@@ -3424,6 +3432,42 @@ mod tests {
         // `7` subtracted from `0`, so it evaluates to `-1` at 8 bits.
         let (v, _) = parse("-7");
         assert_eq!(smt::evaluate(v, |_| None).expect("a constant"), 0xF9);
+    }
+
+    /// A bare literal widened to meet a *signed* operand zero-fills, not
+    /// sign-extends.
+    ///
+    /// The fill is a property of the *constant's* own signedness, not the operand
+    /// it meets. A bare literal is non-negative, so `(x as i16) == 255` for a `u8`
+    /// `x` is true in Rust; filling from the operand's signed `i16` sign-extended
+    /// the `255` to `65535` and *refuted* a postcondition Rust accepts — a false
+    /// refutation, the mirror of a false proof. A signed constant keeps
+    /// sign-extending, which the last assertion pins.
+    #[test]
+    fn a_literal_widened_to_a_signed_operand_zero_fills() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::var(8));
+        let unsigned = BTreeSet::new();
+        let eval_const = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let (v, _) = p.parse_expr().expect("parses");
+            p.expect_end().expect("no trailing tokens");
+            smt::evaluate(v, |_| None).expect("a constant")
+        };
+        // The comparison as a whole, so the widened literal is what is decided.
+        let pred = |text: &str, x: u64| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let pr = p.parse_or().expect("parses as a predicate");
+            p.expect_end().expect("no trailing tokens");
+            smt::evaluate_pred(pr, |_| Some(x)).expect("decides")
+        };
+        // `(x as i16)` at `x == 255` is `255`, so the equality is *true*. Sign-
+        // extending the literal to `65535` would make it false.
+        assert!(pred("(x as i16) == 255", 255), "`255` widened to i16 is `255`");
+        // The widened literal itself, at 32 bits, is still `255`.
+        assert_eq!(eval_const("255 as i32"), 255, "a bare literal zero-fills");
+        // A *signed* constant must still sign-extend: `-1 as i32` is all ones.
+        assert_eq!(eval_const("-1 as i32"), u32::MAX as u64, "a signed constant sign-extends");
     }
 
     /// Unary `-` binds *tighter* than `as`, so `-x as u8` is `(-x) as u8` and its

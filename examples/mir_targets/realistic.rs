@@ -824,6 +824,29 @@ pub fn widen_unsigned_false(a: u8) -> u16 {
     a as u16
 }
 
+/// A *contract literal* widened to meet a signed operand zero-fills, because the
+/// literal's own signedness is what decides the fill, not the operand's.
+///
+/// Rust's `(255u8 as i16)` is `255`, not `65535`, so `(x as i16) == 255` holds for
+/// every `u8` `x`. The reader widened the literal `255` to the operand's signed
+/// `i16` by *sign-extending* it -- filling from the operand's sign instead of the
+/// constant's -- giving `65535`, and refuted a postcondition Rust accepts: a false
+/// *refutation*, the mirror of a false proof. It must verify.
+/// requires: x == 255
+/// ensures: (x as i16) == 255
+pub fn contract_literal_widened_to_signed_zero_fills(x: u8) -> u8 {
+    x
+}
+
+/// The control that the fix did not simply stop widening or verify everything:
+/// `254` is neither the zero-filled nor the sign-extended reading of `255`, so
+/// this is false in Rust and must FAIL.
+/// requires: x == 255
+/// ensures: (x as i16) == 254
+pub fn contract_literal_widened_to_signed_tripwire(x: u8) -> u8 {
+    x
+}
+
 /// A comparison of a *signed* array element is a signed comparison.
 ///
 /// This is the element-side counterpart of the `const 0_i8` case. The element's
