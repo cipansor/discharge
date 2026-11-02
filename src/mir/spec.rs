@@ -2155,28 +2155,30 @@ impl<'a> Parser<'a> {
                 // Both sides of a Rust comparison have the same signedness (the
                 // language will not compare an `i8` with a `u8`), so the typed
                 // operand decides it and a literal on one side leaves the other to
-                // say. An *ordering* comparison with no typed operand at all -- both
-                // sides untyped constants -- is sign-ambiguous (`!0 < 0` is `true`
-                // signed and `false` unsigned) and is refused rather than guessed;
-                // `==`/`!=` compare bit patterns and are not. This is the shape
-                // behind the false proof: `!0 >> 1` read unsigned is `127`, signed
-                // `-1`, and the reader's wrong pick *discharged* `ensures: ret <=
-                // (!0 >> 1)` for an `i8`.
+                // say. With *no* typed operand the reading is a guess, and where
+                // the two readings differ the shape is refused.
+                //
+                // The two readings differ whenever an operand is `Opaque` -- an
+                // untyped constant that is not a bare literal (the complement of
+                // one, or a fold of untyped operands). Such a constant has no type
+                // of its own, and Rust defaults an untyped constant to `i32`, so
+                // `!0` is `-1` and `!0 == 255` is `false`; the reader carries the
+                // complement as a bit pattern at the scope's width, so it built
+                // `255u8 == 255` and *verified* `ensures: !0 == 255` -- a false
+                // proof, and one the maintainer's ordering-only refusal left open
+                // because `==`/`!=` "compare bit patterns". They do not here: the
+                // two readings are different *values* (`-1` vs `255`), not a
+                // different ordering of one value. So an opaque operand with no
+                // typed partner is refused at *every* comparison, not only the
+                // ordering ones. Two bare literals stay unambiguous (`2 == 2`), and
+                // any typed operand fixes the reading, so the common cases read.
                 let signed = match Sign::resolve(ls, rs) {
                     Some(b) => b,
                     None => {
-                        // No typed operand. An *opaque* untyped constant (the
-                        // complement of a literal, or a fold of untyped operands) is
-                        // sign-ambiguous at an *ordering* comparison -- `!0 < 0` is
-                        // `true` signed and `false` unsigned -- so it is refused
-                        // rather than guessed. Two bare literals are unambiguous, and
-                        // `==`/`!=` compare bit patterns, so both read unsigned.
-                        if matches!(op, "<" | "<=" | ">" | ">=")
-                            && (ls.ambiguous() || rs.ambiguous())
-                        {
+                        if ls.ambiguous() || rs.ambiguous() {
                             return Err(self.err(
-                                "an ordering comparison with no typed operand is sign-ambiguous: \
-                                 it reads differently as signed and as unsigned",
+                                "a comparison with no typed operand is sign-ambiguous: an untyped \
+                                 constant reads differently as signed and as unsigned",
                             ));
                         }
                         false
@@ -2471,7 +2473,17 @@ impl<'a> Parser<'a> {
     /// a refusal -- the one outcome a verifier must not produce silently.
     fn parse_neg(&mut self) -> Result<(Var, Sign), SpecError> {
         if self.eat_op("-") {
-            let (v, _) = self.parse_neg()?;
+            let (v, sgn) = self.parse_neg()?;
+            // Rust rejects `-x` for an unsigned `x` (`E0600: cannot apply unary
+            // operator `-` to type `u8``). The reader models the negation as
+            // `0 - x` at the operand's width, which is a *value* Rust never
+            // produces, so the shape is refused rather than decided -- the same
+            // answer as the mixed-signedness pair. A bare literal is untyped (Rust
+            // defaults it to a signed `i32`) and a signed operand is legal, so
+            // `-5` and `-x` for an `i8` still read.
+            if sgn == Sign::Unsigned {
+                return Err(self.err("cannot apply unary `-` to an unsigned operand"));
+            }
             let w = smt::bits(v);
             // A negated *constant* is widened by one bit when its magnitude does
             // not fit signed at its own width, so the true value survives for the
@@ -3423,14 +3435,17 @@ mod tests {
     /// never `> 127` — which reported a verifiable function as *vacuous*. Rust
     /// rejects `-x as u8` for an unsigned `x` with "cannot apply unary operator
     /// `-`", which is the language telling you the negation happens on `x` before
-    /// the cast, not on the cast's result.
+    /// the cast, not on the cast's result. So the operand here is a *signed* `x`
+    /// (the only spelling rustc accepts for a negation), and the unsigned `x` case
+    /// is asserted as a refusal below.
     #[test]
     fn a_negation_binds_tighter_than_a_cast() {
         let mut args = BTreeMap::new();
         args.insert("x".to_string(), smt::word(0, 8));
-        let unsigned = BTreeSet::new();
+        let mut signed = BTreeSet::new();
+        signed.insert("x".to_string());
         let parse = |text: &str| {
-            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let mut p = Parser::new(text, &args, None, &signed, false);
             let (v, sgn) = p.parse_expr().expect("parses");
             p.expect_end().expect("no trailing tokens");
             (v, sgn)
@@ -3450,6 +3465,11 @@ mod tests {
         // undone the previous one.
         let (_, sgn) = parse("-x");
         assert!(sgn.eval(), "a negation with no cast is signed");
+        // A negation of an *unsigned* name is a rustc error (`E0600`), so it is
+        // refused rather than decided.
+        let unsigned = BTreeSet::new();
+        let mut p = Parser::new("-x", &args, None, &unsigned, false);
+        assert!(p.parse_expr().is_err(), "`-x` for a `u8` does not compile");
     }
 
     /// Unary `!` on a value is *bitwise* NOT and binds *tighter* than `==`, so
@@ -3835,6 +3855,20 @@ mod tests {
         assert!(!parses("(!4 % 3) == 0"), "`!4 % 3` has no typed operand");
         assert!(!parses("(!0) < 0"), "`!0 < 0` has no typed operand");
         assert!(!parses("(!7) >= 0"), "`!7 >= 0` has no typed operand");
+        // Equality too. `==`/`!=` were left readable at first ("they compare bit
+        // patterns"), but the two readings of an untyped constant are different
+        // *values*, not a different ordering of one: Rust types an untyped constant
+        // as `i32`, so `!0` is `-1` and `!0 == 255` is `false`, while the reader
+        // built `255u8 == 255` and *verified* `ensures: !0 == 255` -- a false
+        // proof. So the ambiguous operand is refused at `==`/`!=` as well.
+        assert!(!parses("(!0) == 255"), "`!0 == 255` is `false` in Rust, not provable");
+        assert!(!parses("(!0) != 255"), "`!0 != 255` has no typed operand");
+        assert!(!parses("(!4) == 251"), "`!4 == 251` is `false` in Rust, not provable");
+        assert!(!parses("(!0) == (!0)"), "both operands untyped and ambiguous");
+        // Two *bare* literals are unambiguous, so equality still reads.
+        assert!(parses("2 == 2"), "two bare literals compare exactly");
+        assert!(parses("x == 0"), "a typed operand fixes the reading");
+        assert!(parses("x == !x"), "`!x` carries `x`'s type, so the pair is typed");
         // The refusal is narrow. A typed operand fixes the signedness, and a bare
         // literal is non-negative, so both still read.
         assert!(parses("x >> 1 < 0"), "a shift of a name is exact");

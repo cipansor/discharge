@@ -1546,6 +1546,44 @@ pub fn contract_bang_still_negates_a_predicate(x: u8) -> u8 {
     1
 }
 
+/// The false-proof tripwire for an *untyped* constant in an equality.
+///
+/// `!0` has no type of its own. Rust types an untyped constant as `i32`, so `!0`
+/// is `-1` and `!0 == 255` is `false` -- the postcondition holds for no input.
+/// The reader used to carry the complement as a bit pattern at the scope's width,
+/// build `255u8 == 255`, and *verify* this. With the refusal it is `skipped`.
+/// requires: true
+/// ensures: !0 == 255
+pub fn contract_untyped_complement_equality_is_refused(x: u8) -> u8 {
+    x
+}
+
+/// The control: a typed operand fixes the reading, so `!0` becomes a `u8` and
+/// `x == !0` is exactly `x == 255` -- what Rust means. This must still read and
+/// verify, so the refusal above is not a blanket ban on `!` in a comparison.
+/// requires: x == !0
+/// ensures: ret == 255
+pub fn contract_complement_of_literal_with_typed_partner_reads(x: u8) -> u8 {
+    x
+}
+
+/// Unary `-` on an *unsigned* name is a rustc error (`E0600: cannot apply unary
+/// operator `-` to type `u8``). The reader modelled it as `0 - x`, a value Rust
+/// never produces, so the shape is refused rather than decided.
+/// requires: -x >= 0
+/// ensures: ret == 0
+pub fn contract_unsigned_negation_is_refused(x: u8) -> u8 {
+    0
+}
+
+/// The control: a negation of a *signed* name is legal and must still read, so the
+/// refusal above is not a blanket ban on unary `-`.
+/// requires: x == -5
+/// ensures: ret == -x as u8
+pub fn contract_signed_negation_still_reads(x: i8) -> u8 {
+    -x as u8
+}
+
 /// A shift *amount* may be a constant expression, not only a bare literal:
 /// `x >> 1 + 1` is `x >> 2` in Rust. The reader accepted only a raw literal, so
 /// this shape was unreadable -- a dropped obligation on something rustc compiles.

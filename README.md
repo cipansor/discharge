@@ -1377,6 +1377,19 @@ than a verdict on a program that does not compile. The refusal is narrow: two na
 the *same* signedness still compare, and a name against a literal of either value
 still reads. A shift is exempt, because Rust lets the shift amount have its own type.
 
+An *untyped* constant — the complement of a literal (`!0`), or a fold of untyped
+operands — has no type of its own, and Rust types an untyped constant as `i32`, so
+`!0` is `-1`. Where the signed and unsigned readings differ, the shape is refused
+rather than guessed: at `>>`, `/`, `%`, an ordering comparison, a widening cast, and
+at `==`/`!=` too. Equality is included because the two readings are different
+*values*, not a different ordering of one — the reader built `255u8 == 255` from
+`!0 == 255` and *verified* it, though Rust calls it false (a false proof). Any typed
+operand fixes the reading, and two bare literals stay unambiguous.
+
+Unary `-` on an unsigned operand is refused as well: `-x` for a `u8` is `E0600`, and
+the reader's `0 - x` is a value Rust never produces. A signed name, and a bare literal
+(Rust defaults it to a signed `i32`), still negate and read.
+
 A struct or enum whose body closes on its declaration line is read from that line,
 not by opening a cursor. `pub struct B { pub lo: u8 }` used to leave a field cursor
 open with no closing brace left to read, so every following line — the `///`

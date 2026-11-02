@@ -3527,6 +3527,57 @@ two-name branch: the corpus entry gets a verdict (FAILED) instead of `skipped`, 
 the unit test fails. Coverage **133/228 to 134/231** (the control verifies; the two
 refusals are skipped, as they must be); test-count **519 to 521**. Gate green.
 
+## An untyped constant in an equality is refused — the `==` half of the sign guess
+
+The `Sign` model above refuses a sign-ambiguous operand at `>>`, `/`, `%`, an
+ordering comparison, and a widening cast. It left `==`/`!=` readable, on the
+reasoning that they "compare bit patterns" and so do not care about the sign. That
+reasoning is wrong when the two readings are different *values* rather than a
+different ordering of one.
+
+`!0` has no type of its own. Rust types an untyped constant as `i32`, so `!0` is
+`-1` and **`!0 == 255` is `false`**. The reader carries the complement as a bit
+pattern at the *scope's* width, so for any function with a `u8` in scope it built
+`255u8 == 255` — **true** — and discharged `ensures: !0 == 255` for a body returning
+`x`. A false proof, and a family of them: `!4 == 251`, `(!0 << 1) == 254`, all
+`verified` while Rust calls them false.
+
+The fix: an `Opaque` operand with *no typed partner* is refused at **every**
+comparison, not only the ordering ones. The rule is now uniform — no typed operand
+means no recovered type means no verdict. Two bare literals stay unambiguous
+(`2 == 2` reads), and any typed operand fixes the reading (`x == !0` is `x == 255`,
+which verifies).
+
+**Evidence.** Unit assertions in `a_bang_literal_is_refused_where_its_sign_would_change_the_meaning`
+(`!0 == 255`, `!0 != 255`, `!4 == 251`, `!0 == !0` refused; `2 == 2`, `x == 0`,
+`x == !x` read) plus a corpus test with a tripwire
+(`contract_untyped_complement_equality_is_refused`) and a typed-partner control
+(`contract_complement_of_literal_with_typed_partner_reads`). Sensitivity: with the
+branch reverted the tripwire is `verified` — the false proof — and the test fails.
+Coverage **134/231 to 135/233**; test-count **524 to 526**.
+
+## Unary `-` on an unsigned operand is refused
+
+`-x` for an unsigned `x` is `E0600: cannot apply unary operator `-` to type `u8``.
+The reader modelled it as `0 - x` at the operand's width — a value Rust never
+produces — so `requires: -x >= 0` for a `u8` was read as satisfiable and the function
+was decided on a program rustc rejects. `parse_neg` now refuses a `Sign::Unsigned`
+operand. A bare literal is untyped (Rust defaults it to a signed `i32`) and a signed
+name is legal, so `-5` and `-x` for an `i8` still read; `-x as u8` for a signed `x`
+is the only spelling rustc accepts and it still parses.
+
+The refusal broke an existing test (`a_negation_binds_tighter_than_a_cast`) that
+parsed `-x as u8` with an *unsigned* `x` to check that `-` binds tighter than `as`.
+That test's own docstring already noted rustc rejects the shape — it was testing
+precedence on an illegal program. The test now uses a signed `x` (which checks the
+same precedence legally) and asserts the unsigned case as a refusal.
+
+**Evidence.** Unit assertion in `a_negation_binds_tighter_than_a_cast`, a corpus test
+with a tripwire (`contract_unsigned_negation_is_refused`) and a signed control
+(`contract_signed_negation_still_reads`). Sensitivity: with the branch deleted the
+tripwire is `verified` and the test fails. Coverage **135/233 to 136/235**;
+test-count **526**.
+
 ## Toolchain — edition 2024 and the MSRV floor (1.85)
 
 Both manifests are **edition 2024** with `rust-version = "1.85"`. The two numbers

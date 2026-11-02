@@ -3323,3 +3323,51 @@ fn a_mixed_signedness_comparison_is_refused_and_the_same_signedness_pair_reads()
     let o = outcome(&report, "contract_same_signedness_compare_still_reads");
     assert!(o.is_verified(), "the same-signedness control must still verify, got: {o}");
 }
+
+/// An untyped constant's complement is refused in an *equality*, not just an
+/// ordering.
+///
+/// `!0` has no type of its own. Rust types an untyped constant as `i32`, so `!0`
+/// is `-1` and `!0 == 255` is `false`: the postcondition holds for no input. The
+/// reader carried the complement as a bit pattern at the scope's width, built
+/// `255u8 == 255`, and *verified* it -- a false proof. `==`/`!=` "compare bit
+/// patterns" was the reason given for leaving them readable, but here the two
+/// readings are different *values* (`-1` vs `255`), so the shape is refused. The
+/// control fixes the reading with a typed operand and must still verify.
+#[test]
+fn an_untyped_complement_equality_is_refused_and_a_typed_partner_reads() {
+    let Some(report) = verify_realistic(&["contract_untyped_complement_equality_is_refused"]) else {
+        return;
+    };
+    let o = outcome(&report, "contract_untyped_complement_equality_is_refused");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "`!0 == 255` is `false` in Rust; it must be refused, never given a verdict, got: {o}"
+    );
+    let Some(report) =
+        verify_realistic(&["contract_complement_of_literal_with_typed_partner_reads"])
+    else {
+        return;
+    };
+    let o = outcome(&report, "contract_complement_of_literal_with_typed_partner_reads");
+    assert!(o.is_verified(), "a typed partner fixes the reading and must verify, got: {o}");
+}
+
+/// Unary `-` on an *unsigned* name is refused, and a *signed* negation still reads.
+///
+/// `-x` for a `u8` is `E0600: cannot apply unary operator `-` to type `u8``. The
+/// reader modelled it as `0 - x`, a value Rust never produces, so the shape is
+/// refused rather than decided -- the same answer as a mixed-signedness pair. The
+/// control negates a signed name, which is legal, and must still verify.
+#[test]
+fn an_unsigned_negation_is_refused_and_a_signed_negation_reads() {
+    let Some(report) = verify_realistic(&["contract_unsigned_negation_is_refused"]) else { return };
+    let o = outcome(&report, "contract_unsigned_negation_is_refused");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "`-x` for a `u8` does not compile and must be refused, got: {o}"
+    );
+    let Some(report) = verify_realistic(&["contract_signed_negation_still_reads"]) else { return };
+    let o = outcome(&report, "contract_signed_negation_still_reads");
+    assert!(o.is_verified(), "a negation of a signed name must still verify, got: {o}");
+}
