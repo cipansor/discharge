@@ -999,6 +999,30 @@ pub fn contract_signed_mask_with_signed_partner_reads(y: i8) -> i8 {
     y
 }
 
+/// The *unsigned* counterpart: a `u8` mask keeps its `u8` type, so a signed/unsigned
+/// pairing is refused too.
+///
+/// The signed-mask fix only excluded a *signed* typed operand, which left this
+/// symmetric hole open: `1u8 & 1` is a `u8` even though it computes `1`, so
+/// `(1u8 & 1) == y` for an `i8` `y` is `E0308` (`expected u8, found i8`). The
+/// reader still marked the constant `Literal` (the mark needed only "not signed")
+/// and verified it. The contract must not be decided.
+/// requires: y == 1
+/// ensures: (1u8 & 1) == y
+pub fn contract_unsigned_mask_vs_signed_is_refused(y: i8) -> i8 {
+    y
+}
+
+/// The valid control for the unsigned mask: against an *unsigned* partner it reads.
+///
+/// `(1u8 & 1) == y` for a `u8` `y` is well-typed and holds at `y == 1`, so the
+/// symmetric fix must not refuse every mask with an unsigned typed operand.
+/// requires: y == 1
+/// ensures: (1u8 & 1) == y
+pub fn contract_unsigned_mask_with_unsigned_partner_reads(y: u8) -> u8 {
+    y
+}
+
 /// A comparison of a *signed* array element is a signed comparison.
 ///
 /// This is the element-side counterpart of the `const 0_i8` case. The element's

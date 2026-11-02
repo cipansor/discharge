@@ -4642,7 +4642,8 @@ Coverage **131/222 to 133/226**, test-count 514 held. Gate green.
 
 Reviewing the signedness work found four more, each a different flavour of the same
 theme — the reader answering a question it had not been asked, and a test that could not
-have caught it.
+have caught it. (A fifth surfaced while writing this up: the mask's lost type was fixed in
+one direction only, and the symmetric case is the third bullet below.)
 
 **A `u128`-suffixed literal was a panic, not a refusal.** The suffix records the type's
 *true* width, and `Ty::width()` returns `128` for `u128`/`i128`. `parse_atom`'s range check
@@ -4671,13 +4672,20 @@ gated on the result being *constant* — `&` cannot change a symbolic operand's 
 let it through, but it is an `i8` — the mask takes the *typed* operand's type, and `==`
 never coerces, so `(-1i8 & 1) == y` for a `u8` `y` is `E0308` (`expected i8, found u8`). Its
 *value* is the small positive `1`, which is exactly the trap: marking it `Literal` read the
-comparison as `1 == y` and **verified** it. The mark now also requires that the combined
-operands are **not signed**. `(!0 & 1)` has no signed typed operand (`!0` is `Opaque`, `1` a
-bare literal), so it still widens exactly; `(-1i8 & 1)` keeps `Sign::Signed` and the pairing
-is refused.
+comparison as `1 == y` and **verified** it.
 
-The distinction is *typing*, not value or size: a mask's type is its typed operand's type,
-and a constant that merely computes a small positive number does not become untyped.
+*Third*, the fix for the second was itself too narrow: `Sign::combine(sgn, rs) != Sign::Signed`
+excluded only a **signed** typed operand, leaving the **unsigned** half open. `1u8 & 1` is a
+`u8`, so `(1u8 & 1) == y` for an `i8` `y` is the same `E0308` — and it was still marked
+`Literal` (an unsigned typed mask is "not signed") and **verified**. The condition is now
+`Sign::combine(sgn, rs).typed().is_none()`: a constant result may be marked `Literal` only
+when *neither* operand carries a type. `(!0 & 1)` has no typed operand (`!0` is `Opaque`, `1`
+a bare literal), so it still widens exactly; `(-1i8 & 1)` and `1u8 & 1` keep their types and
+the mixed pairings are refused.
+
+The distinction is *typing*, not value or size or signedness alone: a mask's type is its
+typed operand's type — signed **or** unsigned — and a constant that merely computes a small
+positive number does not become untyped.
 
 **The strict test guard had a hole of its own.** `verify_src` was made strict in an earlier
 fix — a contracted function absent from the report is a panic, not a silent `None` — but the
@@ -4693,17 +4701,20 @@ nightly `rustc`: a `#[should_panic]` test feeds it a `missing` list naming the f
 suffixes refused, `1u64` still reads) and the corpus entry `contract_u128_suffix_literal_is_refused`;
 `a_symbolic_mask_keeps_its_type_but_a_constant_mask_still_widens` with the corpus entry
 `contract_symbolic_mask_keeps_its_type` (refused) against `contract_complement_mask_widens_exactly`
-(still verifies); `a_signed_constant_mask_keeps_its_type` (unit and corpus:
-`contract_signed_mask_vs_unsigned_is_refused` refused, `contract_signed_mask_with_signed_partner_reads`
-verifies) for the signed-constant half; and
+(still verifies); `a_typed_constant_mask_keeps_its_type` (unit and corpus, both directions:
+`contract_signed_mask_vs_unsigned_is_refused` and `contract_unsigned_mask_vs_signed_is_refused`
+refused, `contract_signed_mask_with_signed_partner_reads` and
+`contract_unsigned_mask_with_unsigned_partner_reads` verify) for the typed-constant mask; and
 `a_dropped_contracted_function_fails_even_when_missing_names_it` +
 `a_present_function_passes_the_drop_guard` for the guard. Test-count **534 → 542**; corpus
-**142/246 → 143/250**. Gate green: z3 `mismatch=0`, Kani `mismatch=0`.
+**142/246 → 144/252**. Gate green: z3 `mismatch=0`, Kani `mismatch=0`.
 
 The lesson the four share: a refinement is only as wide as the *predicate* it was written
 on, and a predicate that looks at the convenient property (is there a literal mask? is the
-result constant? does a name for the drop exist?) rather than the necessary one (is the
-result's *type* still its operand's?) will be wrong in one direction or the other. The mask
-fix was too wide *twice* — first for a symbolic operand, then for a signed constant — and
-each time the probe that found it was a pairing rustc rejects but the reader decided.
+result constant? is it *signed*? does a name for the drop exist?) rather than the necessary
+one (is the result's *type* still its operand's?) will be wrong in one direction or the
+other. The mask refinement was too wide **three times** — a symbolic operand, then a signed
+constant, then an unsigned constant — and each time the probe that found it was a pairing
+rustc rejects but the reader decided. The pattern is to state the *type* invariant and test
+both directions, not to patch the direction a single counterexample came from.
 

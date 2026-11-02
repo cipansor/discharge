@@ -2374,16 +2374,17 @@ impl<'a> Parser<'a> {
             // `(x & 128) == y` for a signed `y`, a pairing rustc rejects (E0308).
             //
             // A *constant* result may be marked `Literal` (a width-independent
-            // value that may widen) only when it has **no signed typed operand**.
-            // `(!0 & 1)` is untyped (`!0` is `Opaque`, `1` is a bare literal), so
-            // Rust infers its type from the partner and `1` widens exactly. But
-            // `(-1i8 & 1)` is an `i8`: the mask takes the *typed* operand's type,
-            // and the result is `i8` even though `-1 & 1` is the small positive
-            // `1`. Marking it `Literal` hid that, so `(-1i8 & 1) == y` for a `u8`
-            // `y` -- `E0308` in Rust -- was read as `1 == y` and decided.
+            // value that may widen) only when **neither operand carries a type**.
+            // A typed operand -- signed *or* unsigned -- fixes the result's type,
+            // and `&` cannot erase it: `-1i8 & 1` is an `i8` and `1u8 & 1` is a
+            // `u8`, even though both compute the small positive `1`. Marking
+            // either `Literal` hid the type, so `(...) == y` against a partner of
+            // the *other* signedness -- `E0308` in Rust -- was read as `1 == y`
+            // and decided. `(!0 & 1)` has no typed operand (`!0` is `Opaque`, `1`
+            // a bare literal), so it still widens exactly.
             if self.const_value(left).is_some()
                 && (sgn == Sign::Literal || rs == Sign::Literal)
-                && Sign::combine(sgn, rs) != Sign::Signed
+                && Sign::combine(sgn, rs).typed().is_none()
             {
                 sgn = Sign::Literal;
             }
@@ -3734,34 +3735,45 @@ mod tests {
         assert!(p.parse_or().is_ok(), "a `u64` suffix is modelled");
     }
 
-    /// A *signed* constant mask keeps its signed type, so a signed/unsigned pairing
-    /// is refused rather than decided.
+    /// A *typed* constant mask keeps its type, so a pairing of the other
+    /// signedness is refused rather than decided -- in **both** directions.
     ///
-    /// `-1i8 & 1` is an `i8` in Rust even though its value is `1`: the mask takes
-    /// the typed operand's type, and `==` never coerces, so `(-1i8 & 1) == y` for a
-    /// `u8` `y` is `E0308`. Marking the constant result `Literal` hid the `i8` and
-    /// read the comparison as `1 == y`. The signed/unsigned pair must be refused,
-    /// and the same mask against a *signed* partner must still read.
+    /// `-1i8 & 1` is an `i8` and `1u8 & 1` is a `u8`, even though both compute the
+    /// small positive `1`: the mask takes the typed operand's type, and `==` never
+    /// coerces, so `(...) == y` against a partner of the other signedness is
+    /// `E0308`. Marking the constant result `Literal` hid the type and read the
+    /// comparison as `1 == y`. The first fix excluded only a *signed* typed operand,
+    /// which left the unsigned half open; both must be refused now, while the same
+    /// mask against a partner of its *own* signedness still reads.
     #[test]
-    fn a_signed_constant_mask_keeps_its_signed_type() {
+    fn a_typed_constant_mask_keeps_its_type() {
         let mut args = BTreeMap::new();
         args.insert("y".to_string(), smt::var(8));
+        // `y` is unsigned: a signed typed mask cannot be compared with it.
         let unsigned = BTreeSet::new();
-        // `y` is unsigned here: the signed mask cannot be compared with it.
         for text in ["(-1i8 & 1) == y", "(1i8 & 1) == y", "(-1i8 & 1) < y"] {
             let mut p = Parser::new(text, &args, None, &unsigned, false);
             let err = p.parse_or().expect_err("a signed mask vs an unsigned name must be refused");
             let msg = format!("{err}");
             assert!(msg.contains("signed constant"), "`{text}`: got {msg}");
         }
-        // A mask with no *signed typed* operand stays untyped and may widen.
+        // `y` is signed: an unsigned typed mask cannot be compared with it either.
+        let mut signed = BTreeSet::new();
+        signed.insert("y".to_string());
+        for text in ["(1u8 & 1) == y", "(1u8 & 1) < y"] {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            let err = p.parse_or().expect_err("an unsigned mask vs a signed name must be refused");
+            let msg = format!("{err}");
+            assert!(msg.contains("signed constant"), "`{text}`: got {msg}");
+        }
+        // A mask with no *typed* operand stays untyped and may widen.
         let mut p = Parser::new("(!0 & 1) == y", &args, None, &unsigned, false);
         assert!(p.parse_or().is_ok(), "an untyped constant mask still reads");
     }
 
-    /// The same signed mask against a *signed* partner reads.
+    /// A typed constant mask against a partner of its *own* signedness reads.
     #[test]
-    fn a_signed_constant_mask_with_a_signed_partner_reads() {
+    fn a_typed_constant_mask_with_a_same_signedness_partner_reads() {
         let mut args = BTreeMap::new();
         args.insert("y".to_string(), smt::var(8));
         let mut signed = BTreeSet::new();
@@ -3770,6 +3782,13 @@ mod tests {
         let pr = p.parse_or().expect("a signed mask vs a signed name reads");
         p.expect_end().expect("no trailing tokens");
         // `-1i8 & 1` is `1`, so the predicate holds only at `y == 1`.
+        assert!(smt::evaluate_pred(pr, |_| Some(1)).expect("decides"), "`1 == 1`");
+        assert!(!smt::evaluate_pred(pr, |_| Some(0)).expect("decides"), "`1 == 0` is false");
+        // The unsigned direction reads against an unsigned name.
+        let unsigned = BTreeSet::new();
+        let mut p = Parser::new("(1u8 & 1) == y", &args, None, &unsigned, false);
+        let pr = p.parse_or().expect("an unsigned mask vs an unsigned name reads");
+        p.expect_end().expect("no trailing tokens");
         assert!(smt::evaluate_pred(pr, |_| Some(1)).expect("decides"), "`1 == 1`");
         assert!(!smt::evaluate_pred(pr, |_| Some(0)).expect("decides"), "`1 == 0` is false");
     }

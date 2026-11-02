@@ -3575,30 +3575,39 @@ fn a_symbolic_mask_keeps_its_type_but_a_constant_mask_still_widens() {
     );
 }
 
-/// A *signed* constant mask keeps its signed type, so a signed/unsigned pairing is
-/// refused rather than decided.
+/// A *typed* constant mask keeps its type, so a pairing of the other signedness is
+/// refused rather than decided — in **both** directions.
 ///
-/// `-1i8 & 1` is an `i8` in Rust even though its value is the small positive `1`:
-/// the mask takes the typed operand's type and `==` never coerces. Marking the
-/// constant result `Literal` hid the `i8`, so `(-1i8 & 1) == y` for a `u8` `y` --
-/// `E0308` in Rust -- was read as `1 == y` and *verified*. The pairing must be
-/// refused, and the same mask against a *signed* partner must still verify.
+/// `-1i8 & 1` is an `i8` and `1u8 & 1` is a `u8`, even though both compute the
+/// small positive `1`: the mask takes the typed operand's type and `==` never
+/// coerces. Marking the constant result `Literal` hid the type, so a pairing with
+/// the *other* signedness -- `E0308` in Rust -- was read as `1 == y` and
+/// *verified*. The first fix excluded only a *signed* typed operand, leaving the
+/// unsigned half open; both must be refused, and the same mask against a partner of
+/// its own signedness must still verify.
 #[test]
-fn a_signed_constant_mask_keeps_its_type() {
+fn a_typed_constant_mask_keeps_its_type() {
     let Some(report) = verify_realistic(&[
         "contract_signed_mask_vs_unsigned_is_refused",
         "contract_signed_mask_with_signed_partner_reads",
+        "contract_unsigned_mask_vs_signed_is_refused",
+        "contract_unsigned_mask_with_unsigned_partner_reads",
     ]) else {
         return;
     };
-    let o = outcome(&report, "contract_signed_mask_vs_unsigned_is_refused");
-    assert!(
-        !o.is_verified(),
-        "`(-1i8 & 1) == y` for a `u8` `y` is `E0308` and must be refused, got: {o}"
-    );
-    let o = outcome(&report, "contract_signed_mask_with_signed_partner_reads");
-    assert!(
-        o.is_verified(),
-        "the same signed mask against a signed partner is well-typed and must verify, got: {o}"
-    );
+    for name in [
+        "contract_signed_mask_vs_unsigned_is_refused",
+        "contract_unsigned_mask_vs_signed_is_refused",
+    ] {
+        let o = outcome(&report, name);
+        assert!(!o.is_verified(), "{name} pairs a typed mask with the other signedness \
+                                    (`E0308`) and must be refused, got: {o}");
+    }
+    for name in [
+        "contract_signed_mask_with_signed_partner_reads",
+        "contract_unsigned_mask_with_unsigned_partner_reads",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "{name} is well-typed and must verify, got: {o}");
+    }
 }
