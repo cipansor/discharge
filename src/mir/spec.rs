@@ -1534,15 +1534,19 @@ struct Parser<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Tok {
     Ident(String),
-    /// A numeric literal, with the signedness of its type suffix if it has one.
+    /// A numeric literal, with its type suffix's `(width, signed)` if it has one.
     ///
     /// `0u8` is *unsigned* and `0i8` is *signed*: rustc gives the literal that
     /// type, so `-1 <= 0u8` is `E0277` (a `u8` cannot be negated) rather than a
     /// signed comparison. Dropping the suffix left the reader no way to tell
     /// `0u8` from a bare `0`, so a mismatched constant pair was read as signed and
-    /// an invalid program was silently decided. A bare literal has no suffix and
-    /// stays untyped (`None`).
-    Num(u64, Option<bool>),
+    /// an invalid program was silently decided. The *width* matters just as much:
+    /// a suffixed literal has a fixed width, and building it at the scope's width
+    /// instead turned `128i16` into `0x80` in an 8-bit scope, which a later
+    /// `as i32` sign-extended to `-128` and *verified* a false
+    /// `ensures: 128i16 as i32 == -128`. A bare literal has no suffix and stays
+    /// untyped (`None`), sized contextually.
+    Num(u64, Option<(u8, bool)>),
     /// A numeric literal the tokenizer could not read *exactly* -- a digit that
     /// is invalid for its radix, or a value past `u64`.
     ///
@@ -1594,8 +1598,8 @@ fn tokenize(s: &str) -> Vec<Tok> {
             // digits is a separator; the run stops at anything else, which is how a
             // type suffix (`100u32`) is left for the loop below.
             let mut digits = String::new();
-            // The signedness of the literal's type suffix, if it has one.
-            let mut suffix: Option<bool> = None;
+            // The signedness and width of the literal's type suffix, if it has one.
+            let mut suffix: Option<(u8, bool)> = None;
             while i < b.len() && (b[i].is_digit(radix) || b[i] == '_') {
                 if b[i] != '_' {
                     digits.push(b[i]);
@@ -1632,11 +1636,20 @@ fn tokenize(s: &str) -> Vec<Tok> {
                     continue;
                 }
                 // The suffix is the literal's *type*, so it is what makes `0u8`
-                // unsigned. It is recorded rather than dropped: dropping it left a
-                // mismatched constant pair (`-1 <= 0u8`) with no unsigned side to
-                // see, so it was read as a signed comparison and an invalid program
-                // was silently decided.
-                suffix = Some(sfx.starts_with('i'));
+                // unsigned and gives it a fixed width. Both are recorded rather
+                // than dropped: dropping the sign left a mismatched constant pair
+                // (`-1 <= 0u8`) with no unsigned side to see, so it was read as a
+                // signed comparison and an invalid program was silently decided;
+                // dropping the *width* built `128i16` at the scope's width, which a
+                // later widening cast sign-extended to `-128` -- a false proof.
+                let ty = Ty::parse(&sfx);
+                let (signed, width) = match (ty.is_signed(), ty.width()) {
+                    // `u128`/`i128` have no engine width; keep the sign, let the
+                    // width check refuse them (the value still has to fit `u64`).
+                    (s, None) => (s, 64),
+                    (s, Some(w)) => (s, w),
+                };
+                suffix = Some((width, signed));
             }
             // Anything the run did not consume is a malformed literal: a digit not
             // valid for the radix (`0b12`, `0o9`), or a value past `u64`. Refuse
@@ -1995,23 +2008,34 @@ impl<'a> Parser<'a> {
                 .err("a constant expression is wider than the engine's 64-bit words"));
         }
         // The widened result keeps a *typed* operand's sign. With two untyped
-        // operands there is no type to recover, and a widened fold (`!0 + 1`, or
-        // any sum that left the width) is sign-ambiguous, so it is `Opaque`.
+        // operands the result is one of two very different things, and conflating
+        // them was a false proof:
+        //
+        // * A fold of *bare literals* (`200 + 100`) is a width-independent
+        //   **value**: `300` is `300` at any width that holds it, so it may widen
+        //   exactly like a literal. It is `Literal`.
+        // * A fold that touches a *complement* (`!0 + 2`) is a width-dependent bit
+        //   pattern: `!0` is `-1`/`255`/`65535` according to the width, so
+        //   `!0 + 2` is `1` against an `i16` but the reader holds it at the
+        //   scope's width. Emitting it at the engine's full width let a later
+        //   resize *truncate* it to the operand -- `ensures: (x as i16 + 2) == !0
+        //   + 2` was *verified* for `257 == 1`. It is `Opaque`, and `resize_const`
+        //   refuses its widening.
         let out = if signed {
             Sign::Signed
         } else if sa == Sign::Unsigned || sb == Sign::Unsigned {
             Sign::Unsigned
-        } else {
+        } else if sa == Sign::Opaque || sb == Sign::Opaque {
             Sign::Opaque
+        } else {
+            Sign::Literal
         };
-        // An `Opaque` fold is a *value*, not a width-dependent bit pattern: the
-        // arithmetic already produced the exact result. Emit it at the engine's
-        // full width so a later resize *truncates* (which is exact) rather than
-        // *widens* (where the fill would have to guess, and `200 + 100` would be
-        // refused as if it were a complement). A complement (`!0`) is not folded
-        // here; it stays at its scope width, where the top bit is meaningful, and
-        // `resize_const` handles it.
-        let width = if out == Sign::Opaque { 64 } else { width };
+        // Emit at the narrowest width that holds the exact result, at the
+        // expression's own signedness. An `Opaque` result stays *narrow* on
+        // purpose: it is the operand-width value, so a later widening cannot
+        // recover it and must be refused rather than truncate a wrong number into
+        // place. (An earlier version emitted `Opaque` at 64, which made every
+        // later resize a truncation and disarmed that refusal.)
         let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
         Ok(Some((smt::word(r as u64 & mask, width), out)))
     }
@@ -2043,13 +2067,27 @@ impl<'a> Parser<'a> {
     ) -> Result<Var, SpecError> {
         let w = smt::bits(v);
         let val = self.const_value(v).expect("resize_const is only called on a constant");
-        // An *opaque* constant (the complement of a literal, or a fold) has no type
-        // of its own: Rust infers it from the operand it meets, so `!0` is `-1`
-        // against an `i16` and `65535` against a `u16`. That is exactly the operand's
-        // sign, `signed`. A *typed* constant -- a bare literal (non-negative) or a
-        // signed bound/negation (two's-complement) -- has its own, and that is what
-        // decides whether it fills or sign-extends.
-        let effective_signed = if own == Sign::Opaque { signed } else { own.eval() };
+        // An *opaque* constant (`!0`, or a fold that touched a complement) is held
+        // at the *scope's* width, and its value depends on the operand width Rust
+        // would infer -- `!0` is `-1`/`255`/`65535` by context. A *narrowing* to the
+        // operand is exact (the complement at width W is the low W bits of the
+        // scope-width complement), so it truncates with no range check. A
+        // *widening* cannot be modelled: no fixed extension of the scope-width
+        // pattern recovers the operand-width value, and guessing was the false
+        // proof (`!0 + 2` read as `257` and truncated into an `i16`).
+        if own == Sign::Opaque {
+            if wide > w {
+                return Err(self.err(
+                    "a widening of an untyped constant is not modelled: its value depends on the \
+                     operand's width, which is not known where it is read",
+                ));
+            }
+            return Ok(if wide < w { smt::truncate(v, wide) } else { v });
+        }
+        // A *typed* constant -- a bare literal (non-negative) or a signed
+        // bound/negation (two's-complement) -- has its own signedness, and that is
+        // what decides whether it fills or sign-extends.
+        let effective_signed = own.eval();
         // The value the constant denotes, at its own width. A literal written
         // without a type is non-negative; a signed bound or a negation is its
         // two's-complement value.
@@ -2080,23 +2118,6 @@ impl<'a> Parser<'a> {
                 "literal {shown} does not fit the operand's {wide}-bit width"
             )));
         }
-        // An *opaque* constant widened to a wider operand cannot be modelled: its
-        // value is the complement of a literal taken at the *operand's* width, but
-        // the reader holds that complement at the *scope's* width, and no fixed
-        // extension of it recovers the operand-width result. `!0` against a `u16` is
-        // `65535` where the reader holds `255` and zero-extends -- `ensures: (x as
-        // u16 + !0) == 255` was *verified* for a value Rust calls `65535`, a false
-        // proof. The signed case fails the same way when the literal's top bit is
-        // clear: `!128` against an `i16` is `-129`, but the reader holds `0x7F` and
-        // sign-extends it to `127`, *verifying* `ensures: (x as i16 + !128) == 127`.
-        // Only a complement whose top bit is set (`!0`) happens to survive, and that
-        // is not worth a special case, so the widening is refused outright.
-        if wide > w && own == Sign::Opaque {
-            return Err(self.err(
-                "a widening of an untyped constant is not modelled: the complement is taken at \
-                 the operand's width, not the scope's",
-            ));
-        }
         // Truncate rather than rebuild from `val`. A negative literal is the bit
         // pattern `2^w - 10` at its *source* width, so `word(val, wide)` would be
         // handed a value that does not fit `wide` and would set the engine's
@@ -2110,8 +2131,7 @@ impl<'a> Parser<'a> {
         // from the operand's sign instead sign-extended the `255` to `65535` and
         // *refuted* a postcondition Rust accepts -- a false refutation, the mirror
         // of a false proof. A typed signed constant (`-1`, a `MIN` bound)
-        // sign-extends. An opaque constant never reaches here: its widening is
-        // refused above.
+        // sign-extends. An opaque constant never reaches here: it returned above.
         if wide >= w {
             Ok(if effective_signed && wide > w {
                 smt::sign_extend(v, wide)
@@ -2147,25 +2167,36 @@ impl<'a> Parser<'a> {
         let signed = signed.eval();
         let (wa, wb) = (smt::bits(a), smt::bits(b));
         match (self.const_value(a), self.const_value(b)) {
-            // Both constants: align to the narrower for a well-formed term. The
-            // range check still runs, on *both* operands: a contract that meets no
-            // typed name still has to be one rustc would accept. `128 <= i8::MAX`
-            // is a `literal out of range` error in Rust, and without the check here
-            // it read as `-128 <= 127` -- always true -- so the shape is refused
+            // Both constants: give the pair one width. The range check runs on
+            // whichever operand is resized: a contract that meets no typed name
+            // still has to be one rustc would accept. `128 <= i8::MAX` is a
+            // `literal out of range` error in Rust, and without the check here it
+            // read as `-128 <= 127` -- always true -- so the shape is refused
             // rather than decided. A bare literal is checked as `+val` and a named
             // bound as its two's-complement value (see `resize_const`), so
             // `i8::MIN <= i8::MAX` still reads while `128 <= i8::MAX` does not.
-            (Some(_), Some(_)) => {
-                if wa > wb {
-                    Ok((self.resize_const(a, wb, signed, sa)?, b))
-                } else if wb > wa {
-                    Ok((a, self.resize_const(b, wa, signed, sb)?))
-                } else {
-                    let a = self.resize_const(a, wa, signed, sa)?;
-                    let b = self.resize_const(b, wb, signed, sb)?;
-                    Ok((a, b))
+            //
+            // A *bare* literal's width is only a placeholder (it holds its value
+            // at the scope's width); it must take the *other* operand's width,
+            // whichever side is wider. Aligning to the narrower unconditionally
+            // instead resized the *wider* side down -- `128i16 as i32 == 128`,
+            // where the cast result is 32 bits and the literal is 8, narrowed the
+            // 32-bit `128` to eight bits and refused a valid comparison.
+            (Some(_), Some(_)) => match (sa == Sign::Literal, sb == Sign::Literal) {
+                (true, false) => Ok((self.resize_const(a, wb, signed, sa)?, b)),
+                (false, true) => Ok((a, self.resize_const(b, wa, signed, sb)?)),
+                _ => {
+                    if wa > wb {
+                        Ok((self.resize_const(a, wb, signed, sa)?, b))
+                    } else if wb > wa {
+                        Ok((a, self.resize_const(b, wa, signed, sb)?))
+                    } else {
+                        let a = self.resize_const(a, wa, signed, sa)?;
+                        let b = self.resize_const(b, wb, signed, sb)?;
+                        Ok((a, b))
+                    }
                 }
-            }
+            },
             // One constant: resize it to the other operand's width. This runs at
             // *equal* width too, where the resize is the identity term but the
             // range check is not: `128` meeting an `i8` must be refused, not read
@@ -2331,6 +2362,19 @@ impl<'a> Parser<'a> {
             let (l, r) = self.align_widths(left, sgn, r, rs, Sign::combine(sgn, rs))?;
             left = smt::band(l, r);
             sgn = Sign::combine(sgn, rs);
+            // `a & mask` with a *width-independent* mask (`mask` a bare literal or
+            // a fold of bare literals) is itself width-independent: `&` keeps only
+            // the mask's low bits, which are the same at any width, and clears the
+            // rest, so the result is a non-negative value that may widen exactly
+            // like a literal. Carrying it as an opaque constant instead refused the
+            // widening, so `(x as u16) == (!0 & 1)` -- `1` at any width -- was
+            // dropped. A signed partner is excluded: `x & 128` for an `i8` keeps
+            // bit 7, which is negative.
+            if (sgn == Sign::Literal || rs == Sign::Literal)
+                && Sign::combine(sgn, rs) != Sign::Signed
+            {
+                sgn = Sign::Literal;
+            }
         }
         Ok((left, sgn))
     }
@@ -2376,6 +2420,14 @@ impl<'a> Parser<'a> {
                 // A left shift of an untyped constant is sign-insensitive (the bit
                 // pattern is the same either way), so it keeps its `Untyped` state.
                 smt::shl(left, k as u32)
+            } else if k == 0 {
+                // A shift by zero is the identity: it preserves the exact bit
+                // pattern under *both* readings, so even an opaque constant is
+                // unambiguous. `!0 >> 0` is `!0` -- `255` at 8 bits, `-1` at signed
+                // -- and its sign stays `Opaque` until the surrounding expression
+                // fixes a type. Refusing it before this check dropped a valid
+                // postcondition (`ret == (!0 >> 0)`).
+                left
             } else {
                 match sgn {
                     Sign::Signed => smt::ashr(left, k as u32),
@@ -2463,9 +2515,14 @@ impl<'a> Parser<'a> {
             // `125` unsigned and `-2` signed, and the reader would take the unsigned
             // engine. Refuse rather than guess. A bare literal is unambiguous, and a
             // typed operand fixes the reading.
-            if op != "*"
-                && !(sgn.eval() || rs.eval())
-                && (sgn.ambiguous() || rs.ambiguous())
+            //
+            // The test is `Sign::resolve`, not "does either side evaluate signed":
+            // `eval()` is `false` for both `Unsigned` and `Opaque`, so an unsigned
+            // name beside `!0` (`x / !0` for a `u8`) was mistaken for a pair with
+            // no typed operand and refused, though `resolve` reads the unsigned
+            // type off `x` and the division is well-modelled. Only a genuinely
+            // untyped pair (`!0 / !1`) is refused.
+            if op != "*" && Sign::resolve(sgn, rs).is_none() && (sgn.ambiguous() || rs.ambiguous())
             {
                 return Err(self.err(
                     "a `/` or `%` with no typed operand is sign-ambiguous: it reads differently \
@@ -2578,19 +2635,28 @@ impl<'a> Parser<'a> {
         // (`x == 250`): a different predicate, so a wrong verdict, not a refusal.
         if self.eat_op("!") {
             let (v, sgn) = self.parse_neg()?;
+            // A *typed* operand keeps its sign and width: `!x` for a `u8` is
+            // `x ^ 0xFF`, an 8-bit value.
+            if sgn.typed().is_some() {
+                let w = smt::bits(v);
+                return Ok((smt::bxor(v, smt::all_ones(w)), sgn));
+            }
+            // The complement of an *untyped* constant (`!0`, `!128`) has no type of
+            // its own -- it is `-1`/`255`/`65535` according to the operand it meets,
+            // so it is carried as `Opaque` and refused at a sign-sensitive operator
+            // rather than guessed. It is built as a *constant word* at the scope's
+            // width, not as a `bxor` of `all_ones`: the engine folds a `truncate` of
+            // a constant word to a constant, but leaves a `truncate` of a compound
+            // term as an opaque node, so `ret == !0` was decided against a free
+            // 8-bit variable and *refuted* -- a false refutation.
+            if self.const_value(v).is_some() {
+                let val = self.const_value(v).expect("checked above");
+                let w = smt::bits(v);
+                let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                return Ok((smt::word(!val & mask, w), Sign::Opaque));
+            }
             let w = smt::bits(v);
-            // A typed operand keeps its sign. The complement of an *untyped*
-            // constant (`!0`, `!4`) has no type of its own -- it is `-1`/`255`
-            // according to the context -- so it is carried as `Opaque` and refused
-            // at a sign-sensitive operator rather than guessed.
-            let out = if sgn.typed().is_some() {
-                sgn
-            } else if self.const_value(v).is_some() {
-                Sign::Opaque
-            } else {
-                sgn
-            };
-            return Ok((smt::bxor(v, smt::all_ones(w)), out));
+            return Ok((smt::bxor(v, smt::all_ones(w)), sgn));
         }
         self.parse_atom()
     }
@@ -2599,6 +2665,33 @@ impl<'a> Parser<'a> {
         match self.peek().cloned() {
             Some(Tok::Num(n, suffix)) => {
                 self.pos += 1;
+                // A *suffixed* literal has a fixed Rust type: its width and sign
+                // come from the suffix, not from the scope. Building it at the
+                // scope's width instead lost the value's high bits -- `128i16`
+                // became `0x80` in an 8-bit scope, which a later widening cast
+                // sign-extended to `-128` and *verified* a false
+                // `ensures: 128i16 as i32 == -128`. So it is built at its own
+                // width, and the value is range-checked against the suffix.
+                if let Some((w, signed)) = suffix {
+                    // A signed literal is allowed up to `2^(w-1)` because it may
+                    // be negated: `-128i8` needs the literal `128i8` to exist
+                    // first, and the negation is what makes the min magnitude
+                    // legal. A positive use of that magnitude is a Rust error
+                    // this check cannot see from here.
+                    let max = if signed {
+                        1u128 << (w - 1)
+                    } else {
+                        (1u128 << w) - 1
+                    };
+                    if u128::from(n) > max {
+                        return Err(self.err(format!(
+                            "literal `{n}` is out of range for its `{}` type suffix",
+                            if signed { "i" } else { "u" }
+                        )));
+                    }
+                    let sign = if signed { Sign::Signed } else { Sign::Unsigned };
+                    return Ok((smt::word(n, w), sign));
+                }
                 // A literal is built wide enough to *hold* its own value, and at
                 // least as wide as the widest name in scope. Both halves matter:
                 //
@@ -2619,18 +2712,9 @@ impl<'a> Parser<'a> {
                     .max()
                     .unwrap_or(64);
                 let w = scope.max(need).min(64);
-                // A *suffixed* literal (`0u8`, `-1i16`) carries the sign of the
-                // type its suffix names: rustc gives the literal that type, so
-                // `-1 <= 0u8` is an error (a `u8` cannot be negated), and the
-                // reader must see the unsigned side to refuse it. A *bare* literal
-                // is untyped and non-negative: its value is unambiguous, but its
-                // signedness is not yet known.
-                let sign = match suffix {
-                    Some(true) => Sign::Signed,
-                    Some(false) => Sign::Unsigned,
-                    None => Sign::Literal,
-                };
-                Ok((smt::word(n, w), sign))
+                // A *bare* literal is untyped and non-negative: its value is
+                // unambiguous, but its signedness is not yet known.
+                Ok((smt::word(n, w), Sign::Literal))
             }
             Some(Tok::Ident(name)) => {
                 self.pos += 1;
@@ -3564,6 +3648,41 @@ mod tests {
         assert!(parses("x <= 100 + 44"), "a fold that fits its operand still reads");
         // The complement at its *own* width is fine, and the literal zero-extends.
         assert!(parses("(x as i16) == 255"), "a bare literal zero-extends");
+        // A *suffixed* literal keeps its own width, so the pair is not narrowed to
+        // the literal's placeholder width. `128i16 as i32` is a 32-bit `128`, and
+        // the bare `128` beside it must widen to meet it, not the other way round.
+        assert!(parses("128i16 as i32 == 128"), "the bare literal widens to the cast width");
+    }
+
+    /// A *suffixed* literal is built at its own width, and a bare literal beside it
+    /// takes that width rather than forcing the suffixed one down to the scope's.
+    ///
+    /// `128i16` is a sixteen-bit `128`; the reader sized it from the scope's names
+    /// (eight bits here) instead, so `0x80` was read as `-128` and a widening cast
+    /// sign-extended it -- *verifying* `ensures: 128i16 as i32 == -128`, which Rust
+    /// calls false. The true `== 128` must read, which is what fails if the pair is
+    /// narrowed to the literal's placeholder width.
+    #[test]
+    fn a_suffixed_literal_is_sized_from_its_suffix_not_the_scope() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::var(8));
+        let unsigned = BTreeSet::new();
+        let pred = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let pr = p.parse_or().expect("parses");
+            p.expect_end().expect("no trailing tokens");
+            smt::evaluate_pred(pr, |_| Some(0)).expect("decides")
+        };
+        assert!(pred("128i16 as i32 == 128"), "`128i16 as i32` is `128`");
+        assert!(pred("128i16 == 128"), "the suffixed literal is its own value");
+        // The false reading must not verify. It is refused rather than refuted --
+        // the reader cannot model the untyped `-128` beside a 32-bit cast -- which
+        // is the sound direction, so assert the *predicate* is not proved, not that
+        // it parses.
+        let mut p = Parser::new("128i16 as i32 == -128", &args, None, &unsigned, false);
+        if let Ok(pr) = p.parse_or() {
+            assert!(!smt::prove(pr).is_proved(), "`128i16 as i32` is `128`, never `-128`");
+        }
     }
 
     /// Unary `-` binds *tighter* than `as`, so `-x as u8` is `(-x) as u8` and its

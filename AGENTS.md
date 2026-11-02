@@ -3614,9 +3614,14 @@ bit is set (`!0`) happens to survive sign-extension, and that is not worth a spe
 case, so an opaque widening is **refused outright**.
 
 **A fold is not opaque.** `200 + 100` is a *value*, not a width-dependent bit pattern,
-so a fold is emitted at the engine's full width and a later resize *truncates* it to the
-operand exactly — `x as u16 <= 200 + 100` still reads. The refusal is therefore narrow:
-only a complement held at the wrong width.
+so a fold of bare literals is emitted at the narrowest width that holds its exact result
+and may widen exactly like a literal — `x as u16 <= 200 + 100` still reads. A fold that
+*touches* a complement (`!0 + 2`) is a different thing: `!0` is the operand-width value,
+so `!0 + 2` is width-dependent, and it is emitted narrow and carried as `Opaque`, so a
+later widening is refused. (Emitting an opaque fold at the engine's full width instead
+made every later resize a *truncation*, which *verified* `ensures: (x as i16 + 2) == !0 +
+2` for `257 == 1` — a false proof.) The refusal is therefore narrow: only a width-dependent
+constant, whether a bare complement or a fold that touched one.
 
 **Evidence.** Unit tests `a_literal_widened_to_a_signed_operand_zero_fills` and
 `an_opaque_constant_widening_is_refused_but_a_fold_is_not`; corpus tests with controls
@@ -3626,6 +3631,42 @@ FAILs; the two `contract_opaque_widened_*_is_refused` entries must not verify;
 `signed && wide > w` brings the false refutation back, and deleting the refusal brings
 *both* false proofs back (`verified` on a Rust-false equality). Coverage
 **137/237 → 138/240**; test-count **528 → 530**. Gate green.
+
+## The complement refusal was too wide — three valid shapes it dropped
+
+Refusing an `Opaque` operand wherever the two readings differ is the sound direction, but
+three of those refusals were drawn where the readings do **not** actually differ, so they
+dropped postconditions Rust accepts. Each is the same mistake — a *conservative* refusal
+that should have been a *narrow* one — and each is fixed by asking whether the reading is
+ambiguous at that specific operator, not whether the operand is `Opaque`.
+
+**A right shift by zero is the identity.** `!0 >> 0` is `!0` under both readings, so the
+operand is unambiguous. `parse_shift` refused *every* right shift of an `Opaque` operand
+before checking the amount, so `ensures: ret == (!0 >> 0)` (with `requires: ret == 255`)
+was dropped. The `k == 0` case now returns the operand unchanged, keeping its `Opaque`
+sign until the surrounding expression fixes a type.
+
+**A division with a *typed* partner is not ambiguous.** The `/`/`%` guard tested
+`!(sgn.eval() || rs.eval())`, and `eval()` is `false` for *both* `Unsigned` and `Opaque`.
+So an unsigned name beside `!0` — `x / !0` for a `u8` — looked like a pair with no typed
+operand and was refused, though `x`'s unsigned type fixes the reading (`!0` is `255`).
+The test is now `Sign::resolve(sgn, rs).is_none()`: only a genuinely untyped pair
+(`!0 / !1`) is refused.
+
+**A complement *masked* to a width-independent value widens exactly.** `!0 & 1` is `1` at
+any width, so `(x as u16) == (!0 & 1)` holds. The masked result was carried as `Opaque`,
+so the widening was refused. `parse_bitand` now marks the result `Literal` (a
+width-independent value that may widen) when either operand is a bare literal and the
+pair is not signed — `&` keeps only the mask's low bits, which do not change with width.
+A signed partner is excluded, because `x & 128` for an `i8` keeps bit 7 and is negative.
+
+**Evidence.** Corpus entries `contract_complement_shift_by_zero_reads`,
+`contract_complement_division_with_typed_operand_reads`,
+`contract_complement_mask_widens_exactly` (all verify) against the still-refused
+`contract_complement_fold_widening_is_refused`, in test
+`a_complement_fold_widening_is_refused_but_masks_and_shifts_read`. Sensitivity: reverting
+the `k == 0` branch drops the shift entry to `skipped`; reverting the `resolve` test drops
+the division entry; reverting the `parse_bitand` mark drops the mask entry.
 
 ## A suffixed literal keeps its type — the mismatched constant pair that was decided
 
@@ -3641,17 +3682,29 @@ silently decided. `-1 <= 0u8` is `E0277` in Rust (a `u8` cannot be negated), yet
 reader *verified* `ensures: -1 <= 0u8` by reading it as `-1 <= 0`. A whole family
 followed: `-1 == 0u8`, `-1 < 0u8`, `0u8 > -1`, `-1i8 == 0u8`, `-1 <= (0u8 + 0u8)`.
 
-The suffix is now kept as the literal's signedness (`Tok::Num(u64, Option<bool>)`), so
-the unsigned side is visible, and the refusal covers the both-constants case — a signed
-constant cannot adopt an unsigned operand's type whether the other side is a name or a
-constant. Valid pairs still read: two constants of the same signedness (`-1i8 <= 0i8`),
-a bare literal against either (`-1 <= 255`, `255u8 == 255`), and the ordinary cases.
+The suffix is now kept as the literal's *type* — `Tok::Num(u64, Option<(u8, bool)>)`,
+`(width, signed)` — so the unsigned side is visible and the literal is sized from its own
+suffix, and the refusal covers the both-constants case — a signed constant cannot adopt an
+unsigned operand's type whether the other side is a name or a constant. Valid pairs still
+read: two constants of the same signedness (`-1i8 <= 0i8`), a bare literal against either
+(`-1 <= 255`, `255u8 == 255`), and the ordinary cases.
 
-**Evidence.** Unit test `a_suffixed_literal_carries_its_type_signedness` (the invalid
-pairs refused, the valid ones read). Sensitivity: dropping the suffix again makes
-`-1 == 0u8` and its siblings silently decided and fails the test. Test-count
-**530 → 531**; corpus coverage unchanged at **138/240** (the shape is invalid Rust and
-cannot live in the compiled corpus). Gate green.
+**The width half of the same token.** Recording only the sign left the *width* to the
+scope, and that was a false proof: `128i16` became the 8-bit `0x80` when only `u8` names
+were in scope, and `128i16 as i32` sign-extended it to `-128`, *verifying*
+`ensures: 128i16 as i32 == -128` — false in Rust. A suffixed literal is now built at its
+own width and range-checked against the suffix; the true counterpart
+(`128i16 as i32 == 128`) verifies, so the fix is not "refuse every suffixed literal".
+When a bare literal meets a suffixed one, the *bare* one widens to the suffixed one's
+width (`align_widths` picks the non-`Literal` side), which is what keeps `128i16 as i32
+== 128` readable instead of narrowing the 32-bit cast down to eight bits.
+
+**Evidence.** Unit tests `a_suffixed_literal_carries_its_type_signedness` and
+`a_suffixed_literal_is_sized_from_its_suffix_not_the_scope` (the invalid pairs refused,
+the valid ones read). Sensitivity: dropping the suffix again makes `-1 == 0u8` and its
+siblings silently decided and fails the test; sizing from the scope again makes the
+`128i16 as i32 == -128` corpus entry verify. Test-count **531 → 534**; corpus coverage
+**138/240 → 142/246**.
 
 ## Toolchain — edition 2024 and the MSRV floor (1.85)
 

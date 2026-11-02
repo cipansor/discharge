@@ -876,6 +876,74 @@ pub fn contract_fold_widens_to_unsigned_reads(x: u8) -> u8 {
     x
 }
 
+/// A *suffixed* literal keeps its own width, so a cast of it is not re-read from
+/// the names in scope.
+///
+/// `128i16` is a sixteen-bit `128`, and `128i16 as i32` is `128` in Rust. The
+/// reader sized the literal from the scope instead -- with only `u8` names that is
+/// eight bits, so `128i16` was `0x80`, read as `-128`, and `128i16 as i32` became
+/// `-128`. The false postcondition below was *verified* under that reading and is
+/// false in Rust, so it must not verify.
+/// requires: x == 0
+/// ensures: 128i16 as i32 == -128
+pub fn contract_suffixed_literal_keeps_its_width(x: u8) -> u8 {
+    x
+}
+
+/// The true counterpart: `128i16 as i32` is `128`, so this must verify.
+/// requires: x == 0
+/// ensures: 128i16 as i32 == 128
+pub fn contract_suffixed_literal_is_its_own_value(x: u8) -> u8 {
+    x
+}
+
+/// The false proof that a *fold* of a complement was read at the scope's width.
+///
+/// `!0` is `-1` in Rust, so `!0 + 2` is `1`, and `(x as i16 + 2) == !0 + 2` is
+/// false. The reader held the complement at the scope's width (`255`), added `2`
+/// to get `257`, and a later resize truncated it into `i16`'s `1`, *verifying* the
+/// false equality. The fold must not verify now.
+/// requires: x == 255
+/// ensures: (x as i16 + 2) == !0 + 2
+pub fn contract_complement_fold_widening_is_refused(x: u8) -> u8 {
+    x
+}
+
+/// The valid control the same shape dropped: a complement *masked* to a value that
+/// does not depend on the width is width-independent, so it widens exactly.
+///
+/// `!0 & 1` is `1` at any width, so `(x as u16) == (!0 & 1)` holds for `x == 1`.
+/// The reader carried the masked result as an opaque constant and refused the
+/// widening, dropping a valid postcondition.
+/// requires: x == 1
+/// ensures: (x as u16) == (!0 & 1)
+pub fn contract_complement_mask_widens_exactly(x: u8) -> u8 {
+    x
+}
+
+/// A shift by zero is the identity, so an opaque operand is unambiguous.
+///
+/// `!0 >> 0` is `!0`, and for a `u8` operand that is `255`, so `x == (!0 >> 0)`
+/// holds at `x == 255`. The reader refused *every* right shift of an opaque
+/// constant as sign-ambiguous, dropping this valid postcondition.
+/// requires: x == 255
+/// ensures: x == (!0 >> 0)
+pub fn contract_complement_shift_by_zero_reads(x: u8) -> u8 {
+    x
+}
+
+/// A division with a typed operand on one side is not sign-ambiguous.
+///
+/// `!0` is `-1` read as `i32`, but the *typed* `u8` `x` fixes the reading to
+/// unsigned, so `!0` is `255` and `x / !0 == 0` for any `x < 255`. The reader saw
+/// `!0`'s opaque sign and refused the division as untyped, dropping a valid
+/// postcondition.
+/// requires: x == 0
+/// ensures: x / !0 == 0
+pub fn contract_complement_division_with_typed_operand_reads(x: u8) -> u8 {
+    x
+}
+
 /// A comparison of a *signed* array element is a signed comparison.
 ///
 /// This is the element-side counterpart of the `const 0_i8` case. The element's

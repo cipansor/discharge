@@ -3425,3 +3425,60 @@ fn an_opaque_widening_is_refused_but_a_fold_widens() {
     let o = outcome(&report, "contract_fold_widens_to_unsigned_reads");
     assert!(o.is_verified(), "a fold widens exactly and must verify, got: {o}");
 }
+
+/// A *suffixed* literal keeps its own width, so a cast of it is not re-read from
+/// the names in scope.
+///
+/// `128i16` is a sixteen-bit `128`, and `128i16 as i32` is `128` in Rust. Sizing
+/// the literal from the scope instead -- eight bits here, the only names in scope
+/// -- made `128i16` the bit pattern `0x80`, which the widening cast sign-extended
+/// to `-128`, and *verified* `ensures: 128i16 as i32 == -128`, a postcondition Rust
+/// calls false. The true counterpart (`== 128`) must verify, so the fix is not
+/// "refuse every suffixed literal".
+#[test]
+fn a_suffixed_literal_keeps_its_own_width() {
+    let Some(report) = verify_realistic(&[
+        "contract_suffixed_literal_keeps_its_width",
+        "contract_suffixed_literal_is_its_own_value",
+    ]) else {
+        return;
+    };
+    let o = outcome(&report, "contract_suffixed_literal_keeps_its_width");
+    assert!(
+        !o.is_verified(),
+        "`128i16 as i32` is `128`, so `== -128` is false and must not verify, got: {o}"
+    );
+    let o = outcome(&report, "contract_suffixed_literal_is_its_own_value");
+    assert!(o.is_verified(), "`128i16 as i32 == 128` is true and must verify, got: {o}");
+}
+
+/// A fold that touches a complement is a width-dependent bit pattern, so its
+/// widening is refused; the valid masked and shifted shapes still read.
+///
+/// `!0 + 2` is `1` in Rust (the complement is `-1`), so
+/// `(x as i16 + 2) == !0 + 2` is false; the reader held the complement at the
+/// scope's width, added `2` to get `257`, and a later resize truncated it into
+/// `i16`'s `1`, *verifying* the false equality. `!0 & 1` is `1` at any width and
+/// `!0 >> 0` is `!0`, so both of those must still verify -- the refusal is drawn
+/// at the width *depending* on the operand, not at the complement.
+#[test]
+fn a_complement_fold_widening_is_refused_but_masks_and_shifts_read() {
+    let Some(report) = verify_realistic(&[
+        "contract_complement_fold_widening_is_refused",
+        "contract_complement_mask_widens_exactly",
+        "contract_complement_shift_by_zero_reads",
+        "contract_complement_division_with_typed_operand_reads",
+    ]) else {
+        return;
+    };
+    let o = outcome(&report, "contract_complement_fold_widening_is_refused");
+    assert!(!o.is_verified(), "`(x as i16 + 2) == !0 + 2` is false and must not verify, got: {o}");
+    for name in [
+        "contract_complement_mask_widens_exactly",
+        "contract_complement_shift_by_zero_reads",
+        "contract_complement_division_with_typed_operand_reads",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "{name} is a valid contract and must verify, got: {o}");
+    }
+}
