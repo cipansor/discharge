@@ -973,6 +973,32 @@ pub fn contract_symbolic_mask_keeps_its_type(x: u8, y: i8) -> u8 {
     x
 }
 
+/// A *signed* constant mask keeps its signed type, so a signed/unsigned pairing is
+/// refused.
+///
+/// `-1i8 & 1` is an `i8` in Rust even though its value is the small positive `1`:
+/// the mask takes the typed operand's type, and `==` never coerces. So
+/// `(-1i8 & 1) == y` for a `u8` `y` is `E0308` (`expected i8, found u8`). The
+/// reader marked the constant result `Literal` (a width-independent value that may
+/// widen), which hid the `i8`, and decided the comparison instead of refusing it.
+/// The contract must not be verified.
+/// requires: y == 1
+/// ensures: (-1i8 & 1) == y
+pub fn contract_signed_mask_vs_unsigned_is_refused(y: u8) -> u8 {
+    y
+}
+
+/// The valid control for the signed mask: against a *signed* partner it reads.
+///
+/// `(-1i8 & 1) == y` for an `i8` `y` is well-typed, and `-1i8 & 1` is `1`, so the
+/// equality holds at `y == 1`. The fix must keep the signed-mask shape readable
+/// rather than refuse every mask with a signed operand.
+/// requires: y == 1
+/// ensures: (-1i8 & 1) == y
+pub fn contract_signed_mask_with_signed_partner_reads(y: i8) -> i8 {
+    y
+}
+
 /// A comparison of a *signed* array element is a signed comparison.
 ///
 /// This is the element-side counterpart of the `const 0_i8` case. The element's

@@ -4638,9 +4638,9 @@ additive pair (`+`/`-`), the multiplicative triple (`*`/`/`/`%`), and
 
 Coverage **131/222 to 133/226**, test-count 514 held. Gate green.
 
-## Three follow-ups on the untyped-constant reader: a panic, a lost type, and a vacuous test
+## Follow-ups on the untyped-constant reader: a panic, a mask's lost type, and a vacuous test
 
-Reviewing the signedness work found three more, each a different flavour of the same
+Reviewing the signedness work found four more, each a different flavour of the same
 theme — the reader answering a question it had not been asked, and a test that could not
 have caught it.
 
@@ -4657,14 +4657,27 @@ the width and the engine limit, which is the answer `cast_chain` already gives a
 them to 64 — but that arm was dead, because `width()` returns `Some(128)`, so the guard it
 described never ran. The comment now says what the code does.
 
-**A symbolic masked operand lost its type.** The `parse_bitand` refinement that made
-`(!0 & 1)` widen was written on the *presence* of a literal mask, not on the result being
-constant. So `x & 128` for a `u8` — a symbolic operand, still a `u8` — was marked
-`Sign::Literal`, the "untyped, infer me from a partner" state. `refuse_mixed_signedness`
-then saw no typed operand and accepted `(x & 128) == y` for a signed `y`, a pairing rustc
-rejects (E0308), and gave it a signed reading. `&` cannot change its operand's type, so the
-mark is now gated on the *whole result* being constant: `(!0 & 1)` still widens exactly
-(`const_value(left).is_some()`), and `x & 128` keeps `Sign::Unsigned`.
+**A masked operand lost its type — twice, in two different ways.** The `parse_bitand`
+refinement that made `(!0 & 1)` widen was first written on the *presence* of a literal
+mask. That was too wide twice over, and each over-wide version hid a pairing rustc rejects
+(`E0308`), which the reader then decided instead of refusing.
+
+*First*, a **symbolic** operand: `x & 128` for a `u8` is still a `u8`, but the presence of
+the literal `128` marked the result `Sign::Literal`, the "untyped, infer me from a partner"
+state, so `refuse_mixed_signedness` accepted `(x & 128) == y` for a signed `y`. The mark was
+gated on the result being *constant* — `&` cannot change a symbolic operand's type.
+
+*Second*, a **signed constant** operand: `(-1i8 & 1)` is a constant, so the constant gate
+let it through, but it is an `i8` — the mask takes the *typed* operand's type, and `==`
+never coerces, so `(-1i8 & 1) == y` for a `u8` `y` is `E0308` (`expected i8, found u8`). Its
+*value* is the small positive `1`, which is exactly the trap: marking it `Literal` read the
+comparison as `1 == y` and **verified** it. The mark now also requires that the combined
+operands are **not signed**. `(!0 & 1)` has no signed typed operand (`!0` is `Opaque`, `1` a
+bare literal), so it still widens exactly; `(-1i8 & 1)` keeps `Sign::Signed` and the pairing
+is refused.
+
+The distinction is *typing*, not value or size: a mask's type is its typed operand's type,
+and a constant that merely computes a small positive number does not become untyped.
 
 **The strict test guard had a hole of its own.** `verify_src` was made strict in an earlier
 fix — a contracted function absent from the report is a panic, not a silent `None` — but the
@@ -4680,14 +4693,17 @@ nightly `rustc`: a `#[should_panic]` test feeds it a `missing` list naming the f
 suffixes refused, `1u64` still reads) and the corpus entry `contract_u128_suffix_literal_is_refused`;
 `a_symbolic_mask_keeps_its_type_but_a_constant_mask_still_widens` with the corpus entry
 `contract_symbolic_mask_keeps_its_type` (refused) against `contract_complement_mask_widens_exactly`
-(still verifies); and `a_dropped_contracted_function_fails_even_when_missing_names_it` +
-`a_present_function_passes_the_drop_guard` for the guard. Test-count **534 → 539**; corpus
-**142/246 → 142/248** (both new entries are refusals, so the decided count holds). Gate
-green: z3 `mismatch=0`, Kani `mismatch=0`.
+(still verifies); `a_signed_constant_mask_keeps_its_type` (unit and corpus:
+`contract_signed_mask_vs_unsigned_is_refused` refused, `contract_signed_mask_with_signed_partner_reads`
+verifies) for the signed-constant half; and
+`a_dropped_contracted_function_fails_even_when_missing_names_it` +
+`a_present_function_passes_the_drop_guard` for the guard. Test-count **534 → 542**; corpus
+**142/246 → 143/250**. Gate green: z3 `mismatch=0`, Kani `mismatch=0`.
 
-The lesson the three share: a refinement is only as wide as the *predicate* it was written
-on. The mask fix asked "is there a literal mask?" when the question was "is the *result*
-constant?"; the suffix fix trusted a width the *tokenizer* recorded rather than checking it
-against the engine's limit; the guard accepted a drop because it *had* a name for it. Each
-is the same error — answering the convenient question instead of the necessary one.
+The lesson the four share: a refinement is only as wide as the *predicate* it was written
+on, and a predicate that looks at the convenient property (is there a literal mask? is the
+result constant? does a name for the drop exist?) rather than the necessary one (is the
+result's *type* still its operand's?) will be wrong in one direction or the other. The mask
+fix was too wide *twice* — first for a symbolic operand, then for a signed constant — and
+each time the probe that found it was a pairing rustc rejects but the reader decided.
 

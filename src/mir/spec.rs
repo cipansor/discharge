@@ -2372,11 +2372,18 @@ impl<'a> Parser<'a> {
             // `Literal` would erase a typed argument's type: `x & 128` for a `u8`
             // is still a `u8`, and `Literal` made `refuse_mixed_signedness` accept
             // `(x & 128) == y` for a signed `y`, a pairing rustc rejects (E0308).
-            // A constant result needs no such care: it is range-checked against
-            // the operand's width when it is aligned, so `x & 128` for an `i8` is
-            // refused there (`128` does not fit `i8`), and only a value that fits
-            // -- a genuinely width-independent one -- reaches the widening.
-            if self.const_value(left).is_some() && (sgn == Sign::Literal || rs == Sign::Literal)
+            //
+            // A *constant* result may be marked `Literal` (a width-independent
+            // value that may widen) only when it has **no signed typed operand**.
+            // `(!0 & 1)` is untyped (`!0` is `Opaque`, `1` is a bare literal), so
+            // Rust infers its type from the partner and `1` widens exactly. But
+            // `(-1i8 & 1)` is an `i8`: the mask takes the *typed* operand's type,
+            // and the result is `i8` even though `-1 & 1` is the small positive
+            // `1`. Marking it `Literal` hid that, so `(-1i8 & 1) == y` for a `u8`
+            // `y` -- `E0308` in Rust -- was read as `1 == y` and decided.
+            if self.const_value(left).is_some()
+                && (sgn == Sign::Literal || rs == Sign::Literal)
+                && Sign::combine(sgn, rs) != Sign::Signed
             {
                 sgn = Sign::Literal;
             }
@@ -3725,6 +3732,46 @@ mod tests {
         // A 64-bit suffix beside a 128-bit one is still fine on its own.
         let mut p = Parser::new("1u64 == 1", &args, None, &unsigned, false);
         assert!(p.parse_or().is_ok(), "a `u64` suffix is modelled");
+    }
+
+    /// A *signed* constant mask keeps its signed type, so a signed/unsigned pairing
+    /// is refused rather than decided.
+    ///
+    /// `-1i8 & 1` is an `i8` in Rust even though its value is `1`: the mask takes
+    /// the typed operand's type, and `==` never coerces, so `(-1i8 & 1) == y` for a
+    /// `u8` `y` is `E0308`. Marking the constant result `Literal` hid the `i8` and
+    /// read the comparison as `1 == y`. The signed/unsigned pair must be refused,
+    /// and the same mask against a *signed* partner must still read.
+    #[test]
+    fn a_signed_constant_mask_keeps_its_signed_type() {
+        let mut args = BTreeMap::new();
+        args.insert("y".to_string(), smt::var(8));
+        let unsigned = BTreeSet::new();
+        // `y` is unsigned here: the signed mask cannot be compared with it.
+        for text in ["(-1i8 & 1) == y", "(1i8 & 1) == y", "(-1i8 & 1) < y"] {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let err = p.parse_or().expect_err("a signed mask vs an unsigned name must be refused");
+            let msg = format!("{err}");
+            assert!(msg.contains("signed constant"), "`{text}`: got {msg}");
+        }
+        // A mask with no *signed typed* operand stays untyped and may widen.
+        let mut p = Parser::new("(!0 & 1) == y", &args, None, &unsigned, false);
+        assert!(p.parse_or().is_ok(), "an untyped constant mask still reads");
+    }
+
+    /// The same signed mask against a *signed* partner reads.
+    #[test]
+    fn a_signed_constant_mask_with_a_signed_partner_reads() {
+        let mut args = BTreeMap::new();
+        args.insert("y".to_string(), smt::var(8));
+        let mut signed = BTreeSet::new();
+        signed.insert("y".to_string());
+        let mut p = Parser::new("(-1i8 & 1) == y", &args, None, &signed, false);
+        let pr = p.parse_or().expect("a signed mask vs a signed name reads");
+        p.expect_end().expect("no trailing tokens");
+        // `-1i8 & 1` is `1`, so the predicate holds only at `y == 1`.
+        assert!(smt::evaluate_pred(pr, |_| Some(1)).expect("decides"), "`1 == 1`");
+        assert!(!smt::evaluate_pred(pr, |_| Some(0)).expect("decides"), "`1 == 0` is false");
     }
 
     /// Unary `-` binds *tighter* than `as`, so `-x as u8` is `(-x) as u8` and its
