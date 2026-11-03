@@ -4981,3 +4981,55 @@ The lesson: the fold fix's `Opaque` distinction generalised into a rule — a va
 type of its own is only safe at an operator when it is valid at *every* width it could be
 read at. The fold sweep asked the width question of the fold's *result*; this sweep asked
 it of the shift's *operand*, and the same question found the next hole.
+
+## The complement of an out-of-range literal is refused (the reader's own range check)
+
+The same question the shift fix asked — *is this value valid at the width it will be read
+at?* — found the next hole in the complement path. `resize_const`'s `Opaque` branch held an
+untyped constant at the scope's width and truncated it to the operand with **no range
+check**, because a complement's *value* is always the operand's low `W` bits and so fits
+any `W` by construction. But Rust range-checks the complement's **operand**, not its value:
+`!128` for an `i8` is a `literal out of range for i8` error even though the complement
+`127` fits. The reader built `!128` as the constant `127`, marked it `Opaque`, truncated it
+with no check, and so `ensures: y <= (!128)` read as `y <= 127` (`i8::MAX`) — a tautology —
+and **verified** for a program rustc rejects. A false proof.
+
+`Sign::Opaque` now carries the complement's operand literal (`Some(128)` for `!128`,
+`None` for a fold like `!0 + 2`, whose operand is not a single literal). The payload is
+the *bare-literal* operand only: a negated operand (`!(-1)`, `!(-128)`) is **not** tracked,
+because Rust range-checks the negated value (`-1`, `-128`), not the magnitude (`1`, `128`),
+and `!(-128)` for an `i8` is legal — tracking `128` there would be a false refusal. A nested
+complement (`!!128`) propagates the innermost literal, since Rust checks that same literal
+against the type the outermost complement meets. At `resize_const` the tracked operand is
+checked against the type the complement meets — signed up to `2^(W-1)`, unsigned up to
+`2^W - 1` — and a value that exceeds it refuses the shape.
+
+The sweep: `diff_const.py` (rustc accept/reject via `--emit=obj` + exhaustive ground truth
+over `u8`/`i8`/`u16`/`i16`) went from **23 discrepancies** to **14**, and every removed one
+was the false proof — the surviving 14 are all *pre-existing* `reader=failed` on a
+rustc-rejected shape (a wrong refutation, never a false proof), the broader same-family gap
+below. `UNSOUND` stayed **0**. A unit test
+(`the_complement_of_an_out_of_range_literal_is_refused`) pins four refused shapes and four
+that read; a corpus test asserts the tripwire
+`contract_complement_of_out_of_range_literal_is_refused` is `Skipped` against the decided
+controls `contract_fitting_complement_still_reads` (`!127` for an `i8`) and
+`contract_complement_reads_at_a_wider_operand` (`!128` for an `i16`). Test-count **583 →
+585**; corpus **148/263 → 148/266** (the two controls decide, the tripwire is refused, so
+the *decided* count is unchanged — the point is that the tripwire is no longer *verified*).
+Gate green.
+
+**Known, not-yet-fixed, same family (wrong refutations, not false proofs).** The 14
+surviving discrepancies are the broader rule: **every literal in a constant expression is
+range-checked against the inferred type**, not only the literal that meets the comparison.
+`2 & 128` for an `i8` is `literal out of range for i8` even though the fold's value is `0`;
+so are `255 - 128`, `200 & 63`, `100 & 255`. The reader range-checks the fold's *result*
+(and the bare literal that meets a typed name) but not each operand's *literal*, so it
+refuses some of these via the overflow path and, where the value happens to fit, decides
+them (`reader=failed`) instead of refusing — a wrong refutation on a program rustc rejects,
+never a false proof, so it is a soundness-adjacent accuracy gap, not an unsoundness.
+
+The lesson, once more: the `Opaque` distinction is a rule about *values with no type of
+their own*. The width fix resized a typed constant, the fold fix refused a width-dependent
+fold, the shift fix checked an untyped operand, and this fix range-checks a complement's
+operand — each time the same question, asked of the next operand the reader had left
+unchecked.

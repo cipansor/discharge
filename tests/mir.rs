@@ -3394,6 +3394,44 @@ fn an_untyped_complement_equality_is_refused_and_a_typed_partner_reads() {
     assert!(o.is_verified(), "a typed partner fixes the reading and must verify, got: {o}");
 }
 
+/// The complement of an *out-of-range* literal is refused, while a fitting one
+/// still reads and a wider operand is untouched.
+///
+/// `!128` for an `i8` is a rustc `literal out of range for i8` error -- `128` does
+/// not fit a signed eight-bit type -- even though the complement's *value* `127`
+/// does. The reader built `!128` as the constant `127` and let the resize truncate
+/// it with no check, so `y <= !128` read as `y <= 127` (`i8::MAX`) and *verified*
+/// for a program rustc rejects. Two controls keep the refusal at the range: `!127`
+/// fits an `i8`, and `!128` fits an `i16`, so both must be *decided* (each is a
+/// real predicate, not a tautology, so the verdict is `Failed` with a witness) --
+/// a blanket ban on `!`-of-`128` would leave them `Skipped`.
+#[test]
+fn a_complement_of_an_out_of_range_literal_is_refused() {
+    let Some(report) = verify_realistic(&[
+        "contract_complement_of_out_of_range_literal_is_refused",
+        "contract_fitting_complement_still_reads",
+        "contract_complement_reads_at_a_wider_operand",
+    ]) else {
+        return;
+    };
+    let o = outcome(&report, "contract_complement_of_out_of_range_literal_is_refused");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "`y <= !128` for an `i8` is a rustc range error; it must be refused, never given a \
+         verdict, got: {o}"
+    );
+    for name in [
+        "contract_fitting_complement_still_reads",
+        "contract_complement_reads_at_a_wider_operand",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            !matches!(o, FnOutcome::Skipped { .. }),
+            "{name} fits the operand type and must be decided, got: {o}"
+        );
+    }
+}
+
 /// Unary `-` on an *unsigned* name is refused, and a *signed* negation still reads.
 ///
 /// `-x` for a `u8` is `E0600: cannot apply unary operator `-` to type `u8``. The

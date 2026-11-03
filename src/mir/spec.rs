@@ -1460,7 +1460,13 @@ enum Sign {
     /// and carries its own width, so a mismatch with a typed partner is `E0308`.
     NegLiteral,
     Literal,
-    Opaque,
+    /// An untyped constant that is not a bare literal -- the complement of one
+    /// (`!0`, `!128`) -- whose sign cannot be recovered, so it takes the operand's.
+    /// The payload is the complement's *operand literal* (`Some(128)` for `!128`),
+    /// because Rust range-checks that operand against the type the complement meets
+    /// even though the reader holds the complement value. `None` when the operand
+    /// is not tracked, which is the conservative reading: the fit cannot be shown.
+    Opaque(Option<u64>),
 }
 
 impl Sign {
@@ -1476,6 +1482,18 @@ impl Sign {
     /// (or unsigned, which is a literal's natural reading).
     fn eval(self) -> bool {
         matches!(self, Sign::Signed | Sign::NegLiteral)
+    }
+    /// Whether this is an untyped constant that is not a bare literal.
+    fn is_opaque(self) -> bool {
+        matches!(self, Sign::Opaque(_))
+    }
+    /// The complement operand's magnitude, when it is tracked.
+    fn opaque_operand(self) -> Option<u64> {
+        if let Sign::Opaque(m) = self {
+            m
+        } else {
+            None
+        }
     }
     /// Whether the operand's *width* is inferred from the other side rather than
     /// fixed by its own type. A bare literal, a bare negation of one, and an
@@ -1498,7 +1516,7 @@ impl Sign {
         match self {
             Sign::Signed | Sign::NegLiteral => Some(true),
             Sign::Unsigned => Some(false),
-            Sign::Literal | Sign::Opaque => None,
+            Sign::Literal | Sign::Opaque(_) => None,
         }
     }
     /// Resolve a pair: the typed operand's sign, or `None` when neither is typed.
@@ -1518,8 +1536,10 @@ impl Sign {
             } else {
                 Sign::Unsigned
             }
-        } else if a == Sign::Opaque || b == Sign::Opaque {
-            Sign::Opaque
+        } else if a.is_opaque() || b.is_opaque() {
+            // A fold of complements (`!0 + 2`) has no tracked operand, so the fit
+            // cannot be shown; `None` is the conservative payload.
+            Sign::Opaque(a.opaque_operand().or(b.opaque_operand()))
         } else if a == Sign::NegLiteral || b == Sign::NegLiteral {
             Sign::NegLiteral
         } else {
@@ -1529,7 +1549,7 @@ impl Sign {
     /// Is this a sign-*ambiguous* operand: an untyped constant that is not a bare
     /// literal, so signed and unsigned readings of it differ?
     fn ambiguous(self) -> bool {
-        self == Sign::Opaque
+        self.is_opaque()
     }
 }
 
@@ -2058,7 +2078,7 @@ impl<'a> Parser<'a> {
             Sign::Signed
         } else if sa == Sign::Unsigned || sb == Sign::Unsigned {
             Sign::Unsigned
-        } else if sa == Sign::Opaque || sb == Sign::Opaque {
+        } else if sa.is_opaque() || sb.is_opaque() {
             // An untyped fold whose exact result does not fit the operand width:
             // `!0 + 1` is `256` at the scope's width, `!0 + 2` is `257`. Its value
             // depends on the width Rust infers for it, and the reader learns that
@@ -2124,16 +2144,42 @@ impl<'a> Parser<'a> {
         // at the *scope's* width, and its value depends on the operand width Rust
         // would infer -- `!0` is `-1`/`255`/`65535` by context. A *narrowing* to the
         // operand is exact (the complement at width W is the low W bits of the
-        // scope-width complement), so it truncates with no range check. A
+        // scope-width complement), so it truncates without a value check. A
         // *widening* cannot be modelled: no fixed extension of the scope-width
         // pattern recovers the operand-width value, and guessing was the false
         // proof (`!0 + 2` read as `257` and truncated into an `i16`).
-        if own == Sign::Opaque {
+        //
+        // The value check the plain-literal path performs is *not* the one that
+        // applies here. A complement's value is always the operand's low `W` bits,
+        // so it fits any `W` by construction; what Rust range-checks is the
+        // complement's *operand*, against the type the complement meets. `!128`
+        // for an `i8` is a `literal out of range for i8` error even though the
+        // reader holds `127`, and truncating that to the operand silently turned a
+        // rejected program into `y <= 127` -- `i8::MAX` -- which *verified*. So the
+        // tracked operand is checked against the operand type here.
+        if own.is_opaque() {
             if wide > w {
                 return Err(self.err(
                     "a widening of an untyped constant is not modelled: its value depends on the \
                      operand's width, which is not known where it is read",
                 ));
+            }
+            if let Some(m) = own.opaque_operand() {
+                // The type the complement meets is the operand's: signed up to
+                // `2^(W-1)`, unsigned up to `2^W - 1`. A tracked operand that
+                // exceeds it is a shape rustc rejects, so the contract is refused.
+                let max = if signed {
+                    (1u128 << (wide - 1)) - 1
+                } else {
+                    (1u128 << wide) - 1
+                };
+                if u128::from(m) > max {
+                    return Err(self.err(format!(
+                        "the complement of `{m}` does not fit the operand's {wide}-bit \
+                         {} type, so the shape is refused",
+                        if signed { "signed" } else { "unsigned" }
+                    )));
+                }
             }
             return Ok(if wide < w { smt::truncate(v, wide) } else { v });
         }
@@ -2583,7 +2629,7 @@ impl<'a> Parser<'a> {
                     // shape: with no typed operand the reader has no sign to pick,
                     // and the two readings differ (`!0 >> 1` is `-1` arithmetic,
                     // `127` logical). Refuse rather than guess.
-                    Sign::Opaque => {
+                    Sign::Opaque(_) => {
                         return Err(self.err(
                             "a right shift with no typed operand is sign-ambiguous: it reads \
                              differently as an arithmetic and as a logical shift",
@@ -2802,7 +2848,19 @@ impl<'a> Parser<'a> {
                 let val = self.const_value(v).expect("checked above");
                 let w = smt::bits(v);
                 let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                return Ok((smt::word(!val & mask, w), Sign::Opaque));
+                // The operand is carried so its fit can be checked against the type
+                // the complement meets (`!128` is an `i8` range error). A bare
+                // literal operand contributes its value; a nested complement
+                // (`!!128`) propagates the innermost literal, because Rust checks
+                // that same literal against the type the outermost complement
+                // meets. A fold's operand is not a single literal, so it carries
+                // `None` and the fit cannot be shown.
+                let operand = match sgn {
+                    Sign::Literal => Some(val),
+                    Sign::Opaque(_) => sgn.opaque_operand(),
+                    _ => None,
+                };
+                return Ok((smt::word(!val & mask, w), Sign::Opaque(operand)));
             }
             let w = smt::bits(v);
             return Ok((smt::bxor(v, smt::all_ones(w)), sgn));
@@ -3976,6 +4034,48 @@ mod tests {
         for text in ["(200 + 100) <= a", "(200 + 100) == 300"] {
             let mut p = Parser::new(text, &args, None, &unsigned, false);
             assert!(p.parse_or().is_ok(), "`{text}` fits and reads");
+        }
+    }
+
+    /// The complement of an untyped literal is range-checked against the type it
+    /// meets, not merely held at the scope's width.
+    ///
+    /// `!128` for an `i8` is a rustc `literal out of range for i8` error -- `128`
+    /// does not fit a signed eight-bit type -- even though the *complement's*
+    /// value `127` does. The reader built `!128` as the constant `127` and marked
+    /// it `Opaque`, then let the resize truncate it with no check, so `y <= !128`
+    /// read as `y <= 127` (`i8::MAX`) and *verified* for a program rustc rejects.
+    /// The operand is now checked against the type the complement meets, so this
+    /// is refused while `!127` (which does fit) still reads. A complement against
+    /// a wide enough partner (`!128` for an `i16`) is untouched.
+    #[test]
+    fn the_complement_of_an_out_of_range_literal_is_refused() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::var(8));
+        args.insert("y".to_string(), smt::var(8));
+        args.insert("b".to_string(), smt::var(16));
+        // The parser is told which names are *signed*; a name it does not know is
+        // unsigned. So `x` is a `u8`, `y` an `i8`, `b` an `i16`.
+        let mut signed = BTreeSet::new();
+        signed.insert("y".to_string());
+        signed.insert("b".to_string());
+        // `128`, `255` and a nested complement's `128` do not fit an `i8`; rustc
+        // rejects each, so the reader must refuse rather than decide.
+        for text in ["y <= (!128)", "y <= (!255)", "y <= (!!128)", "y <= (!(64 + 64))"] {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            let err = p.parse_or().expect_err("an out-of-range complement must be refused");
+            assert!(format!("{err}").contains("complement"), "`{text}`: got {err}");
+        }
+        // A complement whose operand *fits* the type it meets still reads, so the
+        // refusal is drawn at the range, not at `!`.
+        for text in ["y <= (!127)", "x <= (!255)", "x <= (!0)", "b <= (!128)"] {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            let r = p.parse_or();
+            assert!(
+                r.is_ok(),
+                "`{text}` fits the operand type and reads: {:?}",
+                r.err().map(|e| format!("{e}"))
+            );
         }
     }
 

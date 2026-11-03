@@ -1836,6 +1836,39 @@ pub fn contract_complement_of_literal_with_typed_partner_reads(x: u8) -> u8 {
     x
 }
 
+/// The false-proof tripwire for a complement of an *out-of-range* literal.
+///
+/// `!128` for an `i8` is a rustc `literal out of range for i8` error: `128` does
+/// not fit a signed eight-bit type, even though the *complement's* value `127`
+/// does. The reader built `!128` as the constant `127`, marked it `Opaque`, and
+/// let the resize truncate it with no check, so `y <= !128` read as `y <= 127`
+/// (`i8::MAX`) and *verified* -- a false proof on a program rustc rejects. It must
+/// be refused, not decided.
+/// requires: true
+/// ensures: y <= (!128)
+pub fn contract_complement_of_out_of_range_literal_is_refused(y: i8) -> i8 {
+    y
+}
+
+/// The control: `!127` fits an `i8` (`127` is `i8::MAX`), so the complement is a
+/// legal `i8` and the comparison must still read. This keeps the refusal above
+/// drawn at the range, not at `!`.
+/// requires: true
+/// ensures: y <= (!127)
+pub fn contract_fitting_complement_still_reads(y: i8) -> i8 {
+    y
+}
+
+/// The control for the *width*: `!128` against an `i16` is legal (`128` fits an
+/// `i16`), so the same complement that is refused for an `i8` must read here. A
+/// fix that refused every `!`-of-`128` regardless of the partner width would fail
+/// this.
+/// requires: true
+/// ensures: b <= (!128)
+pub fn contract_complement_reads_at_a_wider_operand(b: i16) -> i16 {
+    b
+}
+
 /// Unary `-` on an *unsigned* name is a rustc error (`E0600: cannot apply unary
 /// operator `-` to type `u8``). The reader modelled it as `0 - x`, a value Rust
 /// never produces, so the shape is refused rather than decided.
