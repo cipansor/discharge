@@ -1872,6 +1872,26 @@ pub fn bits(v: Var) -> u8 {
 /// Widths are honoured: results are masked to the term's own width, shifts are by the
 /// constant amount stored in the node, and `Shr` is arithmetic (the sign bit
 /// replicates), matching the bit-blaster exactly.
+///
+/// # Why this must not be inlined into a recursive caller
+///
+/// The [`EvalMemo`] is a local, and it is 12 KiB: `1024 * (4 + 8)` bytes. When the
+/// optimiser inlines this function into a caller that *recurses*, that 12 KiB
+/// temporary is allocated in the caller's frame and stays live for the whole
+/// recursive descent, so one level of recursion costs 12 KiB of stack instead of a
+/// few hundred bytes. The contract reader is exactly that caller -- `const_value`
+/// is `evaluate`, and the parser calls it at every operator level -- and in a debug
+/// build the frame grows to ~12.7 KiB per level, so `x >> ((2 << 7) + 1)` reached
+/// past the 2 MiB a test thread gets and *aborted*. An abort is a crash in the
+/// caller's process, not a refusal, which is the one thing the front end is not
+/// allowed to do.
+///
+/// `#[inline(never)]` keeps the memo inside this frame, alive only for the walk.
+/// Measured on the nested-amount contract, the parse depth falls from 254 KiB to
+/// 15 KiB. It is deliberately not a `Box`: `no_std` without an allocator cannot
+/// heap-allocate, so the memo has to be a stack local -- and being a stack local is
+/// only safe once the function that owns it is not inlined into a recursion.
+#[inline(never)]
 pub fn evaluate(t: Var, value: impl Fn(u32) -> Option<u64>) -> Option<u64> {
     // The memo is local to this call, so it needs no invalidation: it cannot
     // outlive the assignment it was computed under, and a later call starts from

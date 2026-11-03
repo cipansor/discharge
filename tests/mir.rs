@@ -992,31 +992,25 @@ fn an_always_firing_panic_says_it_fires_on_every_input() {
 
 const REALISTIC: &str = "examples/mir_targets/realistic.rs";
 
-/// The contract reader and the engine both recurse, so their reach is bounded by
-/// stack depth as well as by the arena: one nested arithmetic expression is a
-/// dozen parser frames, and a debug build gives each of them kilobytes. A
-/// contract with a nested shift amount (`x >> ((2 << 7) + 1)`) needs more than
-/// the 2 MiB a test thread gets by default, so the room is asked for up front
-/// rather than discovering the limit as an abort. This is the same discipline
-/// `tests/shift.rs` and `tests/signed.rs` already use.
-fn on_big_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
-    std::thread::Builder::new()
-        .stack_size(64 * 1024 * 1024)
-        .spawn(f)
-        .expect("spawn")
-        .join()
-        .expect("the query panicked")
-}
-
+/// Deliberately runs on the *default* test-thread stack (2 MiB), not a worker with
+/// a larger one.
+///
+/// The corpus contains a nested shift amount (`x >> ((2 << 7) + 1)`), and the
+/// parser recurses once per nesting level, so this call is sensitive to the size of
+/// a parser frame. It used to abort here: `smt::evaluate` owns a 12 KiB memo as a
+/// stack local, the optimiser inlined it into the recursive parser, and every level
+/// of nesting then cost 12 KiB of stack. The fix is `#[inline(never)]` on
+/// `evaluate` (see its doc comment), which brings the parse depth to ~15 KiB. This
+/// test is the *gate* on that: reverting the attribute re-inflates the frames and
+/// this aborts, so the fix cannot be quietly undone. A 64 MiB worker thread here
+/// would have hidden the bug instead of catching it.
 fn verify_realistic(only: &[&str]) -> Option<verify::FileReport> {
     let rustc = rustc()?;
     let only: Vec<String> = only.iter().map(|s| s.to_string()).collect();
-    on_big_stack(move || {
-        match verify::verify_file_with(&rustc, std::path::Path::new(REALISTIC), &only) {
-            Ok(r) => Some(r),
-            Err(e) => panic!("frontend failed: {e}"),
-        }
-    })
+    match verify::verify_file_with(&rustc, std::path::Path::new(REALISTIC), &only) {
+        Ok(r) => Some(r),
+        Err(e) => panic!("frontend failed: {e}"),
+    }
 }
 
 /// A contract can name a struct field, and the field's *value* reaches the body.

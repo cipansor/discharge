@@ -4822,6 +4822,42 @@ mod tests {
         }
     }
 
+    /// A deeply nested amount must not exhaust the stack, because the parser
+    /// recurses once per level and calls `smt::evaluate` (via `const_value`) at
+    /// every level.
+    ///
+    /// `evaluate` owns a 12 KiB [`EvalMemo`] as a stack local. When the optimiser
+    /// inlined it into the recursive parser, every level cost 12 KiB of stack and a
+    /// two-level amount already aborted on the 2 MiB a test thread gets. The fix is
+    /// `#[inline(never)]` on `evaluate`; this test is the gate on it, because it runs
+    /// on the *default* stack and reverting the attribute re-inflates the frames.
+    ///
+    /// The nesting is far deeper than the corpus needs (40 levels against the
+    /// corpus's 2), so the test fails on a regression by a wide margin rather than
+    /// by a hair -- a frame that is merely large should be caught here, not at the
+    /// exact depth some other test happens to use. The amounts stay small enough to
+    /// fit the operand so the *only* thing under test is the stack cost.
+    #[test]
+    fn a_deeply_nested_amount_does_not_exhaust_the_stack() {
+        let mut args = BTreeMap::new();
+        // A 64-bit operand, so the nested amount (which sums to 40) is below the
+        // operand width and the *only* thing the test exercises is the stack cost.
+        args.insert("x".to_string(), smt::var(64));
+        let mut unsigned = BTreeSet::new();
+        unsigned.insert("x".to_string());
+        // `(1 + (1 + (1 + ... )))`, 40 deep, as a shift amount.
+        let mut amount = String::from("1");
+        for _ in 0..40 {
+            amount = format!("(1 + {amount})");
+        }
+        let text = format!("(x >> {amount}) == 0");
+        let mut p = Parser::new(&text, &args, None, &unsigned, false);
+        assert!(
+            p.parse_or().is_ok(),
+            "a 40-level nested amount fits the operand and must read without exhausting the stack"
+        );
+    }
+
     /// Negating a signed constant at its own type is checked against the *value*,
     /// not the written magnitude, so `-(i8::MIN)` and `-(3 << 7)` are refused.
     ///

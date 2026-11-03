@@ -986,11 +986,21 @@ A pristine literal stays exempt, because there the negation is what makes the ma
 differ (a bound, an inner negation, a wrapped fold), a check written against the spelling is a
 check against the wrong thing.
 
-The parser recurses once per nesting level and a debug build gives each frame kilobytes, so a
-contract with a nested amount (`x >> ((2 << 7) + 1)`) needs more than the 2 MiB a test thread
-gets by default and overflows the stack. That is *not* a bug in the reader -- the parse is
-shallow and terminates -- it is a stack budget, and `tests/mir.rs` now runs the corpus on a
-64 MiB worker thread, the same harness `tests/shift.rs` and `tests/signed.rs` use.
+The parser recurses once per nesting level, and it calls `smt::evaluate` (via `const_value`) at
+every operator level. `evaluate` owns a 12 KiB `EvalMemo` as a stack local, so when the optimiser
+inlines it into the recursive parser, *every* nesting level pays 12 KiB of stack: a debug frame
+measured ~12.7 KiB, and `x >> ((2 << 7) + 1)` reached past the 2 MiB a test thread gets and
+aborted. An abort is a crash in the caller's process, not a refusal -- the one thing the front end
+is not allowed to do -- so this is a real defect, not a stack budget to be raised.
+
+The fix is `#[inline(never)]` on `evaluate`, which keeps the memo in its own frame and alive only
+for the walk; the parse depth falls from 254 KiB to 15 KiB. The memo cannot move to the heap
+because `no_std` without an allocator has no heap, so keeping it off the recursion is the fix.
+`verify_realistic` in `tests/mir.rs` deliberately runs on the *default* stack, and it is the gate:
+reverting the attribute re-inflates the frames and the test aborts. The lesson generalises -- a
+large stack local in a function the optimiser can inline into a recursion is a stack cost per
+level, and the frame-address probe that found it (print `&local` at each parser level and diff the
+addresses) is the way to see it, because the parse is shallow and looks innocent.
 
 ## Two rules, one program: `verify` and `wp` must agree
 
