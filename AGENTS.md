@@ -3817,6 +3817,61 @@ by 512 KB overflows that stack. The memo is therefore small on purpose -- 128 sl
 33 KB -- and the measurement says that is enough for the fold terms a single query touches
 (`N=64` and `N=256` behave identically to `N=128` on the corpus).
 
+## The same budget, aimed at the wrong walk: the BDD apply had no counter
+
+The `MAX_BLAST_STEPS` budget above bounded `blast` -- the walk over the *term DAG* -- and
+that was taken to mean the BDD pass could not run away. It could, through a different walk
+the budget never saw. The shape was a `u64` divided by a non-power-of-two constant,
+`(e / 7) == 0`, read straight out of `mir_coverage`: the process sat at 100% CPU for five
+minutes and returned nothing. It was not flaky, either -- five timed runs all hung, so it
+was a real shape, not a solver that happened to be slow once.
+
+Instrumenting the two walks separately is what located it, and the numbers are the whole
+story. For `udiv(x, 15)` at width 64 the term-DAG walk is **~330 steps** -- far under the
+4 194 304 budget, which is why it never tripped -- while the BDD `apply2`, which recurses
+over the *diagram*, passes **more than 4 000 000 calls** with no counter of its own.
+Division by a constant is the shape that does this: `x / 15` is a restoring divider, and
+the resulting boolean function has a BDD exponentially larger than its formula, so the
+apply's recursion, not the DAG walk, is the unbounded work. A power-of-two divisor (`x / 8`)
+is the opposite -- shifts, a BDD that stays linear -- which is why the sweep that found the
+shift bugs never saw this, and why `x / 4` is fast while `x / 7` is not.
+
+The fix is a third budget, `MAX_APPLY_STEPS`, charged inside `apply2` itself. It trips the
+same `overflow` flag the DAG budget and the arena cap trip, so the query degrades along the
+path that already exists -- BDD hands off to SAT, SAT reports `Unknown` -- rather than
+inventing a new one, and the answer stays sound. `apply_steps` is a *separate* counter from
+`blast_steps` because the two bound different work: a query can be small in one and huge in
+the other, and a single counter would either miss the blow-up or cut a legitimate query
+short.
+
+The value, 1 << 19 = 524 288, comes from measurement, not taste. The largest apply count
+over the whole test corpus -- `actuator.rs` and `realistic.rs`, every function -- is
+**57 191**, so an order of magnitude of headroom above it changes no verdict; the
+pathological shape exceeds 4 000 000, so an order of magnitude below it still stops the
+hang. Being charged *per apply* rather than per query, it also bounds the latency: the
+query now returns in about six seconds instead of never, and the corpus tally is unchanged
+(`15 of 30` on `actuator.rs`, `148 of 263` on `realistic.rs`) with the z3 oracle still
+`mismatch=0`.
+
+Two things were checked and are *not* the cause, which is why the write-up says so:
+
+1. **"It is flaky."** No. Five timed runs of the same shape hung identically, and the count
+   was the same 4 000 000+ applies each time. A slow-but-finite query would have finished on
+   one of them.
+2. **"The budget already covers it."** No. `MAX_BLAST_STEPS` is charged only in `blast`, and
+   the DAG walk for this shape is a few hundred steps; the counter was aimed at the walk
+   that was *not* blowing up.
+
+The regression test is `a_wide_constant_divisor_returns_a_verdict_instead_of_hanging` in
+`tests/divmod.rs`, and it is *verified to hang without the fix* -- with the charge
+neutralised it ran past 120s and was killed, which is the only thing that makes it a
+regression test. It asserts `!= Valid` rather than `== Unknown`: the property is
+termination, and `x / 15 == 0` is false at `x == 15`, so a `Valid` here would be the exact
+unsoundness a truncated encoding must not produce. It runs `on_big_stack` because the
+restoring divider needs about 4 MB of stack at these widths -- a *pre-existing* property
+(the original code needs it even for `x / 4`), not something this budget changed, and the
+same reason `tests/divmod.rs` and `tests/signed.rs` already spawn a 64 MB thread.
+
 ## Stage 2, last bullet: the complement's width comes from the operand, not the destination
 
 The roadmap's final Stage 2 item was one line: `Rvalue::Unary(Not)` is "handled,

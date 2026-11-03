@@ -54,6 +54,25 @@ const BLAST_MEMO_N: usize = 128;
 /// blow-up it exists to stop.
 pub(crate) const MAX_BLAST_STEPS: u32 = 1 << 22;
 
+/// Step budget for the BDD *apply* during one query, the third of the engine's bounds.
+///
+/// `MAX_BLAST_STEPS` counts visits to the term DAG, which is where a fold (`pow`, the
+/// divider) blows up when it is walked as a tree. But the DAG walk is not the only place
+/// that can run away: the BDD `apply2` recurses over the *diagram*, and a boolean function
+/// whose BDD is exponentially larger than its formula -- a wide division by a
+/// non-power-of-two constant is the shape here -- makes that recursion, not the DAG walk,
+/// the unbounded work. Measured on `udiv(x, 15)`: the DAG walk is ~330 steps while `apply2`
+/// passes 4 000 000, and with no budget of its own the query never returns.
+///
+/// The bound is chosen from measurement, not taste. Over both corpus files the largest
+/// legitimate query takes **57 191** apply steps (a u64 comparison); the pathological one
+/// exceeds 4 000 000. 1 << 19 = 524 288 sits an order of magnitude above every decided
+/// query and an order of magnitude below the blow-up, so it never changes a verdict in the
+/// corpus while turning a hang into an answer. Because it is *charged per apply* it also
+/// bounds the latency: the pathological query returned in about six seconds instead of
+/// never (4 194 304 steps, the old pass's implied ceiling, took ~50s).
+pub(crate) const MAX_APPLY_STEPS: u32 = 1 << 19;
+
 /// Worst-case arena memory in bytes, so an integrator can budget statically.
 pub const ARENA_BYTES: usize =
     CAP * (core::mem::size_of::<Node>() + 2 * core::mem::size_of::<u32>());
@@ -374,6 +393,12 @@ pub(crate) struct Ctx {
     blast_memo_bits: [[u32; 64]; BLAST_MEMO_N],
     /// Steps taken by the BDD blaster in the current query, against [`MAX_BLAST_STEPS`].
     blast_steps: u32,
+    /// Steps taken by the BDD *apply* in the current query, against [`MAX_APPLY_STEPS`].
+    ///
+    /// A separate counter from `blast_steps`: the two bound different work (the term-DAG
+    /// walk and the diagram recursion), and a query can blow up in either while staying
+    /// small in the other. Both reset per query and both trip `overflow`.
+    apply_steps: u32,
     /// Steps taken by the SAT blaster in the current query, against [`MAX_BLAST_STEPS`].
     sat_blast_steps: u32,
     /// Set when a variable index past `MAX_VARS` was requested.
@@ -496,6 +521,7 @@ impl Ctx {
             blast_memo_key: [0; BLAST_MEMO_N],
             blast_memo_bits: [[FALSE; 64]; BLAST_MEMO_N],
             blast_steps: 0,
+            apply_steps: 0,
             sat_blast_steps: 0,
             var_overflow: false,
             ready: false,
@@ -523,6 +549,7 @@ impl Ctx {
         // bumped below, so the old keys can never match a term in the new arena. Nothing to
         // clear -- only the counters, which are per query, not per arena.
         self.blast_steps = 0;
+        self.apply_steps = 0;
         self.sat_blast_steps = 0;
         self.var_overflow = false;
         self.ready = false;
@@ -1145,6 +1172,17 @@ impl Ctx {
     }
 
     fn apply2(&mut self, op: u8, a: u32, b: u32) -> u32 {
+        // Charge the *diagram* recursion, not just the term-DAG walk `blast` charges. A
+        // function whose BDD is exponentially larger than its formula (a wide division by a
+        // non-power-of-two constant) blows up here, where `blast`'s counter never sees it;
+        // without this the query never returns. Tripping sets `overflow`, which routes the
+        // query to the SAT engine and from there to `Unknown`, exactly as the DAG budget and
+        // the arena cap do -- so the answer stays sound and the call always returns.
+        self.apply_steps = self.apply_steps.saturating_add(1);
+        if self.apply_steps > MAX_APPLY_STEPS {
+            self.overflow = true;
+            return FALSE;
+        }
         if op == 0 {
             if a == FALSE || b == FALSE {
                 return FALSE;
@@ -1579,6 +1617,7 @@ impl Ctx {
 
     fn query_valid(&mut self, t: Term) -> Verdict {
         self.blast_steps = 0;
+        self.apply_steps = 0;
         self.sat_blast_steps = 0;
         let node = self.blast_bool(t);
         if self.stale || self.ill_formed || self.var_overflow {
@@ -1599,6 +1638,7 @@ impl Ctx {
 
     fn query_model(&mut self, t: Term) -> Verdict {
         self.blast_steps = 0;
+        self.apply_steps = 0;
         self.sat_blast_steps = 0;
         let node = self.blast_bool(t);
         if self.stale || self.ill_formed || self.var_overflow {
