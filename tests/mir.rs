@@ -3473,6 +3473,45 @@ fn a_literal_widened_to_a_signed_operand_zero_fills() {
     assert!(matches!(o, FnOutcome::Failed { .. }), "`254` is neither reading and must FAIL, got: {o}");
 }
 
+/// Every literal and every constant `+ - *` intermediate is range-checked against
+/// the type the expression meets, not only the value the fold produces.
+///
+/// The reader folds a constant expression to one value and used to range-check
+/// only that value. Rust checks each literal and each intermediate: `2 & 128` for
+/// an `i8` is a `literal out of range` error although the fold's value is `0`, and
+/// `128 - 63` is rejected although its value `65` fits. The reader decided both --
+/// a wrong verdict on a program rustc rejects, where the previous fix's class was
+/// a false *proof*. Two controls keep the refusal at the range: the same literals
+/// under a `u8` partner fit, and `-128` is rescued by the unary `-` because the
+/// negated value, not the magnitude, is what meets the type.
+#[test]
+fn a_literal_inside_a_constant_fold_is_range_checked_too() {
+    let refused = [
+        "contract_literal_in_fold_out_of_range_is_refused",
+        "contract_masked_literal_out_of_range_is_refused",
+        "contract_constant_sum_value_out_of_range_is_refused",
+        "contract_literal_in_difference_out_of_range_is_refused",
+        "contract_literal_in_negated_fold_is_refused",
+        "contract_complement_shift_amount_is_refused",
+    ];
+    let Some(report) = verify_realistic(&refused) else { return };
+    for name in refused {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Skipped { .. }),
+            "`{name}` is a rustc range error and must be refused, never given a verdict, got: {o}"
+        );
+    }
+    for name in [
+        "contract_fold_literals_in_range_still_read",
+        "contract_bare_negated_bound_still_reads",
+    ] {
+        let Some(report) = verify_realistic(&[name]) else { return };
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "{name} fits the type it meets and must verify, got: {o}");
+    }
+}
+
 /// An *opaque* constant (a complement) widened to a wider operand is refused, and
 /// a *fold* is not.
 ///

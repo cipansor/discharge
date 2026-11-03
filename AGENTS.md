@@ -5019,17 +5019,74 @@ the *decided* count is unchanged — the point is that the tripwire is no longer
 Gate green.
 
 **Known, not-yet-fixed, same family (wrong refutations, not false proofs).** The 14
-surviving discrepancies are the broader rule: **every literal in a constant expression is
+surviving discrepancies were the broader rule: **every literal in a constant expression is
 range-checked against the inferred type**, not only the literal that meets the comparison.
 `2 & 128` for an `i8` is `literal out of range for i8` even though the fold's value is `0`;
-so are `255 - 128`, `200 & 63`, `100 & 255`. The reader range-checks the fold's *result*
+so are `255 - 128`, `200 & 63`, `100 & 255`. The reader range-checked the fold's *result*
 (and the bare literal that meets a typed name) but not each operand's *literal*, so it
-refuses some of these via the overflow path and, where the value happens to fit, decides
+refused some of these via the overflow path and, where the value happened to fit, decided
 them (`reader=failed`) instead of refusing — a wrong refutation on a program rustc rejects,
-never a false proof, so it is a soundness-adjacent accuracy gap, not an unsoundness.
+never a false proof, so it was a soundness-adjacent accuracy gap, not an unsoundness. **That
+gap is now closed — see the next section.**
 
 The lesson, once more: the `Opaque` distinction is a rule about *values with no type of
 their own*. The width fix resized a typed constant, the fold fix refused a width-dependent
 fold, the shift fix checked an untyped operand, and this fix range-checks a complement's
 operand — each time the same question, asked of the next operand the reader had left
 unchecked.
+
+## Every literal in a constant expression is range-checked, not only the fold's value
+
+The 14 surviving discrepancies from the complement fix named the next rule: **Rust
+range-checks each literal and each constant `+ - *` intermediate against the type the
+expression meets, not only the value the whole expression evaluates to.** `2 & 128` for an
+`i8` is a `literal out of range for i8` error although the fold's value is `0`; `128 - 63`
+is rejected although its value `65` fits. The reader *folds* a constant expression to a
+single value (`smt::evaluate`), so the literal that caused the error is gone by the time
+the comparison range-checks the result. It therefore **decided** these — `ensures: y ==
+(200 & 200)` for an `i8` read as `y == 0` and *failed* — on programs rustc rejects: a wrong
+*verdict*, never a false proof, but a verdict all the same.
+
+The fix tracks an **envelope** — the `(min, max)` of the literals and folded intermediates
+a constant term was built from — in a side table keyed by the hash-consed term id
+(`Parser::range: BTreeMap<u32, (i128, i128)>`). Every literal-creation site records its own
+value (`record_const`), every `+ - *` fold records the union of its operands' envelopes plus
+its own result (`record_fold_result`), and `& | ^ << >>` propagate the union of their
+operands' envelopes (`record_range_union`) because those operators add no literal of their
+own. `resize_const` — the one place a constant definitively meets its type — then calls
+`check_range`, which refuses if any recorded value does not fit the meeting type. Two
+subtleties:
+
+* **The pre-align operands, not the aligned ones.** `align_widths` rebuilds a constant at
+  the common width, and the rebuilt term carries no envelope, so each operator records the
+  union from the operands *before* alignment.
+* **A bare literal under a unary `-` is the one exception.** `-128` is legal for an `i8`
+  even though `128` alone is not: Rust checks the *negated value* there, not the magnitude.
+  But a literal *inside* a fold is not rescued — `-(128 - 63)` is rejected for its inner
+  `128`, unlike `-(128)`. A `bare_literals` set of term ids tells the two apart: a negation
+  negates the operand's envelope (so `-128` carries `-128`, which fits) and drops the
+  operand's own value only when the operand is a pristine bare literal. `-(-128)` carries
+  `128` from the inner negation and is refused, as rustc refuses it.
+
+One more shape the sweep found in the same family: a **complement used as a shift amount**
+(`100 >> (!254)`). `!254` is `-255` at the `i32` Rust infers — a shift overflow — but `1` at
+eight bits, so its value, and whether the shift is in range at all, depends on the width the
+result is read at. `parse_shift` now refuses an opaque amount outright, while a bare literal
+or a fold of bare literals (`1 + 1`) still reads.
+
+**Evidence.** The sweep (`diff_const.py`, rustc accept/reject + exhaustive ground truth)
+went from **14 discrepancies to 0** on the primary seed, and to **0–1** across seeds `7`,
+`42`, `777` (`UNSOUND` stays **0** everywhere; the occasional residual is the same
+pre-existing Opaque-fold-*value* class, wrong refutation only). Unit test
+`a_literal_inside_a_constant_fold_is_range_checked_too` pins seven refused shapes and six
+that read, including the `-(128 - 63)` / `-128` pair; corpus test
+`a_literal_inside_a_constant_fold_is_range_checked_too` asserts six tripwires are `Skipped`
+against the decided controls `contract_fold_literals_in_range_still_read` and
+`contract_bare_negated_bound_still_reads`. Test-count **585 → 587**; corpus **148/266 →
+150/274** (six refusals, two decided controls). z3 oracle `mismatch=0`, kani
+`mismatch=0`, gate green.
+
+The lesson is the same question asked one level down: the complement fix range-checked the
+literal that meets the type; this fix range-checks the literals that *fold into* it. A
+folded value is a value, but the literals it was built from are still claims about a width.
+

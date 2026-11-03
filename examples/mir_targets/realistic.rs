@@ -3108,3 +3108,77 @@ pub fn contract_fitting_untyped_shift_still_reads(x: u8) -> u8 {
 pub fn contract_typed_shift_still_reads(a: u16) -> u16 {
     a
 }
+
+// ---------------------------------------------------------------------------
+// Every literal and every constant `+ - *` intermediate is range-checked against
+// the type the expression meets, not only the value the fold produces.
+//
+// The reader folds a constant expression to a single value and used to
+// range-check only that value. Rust checks each literal and each intermediate, so
+// `2 & 128` for an `i8` is a `literal out of range` error although the fold's
+// value is `0`, and `128 - 63` is rejected although its value `65` fits. The
+// reader decided both, on programs rustc rejects -- a wrong *verdict*, not a false
+// proof, but a verdict all the same. The envelope of the literals underneath the
+// fold is what refuses them.
+//
+// These are `skipped`, not `verified` and not `failed`.
+/// requires: true
+/// ensures: y == (200 & 200)
+pub fn contract_literal_in_fold_out_of_range_is_refused(y: i8) -> i8 {
+    y
+}
+
+/// The masking form: the fold's value `0` fits, but the `128` underneath does not.
+/// requires: true
+/// ensures: y == (2 & 128)
+pub fn contract_masked_literal_out_of_range_is_refused(y: i8) -> i8 {
+    y
+}
+
+/// A sum whose value `200` is out of range for the `i8` it meets.
+/// requires: true
+/// ensures: y == (100 + 100)
+pub fn contract_constant_sum_value_out_of_range_is_refused(y: i8) -> i8 {
+    y
+}
+
+/// A difference whose value `65` *fits*, but whose `128` literal does not -- the
+/// case a value-only check cannot see.
+/// requires: true
+/// ensures: y == (128 - 63)
+pub fn contract_literal_in_difference_out_of_range_is_refused(y: i8) -> i8 {
+    y
+}
+
+/// The control: the same literals under a `u8` partner fit, so the comparison
+/// reads. This keeps the refusal drawn at the range, not at the fold.
+/// requires: x == 200
+/// ensures: x == (200 & 200)
+pub fn contract_fold_literals_in_range_still_read(x: u8) -> u8 {
+    x
+}
+
+/// The control: `-128` is the one bare literal a unary `-` rescues for an `i8`,
+/// because the negated value, not the magnitude, is what meets the type.
+/// requires: y == -128
+/// ensures: ret == y
+pub fn contract_bare_negated_bound_still_reads(y: i8) -> i8 {
+    y
+}
+
+/// A literal *inside* a fold is not rescued by a surrounding `-`: `-(128 - 63)` is
+/// rejected for its inner `128`, unlike `-(128)`.
+/// requires: true
+/// ensures: y == -(128 - 63)
+pub fn contract_literal_in_negated_fold_is_refused(y: i8) -> i8 {
+    y
+}
+
+/// A shift amount that is an untyped complement has no width of its own: `!254` is
+/// `-255` at the `i32` Rust infers (a shift overflow) but `1` at eight bits, so
+/// the shape is refused rather than read at the scope's width.
+/// requires: true
+/// ensures: y < (100 >> (!254))
+pub fn contract_complement_shift_amount_is_refused(y: i8) -> i8 {
+    y
+}

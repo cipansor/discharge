@@ -1583,6 +1583,29 @@ struct Parser<'a> {
     /// `variant_consts` can be reported as a bad variant rather than an unknown
     /// constant.
     enum_args: BTreeSet<String>,
+    /// The `(min, max)` envelope, as `i128`, of the *literals and folded
+    /// intermediate values* in the term a `Var` holds. Rust range-checks every
+    /// literal and every constant `+ - *` intermediate against the type the
+    /// expression is read at, not only the value that meets the comparison:
+    /// `2 & 128` for an `i8` is `literal out of range for i8` although the fold's
+    /// value is `0`, and `128 - 63` is rejected although its value `65` fits.
+    /// The engine folds the term, so the reader can only see the result; this
+    /// map remembers what the result was built from. Terms are hash-consed
+    /// (`smt::mk_term`), so keying on the term id is exact.
+    ///
+    /// A complement (`!128`) is *not* propagated into the envelope through its
+    /// value: the complement's own `Opaque` payload already carries the operand
+    /// that Rust range-checks (`128`), and the complement's *value* (`127`) is
+    /// not a literal. Only a bare literal, a unary `-`, and a `+ - *` fold
+    /// contribute.
+    range: BTreeMap<u32, (i128, i128)>,
+    /// The term ids of *pristine bare literals* (`128`, `1`). A bare literal is
+    /// the one thing Rust does *not* check as written when it sits directly under
+    /// a unary `-`: `-128` is legal for an `i8` even though `128` alone is not,
+    /// because the negated value, not the magnitude, is what meets the type. This
+    /// set tells `parse_neg` apart that case from a literal *inside* a fold, whose
+    /// magnitude is checked as written (`-(128 - 63)` is rejected for its `128`).
+    bare_literals: BTreeSet<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1759,6 +1782,8 @@ impl<'a> Parser<'a> {
             ret_signed,
             variant_consts: BTreeMap::new(),
             enum_args: BTreeSet::new(),
+            range: BTreeMap::new(),
+            bare_literals: BTreeSet::new(),
             ret_absent: "`ret` is only meaningful in `ensures`",
         }
     }
@@ -1881,6 +1906,120 @@ impl<'a> Parser<'a> {
     /// rather than treated as an opaque non-constant.
     fn const_value(&self, v: Var) -> Option<u64> {
         smt::evaluate(v, |_| None)
+    }
+
+    /// Record the `(min, max)` of the *literals and folded intermediates* a
+    /// constant term was built from. Rust range-checks every literal and every
+    /// constant `+ - *` intermediate against the type the expression is read at,
+    /// so `2 & 128` is an `i8` error although the fold's value is `0`; the engine
+    /// folds the term, so this remembers what the value was built from. Terms are
+    /// hash-consed, so the id is a faithful key, and the envelope is only ever
+    /// widened (never narrowed), so a shared subterm keeps the union of its uses.
+    fn record_range(&mut self, v: Var, lo: i128, hi: i128) {
+        let e = self.range.entry(v.0 .0).or_insert((lo, hi));
+        e.0 = e.0.min(lo);
+        e.1 = e.1.max(hi);
+    }
+
+    /// The envelope [`record_range`](Self::record_range) recorded for `v`, if any.
+    fn range_of(&self, v: Var) -> Option<(i128, i128)> {
+        self.range.get(&v.0 .0).copied()
+    }
+
+    /// Record `v`'s envelope as the union of its operands' envelopes, so a
+    /// bitwise, shift or `/`/`%` result carries the literals underneath it to the
+    /// later range check even though the operation itself adds no literal.
+    fn record_range_union(&mut self, v: Var, a: Var, b: Var) {
+        let (mut lo, mut hi) = (i128::MAX, i128::MIN);
+        let mut any = false;
+        for x in [a, b] {
+            if let Some((l, h)) = self.range_of(x) {
+                lo = lo.min(l);
+                hi = hi.max(h);
+                any = true;
+            }
+        }
+        if any {
+            self.record_range(v, lo, hi);
+        }
+    }
+
+    /// Record a constant term's own value as its envelope, as the value Rust
+    /// range-checks it at: an unsigned constant is its magnitude, a signed one is
+    /// its two's-complement value (`128i8` and `i8::MIN` are both `-128`, which is
+    /// legal, where the bare `128` is `+128`, which is not).
+    fn record_const(&mut self, v: Var, signed: bool) {
+        if let Some(val) = self.const_value(v) {
+            let w = smt::bits(v);
+            let sv: i128 = if signed {
+                if w >= 64 {
+                    val as i64 as i128
+                } else if val & (1u64 << (w - 1)) != 0 {
+                    val as i128 - (1i128 << w)
+                } else {
+                    val as i128
+                }
+            } else {
+                val as i128
+            };
+            self.record_range(v, sv, sv);
+        }
+    }
+
+    /// Record a folded `+ - *` result: the union of its operands' envelopes (the
+    /// literals underneath) and the result's own value (the intermediate Rust
+    /// checks). `2 & 128` keeps the `128`; `100 + 100` adds the `200`.
+    fn record_fold_result(&mut self, v: Var, a: Var, b: Var, signed: bool) {
+        self.record_range_union(v, a, b);
+        if self.const_value(v).is_some() {
+            self.record_const(v, signed);
+        }
+    }
+
+    /// Record the envelope of a unary negation. Rust checks the *negated value*,
+    /// so the operand's literals carry over (negated) -- `-(128 - 63)` is rejected
+    /// for the inner `128` even though the negated value `-65` fits. The one
+    /// exception is a pristine bare literal: `-128` is legal for an `i8` even
+    /// though `128` alone is not, because there the negated value *replaces* the
+    /// magnitude rather than sitting inside a fold, so its magnitude is not
+    /// checked. `bare` says the operand is such a literal.
+    fn record_negation(&mut self, nv: Var, operand: Var, bare: bool) {
+        if let Some((lo, hi)) = self.range_of(operand) {
+            if !bare {
+                self.record_range(nv, lo, hi);
+            }
+            self.record_range(nv, -hi, -lo);
+        }
+    }
+
+    /// Refuse a constant whose *literals or folded intermediates* do not fit the
+    /// type they meet. Rust range-checks every literal and every constant `+ - *`
+    /// intermediate against the type the expression is read at -- `2 & 128` is an
+    /// `i8` error although the fold's value is `0`, and `128 - 63` is rejected
+    /// although its value `65` fits -- so a contract the reader would otherwise
+    /// *decide* on a program rustc rejects is refused instead. The envelope is
+    /// recorded by [`record_const`](Self::record_const) and friends; a term with
+    /// no entry (a name, a cast) has nothing to check.
+    fn check_range(&self, v: Var, wide: u8, signed: bool) -> Result<(), SpecError> {
+        let Some((lo, hi)) = self.range_of(v) else {
+            return Ok(());
+        };
+        let fits = |x: i128| {
+            if signed {
+                x >= -(1i128 << (wide - 1)) && x < (1i128 << (wide - 1))
+            } else {
+                x >= 0 && (x as u128) < (1u128 << wide)
+            }
+        };
+        if !fits(lo) || !fits(hi) {
+            let shown = if !fits(lo) { lo } else { hi };
+            return Err(self.err(format!(
+                "a constant value `{shown}` does not fit the operand's {wide}-bit {} type, so \
+                 the shape is refused",
+                if signed { "signed" } else { "unsigned" }
+            )));
+        }
+        Ok(())
     }
 
     /// Refuse a *signed* operand meeting an *unsigned* one, in either order.
@@ -2140,6 +2279,12 @@ impl<'a> Parser<'a> {
     ) -> Result<Var, SpecError> {
         let w = smt::bits(v);
         let val = self.const_value(v).expect("resize_const is only called on a constant");
+        // Every literal and every constant `+ - *` intermediate in the term is
+        // range-checked against the type it meets here, not only the value that
+        // reaches the comparison: `2 & 128` is an `i8` error although its value is
+        // `0`. This is what makes a contract the reader would otherwise decide on a
+        // rustc-rejected program a refusal instead.
+        self.check_range(v, wide, signed)?;
         // An *opaque* constant (`!0`, or a fold that touched a complement) is held
         // at the *scope's* width, and its value depends on the operand width Rust
         // would infer -- `!0` is `-1`/`255`/`65535` by context. A *narrowing* to the
@@ -2476,8 +2621,10 @@ impl<'a> Parser<'a> {
         while self.eat_op("|") {
             let (r, rs) = self.parse_bitxor()?;
             self.refuse_mixed_signedness(left, sgn, r, rs)?;
+            let (pl, pr) = (left, r);
             let (l, r) = self.align_widths(left, sgn, r, rs, Sign::combine(sgn, rs))?;
             left = smt::bor(l, r);
+            self.record_range_union(left, pl, pr);
             sgn = Sign::combine(sgn, rs);
         }
         Ok((left, sgn))
@@ -2488,8 +2635,10 @@ impl<'a> Parser<'a> {
         while self.eat_op("^") {
             let (r, rs) = self.parse_bitand()?;
             self.refuse_mixed_signedness(left, sgn, r, rs)?;
+            let (pl, pr) = (left, r);
             let (l, r) = self.align_widths(left, sgn, r, rs, Sign::combine(sgn, rs))?;
             left = smt::bxor(l, r);
+            self.record_range_union(left, pl, pr);
             sgn = Sign::combine(sgn, rs);
         }
         Ok((left, sgn))
@@ -2500,8 +2649,10 @@ impl<'a> Parser<'a> {
         while self.eat_op("&") {
             let (r, rs) = self.parse_shift()?;
             self.refuse_mixed_signedness(left, sgn, r, rs)?;
+            let (pl, pr) = (left, r);
             let (l, r) = self.align_widths(left, sgn, r, rs, Sign::combine(sgn, rs))?;
             left = smt::band(l, r);
+            self.record_range_union(left, pl, pr);
             sgn = Sign::combine(sgn, rs);
             // `a & mask` is a width-independent *value* when the *whole* result
             // is constant and the mask is width-independent: `&` keeps only the
@@ -2554,7 +2705,21 @@ impl<'a> Parser<'a> {
     fn parse_shift(&mut self) -> Result<(Var, Sign), SpecError> {
         let (mut left, sgn) = self.parse_add()?;
         while let Some(op) = self.eat_any(&["<<", ">>"]) {
-            let (r, _) = self.parse_add()?;
+            let (r, rs) = self.parse_add()?;
+            // An *opaque* amount (a complement, or a fold that touched one) has no
+            // width of its own: `!254` is `-255` at the `i32` Rust infers -- a
+            // negative shift amount, and an overflow error -- but `1` at eight bits.
+            // Its value, and whether the shift is in range at all, depends on the
+            // width the result is read at, so the shape is refused rather than read
+            // at the scope's width. A bare literal or a fold of bare literals has
+            // one value at any width (`1 + 1` is `2`), and `!0 & 1` is masked to
+            // `1` and marked `Literal`, so those still read.
+            if rs.is_opaque() {
+                return Err(self.err(
+                    "a shift amount that is an untyped complement is not modelled: its value \
+                     depends on the operand's width",
+                ));
+            }
             // The amount must be *constant*, but not necessarily a bare literal:
             // `x >> 1 + 1` is `x >> 2` in Rust, and the additive level above has
             // already folded it. `const_value` evaluates a variable-free term, so a
@@ -2565,6 +2730,7 @@ impl<'a> Parser<'a> {
             let Some(k) = self.const_value(r) else {
                 return Err(self.err("a shift amount in a contract must be a constant"));
             };
+            let base = left;
             let w = smt::bits(left);
             if k >= w as u64 {
                 return Err(self.err(format!(
@@ -2637,6 +2803,9 @@ impl<'a> Parser<'a> {
                     }
                 }
             };
+            // The shift's operand literals are still checked by Rust
+            // (`128 >> 0` is rejected for its `128`), so they carry through.
+            self.record_range_union(left, base, base);
         }
         Ok((left, sgn))
     }
@@ -2651,22 +2820,23 @@ impl<'a> Parser<'a> {
             // `x + -1 >= 0` for every `x` -- a false proof, exactly as at the
             // comparison level. Refused before the operands are aligned.
             self.refuse_mixed_signedness(left, sgn, r, rs)?;
-            // A literal operand is sized to the other one, exactly as in a
-            // comparison. Without this, `ret == a + 5` with a slice length in
-            // scope adds an 8-bit `a` to a 64-bit `5`, which `bin_word` reports
-            // as ill-formed -- and that poisons every obligation in the run, so
-            // the function is undecided for a reason unrelated to its body.
+            // Capture the pre-align operands: `align_widths` rebuilds a constant
+            // at the common width, and the rebuilt term carries no envelope, so the
+            // union must be taken from the terms the literals were recorded on.
+            let (pl, pr) = (left, r);
             let (l, r) = self.align_widths(left, sgn, r, rs, Sign::combine(sgn, rs))?;
             // A constant sum or difference is folded *exactly*, so a result that
             // overflows the operand width is refused (as rustc refuses the
             // constant expression) instead of wrapping to a wrong value. A result
             // that fits is left to the ordinary operator.
             if let Some((v, s)) = self.fold_const_arith(op, l, sgn, r, rs)? {
+                self.record_fold_result(v, pl, pr, s.eval());
                 left = v;
                 sgn = s;
                 continue;
             }
             left = if op == "+" { smt::add(l, r) } else { smt::sub(l, r) };
+            self.record_fold_result(left, pl, pr, Sign::combine(sgn, rs).eval());
             sgn = Sign::combine(sgn, rs);
         }
         Ok((left, sgn))
@@ -2721,12 +2891,14 @@ impl<'a> Parser<'a> {
             }
             // Same width rule as the other operators: a literal product, divisor
             // or mask is sized to the operand it meets.
+            let (pl, pr) = (left, r);
             let (l, r) = self.align_widths(left, sgn, r, rs, Sign::combine(sgn, rs))?;
             // A constant `/` or `%` can overflow (`i8::MIN / -1`), which rustc
             // rejects; the fold refuses it rather than wrapping. `*` is folded
             // exactly, so a constant product too wide for the operand is refused
             // instead of wrapping to a wrong value.
             if let Some((v, s)) = self.fold_const_arith(op, l, sgn, r, rs)? {
+                self.record_fold_result(v, pl, pr, s.eval());
                 left = v;
                 sgn = s;
                 continue;
@@ -2739,6 +2911,7 @@ impl<'a> Parser<'a> {
                 "%" if signed => smt::srem(l, r),
                 _ => smt::urem(l, r),
             };
+            self.record_fold_result(left, pl, pr, signed);
             sgn = Sign::combine(sgn, rs);
         }
         Ok((left, sgn))
@@ -2814,13 +2987,21 @@ impl<'a> Parser<'a> {
                 // `-mag` fits signed at `w` bits iff `mag <= 2^(w-1)`.
                 let fits = w >= 64 || mag <= (1u64 << (w - 1));
                 if !fits {
-                    return Ok((
-                        smt::sub(smt::word(0, w + 1), smt::word(mag, w + 1)),
-                        out,
-                    ));
+                    let nv = smt::sub(smt::word(0, w + 1), smt::word(mag, w + 1));
+                    self.record_negation(nv, v, true);
+                    return Ok((nv, out));
                 }
             }
-            return Ok((smt::sub(smt::word(0, w), v), out));
+            // A unary `-` is checked as Rust checks the *negated value*: `-(-128)`
+            // is `128`, out of range for an `i8`, where `-128` is fine. The one
+            // exception is a pristine bare literal (`-128`), whose magnitude is
+            // *replaced* by the negation rather than checked, so the operand's own
+            // value is not carried through -- but a literal inside a fold is
+            // (`-(128 - 63)` is rejected for its `128`).
+            let bare = self.bare_literals.contains(&v.0 .0);
+            let nv = smt::sub(smt::word(0, w), v);
+            self.record_negation(nv, v, bare);
+            return Ok((nv, out));
         }
         // `!` is a unary prefix on a *value* here, because `bang_is_predicate`
         // ruled out the predicate reading above. On an integer it is bitwise NOT,
@@ -2860,10 +3041,18 @@ impl<'a> Parser<'a> {
                     Sign::Opaque(_) => sgn.opaque_operand(),
                     _ => None,
                 };
-                return Ok((smt::word(!val & mask, w), Sign::Opaque(operand)));
+                let cv = smt::word(!val & mask, w);
+                // The complement's operand literals are still checked by Rust
+                // (`!(128 - 63)` is rejected for its `128`), and the complement's
+                // own value (`127`) is not a literal, so the envelope is the
+                // operand's alone -- not the complement's value.
+                self.record_range_union(cv, v, v);
+                return Ok((cv, Sign::Opaque(operand)));
             }
             let w = smt::bits(v);
-            return Ok((smt::bxor(v, smt::all_ones(w)), sgn));
+            let cv = smt::bxor(v, smt::all_ones(w));
+            self.record_range_union(cv, v, v);
+            return Ok((cv, sgn));
         }
         self.parse_atom()
     }
@@ -2911,7 +3100,9 @@ impl<'a> Parser<'a> {
                         )));
                     }
                     let sign = if signed { Sign::Signed } else { Sign::Unsigned };
-                    return Ok((smt::word(n, w), sign));
+                    let v = smt::word(n, w);
+                    self.record_const(v, signed);
+                    return Ok((v, sign));
                 }
                 // A literal is built wide enough to *hold* its own value, and at
                 // least as wide as the widest name in scope. Both halves matter:
@@ -2935,7 +3126,10 @@ impl<'a> Parser<'a> {
                 let w = scope.max(need).min(64);
                 // A *bare* literal is untyped and non-negative: its value is
                 // unambiguous, but its signedness is not yet known.
-                Ok((smt::word(n, w), Sign::Literal))
+                let v = smt::word(n, w);
+                self.record_const(v, false);
+                self.bare_literals.insert(v.0 .0);
+                Ok((v, Sign::Literal))
             }
             Some(Tok::Ident(name)) => {
                 self.pos += 1;
@@ -4064,7 +4258,14 @@ mod tests {
         for text in ["y <= (!128)", "y <= (!255)", "y <= (!!128)", "y <= (!(64 + 64))"] {
             let mut p = Parser::new(text, &args, None, &signed, false);
             let err = p.parse_or().expect_err("an out-of-range complement must be refused");
-            assert!(format!("{err}").contains("complement"), "`{text}`: got {err}");
+            let msg = format!("{err}");
+            // Either the complement's own operand check or the per-literal range
+            // check may be the one that fires (the fold `64 + 64` is refused for
+            // its own `128`); both are the refusal this test is about.
+            assert!(
+                msg.contains("complement") || msg.contains("does not fit"),
+                "`{text}`: got {msg}"
+            );
         }
         // A complement whose operand *fits* the type it meets still reads, so the
         // refusal is drawn at the range, not at `!`.
@@ -4075,6 +4276,62 @@ mod tests {
                 r.is_ok(),
                 "`{text}` fits the operand type and reads: {:?}",
                 r.err().map(|e| format!("{e}"))
+            );
+        }
+    }
+
+    /// Every literal and every constant `+ - *` intermediate is range-checked
+    /// against the type the expression meets, not only the fold's value.
+    ///
+    /// The reader folds a constant expression to a single value, and used to
+    /// range-check only that value. So `2 & 128` for an `i8` -- a rustc `literal
+    /// out of range` error, since the `128` does not fit -- was read as `0` and
+    /// *decided*, and `128 - 63` -- also rejected for its `128`, although its value
+    /// `65` fits -- likewise. The envelope of the literals underneath the fold is
+    /// what closes this, so both are refused.
+    #[test]
+    fn a_literal_inside_a_constant_fold_is_range_checked_too() {
+        let mut args = BTreeMap::new();
+        args.insert("y".to_string(), smt::var(8));
+        args.insert("x".to_string(), smt::var(8));
+        args.insert("a".to_string(), smt::var(16));
+        let mut signed = BTreeSet::new();
+        signed.insert("y".to_string());
+        // Each is a rustc `literal out of range` error for the type it meets, so
+        // the reader refuses rather than decides on a program rustc rejects.
+        for text in [
+            "y == (200 & 200)",
+            "y == (2 & 128)",
+            "y == (100 + 100)",
+            "y == ((100 + 100) & 0)",
+            "y == (128 - 63)",
+            "y == (200 | 0)",
+            "y <= (2 & 128)",
+        ] {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            let err = p.parse_or().expect_err("an out-of-range literal must be refused");
+            assert!(
+                format!("{err}").contains("does not fit"),
+                "`{text}`: got {err}"
+            );
+        }
+        // The same value is fine where the literal *does* fit: `200 & 200` is a
+        // `u8` expression, and `-128` is the one bare literal a unary `-` may
+        // rescue for an `i8` (the negated value is checked, not the magnitude).
+        for text in ["x == (200 & 200)", "x == (255 & 255)", "y == -128", "y == (-128)"] {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            assert!(
+                p.parse_or().is_ok(),
+                "`{text}` fits the type it meets and reads"
+            );
+        }
+        // A literal inside a fold is *not* rescued by a surrounding `-`:
+        // `-(128 - 63)` is rejected for its inner `128`, unlike `-(128)`.
+        for text in ["y == -(128 - 63)", "y == -(-128)"] {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            assert!(
+                p.parse_or().is_err(),
+                "`{text}` has an out-of-range literal and must be refused"
             );
         }
     }
