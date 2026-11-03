@@ -962,6 +962,36 @@ well-behaved paths. The amounts now span `0..=11` (including `k == width` and ju
 and a dedicated test drives `k` in `{8, 9, 255, 256, 300, u32::MAX}` and compares the parsed
 meaning against the engine's rule for every input.
 
+## A subexpression is read at its own type, not the surrounding operand's
+
+Two reader bugs were the same mistake: a subexpression sized to the surrounding operand's
+width instead of the width Rust gives it. Both let the reader *decide* a program rustc
+rejects.
+
+A shift *amount* is a value of its own type. Rust leaves an unsuffixed amount's type
+unconstrained, so it defaults to `i32` and is folded at 32 bits, but the reader sized a bare
+literal to the widest name in scope. At an eight-bit scope `x >> (2 << 7)` wrapped the amount
+to `0` and read as `x >> 0`, and `x >> (2 << 7) == 0` was decided -- false at `x == 0` --
+where rustc computes `256` and rejects the shift. `Parser::amount_depth` counts nesting inside
+an amount and floors a bare literal there at 32 bits. A *suffixed* amount keeps its suffix's
+width, so only the bare path is floored.
+
+A negation of a constant is checked against the *value* the constant denotes, not the written
+magnitude. `i8::MIN` is the bit pattern `128` and the value `-128`, and the legal literal
+`128i8` has the same pattern, so the magnitude check passed `-(i8::MIN)` and recorded the
+in-range `-128` -- deciding a program rustc rejects ("attempt to negate `i8::MIN`, which would
+overflow"). `3 << 7` at eight bits wraps to the same pattern, so `-(3 << 7)` was decided too.
+A pristine literal stays exempt, because there the negation is what makes the magnitude legal
+(`-128i8` reads). The pattern to reach for: when a constant's *spelling* and its *value* can
+differ (a bound, an inner negation, a wrapped fold), a check written against the spelling is a
+check against the wrong thing.
+
+The parser recurses once per nesting level and a debug build gives each frame kilobytes, so a
+contract with a nested amount (`x >> ((2 << 7) + 1)`) needs more than the 2 MiB a test thread
+gets by default and overflows the stack. That is *not* a bug in the reader -- the parse is
+shallow and terminates -- it is a stack budget, and `tests/mir.rs` now runs the corpus on a
+64 MiB worker thread, the same harness `tests/shift.rs` and `tests/signed.rs` use.
+
 ## Two rules, one program: `verify` and `wp` must agree
 
 `verify` runs `collect`, which checks `Stmt::frame` at every call and reports a bad frame as
