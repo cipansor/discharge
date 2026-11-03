@@ -3549,6 +3549,45 @@ fn a_sign_ambiguous_untyped_fold_is_refused() {
     }
 }
 
+/// The written magnitude of a suffixed literal is what Rust range-checks, and a
+/// complement's operand envelope must not leak onto an unrelated literal that
+/// shares the complement's value term.
+///
+/// `128i8` alone is a `literal out of range for i8` error and only `-128i8` is
+/// legal, because the negation is what meets the type. Recording the *signed value*
+/// (`-128`) instead of the written magnitude made the negation add `+128` to the
+/// envelope and refuse the valid `-128i8`; it also made the positive `128i8`, which
+/// rustc rejects, read as the in-range `-128` -- a wrong verdict in both directions.
+/// The complement is worse: at eight bits `!128` is the constant `127`, which the
+/// engine hash-conses with a separately written bare `127`, so recording the
+/// operand envelope (`128`) on that shared id skipped the valid
+/// `x == !128 && y == 127`. The envelope now travels in the operand's own payload.
+#[test]
+fn a_suffixed_minimum_and_a_complement_operand_are_checked_where_they_are_written() {
+    for name in [
+        "contract_suffixed_positive_min_magnitude_is_refused",
+        "contract_double_negated_min_is_refused",
+        "contract_complement_operand_out_of_range_is_refused",
+        "contract_negated_complement_operand_is_refused",
+    ] {
+        let Some(report) = verify_realistic(&[name]) else { return };
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Skipped { .. }),
+            "`{name}` is a rustc range error and must be refused, never given a verdict, got: {o}"
+        );
+    }
+    for name in [
+        "contract_suffixed_min_literal_still_reads",
+        "contract_suffixed_positive_literal_still_reads",
+        "contract_complement_does_not_pollute_a_bare_literal",
+    ] {
+        let Some(report) = verify_realistic(&[name]) else { return };
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "{name} is valid Rust and must verify, got: {o}");
+    }
+}
+
 /// An *opaque* constant (a complement) widened to a wider operand is refused, and
 /// a *fold* is not.
 ///

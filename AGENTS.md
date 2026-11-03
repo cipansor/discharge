@@ -5144,3 +5144,45 @@ fix asks *is it valid at the signedness it meets?* A complement is a value with 
 its own, and "no type" means no width **and** no sign — the reader must refuse the shape
 whenever either is unknown and the answer depends on it.
 
+
+## Two over-refusals in constant-fold sign handling (finding 1 and finding 2)
+
+An AI review of the `license-arith-mir-oracle` branch flagged two shapes the reader refused
+that rustc accepts. Both reproduce; both were regressions from `afc3daa` (the fold-literal
+range check) and `8b761d2` (the complement-operand check).
+
+**Finding 1 — a suffixed literal is range-checked by its *written magnitude*, not its value.**
+`y == -128i8` for an `i8` was `skipped` (unreadable). `128i8` alone is a `literal out of range
+for i8` error, and only `-128i8` is legal because the negation is what meets the type. The
+suffixed-literal path recorded the *signed value* (`record_const`, which yields `-128` for the
+pattern `0x80`), so the unary `-` then added `+128` to the envelope and refused the valid
+`-128i8`; worse, the positive `128i8` — which rustc rejects — was read as the in-range `-128`.
+The fix records the *written magnitude* (`record_range(v, n, n)` with `n` the parsed literal)
+and inserts the term into `bare_literals`, so a direct unary `-` *replaces* the envelope
+(`-128i8` reads) while `128i8` and `-(-128i8)` are refused. The same holds at `i16`
+(`-32768i16` reads, `32768i16` refused).
+
+**Finding 2 — a complement's operand envelope must not ride on the complement's *value* term.**
+`x == !128 && y == 127` for a `u8` and an `i8` — both valid Rust — was `skipped`. At eight
+bits `!128` is the constant `127`, which the SMT arena hash-conses with a separately written
+bare `127`, so recording the operand envelope (`128`) in the term-keyed `range` map attached
+it to that innocent literal and refused the whole contract. The envelope now travels in the
+`Sign::Opaque` payload as an `(i128, i128)` *(min, max)* envelope instead of the `range` map.
+It is unioned through folds (`Sign::union_env`) and threaded through the `&`-downgrade and the
+unary `-`, both of which record it on their *compound* result term (a `Band`/`Sub` node, never
+hash-consed with a bare literal) before the sign is downgraded and the envelope would be lost.
+A nested complement (`!!128`) propagates the innermost envelope; `!(128 - 63)` carries
+`(63, 128)` so the `128` is still refused.
+
+**Evidence.** `diff_const.py` went from **166 discrepancies** on seed `1` at the parent
+commit to **≤ 1**, with `UNSOUND` staying **0** on all ten seeds (`1 2 3 5 13 99 101 777 42 7`,
+3000 iterations each ≈ 12 000 cases). The one residual is a pre-existing shift-amount class
+(`31 >> (16 << 5)`), unrelated to sign handling. Unit tests
+`a_suffixed_minimum_literal_is_checked_as_written` and
+`a_complement_operand_does_not_pollute_a_bare_literal`; corpus test
+`a_suffixed_minimum_and_a_complement_operand_are_checked_where_they_are_written`. Test-count
+**589 → 592**; corpus **152/279 → 155/286**. Gate green.
+
+The lesson: a literal's *range* is a property of how it is written, and provenance (which
+literal an envelope came from) must travel with the *expression*, never be keyed on a value
+term the engine hash-conses — a value term is shared by every expression that computes it.

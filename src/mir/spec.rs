@@ -1462,11 +1462,16 @@ enum Sign {
     Literal,
     /// An untyped constant that is not a bare literal -- the complement of one
     /// (`!0`, `!128`) -- whose sign cannot be recovered, so it takes the operand's.
-    /// The payload is the complement's *operand literal* (`Some(128)` for `!128`),
-    /// because Rust range-checks that operand against the type the complement meets
-    /// even though the reader holds the complement value. `None` when the operand
-    /// is not tracked, which is the conservative reading: the fit cannot be shown.
-    Opaque(Option<u64>),
+    /// The payload is the *(min, max) envelope of the operand literals* Rust
+    /// range-checks against the type the complement meets -- `(128, 128)` for
+    /// `!128`, `(63, 128)` for `!(128 - 63)` -- because Rust checks those literals
+    /// even though the reader holds the complement's value. It is carried here
+    /// rather than recorded in the `range` map: the complement's value term is a
+    /// plain constant (`!128` is `word(127, 8)`), so it is *hash-consed with an
+    /// unrelated bare `127`* and attaching the operand's envelope to that id made
+    /// the reader refuse the innocent literal. `None` when the operand is not a
+    /// tracked constant, which is the conservative reading: the fit cannot be shown.
+    Opaque(Option<(i128, i128)>),
 }
 
 impl Sign {
@@ -1487,8 +1492,8 @@ impl Sign {
     fn is_opaque(self) -> bool {
         matches!(self, Sign::Opaque(_))
     }
-    /// The complement operand's magnitude, when it is tracked.
-    fn opaque_operand(self) -> Option<u64> {
+    /// The complement operand literals' envelope, when it is tracked.
+    fn opaque_operand(self) -> Option<(i128, i128)> {
         if let Sign::Opaque(m) = self {
             m
         } else {
@@ -1537,9 +1542,11 @@ impl Sign {
                 Sign::Unsigned
             }
         } else if a.is_opaque() || b.is_opaque() {
-            // A fold of complements (`!0 + 2`) has no tracked operand, so the fit
-            // cannot be shown; `None` is the conservative payload.
-            Sign::Opaque(a.opaque_operand().or(b.opaque_operand()))
+            // A fold of complements (`!0 + 2`) has no tracked operand of its own;
+            // the operands' literal envelopes are unioned, so a literal anywhere
+            // under the fold is still range-checked where the fold is read. `None`
+            // only when neither side carried one (the conservative reading).
+            Sign::Opaque(Sign::union_env(a.opaque_operand(), b.opaque_operand()))
         } else if a == Sign::NegLiteral || b == Sign::NegLiteral {
             Sign::NegLiteral
         } else {
@@ -1550,6 +1557,15 @@ impl Sign {
     /// literal, so signed and unsigned readings of it differ?
     fn ambiguous(self) -> bool {
         self.is_opaque()
+    }
+    /// The union of two optional envelopes: the min of the mins and the max of the
+    /// maxes, or the one that is present when only one is.
+    fn union_env(a: Option<(i128, i128)>, b: Option<(i128, i128)>) -> Option<(i128, i128)> {
+        match (a, b) {
+            (Some((alo, ahi)), Some((blo, bhi))) => Some((alo.min(blo), ahi.max(bhi))),
+            (Some(e), None) | (None, Some(e)) => Some(e),
+            (None, None) => None,
+        }
     }
 }
 
@@ -2354,18 +2370,23 @@ impl<'a> Parser<'a> {
                      operand's width, which is not known where it is read",
                 ));
             }
-            if let Some(m) = own.opaque_operand() {
+            if let Some((lo, hi)) = own.opaque_operand() {
                 // The type the complement meets is the operand's: signed up to
-                // `2^(W-1)`, unsigned up to `2^W - 1`. A tracked operand that
-                // exceeds it is a shape rustc rejects, so the contract is refused.
-                let max = if signed {
-                    (1u128 << (wide - 1)) - 1
+                // `2^(W-1) - 1`, unsigned up to `2^W - 1`. A tracked operand
+                // literal that exceeds it is a shape rustc rejects, so the contract
+                // is refused. The envelope is the operand literals' union, so a
+                // literal anywhere under the complement is checked (`!(128 - 63)`
+                // is refused for its `128`), and its *low* end is checked too: a
+                // negated operand can leave the envelope negative (`!(-7)`).
+                let (min, max) = if signed {
+                    (-(1i128 << (wide - 1)), (1i128 << (wide - 1)) - 1)
                 } else {
-                    (1u128 << wide) - 1
+                    (0, (1i128 << wide) - 1)
                 };
-                if u128::from(m) > max {
+                if lo < min || hi > max {
+                    let shown = if lo < min { lo } else { hi };
                     return Err(self.err(format!(
-                        "the complement of `{m}` does not fit the operand's {wide}-bit \
+                        "the complement of `{shown}` does not fit the operand's {wide}-bit \
                          {} type, so the shape is refused",
                         if signed { "signed" } else { "unsigned" }
                     )));
@@ -2724,6 +2745,19 @@ impl<'a> Parser<'a> {
                 && (sgn == Sign::Literal || rs == Sign::Literal)
                 && Sign::combine(sgn, rs).typed().is_none()
             {
+                // `&` keeps only the mask's low bits, so the *value* is
+                // width-independent and may widen like a literal -- but the operand
+                // literals are still range-checked by Rust (`!200 & 64` is rejected
+                // for its `200`, `!128 & 255` for its `128`). Those literals travel
+                // in the operands' `Opaque` envelopes, not the `range` map, so they
+                // must be folded into the result *before* the sign is downgraded and
+                // the envelopes are lost. The result term is a compound `&` node,
+                // never hash-consed with a bare literal, so recording on it cannot
+                // pollute an unrelated constant the way the complement's own value
+                // term did.
+                if let Some((lo, hi)) = Sign::union_env(sgn.opaque_operand(), rs.opaque_operand()) {
+                    self.record_range(left, lo, hi);
+                }
                 sgn = Sign::Literal;
             }
         }
@@ -3046,6 +3080,15 @@ impl<'a> Parser<'a> {
             let bare = self.bare_literals.contains(&v.0 .0);
             let nv = smt::sub(smt::word(0, w), v);
             self.record_negation(nv, v, bare);
+            // A negated complement carries the complement's operand envelope
+            // forward: the negation is a *value*, so the envelope cannot ride in
+            // the sign, and `-!128` for an `i8` is a rustc error for the same `128`
+            // that `!128` is. The negation term is a compound `Sub` node, never
+            // hash-consed with a bare literal, so recording on it cannot pollute an
+            // unrelated constant.
+            if let Some((lo, hi)) = sgn.opaque_operand() {
+                self.record_range(nv, lo, hi);
+            }
             return Ok((nv, out));
         }
         // `!` is a unary prefix on a *value* here, because `bang_is_predicate`
@@ -3074,24 +3117,24 @@ impl<'a> Parser<'a> {
                 let val = self.const_value(v).expect("checked above");
                 let w = smt::bits(v);
                 let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                // The operand is carried so its fit can be checked against the type
-                // the complement meets (`!128` is an `i8` range error). A bare
-                // literal operand contributes its value; a nested complement
-                // (`!!128`) propagates the innermost literal, because Rust checks
-                // that same literal against the type the outermost complement
-                // meets. A fold's operand is not a single literal, so it carries
-                // `None` and the fit cannot be shown.
+                // The operand's literal envelope is carried so its fit can be
+                // checked against the type the complement meets (`!128` is an `i8`
+                // range error). A bare literal operand contributes its value; a
+                // nested complement (`!!128`) propagates the innermost envelope,
+                // because Rust checks those same literals against the type the
+                // outermost complement meets. A fold's operand carries the union of
+                // its literals (`!(128 - 63)` is `(63, 128)`). It travels in the
+                // `Opaque` payload, *not* in the `range` map: the complement's value
+                // is a plain constant (`!128` is `word(127, 8)`), so it is
+                // hash-consed with an unrelated bare `127`, and recording the
+                // operand's envelope on that shared id refused the innocent literal
+                // (`x == !128 && y == 127` for a `u8` and an `i8` was skipped).
                 let operand = match sgn {
-                    Sign::Literal => Some(val),
-                    Sign::Opaque(_) => sgn.opaque_operand(),
+                    Sign::Literal | Sign::NegLiteral => self.range_of(v),
+                    Sign::Opaque(env) => env.or_else(|| self.range_of(v)),
                     _ => None,
                 };
                 let cv = smt::word(!val & mask, w);
-                // The complement's operand literals are still checked by Rust
-                // (`!(128 - 63)` is rejected for its `128`), and the complement's
-                // own value (`127`) is not a literal, so the envelope is the
-                // operand's alone -- not the complement's value.
-                self.record_range_union(cv, v, v);
                 return Ok((cv, Sign::Opaque(operand)));
             }
             let w = smt::bits(v);
@@ -3146,7 +3189,19 @@ impl<'a> Parser<'a> {
                     }
                     let sign = if signed { Sign::Signed } else { Sign::Unsigned };
                     let v = smt::word(n, w);
-                    self.record_const(v, signed);
+                    // Rust range-checks the *written magnitude* of a suffixed
+                    // literal, not the two's-complement value it denotes: `128i8`
+                    // alone is out of range, and only `-128i8` is legal, because the
+                    // negation is what meets the type. Recording the signed value
+                    // instead made the negation add `+128` to the envelope and refuse
+                    // the valid `-128i8` (and, worse, made the positive `128i8` --
+                    // which rustc rejects -- read as the in-range `-128`). Recording
+                    // the magnitude, and marking the literal pristine so a direct `-`
+                    // *replaces* it, keeps both right: `-128i8` reads, `128i8` is
+                    // refused, and `-(-128i8)` (`128`, out of range) is refused too.
+                    let mag = i128::from(n);
+                    self.record_range(v, mag, mag);
+                    self.bare_literals.insert(v.0 .0);
                     return Ok((v, sign));
                 }
                 // A literal is built wide enough to *hold* its own value, and at
@@ -4444,6 +4499,100 @@ mod tests {
                 r.err().map(|e| format!("{e}"))
             );
         }
+    }
+
+    /// The written magnitude of a suffixed literal is what Rust range-checks, not
+    /// the two's-complement value it denotes.
+    ///
+    /// `128i8` alone is a `literal out of range for i8` error, and only `-128i8`
+    /// is legal, because the negation is what meets the type. Recording the signed
+    /// value (`-128`) made the negation add `+128` to the envelope and refuse the
+    /// valid `-128i8`; it also made the positive `128i8`, which rustc rejects, read
+    /// as the in-range `-128`. Both are pinned here, with the same shape at sixteen
+    /// bits.
+    #[test]
+    fn a_suffixed_minimum_literal_is_checked_as_written() {
+        let mut args = BTreeMap::new();
+        args.insert("y".to_string(), smt::var(8));
+        let mut signed = BTreeSet::new();
+        signed.insert("y".to_string());
+        // `-128i8` is legal (`i8::MIN`) and must read.
+        for text in ["y == -128i8", "y == -(128i8)", "y == i8::MIN"] {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            let r = p.parse_or();
+            assert!(r.is_ok(), "`{text}` is legal and must read: {:?}", r.err().map(|e| format!("{e}")));
+        }
+        // A positive use of the magnitude, and a double negation, are errors.
+        for text in ["y == 128i8", "y == -(-128i8)"] {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            let err = p.parse_or().expect_err("an out-of-range magnitude is refused");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("does not fit") || msg.contains("out of range"),
+                "`{text}`: got {msg}"
+            );
+        }
+        // The same at sixteen bits, where the minimum is `-32768i16`.
+        let mut args = BTreeMap::new();
+        args.insert("b".to_string(), smt::var(16));
+        let mut signed = BTreeSet::new();
+        signed.insert("b".to_string());
+        for text in ["b == -32768i16", "b == -(32768i16)", "b == i16::MIN"] {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            let r = p.parse_or();
+            assert!(r.is_ok(), "`{text}` is legal and must read: {:?}", r.err().map(|e| format!("{e}")));
+        }
+        let mut p = Parser::new("b == 32768i16", &args, None, &signed, false);
+        assert!(p.parse_or().is_err(), "`32768i16` alone is out of range for an `i16`");
+    }
+
+    /// A complement's operand literals are range-checked where the complement is
+    /// read, but they must not leak onto an unrelated literal that shares the
+    /// complement's *value* term.
+    ///
+    /// At eight bits `!128` is the constant `127`, so it is hash-consed with a
+    /// separately written bare `127`. Recording the operand's envelope (`128`) in
+    /// the global term-keyed map attached it to that innocent `127`, and
+    /// `x == !128 && y == 127` for a `u8` and an `i8` -- both valid Rust -- was
+    /// skipped. The envelope now travels in the `Opaque` payload, so the bare
+    /// literal is untouched while `!128` against an `i8` is still refused.
+    #[test]
+    fn a_complement_operand_does_not_pollute_a_bare_literal() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::var(8));
+        args.insert("y".to_string(), smt::var(8));
+        let mut signed = BTreeSet::new();
+        signed.insert("y".to_string());
+        // Both conjuncts are valid Rust; the reader must read the whole contract.
+        for text in [
+            "x == !128 && y == 127",
+            "y == 127 && x == !128",
+            "x == !0 && y == 127",
+        ] {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            let r = p.parse_or();
+            assert!(r.is_ok(), "`{text}` is valid Rust and must read: {:?}", r.err().map(|e| format!("{e}")));
+        }
+        // The complement against an `i8` is still a `literal out of range` error.
+        for text in ["y == !128", "y <= (!128)"] {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            let err = p.parse_or().expect_err("`!128` for an `i8` is out of range");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("complement") || msg.contains("does not fit"),
+                "`{text}`: got {msg}"
+            );
+        }
+        // The refusal survives a unary `-` around the complement: the envelope must
+        // travel through the negation, which is a *value* and cannot carry it in the
+        // sign. `-!128` for an `i8` is a rustc error for the same operand `128`.
+        let mut p = Parser::new("y <= (-(!128))", &args, None, &signed, false);
+        let err = p.parse_or().expect_err("`-!128` for an `i8` is out of range");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("complement") || msg.contains("does not fit"),
+            "`y <= (-(!128))`: got {msg}"
+        );
     }
 
     /// A shift of an *untyped* constant is refused when it is only valid at the

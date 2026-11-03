@@ -3238,3 +3238,74 @@ pub fn contract_agreeing_untyped_fold_still_reads(x: u8) -> u8 {
     x
 }
 
+// ---------------------------------------------------------------------------
+// The written magnitude of a suffixed literal is what Rust range-checks, and a
+// complement's operand envelope must not leak onto an unrelated literal that
+// shares the complement's value term.
+//
+// `128i8` alone is a `literal out of range for i8` error and only `-128i8` is
+// legal, because the negation is what meets the type. Recording the *signed value*
+// (`-128`) instead of the written magnitude made the negation add `+128` to the
+// envelope and refuse the valid `-128i8`; it also made the positive `128i8`, which
+// rustc rejects, read as the in-range `-128` -- a wrong verdict in both directions.
+//
+// The complement is worse: at eight bits `!128` is the constant `127`, which the
+// engine hash-conses with a separately written bare `127`. Recording the operand
+// envelope (`128`) in the global term-keyed map attached it to that innocent `127`,
+// so `x == !128 && y == 127` for a `u8` and an `i8` -- both valid Rust -- was
+// skipped. The envelope now travels in the operand's own payload.
+//
+// These first two are `skipped`: the shapes are rustc range errors.
+/// requires: true
+/// ensures: y == 128i8
+pub fn contract_suffixed_positive_min_magnitude_is_refused(y: i8) -> i8 {
+    y
+}
+
+/// requires: true
+/// ensures: y == -(-128i8)
+pub fn contract_double_negated_min_is_refused(y: i8) -> i8 {
+    y
+}
+
+/// The control: `-128i8` is the one suffixed literal a unary `-` rescues, because
+/// the negated value, not the magnitude, is what meets the type. It must read.
+/// requires: y == -128i8
+/// ensures: ret == y
+pub fn contract_suffixed_min_literal_still_reads(y: i8) -> i8 {
+    y
+}
+
+/// The control: a plain positive suffixed literal well inside range reads.
+/// requires: b == 128i16
+/// ensures: ret == b
+pub fn contract_suffixed_positive_literal_still_reads(b: i16) -> i16 {
+    b
+}
+
+/// The two-conjunct case: `x == !128` is a legal `u8` complement and `y == 127` is
+/// a legal `i8` comparison. The complement's operand (`128`) must not be charged to
+/// the unrelated `127`, so the whole contract reads.
+/// requires: x == !128 && y == 127
+/// ensures: ret == 0
+pub fn contract_complement_does_not_pollute_a_bare_literal(x: u8, y: i8) -> u8 {
+    let _ = (x, y);
+    0
+}
+
+/// The refusal the complement still owes: `!128` against an `i8` is a `literal out
+/// of range for i8` error, because Rust checks the operand `128`.
+/// requires: true
+/// ensures: y <= (!128)
+pub fn contract_complement_operand_out_of_range_is_refused(y: i8) -> i8 {
+    y
+}
+
+/// The refusal survives a unary `-` around the complement: `-!128` for an `i8` is a
+/// rustc error for the same operand `128`, so the envelope must travel through the
+/// negation, which is a *value* and cannot carry it in the sign.
+/// requires: true
+/// ensures: (-(!128)) <= y
+pub fn contract_negated_complement_operand_is_refused(y: i8) -> i8 {
+    y
+}
