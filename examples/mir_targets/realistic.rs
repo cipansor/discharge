@@ -3026,3 +3026,52 @@ pub fn contract_mixed_signedness_add_is_refused(a: i8, b: u8) -> u8 {
 pub fn contract_same_signedness_compare_still_reads(a: i8, b: i8) -> i8 {
     a
 }
+
+// ---------------------------------------------------------------------------
+// A shift of an *untyped* constant is refused, because its width is inferred.
+//
+// `255 >> 8` looks fine at the scope's width (32, from a `u32` name in scope),
+// but the operand has no type of its own: Rust infers its width from where the
+// shift is read, and against a `u8` partner `255` is a `u8` and a shift by its own
+// width is a compile error. The reader verified `255 >> 8 <= x` for a `u8` `x`, a
+// false proof on a program rustc rejects. The amount must be below the narrowest
+// width, and a literal operand must fit an 8-bit signed value, or the shift is
+// refused -- a skipped function, not a wrong verdict.
+//
+// These are `skipped`, not `verified` and not `failed`.
+/// requires: true
+/// ensures: (255 >> 8) <= x
+pub fn contract_untyped_shift_amount_over_narrow_width_is_refused(x: u8) -> u8 {
+    x
+}
+
+/// The left-shift form, and an amount over the narrowest width again.
+/// requires: true
+/// ensures: (!0 << 8) <= x
+pub fn contract_untyped_left_shift_amount_over_narrow_width_is_refused(x: u8) -> u8 {
+    x
+}
+
+/// The same shape where the operand, not the amount, is what the narrow partner
+/// rejects: `255` is a rustc `literal out of range` for an `i8`.
+/// requires: true
+/// ensures: (255 >> 1) >= y
+pub fn contract_untyped_shift_operand_out_of_narrow_range_is_refused(y: i8) -> i8 {
+    y
+}
+
+/// The control: a shift whose amount is below the narrowest width and whose
+/// operand fits an 8-bit signed value is valid at every width, so it reads.
+/// requires: x == 32
+/// ensures: (1 << 4) <= x
+pub fn contract_fitting_untyped_shift_still_reads(x: u8) -> u8 {
+    x
+}
+
+/// The control: a shift of a *typed* name has a known width, so a larger amount is
+/// fine as long as it is below that width.
+/// requires: a == 8
+/// ensures: (a >> 3) == 1
+pub fn contract_typed_shift_still_reads(a: u16) -> u16 {
+    a
+}

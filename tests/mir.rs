@@ -3560,6 +3560,54 @@ fn an_untyped_fold_overflow_is_refused_but_a_fitting_fold_reads() {
     );
 }
 
+/// A shift of an *untyped* constant whose width Rust infers is refused when it is
+/// only valid at the scope's width, while a shift that is valid at every width
+/// reads.
+///
+/// `255 >> 8` is fine at the scope's width (32, from a `u32` name in scope), but
+/// the operand has no type of its own: against a `u8` partner `255` is a `u8`, and
+/// a shift by its own width is a rustc `arithmetic operation will overflow`. The
+/// reader verified `255 >> 8 <= x` on a program rustc rejects. `(255 >> 1) >= y`
+/// for an `i8` `y` failed the same way (`255` is a rustc `literal out of range`).
+/// Both must be refused. `1 << 4` is `16` at any width holding it, and a shift of a
+/// typed name has a known width, so both must still read.
+#[test]
+fn an_untyped_shift_that_needs_a_wider_operand_is_refused_but_a_fitting_shift_reads() {
+    let Some(report) = verify_realistic(&[
+        "contract_untyped_shift_amount_over_narrow_width_is_refused",
+        "contract_untyped_left_shift_amount_over_narrow_width_is_refused",
+        "contract_untyped_shift_operand_out_of_narrow_range_is_refused",
+        "contract_fitting_untyped_shift_still_reads",
+        "contract_typed_shift_still_reads",
+    ]) else {
+        return;
+    };
+    for name in [
+        "contract_untyped_shift_amount_over_narrow_width_is_refused",
+        "contract_untyped_left_shift_amount_over_narrow_width_is_refused",
+        "contract_untyped_shift_operand_out_of_narrow_range_is_refused",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            !o.is_verified(),
+            "{name} shifts an untyped constant by an amount (or with a value) that is only \
+             valid at the scope's width, not the width Rust infers from the partner, and must \
+             be refused, got: {o}"
+        );
+    }
+    for name in [
+        "contract_fitting_untyped_shift_still_reads",
+        "contract_typed_shift_still_reads",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            o.is_verified(),
+            "{name} is a shift whose width is known or whose value fits every width, and must \
+             verify, got: {o}"
+        );
+    }
+}
+
 /// A `u128`-suffixed literal is *refused*, not panicked.
 ///
 /// The suffix records width 128, and the range check that guards the literal

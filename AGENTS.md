@@ -4830,3 +4830,59 @@ The lesson: a differential sweep is only as good as its oracle. Counting a compi
 *warning* as a rejection made the fix look incomplete and sent the search after a
 narrower rule that would have re-opened the hole. Read the oracle's structured output, and
 attribute each diagnostic to the span it is really about.
+
+**Followed up.** The next operator sweep turned up the same shape one operator over — an
+untyped *shift* whose width is inferred, not the fold's overflow but the operand's width —
+see "A shift of an untyped constant is refused when its width is inferred" below.
+
+## A shift of an untyped constant is refused when its width is inferred
+
+The fold fix left the operator axis un-swept: the sweeps so far had compared constants at
+`+ - * & | ^`, and had not driven `<< >>` (nor `/ %`, casts, unary or boolean operators)
+against rustc. A new differential sweep over those families found **45** shapes
+**verified** that rustc rejects, and every one was the same family: a shift of an
+*untyped* constant.
+
+`(255 >> 8) <= x` for a `u8` `x` was **verified**. In Rust `255` is a `u8` there, and a
+shift by its own width is a rustc `arithmetic operation will overflow`; the reader read
+it as `0 <= x`, true for every `x`. `(255 >> 1) >= y` for an `i8` `y` was verified the
+same way, where rustc rejects `255` as `literal out of range for i8`. The left-shift forms
+(`(!0 << 8) <= x`) and a wider partner (`(255 >> 16) <= a`) failed identically.
+
+This is a *third* axis on the same theme. The width fix resized a typed constant; the fold
+fix refused a fold whose value depends on its width. Here the operand is untyped and the
+amount was checked against the *scope's* width — `smt::bits(left)`, 32 from the `u32` name
+in scope — rather than the width Rust infers from where the shift is read, which can be as
+narrow as 8 bits.
+
+The fix is a refusal, in the same place: when the operand is untyped (`!sgn.fixes_type()`),
+the shift is refused unless it is valid at *every* width it could be read at — the amount
+below 8, and a bare or negated literal that fits an 8-bit signed value. An `Opaque`
+operand (a complement, or a fitted fold) needs no value check: its value at any width is
+`-1`/`2^W - 1`, which fits that width by construction. A shift of a *typed* name
+(`x >> 1`) has a known width and is untouched, and `1 << 4` is `16` at any width, so both
+still read — the controls the corpus pins.
+
+**Why not check only the amount.** The 45 shapes split into two causes: an amount at or
+above the partner's width (`255 >> 8`), and an operand out of the partner's range
+(`255 >> 1` into an `i8`). Refusing only the first would leave `(255 >> 1) >= y` verified.
+The operand's value is as much a width-dependent claim as the amount is, so both are
+checked.
+
+**Evidence.** The sweep drove 18744 shapes over the operator families; on it the reader
+had **45** soundness holes, all shift-family, and **0** after the fix. The harness reads
+rustc's diagnostics as JSON and attributes each error to its primary span, the corrected
+form from the fold fix. A unit test
+(`a_shift_of_an_untyped_constant_is_refused_when_it_needs_a_wider_operand`) pins five
+refused shapes and five that must read; a corpus test asserts the tripwires
+`contract_untyped_shift_amount_over_narrow_width_is_refused`,
+`contract_untyped_left_shift_amount_over_narrow_width_is_refused` and
+`contract_untyped_shift_operand_out_of_narrow_range_is_refused` are not decided against the
+controls `contract_fitting_untyped_shift_still_reads` and
+`contract_typed_shift_still_reads`. Test-count **546 → 548**; corpus **146/258 →
+148/263**. Gate green.
+
+The lesson: the fold fix's `Opaque` distinction generalised into a rule — a value with no
+type of its own is only safe at an operator when it is valid at *every* width it could be
+read at. The fold sweep asked the width question of the fold's *result*; this sweep asked
+it of the shift's *operand*, and the same question found the next hole.

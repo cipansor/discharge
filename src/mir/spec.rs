@@ -2525,6 +2525,41 @@ impl<'a> Parser<'a> {
                     "shift amount {k} is not below the operand width {w}"
                 )));
             }
+            // An *untyped* operand has no width of its own: Rust infers it from
+            // where the shift result is read, and that is not known here. The width
+            // can be as narrow as 8 bits, so a shift of an untyped constant is
+            // refused unless it is valid at *every* width it could be read at: the
+            // amount below 8, and a literal operand that fits an 8-bit signed
+            // value. Without this, the amount was checked against the *scope's*
+            // width (32, from the `u32` name in scope), so `255 >> 8` passed and
+            // `255 >> 8 <= x` for a `u8` `x` *verified* -- for a program rustc
+            // rejects as an overflow (`255` is a `u8`, and a shift by its own width
+            // is a compile error). The operand's value was never range-checked
+            // either, so `(255 >> 1) >= y` for an `i8` `y` verified although rustc
+            // rejects `255` as `literal out of range for i8`.
+            //
+            // An `Opaque` operand (a complement, or a fitted fold) needs no value
+            // check: its value at any width is `-1`/`2^W - 1`, which fits that
+            // width by construction.
+            if !sgn.fixes_type() {
+                if k >= 8 {
+                    return Err(self.err(format!(
+                        "a shift of an untyped constant by {k} is refused: the operand's width is \
+                         inferred from where the result is read, and {k} is not below the \
+                         narrowest width"
+                    )));
+                }
+                if matches!(sgn, Sign::Literal | Sign::NegLiteral) {
+                    let sval = self.signed_value(left, sgn.eval());
+                    if !(-128..=127).contains(&sval) {
+                        return Err(self.err(format!(
+                            "a shift of an untyped constant {sval} is refused: the operand's width \
+                             is inferred from where the result is read, and {sval} does not fit \
+                             the narrowest width"
+                        )));
+                    }
+                }
+            }
             left = if op == "<<" {
                 // A left shift of an untyped constant is sign-insensitive (the bit
                 // pattern is the same either way), so it keeps its `Untyped` state.
@@ -3941,6 +3976,51 @@ mod tests {
         for text in ["(200 + 100) <= a", "(200 + 100) == 300"] {
             let mut p = Parser::new(text, &args, None, &unsigned, false);
             assert!(p.parse_or().is_ok(), "`{text}` fits and reads");
+        }
+    }
+
+    /// A shift of an *untyped* constant is refused when it is only valid at the
+    /// scope's width, not at every width the result could be read at.
+    ///
+    /// `255 >> 8` looks fine at the scope's width (32, from the `u32` name in
+    /// scope), but the operand has no type of its own: Rust infers its width from
+    /// where the shift is read, and against a `u8` partner `255` is a `u8` and a
+    /// shift by its own width is a compile error. The reader verified
+    /// `255 >> 8 <= x` for a `u8` `x` on a program rustc rejects. `(255 >> 1) >= y`
+    /// for an `i8` `y` failed the same way, with `255` a rustc `literal out of
+    /// range`. The amount must be below the *narrowest* width, and a literal
+    /// operand must fit an 8-bit signed value, or the shift is refused. A shift of
+    /// a *typed* name (`x >> 1`) is unaffected: its width is known.
+    #[test]
+    fn a_shift_of_an_untyped_constant_is_refused_when_it_needs_a_wider_operand() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::var(8));
+        args.insert("y".to_string(), smt::var(8));
+        args.insert("a".to_string(), smt::var(16));
+        args.insert("c".to_string(), smt::var(32));
+        let mut unsigned = BTreeSet::new();
+        unsigned.insert("x".to_string());
+        unsigned.insert("a".to_string());
+        unsigned.insert("c".to_string());
+        let mut signed = BTreeSet::new();
+        signed.insert("y".to_string());
+        // The scope's width is 32, so the amount passes the old scope-width check
+        // and the operand passes the old (absent) range check; both are refused.
+        for text in ["(255 >> 8) <= x", "(255 >> 16) <= a", "(!0 << 8) <= x",
+                     "(1 >> 16) <= a", "(255 >> 1) >= y"] {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            assert!(
+                p.parse_or().is_err(),
+                "`{text}` is only valid at the scope's width and must be refused"
+            );
+        }
+        // A shift of a *typed* name has a known width and still reads; so does a
+        // constant shift whose amount is below the narrowest width and whose
+        // operand fits an 8-bit signed value (`1 << 4` is `16` at any width).
+        for text in ["(x >> 1) == 0", "(a << 2) <= a", "(1 << 4) <= x", "(1 >> 1) <= x",
+                     "(2 << 2) <= a"] {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            assert!(p.parse_or().is_ok(), "`{text}` has a known width and reads");
         }
     }
 
