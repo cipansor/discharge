@@ -5076,8 +5076,9 @@ or a fold of bare literals (`1 + 1`) still reads.
 
 **Evidence.** The sweep (`diff_const.py`, rustc accept/reject + exhaustive ground truth)
 went from **14 discrepancies to 0** on the primary seed, and to **0–1** across seeds `7`,
-`42`, `777` (`UNSOUND` stays **0** everywhere; the occasional residual is the same
-pre-existing Opaque-fold-*value* class, wrong refutation only). Unit test
+`42`, `777` (`UNSOUND` stays **0** everywhere; the occasional residual was the same
+pre-existing Opaque-fold-*value* class, wrong refutation only — **now closed, see the
+sign-ambiguous-fold section below**). Unit test
 `a_literal_inside_a_constant_fold_is_range_checked_too` pins seven refused shapes and six
 that read, including the `-(128 - 63)` / `-128` pair; corpus test
 `a_literal_inside_a_constant_fold_is_range_checked_too` asserts six tripwires are `Skipped`
@@ -5089,4 +5090,57 @@ against the decided controls `contract_fold_literals_in_range_still_read` and
 The lesson is the same question asked one level down: the complement fix range-checked the
 literal that meets the type; this fix range-checks the literals that *fold into* it. A
 folded value is a value, but the literals it was built from are still claims about a width.
+
+## A fold of an untyped complement is refused when its value is sign-ambiguous
+
+The residual the previous section named — the "Opaque-fold-*value*" class, 0–1
+discrepancies on seeds `7`/`42` — was the same question asked of the fold's **signedness**
+rather than its width. A complement has no signedness of its own: it takes the one the type
+it meets gives it. `fold_const_arith` guesses that signedness from the *other* operand, and
+when **neither** operand fixes a sign the guess can disagree with the reading the fold
+finally gets — and the fold's value, and whether it overflows at all, change with it:
+
+* `(!127) - 63` is `128 - 63 = 65` unsigned, but `i8::MIN - 63` — a rustc *overflow* —
+  signed. The reader guessed unsigned, decided `65`, and **FAILED** a program rustc rejects
+  (`y: i8`). `(!127) * 2` is the same shape (`i8::MIN * 2` overflows, `256` unsigned does
+  not).
+* `(!100) * (-0)` is `E0277` (`cannot apply unary - to type u16`) when the fold meets an
+  unsigned type and legal when it meets a signed one. The reader guessed unsigned from the
+  operand it met and decided it — again a verdict on a program rustc rejects.
+
+`fold_const_arith` now refuses an untyped fold when the two readings disagree. Two guards,
+both only when **no** operand fixes a sign (`!sa.fixes_type() && !sb.fixes_type()`) and at
+least one is opaque:
+
+1. **A negated bare literal beside the complement** (`NegLiteral`) is refused outright: the
+   negation is legal only at a signed type, which the reader does not know.
+2. **Otherwise the fold is recomputed under the other reading.** When the guess *fits* but
+   the other reading does not (or vice versa) the shape is refused. When the guess does
+   *not* fit, the pre-existing width-dependent refusal already fires and its message is
+   kept, so this fix only adds refusals for the shapes that were being *decided* wrongly.
+
+The refusal is drawn at the ambiguity, not at `!`: `(!0) - 1` agrees under both readings
+(`254` unsigned, `-2` signed, both in range at eight bits) and still reads; `(!127) - 63`
+under a *wider* (`u16`) partner is `65345` under both readings and still reads. The trade-off
+is the codebase's standing one — a genuinely ambiguous shape is **refused rather than
+guessed** — so a few rustc-accepted shapes are now `skipped` where they were previously
+`FAILED` (a wrong refutation, the milder error, traded for a refusal).
+
+**Evidence.** The dedicated sweep `diff_opaque.py` (rustc accept/reject + exhaustive ground
+truth, over expressions that *contain* a complement, and reporting the over-refusal quadrant
+that `diff_const.py` does not separate out) went from **6/10/5 wrong verdicts** on seeds
+`101`/`7`/`42` at the parent commit to **0/0/0** — and **0** on seed `777` — with `UNSOUND`
+staying **0** everywhere. The primary sweep `diff_const.py` is now **0 discrepancies** on
+seeds `101`, `7`, `42`, `777`, `13`, `99`. Unit test
+`a_sign_ambiguous_untyped_fold_is_refused` pins the two ambiguous shapes at eight bits, the
+`E0277` shape at sixteen, and three controls that still read; corpus test
+`a_sign_ambiguous_untyped_fold_is_refused` asserts three tripwires are `Skipped` against the
+decided controls `contract_sign_ambiguous_fold_at_wider_width_reads` and
+`contract_agreeing_untyped_fold_still_reads`. Test-count **587 → 589**; corpus **150/274 →
+152/279** (three refusals, two decided controls). Gate green.
+
+The lesson, once more: the width fix asked *is this value valid at the width it meets?*; this
+fix asks *is it valid at the signedness it meets?* A complement is a value with no type of
+its own, and "no type" means no width **and** no sign — the reader must refuse the shape
+whenever either is unknown and the answer depends on it.
 

@@ -3182,3 +3182,59 @@ pub fn contract_literal_in_negated_fold_is_refused(y: i8) -> i8 {
 pub fn contract_complement_shift_amount_is_refused(y: i8) -> i8 {
     y
 }
+
+// ---------------------------------------------------------------------------
+// A fold that mixes an untyped complement with a plain operand is refused when its
+// value depends on the signedness Rust infers for it.
+//
+// A complement (`!127`) has no signedness of its own -- it takes the one the type
+// it meets gives it -- and the reader guesses it from the other operand. When no
+// operand fixes a sign the guess can disagree with the reading the fold finally
+// gets, and the fold's value, and whether it overflows at all, change with it:
+// `!127 - 63` is `128 - 63 = 65` unsigned but `i8::MIN - 63` -- a rustc overflow --
+// signed. The reader decided `65` for a program rustc rejects. So the shape is
+// refused when the two readings disagree on the overflow.
+//
+// These are `skipped`, not `verified` and not `failed`.
+/// requires: true
+/// ensures: y == ((!127) - 63)
+pub fn contract_sign_ambiguous_fold_is_refused(y: i8) -> i8 {
+    y
+}
+
+/// The multiplication form, where the signed reading overflows and the unsigned one
+/// does not: `!127 * 2` is `i8::MIN * 2` (a rustc overflow) but `128 * 2 = 256`
+/// unsigned.
+/// requires: true
+/// ensures: y == ((!127) * 2)
+pub fn contract_sign_ambiguous_mul_is_refused(y: i8) -> i8 {
+    y
+}
+
+/// A negated bare literal beside an untyped complement is legal only at a signed
+/// type (`!100 * -0` is `E0277` for a `u16`), so the shape is refused rather than
+/// decided on the wrong reading.
+/// requires: true
+/// ensures: a == ((!100) * (-0))
+pub fn contract_complement_with_negated_literal_is_refused(a: u16) -> u16 {
+    a
+}
+
+/// The control: the same fold under a *wider* partner is accepted by rustc and must
+/// still be decided. `(!127) - 63` at sixteen bits is `65408 - 63 = 65345`, in
+/// range, so the two readings agree and the shape reads.
+/// requires: a == 65345
+/// ensures: a == ((!127) - 63)
+pub fn contract_sign_ambiguous_fold_at_wider_width_reads(a: u16) -> u16 {
+    a
+}
+
+/// The control: a fold of untyped operands that agrees under both readings still
+/// reads. `(!0) - 1` is `255 - 1 = 254` unsigned and `-1 - 1 = -2` signed, and
+/// *neither* overflows at eight bits, so the reader may decide it.
+/// requires: x == 254
+/// ensures: x == ((!0) - 1)
+pub fn contract_agreeing_untyped_fold_still_reads(x: u8) -> u8 {
+    x
+}
+

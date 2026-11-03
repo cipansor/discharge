@@ -3512,6 +3512,43 @@ fn a_literal_inside_a_constant_fold_is_range_checked_too() {
     }
 }
 
+/// A constant fold that mixes an *untyped* complement with a plain operand is
+/// refused when its value depends on the signedness Rust infers for it.
+///
+/// A complement has no signedness of its own: it takes the one the type it meets
+/// gives it. The reader guesses it from the other operand, and when no operand
+/// fixes a sign the guess can disagree with the reading the fold finally gets.
+/// `!127 - 63` is `128 - 63 = 65` unsigned but `i8::MIN - 63` -- a rustc overflow --
+/// signed, so the reader decided `65` for a program rustc rejects: a wrong verdict.
+/// `!127 * 2` is the same shape. A negated bare literal beside a complement
+/// (`!100 * -0`) is `E0277` for a `u16` -- legal only at a signed type -- so it is
+/// refused too. Two controls keep the refusal at the ambiguity: the same fold under
+/// a wider partner is in range under both readings and reads, and a fold that
+/// agrees under both readings (`(!0) - 1`) still reads.
+#[test]
+fn a_sign_ambiguous_untyped_fold_is_refused() {
+    for name in [
+        "contract_sign_ambiguous_fold_is_refused",
+        "contract_sign_ambiguous_mul_is_refused",
+        "contract_complement_with_negated_literal_is_refused",
+    ] {
+        let Some(report) = verify_realistic(&[name]) else { return };
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Skipped { .. }),
+            "`{name}` is sign-ambiguous and must be refused, never given a verdict, got: {o}"
+        );
+    }
+    for name in [
+        "contract_sign_ambiguous_fold_at_wider_width_reads",
+        "contract_agreeing_untyped_fold_still_reads",
+    ] {
+        let Some(report) = verify_realistic(&[name]) else { return };
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "{name} agrees under both readings and must verify, got: {o}");
+    }
+}
+
 /// An *opaque* constant (a complement) widened to a wider operand is refused, and
 /// a *fold* is not.
 ///

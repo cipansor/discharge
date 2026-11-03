@@ -2162,12 +2162,57 @@ impl<'a> Parser<'a> {
             "-" => va - vb,
             _ => va * vb,
         };
+        // An *opaque* operand (a complement, or a fold that touched one) has no
+        // signedness of its own: Rust infers it from the type the fold meets, which
+        // is not known here. The reader guesses from the other operand, and when
+        // *no* operand fixes a sign the guess can disagree with the reading the fold
+        // finally gets. Two shapes follow, both of which the reader would otherwise
+        // *decide* on a program rustc rejects.
+        let untyped_opaque =
+            (sa.is_opaque() || sb.is_opaque()) && !sa.fixes_type() && !sb.fixes_type();
+        if untyped_opaque && (sa == Sign::NegLiteral || sb == Sign::NegLiteral) {
+            // A negated bare literal (`-0`) beside an opaque operand is `E0277`
+            // (`cannot apply unary - to type u16`) when the fold meets an unsigned
+            // type and legal when it meets a signed one: `!100 * -0` is rejected for
+            // a `u16` but accepted for an `i16`. The reader cannot tell which, so
+            // the shape is refused rather than decided on the wrong reading.
+            return Err(self.err(format!(
+                "a constant `{op}` of an untyped operand and a negated literal is \
+                 sign-ambiguous: the negation is legal only at a signed type"
+            )));
+        }
         let fits = if signed {
             let hi = (1i128 << (w - 1)) - 1;
             r >= min && r <= hi
         } else {
             r >= 0 && (r as u128) < (1u128 << w)
         };
+        // A fold that *fits* under the reader's guess can still overflow under the
+        // other reading: `!127 - 63` is `128 - 63 = 65` unsigned but `i8::MIN - 63`
+        // -- a rustc overflow -- signed. The reader decided it (`65`) for a program
+        // rustc rejects. The two readings disagree on the overflow, so the shape is
+        // refused. (When the guess does *not* fit, the width-dependent refusal below
+        // is the answer, and its message is kept.)
+        if untyped_opaque && fits {
+            let alt = !signed;
+            let (av, bv) = (self.signed_value(a, alt), self.signed_value(b, alt));
+            let ar: i128 = match op {
+                "+" => av + bv,
+                "-" => av - bv,
+                _ => av * bv,
+            };
+            let alt_fits = if alt {
+                ar >= min && ar < (1i128 << (w - 1))
+            } else {
+                ar >= 0 && (ar as u128) < (1u128 << w)
+            };
+            if !alt_fits {
+                return Err(self.err(format!(
+                    "a constant `{op}` of an untyped operand is sign-ambiguous: it overflows the \
+                     {w}-bit operand width under one reading and not the other"
+                )));
+            }
+        }
         if fits {
             return Ok(None);
         }
@@ -4332,6 +4377,71 @@ mod tests {
             assert!(
                 p.parse_or().is_err(),
                 "`{text}` has an out-of-range literal and must be refused"
+            );
+        }
+    }
+
+    /// A constant fold that mixes an *untyped* complement with a plain operand is
+    /// refused when its value depends on the signedness Rust infers for it.
+    ///
+    /// A complement has no signedness of its own -- it takes the one the type it
+    /// meets gives it -- and the reader guesses it from the other operand. When no
+    /// operand fixes a sign, the guess can disagree with the reading the fold
+    /// finally gets, and the value, and whether it overflows at all, change with
+    /// it. `!127 - 63` is `128 - 63 = 65` unsigned but `i8::MIN - 63`, a rustc
+    /// overflow, signed: the reader decided `65` for a program rustc rejects.
+    /// `!127 * 2` is the same shape, and `!100 * -0` is `E0277` for a `u16` (the
+    /// negation is legal only at a signed type). Each is refused.
+    #[test]
+    fn a_sign_ambiguous_untyped_fold_is_refused() {
+        // The scope holds only eight-bit names, so a complement is held at eight
+        // bits too and the fold `!127 - 63` is the signed-overflow shape.
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::var(8));
+        args.insert("y".to_string(), smt::var(8));
+        let mut signed = BTreeSet::new();
+        signed.insert("y".to_string());
+        for text in ["y == ((!127) - 63)", "x == ((!127) - 63)"] {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            let err = p.parse_or().expect_err("a sign-ambiguous fold must be refused");
+            assert!(
+                format!("{err}").contains("sign-ambiguous"),
+                "`{text}`: got {err}"
+            );
+        }
+        // At eight bits the two readings of `(!0) - 1` (`254` unsigned, `-2` signed)
+        // both fit, so it is *not* ambiguous and still reads against a `u8`.
+        {
+            let text = "x == ((!0) - 1)";
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            let r = p.parse_or();
+            assert!(
+                r.is_ok(),
+                "`{text}` agrees under both readings and reads: {:?}",
+                r.err().map(|e| format!("{e}"))
+            );
+        }
+        // A negated bare literal beside an untyped complement is `E0277` when the
+        // fold meets an unsigned type, so it is refused. The scope has a sixteen-bit
+        // name to give the fold that width.
+        let mut args = BTreeMap::new();
+        args.insert("a".to_string(), smt::var(16));
+        let unsigned = BTreeSet::new();
+        let mut p = Parser::new("a == ((!100) * (-0))", &args, None, &unsigned, false);
+        let err = p.parse_or().expect_err("a negated literal beside a complement is refused");
+        assert!(
+            format!("{err}").contains("sign-ambiguous"),
+            "`a == ((!100) * (-0))`: got {err}"
+        );
+        // The controls at sixteen bits: the same fold where neither reading
+        // overflows still reads.
+        for text in ["a == ((!127) - 63)", "a == ((!0) * 0)"] {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let r = p.parse_or();
+            assert!(
+                r.is_ok(),
+                "`{text}` agrees under both readings and reads: {:?}",
+                r.err().map(|e| format!("{e}"))
             );
         }
     }
