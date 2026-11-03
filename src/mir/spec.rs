@@ -1942,6 +1942,26 @@ impl<'a> Parser<'a> {
         self.range.get(&v.0 .0).copied()
     }
 
+    /// A constant of width `w` that is *not* hash-consed with a plain `word(k, w)`.
+    ///
+    /// A named bound (`i8::MIN`, `i8::MAX`) and an enum variant are the same bit
+    /// pattern as a bare or suffixed literal of that value, so `smt::word` returns
+    /// the *one* shared term: `i8::MIN` and `128i8` are both `word(128, 8)`. The
+    /// `range` map is keyed by term, so an envelope recorded for the literal --
+    /// `128i8` records the written magnitude `128`, which is out of range for an
+    /// `i8` -- was read back as the *bound's* envelope and refused a valid
+    /// `y == -128i8 && y == i8::MIN`. A bound's fit is known by construction (it is
+    /// the type's own extreme), so it must not inherit a literal's envelope.
+    ///
+    /// The term is built as `truncate(word(k, 64), w)`, which the engine folds to
+    /// the same value but which hash-conses separately from `word(k, w)`: no
+    /// literal path ever builds a 64-bit word for a value that fits `w`, so this
+    /// node is the bound's alone. It carries no `range` entry, so `check_range`
+    /// passes it, exactly as the plain bound did before the envelope map existed.
+    fn unshared_const(&self, k: u64, w: u8) -> Var {
+        smt::truncate(smt::word(k, 64), w)
+    }
+
     /// Record `v`'s envelope as the union of its operands' envelopes, so a
     /// bitwise, shift or `/`/`%` result carries the literals underneath it to the
     /// later range check even though the operation itself adds no literal.
@@ -3131,7 +3151,13 @@ impl<'a> Parser<'a> {
                 // (`x == !128 && y == 127` for a `u8` and an `i8` was skipped).
                 let operand = match sgn {
                     Sign::Literal | Sign::NegLiteral => self.range_of(v),
-                    Sign::Opaque(env) => env.or_else(|| self.range_of(v)),
+                    // A nested complement's sign carries the envelope it inherited,
+                    // but the operand term may *also* have recorded one of its own
+                    // (a fold: `!(!1 - 200)` folds `!1` and `200`, and the fold term
+                    // carries `200`). Both must survive, so they are unioned -- taking
+                    // the inherited envelope alone dropped the fold's `200` and let the
+                    // reader decide a contract rustc rejects.
+                    Sign::Opaque(env) => Sign::union_env(env, self.range_of(v)),
                     _ => None,
                 };
                 let cv = smt::word(!val & mask, w);
@@ -3274,7 +3300,7 @@ impl<'a> Parser<'a> {
                     // which table has the name.
                     let key = format!("{ty}::{a}");
                     if let Some((k, w)) = self.variant_consts.get(&key).copied() {
-                        return Ok((smt::word(k, w), Sign::Literal));
+                        return Ok((self.unshared_const(k, w), Sign::Literal));
                     }
                     if self.enum_args.contains(&ty) {
                         return Err(self.err(format!(
@@ -3289,7 +3315,16 @@ impl<'a> Parser<'a> {
                         // `128 <= i8::MAX` and refuse the constant as out of range
                         // for a signed 8-bit operand -- a refusal of a bound that
                         // is by definition in range.
-                        return Ok((smt::word(k, w), Sign::from_bool(ty.starts_with('i'))));
+                        //
+                        // It is built as a term *of its own* rather than the shared
+                        // `word(k, w)`: `i8::MIN` and a bare or suffixed `128` are
+                        // the same bit pattern and hash-cons to one term, so an
+                        // out-of-range envelope recorded for the literal (`128i8`
+                        // records `128`) was read back as the bound's and refused a
+                        // valid `y == -128i8 && y == i8::MIN`. The bound's fit is
+                        // known by construction, so it must not inherit a literal's
+                        // envelope. See `unshared_const`.
+                        return Ok((self.unshared_const(k, w), Sign::from_bool(ty.starts_with('i'))));
                     }
                     return Err(self.err(format!("unknown constant `{ty}::{a}`")));
                 }
@@ -4593,6 +4628,50 @@ mod tests {
             msg.contains("complement") || msg.contains("does not fit"),
             "`y <= (-(!128))`: got {msg}"
         );
+    }
+
+    /// A nested complement whose operand is a *fold* keeps every literal underneath
+    /// it, and a named bound does not inherit a literal's envelope.
+    ///
+    /// Two follow-ups to the envelope work. First, `!(!1 - 200)` for an `i8` is a
+    /// rustc error for the `200`: the inner complement `!1` carries `(1, 1)` in its
+    /// sign and the fold `!1 - 200` records `200` on its own term, so the outer
+    /// complement must *union* the two -- taking the inherited envelope alone
+    /// dropped the `200` and the reader decided a contract rustc rejects. Second,
+    /// `i8::MIN` and a bare or suffixed `128` are the same eight-bit constant and
+    /// hash-cons to one term, so a term-keyed envelope recorded for the literal
+    /// (`128i8` records the out-of-range `128`) was read back as the *bound's* and
+    /// skipped a valid `y == -128i8 && y == i8::MIN`; the bound is now its own term.
+    #[test]
+    fn a_nested_complement_keeps_the_fold_and_a_bound_keeps_its_own_fit() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::var(8));
+        args.insert("y".to_string(), smt::var(8));
+        let mut signed = BTreeSet::new();
+        signed.insert("y".to_string());
+        // The fold's `200` survives the outer complement, so the shape is refused
+        // (the exact wording varies: an out-of-range complement operand, or an
+        // unsigned fold that underflows -- both are rustc rejections).
+        for text in ["y == !(!1 - 200)", "y == !(200 - !1)", "y == !(128 - 63)"] {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            assert!(
+                p.parse_or().is_err(),
+                "`{text}` is a rustc range error and must be refused"
+            );
+        }
+        // The named bound is valid in either conjunct order, and beside a bare
+        // `128` on an unsigned name it does not inherit the literal's envelope.
+        for text in [
+            "y == -128i8 && y == i8::MIN",
+            "y == i8::MIN && y == -128i8",
+            "x == 128 && y == i8::MIN",
+            "y == i8::MIN && x == 128",
+            "y == i8::MIN && y == 127",
+        ] {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            let r = p.parse_or();
+            assert!(r.is_ok(), "`{text}` is valid Rust and must read: {:?}", r.err().map(|e| format!("{e}")));
+        }
     }
 
     /// A shift of an *untyped* constant is refused when it is only valid at the

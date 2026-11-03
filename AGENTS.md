@@ -5186,3 +5186,51 @@ commit to **≤ 1**, with `UNSOUND` staying **0** on all ten seeds (`1 2 3 5 13 
 The lesson: a literal's *range* is a property of how it is written, and provenance (which
 literal an envelope came from) must travel with the *expression*, never be keyed on a value
 term the engine hash-conses — a value term is shared by every expression that computes it.
+
+## Two follow-ups to the constant-fold sign work (nested complement, named bound)
+
+A second AI review of the same branch found two more shapes. The first was a **soundness
+regression** the finding-1/finding-2 work introduced; the second is a **pre-existing
+over-refusal** from the same root cause the memory note above already names (a value term is
+shared by every expression that computes it), reached this time through a *named bound*.
+
+**Follow-up 1 — a nested complement must *union* the envelope it inherited with the one its
+operand recorded (regression, was a wrong verdict).** `y == !(!1 - 200)` for an `i8` is a
+rustc `literal out of range` error for the `200`, but the reader *decided* it (baseline
+`skipped`, my finding-2 code `FAILED`). The inner complement `!1` carries `(1, 1)` in its
+`Sign::Opaque` payload; the fold `!1 - 200` records `200` on *its own* term via
+`record_fold_result`. The outer complement's operand envelope used `env.or_else(||
+self.range_of(v))`, which takes the inherited envelope *only when present* and so discards the
+fold's own `200`. Fix: `Sign::union_env(env, self.range_of(v))` — the two sources are
+independent and both must survive. `!(200 - !1)` and `!(128 - 63)` are refused too.
+
+**Follow-up 2 — a named bound (`i8::MIN`) must not inherit a literal's envelope (pre-existing
+over-refusal).** `y == -128i8 && y == i8::MIN` for an `i8` — both valid Rust — was `skipped` in
+*either* conjunct order, as was `x == 128 && y == i8::MIN` for a `u8` and an `i8`. `i8::MIN`
+and a bare or suffixed `128` are the same eight-bit bit pattern, so `smt::word(128, 8)` returns
+*one* hash-consed term; `128i8` records the written magnitude `128` on it (finding 1), and
+`resize_const`/the fold-union path then read that envelope back as the *bound's* and refuse a
+bound that is in range by construction. Fix: build a named bound and an enum variant with
+`unshared_const(k, w) = smt::truncate(smt::word(k, 64), w)`. The engine folds the `Trunc` to the
+same value (`eval_term_body` folds `Trunc` of a constant), so the term *denotes* the bound
+exactly, but it hash-conses separately from `word(k, w)` — no literal path ever builds a 64-bit
+word for a value that fits `w`. It carries no `range` entry, so `check_range` passes it, which
+is correct: the bound's fit is known.
+
+**Evidence.** Unit test `a_nested_complement_keeps_the_fold_and_a_bound_keeps_its_own_fit`;
+corpus entries `contract_nested_complement_fold_operand_is_refused`,
+`contract_named_min_after_suffixed_min_reads`, `contract_suffixed_min_after_named_min_reads`,
+`contract_named_min_after_bare_128_reads`, all pinned in
+`a_suffixed_minimum_and_a_complement_operand_are_checked_where_they_are_written`. Differential
+sweep: `UNSOUND: 0` on six seeds (`101 202 303 404 505 606`); the ≤1 residual discrepancy is
+the same pre-existing nested-shift class (`-(3 << 7)`, `1 << (2 << 7)`), byte-identical on the
+baseline build. `cargo test --features std` **558 → 559** passed, 0 failed (the new unit test);
+corpus **287 → 291** functions typed, with the collision cases flipped from `skipped` to read.
+Gate green.
+
+The deeper lesson (already stated, now with a second example): the `range` map is keyed on the
+*term*, and the engine hash-conses aggressively — not only a complement's value term but a
+*type bound's* bit pattern is shared with plain literals. Any envelope recorded for one must
+never be read back for another. Where a value's fit is known by construction (a bound, a
+variant), give it a term of its own rather than trusting the shared one.
+

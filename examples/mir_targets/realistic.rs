@@ -3309,3 +3309,42 @@ pub fn contract_complement_operand_out_of_range_is_refused(y: i8) -> i8 {
 pub fn contract_negated_complement_operand_is_refused(y: i8) -> i8 {
     y
 }
+
+/// A nested complement whose operand is a *fold*: `!(!1 - 200)` for an `i8` is a
+/// rustc error for the `200`, and the reader must keep it. The inner complement
+/// `!1` carries `(1, 1)` in its sign, and the fold `!1 - 200` records `200` on its
+/// own term; the outer complement has to union both, or taking the inherited
+/// envelope alone drops the `200` and the reader decides a contract rustc rejects.
+/// requires: true
+/// ensures: y == !(!1 - 200)
+pub fn contract_nested_complement_fold_operand_is_refused(y: i8) -> i8 {
+    y
+}
+
+/// A named bound after a suffixed literal of the same bit pattern: `-128i8` records
+/// the written magnitude `128`, and `i8::MIN` is the *same* eight-bit constant, so a
+/// term-keyed envelope charged the literal's `128` to the bound and skipped this
+/// valid contract. Both conjunct orders must read.
+/// requires: y == -128i8 && y == i8::MIN
+/// ensures: ret == y
+pub fn contract_named_min_after_suffixed_min_reads(y: i8) -> i8 {
+    y
+}
+
+/// The reverse conjunct order, so neither the literal nor the bound is recorded
+/// first in a way that hides the collision.
+/// requires: y == i8::MIN && y == -128i8
+/// ensures: ret == y
+pub fn contract_suffixed_min_after_named_min_reads(y: i8) -> i8 {
+    y
+}
+
+/// The bare-literal form of the same collision: `128` is in range for a `u8` and
+/// `i8::MIN` is valid, but both are the eight-bit constant `0x80`. The bound must
+/// not inherit the literal's envelope in either order.
+/// requires: x == 128 && y == i8::MIN
+/// ensures: ret == 0
+pub fn contract_named_min_after_bare_128_reads(x: u8, y: i8) -> u8 {
+    let _ = (x, y);
+    0
+}

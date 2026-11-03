@@ -3562,6 +3562,14 @@ fn a_sign_ambiguous_untyped_fold_is_refused() {
 /// engine hash-conses with a separately written bare `127`, so recording the
 /// operand envelope (`128`) on that shared id skipped the valid
 /// `x == !128 && y == 127`. The envelope now travels in the operand's own payload.
+///
+/// Two follow-ups. A *nested* complement whose operand is a fold must union the
+/// envelope it inherited with the one the fold recorded on its own term, or the
+/// fold's out-of-range literal is dropped and the reader decides a contract rustc
+/// rejects (`y == !(!1 - 200)` for an `i8`). And a *named bound* (`i8::MIN`) shares
+/// its bit pattern with a bare or suffixed `128`, so the term-keyed envelope map
+/// charged the literal's `128` to the bound and skipped a valid contract; the bound
+/// is now built as a term of its own.
 #[test]
 fn a_suffixed_minimum_and_a_complement_operand_are_checked_where_they_are_written() {
     for name in [
@@ -3569,6 +3577,7 @@ fn a_suffixed_minimum_and_a_complement_operand_are_checked_where_they_are_writte
         "contract_double_negated_min_is_refused",
         "contract_complement_operand_out_of_range_is_refused",
         "contract_negated_complement_operand_is_refused",
+        "contract_nested_complement_fold_operand_is_refused",
     ] {
         let Some(report) = verify_realistic(&[name]) else { return };
         let o = outcome(&report, name);
@@ -3581,6 +3590,9 @@ fn a_suffixed_minimum_and_a_complement_operand_are_checked_where_they_are_writte
         "contract_suffixed_min_literal_still_reads",
         "contract_suffixed_positive_literal_still_reads",
         "contract_complement_does_not_pollute_a_bare_literal",
+        "contract_named_min_after_suffixed_min_reads",
+        "contract_suffixed_min_after_named_min_reads",
+        "contract_named_min_after_bare_128_reads",
     ] {
         let Some(report) = verify_realistic(&[name]) else { return };
         let o = outcome(&report, name);
