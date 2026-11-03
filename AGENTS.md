@@ -3872,6 +3872,46 @@ restoring divider needs about 4 MB of stack at these widths -- a *pre-existing* 
 (the original code needs it even for `x / 4`), not something this budget changed, and the
 same reason `tests/divmod.rs` and `tests/signed.rs` already spawn a 64 MB thread.
 
+### A sweep with no timeout cannot report a hang; it reports nothing
+
+The sweep that found the shift soundness bugs (TASK-5) compared the reader's verdict
+against rustc's, shape by shape, in a Python driver. It had no per-shape timeout, and the
+divisor shape above is what exposed the gap: the driver called `mir_coverage` on
+`(e / (8 - 1)) == 0` and waited. A hang does not produce a verdict to disagree with, so the
+sweep could not report it -- it just stopped, and the *absence* of a result was mistaken for
+"still running" rather than "this is a finding". The fix to the sweep is to wrap each shape
+in a timeout and treat the timeout as its own outcome, a *hang* row in the tally, not an
+error and not a pass.
+
+That change is what makes the remaining axes sweepable. Re-running the constant-expression
+axes with a 20s per-shape timeout, after the budget fix:
+
+- **Pure-constant comparisons** (no typed operand at all -- the axis TASK-6 targets), 1536
+  shapes: `0` soundness bugs, `0` hangs, `534` decided (`267` verified, `267` refuted) and
+  `1002` refused. Soundness here cannot be checked against rustc, which accepts *every*
+  pure-constant comparison, so the oracle is the arithmetic itself: evaluate both constants
+  at `i32` and compare. All 534 decided shapes match, and the refusals are correct --
+  `(!0) == (255)` and `(128 << 1) == 256` have no typed operand to fix the reading. The
+  typing rule the oracle had to learn is Rust's own: an untyped integer literal is `i32` by
+  default, so `(-1) < (0)` is *verified* -- read as `i32`, `-1 < 0`; read as unsigned it
+  would be false. The first oracle enumerated signed and unsigned at widths 8/16/32/64 and
+  flagged `(-1) < (0)` as a mismatch -- the oracle was wrong, not the reader, because there
+  is no width or sign to enumerate until a typed operand supplies one, and Rust's fallback
+  is `i32`.
+- **Constant expressions as comparison operands**, 2052 shapes across widths 8/16/32/64:
+  `0` soundness, `0` hangs.
+- **Constant expressions as arithmetic/bitwise operands** (`+ - * & | ^`), 3840 shapes:
+  `0` soundness, `0` hangs.
+- **Every operator at every width against 25 constants**, 2000 shapes: `0` hangs. The
+  `29` shapes over 5s are all division or remainder by a non-power-of-two constant -- the
+  exact shapes `MAX_APPLY_STEPS` now bounds, returning `Unknown` in about six seconds
+  instead of never.
+
+The recurring shape across all of it is the same one: `x / k` and `x % k` for `k` not a
+power of two. `x & 7`, `x ^ 255`, `x << 3` and `x + 100` are all instant at every width --
+the restoring divider's BDD is what costs, and only the divider builds it. A sweep that
+times out on `x / 7` and moves on is doing its job; a sweep that waits on it is not.
+
 ## Stage 2, last bullet: the complement's width comes from the operand, not the destination
 
 The roadmap's final Stage 2 item was one line: `Rvalue::Unary(Not)` is "handled,
