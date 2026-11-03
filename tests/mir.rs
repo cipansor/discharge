@@ -992,13 +992,31 @@ fn an_always_firing_panic_says_it_fires_on_every_input() {
 
 const REALISTIC: &str = "examples/mir_targets/realistic.rs";
 
+/// The contract reader and the engine both recurse, so their reach is bounded by
+/// stack depth as well as by the arena: one nested arithmetic expression is a
+/// dozen parser frames, and a debug build gives each of them kilobytes. A
+/// contract with a nested shift amount (`x >> ((2 << 7) + 1)`) needs more than
+/// the 2 MiB a test thread gets by default, so the room is asked for up front
+/// rather than discovering the limit as an abort. This is the same discipline
+/// `tests/shift.rs` and `tests/signed.rs` already use.
+fn on_big_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn")
+        .join()
+        .expect("the query panicked")
+}
+
 fn verify_realistic(only: &[&str]) -> Option<verify::FileReport> {
     let rustc = rustc()?;
     let only: Vec<String> = only.iter().map(|s| s.to_string()).collect();
-    match verify::verify_file_with(&rustc, std::path::Path::new(REALISTIC), &only) {
-        Ok(r) => Some(r),
-        Err(e) => panic!("frontend failed: {e}"),
-    }
+    on_big_stack(move || {
+        match verify::verify_file_with(&rustc, std::path::Path::new(REALISTIC), &only) {
+            Ok(r) => Some(r),
+            Err(e) => panic!("frontend failed: {e}"),
+        }
+    })
 }
 
 /// A contract can name a struct field, and the field's *value* reaches the body.
@@ -3206,6 +3224,15 @@ fn an_out_of_range_literal_is_refused_not_wrapped() {
         "contract_signed_literal_vs_unsigned_is_refused",
         "contract_signed_constant_sum_vs_unsigned_is_refused",
         "contract_signed_constant_mask_vs_unsigned_is_refused",
+        // A negation of a constant is checked against the value it denotes, so a
+        // negation that overflows its own type is refused (`-(i8::MIN)`, and the
+        // wrapping shift `-(3 << 7)` that shares its bit pattern).
+        "contract_negation_of_min_is_refused",
+        "contract_negation_of_wrapping_shift_is_refused",
+        // A shift *amount* is a value of its own `i32`, so an amount that wraps at
+        // the operand's width but not at `i32` (`2 << 7` is `256`) is refused.
+        "contract_nested_shift_amount_overflow_is_refused",
+        "contract_nested_shift_amount_sum_overflow_is_refused",
     ];
     let Some(report) = verify_realistic(&refused) else { return };
     for name in refused {
@@ -3228,6 +3255,11 @@ fn an_out_of_range_literal_is_refused_not_wrapped() {
         "contract_unsigned_literal_still_reads",
         "contract_unsigned_constant_sum_still_reads",
         "contract_unsigned_mask_still_reads",
+        // The controls for the two classes above: an in-range negation and an
+        // amount that fits `i32` both still read, so the refusals are pinned to
+        // the overflow and not to the shape.
+        "contract_negation_of_max_still_reads",
+        "contract_fitting_shift_amount_still_reads",
     ];
     let Some(report) = verify_realistic(&read) else { return };
     for name in read {

@@ -1622,6 +1622,18 @@ struct Parser<'a> {
     /// set tells `parse_neg` apart that case from a literal *inside* a fold, whose
     /// magnitude is checked as written (`-(128 - 63)` is rejected for its `128`).
     bare_literals: BTreeSet<u32>,
+    /// How deep inside a *shift amount* the parser is.
+    ///
+    /// A shift amount is a value of its *own* type, not of the shifted operand's:
+    /// Rust leaves the amount's type unconstrained, so an unsuffixed amount
+    /// expression defaults to `i32` and is evaluated at 32 bits. The reader sizes
+    /// a bare literal to the widest name in scope, so at an eight-bit scope the
+    /// amount `(2 << 7)` was built at 8 bits and wrapped to `0`, while rustc
+    /// computes `256` and rejects `x >> 256`. The reader then *decided* a
+    /// comparison on a program rustc rejects. Flooring the amount's literals at 32
+    /// bits makes the fold agree with rustc's `i32` evaluation, so the wrapped
+    /// value never appears.
+    amount_depth: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1800,6 +1812,7 @@ impl<'a> Parser<'a> {
             enum_args: BTreeSet::new(),
             range: BTreeMap::new(),
             bare_literals: BTreeSet::new(),
+            amount_depth: 0,
             ret_absent: "`ret` is only meaningful in `ensures`",
         }
     }
@@ -2804,7 +2817,15 @@ impl<'a> Parser<'a> {
     fn parse_shift(&mut self) -> Result<(Var, Sign), SpecError> {
         let (mut left, sgn) = self.parse_add()?;
         while let Some(op) = self.eat_any(&["<<", ">>"]) {
-            let (r, rs) = self.parse_add()?;
+            // The amount is a value of its own type, so its bare literals are
+            // floored at Rust's `i32` (see `amount_depth`). The *operand* is not:
+            // rustc reads `(2 << 7)` in an `i8` comparison at eight bits (it
+            // accepts `y == (2 << 7)`, which is `y == 0` there), while the amount
+            // of a shift stays `i32`.
+            self.amount_depth += 1;
+            let amount = self.parse_add();
+            self.amount_depth -= 1;
+            let (r, rs) = amount?;
             // An *opaque* amount (a complement, or a fold that touched one) has no
             // width of its own: `!254` is `-255` at the `i32` Rust infers -- a
             // negative shift amount, and an overflow error -- but `1` at eight bits.
@@ -3082,6 +3103,7 @@ impl<'a> Parser<'a> {
             // mirror of the bare-literal wrap. One spare bit keeps `-129` as
             // `-129`, which the check then refuses. `-128` (i8::MIN) still fits at
             // 8 bits, so it is left alone.
+            let bare = self.bare_literals.contains(&v.0 .0);
             if let Some(mag) = self.const_value(v) {
                 // `-mag` fits signed at `w` bits iff `mag <= 2^(w-1)`.
                 let fits = w >= 64 || mag <= (1u64 << (w - 1));
@@ -3090,6 +3112,45 @@ impl<'a> Parser<'a> {
                     self.record_negation(nv, v, true);
                     return Ok((nv, out));
                 }
+                // A constant that denotes a *value* rather than a written
+                // magnitude -- a named bound (`i8::MIN`), an inner negation, or a
+                // fold that wrapped to the type's minimum (`3 << 7` at eight bits)
+                // -- negates to `-sval`, and that is the value Rust checks.
+                // `i8::MIN` is the bit pattern `128` and the value `-128`;
+                // negating the *value* is `+128`, out of range, where negating the
+                // literal `128i8` is `-128`, which is not. The magnitude check
+                // above reads the bit pattern, which is the same `128` for both, so
+                // it passed and the negation overflow went unrecorded: the reader
+                // *decided* `y == -(i8::MIN)` and `y == -(3 << 7)` on programs
+                // rustc rejects. Only a pristine literal (`-128`, `-(128i8)`,
+                // `-(128)`) is exempt, because there the negation *is* what makes
+                // the magnitude legal.
+                if !bare {
+                    let sval: i128 = if w >= 64 {
+                        mag as i64 as i128
+                    } else if mag & (1u64 << (w - 1)) != 0 {
+                        mag as i128 - (1i128 << w)
+                    } else {
+                        mag as i128
+                    };
+                    // `-sval` fits a signed `w`-bit type iff it is at most
+                    // `2^(w-1) - 1`, i.e. `sval > -2^(w-1)`. The negation is
+                    // computed at the *operand's* type, so the overflow is a Rust
+                    // error wherever the result is read -- `-(i8::MIN) as i16` does
+                    // not compile either -- and the shape is refused here rather
+                    // than recorded, which a wider target would re-accept.
+                    let fits_neg = if w >= 64 {
+                        sval != i64::MIN as i128
+                    } else {
+                        sval > -(1i128 << (w - 1))
+                    };
+                    if !fits_neg {
+                        return Err(self.err(
+                            "negating a signed constant at its own type is out of range, so the \
+                             shape is refused",
+                        ));
+                    }
+                }
             }
             // A unary `-` is checked as Rust checks the *negated value*: `-(-128)`
             // is `128`, out of range for an `i8`, where `-128` is fine. The one
@@ -3097,7 +3158,6 @@ impl<'a> Parser<'a> {
             // *replaced* by the negation rather than checked, so the operand's own
             // value is not carried through -- but a literal inside a fold is
             // (`-(128 - 63)` is rejected for its `128`).
-            let bare = self.bare_literals.contains(&v.0 .0);
             let nv = smt::sub(smt::word(0, w), v);
             self.record_negation(nv, v, bare);
             // A negated complement carries the complement's operand envelope
@@ -3249,7 +3309,17 @@ impl<'a> Parser<'a> {
                     .map(|v| smt::bits(*v))
                     .max()
                     .unwrap_or(64);
-                let w = scope.max(need).min(64);
+                // A bare literal inside a shift *amount* is floored at 32 bits,
+                // because that is the type Rust gives an unconstrained amount: the
+                // amount's type is not tied to the operand's, so it defaults to
+                // `i32` and is folded at 32 bits. Sizing it to an eight-bit scope
+                // instead made `x >> (2 << 7)` fold the amount to `0` (the
+                // eight-bit `2 << 7` wraps) where rustc computes `256` and rejects
+                // the shift, so the reader *decided* a comparison on a rejected
+                // program. A *suffixed* amount keeps its suffix's width, which is
+                // why only this path is floored.
+                let floor = if self.amount_depth > 0 { 32 } else { 0 };
+                let w = scope.max(need).max(floor).min(64);
                 // A *bare* literal is untyped and non-negative: its value is
                 // unambiguous, but its signedness is not yet known.
                 let v = smt::word(n, w);
@@ -4719,8 +4789,81 @@ mod tests {
         }
     }
 
+    /// A shift *amount* is a value of its own type, so its bare literals are
+    /// evaluated at Rust's `i32` (32 bits), not at the shifted operand's width.
+    ///
+    /// `x >> (2 << 7)` for a `u8` `x` is a rustc error: the amount `2 << 7` is an
+    /// `i32` and is `256`, and a shift by 256 overflows. Sizing the amount's
+    /// literals to the eight-bit scope instead made `2 << 7` wrap to `0`, so the
+    /// shift read as `x >> 0` and the reader *decided* `x >> (2 << 7) == 0` --
+    /// false at `x == 0` -- on a program rustc rejects. The floor makes the fold
+    /// agree with rustc, so the wrapped amount never appears and the shift is
+    /// refused for the amount it really is.
+    #[test]
+    fn a_shift_amount_is_evaluated_at_its_own_width_not_the_operands() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::var(8));
+        let mut unsigned = BTreeSet::new();
+        unsigned.insert("x".to_string());
+        // Each amount is `256` (or wraps through one) at `i32`; every one is a
+        // rustc overflow and must be refused rather than folded to a small count.
+        for text in ["x >> (2 << 7) == 0", "x >> (2 << 6) == 0"] {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            assert!(
+                p.parse_or().is_err(),
+                "`{text}` overflows at the amount's own `i32` width and must be refused"
+            );
+        }
+        // Amounts that fit `i32` and are below the operand width still read.
+        for text in ["(x >> (1 + 1)) == 0", "(x >> (2 * 2)) == 0", "(x >> (8 - 1)) == 0",
+                     "(x >> 7) == 0"] {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            assert!(p.parse_or().is_ok(), "`{text}` has an in-range amount and reads");
+        }
+    }
+
+    /// Negating a signed constant at its own type is checked against the *value*,
+    /// not the written magnitude, so `-(i8::MIN)` and `-(3 << 7)` are refused.
+    ///
+    /// `i8::MIN` is the bit pattern `128` and the value `-128`. The reader's
+    /// magnitude check reads the bit pattern, which is the same `128` that the
+    /// legal literal `128i8` has, so it passed and the negation was recorded as
+    /// the in-range `-128` -- and the reader *decided* `y == -(i8::MIN)` on a
+    /// program rustc rejects with `attempt to negate i8::MIN, which would
+    /// overflow`. `3 << 7` at eight bits wraps to the same bit pattern, so
+    /// `-(3 << 7)` was decided too. Only a pristine literal is exempt, because
+    /// there the negation is what makes the magnitude legal (`-128i8` reads).
+    #[test]
+    fn negating_a_signed_constant_is_checked_as_its_value() {
+        let mut args = BTreeMap::new();
+        args.insert("y".to_string(), smt::var(8));
+        let mut signed = BTreeSet::new();
+        signed.insert("y".to_string());
+        for text in [
+            "y == -(i8::MIN)",
+            "y == -(3 << 7)",
+            "y == -(1 << 7)",
+            "y <= (-(i8::MIN))",
+            "y == -(-128i8)",
+        ] {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            assert!(
+                p.parse_or().is_err(),
+                "`{text}` negates a constant out of range at its own type and must be refused"
+            );
+        }
+        // A pristine literal, the bound's maximum, and a plain negation read.
+        for text in ["y == -128i8", "y == -(128i8)", "y == i8::MIN", "y == -(i8::MAX)",
+                     "y == -(127)"] {
+            let mut p = Parser::new(text, &args, None, &signed, false);
+            let r = p.parse_or();
+            assert!(r.is_ok(), "`{text}` is legal and must read: {:?}", r.err().map(|e| format!("{e}")));
+        }
+    }
+
     /// A typed constant mask against a partner of its *own* signedness reads.
     #[test]
+
     fn a_typed_constant_mask_with_a_same_signedness_partner_reads() {
         let mut args = BTreeMap::new();
         args.insert("y".to_string(), smt::var(8));

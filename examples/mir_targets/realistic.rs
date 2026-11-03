@@ -1886,6 +1886,41 @@ pub fn contract_signed_negation_still_reads(x: i8) -> u8 {
     -x as u8
 }
 
+// ---------------------------------------------------------------------------
+// Negating a *constant* is checked against the value it denotes, not the written
+// magnitude, so a negation that overflows its own type is refused.
+//
+// `i8::MIN` is the bit pattern `128` and the value `-128`. The reader's range
+// check read the bit pattern -- the same `128` the *legal* literal `128i8` has --
+// so the negation passed and was recorded as the in-range `-128`, and the reader
+// *decided* `y == -(i8::MIN)` on a program rustc rejects ("attempt to negate
+// `i8::MIN`, which would overflow"). `3 << 7` at eight bits wraps to the same bit
+// pattern, so `-(3 << 7)` was decided too. Only a pristine literal is exempt,
+// because there the negation is what makes the magnitude legal (`-128i8` reads).
+//
+// These are `skipped`, not `verified` and not `failed`.
+/// requires: true
+/// ensures: y == -(i8::MIN)
+pub fn contract_negation_of_min_is_refused(y: i8) -> i8 {
+    y
+}
+
+/// The same overflow reached through a shift that wraps to `i8::MIN`'s pattern,
+/// so the check is on the *value* and not on the `i8::MIN` spelling.
+/// requires: true
+/// ensures: y == -(3 << 7)
+pub fn contract_negation_of_wrapping_shift_is_refused(y: i8) -> i8 {
+    y
+}
+
+/// The control: negating `i8::MAX` is in range and must still read, so the
+/// refusal above is pinned to the overflow and not to a negation of a bound.
+/// requires: y == -127
+/// ensures: ret == -y as i8
+pub fn contract_negation_of_max_still_reads(y: i8) -> i8 {
+    -y
+}
+
 /// A shift *amount* may be a constant expression, not only a bare literal:
 /// `x >> 1 + 1` is `x >> 2` in Rust. The reader accepted only a raw literal, so
 /// this shape was unreadable -- a dropped obligation on something rustc compiles.
@@ -3107,6 +3142,40 @@ pub fn contract_fitting_untyped_shift_still_reads(x: u8) -> u8 {
 /// ensures: (a >> 3) == 1
 pub fn contract_typed_shift_still_reads(a: u16) -> u16 {
     a
+}
+
+// ---------------------------------------------------------------------------
+// A shift *amount* is a value of its own type, not of the shifted operand's.
+//
+// Rust leaves the amount's type unconstrained, so an unsuffixed amount defaults
+// to `i32` and is folded at 32 bits. `x >> (2 << 7)` for a `u8` `x` is then an
+// amount of `256` -- a shift overflow, and a rustc error. The reader sized the
+// amount's literals to the eight-bit *scope*, so `2 << 7` wrapped to `0` and the
+// shift read as `x >> 0`; the reader then *decided* `x >> (2 << 7) == 0` -- false
+// at `x == 0` -- on a program rustc rejects. Flooring an amount's bare literals
+// at 32 bits makes the fold agree with rustc's `i32` evaluation, so the wrapped
+// amount never appears and the shift is refused for the amount it really is.
+//
+// These are `skipped`, not `verified` and not `failed`.
+/// requires: true
+/// ensures: (x >> (2 << 7)) == 0
+pub fn contract_nested_shift_amount_overflow_is_refused(x: u8) -> u8 {
+    x
+}
+
+/// The same wrapped amount reached through a `+`, so the floor is on the amount
+/// expression as a whole and not only on a bare nested shift.
+/// requires: true
+/// ensures: (x >> ((2 << 7) + 1)) == 0
+pub fn contract_nested_shift_amount_sum_overflow_is_refused(x: u8) -> u8 {
+    x
+}
+
+/// The control: an amount that fits `i32` and is below the operand width reads.
+/// requires: true
+/// ensures: (x >> (1 + 1)) <= x
+pub fn contract_fitting_shift_amount_still_reads(x: u8) -> u8 {
+    x
 }
 
 // ---------------------------------------------------------------------------
