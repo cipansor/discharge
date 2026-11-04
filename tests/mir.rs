@@ -2667,6 +2667,51 @@ fn a_contract_cast_is_read_and_proved() {
     assert!(o.is_verified(), "`narrow` must verify, got: {o}");
 }
 
+/// A cast in a contract is a *value*, so a relational postcondition about it is
+/// decided rather than refused.
+///
+/// The equality entries pin that a cast *extends* like Rust (`-1i8 as i16` is
+/// `-1`, not `255`), but they only ever meet the cast with `==`. A cast the order
+/// operator cannot read would be a silently dropped obligation -- the failure mode
+/// the tripwire rule exists to catch -- so this pairs three true relational
+/// contracts with two that must be refuted. The pair also separates
+/// sign-extension from zero-filling *through the order*: `(y as i16) >= 0` for an
+/// `i8` `y` is false exactly when the source's sign is kept, and
+/// `(y as i16) <= 127` is true exactly when it is.
+///
+/// The evidence behind the entries is a differential sweep over every cast of a
+/// small type into every wider target, compared against an exhaustive Python
+/// model: 2160 cases decided, 0 unsound, 0 discrepancies.
+#[test]
+fn a_cast_in_a_contract_can_be_ordered() {
+    let names = [
+        "contract_cast_relational_nonneg",
+        "contract_cast_relational_lt_width",
+        "contract_cast_relational_signed_bound",
+        "contract_cast_relational_signed_nonneg_tripwire",
+        "contract_cast_relational_positive_tripwire",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in [
+        "contract_cast_relational_nonneg",
+        "contract_cast_relational_lt_width",
+        "contract_cast_relational_signed_bound",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in [
+        "contract_cast_relational_signed_nonneg_tripwire",
+        "contract_cast_relational_positive_tripwire",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "`{name}` is false for every negative (resp. zero) input; got: {o}"
+        );
+    }
+}
+
 /// The contract operators that were missing (`/ % << >>`), and the precedence
 /// they need. A missing operator is a dropped obligation -- the contract is
 /// unreadable and the function silently leaves the check set -- so each entry

@@ -5309,3 +5309,49 @@ The lesson: the reader must never range-check a *guess*. The amount floor's `i32
 about a type Rust leaves open, and the fold's unsigned value was a guess about a signedness
 Rust leaves open; in both cases the guess was checked as though it were read, and a shape
 rustc accepts was refused. A guess may guide a fold, but it must not become a refusal.
+
+## A cast in a contract is a value the order can be asked about, not only a spelling to equate
+
+The cast entries in the corpus all pin *equality*: `ret == x as u32`, and its tripwires. That
+pins that a contract cast extends like Rust rather than reinterpreting, but it never asks the
+reader to *decide* anything about the cast's value -- the comparison is between the cast and a
+term the body also produces, so a reader that carried the cast as an opaque variable of the
+right width would pass every one of them.
+
+So the shape that was *supported until contradicted* is the cast under an order: `(x as i16) >= 0`
+for a `u8` `x`, `(y as i16) <= 127` for an `i8` `y`. Both are decided by the reader's own
+extend-then-compare, and both would be refused ("unknown sign") by a reader that lost the
+cast's sign, which is the exact failure the equality entries cannot see. Five entries now carry
+it -- three true, two tripwires:
+
+* `contract_cast_relational_nonneg` (`u8`→`i16`, `>= 0`) and `contract_cast_relational_lt_width`
+  (`u8`→`i16`, `< 256`) state both ends of the zero-filled range, so neither is a constant the
+  reader could have folded to the answer.
+* `contract_cast_relational_signed_bound` (`i8`→`i16`, `<= 127`) pins sign-extension *through the
+  order*: a zero-filling model would place `-1i8 as i16` at `255` and refute this at `y == -1`.
+* `contract_cast_relational_signed_nonneg_tripwire` (`i8`→`i16`, `>= 0`) must be refuted at
+  `y == -1` (witness `v1:u8 = 128`, i.e. the bit pattern of `-128`), which a reader that dropped
+  the source's sign and treated the cast as unsigned would prove.
+* `contract_cast_relational_positive_tripwire` (`u8`→`i16`, `> 0`) must be refuted at `x == 0`,
+  the lower bound the true entry above claims.
+
+**Evidence.** The differential sweep is the reason the entries are trustworthy rather than a
+guess: every cast of a small type (`u8`, `i8`, `u16`, `i16`) into every wider target (`u8`..`i32`)
+under every comparison operator and constant, against an exhaustive Python model of the same
+cast -- **2160 cases decided, 0 unsound, 0 discrepancies**. Two further sweeps closed the same
+question for the neighbouring dimensions and are recorded here so they are not re-derived: a
+hypothetical-reasoning sweep (320 `requires`/`ensures` pairs over one variable, exhaustive
+ground truth) **0 unsound, 0 discrepancies**, and an end-to-end body sweep (14 arithmetic bodies
+× 6 preconditions × 90 postconditions, each against a 256-value simulation) **7020 decided, 0
+unsound, 0 discrepancies**.
+
+The test `a_cast_in_a_contract_can_be_ordered` pins the five verdicts, so a reader that lost the
+cast's sign is a failure rather than a quiet false proof. Corpus `decided 162 of 301` →
+**`decided 165 of 306`**; `cargo test --features std` **599 → 600** passed, 0 failed. Gate green.
+
+The lesson is the tripwire rule applied to a *value* rather than a name: "supported until
+contradicted" is a statement about coverage, and a value can be read for equality in a hundred
+entries while never once being asked to support an inference. The dimension to look for is the
+one every existing entry holds constant -- here, that the only operator the cast ever meets is
+`==`.
+

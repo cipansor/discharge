@@ -1763,6 +1763,59 @@ pub fn contract_cast_chain_tripwire(x: u8) -> u32 {
     x as u16 as u32
 }
 
+/// A cast in a contract is a *value* the order can be asked about, not only a
+/// spelling that can be equated with the return. `x as i16` for a `u8` `x` is
+/// non-negative, because zero-filling a `u8` into a wider signed type cannot set
+/// the sign bit. The comparison is therefore decided on the cast's value rather
+/// than refused as an unknown sign, which is what the equality entries above do
+/// not show: they only ever meet the cast with `==`.
+/// requires: true
+/// ensures: (x as i16) >= 0
+pub fn contract_cast_relational_nonneg(x: u8) -> u8 {
+    x
+}
+
+/// The same cast against the upper bound: a `u8` zero-fills into `i16` in
+/// `[0, 255]`, so `(x as i16) < 256` holds for every input. Pinned with the
+/// entry above so both ends of the widened range are exercised, and neither is a
+/// constant the reader could have folded to the answer.
+/// requires: true
+/// ensures: (x as i16) < 256
+pub fn contract_cast_relational_lt_width(x: u8) -> u8 {
+    x
+}
+
+/// A *signed* source sign-extends into the wider signed target, so `y as i16` for
+/// an `i8` `y` is `<= 127` -- the top of the source's range, sign-extended. A
+/// model that zero-filled would place `-1i8 as i16` at `255`, and this contract
+/// would be refuted at `y == -1`.
+/// requires: true
+/// ensures: (y as i16) <= 127
+pub fn contract_cast_relational_signed_bound(y: i8) -> i8 {
+    y
+}
+
+/// The tripwire for the two `>= 0` claims above: the *signed* source is not
+/// non-negative, so `(y as i16) >= 0` is false at every negative `y` and the
+/// function must be refuted. A reader that dropped the sign of the source and
+/// treated the cast as unsigned would prove this, which is the false proof the
+/// pair exists to forbid.
+/// requires: true
+/// ensures: (y as i16) >= 0
+pub fn contract_cast_relational_signed_nonneg_tripwire(y: i8) -> i8 {
+    y
+}
+
+/// The tripwire for the widened upper bound: an `unsigned` source is *not* always
+/// positive, so `(x as i16) > 0` is false at `x == 0` and the function must be
+/// refuted. Together with `..._lt_width` this pins that the reader knows the
+/// widened value's true range rather than accepting any comparison about it.
+/// requires: true
+/// ensures: (x as i16) > 0
+pub fn contract_cast_relational_positive_tripwire(x: u8) -> u8 {
+    x
+}
+
 /// Unary `-` binds *tighter* than `as` in Rust, so `-x as u8` is `(-x) as u8`,
 /// not `-(x as u8)`. The two readings agree on the value here — negation and
 /// truncation commute — but not on the *type*: Rust's is `u8`, the other is
