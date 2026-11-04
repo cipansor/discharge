@@ -3988,6 +3988,98 @@ pub fn tuple_struct_signed_field_reads(d: &Delta) -> i8 {
     d.0
 }
 
+/// A generic type whose method is monomorphised to `Wrapper<u8>`.
+pub struct Wrapper<T> {
+    pub v: T,
+}
+
+impl Wrapper<u8> {
+    /// An associated function, called as `Wrapper::seed`.
+    pub fn seed(v: u8) -> Wrapper<u8> {
+        Wrapper { v }
+    }
+
+    /// A `&mut self` builder that returns `&mut Self`.
+    pub fn stow(&mut self, x: u8) -> &mut Wrapper<u8> {
+        self.v = x;
+        self
+    }
+
+    /// A `&self` read.
+    pub fn peek(&self) -> u8 {
+        self.v
+    }
+}
+
+/// A trait method call on a concrete receiver.
+pub trait Stow {
+    fn stash(&mut self, x: u8);
+}
+
+pub struct Slot {
+    pub v: u8,
+}
+
+impl Stow for Slot {
+    fn stash(&mut self, x: u8) {
+        self.v = x;
+    }
+}
+
+/// A method on a tuple struct.
+pub struct Couple(pub u8, pub u8);
+
+impl Couple {
+    /// A `&self` read that names a positional field.
+    pub fn prim(&self) -> u8 {
+        self.0
+    }
+
+    /// A method taking an argument.
+    pub fn shift_by(&self, k: u8) -> u8 {
+        self.0 + k
+    }
+}
+
+/// A generic method, monomorphised to `Wrapper<u8>`.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_generic_method(mut w: Wrapper<u8>) -> u8 {
+    w.stow(5);
+    w.v
+}
+
+/// An associated function, a `&mut self` builder and a `&self` read in one body.
+/// requires: true
+/// ensures: ret == 5
+pub fn an_associated_fn_and_builder_chain() -> u8 {
+    let mut w = Wrapper::seed(0);
+    w.stow(5);
+    w.peek()
+}
+
+/// A trait method call on a concrete receiver.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_trait_method(mut s: Slot) -> u8 {
+    s.stash(5);
+    s.v
+}
+
+/// A `&self` method on a tuple struct, naming a positional field.
+/// requires: t.0 == 9
+/// ensures: ret == 9
+pub fn a_tuple_struct_read_method(t: Couple) -> u8 {
+    t.prim()
+}
+
+/// A `&self` method taking an argument.
+/// requires: t.0 == 3
+/// ensures: ret == 7
+pub fn a_method_with_an_argument(t: Couple) -> u8 {
+    t.shift_by(4)
+}
+
 /// A type whose method's tail collides with a *free function* of the same name.
 ///
 /// The collision is deliberately on names used by nothing else in this file: a

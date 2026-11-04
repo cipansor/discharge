@@ -1667,6 +1667,11 @@ fn a_method_is_inlined_by_its_tail_and_an_ambiguous_tail_is_refused() {
         "a_method_leaves_its_sibling",
         "a_stale_sibling_cannot_prove_this",
         "an_ambiguous_method_tail_cannot_prove_this",
+        "a_generic_method",
+        "an_associated_fn_and_builder_chain",
+        "a_trait_method",
+        "a_tuple_struct_read_method",
+        "a_method_with_an_argument",
     ]) else {
         return;
     };
@@ -1674,6 +1679,14 @@ fn a_method_is_inlined_by_its_tail_and_an_ambiguous_tail_is_refused() {
         "a_method_write_reaches_the_caller",
         "a_method_read_modify_write",
         "a_method_leaves_its_sibling",
+        // The shapes a method can take: a generic receiver, an associated function
+        // feeding a `&mut self` builder that returns `&mut Self`, a trait method,
+        // and a `&self` read (on a tuple struct, and with an argument).
+        "a_generic_method",
+        "an_associated_fn_and_builder_chain",
+        "a_trait_method",
+        "a_tuple_struct_read_method",
+        "a_method_with_an_argument",
     ] {
         let o = outcome(&report, name);
         assert!(o.is_verified(), "a method write must reach its caller; got: {o}");

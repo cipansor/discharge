@@ -5680,7 +5680,12 @@ contract -- `an_ambiguous_method_tail_cannot_prove_this` pins that (`Widget::twi
 free `twist`) and is `incomplete`, not `verified`. Six entries with their false twins,
 pinned by `a_method_is_inlined_by_its_tail_and_an_ambiguous_tail_is_refused`.
 
-**Evidence.** Corpus `decided 181 of 333` -> **`194 of 358`**; `cargo test --workspace
+The five shapes a method takes were then probed and all decide: a generic receiver
+(`Wrapper<u8>` monomorphised), an associated function feeding a `&mut self` builder that
+returns `&mut Self`, a trait method on a concrete receiver, and a `&self` read -- on a
+tuple struct and with an argument. They are in the same test.
+
+**Evidence.** Corpus `decided 181 of 333` -> **`199 of 363`**; `cargo test --workspace
 --features std` **608 -> 614** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
