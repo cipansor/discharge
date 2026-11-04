@@ -1649,6 +1649,51 @@ fn an_element_target_is_written_and_a_by_value_copy_is_not() {
     }
 }
 
+/// A method is inlined by its *last* path component, because rustc defines an
+/// inherent method as `<impl at file:line:col>::set_lo` but calls it as
+/// `Config::set_lo`; and an ambiguous tail is refused rather than guessed.
+///
+/// Before the tail match, a call to any method was "unmodelled function", so a
+/// method's write through `&mut self` was invisible to its caller. The tripwire
+/// pins the other direction: `set_lo` is both a method and a free function here, so
+/// the tail names two bodies and the call must be refused -- inlining the free
+/// function would write through the wrong shape and *prove* a false contract.
+#[test]
+fn a_method_is_inlined_by_its_tail_and_an_ambiguous_tail_is_refused() {
+    let Some(report) = verify_realistic(&[
+        "a_method_write_reaches_the_caller",
+        "a_method_write_cannot_prove_this",
+        "a_method_read_modify_write",
+        "a_method_leaves_its_sibling",
+        "a_stale_sibling_cannot_prove_this",
+        "an_ambiguous_method_tail_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "a_method_write_reaches_the_caller",
+        "a_method_read_modify_write",
+        "a_method_leaves_its_sibling",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a method write must reach its caller; got: {o}");
+    }
+    for name in ["a_method_write_cannot_prove_this", "a_stale_sibling_cannot_prove_this"] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a stale caller value must not prove this false contract; got: {o}"
+        );
+    }
+    // Refused, not decided either way: the tail is ambiguous, so any verdict would
+    // come from the wrong body. It surfaces as `Incomplete`, which is not a pass.
+    let o = outcome(&report, "an_ambiguous_method_tail_cannot_prove_this");
+    assert!(
+        matches!(o, FnOutcome::Incomplete { .. }),
+        "an ambiguous method tail must be refused; got: {o}"
+    );
+}
+
 /// A slice's length is read through the *one* rvalue the compiler prints, on any
 /// toolchain.
 ///

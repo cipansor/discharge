@@ -5668,8 +5668,20 @@ argument (`set_five_by_value(x)`) must leave the caller's value alone, so
 That is the boundary the whole write-back exists to keep: a reference shares storage, a
 value does not.
 
-**Evidence.** Corpus `decided 181 of 333` -> **`191 of 352`**; `cargo test --workspace
---features std` **608 -> 613** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+**Methods are inlined by their tail, and an ambiguous tail is refused.** rustc defines an
+inherent method as `<impl at file:line:col>::set_lo` and calls it as `Config::set_lo`, so
+the fallback name match -- which compared the call against the whole definition name --
+never fired for a method: *every* method call was "unmodelled function", and a method's
+write through `&mut self` was invisible to its caller. Cutting both sides to the last `::`
+component fixes that, but the tail is not unique in general (`set_lo` can be a method *and*
+a free function), so the match is required to hit exactly one definition. An ambiguous tail
+is refused, because picking either body would inline the wrong one and *prove* a false
+contract -- `an_ambiguous_method_tail_cannot_prove_this` pins that (`Widget::twist` vs a
+free `twist`) and is `incomplete`, not `verified`. Six entries with their false twins,
+pinned by `a_method_is_inlined_by_its_tail_and_an_ambiguous_tail_is_refused`.
+
+**Evidence.** Corpus `decided 181 of 333` -> **`194 of 358`**; `cargo test --workspace
+--features std` **608 -> 614** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
 `mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.

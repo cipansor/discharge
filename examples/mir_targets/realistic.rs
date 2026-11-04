@@ -369,6 +369,20 @@ pub struct Config {
     pub hi: u8,
 }
 
+impl Config {
+    pub fn set_lo(&mut self, v: u8) {
+        self.lo = v;
+    }
+
+    pub fn bump_lo(&mut self) {
+        self.lo = self.lo + 1;
+    }
+
+    pub fn set_hi(&mut self, v: u8) {
+        self.hi = v;
+    }
+}
+
 /// A fieldless enum, for the `match` shapes at the end of the file.
 ///
 /// Its variants are declared in one line, which is the shape a one-line reader
@@ -859,6 +873,56 @@ pub fn a_by_value_callee_write_stays_in_the_callee(x: u8) -> u8 {
 pub fn a_by_value_callee_write_cannot_prove_this(x: u8) -> u8 {
     let _ = set_five_by_value(x);
     x
+}
+
+/// A method that writes a field through `&mut self`.
+///
+/// An inherent method is *defined* as `<impl at file:line:col>::set_lo` and *called*
+/// as `Config::set_lo`, so a name match has to cut both sides to their last `::`
+/// component. Without that, every method call was "unmodelled function" and a
+/// method's write through `&mut self` could not be seen by its caller.
+pub fn method_set_lo(c: &mut Config, v: u8) {
+    c.lo = v;
+}
+
+/// A method's write through `&mut self` reaches the caller.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_method_write_reaches_the_caller(mut c: Config) -> u8 {
+    c.set_lo(5);
+    c.lo
+}
+
+/// The false direction of [`a_method_write_reaches_the_caller`].
+/// requires: c.lo == 0
+/// ensures: ret == 0
+pub fn a_method_write_cannot_prove_this(mut c: Config) -> u8 {
+    c.set_lo(5);
+    c.lo
+}
+
+/// A read-modify-write *method*.
+/// requires: c.lo == 3
+/// ensures: ret == 4
+pub fn a_method_read_modify_write(mut c: Config) -> u8 {
+    c.bump_lo();
+    c.lo
+}
+
+/// A method writing one field leaves its *sibling* alone.
+/// requires: c.lo == 7
+/// ensures: ret == 7
+pub fn a_method_leaves_its_sibling(mut c: Config) -> u8 {
+    c.set_hi(9);
+    c.lo
+}
+
+/// The false direction of [`a_method_leaves_its_sibling`].
+/// requires: c.lo == 7
+/// ensures: ret == 9
+pub fn a_stale_sibling_cannot_prove_this(mut c: Config) -> u8 {
+    c.set_hi(9);
+    c.lo
 }
 
 /// A read-modify-write helper through a `&mut` is modelled, not left incomplete.
@@ -3922,6 +3986,37 @@ pub fn tuple_struct_by_value_reads_its_field(p: Pair) -> u8 {
 /// ensures: ret < 0
 pub fn tuple_struct_signed_field_reads(d: &Delta) -> i8 {
     d.0
+}
+
+/// A type whose method's tail collides with a *free function* of the same name.
+///
+/// The collision is deliberately on names used by nothing else in this file: a
+/// shared tail is ambiguous everywhere it appears, so putting it on `set_lo` would
+/// refuse every method call above rather than only the tripwire.
+pub struct Widget {
+    pub v: u8,
+}
+
+impl Widget {
+    pub fn twist(&mut self, x: u8) {
+        self.v = x;
+    }
+}
+
+/// The free function that shares the tail `twist` with `Widget::twist`.
+pub fn twist(v: &mut u8, x: u8) {
+    *v = x;
+}
+
+/// The ambiguity tripwire: the call `w.twist(5)` must not be answered by the free
+/// function `twist`, which takes a different shape and would write through it.
+/// Inlining the wrong body here would *prove* a false contract, so the ambiguous
+/// tail is refused rather than matched to either.
+/// requires: w.v == 0
+/// ensures: ret == 0
+pub fn an_ambiguous_method_tail_cannot_prove_this(mut w: Widget) -> u8 {
+    w.twist(5);
+    w.v
 }
 
 /// The positional tripwire: the two fields are independent inputs, so a reader

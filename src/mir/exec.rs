@@ -2393,10 +2393,30 @@ where
             // anything else would be assuming the conclusion, so it is unknown. The
             // suffix match is the fallback for a name rustc prints with a path prefix
             // (`module::f`); an exact match above already took the unambiguous case.
+            //
+            // Both sides are cut to their last `::` component, because the two sides
+            // are printed differently: an inherent method is *defined* as
+            // `<impl at file:line:col>::set_lo` and *called* as `Config::set_lo`, so
+            // matching the call against the whole definition name never fires. Cutting
+            // both to `set_lo` is what lets a method be inlined at all -- without it a
+            // call to any method was "unmodelled function", so a method's write
+            // through `&mut self` could not be seen by its caller.
+            //
+            // The tail match is required to be *unique*. `set_lo` on two types is
+            // two definitions with the same tail, and the call names only one of
+            // them, so picking the first would inline the wrong body -- a wrong
+            // proof, not a lost one. An ambiguous tail is refused instead.
             let inline_idx = exact.or_else(|| {
-                prog.fns
+                let tail = name.rsplit("::").next();
+                let mut hits = prog
+                    .fns
                     .iter()
-                    .position(|g| g.name.rsplit("::").next() == Some(name.as_str()))
+                    .enumerate()
+                    .filter(|(_, g)| g.name.rsplit("::").next() == tail);
+                match (hits.next(), hits.next()) {
+                    (Some((i, _)), None) => Some(i),
+                    _ => None,
+                }
             });
             let Some(idx) = inline_idx else {
                 report.unknown_paths.push(format!("call to unmodelled function `{name}`"));
