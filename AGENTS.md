@@ -5712,8 +5712,18 @@ front), routing a one-step remainder to `fields` and a longer one to `nested`. F
 entries with their false twins, pinned by
 `a_reference_argument_is_read_and_written_through_its_target`.
 
-**Evidence.** Corpus `decided 181 of 333` -> **`209 of 381`**; `cargo test --workspace
---features std` **608 -> 615** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+**A method receiver is a sub-place like any other argument.** With the tail match, the
+carry-in and the re-based write-back in place, the receiver *shapes* decide through the
+same path: a nested-field receiver (`o.i.set_leaf(5)`), two calls in sequence, a
+reborrowed receiver (`let r = &mut o; r.i.set_leaf(5)`), a `&self` read feeding a `&mut`
+write, and a leaf write that leaves the target's sibling at the caller's seed. Ten entries
+with their false twins, pinned by
+`a_method_receiver_is_a_sub_place_like_any_other_argument`. A whole-aggregate replacement
+through a sub-place target (`*i = n` for `&mut o.i`) is *sound-incomplete* rather than
+decided: a leaf write cannot spell a whole value, so the caller's leaf reads unknown.
+
+**Evidence.** Corpus `decided 181 of 333` -> **`214 of 391`**; `cargo test --workspace
+--features std` **608 -> 616** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
 `mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.

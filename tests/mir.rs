@@ -1788,6 +1788,54 @@ fn a_reference_argument_is_read_and_written_through_its_target() {
     }
 }
 
+/// The receiver *shapes* a method arrives in: a nested-field receiver, two calls in
+/// sequence, a reborrowed receiver, a `&self` read feeding a `&mut` write, and a leaf
+/// write that must leave its sibling at the caller's seed.
+///
+/// These decide through the same inlining and write-back as the plain receiver, which
+/// is the point: the receiver is just another argument, and its target is a sub-place
+/// (`o.i`) rather than a whole local.
+#[test]
+fn a_method_receiver_is_a_sub_place_like_any_other_argument() {
+    let Some(report) = verify_realistic(&[
+        "a_method_on_a_nested_receiver",
+        "a_stale_nested_receiver_cannot_prove_this",
+        "two_methods_in_sequence",
+        "a_stale_first_method_cannot_prove_this",
+        "a_method_through_a_reborrow",
+        "a_stale_reborrow_receiver_cannot_prove_this",
+        "a_read_method_feeds_a_write",
+        "a_stale_read_method_cannot_prove_this",
+        "a_leaf_write_leaves_its_sibling",
+        "a_stale_leaf_sibling_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "a_method_on_a_nested_receiver",
+        "two_methods_in_sequence",
+        "a_method_through_a_reborrow",
+        "a_read_method_feeds_a_write",
+        "a_leaf_write_leaves_its_sibling",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a method receiver must reach its target; got: {o}");
+    }
+    for name in [
+        "a_stale_nested_receiver_cannot_prove_this",
+        "a_stale_first_method_cannot_prove_this",
+        "a_stale_reborrow_receiver_cannot_prove_this",
+        "a_stale_read_method_cannot_prove_this",
+        "a_stale_leaf_sibling_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a stale receiver value must not prove this false contract; got: {o}"
+        );
+    }
+}
+
 /// A slice's length is read through the *one* rvalue the compiler prints, on any
 /// toolchain.
 ///

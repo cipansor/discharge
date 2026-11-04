@@ -4267,6 +4267,120 @@ pub fn a_stale_nested_aggregate_read_cannot_prove_this(o: OuterBox) -> u8 {
     read_nested(&o.i)
 }
 
+/// A `&mut self` method on the *inner* type, called on a nested-field receiver
+/// (`o.i.set_leaf(5)`), plus its `&self` read.
+impl InnerBox {
+    /// A `&mut self` method writing the leaf.
+    pub fn set_leaf(&mut self, x: u8) {
+        self.v = x;
+    }
+
+    /// A `&self` method reading the leaf.
+    pub fn get_leaf(&self) -> u8 {
+        self.v
+    }
+}
+
+/// A method on a *nested-field* receiver: `o.i.set_leaf(5)`.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_method_on_a_nested_receiver(mut o: OuterBox) -> u8 {
+    o.i.set_leaf(5);
+    o.i.v
+}
+
+/// The false direction of [`a_method_on_a_nested_receiver`].
+/// requires: o.i.v == 0
+/// ensures: ret == 0
+pub fn a_stale_nested_receiver_cannot_prove_this(mut o: OuterBox) -> u8 {
+    o.i.set_leaf(5);
+    o.i.v
+}
+
+/// Two method calls in sequence on one receiver: the later write must win.
+/// requires: true
+/// ensures: ret == 7
+pub fn two_methods_in_sequence(mut o: OuterBox) -> u8 {
+    o.i.set_leaf(5);
+    o.i.set_leaf(7);
+    o.i.v
+}
+
+/// The false direction: the first call's 5 must not survive.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_stale_first_method_cannot_prove_this(mut o: OuterBox) -> u8 {
+    o.i.set_leaf(5);
+    o.i.set_leaf(7);
+    o.i.v
+}
+
+/// A method call through a *reborrowed* receiver (`let r = &mut o; r.i.set_leaf(5)`).
+/// requires: true
+/// ensures: ret == 5
+pub fn a_method_through_a_reborrow(mut o: OuterBox) -> u8 {
+    let r = &mut o;
+    r.i.set_leaf(5);
+    o.i.v
+}
+
+/// The false direction of [`a_method_through_a_reborrow`].
+/// requires: o.i.v == 0
+/// ensures: ret == 0
+pub fn a_stale_reborrow_receiver_cannot_prove_this(mut o: OuterBox) -> u8 {
+    let r = &mut o;
+    r.i.set_leaf(5);
+    o.i.v
+}
+
+/// A `&self` method whose result feeds a `&mut` write on the same struct.
+/// requires: o.i.v == 9
+/// ensures: ret == 9
+pub fn a_read_method_feeds_a_write(mut o: OuterBox) -> u8 {
+    let t = o.i.get_leaf();
+    o.i.set_leaf(t);
+    o.i.v
+}
+
+/// The false direction of [`a_read_method_feeds_a_write`].
+/// requires: o.i.v == 9
+/// ensures: ret == 8
+pub fn a_stale_read_method_cannot_prove_this(mut o: OuterBox) -> u8 {
+    let t = o.i.get_leaf();
+    o.i.set_leaf(t);
+    o.i.v
+}
+
+/// A two-leaf type for the sibling test, kept apart from `InnerBox` so the leaf
+/// write and the sibling read are fields of one target.
+pub struct DuoBox {
+    pub v: u8,
+    pub w: u8,
+}
+
+/// A helper writing only the `v` leaf of a `&mut DuoBox`.
+pub fn write_duo(d: &mut DuoBox) {
+    d.v = 5;
+}
+
+/// A leaf write through a `&mut` target leaves the target's *sibling* leaf at the
+/// caller's seed.
+/// requires: d.w == 9
+/// ensures: ret == 9
+pub fn a_leaf_write_leaves_its_sibling(mut d: DuoBox) -> u8 {
+    write_duo(&mut d);
+    d.w
+}
+
+/// The false direction of [`a_leaf_write_leaves_its_sibling`]: the sibling is not
+/// the value that was written.
+/// requires: d.w == 9
+/// ensures: ret == 5
+pub fn a_stale_leaf_sibling_cannot_prove_this(mut d: DuoBox) -> u8 {
+    write_duo(&mut d);
+    d.w
+}
+
 /// A type whose method's tail collides with a *free function* of the same name.
 ///
 /// The collision is deliberately on names used by nothing else in this file: a
