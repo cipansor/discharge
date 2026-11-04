@@ -309,33 +309,47 @@ pub fn extract(source: &str) -> Specs {
             }
             continue;
         }
-        if let Some((name, closed_inline)) = struct_head(line) {
+        if let Some(head) = struct_head(line) {
             // A doc comment above a struct documents the struct, not a function.
             // The pending contract is dropped here for the same reason the
             // catch-all below drops it: a contract must attach to the item it was
             // written above. Carrying it to the next `fn` was a false proof when
             // the leaked `requires` was satisfiable.
             pending = FnContract::default();
-            // A one-line body is complete already; opening a cursor would run
-            // past the closing brace and consume every following line -- contracts
-            // and functions included -- as fields, so the functions would silently
-            // disappear from the spec table. Read the fields out of the head line
-            // instead, exactly as the enum path reads an `Inline` body.
-            if closed_inline {
-                let t = line.trim_start_matches("pub(crate) ").trim_start_matches("pub ").trim();
-                let mut def = StructDef::default();
-                if let Some(open) = t.find('{') {
-                    if let Some(close) = t[open + 1..].rfind('}') {
-                        for f in split_top_level(&t[open + 1..open + 1 + close], ',') {
-                            if let Some((fname, fty)) = struct_field(&f) {
-                                def.fields.push((fname, Ty::parse(&fty)));
+            match head {
+                // A tuple struct carries its fields in the head, numbered by
+                // position, so there is no body to cursor over.
+                StructHead::Tuple { name, fields } => {
+                    let mut def = StructDef::default();
+                    for (fname, fty) in fields {
+                        def.fields.push((fname, Ty::parse(&fty)));
+                    }
+                    specs.structs.insert(name, def);
+                }
+                StructHead::Named { name, closed_inline } => {
+                    // A one-line body is complete already; opening a cursor would run
+                    // past the closing brace and consume every following line -- contracts
+                    // and functions included -- as fields, so the functions would silently
+                    // disappear from the spec table. Read the fields out of the head line
+                    // instead, exactly as the enum path reads an `Inline` body.
+                    if closed_inline {
+                        let t =
+                            line.trim_start_matches("pub(crate) ").trim_start_matches("pub ").trim();
+                        let mut def = StructDef::default();
+                        if let Some(open) = t.find('{') {
+                            if let Some(close) = t[open + 1..].rfind('}') {
+                                for f in split_top_level(&t[open + 1..open + 1 + close], ',') {
+                                    if let Some((fname, fty)) = struct_field(&f) {
+                                        def.fields.push((fname, Ty::parse(&fty)));
+                                    }
+                                }
                             }
                         }
+                        specs.structs.insert(name, def);
+                    } else {
+                        cur_struct = Some((name, StructDef::default()));
                     }
                 }
-                specs.structs.insert(name, def);
-            } else {
-                cur_struct = Some((name, StructDef::default()));
             }
             continue;
         }
@@ -3688,32 +3702,67 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Pull the struct name out of a `pub struct Name {` head line, and say whether
-/// the body closes on that same line.
+/// The parsed head of a `struct` declaration.
 ///
-/// Only a *braced* struct is recognised. A tuple struct or a unit struct has no
-/// named fields to project, so reading it as a struct with no fields would turn a
-/// contract naming `.0` into an "unknown field" refusal rather than a "this shape
-/// is not modelled" one — the same outcome, and no false layout.
+/// Two shapes are recognised, and they are distinct because they carry their
+/// fields differently. A *named-field* struct (`pub struct C { lo: u8 }`) may
+/// close on its head line or need a cursor to collect the body; that is the
+/// `closed_inline` flag, which keeps an open cursor from swallowing every
+/// following line as a field and silently dropping the functions after it.
+/// A *tuple* struct (`pub struct P(pub u8, pub u8);`) carries its fields in the
+/// head itself, numbered by position, and needs no cursor.
 ///
-/// The returned flag is what keeps a one-line body (`pub struct B { pub lo: u8 }`)
-/// from opening a multi-line cursor: with the brace already closed on the head
-/// line there is no closing brace left to read, so an open cursor would consume
-/// every following line as a field and swallow the functions that come after —
-/// which silently drops them from the spec table rather than mis-verifying them.
-/// The enum reader has had this distinction (`EnumHead::Inline`) all along.
-fn struct_head(line: &str) -> Option<(String, bool)> {
+/// A unit struct is neither: it has no fields to project, so returning `None`
+/// leaves a contract naming `.0` as an "unknown name" refusal rather than
+/// inventing a layout with no fields.
+enum StructHead {
+    Named { name: String, closed_inline: bool },
+    Tuple { name: String, fields: Vec<(String, String)> },
+}
+
+fn struct_head(line: &str) -> Option<StructHead> {
     let t = line.trim_start_matches("pub(crate) ").trim_start_matches("pub ").trim();
     let rest = t.strip_prefix("struct ")?;
-    // Only a brace body on this line is a named-field struct.
-    let open = rest.find('{')?;
-    let name = rest.split(|c: char| c == '{' || c == '<' || c.is_whitespace()).next()?;
+    let name = rest.split(|c: char| c == '{' || c == '(' || c == '<' || c.is_whitespace()).next()?;
     if name.is_empty() {
         return None;
     }
+    // A tuple struct: the parenthesised list is the field list, and its
+    // position in the list *is* the MIR field index, exactly as a named
+    // struct's declaration order is. `pub u8` and a bare `u8` are the same
+    // field, so the `pub` is stripped the way a named field's is.
+    if let Some(open) = rest.find('(') {
+        // The brace form wins if a `{` precedes the `(`: `struct S { f: fn(u8) }`
+        // has a paren inside a field type, not a tuple body.
+        let brace = rest.find('{');
+        if brace.is_none() || open < brace.unwrap() {
+            let close = rest[open + 1..].find(')')? + open + 1;
+            let inner = &rest[open + 1..close];
+            let fields = split_top_level(inner, ',')
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, f)| {
+                    let f = f.trim();
+                    if f.is_empty() {
+                        return None;
+                    }
+                    let f = f.trim_start_matches("pub(crate) ").trim_start_matches("pub ").trim();
+                    // A tuple field cannot be empty and has no name of its own,
+                    // so its name is its index. A field type with a trailing
+                    // attribute is left as-is: `Ty::parse` reads the front of it,
+                    // and an unreadable one widens to `Other`, which refuses a
+                    // contract on it rather than fabricating a width.
+                    Some((i.to_string(), f.to_string()))
+                })
+                .collect();
+            return Some(StructHead::Tuple { name: name.to_string(), fields });
+        }
+    }
+    // Only a brace body on this line is a named-field struct.
+    let open = rest.find('{')?;
     // Closed on the head line iff a `}` follows the `{`.
     let closed_inline = rest[open + 1..].contains('}');
-    Some((name.to_string(), closed_inline))
+    Some(StructHead::Named { name: name.to_string(), closed_inline })
 }
 
 /// Pull `(field, type)` out of one line of a struct body.

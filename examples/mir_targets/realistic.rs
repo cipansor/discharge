@@ -3619,3 +3619,82 @@ pub fn contract_named_min_after_bare_128_reads(x: u8, y: i8) -> u8 {
     let _ = (x, y);
     0
 }
+
+// ---------------------------------------------------------------------------
+// Gap 8: a contract could not name a *tuple struct's* field.
+// ---------------------------------------------------------------------------
+
+/// A tuple struct, for the positional-field shapes.
+///
+/// `struct_head` recognised only a braced body, so `pub struct Pair(pub u8, pub u8)`
+/// was never read as a struct: a contract naming `p.0` got "unknown name `p`"
+/// because the argument's type was an opaque `Other("Pair")` with no layout. Its
+/// fields are numbered by position, which is exactly the MIR field index, so
+/// `p.0` and the body's `(*_1).0` name one variable.
+pub struct Pair(pub u8, pub u8);
+
+/// A one-field tuple struct with a *signed* field, so the field's signedness has
+/// to come from the declared type rather than the dump. `Delta(-5)` is an `i8`
+/// whose `.0` is negative, so `d.0 > -100` is a signed comparison.
+pub struct Delta(pub i8);
+
+/// The positional form of [`struct_reassign_then_field_read`]: a tuple struct's
+/// field read through a reference.
+/// requires: p.0 <= p.1
+/// ensures: ret >= p.0
+pub fn tuple_struct_reads_its_field(p: &Pair) -> u8 {
+    if p.0 > p.1 { p.0 } else { p.1 }
+}
+
+/// The same contract on a *by-value* tuple struct, so the binding does not depend
+/// on reading through the reference.
+/// requires: p.0 <= p.1
+/// ensures: ret <= p.1
+pub fn tuple_struct_by_value_reads_its_field(p: Pair) -> u8 {
+    if p.0 > p.1 { p.0 } else { p.1 }
+}
+
+/// A signed tuple field. `d.0 < 0` is satisfiable only under the *signed*
+/// reading of the field, so a reader that took `d.0` as unsigned would find the
+/// precondition unsatisfiable and refuse the contract as vacuous rather than
+/// verify it. `verified` is therefore the evidence that the declared `i8` was
+/// read, not the dump's unsigned default.
+/// requires: d.0 < 0
+/// ensures: ret < 0
+pub fn tuple_struct_signed_field_reads(d: &Delta) -> i8 {
+    d.0
+}
+
+/// The positional tripwire: the two fields are independent inputs, so a reader
+/// that bound `p.0` and `p.1` to one variable would make `ret == p.0` hold --
+/// with one variable, `max(v, v)` is `v`. With two, `p.0 <= p.1` and `p.0 != p.1`
+/// gives `ret == p.1 != p.0`, so the contract is refuted. Refuted is the evidence
+/// the fields are distinct rather than one aliased word.
+/// requires: p.0 < p.1
+/// ensures: ret == p.0
+pub fn tuple_struct_fields_are_independent(p: &Pair) -> u8 {
+    if p.0 > p.1 { p.0 } else { p.1 }
+}
+
+/// The index beyond the tuple's arity: `Pair` has two fields, so `p.2` names
+/// nothing. It must be refused as an unknown field rather than bound to a
+/// fabricated word.
+/// requires: p.2 < 100
+/// ensures: ret == 0
+pub fn tuple_struct_out_of_range_field_is_refused(p: &Pair) -> u8 {
+    let _ = p;
+    0
+}
+
+/// A tuple struct whose single field is itself a struct: the projection is
+/// nested, which this frontend does not model. It must be refused rather than
+/// silently read as the outer field.
+/// requires: n.p.0 < 100
+/// ensures: ret == 0
+pub fn nested_tuple_projection_is_refused(n: &NestedPair) -> u8 {
+    let _ = n;
+    0
+}
+
+/// The inner type of [`nested_tuple_projection_is_refused`].
+pub struct NestedPair { pub p: Pair }

@@ -5436,3 +5436,59 @@ workspace member for exactly that reason. So "this project needs nightly" is tru
 oracle and false of the crate and its MIR frontend. When a comment states a toolchain
 requirement, check it against a second toolchain before trusting it; a wrong comment here is the
 kind of thing that gets copied into a downstream build script and never questioned again.
+
+## A tuple struct is a struct too: its fields are numbered by position
+
+`struct_head` recognised only a *braced* body, so `pub struct Pair(pub u8, pub u8)`
+was never read as a struct at all. The argument's type stayed an opaque `Other("Pair")`
+with no layout, and a contract naming `p.0` was refused as "unknown name `p`" -- a
+silently dropped obligation, not a wrong verdict, for one of the most ordinary shapes in
+Rust. The old code documented this as a choice ("a tuple struct has no named fields to
+project"), and the reasoning was sound for the reader it had: there was no way to name a
+positional field. The fix is not to name it, but to number it -- the position in the
+declaration *is* the MIR field index, exactly as declaration order is for a named struct.
+
+The head parser now returns one of two shapes, and they are distinct because they carry
+their fields differently: a named struct may close on its head line or need a cursor (the
+`closed_inline` flag, which keeps an open cursor from swallowing every following line), and
+a tuple struct carries its fields in the head and needs no cursor at all. A unit struct is
+neither, so a contract naming `.0` on it stays an "unknown name" refusal rather than a
+layout with no fields.
+
+Six corpus entries, pinned by two tests (`a_contract_can_name_a_tuple_struct_field`,
+`a_tuple_struct_field_that_does_not_exist_is_refused`):
+
+| entry | shape | verdict |
+|---|---|---|
+| `tuple_struct_reads_its_field` | `&Pair`, `p.0 <= p.1` | verified |
+| `tuple_struct_by_value_reads_its_field` | `Pair` by value | verified |
+| `tuple_struct_signed_field_reads` | `&Delta(i8)`, `d.0 < 0` | verified |
+| `tuple_struct_fields_are_independent` | `p.0 < p.1`, `ret == p.0` | **FAILED** |
+| `tuple_struct_out_of_range_field_is_refused` | `p.2` on a two-field tuple | refused |
+| `nested_tuple_projection_is_refused` | `n.p.0` | refused |
+
+Two of these are worth the ink. `tuple_struct_signed_field_reads` uses `d.0 < 0`: that
+precondition is satisfiable *only* under the signed reading of the field, so a reader that
+took the positional field as unsigned would find it unsatisfiable and refuse the contract as
+vacuous -- `verified` is therefore the evidence the declared `i8` was read, not the dump's
+unsigned default. And `tuple_struct_fields_are_independent` is the tripwire: with `p.0` and
+`p.1` aliased to one variable, `max(v, v) == v` makes `ret == p.0` *true*, so a reader that
+lost the second field would prove it; refuted is the evidence the two are distinct inputs.
+
+**Evidence.** A differential grid against exhaustive ground truth over all 2^16 `(p.0, p.1)`
+pairs: 7 bodies x 5 preconditions x 18 postconditions = **630 decided, 0 unsound, 0 false
+refutations**; and for the signed field, 3 bodies x 4 preconditions x 36 postconditions =
+**432 decided, 0 unsound, 0 false refutations**. **1078 cases, all decided, all agreeing
+with the model.** A sweep that does not model its own program correctly reports its bugs as
+the engine's: the first run had a `bool`-returning body in a `u8` function, which rustc
+rejected, and the sweep read the resulting *driver* failure as "every case undecided" --
+fixed by asking rustc what the program means before believing a verdict.
+
+Corpus `decided 171 of 315` -> **`174 of 321`**; `cargo test --workspace --features std`
+**601 -> 603** passed, 0 failed; z3 `mismatch=0`, kani `mismatch=0`. Gate green; zero
+dependencies and `no_std` untouched.
+
+Still not modelled, and named so the boundary is honest: a *nested* projection (`n.p.0`) is
+refused, as is a tuple struct's field read through a nested path. A tuple struct with more
+fields than `MAX_VARS` allows would refuse the binding rather than alias it, the same rule a
+named struct follows.

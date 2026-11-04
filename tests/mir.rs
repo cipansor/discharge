@@ -1296,6 +1296,73 @@ fn a_struct_literal_reads_fields_in_declaration_order() {
     );
 }
 
+/// A contract can name a *tuple struct's* field, numbered by position.
+///
+/// `struct_head` recognised only a braced body, so `pub struct Pair(pub u8, pub u8)`
+/// was never read as a struct at all: the argument's type stayed an opaque
+/// `Other("Pair")` with no layout, and a contract naming `p.0` was refused as
+/// "unknown name `p`". The positional index *is* the MIR field index, so `p.0` and
+/// the body's `(*_1).0` must name one variable -- and each field must be its own
+/// input, not one aliased word.
+///
+/// The four verdicts pin the four things that could go wrong: the read itself
+/// (`verified`), the read through a reference as well as by value (`verified`),
+/// the declared *signedness* of the field (`verified`, and only under the signed
+/// reading), and the independence of the two fields (`FAILED`, which is the
+/// evidence they are distinct -- one shared variable would make the contract hold).
+#[test]
+fn a_contract_can_name_a_tuple_struct_field() {
+    let Some(report) = verify_realistic(&[
+        "tuple_struct_reads_its_field",
+        "tuple_struct_by_value_reads_its_field",
+        "tuple_struct_signed_field_reads",
+        "tuple_struct_fields_are_independent",
+    ]) else {
+        return;
+    };
+    for name in [
+        "tuple_struct_reads_its_field",
+        "tuple_struct_by_value_reads_its_field",
+        "tuple_struct_signed_field_reads",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must be read and verified; got: {o}");
+    }
+    let o = outcome(&report, "tuple_struct_fields_are_independent");
+    assert!(
+        !o.is_verified(),
+        "`tuple_struct_fields_are_independent` must be refuted -- a reader that aliased \
+         `p.0` and `p.1` to one variable would prove it; got: {o}"
+    );
+}
+
+/// A tuple struct's field index beyond its arity is refused, not bound.
+///
+/// `Pair` has two fields, so `p.2` names nothing. Binding it to a fabricated word
+/// would let a contract about a field that does not exist be proved, which is a
+/// false proof rather than a missing one. The refusal is the safe direction, and
+/// this pins it together with the *nested* projection (`n.p.0`), which the
+/// frontend does not model either.
+#[test]
+fn a_tuple_struct_field_that_does_not_exist_is_refused() {
+    let Some(report) = verify_realistic(&[
+        "tuple_struct_out_of_range_field_is_refused",
+        "nested_tuple_projection_is_refused",
+    ]) else {
+        return;
+    };
+    for name in [
+        "tuple_struct_out_of_range_field_is_refused",
+        "nested_tuple_projection_is_refused",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            !o.is_verified(),
+            "`{name}` names a field the layout does not have and must be refused; got: {o}"
+        );
+    }
+}
+
 /// A postcondition can name a component of a tuple return.
 ///
 /// `split` returns `(u8, u8)` and claims `ret.0 <= a`. The return place is an
