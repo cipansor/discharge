@@ -5771,8 +5771,24 @@ true contract is refused rather than the write being dropped, which is the hones
 mode. Eight entries with their false twins, pinned by
 `a_returned_reference_composes_with_the_next_use`.
 
-**Evidence.** Corpus `decided 181 of 333` -> **`228 of 418`**; `cargo test --workspace
---features std` **608 -> 620** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+**Two reference targets in one call stay independent.** Two `&mut` to different
+*aggregate* fields (`&mut o.i, &mut o.j`) and two *elements* of one array through one
+`&mut` (`set_two_elements(&mut a)`) each keep their own write, and the swap shapes read
+both referents so they also exercise the carry-in. The false twins read the *other*
+target and would verify if the two collapsed onto one place. Ten entries, pinned by
+`two_reference_targets_in_one_call_stay_independent`.
+
+**Not yet modelled, and *silently* so.** A *field whose type is an array* (`o.a[0]`) and
+an *array of arrays* (`m[1][0]`) cannot be named in a contract at all -- the refusal is
+`unknown field`, and an `ensures` about the value is reported as unreadable, so such a
+function is *skipped* rather than decided. This is a coverage hole rather than a
+soundness one (nothing false can be proved, since the contract cannot be written), and it
+is the next precision target: the `indexed` store is keyed by *local* only, so an array
+reached through a projection has no entry. Closing it means keying `indexed` by a place
+and re-basing element keys on the projection, the same shape as the `nested`-store work.
+
+**Evidence.** Corpus `decided 181 of 333` -> **`234 of 428`**; `cargo test --workspace
+--features std` **608 -> 621** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
 `mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.

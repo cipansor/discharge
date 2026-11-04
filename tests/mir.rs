@@ -2003,6 +2003,53 @@ fn a_returned_reference_composes_with_the_next_use() {
     }
 }
 
+/// Two `&mut` targets in one call: two *aggregate* fields, or two *elements* of one
+/// array.
+///
+/// The two writes must stay independent -- the false twins read the *other* target,
+/// and would verify if the two targets collapsed onto one place. The swap shapes read
+/// both referents, so they also exercise the carry-in.
+#[test]
+fn two_reference_targets_in_one_call_stay_independent() {
+    let Some(report) = verify_realistic(&[
+        "two_aggregate_reference_targets",
+        "two_aggregate_reference_targets_other",
+        "a_stale_two_aggregate_targets_cannot_prove_this",
+        "a_swap_of_two_aggregate_targets",
+        "a_stale_swap_of_aggregate_targets_cannot_prove_this",
+        "two_elements_through_one_reference",
+        "two_elements_through_one_reference_other",
+        "a_stale_two_elements_cannot_prove_this",
+        "a_swap_of_two_elements",
+        "a_stale_swap_of_elements_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "two_aggregate_reference_targets",
+        "two_aggregate_reference_targets_other",
+        "a_swap_of_two_aggregate_targets",
+        "two_elements_through_one_reference",
+        "two_elements_through_one_reference_other",
+        "a_swap_of_two_elements",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "two reference targets must stay independent; got: {o}");
+    }
+    for name in [
+        "a_stale_two_aggregate_targets_cannot_prove_this",
+        "a_stale_swap_of_aggregate_targets_cannot_prove_this",
+        "a_stale_two_elements_cannot_prove_this",
+        "a_stale_swap_of_elements_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "collapsed or stale targets must not prove this false contract; got: {o}"
+        );
+    }
+}
+
 /// A slice's length is read through the *one* rvalue the compiler prints, on any
 /// toolchain.
 ///

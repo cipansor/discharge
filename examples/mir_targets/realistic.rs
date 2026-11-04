@@ -4692,6 +4692,112 @@ pub fn a_stale_tuple_component_reference_cannot_prove_this(mut t: (u8, u8)) -> u
     t.0
 }
 
+/// A helper writing two *different aggregate* fields through two `&mut`.
+pub fn set_two_parts(a: &mut InnerBox, b: &mut InnerBox) {
+    a.v = 5;
+    b.v = 7;
+}
+
+/// The same two fields, swapped: both referents are *read*.
+pub fn swap_two_parts(a: &mut InnerBox, b: &mut InnerBox) {
+    let t = a.v;
+    a.v = b.v;
+    b.v = t;
+}
+
+/// A helper writing two *elements* of one array through one `&mut`.
+pub fn set_two_elements(a: &mut [u8; 2]) {
+    a[0] = 5;
+    a[1] = 7;
+}
+
+/// The same two elements, swapped.
+pub fn swap_two_elements(a: &mut [u8; 2]) {
+    let t = a[0];
+    a[0] = a[1];
+    a[1] = t;
+}
+
+/// Two `&mut` to different *aggregate* fields in one call, and the first read back.
+/// requires: true
+/// ensures: ret == 5
+pub fn two_aggregate_reference_targets(mut o: OuterBox) -> u8 {
+    set_two_parts(&mut o.i, &mut o.j);
+    o.i.v
+}
+
+/// The *other* aggregate field of the same call.
+/// requires: true
+/// ensures: ret == 7
+pub fn two_aggregate_reference_targets_other(mut o: OuterBox) -> u8 {
+    set_two_parts(&mut o.i, &mut o.j);
+    o.j.v
+}
+
+/// The false direction: the two aggregate writes must not collapse onto one.
+/// requires: true
+/// ensures: ret == 7
+pub fn a_stale_two_aggregate_targets_cannot_prove_this(mut o: OuterBox) -> u8 {
+    set_two_parts(&mut o.i, &mut o.j);
+    o.i.v
+}
+
+/// A swap of two aggregate fields, so both referents are read.
+/// requires: o.i.v == 1 && o.j.v == 2
+/// ensures: ret == 2
+pub fn a_swap_of_two_aggregate_targets(mut o: OuterBox) -> u8 {
+    swap_two_parts(&mut o.i, &mut o.j);
+    o.i.v
+}
+
+/// The false direction of [`a_swap_of_two_aggregate_targets`].
+/// requires: o.i.v == 1 && o.j.v == 2
+/// ensures: ret == 1
+pub fn a_stale_swap_of_aggregate_targets_cannot_prove_this(mut o: OuterBox) -> u8 {
+    swap_two_parts(&mut o.i, &mut o.j);
+    o.i.v
+}
+
+/// Two element writes through one `&mut` to the whole array, first element read.
+/// requires: true
+/// ensures: ret == 5
+pub fn two_elements_through_one_reference(mut a: [u8; 2]) -> u8 {
+    set_two_elements(&mut a);
+    a[0]
+}
+
+/// The *other* element of the same call.
+/// requires: true
+/// ensures: ret == 7
+pub fn two_elements_through_one_reference_other(mut a: [u8; 2]) -> u8 {
+    set_two_elements(&mut a);
+    a[1]
+}
+
+/// The false direction: the two element writes must not collapse onto one.
+/// requires: true
+/// ensures: ret == 7
+pub fn a_stale_two_elements_cannot_prove_this(mut a: [u8; 2]) -> u8 {
+    set_two_elements(&mut a);
+    a[0]
+}
+
+/// An element swap through a `&mut` to the whole array.
+/// requires: a[0] == 1 && a[1] == 2
+/// ensures: ret == 2
+pub fn a_swap_of_two_elements(mut a: [u8; 2]) -> u8 {
+    swap_two_elements(&mut a);
+    a[0]
+}
+
+/// The false direction of [`a_swap_of_two_elements`].
+/// requires: a[0] == 1 && a[1] == 2
+/// ensures: ret == 1
+pub fn a_stale_swap_of_elements_cannot_prove_this(mut a: [u8; 2]) -> u8 {
+    swap_two_elements(&mut a);
+    a[0]
+}
+
 /// A type whose method's tail collides with a *free function* of the same name.
 ///
 /// The collision is deliberately on names used by nothing else in this file: a
