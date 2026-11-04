@@ -1,0 +1,38 @@
+nohup: ignoring input
+=== seed 101 ===
+UNSOUND: 0
+DISCREPANCY: 1
+wrapped-but-rustc-accepted (eval ambiguity): 57
+=== seed 7 ===
+UNSOUND: 0
+DISCREPANCY: 0
+wrapped-but-rustc-accepted (eval ambiguity): 68
+=== seed 42 ===
+UNSOUND: 0
+DISCREPANCY: 0
+wrapped-but-rustc-accepted (eval ambiguity): 79
+=== seed 777 ===
+UNSOUND: 0
+DISCREPANCY: 0
+wrapped-but-rustc-accepted (eval ambiguity): 67
+=== seed 13 ===
+UNSOUND: 0
+DISCREPANCY: 1
+wrapped-but-rustc-accepted (eval ambiguity): 54
+=== seed 99 ===
+UNSOUND: 0
+DISCREPANCY: 1
+wrapped-but-rustc-accepted (eval ambiguity): 62
+=== seed 5 ===
+UNSOUND: 0
+DISCREPANCY: 1
+wrapped-but-rustc-accepted (eval ambiguity): 70
+=== seed 3 ===
+UNSOUND: 0
+DISCREPANCY: 1
+wrapped-but-rustc-accepted (eval ambiguity): 69
+=== seed 1 ===
+UNSOUND: 2
+DISCREPANCY: 159
+wrapped-but-rustc-accepted (eval ambiguity): 104
+=== seed 2 ===

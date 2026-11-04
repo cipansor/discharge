@@ -1,0 +1,14 @@
+total 1200 ok 718 refused 415
+UNSOUND: 0
+DISCREPANCY: 0
+wrapped-but-rustc-accepted (eval ambiguity): 67
+  [x: u8] (((127 * 2) ^ 127)) <= x
+  [y: i8] ((-8)) <= y
+  [b: i16] ((-200)) <= b
+  [y: i8] y == ((-(8 | 31)))
+  [b: i16] b == ((-240))
+  [y: i8] ((-64)) == y
+  [b: i16] ((-3)) < b
+  [x: u8] x == (((3 & 15) + 240))
+  [x: u8] (((64 + 2) + 63)) == x
+  [b: i16] b <= (((-8) + (255 | 15)))

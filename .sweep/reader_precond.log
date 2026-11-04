@@ -1,0 +1,4 @@
+nohup: ignoring input
+total 2500 ok 331 vacuous-refusals 67 skipped 2102 hangs 0
+UNSOUND: 0
+WRONG-REFUTATION (sat premise, implication holds, but failed): 0

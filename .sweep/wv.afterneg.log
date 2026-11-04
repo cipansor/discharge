@@ -1,0 +1,15 @@
+nohup: ignoring input
+WRONG VERDICTS (decided on a rejected program): 12
+  w8   y == ((1 << (2 << 7)))             failed
+  w8   ((1 << (2 << 7))) == y             failed
+  w8   y != ((1 << (2 << 7)))             failed
+  w8   ((1 << (2 << 7))) != y             failed
+  w8   y < ((1 << (2 << 7)))              failed
+  w8   ((1 << (2 << 7))) < y              failed
+  w8   y <= ((1 << (2 << 7)))             failed
+  w8   ((1 << (2 << 7))) <= y             failed
+  w8   y > ((1 << (2 << 7)))              failed
+  w8   ((1 << (2 << 7))) > y              failed
+  w8   y >= ((1 << (2 << 7)))             failed
+  w8   ((1 << (2 << 7))) >= y             failed
+over-refusals (accepted, skipped): 312 of 2288

@@ -646,6 +646,107 @@ pub fn field_write_through_ref_mut_is_not_dropped(c: &mut Config) -> u8 {
     c.lo
 }
 
+/// A helper writes a field through a `&mut` argument.
+pub fn set_lo_through_ref(c: &mut Config) {
+    c.lo = 5;
+}
+
+/// A scalar helper writes through a `&mut` argument.
+pub fn set_five(v: &mut u8) {
+    *v = 5;
+}
+
+/// A helper's field write through a `&mut` reaches the caller.
+///
+/// The write happens one frame down: `set_lo_through_ref(c)` runs `c.lo = 5` in
+/// the callee, and the caller's `c.lo` must be 5 when it returns. This is the
+/// boundary the write-back used to miss -- only an *indexed* reference argument's
+/// store crossed back, so a field write died with the callee's frame and the
+/// caller read its own seed.
+/// requires: true
+/// ensures: ret == 5
+pub fn helper_field_write_reaches_the_caller(c: &mut Config) -> u8 {
+    set_lo_through_ref(c);
+    c.lo
+}
+
+/// The false direction of [`helper_field_write_reaches_the_caller`].
+///
+/// The helper sets `c.lo = 5` and the caller returns it, so `ret == 0` is false.
+/// With the field write lost across the boundary, the caller's `c.lo` kept the
+/// seed the precondition pinned to 0, so this was *proved* against a body that
+/// returns 5.
+/// requires: c.lo == 0
+/// ensures: ret == 0
+pub fn a_stale_caller_field_cannot_prove_this(c: &mut Config) -> u8 {
+    set_lo_through_ref(c);
+    c.lo
+}
+
+/// A helper's write to the *whole* referent (`*v = 5`) reaches the caller.
+///
+/// `&mut x` is passed as a temp (`_5 = &mut _2; set_five(_5)`), so the caller's
+/// storage is `_2` while the callee's argument local is `_5`. The write-back has
+/// to follow the recorded address to `_2`, and the callee's own `(*_1) = 5` has to
+/// be modelled at all: a deref of an argument with no recorded referent was
+/// dropped, so the write vanished twice over.
+/// requires: true
+/// ensures: ret == 5
+pub fn helper_scalar_write_reaches_the_caller(mut x: u8) -> u8 {
+    set_five(&mut x);
+    x
+}
+
+/// The false direction of [`helper_scalar_write_reaches_the_caller`].
+///
+/// The helper writes `5` and the caller returns it, so `ret == 0` is false. With
+/// both the callee's write and the write-back lost, the caller read its seed and
+/// this was *proved*.
+/// requires: x == 0
+/// ensures: ret == 0
+pub fn a_stale_caller_scalar_cannot_prove_this(mut x: u8) -> u8 {
+    set_five(&mut x);
+    x
+}
+
+/// A helper writes a *nested* field through a `&mut` argument.
+pub fn set_nested_through_ref(o: &mut OuterBox) {
+    o.i.v = 9;
+}
+
+/// A helper reads and writes the same field through a `&mut` argument.
+pub fn add_lo_through_ref(c: &mut Config, d: u8) {
+    c.lo = c.lo + d;
+}
+
+/// A helper's *nested* field write through a `&mut` reaches the caller.
+/// requires: true
+/// ensures: ret == 9
+pub fn helper_nested_write_reaches_the_caller(o: &mut OuterBox) -> u8 {
+    set_nested_through_ref(o);
+    o.i.v
+}
+
+/// The false direction of [`helper_nested_write_reaches_the_caller`].
+/// requires: true
+/// ensures: ret == 0
+pub fn a_stale_caller_nested_cannot_prove_this(o: &mut OuterBox) -> u8 {
+    set_nested_through_ref(o);
+    o.i.v
+}
+
+/// A read-modify-write helper through a `&mut` is modelled, not left incomplete.
+///
+/// The callee reads `c.lo` before writing it, so the caller's field seed has to
+/// cross *into* the callee as well as back out. Carrying only the write-back would
+/// leave the callee's read unmodelled and this contract incomplete.
+/// requires: c.lo == 3
+/// ensures: ret == 8
+pub fn read_modify_write_through_helper(c: &mut Config) -> u8 {
+    add_lo_through_ref(c, 5);
+    c.lo
+}
+
 /// A generated binding name that a real argument also uses.
 ///
 /// The contract's `a[i]` is rewritten to a binding named `a__chain`, and the

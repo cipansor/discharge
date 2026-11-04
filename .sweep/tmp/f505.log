@@ -1,0 +1,15 @@
+total 1200 ok 765 refused 374
+UNSOUND: 0
+DISCREPANCY: 1
+  [y: i8] ((1 << (2 << 7))) <= y :: rustc REJECT but reader=failed
+wrapped-but-rustc-accepted (eval ambiguity): 60
+  [y: i8] y == (((-63) >> (0 << 5)))
+  [b: i16] ((240 ^ (-2))) <= b
+  [y: i8] ((!(-128))) == y
+  [y: i8] y < ((-(-7)))
+  [y: i8] y <= ((-15))
+  [b: i16] ((-127)) < b
+  [b: i16] ((-(!1))) == b
+  [b: i16] b == (((240 << 15) - (!255)))
+  [y: i8] ((-(8 & 8))) <= y
+  [y: i8] y == (((!2) ^ (-15)))

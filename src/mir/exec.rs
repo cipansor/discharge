@@ -414,6 +414,13 @@ struct Env {
     /// seeded; a nested read the contract did not name finds nothing here and
     /// stays `Unknown`, which is the same refusal the reader gives today.
     nested: BTreeMap<(u32, Vec<u32>), Val>,
+    /// Locals written as a *whole* place (an empty projection), so the call
+    /// return merge can tell "the callee assigned `*v`" from "the callee left
+    /// `v` alone". Copying the callee's value back unconditionally would replace
+    /// the caller's variable with the callee's unseeded `Unknown` for a helper
+    /// that never wrote through the reference, turning a contract the caller
+    /// could have proved into an incomplete one.
+    whole_writes: BTreeSet<u32>,
     /// Enum payloads, keyed by (local, variant), with the payload's width.
     /// Written by the `checked_*` model and read through a `Proj::Downcast`.
     payloads: BTreeMap<(u32, u64), (Val, u8)>,
@@ -538,6 +545,7 @@ impl Env {
             addressed: BTreeMap::new(),
             indexed: BTreeMap::new(),
             indexed_writes: BTreeSet::new(),
+            whole_writes: BTreeSet::new(),
             enums: BTreeMap::new(),
             tag_widths: BTreeMap::new(),
         }
@@ -918,6 +926,25 @@ impl Env {
         // read of the target meet in one store.
         let resolved = self.resolve(p);
         let p = &resolved;
+        // A write to the *whole* referent through a reference -- `(*_1) = v`, how
+        // `*v = 5` lowers for `v: &mut u8` -- is a whole-place write to `_1`,
+        // because `Ty::Ref` is modelled as its referent (`_1` *is* the value
+        // `*_1` names). Stripping the lone deref here lets it share the whole-place
+        // arm below. Only a lone deref of a deref-ok local qualifies: `(*_1)[0] = v`
+        // and `(*_1).0 = v` keep their projection and reach their own arms, and a
+        // deref of a local with no recorded referent stays unresolved.
+        //
+        // This strip was missing, and its absence was a false proof: `*v = 5; *v`
+        // on a `&mut u8` dropped the write, the read returned the seed, and
+        // `requires: v == 0` / `ensures: ret == 0` was **proved** against a body
+        // that returns 5.
+        let stripped;
+        let p = if p.proj.as_slice() == [Proj::Deref] && self.deref_ok.contains_key(&p.local) {
+            stripped = Place { local: p.local, proj: Vec::new() };
+            &stripped
+        } else {
+            p
+        };
         if p.proj.is_empty() {
             // A whole-place assignment replaces the value *and* every part of it
             // the environment holds separately. The field, element, payload and
@@ -937,6 +964,7 @@ impl Env {
             if !matches!(v, Val::Agg) {
                 self.forget_parts(p.local);
             }
+            self.whole_writes.insert(p.local);
             self.locals.insert(p.local, v);
             return;
         }
@@ -1190,8 +1218,10 @@ struct Frame {
     /// `Incomplete`, never a false proof -- but it silently discards a valid
     /// proof, which is the failure this crate treats as a defect.
     saved_cut: Option<Cut>,
-    /// `(caller local, callee local)` for each indexed argument the caller
-    /// handed over through a reference (`&[T]` / `&mut [T]`).
+    /// `(caller storage, callee local)` for each argument the caller handed over
+    /// through a reference (`&T`, `&mut T`, `&[T]`, `&mut [T]`). The caller side
+    /// is the *place* the reference names -- `_2` for `set5(&mut x)` -- not the
+    /// reference local, which is a temp.
     ///
     /// The frontend models `&T` as its referent, so these two locals denote the
     /// same storage and the callee's post-state is copied back to the caller's
@@ -1199,7 +1229,12 @@ struct Frame {
     /// its writes must stay in the callee's frame, or `let b = f(a)` would
     /// mutate `a` and a caller contract about `a` would be checked against the
     /// wrong value.
-    by_ref_indexed: Vec<(u32, u32)>,
+    ///
+    /// This used to hold only the *indexed* references, so a helper that wrote a
+    /// field or a scalar through a `&mut` had its write die with the frame: the
+    /// caller read its own seed, and `requires: c.lo == 0; ensures: ret == 0` on
+    /// `set_lo(c); c.lo` was **proved** against a body that returns 5.
+    by_ref: Vec<(Place, u32)>,
     /// The caller's frame, or `None` for the root.
     caller: Option<Box<Frame>>,
 }
@@ -1518,7 +1553,7 @@ where
             ret_dest: None,
             saved_env: None,
             saved_cut: None,
-            by_ref_indexed: Vec::new(),
+            by_ref: Vec::new(),
             caller: None,
         },
         block: start,
@@ -2113,9 +2148,50 @@ where
                     //   back. That is what makes a helper that writes through a
                     //   reference visible to the caller, and a callee that wrote
                     //   nothing leaves the caller's store as it was.
-                    for (cl, cal) in &caller.by_ref_indexed {
+                    for (target, cal) in &caller.by_ref {
+                        let cl = target.local;
+                        // An indexed referent (`&mut [T]` / `&mut [T; N]`): the
+                        // callee's element store *is* the caller's post-state.
                         if let Some(s) = st.env.indexed.get(cal) {
-                            env.indexed.insert(*cl, s.clone());
+                            env.indexed.insert(cl, s.clone());
+                        }
+                        // A whole-referent write (`*v = x`). The whole place was
+                        // replaced, so the caller's derived parts are dropped
+                        // before the callee's value is copied in -- otherwise a
+                        // stale field the callee overwrote would survive. A
+                        // sub-place target (`&mut _1.0`) is coarser: every part of
+                        // `_1` is dropped, which loses precision but never keeps a
+                        // stale value.
+                        if st.env.whole_writes.contains(cal) {
+                            env.forget_parts(cl);
+                            if let Some(v) = st.env.locals.get(cal) {
+                                env.locals.insert(cl, *v);
+                            }
+                            env.whole_writes.insert(cl);
+                        }
+                        // A write to a *part* of the referent (`(*v).0 = x`,
+                        // `(*v).a.b = x`, `(*v)[0] = x`). Only the callee's
+                        // entries exist for its argument local (a reference is
+                        // seeded as `Unknown`, never as parts), so every entry
+                        // here is a write and is safe to carry back. A part the
+                        // callee did not touch keeps the caller's seed, which is
+                        // the same storage the callee read.
+                        if target.proj.is_empty() {
+                            for ((l, f), v) in st.env.fields.iter() {
+                                if *l == *cal {
+                                    env.fields.insert((cl, *f), *v);
+                                }
+                            }
+                            for ((l, chain), v) in st.env.nested.iter() {
+                                if *l == *cal {
+                                    env.nested.insert((cl, chain.clone()), *v);
+                                }
+                            }
+                            for ((l, k), v) in st.env.elems.iter() {
+                                if *l == *cal {
+                                    env.elems.insert((cl, *k), *v);
+                                }
+                            }
                         }
                     }
                     if let Some(dest) = &caller.ret_dest {
@@ -2322,20 +2398,22 @@ where
             let mut env = Env::with_enums(&prog.enums);
             // Which caller locals were handed over through a reference, so the
             // return path knows whose store the callee's post-state belongs to.
-            let mut by_ref_indexed: Vec<(u32, u32)> = Vec::new();
+            let mut by_ref: Vec<(Place, u32)> = Vec::new();
             for (i, a) in args.iter().enumerate() {
                 let v = operand(&mut st.env, a);
                 let Some(&l) = callee_fn.arg_locals.get(i) else { continue };
                 env.locals.insert(l, v);
-                // Carry the indexed argument's state into the callee. Without
-                // this the callee's `a[0]` and `a.len()` have no store to read, so
-                // a helper that indexes its parameter cannot be modelled at all
-                // and a caller's contract about the result stays unproved.
-                //
-                // The store is *cloned*, never shared: the callee must not be able
-                // to write the caller's copy directly, or a by-value argument would
-                // behave like a reference. Only a reference argument's post-state
-                // is copied back (see the return path).
+                // A reference argument may be dereferenced inside the callee
+                // (`*_1 = 5`), and `Ty::Ref` is modelled as its referent, so `_1`
+                // *is* the value `*_1` names. `verify_fn` marks the root's
+                // reference arguments this way; the inliner builds the callee's
+                // env itself, so it has to mark them too, or the callee's
+                // `(*_1) = v` is treated as a deref with no recorded referent and
+                // the write is dropped -- which is how a `&mut u8` helper's write
+                // was lost and a false `ret == 0` contract was proved.
+                if matches!(callee_fn.ty_of(l), Some(Ty::Ref(_))) {
+                    env.deref_ok.insert(l, ());
+                }
                 let Place { local: cl, proj } = match a {
                     Operand::Copy(p) | Operand::Move(p) => p,
                     Operand::Const(_) => continue,
@@ -2343,10 +2421,54 @@ where
                 if !proj.is_empty() {
                     continue;
                 }
-                let Some(store) = st.env.indexed.get(cl).cloned() else { continue };
-                env.indexed.insert(l, store);
-                if arg_is_indexed_ref(callee_fn, i) {
-                    by_ref_indexed.push((*cl, l));
+                // The *storage* the argument denotes, which is the caller's local
+                // itself for a by-value argument and the pointee for a reference.
+                //
+                // `pointee`, not `resolve`: `resolve` only follows an explicit
+                // `*_p` projection, and `set5(&mut x)` hands the callee a *temp*
+                // (`_5 = &mut _2; set5(_5)`) whose place has no projection at all.
+                // `pointee` follows the recorded address of an empty-projection
+                // local, which is what turns `_5` into the `_2` the caller reads.
+                //
+                // The whole argument's state -- its element store *and* its parts
+                // -- is carried in, keyed on the callee's local. A reference shares
+                // the caller's storage, so the callee's `a[0]`, `c.lo` and `o.i.v`
+                // must read the caller's values; without them a helper that indexes
+                // or reads a field has an unmodelled operand and the caller's
+                // contract stays unproved, while a read-modify-write helper
+                // (`c.lo = c.lo + d`) cannot be modelled at all.
+                //
+                // The state is *cloned*, never shared: the callee must not be able
+                // to write the caller's copy directly, or a by-value argument would
+                // behave like a reference. Only a reference argument's post-state
+                // is copied back (see the return path).
+                let is_ref = arg_is_ref(callee_fn, i);
+                let source = if is_ref {
+                    st.env.pointee(&Place { local: *cl, proj: Vec::new() })
+                } else {
+                    Place { local: *cl, proj: Vec::new() }
+                };
+                let sl = source.local;
+                if let Some(store) = st.env.indexed.get(&sl).cloned() {
+                    env.indexed.insert(l, store);
+                }
+                for ((l0, f), v) in st.env.fields.iter() {
+                    if *l0 == sl {
+                        env.fields.insert((l, *f), *v);
+                    }
+                }
+                for ((l0, chain), v) in st.env.nested.iter() {
+                    if *l0 == sl {
+                        env.nested.insert((l, chain.clone()), *v);
+                    }
+                }
+                for ((l0, k), v) in st.env.elems.iter() {
+                    if *l0 == sl {
+                        env.elems.insert((l, *k), *v);
+                    }
+                }
+                if is_ref {
+                    by_ref.push((source, l));
                 }
             }
             let caller = Frame {
@@ -2360,7 +2482,7 @@ where
                 // describes the caller's loop, and the caller is still inside it
                 // when this call returns.
                 saved_cut: st.cut.clone(),
-                by_ref_indexed: by_ref_indexed.clone(),
+                by_ref: by_ref.clone(),
                 caller: st.frame.caller.clone(),
             };
             let mut visits = st.visits;
@@ -2372,7 +2494,7 @@ where
                     ret_dest: None,
                     saved_env: None,
                     saved_cut: None,
-                    by_ref_indexed: Vec::new(),
+                    by_ref: Vec::new(),
                     caller: Some(Box::new(caller)),
                 },
                 block: b0.id,
@@ -2662,32 +2784,19 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
             env.addressed.insert(dest.local, p.clone());
             Val::Unknown
         }
-        Rvalue::Len(_) | Rvalue::Unknown(_) => Val::Unknown,
-        // `PtrMetadata(_1)` — for a `&[T]` this is the slice's length. Modelled
+        // `Len(p)` -- the length of a slice or array. `PtrMetadata` is how 1.99
+        // and later lower the same query for a `&[T]`; older compilers (1.85, the
+        // MSRV) lower it as `Len((*_1))` instead. The two mean the same number, so
+        // they are modelled by the same code: refusing `Len` on a slice leaves the
+        // bounds check above `a[i]` unmodelled on 1.85 and turns an otherwise
+        // decidable corpus entry into an incomplete one.
+        Rvalue::Len(p) => length_of(env, f, p),
+        Rvalue::Unknown(_) => Val::Unknown,
+        // `PtrMetadata(_1)` -- for a `&[T]` this is the slice's length. Modelled
         // only when the local is a slice the frontend bound a length for; any
         // other pointer has metadata this model cannot express, and answering
         // `Unknown` there is what keeps an invented length out of a proof.
-        Rvalue::PtrMetadata(p) => {
-            // The place is followed to its pointee first, so `_2 = _3 as &[u8]`
-            // after `_3 = &_1` names `_1` here -- the place whose length is
-            // actually wanted.
-            let p = env.pointee(p);
-            match env.indexed.get(&p.local) {
-                // A slice argument, whose length is a symbolic input.
-                // A length is a `usize`, so it is unsigned.
-                Some(s) => Val::Sym(s.len, Sign::Unsigned),
-                // An *array* has its length in its type, not in `indexed`, so an
-                // unsized `&[T; N]` would otherwise read unknown. The length is
-                // the type's constant -- not a guess, and not a fresh variable:
-                // `[T; N]` coerces to a slice of exactly `N`, so the two are the
-                // same number and a contract that writes `a.len() == 4` on an
-                // `a: [u8; 4]` has something to agree with.
-                None => match type_of_place(f, &p) {
-                    Some(Ty::Array(_, n)) => Val::Sym(smt::word(n, USIZE_WIDTH), Sign::Unsigned),
-                    _ => Val::Unknown,
-                },
-            }
-        }
+        Rvalue::PtrMetadata(p) => length_of(env, f, p),
         Rvalue::Discriminant(p) => match env.discriminants.get(&p.local) {
             // The tag's width is the payload's, not the dump's `isize`. The
             // `switchInt` compares it against the small variant constants, so
@@ -2765,9 +2874,11 @@ fn width_of(f: &MirFn, p: &Place) -> Option<u8> {
 /// callee's own copy (the caller's is unchanged). Reading it off the callee's
 /// declared parameter type is what keeps the two apart, because the *caller's*
 /// operand type is the same for both.
-fn arg_is_indexed_ref(f: &MirFn, i: usize) -> bool {
+/// True when argument `i` is passed by reference, so the callee's post-state for
+/// that local is the caller's storage and must be copied back on return.
+fn arg_is_ref(f: &MirFn, i: usize) -> bool {
     let Some(&l) = f.arg_locals.get(i) else { return false };
-    matches!(f.ty_of(l), Some(Ty::Ref(inner)) if matches!(**inner, Ty::Slice(_) | Ty::Array(..)))
+    matches!(f.ty_of(l), Some(Ty::Ref(_)))
 }
 
 /// The declared type of a place, resolving the projections the dump spells out.
@@ -2782,6 +2893,30 @@ fn arg_is_indexed_ref(f: &MirFn, i: usize) -> bool {
 /// which the caller treats as "refuse" rather than "unsigned". In practice rustc
 /// copies a field into a temp before using it as a binary operand, so this is the
 /// defensive case; refusing is still the right answer if the shape ever changes.
+/// The length of the slice or array a place denotes, or `Unknown`.
+///
+/// Both `PtrMetadata(p)` (a `&[T]`, from 1.99 on) and `Len(p)` (the same query
+/// printed by older compilers, and an array's length) read through this. The place
+/// is followed to its pointee first, so `_2 = _3 as &[u8]` after `_3 = &_1` names
+/// `_1` here -- the place whose length is actually wanted.
+fn length_of(env: &Env, f: &MirFn, p: &Place) -> Val {
+    let p = env.pointee(p);
+    match env.indexed.get(&p.local) {
+        // A slice argument, whose length is a symbolic input.
+        // A length is a `usize`, so it is unsigned.
+        Some(s) => Val::Sym(s.len, Sign::Unsigned),
+        // An *array* has its length in its type, not in `indexed`, so an unsized
+        // `&[T; N]` would otherwise read unknown. The length is the type's
+        // constant -- not a guess, and not a fresh variable: `[T; N]` coerces to a
+        // slice of exactly `N`, so the two are the same number and a contract that
+        // writes `a.len() == 4` on an `a: [u8; 4]` has something to agree with.
+        None => match type_of_place(f, &p) {
+            Some(Ty::Array(_, n)) => Val::Sym(smt::word(n, USIZE_WIDTH), Sign::Unsigned),
+            _ => Val::Unknown,
+        },
+    }
+}
+
 fn type_of_place(f: &MirFn, p: &Place) -> Option<Ty> {
     let mut ty = f.ty_of(p.local)?.clone();
     for pr in &p.proj {

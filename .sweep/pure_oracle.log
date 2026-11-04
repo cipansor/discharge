@@ -1,0 +1,62 @@
+nohup: ignoring input
+total 1536 checked 342 skipped 1002 MISMATCHES 192
+   (255) < (1) :: decided failed but truth varies: {False, True}
+   (255) <= (1) :: decided failed but truth varies: {False, True}
+   (255) > (1) :: decided verified but truth varies: {False, True}
+   (255) >= (1) :: decided verified but truth varies: {False, True}
+   (255) < (2) :: decided failed but truth varies: {False, True}
+   (255) <= (2) :: decided failed but truth varies: {False, True}
+   (255) > (2) :: decided verified but truth varies: {False, True}
+   (255) >= (2) :: decided verified but truth varies: {False, True}
+   (255) < ((255 / 2)) :: decided failed but truth varies: {False, True}
+   (255) <= ((255 / 2)) :: decided failed but truth varies: {False, True}
+   (255) > ((255 / 2)) :: decided verified but truth varies: {False, True}
+   (255) >= ((255 / 2)) :: decided verified but truth varies: {False, True}
+   (255) < ((255 % 2)) :: decided failed but truth varies: {False, True}
+   (255) <= ((255 % 2)) :: decided failed but truth varies: {False, True}
+   (255) > ((255 % 2)) :: decided verified but truth varies: {False, True}
+   (255) >= ((255 % 2)) :: decided verified but truth varies: {False, True}
+   (1) < (255) :: decided verified but truth varies: {False, True}
+   (1) <= (255) :: decided verified but truth varies: {False, True}
+   (1) > (255) :: decided failed but truth varies: {False, True}
+   (1) >= (255) :: decided failed but truth varies: {False, True}
+   (1) < (128) :: decided verified but truth varies: {False, True}
+   (1) <= (128) :: decided verified but truth varies: {False, True}
+   (1) > (128) :: decided failed but truth varies: {False, True}
+   (1) >= (128) :: decided failed but truth varies: {False, True}
+   (1) < (-1) :: decided failed but truth varies: {False, True}
+   (1) <= (-1) :: decided failed but truth varies: {False, True}
+   (1) > (-1) :: decided verified but truth varies: {False, True}
+   (1) >= (-1) :: decided verified but truth varies: {False, True}
+   (1) < (-128) :: decided failed but truth varies: {False, True}
+   (1) <= (-128) :: decided failed but truth varies: {False, True}
+   (1) > (-128) :: decided verified but truth varies: {False, True}
+   (1) >= (-128) :: decided verified but truth varies: {False, True}
+   (1) < (200) :: decided verified but truth varies: {False, True}
+   (1) <= (200) :: decided verified but truth varies: {False, True}
+   (1) > (200) :: decided failed but truth varies: {False, True}
+   (1) >= (200) :: decided failed but truth varies: {False, True}
+   (1) < ((1 << 7)) :: decided verified but truth varies: {False, True}
+   (1) <= ((1 << 7)) :: decided verified but truth varies: {False, True}
+   (1) > ((1 << 7)) :: decided failed but truth varies: {False, True}
+   (1) >= ((1 << 7)) :: decided failed but truth varies: {False, True}
+   (2) < (255) :: decided verified but truth varies: {False, True}
+   (2) <= (255) :: decided verified but truth varies: {False, True}
+   (2) > (255) :: decided failed but truth varies: {False, True}
+   (2) >= (255) :: decided failed but truth varies: {False, True}
+   (2) < (128) :: decided verified but truth varies: {False, True}
+   (2) <= (128) :: decided verified but truth varies: {False, True}
+   (2) > (128) :: decided failed but truth varies: {False, True}
+   (2) >= (128) :: decided failed but truth varies: {False, True}
+   (2) < (-1) :: decided failed but truth varies: {False, True}
+   (2) <= (-1) :: decided failed but truth varies: {False, True}
+   (2) > (-1) :: decided verified but truth varies: {False, True}
+   (2) >= (-1) :: decided verified but truth varies: {False, True}
+   (2) < (-128) :: decided failed but truth varies: {False, True}
+   (2) <= (-128) :: decided failed but truth varies: {False, True}
+   (2) > (-128) :: decided verified but truth varies: {False, True}
+   (2) >= (-128) :: decided verified but truth varies: {False, True}
+   (2) < (200) :: decided verified but truth varies: {False, True}
+   (2) <= (200) :: decided verified but truth varies: {False, True}
+   (2) > (200) :: decided failed but truth varies: {False, True}
+   (2) >= (200) :: decided failed but truth varies: {False, True}

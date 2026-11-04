@@ -1502,6 +1502,85 @@ fn a_nested_seed_is_invalidated_by_a_write_and_carried_by_a_copy() {
     assert!(copy.is_verified(), "a whole-struct copy must carry nested paths; got: {copy}");
 }
 
+/// A helper's write through a `&mut` argument reaches the caller, and the false
+/// direction is refuted rather than proved.
+///
+/// The write happens one frame down. Only an *indexed* reference argument's store
+/// used to cross back, so a field or scalar write through a `&mut` died with the
+/// callee's frame: the caller read its own seed, and the false entries here were
+/// *proved* against bodies that return 5. Both directions are toothed.
+#[test]
+fn a_helpers_write_through_a_mutable_reference_reaches_the_caller() {
+    let Some(report) = verify_realistic(&[
+        "helper_field_write_reaches_the_caller",
+        "a_stale_caller_field_cannot_prove_this",
+        "helper_scalar_write_reaches_the_caller",
+        "a_stale_caller_scalar_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in
+        ["helper_field_write_reaches_the_caller", "helper_scalar_write_reaches_the_caller"]
+    {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "the helper's write must reach the caller; got: {o}");
+    }
+    for name in ["a_stale_caller_field_cannot_prove_this", "a_stale_caller_scalar_cannot_prove_this"]
+    {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a stale caller value must not prove this false contract; got: {o}"
+        );
+    }
+}
+
+/// A helper's write-back covers a *nested* field and a read-modify-write, and the
+/// caller's field seed crosses *into* the callee so the callee's read is modelled.
+///
+/// Two teeth here. The nested false entry must be refuted rather than proved: the
+/// helper sets `o.i.v = 9` and the caller returns it, so `ret == 0` is false, and
+/// a write-back that missed the nested chain would leave the caller's seed and
+/// prove it. The read-modify-write entry must *verify* rather than go incomplete:
+/// the callee reads `c.lo` before writing it, so carrying only the write-back
+/// leaves the callee's read unmodelled and the contract unproved.
+#[test]
+fn a_helpers_nested_and_read_modify_write_through_a_reference_are_modelled() {
+    let Some(report) = verify_realistic(&[
+        "helper_nested_write_reaches_the_caller",
+        "a_stale_caller_nested_cannot_prove_this",
+        "read_modify_write_through_helper",
+    ]) else {
+        return;
+    };
+    let nested = outcome(&report, "helper_nested_write_reaches_the_caller");
+    assert!(nested.is_verified(), "a nested write through a `&mut` must reach the caller; got: {nested}");
+    let stale = outcome(&report, "a_stale_caller_nested_cannot_prove_this");
+    assert!(
+        matches!(stale, FnOutcome::Failed { .. }),
+        "a stale caller nested value must not prove this false contract; got: {stale}"
+    );
+    let rmw = outcome(&report, "read_modify_write_through_helper");
+    assert!(rmw.is_verified(), "a read-modify-write through a `&mut` must be modelled; got: {rmw}");
+}
+
+/// A slice's length is read through the *one* rvalue the compiler prints, on any
+/// toolchain.
+///
+/// `PtrMetadata(copy _1)` is what 1.99 and later print for a `&[T]`'s length;
+/// before 1.99 (the MSRV, 1.85) the same query prints as `Len((*_1))`. Two things
+/// had to hold for the entry to decide on both: `Len` had to be modelled at all,
+/// and its argument had to survive parsing. `trim_end_matches(')')` stripped *both*
+/// trailing parens, leaving `(*_1` -- unparseable, so the length was `Unknown` and
+/// the bounds check above `a[i]` was unmodelled, turning this decidable entry into
+/// an incomplete one on 1.85 only. The entry decides identically on both now.
+#[test]
+fn a_slices_length_is_read_on_any_toolchain() {
+    let Some(report) = verify_realistic(&["slice_symbolic_index"]) else { return };
+    let o = outcome(&report, "slice_symbolic_index");
+    assert!(o.is_verified(), "the slice entry must decide on any toolchain; got: {o}");
+}
+
 /// A postcondition can name a component of a tuple return.
 ///
 /// `split` returns `(u8, u8)` and claims `ret.0 <= a`. The return place is an

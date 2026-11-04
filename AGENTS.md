@@ -5421,11 +5421,20 @@ whole corpus. Measured, not assumed:
 
 | compiler | `mir_coverage` on `examples/mir_targets/realistic.rs` | `cargo test --test mir` |
 |---|---|---|
-| `1.85.1` (the MSRV) | `decided 171 of 315` | 133 passed |
-| `1.99.1` (current stable) | `decided 171 of 315` | 133 passed |
+| `1.85.1` (the MSRV) | `decided 185 of 340` | 142 passed |
+| `1.99.1` (current stable) | `decided 185 of 340` | 142 passed |
 
 Identical verdicts and an identical decided count on both, so the frontend is a stable-toolchain
-tool. CI still names a nightly, and that is fine -- the thing to keep straight is *why*: a
+tool. That parity is itself checked, not assumed: the first measurement of this session had the
+MSRV at `181 of 340` and stable at `185 of 340`, and the four-entry gap was a real defect -- a
+slice's length is printed `Len((*_1))` before 1.99 and `PtrMetadata(copy _1)` from 1.99 on, and
+the parser's `trim_end_matches(')')` ate *both* trailing parens of the older spelling, leaving
+`(*_1` unparseable, so the length read `Unknown` and the bounds check above `a[i]` went
+unmodelled. `Rvalue::Len` is now modelled through the same `length_of` as `PtrMetadata`, and the
+argument is closed with a single `strip_suffix` (see the `close_paren` note). The `Len` half was
+invisible on the current toolchain alone; only running both toolchains surfaced it, which is the
+point of the gate naming a second compiler.
+ CI still names a nightly, and that is fine -- the thing to keep straight is *why*: a
 dump-format change is a real risk (the parser reads `rustc`'s text, so a printer change can break
 it silently), and the `rustc_public` oracle in step 10 is what catches that. The nightly is
 caution about the *format*, never a requirement of `--emit=mir`.
@@ -5555,3 +5564,77 @@ rules that had to land together or the nested store would be unsound:
 std --all-targets -- -D warnings` clean; `scripts/gate.sh` green (bare-metal build,
 zero-dependency and no_std gates included). Gate green; zero dependencies and `no_std`
 untouched.
+
+## A helper's write through a `&mut` argument died with the callee's frame
+
+The inliner copied a callee's post-state back to the caller for exactly one kind of
+argument: an *indexed* reference (`&[T]` / `&mut [T; N]`), which it tracked in
+`Frame::by_ref_indexed` as a `(caller local, callee local)` pair. A `&mut u8` or a
+`&mut Config` was not in that list, so a helper's `*v = 5` or `c.lo = 5` died with the
+frame and the caller read its own seed. `requires: c.lo == 0` / `ensures: ret == 0` on
+`set_lo(c); c.lo` was therefore **proved** against a body that returns 5 -- a false
+proof, and reachable from ordinary code.
+
+Three separate drops had to be repaired together, because each alone leaves the write
+lost:
+
+1. **The callee's own `(*_1) = v` was dropped.** `Env::set` resolved a lone deref of an
+   addressed local only via `resolve`, which rewrites an explicit `*_p` projection; but
+   `verify_fn` is the *only* place that marked a reference argument as dereferenceable
+   (`deref_ok`), and the inliner builds the callee's env itself. `(*_1) = v` there was a
+   deref with no recorded referent, so the write went to the catch-all. The inliner now
+   marks its reference arguments the same way `verify_fn` marks the root's.
+2. **`set` did not strip a lone deref.** `*v = 5` on a `&mut u8` lowers to `(*_1) = v`
+   with an empty-projection *target*; `Ty::Ref` is modelled as its referent, so that is a
+   whole-place write to `_1`. `set` now strips a lone `Deref` of a deref-ok local so the
+   write shares the whole-place arm. `(*_1)[0] = v` and `(*_1).0 = v` keep their
+   projection and still reach their own arms.
+3. **The write-back was indexed-only.** `by_ref` now holds *every* reference argument,
+   resolved through `pointee` (not `resolve`: `set5(&mut x)` hands the callee a temp
+   `_5 = &mut _2`, whose place has no projection, so `resolve` stops at `_5` and the
+   post-state would land on a dead temp). On return the callee's whole-place write,
+   field parts, nested parts and element store for that local are merged onto the
+   caller's storage. `Env::whole_writes` records which locals were assigned as a whole
+   place, so a helper that only *reads* through a `&mut` does not overwrite the
+   caller's value with the callee's unseeded `Unknown`.
+
+The merge is per-direction: a *by-value* argument is still the callee's own copy and is
+never copied back, which is what keeps `let b = f(a)` from mutating `a`.
+
+**Carrying the state *in*, not only back.** A read-modify-write helper (`c.lo = c.lo + d`)
+needs the caller's field seed to cross *into* the callee as well: with only the write-back,
+the callee's `c.lo` read is `Unknown`, its add has an unmodelled operand, and the caller's
+contract is left incomplete rather than checked. The argument's whole state -- element
+store, single-field parts and nested parts, keyed on the pointee for a reference -- is
+cloned into the callee's env. `read_modify_write_through_helper` goes from incomplete to
+verified on this.
+
+Seven corpus entries, pinned by two tests
+(`a_helpers_write_through_a_mutable_reference_reaches_the_caller`,
+`a_helpers_nested_and_read_modify_write_through_a_reference_are_modelled`):
+
+| entry | shape | verdict |
+|---|---|---|
+| `helper_field_write_reaches_the_caller` | `set_lo(c); c.lo` | verified |
+| `a_stale_caller_field_cannot_prove_this` | same body, `c.lo == 0` / `ret == 0` | **FAILED** |
+| `helper_scalar_write_reaches_the_caller` | `set_five(&mut x); x` | verified |
+| `a_stale_caller_scalar_cannot_prove_this` | same body, `x == 0` / `ret == 0` | **FAILED** |
+| `helper_nested_write_reaches_the_caller` | `set_nested(o); o.i.v` | verified |
+| `a_stale_caller_nested_cannot_prove_this` | same body, `ret == 0` | **FAILED** |
+| `read_modify_write_through_helper` | `c.lo = c.lo + 5` one frame down | verified |
+
+The false entries are the teeth: with the write-back removed, each of them *verifies*
+against a body that returns 5, and the positive entries are refuted. Both directions are
+asserted for that reason.
+
+**Evidence.** Corpus `decided 181 of 333` -> **`185 of 340`**; `cargo test --workspace
+--features std` **608 -> 611** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+`cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
+`scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
+`mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.
+
+Still not modelled, and named so the boundary is honest: the write-back merges the
+callee's state for a reference argument, so a callee that stores a *coarser* shape than
+the caller reads (`&mut _1.0` handed over as a whole-place target) drops the caller's
+parts under `_1` rather than tracking the sub-place -- precision is lost, never a stale
+value kept.

@@ -1,0 +1,55 @@
+total 1200 ok 403 refused 518
+UNSOUND: 1
+  [b: i16] b <= (((129 ^ 128) + 255)) :: VERIFIED non-tautology
+DISCREPANCY: 166
+  [b: i16] (((127 >> 200) + 128)) < b :: rustc REJECT but reader=failed
+  [y: i8] y == (((100 << 2) & 8)) :: rustc REJECT but reader=failed
+  [y: i8] (((3 ^ 64) & (128 | 3))) < y :: rustc REJECT but reader=failed
+  [a: u16] (3) <= a :: rustc REJECT but reader=failed
+  [x: u8] (5) <= x :: rustc REJECT but reader=failed
+  [a: u16] (240) < a :: rustc REJECT but reader=failed
+  [y: i8] y == ((!(!15))) :: rustc REJECT but reader=failed
+  [x: u8] (0) == x :: rustc REJECT but reader=failed
+  [x: u8] x < ((-(15 + 100))) :: rustc REJECT but reader=failed
+  [y: i8] (31) <= y :: rustc REJECT but reader=failed
+  [x: u8] x == (5) :: rustc REJECT but reader=failed
+  [y: i8] y <= ((!(-7))) :: rustc REJECT but reader=failed
+  [a: u16] a < (15) :: rustc REJECT but reader=failed
+  [b: i16] b == (254) :: rustc REJECT but reader=failed
+  [x: u8] (0) <= x :: rustc REJECT but reader=verified
+  [x: u8] (240) == x :: rustc REJECT but reader=failed
+  [a: u16] ((!(129 + 31))) == a :: rustc REJECT but reader=failed
+  [x: u8] x <= (3) :: rustc REJECT but reader=failed
+  [a: u16] a < (64) :: rustc REJECT but reader=failed
+  [x: u8] (64) < x :: rustc REJECT but reader=failed
+  [y: i8] y < (128) :: rustc REJECT but reader=failed
+  [a: u16] (200) == a :: rustc REJECT but reader=failed
+  [b: i16] (1) == b :: rustc REJECT but reader=failed
+  [b: i16] (0) == b :: rustc REJECT but reader=failed
+  [x: u8] x == (31) :: rustc REJECT but reader=failed
+  [y: i8] y <= (100) :: rustc REJECT but reader=failed
+  [a: u16] a <= (128) :: rustc REJECT but reader=failed
+  [b: i16] b < (7) :: rustc REJECT but reader=failed
+  [y: i8] (7) == y :: rustc REJECT but reader=failed
+  [b: i16] b == (64) :: rustc REJECT but reader=failed
+  [x: u8] x == ((-2)) :: rustc REJECT but reader=failed
+  [x: u8] x == (128) :: rustc REJECT but reader=failed
+  [y: i8] (8) < y :: rustc REJECT but reader=failed
+  [x: u8] (((!3) - 5)) < x :: rustc REJECT but reader=failed
+  [a: u16] ((-16)) < a :: rustc REJECT but reader=failed
+  [x: u8] ((-127)) == x :: rustc REJECT but reader=failed
+  [a: u16] a == (200) :: rustc REJECT but reader=failed
+  [y: i8] y < (16) :: rustc REJECT but reader=failed
+  [b: i16] b == (16) :: rustc REJECT but reader=failed
+  [y: i8] y == (127) :: rustc REJECT but reader=failed
+wrapped-but-rustc-accepted (eval ambiguity): 112
+  [b: i16] b == ((-(2 | 0)))
+  [b: i16] b <= ((-(31 + 64)))
+  [y: i8] ((-63)) <= y
+  [b: i16] ((128 ^ (-200))) == b
+  [x: u8] x < (((129 & 255) + 16))
+  [b: i16] ((15 | (-63))) < b
+  [b: i16] ((-(3 - 31))) <= b
+  [x: u8] x < ((16 >> 240))
+  [y: i8] (((!15) << (200 * 15))) <= y
+  [b: i16] b <= ((127 << (!64)))

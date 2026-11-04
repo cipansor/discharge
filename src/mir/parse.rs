@@ -722,6 +722,17 @@ fn parse_local(s: &str) -> Option<LocalIdx> {
     rest.parse::<LocalIdx>().ok()
 }
 
+/// Drop the single closing paren that ends an rvalue's argument list.
+///
+/// `trim_end_matches(')')` is the wrong tool here: it strips *every* trailing
+/// paren, so `Len((*_1))` -- how a compiler before 1.99 prints a slice's length --
+/// loses both and leaves the unparseable `(*_1`, which makes the length `Unknown`
+/// and the bounds check above `a[i]` unmodelled. One `strip_suffix` keeps the
+/// place's own parens, so `(*_1)` survives to `parse_place`.
+fn close_paren(s: &str) -> &str {
+    s.trim().strip_suffix(')').unwrap_or(s.trim())
+}
+
 /// Drop a leading `copy ` / `move ` from a place expression.
 ///
 /// `Len(copy _1)` and `PtrMetadata(copy _1)` print the operand the same way any
@@ -1249,12 +1260,12 @@ fn parse_rvalue(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Rvalue {
         }
     }
     if let Some(rest) = t.strip_prefix("Len(") {
-        if let Some(p) = parse_place(strip_copy(rest.trim_end_matches(')')), enums) {
+        if let Some(p) = parse_place(strip_copy(close_paren(rest)), enums) {
             return Rvalue::Len(p);
         }
     }
     if let Some(rest) = t.strip_prefix("PtrMetadata(") {
-        if let Some(p) = parse_place(strip_copy(rest.trim_end_matches(')')), enums) {
+        if let Some(p) = parse_place(strip_copy(close_paren(rest)), enums) {
             return Rvalue::PtrMetadata(p);
         }
     }
