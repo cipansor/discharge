@@ -4530,6 +4530,83 @@ pub fn a_stale_returned_builder_cannot_prove_this(mut c: Config) -> u8 {
     c.lo
 }
 
+/// A free function returning a `&mut` to a *nested* field of its argument.
+pub fn nested_mut(o: &mut OuterBox) -> &mut u8 {
+    &mut o.i.v
+}
+
+/// A free function returning a `&mut` to a field of its *second* argument.
+pub fn pick_second<'a>(_a: &'a mut OuterBox, b: &'a mut InnerBox) -> &'a mut u8 {
+    &mut b.v
+}
+
+/// A `&mut self` method returning a `&mut` to a nested field.
+impl OuterBox {
+    /// A `&mut self` method returning `&mut` to `self.i.v`.
+    pub fn inner_mut(&mut self) -> &mut u8 {
+        &mut self.i.v
+    }
+}
+
+/// A write through a `&mut` to a *nested* field returned by a helper: the returned
+/// place is two steps deep in the caller (`o.i.v`), so the translation has to carry
+/// the whole projection, not just the head local.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_write_through_a_returned_nested_reference(mut o: OuterBox) -> u8 {
+    *nested_mut(&mut o) = 5;
+    o.i.v
+}
+
+/// The false direction of [`a_write_through_a_returned_nested_reference`].
+/// requires: o.i.v == 0
+/// ensures: ret == 0
+pub fn a_stale_returned_nested_reference_cannot_prove_this(mut o: OuterBox) -> u8 {
+    *nested_mut(&mut o) = 5;
+    o.i.v
+}
+
+/// A write to `o.i.v` must leave `o.j.v` alone.
+/// requires: o.j.v == 3
+/// ensures: ret == 3
+pub fn a_returned_nested_reference_leaves_its_sibling(mut o: OuterBox) -> u8 {
+    *nested_mut(&mut o) = 5;
+    o.j.v
+}
+
+/// The same through a *method* returning `&mut self.i.v`.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_write_through_a_method_nested_reference(mut o: OuterBox) -> u8 {
+    *o.inner_mut() = 5;
+    o.i.v
+}
+
+/// The false direction of [`a_write_through_a_method_nested_reference`].
+/// requires: o.i.v == 0
+/// ensures: ret == 0
+pub fn a_stale_method_nested_reference_cannot_prove_this(mut o: OuterBox) -> u8 {
+    *o.inner_mut() = 5;
+    o.i.v
+}
+
+/// A returned reference to the *second* argument, so the translation must pick the
+/// right argument and not the first.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_write_through_a_second_argument_reference(mut a: OuterBox, mut b: InnerBox) -> u8 {
+    *pick_second(&mut a, &mut b) = 5;
+    b.v
+}
+
+/// The false direction of [`a_write_through_a_second_argument_reference`].
+/// requires: b.v == 0
+/// ensures: ret == 0
+pub fn a_stale_second_argument_reference_cannot_prove_this(mut a: OuterBox, mut b: InnerBox) -> u8 {
+    *pick_second(&mut a, &mut b) = 5;
+    b.v
+}
+
 /// A type whose method's tail collides with a *free function* of the same name.
 ///
 /// The collision is deliberately on names used by nothing else in this file: a

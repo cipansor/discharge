@@ -5752,8 +5752,18 @@ return, so nothing is recorded and the write is dropped rather than aimed at a f
 place. Six entries with their false twins, pinned by
 `a_method_may_return_a_reference_to_its_own_field`.
 
-**Evidence.** Corpus `decided 181 of 333` -> **`220 of 403`**; `cargo test --workspace
---features std` **608 -> 618** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+**A returned reference carries its whole projection, from whichever argument.** Two
+extensions of the same translation, both already covered by the `Place`-valued
+`ref_origin` and the `arg_source` lookup, and now pinned. The returned place may be
+*nested* (`&mut o.i.v`), so the whole projection has to survive, not just the head local;
+and it may name a *different* argument than the first (`pick_second(&mut a, &mut b)`), so
+the lookup must use the head local's own entry rather than assuming argument 0. A write
+through a nested returned reference also leaves its sibling (`o.j.v`) at the caller's seed.
+Seven entries with their false twins, pinned by
+`a_returned_reference_carries_its_whole_projection`.
+
+**Evidence.** Corpus `decided 181 of 333` -> **`224 of 410`**; `cargo test --workspace
+--features std` **608 -> 619** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
 `mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.

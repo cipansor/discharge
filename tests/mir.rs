@@ -1917,6 +1917,47 @@ fn a_method_may_return_a_reference_to_its_own_field() {
     }
 }
 
+/// A returned reference may name a *nested* place, or a place in a *different*
+/// argument.
+///
+/// The nested case (`&mut o.i.v`) needs the whole projection carried, not just the
+/// head local, and the two-argument case needs the translation to pick the argument
+/// the reference was actually built from rather than the first one.
+#[test]
+fn a_returned_reference_carries_its_whole_projection() {
+    let Some(report) = verify_realistic(&[
+        "a_write_through_a_returned_nested_reference",
+        "a_stale_returned_nested_reference_cannot_prove_this",
+        "a_returned_nested_reference_leaves_its_sibling",
+        "a_write_through_a_method_nested_reference",
+        "a_stale_method_nested_reference_cannot_prove_this",
+        "a_write_through_a_second_argument_reference",
+        "a_stale_second_argument_reference_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "a_write_through_a_returned_nested_reference",
+        "a_returned_nested_reference_leaves_its_sibling",
+        "a_write_through_a_method_nested_reference",
+        "a_write_through_a_second_argument_reference",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a returned reference must reach its place; got: {o}");
+    }
+    for name in [
+        "a_stale_returned_nested_reference_cannot_prove_this",
+        "a_stale_method_nested_reference_cannot_prove_this",
+        "a_stale_second_argument_reference_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a dropped write through a returned reference must not prove this; got: {o}"
+        );
+    }
+}
+
 /// A slice's length is read through the *one* rvalue the compiler prints, on any
 /// toolchain.
 ///
