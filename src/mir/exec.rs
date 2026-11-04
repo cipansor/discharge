@@ -2163,11 +2163,25 @@ where
                         // `_1` is dropped, which loses precision but never keeps a
                         // stale value.
                         if st.env.whole_writes.contains(cal) {
-                            env.forget_parts(cl);
                             if let Some(v) = st.env.locals.get(cal) {
-                                env.locals.insert(cl, *v);
+                                // The callee's whole-place value lands *at the
+                                // target*, which is the caller's local only when
+                                // the target has no projection. For `&mut c.lo` the
+                                // target is `c.0`, so the write belongs in the
+                                // field store, not on `c` itself -- writing it to
+                                // `c` would put a bit-vector where a struct lives.
+                                // `set` keys the projection for us, and it drops
+                                // the parts the write replaces.
+                                env.set(&target.clone(), *v);
+                                // A *whole-local* target additionally supersedes
+                                // the whole local, which is what the parts drop
+                                // above needs to see.
+                                if target.proj.is_empty() {
+                                    env.whole_writes.insert(cl);
+                                }
+                            } else {
+                                env.forget_parts(cl);
                             }
-                            env.whole_writes.insert(cl);
                         }
                         // A write to a *part* of the referent (`(*v).0 = x`,
                         // `(*v).a.b = x`, `(*v)[0] = x`). Only the callee's

@@ -1564,6 +1564,48 @@ fn a_helpers_nested_and_read_modify_write_through_a_reference_are_modelled() {
     assert!(rmw.is_verified(), "a read-modify-write through a `&mut` must be modelled; got: {rmw}");
 }
 
+/// The write-back keys the *target's projection*, so `&mut c.lo` lands on the
+/// field and a conditional helper write follows the callee's branch.
+///
+/// A target with a projection (`&mut c.lo`) must not be written to the caller's
+/// local: that puts a bit-vector where a struct lives and leaves `c.lo` at its
+/// seed, which is how the false twin here was *proved*. A conditional helper write
+/// has to reach the caller from the branch it takes, so the `c == true` case reads
+/// 5 -- and the false twin, whose precondition pins both the seed and the flag,
+/// must be refuted rather than proved.
+#[test]
+fn a_helper_write_lands_on_the_targets_projection() {
+    let Some(report) = verify_realistic(&[
+        "helper_write_reaches_a_field_target",
+        "a_stale_field_target_cannot_prove_this",
+        "helper_write_reaches_a_nested_target",
+        "a_stale_nested_target_cannot_prove_this",
+        "conditional_helper_write_reaches_the_caller",
+        "a_conditional_helper_write_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "helper_write_reaches_a_field_target",
+        "helper_write_reaches_a_nested_target",
+        "conditional_helper_write_reaches_the_caller",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a helper write must reach the caller; got: {o}");
+    }
+    for name in [
+        "a_stale_field_target_cannot_prove_this",
+        "a_stale_nested_target_cannot_prove_this",
+        "a_conditional_helper_write_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a stale caller value must not prove this false contract; got: {o}"
+        );
+    }
+}
+
 /// A slice's length is read through the *one* rvalue the compiler prints, on any
 /// toolchain.
 ///

@@ -5609,9 +5609,11 @@ store, single-field parts and nested parts, keyed on the pointee for a reference
 cloned into the callee's env. `read_modify_write_through_helper` goes from incomplete to
 verified on this.
 
-Seven corpus entries, pinned by two tests
+Thirteen corpus entries, pinned by three tests
 (`a_helpers_write_through_a_mutable_reference_reaches_the_caller`,
-`a_helpers_nested_and_read_modify_write_through_a_reference_are_modelled`):
+`a_helpers_nested_and_read_modify_write_through_a_reference_are_modelled`,
+`a_helper_write_lands_on_the_targets_projection`). The first seven are the write-back
+itself:
 
 | entry | shape | verdict |
 |---|---|---|
@@ -5627,8 +5629,31 @@ The false entries are the teeth: with the write-back removed, each of them *veri
 against a body that returns 5, and the positive entries are refuted. Both directions are
 asserted for that reason.
 
-**Evidence.** Corpus `decided 181 of 333` -> **`185 of 340`**; `cargo test --workspace
---features std` **608 -> 611** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+**The write-back keys the target's projection.** The first version of the write-back
+wrote the callee's whole-place value to the caller's *local*. That is right for `&mut x`
+-- `x` is the target -- and wrong for `&mut c.lo`, where the target is `c.0`: the value
+landed on `c`, which put a bit-vector where a struct lives and left `c.lo` at its seed.
+So `set5(&mut c.lo); c.lo` with `c.lo == 0` **proved** `ret == 0`. The merge now hands
+the value to `Env::set` keyed on the target place, which files it under the field and
+drops the parts that write replaces; a whole-local target additionally records the
+whole-place write. Three shapes fall out of that, each with its false twin:
+
+| entry | shape | verdict |
+|---|---|---|
+| `helper_write_reaches_a_field_target` | `set5(&mut c.lo); c.lo` | verified |
+| `a_stale_field_target_cannot_prove_this` | same body, `c.lo == 0` / `ret == 0` | **FAILED** |
+| `helper_write_reaches_a_nested_target` | `set5(&mut o.i.v); o.i.v` | verified |
+| `a_stale_nested_target_cannot_prove_this` | same body, `o.i.v == 0` / `ret == 0` | **FAILED** |
+| `conditional_helper_write_reaches_the_caller` | `if c { *v = 5 }; x` | verified |
+| `a_conditional_helper_write_cannot_prove_this` | same body, `x == 0 && c == true` | **FAILED** |
+
+The conditional pair is the one that pins *branch* propagation rather than the write-back
+alone: the callee writes on one path and not the other, so the caller's value has to come
+back from the path taken. With the write-back removed, the flag case would read the seed
+and the `ret == 5` contract would be refuted while the `ret == 0` twin *verified*.
+
+**Evidence.** Corpus `decided 181 of 333` -> **`188 of 346`**; `cargo test --workspace
+--features std` **608 -> 612** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
 `mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.

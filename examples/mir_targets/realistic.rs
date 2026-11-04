@@ -719,6 +719,13 @@ pub fn add_lo_through_ref(c: &mut Config, d: u8) {
     c.lo = c.lo + d;
 }
 
+/// A helper that writes through a `&mut` only on one branch.
+pub fn set_five_if(v: &mut u8, c: bool) {
+    if c {
+        *v = 5;
+    }
+}
+
 /// A helper's *nested* field write through a `&mut` reaches the caller.
 /// requires: true
 /// ensures: ret == 9
@@ -733,6 +740,63 @@ pub fn helper_nested_write_reaches_the_caller(o: &mut OuterBox) -> u8 {
 pub fn a_stale_caller_nested_cannot_prove_this(o: &mut OuterBox) -> u8 {
     set_nested_through_ref(o);
     o.i.v
+}
+
+/// A helper writes through a `&mut` to a *field* of the caller's struct.
+///
+/// The reference names a sub-place (`&mut c.lo`), so the callee's write belongs at
+/// `c.0` and not on `c`. Landing it on `c` would put a bit-vector where a struct
+/// lives and leave `c.lo` at its seed -- which is why the false twin below was
+/// *proved* before the write-back keyed the target's projection.
+/// requires: c.lo == 0
+/// ensures: ret == 5
+pub fn helper_write_reaches_a_field_target(mut c: Config) -> u8 {
+    set_five(&mut c.lo);
+    c.lo
+}
+
+/// The false direction of [`helper_write_reaches_a_field_target`].
+/// requires: c.lo == 0
+/// ensures: ret == 0
+pub fn a_stale_field_target_cannot_prove_this(mut c: Config) -> u8 {
+    set_five(&mut c.lo);
+    c.lo
+}
+
+/// A helper write through a `&mut` to a *nested* field target.
+///
+/// The reference names a two-step chain (`&mut o.i.v`), so the write-back has to
+/// key the whole chain, not just the first field.
+/// requires: true
+/// ensures: ret == 5
+pub fn helper_write_reaches_a_nested_target(mut o: OuterBox) -> u8 {
+    set_five(&mut o.i.v);
+    o.i.v
+}
+
+/// The false direction of [`helper_write_reaches_a_nested_target`].
+/// requires: o.i.v == 0
+/// ensures: ret == 0
+pub fn a_stale_nested_target_cannot_prove_this(mut o: OuterBox) -> u8 {
+    set_five(&mut o.i.v);
+    o.i.v
+}
+
+/// A *conditional* helper write: the caller reads 5 when the flag holds and its
+/// seed otherwise, so the caller's value has to follow the callee's branch.
+/// requires: c == true
+/// ensures: ret == 5
+pub fn conditional_helper_write_reaches_the_caller(mut x: u8, c: bool) -> u8 {
+    set_five_if(&mut x, c);
+    x
+}
+
+/// The false direction of [`conditional_helper_write_reaches_the_caller`].
+/// requires: x == 0 && c == true
+/// ensures: ret == 0
+pub fn a_conditional_helper_write_cannot_prove_this(mut x: u8, c: bool) -> u8 {
+    set_five_if(&mut x, c);
+    x
 }
 
 /// A read-modify-write helper through a `&mut` is modelled, not left incomplete.
