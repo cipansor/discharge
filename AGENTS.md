@@ -972,9 +972,19 @@ A shift *amount* is a value of its own type. Rust leaves an unsuffixed amount's 
 unconstrained, so it defaults to `i32` and is folded at 32 bits, but the reader sized a bare
 literal to the widest name in scope. At an eight-bit scope `x >> (2 << 7)` wrapped the amount
 to `0` and read as `x >> 0`, and `x >> (2 << 7) == 0` was decided -- false at `x == 0` --
-where rustc computes `256` and rejects the shift. `Parser::amount_depth` counts nesting inside
-an amount and floors a bare literal there at 32 bits. A *suffixed* amount keeps its suffix's
-width, so only the bare path is floored.
+where rustc computes `256` and rejects the shift. The first fix floored an amount's bare
+literals at a flat `i32`, which over-refused: a *typed* operand in the amount fixes the
+amount's type, so `x >> (1u8 + (2 << 7))` for a `u8` `x` is a `u8` amount (`2 << 7` is `0u8`,
+the amount is `1u8`) and rustc accepts it, while the flat floor built the inner `2 << 7` as
+`256` and refused. `Parser::amount_width` now scans the amount's own add-level for a typed
+operand and floors its bare literals at that width, or `i32` when none fixes the type.
+
+The scan mirrors the grammar rather than flattening it, because only an operand at the amount's
+*own* level fixes its type. In `2 << 7u8` the suffix is in the nested shift's amount, so the
+outer amount stays the `i32` `256` (still a rustc overflow); a cast fixes the type and
+overrides what it casts (`(1u8) as u16` is a `u16`, so the amount is `257u16`). `amount_floor`
+is *inherited*, not recomputed, when a shift is itself inside an amount, so the enclosing type
+unifies inward through the parentheses.
 
 A negation of a constant is checked against the *value* the constant denotes, not the written
 magnitude. `i8::MIN` is the bit pattern `128` and the value `-128`, and the legal literal
@@ -5274,3 +5284,28 @@ The deeper lesson (already stated, now with a second example): the `range` map i
 never be read back for another. Where a value's fit is known by construction (a bound, a
 variant), give it a term of its own rather than trusting the shared one.
 
+## A fold that touched a complement must not range-check its provisional value
+
+The amount-width correction above and this one are the same question asked of a *value the
+reader guesses* rather than one it reads. Here the guess is a signedness: `record_fold_result`
+recorded a fold's own value for range-checking, but an `Opaque` fold is evaluated *unsigned*
+at that point because its type is not known until it meets one. So `!1 + 1` recorded `255`
+where the `i8` it finally meets makes it `-1`, and range-checking that guess refused the valid
+`y == !(!1 + 1)` for an `i8`.
+
+The fix records the result's own value only when the sign is not opaque. The operands'
+envelopes still carry, so a genuine literal *under* the fold is still checked -- `!128` for an
+`i8` is refused -- and the width-dependent refusal in `fold_const_arith` still fires before the
+record, so no shape that rustc rejects is newly accepted.
+
+**Evidence.** Unit test `an_opaque_folds_provisional_value_is_not_range_checked`; corpus
+entries `contract_opaque_fold_provisional_value_is_not_range_checked` (reads) and
+`contract_literal_under_complement_is_still_range_checked` (`Skipped`), pinned in the corpus
+test of the same name. The entry was confirmed to have teeth: reverting the fix turns it red.
+`cargo test --features std` 599 passed, 0 failed; clippy clean; MIR oracle `302/302 agree`;
+corpus `decided 162 of 301`. Gate green.
+
+The lesson: the reader must never range-check a *guess*. The amount floor's `i32` was a guess
+about a type Rust leaves open, and the fold's unsigned value was a guess about a signedness
+Rust leaves open; in both cases the guess was checked as though it were read, and a shape
+rustc accepts was refused. A guess may guide a fold, but it must not become a refusal.
