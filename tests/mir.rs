@@ -2050,6 +2050,42 @@ fn two_reference_targets_in_one_call_stay_independent() {
     }
 }
 
+/// A *scalar* field reached through a `&T`/`&mut T` argument, both read and written.
+///
+/// The referent's parts are carried into the callee, so the callee's `d.v` resolves to
+/// the caller's `d.v`; the write-back then re-bases on the target's projection, which
+/// is empty here (the target is the whole local). An enum *payload* through a reference
+/// stays sound-incomplete -- the discriminant switch is unmodelled -- which is the
+/// honest refusal rather than a dropped write.
+#[test]
+fn a_scalar_field_crosses_a_reference_argument() {
+    let Some(report) = verify_realistic(&[
+        "a_scalar_field_read_through_a_reference",
+        "a_stale_scalar_field_read_cannot_prove_this",
+        "a_scalar_field_write_through_a_reference",
+        "a_stale_scalar_field_write_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "a_scalar_field_read_through_a_reference",
+        "a_scalar_field_write_through_a_reference",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a scalar field must cross a reference argument; got: {o}");
+    }
+    for name in [
+        "a_stale_scalar_field_read_cannot_prove_this",
+        "a_stale_scalar_field_write_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a stale scalar field must not prove this false contract; got: {o}"
+        );
+    }
+}
+
 /// A slice's length is read through the *one* rvalue the compiler prints, on any
 /// toolchain.
 ///

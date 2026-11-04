@@ -4798,6 +4798,47 @@ pub fn a_stale_swap_of_elements_cannot_prove_this(mut a: [u8; 2]) -> u8 {
     a[0]
 }
 
+/// A helper reading a *scalar* field of a `&DuoBox`.
+pub fn take_duo_v(d: &DuoBox) -> u8 {
+    d.v
+}
+
+/// A helper writing a *scalar* field through a `&mut DuoBox`.
+pub fn put_duo_v(d: &mut DuoBox, x: u8) {
+    d.v = x;
+}
+
+/// A scalar field read through a helper's `&DuoBox`: the referent's parts are
+/// carried in, and the callee's read of `d.v` resolves to the caller's `d.v`.
+/// requires: d.v == 7
+/// ensures: ret == 7
+pub fn a_scalar_field_read_through_a_reference(d: DuoBox) -> u8 {
+    take_duo_v(&d)
+}
+
+/// The false direction of [`a_scalar_field_read_through_a_reference`].
+/// requires: d.v == 7
+/// ensures: ret == 0
+pub fn a_stale_scalar_field_read_cannot_prove_this(d: DuoBox) -> u8 {
+    take_duo_v(&d)
+}
+
+/// A scalar field written through a helper's `&mut DuoBox`.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_scalar_field_write_through_a_reference(mut d: DuoBox) -> u8 {
+    put_duo_v(&mut d, 5);
+    d.v
+}
+
+/// The false direction of [`a_scalar_field_write_through_a_reference`].
+/// requires: d.v == 0
+/// ensures: ret == 0
+pub fn a_stale_scalar_field_write_cannot_prove_this(mut d: DuoBox) -> u8 {
+    put_duo_v(&mut d, 5);
+    d.v
+}
+
 /// A type whose method's tail collides with a *free function* of the same name.
 ///
 /// The collision is deliberately on names used by nothing else in this file: a

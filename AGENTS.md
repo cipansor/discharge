@@ -5787,8 +5787,16 @@ is the next precision target: the `indexed` store is keyed by *local* only, so a
 reached through a projection has no entry. Closing it means keying `indexed` by a place
 and re-basing element keys on the projection, the same shape as the `nested`-store work.
 
-**Evidence.** Corpus `decided 181 of 333` -> **`234 of 428`**; `cargo test --workspace
---features std` **608 -> 621** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+**A scalar field crosses a reference argument.** A helper reading `d.v` through a
+`&DuoBox` and one writing it through a `&mut DuoBox` both decide: the referent's *parts*
+are carried in, so the callee's `d.v` resolves to the caller's `d.v`, and the write-back
+re-bases on the target's projection (empty for a whole-local target). Four entries with
+their false twins, pinned by `a_scalar_field_crosses_a_reference_argument`. An enum
+*payload* through a reference (`*e = E::A(5)`) stays sound-incomplete -- the discriminant
+switch is unmodelled -- which is the honest refusal rather than a dropped write.
+
+**Evidence.** Corpus `decided 181 of 333` -> **`236 of 432`**; `cargo test --workspace
+--features std` **608 -> 622** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
 `mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.
