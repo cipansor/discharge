@@ -2168,6 +2168,48 @@ fn a_reference_to_a_reference_crosses_a_frame_only_when_refused() {
     );
 }
 
+/// The whole-corpus direction invariant: a function whose *name* says it must not be
+/// provable may never come back `verified`.
+///
+/// The corpus pairs each contract with its false twin, spelled `..._cannot_prove_this`:
+/// the same body, or one differing only in the direction of the claim, so a twin that
+/// verifies is a false proof by construction. Checking the naming convention
+/// over the whole file means a new false proof of any *known* shape fails this test the
+/// moment it is introduced, instead of waiting for someone to remember to assert the
+/// twin in the same commit that adds the shape. It is the corpus-wide version of the
+/// per-shape `Failed` assertions below, and it is deliberately weaker than they are --
+/// a twin may be `Failed`, `Incomplete` or `Skipped` and this passes, because all three
+/// are honest answers and only `verified` is a lie.
+#[test]
+fn no_cannot_prove_entry_is_ever_verified() {
+    let Some(report) = verify_realistic(&[]) else { return };
+    let mut checked = 0usize;
+    let mut liars = Vec::new();
+    for (name, o) in &report.outcomes {
+        // The suffix is the whole convention: all 49 probes in the corpus use it, and
+        // none uses a prefix. A name that does not end this way is not a
+        // false-direction probe, whatever else it looks like.
+        let false_direction = name.ends_with("_cannot_prove_this");
+        if !false_direction {
+            continue;
+        }
+        checked += 1;
+        if o.is_verified() {
+            liars.push(name.clone());
+        }
+    }
+    assert!(
+        liars.is_empty(),
+        "these entries claim a false contract and were `verified` -- a false proof: {liars:?}"
+    );
+    // A silent zero would make this test vacuous if the naming convention ever drifts,
+    // so the count is asserted rather than merely reported.
+    assert!(
+        checked >= 40,
+        "expected the corpus to carry dozens of false-direction probes, found {checked}; \
+         has the naming convention changed?"
+    );
+}
 /// A slice's length is read through the *one* rvalue the compiler prints, on any
 /// toolchain.
 ///

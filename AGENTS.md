@@ -5820,8 +5820,19 @@ than modelled wrongly -- the true contract stays unproved, which is the honest f
 mode. Five entries, pinned by
 `a_reference_to_a_reference_crosses_a_frame_only_when_refused`.
 
+**A false-direction probe may never verify.** Every contract in the corpus that the body
+refutes is spelled `..._cannot_prove_this`, and
+`no_cannot_prove_entry_is_ever_verified` sweeps the whole file asserting that none of them
+is `verified`. It is weaker than the per-shape assertions on purpose: a probe may be
+`Failed`, `Incomplete` or `Skipped` and the test passes, because all three are honest
+answers and only `verified` is a lie. The value is that a *new* false proof of an already
+known shape now fails the gate in the commit that introduces it, without anyone having to
+remember to assert the twin. The count is asserted too (`>= 40`), so the test cannot go
+vacuous if the naming convention drifts. Verified to fail by injecting a true contract
+under a `_cannot_prove_this` name.
+
 **Evidence.** Corpus `decided 181 of 333` -> **`241 of 443`**; `cargo test --workspace
---features std` **608 -> 624** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+--features std` **608 -> 625** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
 `mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.
