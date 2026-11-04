@@ -5739,8 +5739,21 @@ two-reference `swap` both scalar copies then claimed the same storage, which bro
 swap and proved a false contract. Only a plain reference local is carried. Six entries with
 their false twins, pinned by `a_reference_crosses_a_call_in_both_directions`.
 
-**Evidence.** Corpus `decided 181 of 333` -> **`217 of 397`**; `cargo test --workspace
---features std` **608 -> 617** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+**A method may return a reference to its own field.** `*c.lo_mut() = 5` was another
+**false proof**. Inside the callee the returned reference is `&mut (*_1).0` -- a place in
+the *callee's* terms -- and `ref_origin` recorded only a local, so the projection was lost,
+the returned reference named nothing, the write was dropped, the true `ret == 5` was
+refuted, and the false `ret == 0` was **proved**. `ref_origin` now holds a `Place`, and an
+`arg_source` map records, for each reference *argument*, the place it denotes in the
+*caller's* frame. A returned reference is translated by looking up its head in
+`arg_source` and appending the returned projection: `_1` is the caller's `c`, so `_1.0` is
+`c.lo`. A head that is *not* an argument is the callee's own storage, which dies at
+return, so nothing is recorded and the write is dropped rather than aimed at a foreign
+place. Six entries with their false twins, pinned by
+`a_method_may_return_a_reference_to_its_own_field`.
+
+**Evidence.** Corpus `decided 181 of 333` -> **`220 of 403`**; `cargo test --workspace
+--features std` **608 -> 618** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
 `mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.

@@ -1877,6 +1877,46 @@ fn a_reference_crosses_a_call_in_both_directions() {
     }
 }
 
+/// A method that *returns* a reference to one of its own fields.
+///
+/// `*c.lo_mut() = 5` lowers to `_2 = Config::lo_mut(move _3); (*_2) = 5; _0 = c.lo`,
+/// and inside the callee the returned reference is `&mut (*_1).0` -- a place in the
+/// *callee's* terms. Translating its head through the argument's caller place gives
+/// `c.lo`. Without that the returned reference named nothing, the write was dropped,
+/// the true `ret == 5` was refuted, and the false `ret == 0` was **proved**.
+#[test]
+fn a_method_may_return_a_reference_to_its_own_field() {
+    let Some(report) = verify_realistic(&[
+        "a_write_through_a_returned_field_reference",
+        "a_stale_returned_field_reference_cannot_prove_this",
+        "a_write_through_the_other_returned_reference",
+        "a_stale_other_returned_reference_cannot_prove_this",
+        "a_write_through_a_returned_builder",
+        "a_stale_returned_builder_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "a_write_through_a_returned_field_reference",
+        "a_write_through_the_other_returned_reference",
+        "a_write_through_a_returned_builder",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a returned field reference must reach the field; got: {o}");
+    }
+    for name in [
+        "a_stale_returned_field_reference_cannot_prove_this",
+        "a_stale_other_returned_reference_cannot_prove_this",
+        "a_stale_returned_builder_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a dropped write through a returned reference must not prove this; got: {o}"
+        );
+    }
+}
+
 /// A slice's length is read through the *one* rvalue the compiler prints, on any
 /// toolchain.
 ///

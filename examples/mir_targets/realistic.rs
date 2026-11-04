@@ -4456,6 +4456,80 @@ pub fn a_stale_returned_reference_cannot_prove_this(mut x: u8) -> u8 {
     x
 }
 
+/// Methods that *return* a reference to one of their own fields.
+impl Config {
+    /// A `&mut self` method returning a `&mut` to the `lo` field.
+    pub fn lo_mut(&mut self) -> &mut u8 {
+        &mut self.lo
+    }
+
+    /// The same for `hi`.
+    pub fn hi_mut(&mut self) -> &mut u8 {
+        &mut self.hi
+    }
+
+    /// A builder that writes and returns `&mut Self`.
+    pub fn touch(&mut self, x: u8) -> &mut Config {
+        self.lo = x;
+        self
+    }
+}
+
+/// A write through a `&mut` to a field *returned by a method*: `*c.lo_mut() = 5`.
+///
+/// The returned reference names a place in the *callee's* terms (`&mut (*_1).0`),
+/// and `_1` is the caller's `c`, so the write belongs to `c.lo`. Without that
+/// translation the returned reference named nothing, the write was dropped, the true
+/// `ret == 5` was refuted, and the false `ret == 0` was **proved**.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_write_through_a_returned_field_reference(mut c: Config) -> u8 {
+    *c.lo_mut() = 5;
+    c.lo
+}
+
+/// The false direction of [`a_write_through_a_returned_field_reference`] -- the one
+/// that was wrongly proved.
+/// requires: c.lo == 0
+/// ensures: ret == 0
+pub fn a_stale_returned_field_reference_cannot_prove_this(mut c: Config) -> u8 {
+    *c.lo_mut() = 5;
+    c.lo
+}
+
+/// The same for the *other* field, so the translation cannot be a coincidence of one
+/// index.
+/// requires: true
+/// ensures: ret == 7
+pub fn a_write_through_the_other_returned_reference(mut c: Config) -> u8 {
+    *c.hi_mut() = 7;
+    c.hi
+}
+
+/// The false direction of [`a_write_through_the_other_returned_reference`].
+/// requires: c.hi == 0
+/// ensures: ret == 0
+pub fn a_stale_other_returned_reference_cannot_prove_this(mut c: Config) -> u8 {
+    *c.hi_mut() = 7;
+    c.hi
+}
+
+/// A builder whose returned `&mut Self` is read back.
+/// requires: true
+/// ensures: ret == 9
+pub fn a_write_through_a_returned_builder(mut c: Config) -> u8 {
+    c.touch(9);
+    c.lo
+}
+
+/// The false direction of [`a_write_through_a_returned_builder`].
+/// requires: c.lo == 0
+/// ensures: ret == 0
+pub fn a_stale_returned_builder_cannot_prove_this(mut c: Config) -> u8 {
+    c.touch(9);
+    c.lo
+}
+
 /// A type whose method's tail collides with a *free function* of the same name.
 ///
 /// The collision is deliberately on names used by nothing else in this file: a
