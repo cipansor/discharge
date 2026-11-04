@@ -33,10 +33,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      # The nightly is not for building this crate; it is what `gate.sh` step 7 points
-      # `DISCHARGE_RUSTC` at, because `rustc --emit=mir` needs a nightly. Without it every
-      # test in `tests/mir.rs` skips itself -- and a skipped test still reports `ok`, so the
-      # suite count is identical whether the MIR frontend was exercised or not. That is how
+      # `--emit=mir` works on stable, so a stable `rustc` is enough for the MIR suite;
+      # CI names a nightly anyway, out of caution, because a dump-format change is exactly
+      # what the `rustc_public` oracle in step 10 exists to catch. Without a compiler named,
+      # every test in `tests/mir.rs` skips itself -- and a skipped test still reports `ok`, so
+      # the suite count is identical whether the MIR frontend was exercised or not. That is how
       # the per-kind discharge polarity (`Obligation::is_discharged`) came to have no teeth
       # in CI. The in-module oracle in `src/mir/exec.rs` covers that logic ungated; this
       # makes the end-to-end tests run too.

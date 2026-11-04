@@ -5411,3 +5411,28 @@ program correctly reports the engine's bugs as its own and its own as the engine
 resolved by asking rustc what the program *means* (a MIR dump, not a guess) before believing the
 verdict.
 
+
+## The MIR frontend needs a `rustc`, not a *nightly* `rustc`
+
+Two comments claimed otherwise -- `scripts/gate.sh` step 8 ("which needs nightly") and
+`.github/workflows/ci.yml` ("because `rustc --emit=mir` needs a nightly") -- and both were wrong.
+`-Zunpretty=mir` is nightly-only, but `--emit=mir` is stable, so a stable `rustc` reads the
+whole corpus. Measured, not assumed:
+
+| compiler | `mir_coverage` on `examples/mir_targets/realistic.rs` | `cargo test --test mir` |
+|---|---|---|
+| `1.85.1` (the MSRV) | `decided 171 of 315` | 133 passed |
+| `1.99.1` (current stable) | `decided 171 of 315` | 133 passed |
+
+Identical verdicts and an identical decided count on both, so the frontend is a stable-toolchain
+tool. CI still names a nightly, and that is fine -- the thing to keep straight is *why*: a
+dump-format change is a real risk (the parser reads `rustc`'s text, so a printer change can break
+it silently), and the `rustc_public` oracle in step 10 is what catches that. The nightly is
+caution about the *format*, never a requirement of `--emit=mir`.
+
+The `tools/mir-oracle` crate is the one piece that genuinely needs a nightly with `rustc-dev` --
+it links `rustc` internals behind `#![feature(rustc_private)]` -- and it is deliberately *not* a
+workspace member for exactly that reason. So "this project needs nightly" is true of a test
+oracle and false of the crate and its MIR frontend. When a comment states a toolchain
+requirement, check it against a second toolchain before trusting it; a wrong comment here is the
+kind of thing that gets copied into a downstream build script and never questioned again.

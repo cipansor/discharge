@@ -92,12 +92,15 @@ else
   echo "   (kani not installed; skipped -- 'cargo install --locked kani-verifier && cargo kani setup')"
 fi
 
-echo "== 8/13 MIR frontend, on real rustc MIR (skipped if no nightly is named) =="
-# The MIR frontend shells out to `rustc --emit=mir`, which needs nightly. It takes the
-# compiler from DISCHARGE_RUSTC rather than RUSTC so that pointing it at a nightly does
-# not disturb the cargo that is building these tests. Without a nightly named, the
+echo "== 8/13 MIR frontend, on real rustc MIR (skipped if no rustc is named) =="
+# The MIR frontend shells out to `rustc --emit=mir`. That works on a *stable* compiler:
+# `-Zunpretty=mir` is nightly-only, but `--emit=mir` is not, so a stable `rustc` is enough
+# for the whole `tests/mir.rs` suite (verified on 1.85, the MSRV, and on current stable).
+# It takes the compiler from DISCHARGE_RUSTC rather than RUSTC so that naming a different
+# rustc does not disturb the cargo that is building these tests. Without one named, the
 # frontend's tests skip themselves -- so this gate says so rather than passing in silence,
-# exactly like Kani and Verus below.
+# exactly like Kani and Verus below. CI names a nightly anyway, out of caution, because a
+# dump-format change is what the rustc_public oracle in step 10 exists to catch.
 if [ -n "${DISCHARGE_RUSTC:-}" ]; then
   cargo run -q --features std --example mir_demo || fail "MIR demo"
 else
