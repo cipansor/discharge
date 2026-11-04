@@ -2560,13 +2560,22 @@ pub fn shift_var(op: Shift, x: Var, n: Var) -> Var {
             Shift::LogicalRight => Op::LShr,
             Shift::ArithmeticRight => Op::Shr,
         };
+        // The amount is tested in *its own* width, not the value's. `_1 >> _2`
+        // where `_1: u8` and `_2: u32` is the ordinary shape -- Rust takes the
+        // shift amount as any integer type -- and building the mask at the
+        // value's width made `n & mask` mix 32 bits with 8, which is ill-formed
+        // and refused the whole function. `n`'s width is at least the `log2(w)`
+        // bits the stages read for every real shift-amount type, so no bit is
+        // lost; an amount *narrower* than the value is the case the mask has to
+        // be read from, and it is read from `n`.
+        let nw = c.width_of(n.0);
         let mut acc = x;
         let mut i = 0u32;
         while (1u32 << i) < w as u32 {
             let amt = 1u32 << i;
             // Bit `i` of `n`, as `(n & 2^i) == 2^i`. Testing the masked value
             // against the mask avoids needing a bit-extraction primitive.
-            let mask = c.konst(amt as u64, w);
+            let mask = c.konst(amt as u64, nw);
             let masked = c.bin_word(Op::And, n.0, mask);
             let bit = c.cmp(Op::Eq, masked, mask);
             let shifted = c.shift(hop, acc.0, amt);
@@ -2579,7 +2588,9 @@ pub fn shift_var(op: Shift, x: Var, n: Var) -> Var {
         // out-of-range value explicitly. Without this, `x << 4` at 4 bits returns
         // `x`, which is neither the documented value nor anything Rust does;
         // `tests/shift.rs` pins it.
-        let wt = c.konst(w as u64, w);
+        // `w <= 64` and every shift-amount type is at least 8 bits wide, so this
+        // constant is exact in `n`'s width rather than truncated.
+        let wt = c.konst(w as u64, nw);
         let in_range = c.cmp(Op::Ult, n.0, wt);
         let oor = match op {
             // An arithmetic shift by `w - 1` replicates the sign bit across the

@@ -5848,8 +5848,17 @@ missing, because an unavailable oracle is not evidence. It is a *test* oracle, n
 dependency -- the crate stays zero-dependency. A fresh container needs
 `python3 -m pip install z3-solver` before the gate can go green.
 
-**Evidence.** Corpus `decided 181 of 333` -> **`246 of 458`**; `cargo test --workspace
---features std` **608 -> 626** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+**The shift amount is read at its own width.** `smt::shift_var` built its per-stage mask
+at the *value's* width, so `n & mask` for `_1: u8, _2: u32` mixed 32 bits with 8; the
+query came back ill-formed and the frontend answered `incomplete`. Only the symbolic path
+saw it -- `evaluate` folds an ill-formed term anyway -- so `u8 >> u32` was refused while
+`u8 >> u8` verified, which is why the existing shift tests (all of which pass the amount at
+the value's width) missed it. The regression test must go through `prove`, not `evaluate`,
+or it guards nothing; both are present and the symbolic one was checked against the
+unfixed code. Pinned by `a_wider_shift_amount_is_read_at_its_own_width{,_symbolically}`.
+
+**Evidence.** Corpus `decided 181 of 333` -> **`248 of 462`**; `cargo test --workspace
+--features std` **608 -> 628** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
 `mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.

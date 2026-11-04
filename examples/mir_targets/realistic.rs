@@ -5107,6 +5107,43 @@ pub fn an_invariant_not_preserved_cannot_prove_this(n: u8) -> u8 {
     i
 }
 
+/// A variable shift whose amount is *wider* than the value, which is the shape
+/// rustc prints: the amount of `a >> b` may be any integer type.
+///
+/// This was `incomplete` until the barrel shifter read the amount at its own
+/// width: the stages built their mask at the *value's* width, so `n & mask` mixed
+/// 32 bits with 8 and the query came back ill-formed. Only the symbolic path
+/// noticed, because `evaluate` folds an ill-formed term anyway -- so a proof about
+/// a shift by a `u32` was refused while the same shift by a `u8` went through.
+/// requires: a == 255 && b == 1
+/// ensures: ret == 127
+pub fn a_shift_by_a_wider_amount(a: u8, b: u32) -> u8 {
+    a >> b
+}
+
+/// The false direction of [`a_shift_by_a_wider_amount`]: a logical right shift of
+/// `255` by one is `127`, never `128`.
+/// requires: a == 255 && b == 1
+/// ensures: ret == 128
+pub fn a_shift_by_a_wider_amount_cannot_prove_this(a: u8, b: u32) -> u8 {
+    a >> b
+}
+
+/// An arithmetic right shift of a signed value, at a wider amount: `-1 >> 1` is
+/// `-1` because the sign bit is replicated, not `127`.
+/// requires: a == -1 && b == 1
+/// ensures: ret == -1
+pub fn an_arithmetic_shift_by_a_wider_amount(a: i8, b: u32) -> i8 {
+    a >> b
+}
+
+/// The false direction: a *logical* shift of `-1` by one would be `127`.
+/// requires: a == -1 && b == 1
+/// ensures: ret == 127
+pub fn an_arithmetic_shift_by_a_wider_amount_cannot_prove_this(a: i8, b: u32) -> i8 {
+    a >> b
+}
+
 /// A type whose method's tail collides with a *free function* of the same name.
 ///
 /// The collision is deliberately on names used by nothing else in this file: a
