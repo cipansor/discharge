@@ -449,6 +449,19 @@ struct Env {
     /// for reads `Unknown`, which is the honest answer for a pointer whose
     /// target the run never saw.
     addressed: BTreeMap<u32, Place>,
+    /// For a reference local, the *caller's* local whose address it was built from,
+    /// carried across a call boundary when the reference is passed as an argument.
+    ///
+    /// `addressed` cannot cross a call: a callee's `&mut u8` argument is a fresh
+    /// local whose `addressed` entry is the caller's place, but when the callee
+    /// returns that reference the caller's destination needs a place in the
+    /// *caller's* frame, and the callee's local indices mean nothing there. This
+    /// records the origin in terms the caller can use -- `_3 = &mut _1` records
+    /// `3 -> _1` -- so a returned reference can be resolved to the caller's storage
+    /// rather than dropped. Without it `let r = identity(&mut x); *r = 5` lost the
+    /// write: `_2 = identity(_3)` left `_2` with no address, `*_2 = 5` was a write to
+    /// a local no caller reads, and the false `ret == 0` was **proved**.
+    ref_origin: BTreeMap<u32, u32>,
     /// Values addressed by an index, with a length: slice arguments (`&[T]`) and
     /// array arguments (`[T; N]`), keyed by the local the argument lives in.
     ///
@@ -533,6 +546,7 @@ impl Env {
             discriminants: BTreeMap::new(),
             deref_ok: BTreeMap::new(),
             addressed: BTreeMap::new(),
+            ref_origin: BTreeMap::new(),
             indexed: BTreeMap::new(),
             whole_writes: BTreeSet::new(),
             enums: BTreeMap::new(),
@@ -2012,6 +2026,35 @@ where
             }
             Stmt::Assign(dest, rv) => {
                 let v = eval_rvalue(cur, &mut st.env, dest, rv);
+                // A reference *copied* between locals (`let r = identity(&mut x)`
+                // lowers to `_4 = move _3` where `_3` is the returned `&mut u8`)
+                // addresses the same place `_3` did, and `resolve` is what turns
+                // `*_4` into that place. Only `Rvalue::Ref` and a reference `Cast`
+                // recorded the mapping, so the copy lost it: `*_4 = 5` was then a
+                // write to a local no caller reads, the write was dropped, and
+                // `requires: x == 0` / `ensures: ret == 0` was **proved** against a
+                // body that returns 5 -- while the true contract `ret == 5` was
+                // refuted. The mapping is carried only for a reference *type*, so a
+                // numeric copy cannot invent one.
+                // The *source* is the guard, not the destination: a copy of a
+                // reference local is a reference copy, and `q.proj.is_empty()`
+                // keeps a copy *through* a reference (`_3 = copy (*_1)`, where `_3`
+                // is a `u8`) out -- carrying the address there would give a scalar
+                // an address, and in a two-reference `swap` both scalar copies then
+                // claimed the same storage, which broke the swap and proved a false
+                // contract.
+                if let Rvalue::Use(Operand::Copy(q) | Operand::Move(q)) = rv {
+                    if q.proj.is_empty()
+                        && matches!(cur.ty_of(q.local), Some(Ty::Ref(_)))
+                    {
+                        if let Some(o) = st.env.ref_origin.get(&q.local).copied() {
+                            st.env.ref_origin.insert(dest.local, o);
+                            st.env
+                                .addressed
+                                .insert(dest.local, Place { local: o, proj: Vec::new() });
+                        }
+                    }
+                }
                 st.env.set(dest, v);
             }
         }
@@ -2282,6 +2325,18 @@ where
                         }
                     }
                     if let Some(dest) = &caller.ret_dest {
+                        // A reference the callee *returned*: `identity(_3) -> _2`
+                        // where the callee's `_0` addressed its argument. The
+                        // callee's local indices mean nothing in the caller's
+                        // frame, but `ref_origin` records which caller local the
+                        // reference was built from, so the caller's destination can
+                        // be pointed at that storage. Without this the returned
+                        // reference had no address in the caller, `*r = 5` was
+                        // dropped, and the false `ret == 0` was **proved**.
+                        if let Some(o) = st.env.ref_origin.get(&0).copied() {
+                            env.addressed.insert(dest.local, Place { local: o, proj: Vec::new() });
+                            env.ref_origin.insert(dest.local, o);
+                        }
                         env.set(dest, ret);
                         // A tuple return has components, and the callee stored
                         // them in its *own* return place (`_0.0`, `_0.1`). The
@@ -2641,6 +2696,21 @@ where
                 if is_ref {
                     by_ref.push((source, l));
                 }
+                // The origin local of a reference argument, in the *caller's*
+                // frame, so a reference the callee returns can be resolved once it
+                // is back in the caller. A `&mut x` argument is passed through a
+                // temp (`_5 = &mut _2; set5(_5)`), so the origin is `_5`'s origin --
+                // `_2` -- not `_5` itself.
+                if matches!(callee_fn.ty_of(l), Some(Ty::Ref(_))) {
+                    // Only a reference built from a *plain* local has an origin;
+                    // `&mut c.lo` has none, and recording the enclosing local
+                    // instead would point the callee's argument at the wrong
+                    // storage. Absent an origin, nothing is recorded and a
+                    // reference the callee returns reads unknown -- sound.
+                    if let Some(o) = st.env.ref_origin.get(cl).copied() {
+                        env.ref_origin.insert(l, o);
+                    }
+                }
             }
             let caller = Frame {
                 func: st.frame.func,
@@ -2953,6 +3023,13 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
             // The place is stored as written, so `&_1.0` keeps its projection and
             // `(*_2)` later reads `_1.0` rather than the whole of `_1`.
             env.addressed.insert(dest.local, p.clone());
+            // The *origin* in the frame the reference was created in. A reference
+            // built from a plain local (`_3 = &mut _1`) records `3 -> 1`; one built
+            // from a projection has no single origin local, so nothing is recorded
+            // and a returned reference through it stays unknown rather than wrong.
+            if p.proj.is_empty() {
+                env.ref_origin.insert(dest.local, p.local);
+            }
             Val::Unknown
         }
         // `Len(p)` -- the length of a slice or array. `PtrMetadata` is how 1.99

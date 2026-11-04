@@ -4381,6 +4381,81 @@ pub fn a_stale_leaf_sibling_cannot_prove_this(mut d: DuoBox) -> u8 {
     d.w
 }
 
+/// An inner helper that writes through a `&mut u8`.
+pub fn relay_set(v: &mut u8, x: u8) {
+    *v = x;
+}
+
+/// An outer helper that *forwards* its `&mut u8` to the inner one.
+pub fn pass_on(v: &mut u8, x: u8) {
+    relay_set(v, x);
+}
+
+/// An outer helper that forwards a constant to the inner one.
+pub fn pass_on_five(v: &mut u8) {
+    relay_set(v, 5);
+}
+
+/// A helper that *returns* the reference it was given. The caller's `let r =
+/// identity(&mut x); *r = 5` needs the returned reference's address to survive the
+/// call: before it did, `*r = 5` was a write to a local no caller reads, the write
+/// was dropped, and the false `ret == 0` was **proved** while the true `ret == 5`
+/// was refuted.
+pub fn borrowed_identity(x: &mut u8) -> &mut u8 {
+    x
+}
+
+/// A two-frame chain: the caller's write goes through `pass_on` into `relay_set`.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_two_frame_chain(mut x: u8) -> u8 {
+    pass_on(&mut x, 5);
+    x
+}
+
+/// The false direction of [`a_two_frame_chain`].
+/// requires: x == 0
+/// ensures: ret == 0
+pub fn a_stale_two_frame_chain_cannot_prove_this(mut x: u8) -> u8 {
+    pass_on(&mut x, 5);
+    x
+}
+
+/// A two-frame chain whose inner write is a constant.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_two_frame_constant(mut x: u8) -> u8 {
+    pass_on_five(&mut x);
+    x
+}
+
+/// The false direction of [`a_two_frame_constant`].
+/// requires: x == 0
+/// ensures: ret == 0
+pub fn a_stale_two_frame_constant_cannot_prove_this(mut x: u8) -> u8 {
+    pass_on_five(&mut x);
+    x
+}
+
+/// A write through a reference *returned* by a helper.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_write_through_a_returned_reference(mut x: u8) -> u8 {
+    let r = borrowed_identity(&mut x);
+    *r = 5;
+    x
+}
+
+/// The false direction of [`a_write_through_a_returned_reference`] -- the one that
+/// was wrongly proved before the returned reference kept its address.
+/// requires: x == 0
+/// ensures: ret == 0
+pub fn a_stale_returned_reference_cannot_prove_this(mut x: u8) -> u8 {
+    let r = borrowed_identity(&mut x);
+    *r = 5;
+    x
+}
+
 /// A type whose method's tail collides with a *free function* of the same name.
 ///
 /// The collision is deliberately on names used by nothing else in this file: a

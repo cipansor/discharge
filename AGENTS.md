@@ -5722,8 +5722,25 @@ with their false twins, pinned by
 through a sub-place target (`*i = n` for `&mut o.i`) is *sound-incomplete* rather than
 decided: a leaf write cannot spell a whole value, so the caller's leaf reads unknown.
 
-**Evidence.** Corpus `decided 181 of 333` -> **`214 of 391`**; `cargo test --workspace
---features std` **608 -> 616** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+**A reference crosses a call in both directions.** A reference *returned* by a helper was
+the sharpest case, and it was a **false proof**: `let r = identity(&mut x); *r = 5` lowers
+to `_3 = &mut _1; _2 = identity(_3); (*_2) = 5`, so the write is keyed on a local the
+*call* defined. `addressed` cannot cross a call -- the callee's local indices mean nothing
+in the caller's frame -- so `_2` had no address, `*_2 = 5` was a write to a local no caller
+reads, and `requires: x == 0` / `ensures: ret == 0` was **proved** against a body that
+returns 5, while the true `ret == 5` was refuted. A separate `ref_origin` map records
+which *caller* local a reference was built from (`_3 = &mut _1` records `3 -> 1`), is
+carried into the callee for a reference argument, and is applied to the caller's
+destination when the callee returns.
+
+The guard is on the *source* of a copy, not the destination: `_3 = copy (*_1)` copies a
+scalar *through* a reference, and carrying an address there gave a scalar one -- in a
+two-reference `swap` both scalar copies then claimed the same storage, which broke the
+swap and proved a false contract. Only a plain reference local is carried. Six entries with
+their false twins, pinned by `a_reference_crosses_a_call_in_both_directions`.
+
+**Evidence.** Corpus `decided 181 of 333` -> **`217 of 397`**; `cargo test --workspace
+--features std` **608 -> 617** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
 `mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.

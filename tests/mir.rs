@@ -1836,6 +1836,47 @@ fn a_method_receiver_is_a_sub_place_like_any_other_argument() {
     }
 }
 
+/// A helper that forwards its reference to another helper, and a helper that
+/// *returns* the reference it was given.
+///
+/// The returned reference is the sharp case: `let r = identity(&mut x); *r = 5`
+/// lowers to `_3 = &mut _1; _2 = identity(_3); (*_2) = 5`, so the write is keyed on
+/// a local the *call* defined. Without the reference's origin crossing the call,
+/// `_2` had no address, the write went to a local no caller reads, and the false
+/// `ret == 0` was proved while the true `ret == 5` was refuted.
+#[test]
+fn a_reference_crosses_a_call_in_both_directions() {
+    let Some(report) = verify_realistic(&[
+        "a_two_frame_chain",
+        "a_stale_two_frame_chain_cannot_prove_this",
+        "a_two_frame_constant",
+        "a_stale_two_frame_constant_cannot_prove_this",
+        "a_write_through_a_returned_reference",
+        "a_stale_returned_reference_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "a_two_frame_chain",
+        "a_two_frame_constant",
+        "a_write_through_a_returned_reference",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a forwarded reference must reach its target; got: {o}");
+    }
+    for name in [
+        "a_stale_two_frame_chain_cannot_prove_this",
+        "a_stale_two_frame_constant_cannot_prove_this",
+        "a_stale_returned_reference_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a dropped write must not prove this false contract; got: {o}"
+        );
+    }
+}
+
 /// A slice's length is read through the *one* rvalue the compiler prints, on any
 /// toolchain.
 ///
