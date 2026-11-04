@@ -5795,8 +5795,22 @@ their false twins, pinned by `a_scalar_field_crosses_a_reference_argument`. An e
 *payload* through a reference (`*e = E::A(5)`) stays sound-incomplete -- the discriminant
 switch is unmodelled -- which is the honest refusal rather than a dropped write.
 
-**Evidence.** Corpus `decided 181 of 333` -> **`236 of 432`**; `cargo test --workspace
---features std` **608 -> 622** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+**A reference reached through another reference.** `**rr = 5` on a `&mut &mut u8`
+lowers to `_4 = <retag marker> copy (*_3); (*_4) = 5` with `_4: &mut u8`, and the marker
+is toolchain-specific: `no_retag copy` on 1.99+, `deref_copy` on 1.85. Neither was
+recognised, so the rvalue fell to `Rvalue::Unknown`, `_4` got no address, and `(*_4) = 5`
+was dropped -- the *false* `ret == 0` was **proved** against a body that returns 5 and the
+true `ret == 5` was refuted. Both markers are now peeled to a plain copy, and the
+deref-of-a-reference copy carries its address when the *destination's* type is a
+reference (the source projection is a deref in both the reference and the scalar case, so
+the type is the only discriminator). A read `**rr` had the same hole. Peeling the marker
+from *every* rvalue instead of just `copy`/`move` moved 114 verdicts, most of them wrong:
+`no_retag &mut _1` and `no_retag (*_1)` in receiver lowering carry meaning the copy does
+not. Six entries with their false twins, pinned by
+`a_reference_through_a_reference_is_not_dropped`.
+
+**Evidence.** Corpus `decided 181 of 333` -> **`239 of 438`**; `cargo test --workspace
+--features std` **608 -> 623** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
 `mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.

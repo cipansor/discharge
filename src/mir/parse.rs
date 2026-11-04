@@ -1208,6 +1208,30 @@ fn parse_bb_ref(s: &str) -> Option<usize> {
 /// Parse an rvalue appearing after `place = `.
 fn parse_rvalue(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Rvalue {
     let t = s.trim();
+    // A copy of a reference *through* another reference is printed with a retag
+    // marker: `_4 = no_retag copy (*_3)` on 1.99+, and `_4 = deref_copy (*_3)` on
+    // 1.85 (the MSRV). Leaving either prefix on made the whole rvalue unparseable,
+    // and that is not a harmless loss: `_4` then became `Rvalue::Unknown`, got no
+    // address, and `(*_4) = 5` was dropped -- so `requires: x == 0` / `ensures: ret
+    // == 0` was **proved** against a body that returns 5, while the true `ret == 5`
+    // was refuted. Both markers are peeled to a plain copy of the inner place.
+    //
+    // Only the `copy`/`move` forms are peeled. Stripping the marker from *every*
+    // rvalue also rewrote `no_retag &mut _1` and `no_retag (*_1)` in method receiver
+    // lowering, which changed where a `&mut self` receiver pointed and lost the
+    // callee's write -- 114 corpus verdicts moved, most of them to the wrong answer.
+    // The retag-copy is the one form that was broken; the rest keep the meaning they
+    // had.
+    for prefix in ["no_retag ", "deref_copy "] {
+        if let Some(rest) = t.strip_prefix(prefix).map(str::trim) {
+            let as_copy = if rest.starts_with("copy ") || rest.starts_with("move ") {
+                rest.to_string()
+            } else {
+                format!("copy {rest}")
+            };
+            return parse_rvalue(&as_copy, enums);
+        }
+    }
     // A call is handled by the caller (it is a terminator).
     //
     // `copy`/`move` of a place is tried *before* the cast check, because a

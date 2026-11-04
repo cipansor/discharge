@@ -4839,6 +4839,72 @@ pub fn a_stale_scalar_field_write_cannot_prove_this(mut d: DuoBox) -> u8 {
     d.v
 }
 
+/// A write through *two* levels of `&mut`: `**rr = 5` on a `&mut &mut u8`.
+///
+/// Lowers to `_4 = no_retag copy (*_3); (*_4) = 5`, where `_4` is a `&mut u8`. The
+/// `no_retag` prefix made the rvalue unparseable, and the copy of a reference
+/// *through* a deref had no branch, so `_4` got no address and the write was dropped:
+/// the false `ret == 0` was proved against a body that returns 5, and the true
+/// `ret == 5` was refuted.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_write_through_two_levels_of_reference(mut x: u8) -> u8 {
+    let mut r = &mut x;
+    let rr = &mut r;
+    **rr = 5;
+    x
+}
+
+/// The false direction of [`a_write_through_two_levels_of_reference`]: if the write
+/// were dropped, this would verify.
+/// requires: x == 0
+/// ensures: ret == 0
+pub fn a_stale_two_level_write_cannot_prove_this(mut x: u8) -> u8 {
+    let mut r = &mut x;
+    let rr = &mut r;
+    **rr = 5;
+    x
+}
+
+/// A *read* through two levels of reference: `**rr`.
+/// requires: x == 3
+/// ensures: ret == 3
+pub fn a_read_through_two_levels_of_reference(x: u8) -> u8 {
+    let r = &x;
+    let rr = &r;
+    **rr
+}
+
+/// The false direction of [`a_read_through_two_levels_of_reference`].
+/// requires: x == 3
+/// ensures: ret == 4
+pub fn a_stale_two_level_read_cannot_prove_this(x: u8) -> u8 {
+    let r = &x;
+    let rr = &r;
+    **rr
+}
+
+/// A write through a reference to a *local copy* must not reach the original.
+/// requires: x == 3
+/// ensures: ret == 3
+pub fn a_write_to_a_copy_stays_in_the_copy(x: u8) -> u8 {
+    let mut y = x;
+    let r = &mut y;
+    *r = 9;
+    x
+}
+
+/// The false direction of [`a_write_to_a_copy_stays_in_the_copy`]: if the copy
+/// aliased the original, this would verify.
+/// requires: x == 3
+/// ensures: ret == 9
+pub fn a_stale_copy_write_cannot_prove_this(x: u8) -> u8 {
+    let mut y = x;
+    let r = &mut y;
+    *r = 9;
+    x
+}
+
 /// A type whose method's tail collides with a *free function* of the same name.
 ///
 /// The collision is deliberately on names used by nothing else in this file: a

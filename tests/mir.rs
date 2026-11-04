@@ -2086,6 +2086,46 @@ fn a_scalar_field_crosses_a_reference_argument() {
     }
 }
 
+/// A reference reached *through* another reference, and a reference to a local copy.
+///
+/// `**rr = 5` lowers to `_4 = no_retag copy (*_3); (*_4) = 5` with `_4: &mut u8`. The
+/// `no_retag` prefix left the rvalue unparsed and the deref-of-a-reference copy had no
+/// address, so the write was dropped: the *false* `ret == 0` proved and the true
+/// `ret == 5` refuted. The read shape `**rr` had the same hole, and a write through a
+/// reference to a local *copy* must not reach the original.
+#[test]
+fn a_reference_through_a_reference_is_not_dropped() {
+    let Some(report) = verify_realistic(&[
+        "a_write_through_two_levels_of_reference",
+        "a_stale_two_level_write_cannot_prove_this",
+        "a_read_through_two_levels_of_reference",
+        "a_stale_two_level_read_cannot_prove_this",
+        "a_write_to_a_copy_stays_in_the_copy",
+        "a_stale_copy_write_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "a_write_through_two_levels_of_reference",
+        "a_read_through_two_levels_of_reference",
+        "a_write_to_a_copy_stays_in_the_copy",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a two-level reference must reach its place; got: {o}");
+    }
+    for name in [
+        "a_stale_two_level_write_cannot_prove_this",
+        "a_stale_two_level_read_cannot_prove_this",
+        "a_stale_copy_write_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a dropped two-level write, or an aliasing copy, must not prove this; got: {o}"
+        );
+    }
+}
+
 /// A slice's length is read through the *one* rvalue the compiler prints, on any
 /// toolchain.
 ///

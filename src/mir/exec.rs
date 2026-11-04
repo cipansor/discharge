@@ -2050,13 +2050,33 @@ where
                 // claimed the same storage, which broke the swap and proved a false
                 // contract.
                 if let Rvalue::Use(Operand::Copy(q) | Operand::Move(q)) = rv {
-                    if q.proj.is_empty()
-                        && matches!(cur.ty_of(q.local), Some(Ty::Ref(_)))
-                    {
+                    if q.proj.is_empty() && matches!(cur.ty_of(q.local), Some(Ty::Ref(_))) {
                         if let Some(o) = st.env.ref_origin.get(&q.local).cloned() {
                             st.env.addressed.insert(dest.local, o.clone());
                             st.env.ref_origin.insert(dest.local, o);
                         }
+                    } else if q.proj.as_slice() == [Proj::Deref]
+                        && matches!(cur.ty_of(dest.local), Some(Ty::Ref(_)))
+                    {
+                        // A reference read *through* another reference: `**rr = 5`
+                        // lowers to `_4 = no_retag copy (*_3); (*_4) = 5`, where `_4`
+                        // is a `&mut u8`. The copy is a *reference*, so it addresses
+                        // what `_3` points to. Neither branch above fires -- the
+                        // source is not a bare reference local, and its projection is
+                        // a deref -- so `_4` got no address, `(*_4) = 5` was dropped,
+                        // and `requires: x == 0` / `ensures: ret == 0` was **proved**
+                        // against a body that returns 5, while the true `ret == 5` was
+                        // refuted. The destination's *type* is what separates this from
+                        // `_3 = copy (*_1)` with `_3: u8`, which copies a scalar and
+                        // must carry no address (both are a deref; only the type
+                        // differs).
+                        //
+                        // The place is `_3`'s referent, not `_3`: aiming at `_3` would
+                        // make `(*_4) = 5` write to the reference local rather than to
+                        // what it points at.
+                        let p = st.env.pointee(q);
+                        st.env.addressed.insert(dest.local, p.clone());
+                        st.env.ref_origin.insert(dest.local, p);
                     }
                 }
                 st.env.set(dest, v);
