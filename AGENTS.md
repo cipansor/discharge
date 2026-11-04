@@ -5455,8 +5455,12 @@ a tuple struct carries its fields in the head and needs no cursor at all. A unit
 neither, so a contract naming `.0` on it stays an "unknown name" refusal rather than a
 layout with no fields.
 
-Six corpus entries, pinned by two tests (`a_contract_can_name_a_tuple_struct_field`,
-`a_tuple_struct_field_that_does_not_exist_is_refused`):
+Seventeen corpus entries, pinned by six tests (`a_contract_can_name_a_tuple_struct_field`,
+`a_tuple_struct_field_that_does_not_exist_is_refused`,
+`a_nested_field_projection_is_read_and_agrees_with_the_body`,
+`nested_leaves_under_different_paths_are_independent`,
+`a_nested_field_write_through_a_mutable_reference_is_applied`,
+`a_nested_seed_is_invalidated_by_a_write_and_carried_by_a_copy`):
 
 | entry | shape | verdict |
 |---|---|---|
@@ -5465,7 +5469,17 @@ Six corpus entries, pinned by two tests (`a_contract_can_name_a_tuple_struct_fie
 | `tuple_struct_signed_field_reads` | `&Delta(i8)`, `d.0 < 0` | verified |
 | `tuple_struct_fields_are_independent` | `p.0 < p.1`, `ret == p.0` | **FAILED** |
 | `tuple_struct_out_of_range_field_is_refused` | `p.2` on a two-field tuple | refused |
-| `nested_tuple_projection_is_refused` | `n.p.0` | refused |
+| `nested_tuple_projection_reads` | `n.p.0` | verified |
+| `nested_tuple_projection_is_the_body_value` | `n.p.0 == 42`, body reads it | verified |
+| `nested_tuple_projection_leaves_are_independent` | `n.p.0 < n.p.1`, `ret == n.p.0` | **FAILED** |
+| `nested_path_off_the_layout_is_refused` | `n.p.q` | refused |
+| `nested_named_field_reads_its_leaf` | `o.i.v == 7` | verified |
+| `nested_named_field_is_the_body_value` | `o.i.v`, body reads it | verified |
+| `nested_named_leaves_under_different_fields` | `o.i.v != o.j.v`, `ret == o.j.v` | **FAILED** |
+| `nested_field_write_through_ref_mut_takes_effect` | `o.i.v = 5; o.i.v` on `&mut` | verified |
+| `nested_field_write_through_ref_mut_is_not_dropped` | same body, `ret == 0` | **FAILED** |
+| `whole_inner_write_makes_nested_seed_stale` | `o.i = Inner{..}; o.i.v` | not verified |
+| `whole_struct_copy_carries_nested_paths` | `c = d; c.i.v` | verified |
 
 Two of these are worth the ink. `tuple_struct_signed_field_reads` uses `d.0 < 0`: that
 precondition is satisfiable *only* under the signed reading of the field, so a reader that
@@ -5484,11 +5498,60 @@ the engine's: the first run had a `bool`-returning body in a `u8` function, whic
 rejected, and the sweep read the resulting *driver* failure as "every case undecided" --
 fixed by asking rustc what the program means before believing a verdict.
 
-Corpus `decided 171 of 315` -> **`174 of 321`**; `cargo test --workspace --features std`
-**601 -> 603** passed, 0 failed; z3 `mismatch=0`, kani `mismatch=0`. Gate green; zero
+Corpus `decided 171 of 315` -> **`181 of 333`**; `cargo test --workspace --features std`
+**601 -> 608** passed, 0 failed; z3 `mismatch=0`, kani `mismatch=0`. Gate green; zero
 dependencies and `no_std` untouched.
 
-Still not modelled, and named so the boundary is honest: a *nested* projection (`n.p.0`) is
-refused, as is a tuple struct's field read through a nested path. A tuple struct with more
-fields than `MAX_VARS` allows would refuse the binding rather than alias it, the same rule a
-named struct follows.
+Still not modelled, and named so the boundary is honest: a nested path whose *outer* field is
+an array or slice (`a[0].v`, `xs[0].v`) is refused, because the chain a subscript selects is a
+store entry rather than a field of a layout; and a tuple struct with more fields than
+`MAX_VARS` allows refuses the binding rather than aliasing it, the same rule a named struct
+follows.
+
+## A field write through a `&mut` was dropped, which was a false proof and not a lost one
+
+`Env::set` had an arm for `[Proj::Deref, Proj::Index(i)]` but none for
+`[Proj::Deref, Proj::Field(i)]`, so `((*_1).0: u8) = const 5_u8` -- how a write to a
+struct field through a `&mut` lowers -- fell to the catch-all and was dropped. The
+`Deref` is what makes this shape distinct: `resolve` collapses `(*_1).0` to `_1.0`
+only when `_1` is an argument whose target is recorded, so the store saw a
+projection run it did not model and discarded it.
+
+The consequence was two-sided, and both sides are worse than a missing proof:
+
+- **A false refutation.** `c.lo = 5; c.lo` on a `&mut Config` kept reading the
+  *seed*, so a true contract was refuted with a witness (`v2:u8 = 0`) that no run
+  could produce.
+- **A false proof.** With the write gone, `requires: true` / `ensures: ret == 0`
+  was **proved** against a body that returns 5, because the postcondition was
+  checked against the variable the write was supposed to replace.
+
+The fix is one arm, `[Proj::Deref, Proj::Field(i)] => self.fields.insert(...)`,
+which is the same store the read consults. The regression is toothed both ways:
+`field_write_through_ref_mut_takes_effect` (`ret == 5`) must verify and
+`field_write_through_ref_mut_is_not_dropped` (`ret == 0`) must be refuted. Drop the
+arm again and the first fails while the second *verifies* -- the false proof comes
+back, which is why both are asserted rather than only the positive one.
+
+**The same hole one level down.** A *nested* path (`o.i.v`) needs its own store,
+because a single field index cannot name a walk. Adding it exposed three sibling
+rules that had to land together or the nested store would be unsound:
+
+1. **A whole-aggregate write invalidates the leaves under it.** `o.i = Inner { .. }`
+   replaces the value `o.i.v` was a part of, so `forget_nested_under` drops every
+   chain with that prefix. Without it the seeded leaf survived the write and a
+   false contract about it could be *proved*.
+2. **A whole-struct copy carries the nested parts.** `c = d` moved `fields` but not
+   `nested`, so `c.i.v` afterwards read `c`'s own seed -- a false refutation of the
+   true `d.i.v == 1`. `copy_parts` now moves the chains too, and `any` counts them
+   so a value that is *only* nested is still seen as parts rather than unknown.
+3. **A nested read consults the nested store and nothing else.** `get` returns
+   `Unknown` for a chain of two or more fields when no contract bound it, rather
+   than falling through to the single-field walk, which would answer `(((*_1).0).0)`
+   with the *outer* field's value -- a wrong value, not a missing one.
+
+**Evidence.** Corpus `decided 179 of 329` -> **`181 of 333`**; `cargo test --workspace
+--features std` **606 -> 608** passed, 0 failed; `cargo clippy --workspace --features
+std --all-targets -- -D warnings` clean; `scripts/gate.sh` green (bare-metal build,
+zero-dependency and no_std gates included). Gate green; zero dependencies and `no_std`
+untouched.

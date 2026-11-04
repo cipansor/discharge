@@ -404,6 +404,16 @@ struct Env {
     elems: BTreeMap<(u32, u64), Val>,
     /// Tuple fields, keyed by (local, field).
     fields: BTreeMap<(u32, u32), Val>,
+    /// A *nested* field path, keyed by (local, the projection chain from the
+    /// local to the leaf). `o.i.v` on a `&Outer` is `(1, [0, 0])`.
+    ///
+    /// The single-field store cannot answer a nested path: its key is one field
+    /// index, and `(((*_1).0).0)` would look up `(1, 0)` twice and return the
+    /// *outer* field's value for the leaf. A path is a walk, not a field, so it
+    /// gets its own store and its own key. Only paths a contract binds are
+    /// seeded; a nested read the contract did not name finds nothing here and
+    /// stays `Unknown`, which is the same refusal the reader gives today.
+    nested: BTreeMap<(u32, Vec<u32>), Val>,
     /// Enum payloads, keyed by (local, variant), with the payload's width.
     /// Written by the `checked_*` model and read through a `Proj::Downcast`.
     payloads: BTreeMap<(u32, u64), (Val, u8)>,
@@ -521,6 +531,7 @@ impl Env {
             locals: BTreeMap::new(),
             elems: BTreeMap::new(),
             fields: BTreeMap::new(),
+            nested: BTreeMap::new(),
             payloads: BTreeMap::new(),
             discriminants: BTreeMap::new(),
             deref_ok: BTreeMap::new(),
@@ -715,12 +726,27 @@ impl Env {
             self.payloads.iter().filter(|((l, _), _)| *l == s).map(|((_, k), v)| (*k, *v)).collect();
         let disc = self.discriminants.get(&s).copied();
         let indexed = self.indexed.get(&s).cloned();
+        // Nested paths are parts too, keyed by the local *and* the chain. A copy
+        // that moved only the single-field parts would leave `c`'s own `c.i.v`
+        // seed in place after `c = d`, so a later `c.i.v` would read `c`'s
+        // pre-copy leaf rather than `d`'s -- the same stale-part hole, one level
+        // down, and a false refutation of the true contract `d.i.v == 1`.
+        let nested: Vec<(Vec<u32>, Val)> = self
+            .nested
+            .iter()
+            .filter(|((l, _), _)| *l == s)
+            .map(|((_, chain), v)| (chain.clone(), *v))
+            .collect();
         let any = !fields.is_empty()
             || !elems.is_empty()
             || !payloads.is_empty()
+            || !nested.is_empty()
             || disc.is_some()
             || indexed.is_some();
         self.forget_parts(dst);
+        for (chain, v) in nested {
+            self.nested.insert((dst, chain), v);
+        }
         for (k, v) in fields {
             self.fields.insert((dst, k), v);
         }
@@ -742,6 +768,16 @@ impl Env {
     fn get(&self, p: &Place) -> Val {
         let resolved = self.resolve(p);
         let p = &resolved;
+        // A nested field path is a walk, not a field: `(((*_1).0).0)` must not be
+        // answered by looking up the *outer* field `(1, 0)` twice, which would
+        // return `o.i` for `o.i.v` -- a wrong value, not a missing one. So a chain
+        // of two or more fields is answered *only* out of the nested store, and a
+        // path no contract bound reads `Unknown`. The single-field walk below is
+        // deliberately not consulted: it is keyed by one field index and would
+        // return the intermediate aggregate for the leaf.
+        if let Some(chain) = field_chain(&p.proj) {
+            return self.nested.get(&(p.local, chain)).copied().unwrap_or(Val::Unknown);
+        }
         let mut cur = match self.locals.get(&p.local) {
             Some(v) => *v,
             // A modelled `Option` local has no entry in `locals`: its value is
@@ -907,6 +943,12 @@ impl Env {
         match p.proj.as_slice() {
             [Proj::Field(i)] => {
                 self.fields.insert((p.local, *i), v);
+                // A write to the aggregate `o.i` makes every nested path through it
+                // describe a value that is no longer there. `o.i.v` is seeded
+                // separately, so leaving it would let a later read return the
+                // pre-write leaf -- the same stale-part hole the whole-local write
+                // closes, one level down.
+                self.forget_nested_under(p.local, &[*i]);
             }
             // An element write to a slice or array argument has to land in the
             // *same* store the read consults. Writing it to `elems` -- the
@@ -931,17 +973,45 @@ impl Env {
             // argument lowers. The deref is transparent for an argument, so the
             // element belongs to the same store `read_indexed` consults.
             [Proj::Deref, Proj::Index(i)] => self.write_elem(p.local, *i, v),
+            // `(*_1).0 = v` -- how a write to a field through a `&mut` argument
+            // lowers. `resolve` has already collapsed `(*_1).0` to `_1.0` when the
+            // argument is one, so this arm is reached only for a reference *local*
+            // whose target is not recorded, and the field belongs to the same
+            // store the read consults.
+            //
+            // This arm was missing, and its absence was a false proof, not a lost
+            // proof: `c.lo = 5; c.lo` on a `&mut Config` dropped the write, the
+            // read returned the *seed*, and `requires: c.lo == 0` / `ensures: ret
+            // == 0` was **proved** against a body that returns 5.
+            [Proj::Deref, Proj::Field(i)] => {
+                self.fields.insert((p.local, *i), v);
+                self.forget_nested_under(p.local, &[*i]);
+            }
+            // A nested write through a reference: `((*_1).0).0 = v` falls to the
+            // catch-all below, which strips the leading deref before building the
+            // chain. A deref followed by something that is *not* all fields (an
+            // index, a downcast) must reach that same catch-all rather than being
+            // swallowed here, or an indexed local would be left stale instead of
+            // poisoned.
             [Proj::Downcast(variant), Proj::Field(0)] | [Proj::Downcast(variant)] => {
                 self.payloads.insert((p.local, *variant), (v, 0));
             }
-            // A shape the arms above do not cover. A nested projection would
-            // need a place tree, and `*a = v` (a whole-store write through a
-            // `&mut [T; N]`) would need a new store, so both are dropped. For an
-            // indexed local that leaves the store describing a value that is no
-            // longer there, so it is poisoned rather than left stale -- and
-            // `poison_elems` records the write, so a `&mut` caller sees the
-            // poison rather than its pre-call elements.
-            _ => {
+            // A nested field write: `((_1.0).0) = v`. Keyed by the whole chain, so
+            // it lands in the same store the nested read consults. A chain that is
+            // not all field projections (an index, a downcast) is left to the
+            // catch-all, which poisons an indexed local rather than guessing.
+            rest => {
+                if let Some(chain) = field_chain(rest) {
+                    self.forget_nested_under(p.local, &chain);
+                    self.nested.insert((p.local, chain), v);
+                    return;
+                }
+                // A shape the arms above do not cover. `*a = v` (a whole-store
+                // write through a `&mut [T; N]`) would need a new store, so it is
+                // dropped. For an indexed local that leaves the store describing a
+                // value that is no longer there, so it is poisoned rather than left
+                // stale -- and `poison_elems` records the write, so a `&mut` caller
+                // sees the poison rather than its pre-call elements.
                 if self.indexed.contains_key(&p.local) {
                     self.poison_elems(p.local);
                 }
@@ -956,8 +1026,20 @@ impl Env {
     /// describe a value that is no longer there. The *length* of an indexed local
     /// is kept: it is a property of the type, not of the value, so a reassigned
     /// array still has its `N`.
+    /// Drop every nested path through `prefix` for `local`.
+    ///
+    /// Called when an *intermediate* aggregate is overwritten (`o.i = ...`), so the
+    /// seeded leaves under it (`o.i.v`) no longer describe the value in the store.
+    /// A stale part is a wrong value, not a missing one, so it is dropped rather
+    /// than read later.
+    fn forget_nested_under(&mut self, local: u32, prefix: &[u32]) {
+        self.nested
+            .retain(|(l, chain), _| *l != local || !chain.starts_with(prefix));
+    }
+
     fn forget_parts(&mut self, local: u32) {
         self.fields.retain(|(l, _), _| *l != local);
+        self.nested.retain(|(l, _), _| *l != local);
         self.elems.retain(|(l, _), _| *l != local);
         self.payloads.retain(|(l, _), _| *l != local);
         self.discriminants.remove(&local);
@@ -1043,6 +1125,34 @@ impl Env {
         }
         self.discriminants.insert(local, tag);
     }
+}
+
+/// The field chain a projection run denotes, if every step is a field access.
+///
+/// `(((*_1).0).0)` has the projections `[Deref, Field(0), Field(0)]`; the deref
+/// is transparent for an argument (its referent is the local itself), so the chain
+/// is `[0, 0]`. A run that is not all fields -- an index, a downcast, a deref in
+/// the middle -- returns `None`, because those name a different store and must not
+/// be answered out of the nested one.
+///
+/// A *single* field is not a chain here: `[_1.0]` returns `None` so the
+/// single-field store keeps answering it, and the two stores stay disjoint.
+fn field_chain(proj: &[Proj]) -> Option<Vec<u32>> {
+    let steps = match proj.first() {
+        Some(Proj::Deref) => &proj[1..],
+        _ => proj,
+    };
+    if steps.len() < 2 {
+        return None;
+    }
+    let mut chain = Vec::with_capacity(steps.len());
+    for s in steps {
+        match s {
+            Proj::Field(i) => chain.push(*i),
+            _ => return None,
+        }
+    }
+    Some(chain)
 }
 
 /// A frame on the inlining stack.
@@ -1172,6 +1282,10 @@ pub struct Seeds {
     /// names. The sign travels with the seed so the executor builds a
     /// `Val::Sym` that knows it, rather than one it has to guess at.
     pub fields: Vec<(u32, u32, Var, bool)>,
+    /// `(local, projection chain, variable, signed)` for each *nested* path a
+    /// contract names, so the executor's nested store holds the same variable the
+    /// contract's `o.i.v` was rewritten to.
+    pub nested: Vec<(u32, Vec<u32>, Var, bool)>,
     /// `(local, length variable, element width, element signed)` for each slice
     /// or array argument.
     pub lens: Vec<(u32, Var, u8, bool)>,
@@ -1280,6 +1394,12 @@ where
     // same symbolic input rather than two that merely look alike.
     for &(local, field, v, signed) in &seeds.fields {
         env.fields.insert((local, field), Val::Sym(v, Sign::of_bool(signed)));
+    }
+    // Nested field paths the contract names, keyed by the whole projection chain
+    // so the body's `(((*_1).0).0)` reads the same variable the contract's `o.i.v`
+    // was rewritten to.
+    for &(local, ref chain, v, signed) in &seeds.nested {
+        env.nested.insert((local, chain.clone()), Val::Sym(v, Sign::of_bool(signed)));
     }
     // Slice lengths and elements the contract names. The contract's `xs.len()` and
     // `xs[0]` and the body's `PtrMetadata(_1)` and `(*_1)[0]` must be one value,

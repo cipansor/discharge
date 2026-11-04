@@ -827,26 +827,42 @@ fn strip_generics(s: &str) -> String {
 
 /// Parse a place like `_3.1` or `_2` or `_1.0[0]`.
 fn parse_place(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Option<Place> {
-    let s = strip_annot(s).trim();
+    let stripped = strip_annot(s).trim();
+    // A *nested* place carries its type annotations in the middle:
+    // `(((*_1).0: Inner).0: u8)`. `strip_annot` only drops a whole-place `: Ty`, so
+    // the inner ones would stop the walk at the first `:`. They are dropped here,
+    // keeping the `)` that closes the group they annotate -- dropping that paren
+    // too would unbalance the string and lose the rest of the walk.
+    let cleaned = strip_mid_annotations(stripped);
+    let s = cleaned.trim();
     // `(*_1)` — a pointer dereference. Like the downcast below it can appear as a
     // whole place or as a prefix (`(*_1).0`), so the inner place is parsed and the
-    // `Deref` step is pushed before the tail projections.
-    if let Some(rest) = s.strip_prefix("(*") {
-        let close = rest.find(')')?;
-        let mut place = parse_place(&rest[..close], enums)?;
+    // `Deref` step is pushed before the tail projections. The close paren is the
+    // *matching* one, not the first: a nested place nests its parens, so the first
+    // `)` may close an inner group rather than this one.
+    if s.starts_with("(*") {
+        let close = matching_paren(s, 0)?;
+        let mut place = parse_place(s.get(2..close)?, enums)?;
         place.proj.push(Proj::Deref);
-        return push_projs(place, rest.get(close + 1..)?, enums);
+        return push_projs(place, s.get(close + 1..)?, enums);
     }
-    // `(base as Variant)` — an enum downcast. It can appear as a whole place or
-    // as a prefix, so the inner place is parsed and the tail projection is
-    // appended to it.
-    if let Some(rest) = s.strip_prefix('(') {
-        let close = rest.find(')')?;
-        let inner = rest[..close].trim();
-        let (base, variant) = inner.rsplit_once(" as ")?;
-        let mut place = parse_place(base.trim(), enums)?;
-        place.proj.push(Proj::Downcast(variant_index(variant.trim(), enums)?));
-        return push_projs(place, rest.get(close + 1..)?, enums);
+    // A parenthesised group: either an enum downcast `(base as Variant)` or a plain
+    // grouping of a nested place `((*_1).0)`. Both are a sub-place followed by a
+    // tail, so both parse the inner text and append the tail projections. The
+    // downcast is distinguished by the ` as ` it must contain.
+    if s.starts_with('(') {
+        let close = matching_paren(s, 0)?;
+        let inner = s.get(1..close)?.trim();
+        let mut place = match inner.rsplit_once(" as ") {
+            Some((base, variant)) => {
+                let mut p = parse_place(base.trim(), enums)?;
+                p.proj.push(Proj::Downcast(variant_index(variant.trim(), enums)?));
+                p
+            }
+            None => parse_place(inner, enums)?,
+        };
+        let _ = &mut place;
+        return push_projs(place, s.get(close + 1..)?, enums);
     }
     // A bare local.
     if let Some(idx) = parse_local(s) {
@@ -863,6 +879,39 @@ fn parse_place(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Option<Place> {
     }
     let local = s[1..i].parse::<LocalIdx>().ok()?;
     push_projs(Place::new(local), &s[i..], enums)
+}
+
+/// Drop the *inner* `: Ty` annotations a nested place carries.
+///
+/// rustc annotates each projection step: `(((*_1).0: Inner).0: u8)`. Only the
+/// outermost annotation is a whole-place `: Ty` for `strip_annot`; the inner ones
+/// sit *inside* the string and would stop the walk at the first `:`. Each is
+/// dropped up to the `)` closing the group it annotates -- and that `)` is kept,
+/// because it belongs to the grouping, not to the annotation.
+fn strip_mid_annotations(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        // `::` is a path separator, not an annotation.
+        if chars[i] == ':' && chars.get(i + 1) != Some(&':') {
+            i += 1;
+            let mut depth = 0i32;
+            while i < chars.len() {
+                match chars[i] {
+                    '(' | '[' | '<' => depth += 1,
+                    ')' if depth == 0 => break,
+                    ')' | ']' | '>' => depth -= 1,
+                    _ => {}
+                }
+                i += 1;
+            }
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Append a run of `.N`, `[N]` and `(base as Variant)` projections to a place.

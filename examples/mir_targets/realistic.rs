@@ -614,6 +614,38 @@ pub fn struct_reassign_then_field_read(mut c: Config, d: Config) -> u8 {
     c.lo
 }
 
+/// A field *write* through a `&mut`: `c.lo = 5`.
+///
+/// The write is the mirror of the read, and it is the shape that was silently
+/// dropped. MIR spells it `((*_1).0: u8) = const 5_u8`, a `Deref` then a `Field`,
+/// and a store that modelled `Deref, Index` but not `Deref, Field` fell through to
+/// the drop arm. The consequence was two-sided: the write did not take effect, so a
+/// true contract was refuted (the read saw the caller's old value) *and* a false
+/// contract could be proved (the postcondition was checked against the value the
+/// write was supposed to replace). This entry pins the true direction: the write
+/// lands and the read after it is `5`, so `ret == 5` verifies.
+/// requires: true
+/// ensures: ret == 5
+pub fn field_write_through_ref_mut_takes_effect(c: &mut Config) -> u8 {
+    c.lo = 5;
+    c.lo
+}
+
+/// The false direction of [`field_write_through_ref_mut_takes_effect`].
+///
+/// The body writes `5` and returns it, so `ret == 0` is false for every input. With
+/// the write dropped, the read saw the caller's unconstrained `c.lo` and the
+/// postcondition was checked against a variable the write never touched, which made
+/// this *provable* -- a false proof in already-shipped code. It must be refuted, and
+/// the refutation must be "false on every input" rather than a one-value witness:
+/// that is the term-level evidence the write fixes `ret` to `5`.
+/// requires: true
+/// ensures: ret == 0
+pub fn field_write_through_ref_mut_is_not_dropped(c: &mut Config) -> u8 {
+    c.lo = 5;
+    c.lo
+}
+
 /// A generated binding name that a real argument also uses.
 ///
 /// The contract's `a[i]` is rewritten to a binding named `a__chain`, and the
@@ -3687,14 +3719,131 @@ pub fn tuple_struct_out_of_range_field_is_refused(p: &Pair) -> u8 {
 }
 
 /// A tuple struct whose single field is itself a struct: the projection is
-/// nested, which this frontend does not model. It must be refused rather than
-/// silently read as the outer field.
+/// nested, `n.p.0`. It is now *bound* -- `n.p` is a `Pair` with a readable layout
+/// and `.0` is its first field -- so the contract is a real obligation rather than
+/// a refusal. The body returns 0, so `ret == 0` verifies and the contract is
+/// decided rather than skipped.
 /// requires: n.p.0 < 100
 /// ensures: ret == 0
-pub fn nested_tuple_projection_is_refused(n: &NestedPair) -> u8 {
+pub fn nested_tuple_projection_reads(n: &NestedPair) -> u8 {
     let _ = n;
     0
 }
 
-/// The inner type of [`nested_tuple_projection_is_refused`].
+/// The same nested path, but *read* by the body: the value the contract names as
+/// `n.p.0` and the value the body reads are one input, so pinning it makes the
+/// postcondition hold. A reader that bound the two separately would refute this.
+/// requires: n.p.0 == 42
+/// ensures: ret == 42
+pub fn nested_tuple_projection_is_the_body_value(n: &NestedPair) -> u8 {
+    n.p.0
+}
+
+/// The tripwire for the nested path: `n.p.0` and `n.p.1` are independent inputs,
+/// so a reader that aliased them would prove `ret == n.p.0` vacuously. With two,
+/// `n.p.0 < n.p.1` gives `ret == n.p.1 != n.p.0`, so the contract is refuted --
+/// which is the evidence the two leaves are distinct.
+/// requires: n.p.0 < n.p.1
+/// ensures: ret == n.p.0
+pub fn nested_tuple_projection_leaves_are_independent(n: &NestedPair) -> u8 {
+    if n.p.0 > n.p.1 { n.p.0 } else { n.p.1 }
+}
+
+/// A nested path that walks off the layout: `n.p` is a `Pair` of scalars, so
+/// `n.p.q` names a field `Pair` does not have. It must be refused as an unknown
+/// field rather than bound to a fabricated word.
+/// requires: n.p.q < 100
+/// ensures: ret == 0
+pub fn nested_path_off_the_layout_is_refused(n: &NestedPair) -> u8 {
+    let _ = n;
+    0
+}
+
+/// A *nested* field write through a `&mut`: `o.i.v = 5`.
+///
+/// MIR spells it `(((*_1).0).0: u8) = const 5_u8`, a walk of two field projections.
+/// The single-field store is keyed by one field index, so a write there would land
+/// on `(local, 0)` -- the *outer* field -- and the nested read would then see the
+/// caller's value. This entry pins that the write lands where the read looks:
+/// `ret == 5` holds only if `o.i.v` is the same input on both sides.
+/// requires: true
+/// ensures: ret == 5
+pub fn nested_field_write_through_ref_mut_takes_effect(o: &mut OuterBox) -> u8 {
+    o.i.v = 5;
+    o.i.v
+}
+
+/// The false direction of [`nested_field_write_through_ref_mut_takes_effect`].
+///
+/// The body writes `5` and returns it, so `ret == 0` is false for every input. A
+/// dropped or mis-keyed nested write would leave the read on the caller's
+/// unconstrained leaf and make this *provable*; it must be refuted.
+/// requires: true
+/// ensures: ret == 0
+pub fn nested_field_write_through_ref_mut_is_not_dropped(o: &mut OuterBox) -> u8 {
+    o.i.v = 5;
+    o.i.v
+}
+
+/// Overwriting the *whole* intermediate aggregate makes the seeded leaf stale.
+///
+/// `o.i = Inner { v: 9, .. }` replaces the value `o.i.v` was a part of, so the
+/// seed for `o.i.v` no longer describes the store. The read must not return the
+/// pre-write leaf: a reader that kept the stale seed would make this false contract
+/// (`ret == 3`) *provable*. This entry pins the safe direction -- not verified.
+/// requires: true
+/// ensures: ret == 3
+pub fn whole_inner_write_makes_nested_seed_stale(mut o: OuterBox) -> u8 {
+    o.i = InnerBox { v: 9 };
+    o.i.v
+}
+
+/// A whole-struct copy carries its *nested* parts, not only its single fields.
+///
+/// `c = d` copies the value, so `c.i.v` afterwards is `d.i.v`. Nested paths are
+/// keyed by local, so a copy that moved only the single-field parts would leave
+/// `c`'s own `c.i.v` seed in place and refute this true contract. The two
+/// preconditions pin the two seeds to different values, so `verified` is the
+/// evidence the copy moved the right one.
+/// requires: c.i.v == 0
+/// requires: d.i.v == 1
+/// ensures: ret == 1
+pub fn whole_struct_copy_carries_nested_paths(mut c: OuterBox, d: OuterBox) -> u8 {
+    c = d;
+    c.i.v
+}
+
+/// The inner type of [`nested_tuple_projection_reads`].
 pub struct NestedPair { pub p: Pair }
+
+/// A *named-field* struct whose field is itself a named-field struct, so the
+/// contract can name `o.i.v`. The read is bound to the body's value: pinning
+/// `o.i.v` makes the postcondition hold, which a reader that bound the two
+/// separately would refute.
+/// requires: o.i.v == 7
+/// ensures: ret == 7
+pub fn nested_named_field_reads_its_leaf(o: &OuterBox) -> u8 {
+    o.i.v
+}
+
+/// The named-field tripwire: `o.i.v` and `o.j.v` are leaves under *different*
+/// outer fields, so a reader that keyed only on the leaf name would alias them and
+/// prove `ret == o.j.v` vacuously. With distinct chains, `o.i.v != o.j.v` holds
+/// and the contract is refuted -- the evidence the paths are distinct inputs.
+/// requires: o.i.v != o.j.v
+/// ensures: ret == o.j.v
+pub fn nested_named_leaves_under_different_fields(o: &OuterBox) -> u8 {
+    o.i.v
+}
+
+/// A nested named-field read that the *body* performs, so the contract's `o.i.v`
+/// and the body's `(((*_1).0).0)` must be the same input for this to verify.
+/// requires: o.i.v <= 200
+/// ensures: ret == o.i.v
+pub fn nested_named_field_is_the_body_value(o: &OuterBox) -> u8 {
+    o.i.v
+}
+
+/// The named-field types for the nested named-field entries above.
+pub struct InnerBox { pub v: u8 }
+pub struct OuterBox { pub i: InnerBox, pub j: InnerBox }

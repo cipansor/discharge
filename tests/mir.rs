@@ -1336,24 +1336,26 @@ fn a_contract_can_name_a_tuple_struct_field() {
     );
 }
 
-/// A tuple struct's field index beyond its arity is refused, not bound.
+/// A tuple field the layout does not have is refused, and so is a *nested* path
+/// that walks off the layout.
 ///
 /// `Pair` has two fields, so `p.2` names nothing. Binding it to a fabricated word
 /// would let a contract about a field that does not exist be proved, which is a
-/// false proof rather than a missing one. The refusal is the safe direction, and
-/// this pins it together with the *nested* projection (`n.p.0`), which the
-/// frontend does not model either.
+/// false proof rather than a missing one. `n.p.q` is the nested form: `n.p` *is*
+/// bound (it is a `Pair` with a layout), but `Pair` has no field `q`, so the walk
+/// stops and the path is refused -- naming the segment that failed, not the whole
+/// path. Both refusals are the safe direction, and this pins them.
 #[test]
 fn a_tuple_struct_field_that_does_not_exist_is_refused() {
     let Some(report) = verify_realistic(&[
         "tuple_struct_out_of_range_field_is_refused",
-        "nested_tuple_projection_is_refused",
+        "nested_path_off_the_layout_is_refused",
     ]) else {
         return;
     };
     for name in [
         "tuple_struct_out_of_range_field_is_refused",
-        "nested_tuple_projection_is_refused",
+        "nested_path_off_the_layout_is_refused",
     ] {
         let o = outcome(&report, name);
         assert!(
@@ -1361,6 +1363,143 @@ fn a_tuple_struct_field_that_does_not_exist_is_refused() {
             "`{name}` names a field the layout does not have and must be refused; got: {o}"
         );
     }
+}
+
+/// A *nested* field projection is read: the contract's `n.p.0` and the body's
+/// `(((*_1).0).0)` are one input.
+///
+/// This is the coverage the nested support adds. `n.p.0` is a walk of two field
+/// projections, and the single-field store would answer it by looking up the
+/// *outer* field `(local, 0)` twice -- returning `n.p` for `n.p.0`, a wrong value
+/// rather than a missing one. The positive entry pins that the contract and the
+/// body agree; the false entry pins that a disagreeing postcondition is refuted,
+/// so the agreement is not vacuous.
+#[test]
+fn a_nested_field_projection_is_read_and_agrees_with_the_body() {
+    let Some(report) = verify_realistic(&[
+        "nested_tuple_projection_reads",
+        "nested_tuple_projection_is_the_body_value",
+        "nested_named_field_reads_its_leaf",
+        "nested_named_field_is_the_body_value",
+    ]) else {
+        return;
+    };
+    for name in [
+        "nested_tuple_projection_reads",
+        "nested_tuple_projection_is_the_body_value",
+        "nested_named_field_reads_its_leaf",
+        "nested_named_field_is_the_body_value",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+}
+
+/// Two nested leaves are *independent* inputs, which is what makes the binding a
+/// walk rather than a single field.
+///
+/// The entries are toothed: each claims a value the body does not return, so a
+/// reader that aliased the leaves (`n.p.0` with `n.p.1`, or `o.i.v` with `o.j.v`)
+/// would *verify* them -- a false proof. Refuted is the evidence the leaves are
+/// distinct, and each counterexample names two different variables, which is the
+/// same evidence at the term level.
+#[test]
+fn nested_leaves_under_different_paths_are_independent() {
+    let Some(report) = verify_realistic(&[
+        "nested_tuple_projection_leaves_are_independent",
+        "nested_named_leaves_under_different_fields",
+    ]) else {
+        return;
+    };
+    for name in [
+        "nested_tuple_projection_leaves_are_independent",
+        "nested_named_leaves_under_different_fields",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "`{name}` must be refuted: aliasing its leaves would make it a false proof; got: {o}"
+        );
+    }
+}
+
+/// A field write through a `&mut` is applied, not dropped -- and the *false*
+/// direction is refuted rather than proved.
+///
+/// This is the regression for the two-sided soundness bug: `((*_1).0) = v` (a
+/// `Deref` then a `Field`) had no arm in the store and fell to the drop arm. The
+/// true entry pins that the write lands (the read after it is `5`); the false entry
+/// pins that the postcondition is checked against the written value, so a contract
+/// the body cannot satisfy is refuted instead of proved. Dropping the write makes
+/// the false entry *verify* and the true entry fail, so both directions are toothed.
+#[test]
+fn a_field_write_through_a_mutable_reference_is_applied() {
+    let Some(report) = verify_realistic(&[
+        "field_write_through_ref_mut_takes_effect",
+        "field_write_through_ref_mut_is_not_dropped",
+    ]) else {
+        return;
+    };
+    let true_dir = outcome(&report, "field_write_through_ref_mut_takes_effect");
+    assert!(
+        true_dir.is_verified(),
+        "the write must land, so the read after it is 5; got: {true_dir}"
+    );
+    let false_dir = outcome(&report, "field_write_through_ref_mut_is_not_dropped");
+    assert!(
+        matches!(false_dir, FnOutcome::Failed { .. }),
+        "the postcondition must be checked against the written value, so `ret == 0` \
+         is refuted rather than proved; got: {false_dir}"
+    );
+}
+
+/// A *nested* write through a `&mut` lands where the nested read looks, and the
+/// false direction is refuted rather than proved.
+///
+/// The nested store is keyed by the whole chain, so `o.i.v = 5` and the later
+/// `o.i.v` meet in one entry. A write keyed by a single field index would land on
+/// the *outer* field and the read would see the caller's value: the true entry
+/// would fail and the false entry would *verify*. Both are toothed here.
+#[test]
+fn a_nested_field_write_through_a_mutable_reference_is_applied() {
+    let Some(report) = verify_realistic(&[
+        "nested_field_write_through_ref_mut_takes_effect",
+        "nested_field_write_through_ref_mut_is_not_dropped",
+    ]) else {
+        return;
+    };
+    let true_dir = outcome(&report, "nested_field_write_through_ref_mut_takes_effect");
+    assert!(true_dir.is_verified(), "the nested write must land; got: {true_dir}");
+    let false_dir = outcome(&report, "nested_field_write_through_ref_mut_is_not_dropped");
+    assert!(
+        matches!(false_dir, FnOutcome::Failed { .. }),
+        "the nested write must be seen by the read, so `ret == 0` is refuted; got: {false_dir}"
+    );
+}
+
+/// A seeded nested path is invalidated by a write that replaces the value it was
+/// part of, and carried across by a whole-struct copy.
+///
+/// Both are the "parts" rules one level down. `o.i = Inner { v: 9 }` makes the seed
+/// for `o.i.v` stale, so the false entry must not be *proved* against the
+/// pre-write leaf. And `c = d` must move `c.i.v` with the copy, so the true entry
+/// verifies -- it pins `c.i.v` and `d.i.v` to different values, so `verified` is
+/// the evidence the copy moved the right one rather than leaving `c`'s own seed.
+#[test]
+fn a_nested_seed_is_invalidated_by_a_write_and_carried_by_a_copy() {
+    let Some(report) = verify_realistic(&[
+        "whole_inner_write_makes_nested_seed_stale",
+        "whole_struct_copy_carries_nested_paths",
+    ]) else {
+        return;
+    };
+    let stale = outcome(&report, "whole_inner_write_makes_nested_seed_stale");
+    assert!(
+        !stale.is_verified(),
+        "a stale nested seed must not prove a false contract; got: {stale}"
+    );
+    let copy = outcome(&report, "whole_struct_copy_carries_nested_paths");
+    assert!(copy.is_verified(), "a whole-struct copy must carry nested paths; got: {copy}");
 }
 
 /// A postcondition can name a component of a tuple return.

@@ -486,6 +486,25 @@ pub struct FieldEnv {
     /// `arg.field` → mangled name, so the rewrite can be driven by what actually
     /// exists rather than by a pattern.
     pub paths: BTreeMap<String, String>,
+    /// A *nested* field path, keyed by the exact source spelling the contract
+    /// writes (`o.i.v`) → the mangled name it is rewritten to.
+    ///
+    /// A single field is a property of the argument (`arg.field`), but a nested
+    /// path is a property of the *path*: `o.i.v` and `o.i.w` share the outer
+    /// projection `o.i` and differ only in the inner field. So the binding is
+    /// keyed by the whole dotted spelling, and the rewrite matches the longest
+    /// prefix that exists. The key is the source spelling because that is what the
+    /// scanner has in hand; the value is the variable the path names, seeded into
+    /// the executor's `nested` store under the same projection chain, so the
+    /// contract's `o.i.v` and the body's `(((*_1).0).0)` are one input rather than
+    /// two that look alike.
+    pub nested_paths: BTreeMap<String, String>,
+    /// The argument names that are aggregates *with a readable layout*, used only
+    /// to *diagnose* a nested path that walks off the layout: `o.i` where `i` is a
+    /// scalar, or `o.nope.v`. A name here that is followed by a dotted path with no
+    /// binding gets a message naming the segment rather than a parser error about
+    /// the `.` it cannot reduce.
+    pub aggregate_args: BTreeSet<String>,
     /// The argument names known to be aggregates. Used only to *diagnose*: a
     /// contract naming `c.lo` where `c` is a struct but `lo` is not a field gets
     /// "unknown field `lo`" rather than a parser error about the `.` it cannot
@@ -519,6 +538,16 @@ pub struct FieldEnv {
     /// build a `Val::Sym` that *knows* its sign. A seed without one would force
     /// the executor to guess, which is the bug class this closes.
     pub seeds: Vec<(u32, u32, Var, bool)>,
+    /// `(local, projection chain, variable, signed)` for each *nested* path a
+    /// contract names, so the executor's nested store holds the same variable the
+    /// contract's `o.i.v` was rewritten to.
+    ///
+    /// The chain is the MIR projection from the argument's base local: for `o.i.v`
+    /// it is `[Field(0), Field(0)]`, and the executor seeds `((local, 0), 0)`. The
+    /// chain is stored rather than a single index because a nested path is a walk,
+    /// not a field: the executor has to place the value at the *end* of the walk,
+    /// and the walk's shape is what makes `o.i.v` a different input from `o.j.v`.
+    pub nested_seeds: Vec<(u32, Vec<u32>, Var, bool)>,
     /// `(local, fixed length)` for each *array* argument, so the executor can
     /// enumerate the domain a symbolic subscript needs. A slice has no entry:
     /// there is no fixed domain, so its `xs[i]` stays refused.
@@ -701,6 +730,122 @@ impl FieldEnv {
         self.paths.insert(format!("{arg}.{field}"), mangled);
         self.known_args.insert(arg.to_string());
         Some(())
+    }
+
+    /// Bind a *nested* field path (`o.i.v`) to a fresh variable of the leaf
+    /// field's width and signedness.
+    ///
+    /// `chain` is the MIR projection from the argument's base local to the leaf:
+    /// for `o.i.v` it is `[0, 0]`, and the executor seeds the value at
+    /// `((local, 0), 0)`. The whole chain is the identity of the input, because
+    /// `o.i.v` and `o.j.v` are different words: the mangled name is derived from
+    /// the chain, not from the leaf name, so the two cannot collide even though
+    /// both end in `.v`.
+    ///
+    /// Every intermediate segment must itself be a *struct or tuple* with a
+    /// readable layout. A segment that is a scalar, a reference, or an unknown
+    /// type stops the walk, and the path is refused -- binding a fabricated word
+    /// for `o.i` where `i` is a `u8` would let a contract about a field that does
+    /// not exist be proved.
+    pub fn bind_nested(&mut self, local: u32, arg: &str, path: &str, chain: &[u32], ty: &Ty) -> Option<()> {
+        let w = ty.width()?;
+        let slot = self.base + self.next_slot;
+        if slot as usize >= crate::smt::MAX_VARS {
+            return None;
+        }
+        // The mangled name is the chain, so `o.i.v` and `o.j.v` differ even though
+        // they share the leaf name. `__n` marks it as nested, keeping it distinct
+        // from the single-field `__f` form for the same local.
+        let mangled = format!(
+            "{arg}__n{}",
+            chain.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("_")
+        );
+        if !self.name_is_free(&mangled) {
+            return None;
+        }
+        self.next_slot += 1;
+        let v = smt::var_named(slot, w);
+        self.vars.insert(mangled.clone(), v);
+        if ty.is_signed() {
+            self.signed.insert(mangled.clone());
+        }
+        self.nested_seeds.push((local, chain.to_vec(), v, ty.is_signed()));
+        self.nested_paths.insert(path.to_string(), mangled);
+        self.aggregate_args.insert(arg.to_string());
+        self.known_args.insert(arg.to_string());
+        Some(())
+    }
+
+    /// Bind every nested field path a contract may name on an argument.
+    ///
+    /// `arg` is the source name, `ty` the argument's type (already read through a
+    /// reference), and `structs` the declared layouts. The walk is depth-first over
+    /// the fields whose type is itself a struct or tuple with a readable layout, so
+    /// `o.i.v` is bound when `o.i` is a struct and `v` is a scalar leaf. A segment
+    /// whose type has no layout -- a scalar, a reference, an unknown name -- ends
+    /// that branch: the path is not bound, so a contract naming it is *refused*
+    /// rather than bound to a fabricated word.
+    ///
+    /// Only paths of depth >= 2 are bound here: a single field is already bound by
+    /// [`bind`](Self::bind), and binding it again under a second name would give one
+    /// source field two variables.
+    ///
+    /// Depth is bounded by the type, not by a constant: a *recursive* type would
+    /// make the walk unbounded, so the chain of type names on the current branch is
+    /// kept and a type already on it stops the descent. The guard is the branch, not
+    /// a global set, so two fields of the same type are both walked.
+    pub fn bind_nested_paths(
+        &mut self,
+        local: u32,
+        arg: &str,
+        ty: &Ty,
+        structs: &BTreeMap<String, StructDef>,
+    ) {
+        let mut w = NestedWalk { local, arg, structs, on_path: Vec::new() };
+        self.walk_nested(&mut w, arg, &[], ty);
+    }
+
+    fn walk_nested(
+        &mut self,
+        w: &mut NestedWalk<'_>,
+        prefix: &str,
+        chain: &[u32],
+        ty: &Ty,
+    ) {
+        // The fields of this aggregate, in field order, which *is* the MIR index.
+        let fields: Vec<(String, Ty)> = match ty {
+            Ty::Other(name) => match w.structs.get(name) {
+                Some(def) => def.fields.clone(),
+                None => return,
+            },
+            Ty::Tuple(ts) => {
+                ts.iter().enumerate().map(|(i, t)| (i.to_string(), t.clone())).collect()
+            }
+            _ => return,
+        };
+        if let Ty::Other(name) = ty {
+            if w.on_path.iter().any(|n| n == name) {
+                return;
+            }
+            w.on_path.push(name.clone());
+        }
+        for (index, (fname, fty)) in fields.iter().enumerate() {
+            let mut child = chain.to_vec();
+            child.push(index as u32);
+            let path = format!("{prefix}.{fname}");
+            // A leaf with a bit width is the value a contract can compare. An
+            // aggregate is *not* bound (it has no single word) but is descended
+            // into, so its scalar fields are reachable as deeper paths.
+            if child.len() >= 2 && fty.width().is_some() {
+                self.bind_nested(w.local, w.arg, &path, &child, fty);
+            }
+            if matches!(fty, Ty::Other(_) | Ty::Tuple(_)) {
+                self.walk_nested(w, &path, &child, fty);
+            }
+        }
+        if matches!(ty, Ty::Other(_)) {
+            w.on_path.pop();
+        }
     }
 
     /// Bind an enum-typed argument: its tag, and each variant's payloads.
@@ -1221,6 +1366,84 @@ pub fn named_ret_components(texts: &[String]) -> BTreeSet<u32> {
     out
 }
 
+/// The longest dotted run starting at `dot` that has a nested binding, as
+/// `(index past the run, mangled name)`.
+///
+/// `dot` is the index of the first `.` in `ident.field...`. The run is scanned
+/// segment by segment, and the longest prefix present in `nested_paths` wins: for
+/// `o.i.v` with bindings for both `o.i` and `o.i.v`, the leaf wins, so the parser
+/// sees the leaf variable rather than the intermediate one. A segment that is not
+/// an identifier (`o.len()`, `o[0]`) ends the run, so a call or subscript is never
+/// swallowed by a nested match.
+fn longest_nested_match(
+    chars: &[char],
+    start: usize,
+    dot: usize,
+    fields: &FieldEnv,
+) -> Option<(usize, String)> {
+    let mut best: Option<(usize, String)> = None;
+    let mut i = dot;
+    while chars.get(i) == Some(&'.') {
+        let mut j = i + 1;
+        while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+            j += 1;
+        }
+        if j == i + 1 {
+            break;
+        }
+        let candidate: String = chars[start..j].iter().collect();
+        if let Some(m) = fields.nested_paths.get(&candidate) {
+            best = Some((j, m.clone()));
+        }
+        i = j;
+    }
+    best
+}
+
+/// The segment name a nested refusal should name: the first dotted segment after
+/// the longest prefix that *did* bind.
+///
+/// For `o.i.nope` where `o.i` binds, the failure is `nope`, so the message says
+/// `unknown field \`nope\` of \`o\`` rather than repeating the whole path. When
+/// nothing binds (the first segment is the bad one) it names that segment.
+fn longest_bound_prefix(chars: &[char], start: usize, dot: usize, fields: &FieldEnv) -> String {
+    let mut last_bound_end = dot;
+    let mut i = dot;
+    while chars.get(i) == Some(&'.') {
+        let mut j = i + 1;
+        while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+            j += 1;
+        }
+        if j == i + 1 {
+            break;
+        }
+        let candidate: String = chars[start..j].iter().collect();
+        if fields.nested_paths.contains_key(&candidate) {
+            last_bound_end = j;
+        }
+        i = j;
+    }
+    // The segment right after the last bound prefix.
+    let mut k = last_bound_end;
+    if chars.get(k) == Some(&'.') {
+        k += 1;
+    }
+    let mut e = k;
+    while e < chars.len() && (chars[e].is_alphanumeric() || chars[e] == '_') {
+        e += 1;
+    }
+    chars[k..e].iter().collect()
+}
+
+/// The context a nested-field walk carries: the argument being walked and the
+/// struct layouts, plus the type names on the current branch (the recursion guard).
+struct NestedWalk<'a> {
+    local: u32,
+    arg: &'a str,
+    structs: &'a BTreeMap<String, StructDef>,
+    on_path: Vec<String>,
+}
+
 fn rewrite_fields(text: &str, fields: &FieldEnv) -> Result<String, SpecError> {
     // A payload path is a rewrite target too, so an enum-only contract must not
     // take the early return: `m.Data` would be left spelled as a field access the
@@ -1228,6 +1451,7 @@ fn rewrite_fields(text: &str, fields: &FieldEnv) -> Result<String, SpecError> {
     if fields.paths.is_empty()
         && fields.known_args.is_empty()
         && fields.payload_paths.is_empty()
+        && fields.nested_paths.is_empty()
     {
         return Ok(text.to_string());
     }
@@ -1304,11 +1528,31 @@ fn rewrite_fields(text: &str, fields: &FieldEnv) -> Result<String, SpecError> {
                         i = j;
                         continue;
                     }
+                    // A *nested* path: `o.i.v`. The longest dotted run that has a
+                    // binding wins, so `o.i.v` is preferred to a bare `o.i` when
+                    // both exist, and the match ends after the segment it consumed.
+                    // The run has to start at the first `.` and be all fields, which
+                    // is what keeps `xs.len()` and `a[i]` out of it.
+                    if let Some((end, mangled)) = longest_nested_match(&chars, start, dot, fields) {
+                        out.push_str(&mangled);
+                        i = end;
+                        continue;
+                    }
                     // A field of a known aggregate that has no binding: the struct
                     // has no such field, or its layout was not readable. Refuse
                     // with a message that names the field, rather than letting the
                     // `.` reach the parser and produce "expected a comparison
                     // operator" — the same refusal, a diagnosable one.
+                    if fields.aggregate_args.contains(&ident) {
+                        // The *segment* that failed is the one after the longest
+                        // prefix that did bind, so the message names `v` in
+                        // `o.i.v` rather than the whole path.
+                        let bad = longest_bound_prefix(&chars, start, dot, fields);
+                        return Err(SpecError {
+                            text: text.to_string(),
+                            reason: format!("unknown field `{bad}` of `{ident}`"),
+                        });
+                    }
                     if fields.known_args.contains(&ident) {
                         return Err(SpecError {
                             text: text.to_string(),
@@ -4217,6 +4461,11 @@ pub fn field_env(
         for (i, (fname, fty)) in def.fields.iter().enumerate() {
             env.bind(l, &arg, fname, i as u32, fty);
         }
+        // Nested paths: `o.i.v` and, for a *named-field* struct, `o.i` too (its
+        // field names are not numeric, so the single-field pass above skipped them).
+        // A tuple struct's `.0` is already bound by `bind`, and `bind_nested` only
+        // takes depth >= 2, so the two passes do not overlap.
+        env.bind_nested_paths(l, &arg, base, structs);
     }
     env
 }

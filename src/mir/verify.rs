@@ -449,6 +449,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         invariant,
         &exec::Seeds {
             fields: fields.seeds.clone(),
+            nested: fields.nested_seeds.clone(),
             lens: fields.len_seeds.clone(),
             array_lens: fields.array_lens.clone(),
             slice_steps: fields.slice_chain_steps(),
