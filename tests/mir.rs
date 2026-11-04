@@ -2126,6 +2126,48 @@ fn a_reference_through_a_reference_is_not_dropped() {
     }
 }
 
+/// A copy between two reference targets, a field through a *double* reference, and a
+/// call through a reference to a reference.
+///
+/// `*r = *s` on two `&mut` to different fields must copy the right way, and
+/// `(**rr).lo = 5` resolves both levels inside the frame. The *argument* case
+/// (`relay(&mut r)` with `v: &mut &mut u8`) crosses two frames and is refused rather
+/// than modelled -- the callee's write had been dropped, proving a false `ret == 0`.
+#[test]
+fn a_reference_to_a_reference_crosses_a_frame_only_when_refused() {
+    let Some(report) = verify_realistic(&[
+        "a_copy_between_two_reference_targets",
+        "a_stale_copy_between_reference_targets_cannot_prove_this",
+        "a_write_through_a_double_reference_to_a_struct",
+        "a_stale_double_reference_struct_cannot_prove_this",
+        "a_call_through_a_reference_to_a_reference_is_refused",
+    ]) else {
+        return;
+    };
+    for name in [
+        "a_copy_between_two_reference_targets",
+        "a_write_through_a_double_reference_to_a_struct",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a local reference chain must be modelled; got: {o}");
+    }
+    for name in [
+        "a_stale_copy_between_reference_targets_cannot_prove_this",
+        "a_stale_double_reference_struct_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a stale or misdirected reference write must not prove this; got: {o}"
+        );
+    }
+    let refused = outcome(&report, "a_call_through_a_reference_to_a_reference_is_refused");
+    assert!(
+        matches!(refused, FnOutcome::Incomplete { .. }),
+        "a `&mut &mut T` call must be refused, not decided; got: {refused}"
+    );
+}
+
 /// A slice's length is read through the *one* rvalue the compiler prints, on any
 /// toolchain.
 ///

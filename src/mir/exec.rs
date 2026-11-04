@@ -2592,6 +2592,28 @@ where
                 return;
             };
             let callee_fn = &prog.fns[idx];
+            // A callee taking `&mut &mut T` is refused. Its `**v = x` writes
+            // through two levels: the outer reference's referent lives in the
+            // *caller's* frame, and the callee reaches it through its own `(*_1)`,
+            // whose local index means something else in each frame. One level of
+            // that is modelled (the referent's parts are carried in and the
+            // post-state copied back); two is not, and `relay(&mut r)` with
+            // `relay(v: &mut &mut u8) { **v = 5 }` had its write dropped -- so
+            // `requires: x == 0` / `ensures: ret == 0` was **proved** against a
+            // body that returns 5. Refusing the call leaves the true contract
+            // unproved instead of proving the false one, which is the honest
+            // failure mode. `&mut T` is unaffected: its argument is not a
+            // reference to a reference.
+            if callee_fn
+                .arg_locals
+                .iter()
+                .any(|l| matches!(callee_fn.ty_of(*l), Some(Ty::Ref(inner)) if matches!(**inner, Ty::Ref(_))))
+            {
+                report.unknown_paths.push(
+                    "call to a function taking `&mut &mut T` is not modelled".into(),
+                );
+                return;
+            }
             let Some(b0) = callee_fn.blocks.first() else {
                 report.unknown_paths.push(format!("callee `{name}` has no body"));
                 return;

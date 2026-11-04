@@ -4905,6 +4905,71 @@ pub fn a_stale_copy_write_cannot_prove_this(x: u8) -> u8 {
     x
 }
 
+/// A copy from one reference target to another: `*r = *s` where the two point at
+/// different fields.
+/// requires: c.lo == 1 && c.hi == 2
+/// ensures: ret == 2
+pub fn a_copy_between_two_reference_targets(mut c: Config) -> u8 {
+    let r = &mut c.lo;
+    let s = &mut c.hi;
+    *r = *s;
+    c.lo
+}
+
+/// The false direction of [`a_copy_between_two_reference_targets`]: if the copy
+/// went the wrong way, or `*s` read the stale `lo`, this would verify.
+/// requires: c.lo == 1 && c.hi == 2
+/// ensures: ret == 1
+pub fn a_stale_copy_between_reference_targets_cannot_prove_this(mut c: Config) -> u8 {
+    let r = &mut c.lo;
+    let s = &mut c.hi;
+    *r = *s;
+    c.lo
+}
+
+/// A field written through a *double* reference to a struct: `(**rr).lo = 5`.
+///
+/// The `*` chain is local, so both levels resolve inside the frame; it is the
+/// *argument* case (`relay(&mut r)` with `v: &mut &mut u8`) that crosses frames and
+/// is refused.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_write_through_a_double_reference_to_a_struct(mut c: Config) -> u8 {
+    let mut r = &mut c;
+    let rr = &mut r;
+    (**rr).lo = 5;
+    c.lo
+}
+
+/// The false direction of [`a_write_through_a_double_reference_to_a_struct`].
+/// requires: c.lo == 0
+/// ensures: ret == 0
+pub fn a_stale_double_reference_struct_cannot_prove_this(mut c: Config) -> u8 {
+    let mut r = &mut c;
+    let rr = &mut r;
+    (**rr).lo = 5;
+    c.lo
+}
+
+/// A call through a reference to a reference is *refused*, not modelled.
+///
+/// `relay(&mut r)` with `relay(v: &mut &mut u8) { **v = 5 }` crosses two frames: the
+/// outer referent lives in the caller and the callee reaches it with its own local
+/// index. The write was dropped, so the false `ret == 0` was **proved**; refusing
+/// leaves the true contract unproved instead.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_call_through_a_reference_to_a_reference_is_refused(mut x: u8) -> u8 {
+    let mut r = &mut x;
+    relay_two(&mut r);
+    x
+}
+
+/// A helper writing through a reference to a reference.
+pub fn relay_two(v: &mut &mut u8) {
+    **v = 5;
+}
+
 /// A type whose method's tail collides with a *free function* of the same name.
 ///
 /// The collision is deliberately on names used by nothing else in this file: a

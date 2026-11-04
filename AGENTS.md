@@ -5809,8 +5809,19 @@ from *every* rvalue instead of just `copy`/`move` moved 114 verdicts, most of th
 not. Six entries with their false twins, pinned by
 `a_reference_through_a_reference_is_not_dropped`.
 
-**Evidence.** Corpus `decided 181 of 333` -> **`239 of 438`**; `cargo test --workspace
---features std` **608 -> 623** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+**A reference to a reference across a frame is refused.** A local chain
+(`(**rr).lo = 5`, or `*r = *s` between two `&mut` to different fields) resolves inside
+one frame and is modelled. The *argument* case is not: `relay(&mut r)` with
+`relay(v: &mut &mut u8) { **v = 5 }` has the outer referent in the caller and the callee
+reaching it with its own local index, so the write was dropped and the false `ret == 0`
+was **proved** against a body that returns 5. A call whose callee takes a `&mut &mut T`
+is now refused outright (`call to a function taking &mut &mut T is not modelled`) rather
+than modelled wrongly -- the true contract stays unproved, which is the honest failure
+mode. Five entries, pinned by
+`a_reference_to_a_reference_crosses_a_frame_only_when_refused`.
+
+**Evidence.** Corpus `decided 181 of 333` -> **`241 of 443`**; `cargo test --workspace
+--features std` **608 -> 624** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
 `mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.
