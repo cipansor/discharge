@@ -458,16 +458,6 @@ struct Env {
     /// distinct inputs per index, so `xs[0]` and `xs[1]` are two values and
     /// `xs[0] == xs[1]` is not provable; see `Indexed::elems`.
     indexed: BTreeMap<u32, Indexed>,
-    /// Locals whose indexed store has been written since this `Env` was built.
-    ///
-    /// A call hands a callee a *copy* of an indexed argument's state. For a
-    /// by-value `[T; N]` the callee's writes are its own and die with its frame,
-    /// so the caller's store is untouched. For a `&mut [T]`/`&mut [T; N]` the
-    /// callee writes the caller's storage, which this frontend does not model,
-    /// so the caller's elements must become unknown when it returns -- a stale
-    /// element there is a wrong value, not a missing one. This set is how the
-    /// return path learns that a callee wrote.
-    indexed_writes: BTreeSet<u32>,
     /// The program's enum layouts, so a variant *construction* constant
     /// (`Mode::Idle`) resolves to its discriminant.
     ///
@@ -544,7 +534,6 @@ impl Env {
             deref_ok: BTreeMap::new(),
             addressed: BTreeMap::new(),
             indexed: BTreeMap::new(),
-            indexed_writes: BTreeSet::new(),
             whole_writes: BTreeSet::new(),
             enums: BTreeMap::new(),
             tag_widths: BTreeMap::new(),
@@ -1087,7 +1076,6 @@ impl Env {
     /// live in `elems`. The read path keys on the same distinction, so the two
     /// must agree here or a write becomes invisible to the read.
     fn write_elem(&mut self, local: u32, index: u64, v: Val) {
-        self.indexed_writes.insert(local);
         match self.indexed.get_mut(&local) {
             Some(s) => match v {
                 Val::Sym(x, _) => {
@@ -1106,7 +1094,6 @@ impl Env {
 
     /// Mark every element of `local` unknown, keeping the length.
     fn poison_elems(&mut self, local: u32) {
-        self.indexed_writes.insert(local);
         match self.indexed.get_mut(&local) {
             Some(s) => s.poisoned = true,
             // A literal array written through a symbolic subscript: the whole
