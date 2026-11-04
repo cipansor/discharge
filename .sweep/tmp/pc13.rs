@@ -1,4 +1,0 @@
-#![allow(dead_code)]
-/// requires: true
-/// ensures: y == -128 && y == 127
-pub fn s0(y: i8)->u8{0}

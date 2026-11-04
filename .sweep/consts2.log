@@ -1,7 +1,0 @@
-nohup: ignoring input
-shapes 3588
-SOUNDNESS bugs: 0
-HANGS: 0
-COMPLETENESS misses: 622 of 2052
-SLOW (5-20s): 1
-  6.6s w64 (e % (8 - 1)) == 0

@@ -1,4 +1,0 @@
-nohup: ignoring input
-total 3000 ok 1038 skipped 1962 hangs 0
-UNSOUND (verified a non-tautology): 0
-WRONG-REFUTATION (failed a tautology): 0

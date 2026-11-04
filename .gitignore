@@ -1,2 +1,6 @@
 target/
 /workspace/.rust/
+
+# Local scratch and rustc artifacts -- never part of the crate.
+.sweep/
+*.rlib
