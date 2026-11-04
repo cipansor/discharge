@@ -4118,6 +4118,155 @@ pub fn a_stale_tuple_component_cannot_prove_this(mut t: Pair) -> u8 {
     t.0
 }
 
+/// A helper that *reads* through a `&u8`. Before the referent's value was carried
+/// into the callee, `_1` held the reference temp's `Unknown`, so `*v` was an
+/// unmodelled operand and the caller could not be decided at all -- while a helper
+/// that only *wrote* worked, because the write created the value the copy-back read.
+pub fn read_through(v: &u8) -> u8 {
+    *v
+}
+
+/// A helper that reads *and* writes through a `&mut u8`.
+pub fn bump_through(v: &mut u8) {
+    *v = *v + 1;
+}
+
+/// Two `&mut` to *different* fields of one struct, in a single call.
+pub fn set_two(lo: &mut u8, hi: &mut u8) {
+    *lo = 5;
+    *hi = 7;
+}
+
+/// A swap through two `&mut`, the shape that *reads* both referents.
+pub fn swap_two(lo: &mut u8, hi: &mut u8) {
+    let t = *lo;
+    *lo = *hi;
+    *hi = t;
+}
+
+/// A helper that writes a *nested aggregate* it was handed (`&mut o.i`).
+pub fn write_nested(i: &mut InnerBox) {
+    i.v = 5;
+}
+
+/// A helper that *reads* a nested aggregate it was handed (`&InnerBox`).
+pub fn read_nested(i: &InnerBox) -> u8 {
+    i.v
+}
+
+/// A read through a helper's `&u8`.
+/// requires: x == 3
+/// ensures: ret == 3
+pub fn a_read_through_a_helper(x: u8) -> u8 {
+    read_through(&x)
+}
+
+/// The false direction of [`a_read_through_a_helper`].
+/// requires: x == 3
+/// ensures: ret == 4
+pub fn a_stale_read_through_a_helper_cannot_prove_this(x: u8) -> u8 {
+    read_through(&x)
+}
+
+/// A read-modify-write through a helper's `&mut u8`.
+/// requires: x == 3
+/// ensures: ret == 4
+pub fn a_bump_through_a_helper(mut x: u8) -> u8 {
+    bump_through(&mut x);
+    x
+}
+
+/// The false direction of [`a_bump_through_a_helper`]: the bump must be visible.
+/// requires: x == 3
+/// ensures: ret == 3
+pub fn a_stale_bump_cannot_prove_this(mut x: u8) -> u8 {
+    bump_through(&mut x);
+    x
+}
+
+/// Two `&mut` to different fields in one call, and the first field read back.
+/// requires: true
+/// ensures: ret == 5
+pub fn two_reference_arguments(mut c: Config) -> u8 {
+    set_two(&mut c.lo, &mut c.hi);
+    c.lo
+}
+
+/// The *other* field of the same two-reference call.
+/// requires: true
+/// ensures: ret == 7
+pub fn two_reference_arguments_other(mut c: Config) -> u8 {
+    set_two(&mut c.lo, &mut c.hi);
+    c.hi
+}
+
+/// The false direction: `hi` must not read `lo`'s value.
+/// requires: true
+/// ensures: ret == 5
+pub fn two_reference_arguments_swapped_cannot_prove_this(mut c: Config) -> u8 {
+    set_two(&mut c.lo, &mut c.hi);
+    c.hi
+}
+
+/// A swap through two references: both fields are *read*, which is the case that
+/// needs the referent's value carried into the callee, not just its parts.
+/// requires: c.lo == 1 && c.hi == 2
+/// ensures: ret == 2
+pub fn a_swap_through_two_references(mut c: Config) -> u8 {
+    swap_two(&mut c.lo, &mut c.hi);
+    c.lo
+}
+
+/// The other half of the swap.
+/// requires: c.lo == 1 && c.hi == 2
+/// ensures: ret == 1
+pub fn a_swap_through_two_references_other(mut c: Config) -> u8 {
+    swap_two(&mut c.lo, &mut c.hi);
+    c.hi
+}
+
+/// The false direction of the swap: `lo` must not still be 1.
+/// requires: c.lo == 1 && c.hi == 2
+/// ensures: ret == 1
+pub fn a_stale_swap_cannot_prove_this(mut c: Config) -> u8 {
+    swap_two(&mut c.lo, &mut c.hi);
+    c.lo
+}
+
+/// A helper writing a nested aggregate target (`&mut o.i`) must land on `o.i.v`.
+/// Before the copy-back was re-based on the target's projection, this write was
+/// dropped: the true contract `ret == 5` was refuted and the false `ret == 0` was
+/// **proved**.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_nested_aggregate_target_reaches(mut o: OuterBox) -> u8 {
+    write_nested(&mut o.i);
+    o.i.v
+}
+
+/// The false direction of [`a_nested_aggregate_target_reaches`] -- the one that was
+/// wrongly proved before the re-basing.
+/// requires: o.i.v == 0
+/// ensures: ret == 0
+pub fn a_stale_nested_aggregate_cannot_prove_this(mut o: OuterBox) -> u8 {
+    write_nested(&mut o.i);
+    o.i.v
+}
+
+/// A *read* of a nested aggregate target (`&o.i`).
+/// requires: o.i.v == 3
+/// ensures: ret == 3
+pub fn a_nested_aggregate_read(o: OuterBox) -> u8 {
+    read_nested(&o.i)
+}
+
+/// The false direction of [`a_nested_aggregate_read`].
+/// requires: o.i.v == 3
+/// ensures: ret == 4
+pub fn a_stale_nested_aggregate_read_cannot_prove_this(o: OuterBox) -> u8 {
+    read_nested(&o.i)
+}
+
 /// A type whose method's tail collides with a *free function* of the same name.
 ///
 /// The collision is deliberately on names used by nothing else in this file: a

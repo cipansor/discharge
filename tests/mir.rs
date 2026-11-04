@@ -1730,6 +1730,64 @@ fn a_method_is_inlined_by_its_tail_and_an_ambiguous_tail_is_refused() {
     );
 }
 
+/// A helper that *reads* its referent, a read-modify-write helper, a two-reference
+/// call, and a nested *aggregate* target.
+///
+/// Each of these needs something the write-only case did not. A read needs the
+/// referent's value carried *into* the callee (`_1` otherwise holds the reference
+/// temp's `Unknown`, so `*v` is an unmodelled operand). A sub-place aggregate target
+/// (`&mut o.i`) needs both the carry-in and the write-back re-based on the target's
+/// projection -- dropping the write there refuted the true `ret == 5` and *proved*
+/// the false `ret == 0`, which is why the false twin is pinned.
+#[test]
+fn a_reference_argument_is_read_and_written_through_its_target() {
+    let Some(report) = verify_realistic(&[
+        "a_read_through_a_helper",
+        "a_stale_read_through_a_helper_cannot_prove_this",
+        "a_bump_through_a_helper",
+        "a_stale_bump_cannot_prove_this",
+        "two_reference_arguments",
+        "two_reference_arguments_other",
+        "two_reference_arguments_swapped_cannot_prove_this",
+        "a_swap_through_two_references",
+        "a_swap_through_two_references_other",
+        "a_stale_swap_cannot_prove_this",
+        "a_nested_aggregate_target_reaches",
+        "a_stale_nested_aggregate_cannot_prove_this",
+        "a_nested_aggregate_read",
+        "a_stale_nested_aggregate_read_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "a_read_through_a_helper",
+        "a_bump_through_a_helper",
+        "two_reference_arguments",
+        "two_reference_arguments_other",
+        "a_swap_through_two_references",
+        "a_swap_through_two_references_other",
+        "a_nested_aggregate_target_reaches",
+        "a_nested_aggregate_read",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a reference argument must reach its target; got: {o}");
+    }
+    for name in [
+        "a_stale_read_through_a_helper_cannot_prove_this",
+        "a_stale_bump_cannot_prove_this",
+        "two_reference_arguments_swapped_cannot_prove_this",
+        "a_stale_swap_cannot_prove_this",
+        "a_stale_nested_aggregate_cannot_prove_this",
+        "a_stale_nested_aggregate_read_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a stale or unread referent must not prove this false contract; got: {o}"
+        );
+    }
+}
+
 /// A slice's length is read through the *one* rvalue the compiler prints, on any
 /// toolchain.
 ///

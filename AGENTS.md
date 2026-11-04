@@ -5695,8 +5695,25 @@ in a contract (`unknown field`), because `Ty::Struct` has no layout, so a contra
 it is skipped and a bare `ret == 5` there goes `incomplete`. That is a missing decision,
 not a wrong one: the write itself lands, and no false contract is proved.
 
-**Evidence.** Corpus `decided 181 of 333` -> **`201 of 367`**; `cargo test --workspace
---features std` **608 -> 614** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+**A reference argument is read through, not just written through.** Carrying only the
+target's *parts* into a callee left its argument local holding the reference temp's
+`Unknown`, so `*v` was an unmodelled operand: a helper that *read* its referent (`*v`,
+`*v = *v + 1`, a two-reference `swap`) could not be decided at all, while a helper that
+only *wrote* (`*v = 5`) worked -- the write created the value the copy-back then read. The
+value *at the target* is now carried in through `get`, not out of `locals`, because a
+sub-place target has no whole-local entry.
+
+The write-back had the matching hole, and it was a **false proof**: for a sub-place target
+(`&mut o.i`) the part keys were dropped unless the target was a whole local, so
+`set_inner(&mut o.i); o.i.v` read the caller's seed -- the true `ret == 5` was refuted and
+the false `ret == 0` was proved. Every key is now re-based on the target's projection
+(`rest ++ key`), and the carry-in is its exact inverse (drop the target's chain from the
+front), routing a one-step remainder to `fields` and a longer one to `nested`. Fourteen
+entries with their false twins, pinned by
+`a_reference_argument_is_read_and_written_through_its_target`.
+
+**Evidence.** Corpus `decided 181 of 333` -> **`209 of 381`**; `cargo test --workspace
+--features std` **608 -> 615** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
 `mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.

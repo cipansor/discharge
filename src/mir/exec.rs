@@ -2137,6 +2137,17 @@ where
                     //   nothing leaves the caller's store as it was.
                     for (target, cal) in &caller.by_ref {
                         let cl = target.local;
+                        // The target's projection *below* its leading deref. A
+                        // reference argument arrives as `_5 = &mut _2; set5(_5)`,
+                        // so `pointee` has already collapsed the temp and the target
+                        // is a plain place on the caller's local -- `c` for `&mut c`,
+                        // `c.0` for `&mut c.lo`. Stripping the deref (when a caller
+                        // ever hands one over) leaves the chain every re-key below
+                        // is prefixed with.
+                        let rest: &[Proj] = match target.proj.first() {
+                            Some(Proj::Deref) => &target.proj[1..],
+                            _ => &target.proj,
+                        };
                         // An indexed referent (`&mut [T]` / `&mut [T; N]`): the
                         // callee's element store *is* the caller's post-state.
                         //
@@ -2148,7 +2159,7 @@ where
                         // poison back would make the caller's untouched `a[0]` read
                         // unknown, turning a decidable contract into an incomplete
                         // one.
-                        if target.proj.is_empty() {
+                        if rest.is_empty() {
                             if let Some(s) = st.env.indexed.get(cal) {
                                 env.indexed.insert(cl, s.clone());
                             }
@@ -2188,22 +2199,86 @@ where
                         // here is a write and is safe to carry back. A part the
                         // callee did not touch keeps the caller's seed, which is
                         // the same storage the callee read.
-                        if target.proj.is_empty() {
-                            for ((l, f), v) in st.env.fields.iter() {
-                                if *l == *cal {
+                        //
+                        // Every key is re-based on the *target's* projection, not
+                        // copied onto the caller's local. For a whole-local target
+                        // (`&mut c`) `rest` is empty and the keys are unchanged, so
+                        // `c.lo` lands on `c`'s field as before. For a sub-place
+                        // target (`&mut o.i`) the callee's `_1.v` is `o.i.v`, so the
+                        // key has to become the chain `rest ++ [v]` -- copying it to
+                        // `o`'s field `v` would put a leaf where no leaf lives, and
+                        // *dropping* it (what a whole-local-only guard did) lost the
+                        // write entirely: `set_inner(&mut o.i); o.i.v` read the
+                        // caller's seed, so the true contract `ret == 5` was refuted
+                        // and the false `ret == 0` was **proved**.
+                        // `nested` is keyed by a chain of *field* indices, so the
+                        // target's projection is usable as a prefix exactly when it
+                        // is itself a field chain. A target that is not one (an
+                        // element, `&mut o.a[0]`) is a scalar in the callee, so it
+                        // has no parts to carry and the loops below see nothing --
+                        // the `None` arm exists only so an unrepresentable key is
+                        // never invented.
+                        let rest_chain: Option<Vec<u32>> = {
+                            let mut c = Vec::with_capacity(rest.len());
+                            let ok = rest.iter().all(|s| match s {
+                                Proj::Field(i) => {
+                                    c.push(*i);
+                                    true
+                                }
+                                _ => false,
+                            });
+                            if ok {
+                                Some(c)
+                            } else {
+                                None
+                            }
+                        };
+                        let mut dropped = false;
+                        for ((l, f), v) in st.env.fields.iter() {
+                            if *l != *cal {
+                                continue;
+                            }
+                            match &rest_chain {
+                                Some(rc) if rc.is_empty() => {
                                     env.fields.insert((cl, *f), *v);
                                 }
-                            }
-                            for ((l, chain), v) in st.env.nested.iter() {
-                                if *l == *cal {
-                                    env.nested.insert((cl, chain.clone()), *v);
+                                Some(rc) => {
+                                    let mut key = rc.clone();
+                                    key.push(*f);
+                                    env.nested.insert((cl, key), *v);
                                 }
+                                None => dropped = true,
                             }
-                            for ((l, k), v) in st.env.elems.iter() {
-                                if *l == *cal {
-                                    env.elems.insert((cl, *k), *v);
+                        }
+                        for ((l, chain), v) in st.env.nested.iter() {
+                            if *l != *cal {
+                                continue;
+                            }
+                            match &rest_chain {
+                                Some(rc) => {
+                                    let mut key = rc.clone();
+                                    key.extend_from_slice(chain);
+                                    env.nested.insert((cl, key), *v);
                                 }
+                                None => dropped = true,
                             }
+                        }
+                        for ((l, k), v) in st.env.elems.iter() {
+                            if *l != *cal {
+                                continue;
+                            }
+                            if rest.is_empty() {
+                                env.elems.insert((cl, *k), *v);
+                            } else {
+                                // An element under a sub-place target has no key in
+                                // this store. Leaving the caller's element would be a
+                                // stale value, so the caller's parts go instead --
+                                // precision lost, never a wrong value kept.
+                                dropped = true;
+                            }
+                        }
+                        if dropped {
+                            env.forget_parts(cl);
                         }
                     }
                     if let Some(dest) = &caller.ret_dest {
@@ -2481,22 +2556,86 @@ where
                     Place { local: *cl, proj: Vec::new() }
                 };
                 let sl = source.local;
-                if let Some(store) = st.env.indexed.get(&sl).cloned() {
-                    env.indexed.insert(l, store);
+                // The value *at the target*, and the target's parts. The value is
+                // read through `get`, not out of `locals`, because a sub-place
+                // target has no whole-local entry: `&mut c.lo` targets `c.0`, whose
+                // value lives in `fields`. Reading `locals[source.local]` there
+                // returned the *struct's* absent value, so the callee's `*v` was
+                // `Unknown` and a helper that *reads* through its argument (`*v`,
+                // `*v = *v + 1`, a two-reference `swap`) had an unmodelled operand --
+                // while a helper that only *wrote* (`*v = 5`) worked, because the
+                // write creates the value the copy-back then reads. `Ty::Ref` is
+                // modelled as its referent, so the callee's local *is* the target's
+                // value and this is a copy of what the caller holds, not an
+                // assumption about it.
+                //
+                // The part stores are copied only for a *whole-local* target, and
+                // they are keyed by `source.local` because that is the local that
+                // owns them. For a sub-place target the parts belong to the target's
+                // own type, which the value copy above already covers for a scalar;
+                // copying the enclosing local's parts instead would hand the callee
+                // a sibling field it does not own.
+                if is_ref {
+                    let v = st.env.get(&source);
+                    env.locals.insert(l, v);
                 }
-                for ((l0, f), v) in st.env.fields.iter() {
-                    if *l0 == sl {
-                        env.fields.insert((l, *f), *v);
+                if source.proj.is_empty() {
+                    if let Some(store) = st.env.indexed.get(&sl).cloned() {
+                        env.indexed.insert(l, store);
                     }
-                }
-                for ((l0, chain), v) in st.env.nested.iter() {
-                    if *l0 == sl {
-                        env.nested.insert((l, chain.clone()), *v);
+                    for ((l0, f), v) in st.env.fields.iter() {
+                        if *l0 == sl {
+                            env.fields.insert((l, *f), *v);
+                        }
                     }
-                }
-                for ((l0, k), v) in st.env.elems.iter() {
-                    if *l0 == sl {
-                        env.elems.insert((l, *k), *v);
+                    for ((l0, chain), v) in st.env.nested.iter() {
+                        if *l0 == sl {
+                            env.nested.insert((l, chain.clone()), *v);
+                        }
+                    }
+                    for ((l0, k), v) in st.env.elems.iter() {
+                        if *l0 == sl {
+                            env.elems.insert((l, *k), *v);
+                        }
+                    }
+                } else if is_ref {
+                    // A sub-place target whose own type is an aggregate: `&mut
+                    // o.i`. The callee's `i.v` is the caller's `o.i.v`, so the
+                    // target's parts are carried in *re-based* -- the target's
+                    // chain is dropped from the front of each key and the callee's
+                    // local takes its place. This is the exact inverse of the
+                    // re-based copy-back, and it is what lets a helper *read* a
+                    // nested aggregate it was handed (`read_inner(&o.i)`), which is
+                    // otherwise an unmodelled operand.
+                    let mut rc = Vec::with_capacity(source.proj.len());
+                    let ok = source.proj.iter().all(|p| match p {
+                        Proj::Field(i) => {
+                            rc.push(*i);
+                            true
+                        }
+                        _ => false,
+                    });
+                    if ok {
+                        // A remainder of one step is a *field* in this store's
+                        // spelling (`fields` is keyed by a single index, `nested` by
+                        // a chain of two or more), so the two lengths have to be
+                        // routed apart or the callee's `_1.0` -- a lone field read --
+                        // would consult `fields` and miss.
+                        for ((l0, chain), v) in st.env.nested.iter() {
+                            if *l0 != sl || !chain.starts_with(&rc) {
+                                continue;
+                            }
+                            let rem = &chain[rc.len()..];
+                            match rem {
+                                [f] => {
+                                    env.fields.insert((l, *f), *v);
+                                }
+                                [] => {}
+                                _ => {
+                                    env.nested.insert((l, rem.to_vec()), *v);
+                                }
+                            }
+                        }
                     }
                 }
                 if is_ref {
