@@ -3224,9 +3224,15 @@ fn an_out_of_range_literal_is_refused_not_wrapped() {
         "contract_negation_of_min_is_refused",
         "contract_negation_of_wrapping_shift_is_refused",
         // A shift *amount* is a value of its own `i32`, so an amount that wraps at
-        // the operand's width but not at `i32` (`2 << 7` is `256`) is refused.
+        // the operand's width but not at `i32` (`2 << 7` is `256`) is refused. A
+        // nested suffix is in the inner shift's amount, so it does not fix the
+        // outer amount's type (`2 << 7u8` is still the `i32` `256`), and a cast
+        // fixes the type and overrides what it casts (`(1u8) as u16` is a `u16`,
+        // so the amount is `257u16`).
         "contract_nested_shift_amount_overflow_is_refused",
         "contract_nested_shift_amount_sum_overflow_is_refused",
+        "contract_nested_amount_suffix_does_not_fix_the_outer_width",
+        "contract_cast_amount_operand_fixes_the_width",
     ];
     let Some(report) = verify_realistic(&refused) else { return };
     for name in refused {
@@ -3251,9 +3257,12 @@ fn an_out_of_range_literal_is_refused_not_wrapped() {
         "contract_unsigned_mask_still_reads",
         // The controls for the two classes above: an in-range negation and an
         // amount that fits `i32` both still read, so the refusals are pinned to
-        // the overflow and not to the shape.
+        // the overflow and not to the shape. A *typed* amount operand fixes the
+        // amount's width, so `1u8 + (2 << 7)` is a `u8` amount (`2 << 7` is `0u8`)
+        // and the shift rustc accepts must read rather than be refused.
         "contract_negation_of_max_still_reads",
         "contract_fitting_shift_amount_still_reads",
+        "contract_typed_amount_operand_fixes_the_width",
     ];
     let Some(report) = verify_realistic(&read) else { return };
     for name in read {
@@ -3573,6 +3582,37 @@ fn a_sign_ambiguous_untyped_fold_is_refused() {
         let o = outcome(&report, name);
         assert!(o.is_verified(), "{name} agrees under both readings and must verify, got: {o}");
     }
+}
+
+/// A complement's *provisional* unsigned value must not be range-checked as if it
+/// were a written literal, while a literal *under* the fold still is.
+///
+/// `y == !(!1 + 1)` for an `i8` `y` is valid Rust: `!1 + 1` is `-1` at `i8` and
+/// `!(-1)` is `0`, so the contract is `y == 0`. The reader evaluates the fold
+/// unsigned (`255`) because its type is not known until it meets the `i8`, and
+/// range-checking that guess refused the contract although no `255` is written. The
+/// fold now records only its operands' envelopes, so the guess is not checked -- the
+/// control shows a genuine literal under the fold (`!128`) is still range-checked
+/// against the type the complement meets and is refused.
+#[test]
+fn an_opaque_folds_provisional_value_is_not_range_checked() {
+    let Some(report) =
+        verify_realistic(&["contract_opaque_fold_provisional_value_is_not_range_checked"])
+    else {
+        return;
+    };
+    let o = outcome(&report, "contract_opaque_fold_provisional_value_is_not_range_checked");
+    assert!(o.is_verified(), "`y == !(!1 + 1)` is `y == 0` and must verify, got: {o}");
+    let Some(report) =
+        verify_realistic(&["contract_literal_under_complement_is_still_range_checked"])
+    else {
+        return;
+    };
+    let o = outcome(&report, "contract_literal_under_complement_is_still_range_checked");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "`!128` is an `i8` range error and must be refused, got: {o}"
+    );
 }
 
 /// The written magnitude of a suffixed literal is what Rust range-checks, and a

@@ -1622,18 +1622,27 @@ struct Parser<'a> {
     /// set tells `parse_neg` apart that case from a literal *inside* a fold, whose
     /// magnitude is checked as written (`-(128 - 63)` is rejected for its `128`).
     bare_literals: BTreeSet<u32>,
-    /// How deep inside a *shift amount* the parser is.
+    /// The width a shift amount's bare literals are floored at, or `0` outside an
+    /// amount.
     ///
     /// A shift amount is a value of its *own* type, not of the shifted operand's:
     /// Rust leaves the amount's type unconstrained, so an unsuffixed amount
-    /// expression defaults to `i32` and is evaluated at 32 bits. The reader sizes
-    /// a bare literal to the widest name in scope, so at an eight-bit scope the
-    /// amount `(2 << 7)` was built at 8 bits and wrapped to `0`, while rustc
-    /// computes `256` and rejects `x >> 256`. The reader then *decided* a
-    /// comparison on a program rustc rejects. Flooring the amount's literals at 32
-    /// bits makes the fold agree with rustc's `i32` evaluation, so the wrapped
-    /// value never appears.
-    amount_depth: usize,
+    /// expression defaults to `i32` and is folded at 32 bits. Sizing the amount's
+    /// bare literals to the scope's width instead made `x >> (2 << 7)` fold the
+    /// amount to `0` at an eight-bit scope (the eight-bit `2 << 7` wraps) where
+    /// rustc computes `256` and rejects the shift, so the reader *decided* a
+    /// comparison on a program rustc rejects. Flooring at 32 bits makes the fold
+    /// agree with rustc's `i32` evaluation, so the wrapped value never appears.
+    ///
+    /// The floor is the amount's *inferred* type, which is [`amount_width`]'s job:
+    /// `i32` when nothing in the amount fixes it, or the width of a *typed*
+    /// (suffixed) operand when one does -- `1u8 + (2 << 7)` is a `u8` expression,
+    /// so its `2 << 7` is `0u8`, not the `256` a blind `i32` floor would build.
+    /// The field is set at each shift and restored after the amount is parsed, so a
+    /// nested shift's *operand* still sees the enclosing amount's floor.
+    ///
+    /// [`amount_width`]: Self::amount_width
+    amount_floor: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1812,7 +1821,7 @@ impl<'a> Parser<'a> {
             enum_args: BTreeSet::new(),
             range: BTreeMap::new(),
             bare_literals: BTreeSet::new(),
-            amount_depth: 0,
+            amount_floor: 0,
             ret_absent: "`ret` is only meaningful in `ensures`",
         }
     }
@@ -2018,10 +2027,20 @@ impl<'a> Parser<'a> {
     /// Record a folded `+ - *` result: the union of its operands' envelopes (the
     /// literals underneath) and the result's own value (the intermediate Rust
     /// checks). `2 & 128` keeps the `128`; `100 + 100` adds the `200`.
-    fn record_fold_result(&mut self, v: Var, a: Var, b: Var, signed: bool) {
+    ///
+    /// An *opaque* result (a fold that touched a complement) records only its
+    /// operands. Its own value is a *guess*: the reader evaluates it unsigned
+    /// because the fold's type is not known here, so `!1 + 1` records `255` where
+    /// the `i8` the fold finally meets makes it `-1`. Range-checking that guess
+    /// refused a valid `y == !(!1 + 1)` for an `i8` -- the `255` is out of range
+    /// for the signed type, though no `255` is written. The genuine operand
+    /// envelopes still carry, so a literal anywhere under the fold is still
+    /// checked, and an overflowing intermediate is refused in `fold_const_arith`
+    /// before it can reach here.
+    fn record_fold_result(&mut self, v: Var, a: Var, b: Var, sgn: Sign) {
         self.record_range_union(v, a, b);
-        if self.const_value(v).is_some() {
-            self.record_const(v, signed);
+        if !sgn.is_opaque() && self.const_value(v).is_some() {
+            self.record_const(v, sgn.eval());
         }
     }
 
@@ -2797,6 +2816,108 @@ impl<'a> Parser<'a> {
         Ok((left, sgn))
     }
 
+    /// The width Rust infers for the shift amount at the cursor, so the amount's
+    /// bare literals are floored at that width instead of a blind `i32`.
+    ///
+    /// An amount's type is not tied to the shifted operand's, so an unsuffixed
+    /// amount defaults to `i32`. A *typed* operand at the amount's own level -- a
+    /// suffixed literal (`1u8`), a cast (`n as u8`) -- instead fixes the amount's
+    /// type to its width, and every bare literal in the amount takes that width.
+    /// Reading `1u8 + (2 << 7)` as `i32` built the inner `2 << 7` as `256` and
+    /// refused a shift rustc accepts (`2 << 7` is `0u8` there, so the amount is
+    /// `1u8`).
+    ///
+    /// The scan mirrors the grammar rather than flattening it, because only an
+    /// operand at the *amount's own level* fixes its type. In `2 << 7u8` the suffix
+    /// is inside the nested shift's *amount*, not an operand of the outer shift, so
+    /// it does not make the outer amount `u8`: the outer amount is the `i32`
+    /// `2 << 7u8` = `256`, a rustc overflow. A flat scan that took any suffix would
+    /// read the outer amount as `u8` and accept a program rustc rejects.
+    fn amount_width(&self) -> u8 {
+        match self.scan_amount_add(self.pos).0 {
+            0 => 32,
+            w => w,
+        }
+    }
+
+    /// Scan an add-level term (the amount's own level) for a typed operand,
+    /// returning its width and the index just past the scanned span.
+    fn scan_amount_add(&self, mut i: usize) -> (u8, usize) {
+        loop {
+            let (w, j) = self.scan_amount_mul(i);
+            if w != 0 {
+                return (w, j);
+            }
+            i = j;
+            match self.toks.get(i) {
+                Some(Tok::Op(o)) if o == "+" || o == "-" => i += 1,
+                _ => return (0, i),
+            }
+        }
+    }
+
+    /// Scan a mul-level term for a typed operand.
+    fn scan_amount_mul(&self, mut i: usize) -> (u8, usize) {
+        loop {
+            let (w, j) = self.scan_amount_atom(i);
+            if w != 0 {
+                return (w, j);
+            }
+            i = j;
+            match self.toks.get(i) {
+                Some(Tok::Op(o)) if o == "*" || o == "/" || o == "%" => i += 1,
+                _ => return (0, i),
+            }
+        }
+    }
+
+    /// Scan one atom (any unary prefixes, and a trailing cast) for a typed width.
+    ///
+    /// A parenthesized group is scanned at the amount's own level, so a suffix
+    /// inside a nested shift's amount is not mistaken for the amount's own type.
+    /// A cast fixes the width and *overrides* what it casts -- `(1u8) as u16` is a
+    /// `u16` amount, so the inner `1u8` must not win.
+    fn scan_amount_atom(&self, i: usize) -> (u8, usize) {
+        let mut i = i;
+        while matches!(self.toks.get(i), Some(Tok::Op(o)) if o == "-" || o == "!") {
+            i += 1;
+        }
+        let (mut w, mut j) = match self.toks.get(i) {
+            Some(Tok::Num(_, Some((w, _)))) => (u8::min(*w, 64), i + 1),
+            Some(Tok::Op(o)) if o == "(" => (self.scan_amount_add(i + 1).0, self.after_paren(i)),
+            _ => (0, i + 1),
+        };
+        if matches!(self.toks.get(j), Some(Tok::Ident(n)) if n == "as") {
+            if let Some(Tok::Ident(ty)) = self.toks.get(j + 1) {
+                if let Some(cw) = Ty::parse(ty).width() {
+                    w = cw.min(64);
+                    j += 2;
+                }
+            }
+        }
+        (w, j)
+    }
+
+    /// The index just past the `)` matching the `(` at `i`.
+    fn after_paren(&self, i: usize) -> usize {
+        let mut depth = 0usize;
+        let mut j = i;
+        while let Some(t) = self.toks.get(j) {
+            match t {
+                Tok::Op(o) if o == "(" => depth += 1,
+                Tok::Op(o) if o == ")" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return j + 1;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        j
+    }
+
     /// The shift level: `<<` and `>>`, which bind tighter than `&` but looser
     /// than `+`.
     ///
@@ -2817,14 +2938,22 @@ impl<'a> Parser<'a> {
     fn parse_shift(&mut self) -> Result<(Var, Sign), SpecError> {
         let (mut left, sgn) = self.parse_add()?;
         while let Some(op) = self.eat_any(&["<<", ">>"]) {
-            // The amount is a value of its own type, so its bare literals are
-            // floored at Rust's `i32` (see `amount_depth`). The *operand* is not:
-            // rustc reads `(2 << 7)` in an `i8` comparison at eight bits (it
-            // accepts `y == (2 << 7)`, which is `y == 0` there), while the amount
-            // of a shift stays `i32`.
-            self.amount_depth += 1;
+            // The amount is a value of its *own* type, unconstrained by the
+            // operand, so its bare literals are floored at the amount's inferred
+            // width (`amount_width`): `i32` when nothing in the amount fixes a
+            // type, or a typed operand's width when one does. The *operand* is not
+            // floored: rustc reads `(2 << 7)` in an `i8` comparison at eight bits
+            // (it accepts `y == (2 << 7)`, which is `y == 0` there).
+            //
+            // The floor is inherited, not recomputed, when the shift is itself
+            // inside an amount: the enclosing type unifies inward through the
+            // parentheses, so `x >> (1u8 + (2 << 7))` folds the inner `2 << 7` at
+            // eight bits. Recomputing from the inner amount's own tokens would miss
+            // the outer `1u8` and build `256`, refusing a shift rustc accepts.
+            let saved = self.amount_floor;
+            self.amount_floor = if saved == 0 { self.amount_width() } else { saved };
             let amount = self.parse_add();
-            self.amount_depth -= 1;
+            self.amount_floor = saved;
             let (r, rs) = amount?;
             // An *opaque* amount (a complement, or a fold that touched one) has no
             // width of its own: `!254` is `-255` at the `i32` Rust infers -- a
@@ -2950,13 +3079,13 @@ impl<'a> Parser<'a> {
             // constant expression) instead of wrapping to a wrong value. A result
             // that fits is left to the ordinary operator.
             if let Some((v, s)) = self.fold_const_arith(op, l, sgn, r, rs)? {
-                self.record_fold_result(v, pl, pr, s.eval());
+                self.record_fold_result(v, pl, pr, s);
                 left = v;
                 sgn = s;
                 continue;
             }
             left = if op == "+" { smt::add(l, r) } else { smt::sub(l, r) };
-            self.record_fold_result(left, pl, pr, Sign::combine(sgn, rs).eval());
+            self.record_fold_result(left, pl, pr, Sign::combine(sgn, rs));
             sgn = Sign::combine(sgn, rs);
         }
         Ok((left, sgn))
@@ -3018,7 +3147,7 @@ impl<'a> Parser<'a> {
             // exactly, so a constant product too wide for the operand is refused
             // instead of wrapping to a wrong value.
             if let Some((v, s)) = self.fold_const_arith(op, l, sgn, r, rs)? {
-                self.record_fold_result(v, pl, pr, s.eval());
+                self.record_fold_result(v, pl, pr, s);
                 left = v;
                 sgn = s;
                 continue;
@@ -3031,7 +3160,7 @@ impl<'a> Parser<'a> {
                 "%" if signed => smt::srem(l, r),
                 _ => smt::urem(l, r),
             };
-            self.record_fold_result(left, pl, pr, signed);
+            self.record_fold_result(left, pl, pr, Sign::combine(sgn, rs));
             sgn = Sign::combine(sgn, rs);
         }
         Ok((left, sgn))
@@ -3309,17 +3438,11 @@ impl<'a> Parser<'a> {
                     .map(|v| smt::bits(*v))
                     .max()
                     .unwrap_or(64);
-                // A bare literal inside a shift *amount* is floored at 32 bits,
-                // because that is the type Rust gives an unconstrained amount: the
-                // amount's type is not tied to the operand's, so it defaults to
-                // `i32` and is folded at 32 bits. Sizing it to an eight-bit scope
-                // instead made `x >> (2 << 7)` fold the amount to `0` (the
-                // eight-bit `2 << 7` wraps) where rustc computes `256` and rejects
-                // the shift, so the reader *decided* a comparison on a rejected
-                // program. A *suffixed* amount keeps its suffix's width, which is
-                // why only this path is floored.
-                let floor = if self.amount_depth > 0 { 32 } else { 0 };
-                let w = scope.max(need).max(floor).min(64);
+                // A bare literal inside a shift *amount* is floored at the
+                // amount's inferred width (see `amount_floor`): 32 bits when
+                // nothing in the amount fixes a type, or a typed operand's width
+                // when one does. Outside an amount there is no floor.
+                let w = scope.max(need).max(self.amount_floor).min(64);
                 // A *bare* literal is untyped and non-negative: its value is
                 // unambiguous, but its signedness is not yet known.
                 let v = smt::word(n, w);
@@ -4820,6 +4943,90 @@ mod tests {
             let mut p = Parser::new(text, &args, None, &unsigned, false);
             assert!(p.parse_or().is_ok(), "`{text}` has an in-range amount and reads");
         }
+    }
+
+    /// A typed operand *inside* the amount fixes the amount's type, so the
+    /// amount's bare literals must be built at that width, not at a blind `i32`.
+    ///
+    /// `x >> (1u8 + (2 << 7))` for a `u8` `x` is valid Rust: the suffixed `1u8`
+    /// makes the amount a `u8`, so `2 << 7` is `0u8` and the amount is `1u8`. The
+    /// earlier reader floored the amount's literals at a flat 32 bits, built
+    /// `2 << 7` as `256`, and *refused* the shift -- a false refusal on a program
+    /// rustc accepts. The floor now comes from the amount's own inferred width.
+    ///
+    /// The negative cases pin the other direction, because the fix must not accept
+    /// a program rustc rejects: an amount with *no* typed operand is still `i32`
+    /// (`2 << 7` is `256`, an overflow), a nested shift's amount suffix does not fix
+    /// the outer amount's type (`2 << 7u8` is still the `i32` `256`), a typed
+    /// operand outside the amount cannot narrow it (`x >> 300`), and two typed
+    /// operands of different widths are a type error.
+    #[test]
+    fn a_typed_amount_operand_fixes_the_amounts_width() {
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), smt::var(8));
+        let mut unsigned = BTreeSet::new();
+        unsigned.insert("x".to_string());
+
+        let mut p = Parser::new("(x >> (1u8 + (2 << 7))) == 0", &args, None, &unsigned, false);
+        let pred = p.parse_or().expect("`x >> (1u8 + (2 << 7))` is valid Rust and must read");
+        assert!(smt::evaluate_pred(pred, |_| Some(0)).unwrap(), "0 >> 1 == 0");
+        assert!(!smt::evaluate_pred(pred, |_| Some(2)).unwrap(), "2 >> 1 == 1 != 0");
+
+        for text in [
+            // No typed operand: the amount is `i32` `2 << 7` = `256`, an overflow.
+            "x >> (2 << 7) == 0",
+            // `1u16 + (2 << 7)` is `257` at `u16`, an overflow.
+            "x >> (1u16 + (2 << 7)) == 0",
+            // `1 + (2 << 7)` is `257` at `i32`, an overflow.
+            "x >> (1 + (2 << 7)) == 0",
+            // The `u8` suffix is in the *nested* shift's amount, so the outer amount
+            // stays the `i32` `2 << 7u8` = `256`, an overflow.
+            "x >> (2 << 7u8) == 0",
+            // A typed operand outside the amount cannot narrow it: `300` stays `300`.
+            "(x >> 300) == 2u8",
+            "(x >> 300) == 2",
+            // Two typed operands of different widths are a type error.
+            "(x >> (1u8 + 1u16)) == 0",
+            "(x >> (1u8 + 1i8)) == 0",
+            // A cast fixes the amount's type and overrides what it casts:
+            // `(1u8) as u16 + (2 << 7)` is `1u16 + 128u16` = `257u16`, an overflow.
+            "x >> ((1u8) as u16 + (2 << 7)) == 0",
+            "x >> (1u8 as u16 + (2 << 7)) == 0",
+            // The width-dependent untyped folds were already refused and must stay so.
+            "(!0 + 1) < 1u8",
+            "(!0 + 2) == 1u8",
+        ] {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            assert!(p.parse_or().is_err(), "`{text}` is a rustc error and must be refused");
+        }
+    }
+
+    /// The provisional unsigned value of a fold that touched a complement must not
+    /// be range-checked as if it were a written literal.
+    ///
+    /// `y == !(!1 + 1)` for an `i8` `y` is valid Rust: `!1 + 1` is `-1` at `i8`, and
+    /// `!(-1)` is `0`, so the contract is `y == 0`. The reader evaluates the fold
+    /// unsigned (`255`) because its type is not known until it meets the `i8`, and
+    /// range-checking that *guess* refused the contract though no `255` is written.
+    /// An `Opaque` fold now records only its operands' envelopes, so the guess is
+    /// not checked -- while a genuine literal under the fold still is.
+    #[test]
+    fn an_opaque_folds_provisional_value_is_not_range_checked() {
+        let mut args = BTreeMap::new();
+        args.insert("y".to_string(), smt::var(8));
+        let mut signed = BTreeSet::new();
+        signed.insert("y".to_string());
+
+        let mut p = Parser::new("y == !(!1 + 1)", &args, None, &signed, true);
+        let pred = p.parse_or().expect("`y == !(!1 + 1)` is valid Rust and must read");
+        assert!(smt::evaluate_pred(pred, |_| Some(0)).unwrap(), "y == 0 reads true at 0");
+        assert!(!smt::evaluate_pred(pred, |_| Some(1)).unwrap(), "y == 0 reads false at 1");
+
+        // A literal *under* the fold is still range-checked against the type the
+        // complement meets: `!128` is an `i8` range error even though `!128` is
+        // `127`, so `y == !128` must be refused.
+        let mut p = Parser::new("y == !128", &args, None, &signed, true);
+        assert!(p.parse_or().is_err(), "`!128` meets an `i8` and must be refused");
     }
 
     /// A deeply nested amount must not exhaust the stack, because the parser

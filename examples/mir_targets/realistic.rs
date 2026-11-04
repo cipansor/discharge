@@ -978,6 +978,30 @@ pub fn contract_complement_division_with_typed_operand_reads(x: u8) -> u8 {
     x
 }
 
+/// A complement's *provisional* unsigned value must not be range-checked as if it
+/// were a written literal.
+///
+/// `!(!1 + 1)` for an `i8` is valid Rust: `!1 + 1` is `-1`, and `!(-1)` is `0`, so
+/// the value is `0`. The reader evaluates the fold unsigned (`255`) because its
+/// type is not known until it meets the `i8`, and range-checking that *guess*
+/// refused a contract naming it although no `255` is written. The fold now records
+/// only its operands' envelopes, so the guess is not checked while a genuine
+/// literal under the fold still is.
+/// requires: y == 0
+/// ensures: y == !(!1 + 1)
+pub fn contract_opaque_fold_provisional_value_is_not_range_checked(y: i8) -> i8 {
+    y
+}
+
+/// The negative control: a literal *under* the fold is still range-checked against
+/// the type the complement meets, so `!128` for an `i8` is a `literal out of
+/// range` error even though `!128` is `127`.
+/// requires: y == 127
+/// ensures: y == !128
+pub fn contract_literal_under_complement_is_still_range_checked(y: i8) -> i8 {
+    y
+}
+
 /// A `u128`-suffixed literal must be *refused*, not panicked.
 ///
 /// The suffix carries width 128, and the range check that guards the literal
@@ -3175,6 +3199,36 @@ pub fn contract_nested_shift_amount_sum_overflow_is_refused(x: u8) -> u8 {
 /// requires: true
 /// ensures: (x >> (1 + 1)) <= x
 pub fn contract_fitting_shift_amount_still_reads(x: u8) -> u8 {
+    x
+}
+
+// A *typed* operand inside the amount fixes the amount's type, so the amount is
+// folded at that width and not at `i32`. `x >> (1u8 + (2 << 7))` for a `u8` `x` is
+// a `u8` amount: `2 << 7` is `0u8`, so the amount is `1u8` and rustc accepts the
+// shift. Flooring the amount's literals at a flat `i32` built `2 << 7` as `256`
+// and *refused* the shift -- a false refusal on a program rustc accepts.
+//
+// The first is `verified`; the two negative controls after it are `skipped`.
+/// requires: true
+/// ensures: (x >> (1u8 + (2 << 7))) <= x
+pub fn contract_typed_amount_operand_fixes_the_width(x: u8) -> u8 {
+    x
+}
+
+/// The negative control: the `u8` suffix sits in the *nested* shift's amount, not
+/// among the outer amount's operands, so the outer amount stays the `i32`
+/// `2 << 7u8` = `256` -- a shift overflow, and a rustc error.
+/// requires: true
+/// ensures: (x >> (2 << 7u8)) == 0
+pub fn contract_nested_amount_suffix_does_not_fix_the_outer_width(x: u8) -> u8 {
+    x
+}
+
+/// A cast fixes the amount's type and overrides what it casts: `(1u8) as u16` is a
+/// `u16`, so `(1u8) as u16 + (2 << 7)` is `257u16` -- a shift overflow.
+/// requires: true
+/// ensures: (x >> ((1u8) as u16 + (2 << 7))) == 0
+pub fn contract_cast_amount_operand_fixes_the_width(x: u8) -> u8 {
     x
 }
 
