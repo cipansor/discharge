@@ -5762,8 +5762,17 @@ through a nested returned reference also leaves its sibling (`o.j.v`) at the cal
 Seven entries with their false twins, pinned by
 `a_returned_reference_carries_its_whole_projection`.
 
-**Evidence.** Corpus `decided 181 of 333` -> **`224 of 410`**; `cargo test --workspace
---features std` **608 -> 619** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+**A returned reference composes with its next use.** A reference from one call fed
+straight into another (`write_one(identity(&mut c.lo))`), a reborrow of it (`let s = &mut
+*r`), two returned references to *different* fields held at once, and a returned reference
+to a *tuple component* all decide through the same `addressed` mapping. A returned place
+whose key cannot be spelled (an *array element*, `&mut a[0]`) stays sound-incomplete: the
+true contract is refused rather than the write being dropped, which is the honest failure
+mode. Eight entries with their false twins, pinned by
+`a_returned_reference_composes_with_the_next_use`.
+
+**Evidence.** Corpus `decided 181 of 333` -> **`228 of 418`**; `cargo test --workspace
+--features std` **608 -> 620** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
 `mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.

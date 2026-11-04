@@ -1958,6 +1958,51 @@ fn a_returned_reference_carries_its_whole_projection() {
     }
 }
 
+/// A returned reference fed straight into another call, reborrowed, held alongside a
+/// second returned reference to a different field, or naming a tuple component.
+///
+/// The reborrow (`let s = &mut *r` where `r` came from a call) and the pass-through
+/// (`write_one(identity(&mut c.lo))`) both go through the same `addressed` mapping
+/// the returned reference installs. Two returned references to different fields must
+/// not collapse onto one, and a tuple component is a returned place the write-back key
+/// *can* spell (`Field(0)`), unlike an array element.
+#[test]
+fn a_returned_reference_composes_with_the_next_use() {
+    let Some(report) = verify_realistic(&[
+        "a_reference_returned_into_another_call",
+        "a_stale_returned_into_another_call_cannot_prove_this",
+        "a_reborrow_of_a_returned_reference",
+        "a_stale_reborrow_of_a_returned_reference_cannot_prove_this",
+        "two_returned_field_references",
+        "a_stale_two_returned_fields_cannot_prove_this",
+        "a_returned_tuple_component_reference",
+        "a_stale_tuple_component_reference_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "a_reference_returned_into_another_call",
+        "a_reborrow_of_a_returned_reference",
+        "two_returned_field_references",
+        "a_returned_tuple_component_reference",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a returned reference must compose with its next use; got: {o}");
+    }
+    for name in [
+        "a_stale_returned_into_another_call_cannot_prove_this",
+        "a_stale_reborrow_of_a_returned_reference_cannot_prove_this",
+        "a_stale_two_returned_fields_cannot_prove_this",
+        "a_stale_tuple_component_reference_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a dropped or misplaced write must not prove this false contract; got: {o}"
+        );
+    }
+}
+
 /// A slice's length is read through the *one* rvalue the compiler prints, on any
 /// toolchain.
 ///

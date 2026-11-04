@@ -4381,6 +4381,16 @@ pub fn a_stale_leaf_sibling_cannot_prove_this(mut d: DuoBox) -> u8 {
     d.w
 }
 
+/// A helper writing the constant one through a `&mut u8`.
+pub fn write_one(v: &mut u8) {
+    *v = 1;
+}
+
+/// A helper returning a `&mut` to a tuple component.
+pub fn tuple_mut(t: &mut (u8, u8)) -> &mut u8 {
+    &mut t.0
+}
+
 /// An inner helper that writes through a `&mut u8`.
 pub fn relay_set(v: &mut u8, x: u8) {
     *v = x;
@@ -4605,6 +4615,81 @@ pub fn a_write_through_a_second_argument_reference(mut a: OuterBox, mut b: Inner
 pub fn a_stale_second_argument_reference_cannot_prove_this(mut a: OuterBox, mut b: InnerBox) -> u8 {
     *pick_second(&mut a, &mut b) = 5;
     b.v
+}
+
+/// A reference returned by one call, passed straight into another.
+/// requires: true
+/// ensures: ret == 1
+pub fn a_reference_returned_into_another_call(mut c: Config) -> u8 {
+    write_one(borrowed_identity(&mut c.lo));
+    c.lo
+}
+
+/// The false direction of [`a_reference_returned_into_another_call`].
+/// requires: c.lo == 0
+/// ensures: ret == 0
+pub fn a_stale_returned_into_another_call_cannot_prove_this(mut c: Config) -> u8 {
+    write_one(borrowed_identity(&mut c.lo));
+    c.lo
+}
+
+/// A reborrow of a returned reference.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_reborrow_of_a_returned_reference(mut x: u8) -> u8 {
+    let r = borrowed_identity(&mut x);
+    let s = &mut *r;
+    *s = 5;
+    x
+}
+
+/// The false direction of [`a_reborrow_of_a_returned_reference`].
+/// requires: x == 0
+/// ensures: ret == 0
+pub fn a_stale_reborrow_of_a_returned_reference_cannot_prove_this(mut x: u8) -> u8 {
+    let r = borrowed_identity(&mut x);
+    let s = &mut *r;
+    *s = 5;
+    x
+}
+
+/// Two returned references to *different* fields, both written, and the first read.
+/// requires: true
+/// ensures: ret == 5
+pub fn two_returned_field_references(mut c: Config) -> u8 {
+    let r = borrowed_identity(&mut c.lo);
+    let s = borrowed_identity(&mut c.hi);
+    *r = 5;
+    *s = 7;
+    c.lo
+}
+
+/// The false direction of [`two_returned_field_references`]: the *other* field's
+/// write must not land on `lo`.
+/// requires: true
+/// ensures: ret == 7
+pub fn a_stale_two_returned_fields_cannot_prove_this(mut c: Config) -> u8 {
+    let r = borrowed_identity(&mut c.lo);
+    let s = borrowed_identity(&mut c.hi);
+    *r = 5;
+    *s = 7;
+    c.lo
+}
+
+/// A returned reference to a *tuple component*.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_returned_tuple_component_reference(mut t: (u8, u8)) -> u8 {
+    *tuple_mut(&mut t) = 5;
+    t.0
+}
+
+/// The false direction of [`a_returned_tuple_component_reference`].
+/// requires: true
+/// ensures: ret == 0
+pub fn a_stale_tuple_component_reference_cannot_prove_this(mut t: (u8, u8)) -> u8 {
+    *tuple_mut(&mut t) = 5;
+    t.0
 }
 
 /// A type whose method's tail collides with a *free function* of the same name.
