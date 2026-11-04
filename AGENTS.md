@@ -5831,8 +5831,25 @@ remember to assert the twin. The count is asserted too (`>= 40`), so the test ca
 vacuous if the naming convention drifts. Verified to fail by injecting a true contract
 under a `_cannot_prove_this` name.
 
-**Evidence.** Corpus `decided 181 of 333` -> **`241 of 443`**; `cargo test --workspace
---features std` **608 -> 625** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+**A callee contract is never assumed.** The engine inlines a callee's body rather than
+trusting its `ensures`, so a lying helper cannot hand a caller a proof, and a callee whose
+`requires` is *unsatisfiable* cannot be used to assume a false postcondition. Recursion and
+mutual recursion are the same property under the induction hypothesis and were checked
+separately. One honest incompleteness is pinned rather than left implicit: a callee's
+`requires` is **not** an obligation at the call site, so a violating call is decided from
+the inlined body -- sound because the body's own panics (a division by zero, say) still
+fail the path, but not a precondition check. That entry is named `..._is_not_checked`, not
+`..._cannot_prove_this`, so the corpus-wide probe invariant does not count it. Pinned by
+`a_callee_contract_is_never_assumed`; loop-invariant initiation and preservation are pinned
+by the same test.
+
+**Environment note.** `scripts/gate.sh` step 6 hard-fails when the `z3` Python module is
+missing, because an unavailable oracle is not evidence. It is a *test* oracle, not a
+dependency -- the crate stays zero-dependency. A fresh container needs
+`python3 -m pip install z3-solver` before the gate can go green.
+
+**Evidence.** Corpus `decided 181 of 333` -> **`246 of 458`**; `cargo test --workspace
+--features std` **608 -> 626** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
 `mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.

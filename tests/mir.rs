@@ -2210,6 +2210,77 @@ fn no_cannot_prove_entry_is_ever_verified() {
          has the naming convention changed?"
     );
 }
+/// A callee's contract is never taken on faith: its body is inlined, so a lying
+/// `ensures` cannot be inherited by a caller, and a vacuous `requires` cannot be
+/// used to assume a false postcondition.
+///
+/// This is the soundness property with the largest blast radius -- assuming a
+/// callee's postcondition is the canonical way a modular verifier proves a false
+/// contract -- so it is pinned directly rather than left implied by the absence of
+/// a bug report. The recursion cases are the same property under the inductive
+/// hypothesis, where an unguarded assumption is easiest to make.
+#[test]
+fn a_callee_contract_is_never_assumed() {
+    let Some(report) = verify_realistic(&[
+        "a_helper_whose_contract_is_false",
+        "a_caller_of_a_lying_helper_cannot_prove_this",
+        "a_caller_of_a_lying_helper_knows_the_truth",
+        "a_call_that_violates_a_precondition_is_not_checked",
+        "a_call_that_divides_by_zero_cannot_prove_this",
+        "a_vacuous_helper_whose_postcondition_is_false",
+        "a_caller_inheriting_a_vacuous_lie_cannot_prove_this",
+        "a_caller_of_a_vacuous_helper_knows_the_truth",
+        "a_recursive_contract_that_is_false_cannot_prove_this",
+        "a_mutual_lie_a_cannot_prove_this",
+        "a_mutual_lie_b_cannot_prove_this",
+        "an_invariant_false_on_entry_cannot_prove_this",
+        "an_invariant_not_preserved_cannot_prove_this",
+    ]) else {
+        return;
+    };
+
+    // The two entries that must verify are the *honest* directions: they are what
+    // proves the shapes above are decidable at all, rather than undecided for a
+    // reason that happens to look safe.
+    for name in [
+        "a_caller_of_a_lying_helper_knows_the_truth",
+        "a_caller_of_a_vacuous_helper_knows_the_truth",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "the honest direction must verify; `{name}` got: {o}");
+    }
+
+    // A callee's `requires` is not an obligation at the call site -- the body is
+    // inlined instead -- so this one verifies, and that is the honest answer rather
+    // than a false proof: the helper returns its argument whatever it is. Pinning it
+    // makes the *choice* visible instead of accidental.
+    let unchecked = outcome(&report, "a_call_that_violates_a_precondition_is_not_checked");
+    assert!(
+        unchecked.is_verified(),
+        "a callee precondition is not a call-site obligation; expected verified, got: {unchecked}"
+    );
+
+    for name in [
+        "a_helper_whose_contract_is_false",
+        "a_caller_of_a_lying_helper_cannot_prove_this",
+        "a_call_that_divides_by_zero_cannot_prove_this",
+        "a_vacuous_helper_whose_postcondition_is_false",
+        "a_caller_inheriting_a_vacuous_lie_cannot_prove_this",
+        "a_recursive_contract_that_is_false_cannot_prove_this",
+        "a_mutual_lie_a_cannot_prove_this",
+        "a_mutual_lie_b_cannot_prove_this",
+        "an_invariant_false_on_entry_cannot_prove_this",
+        "an_invariant_not_preserved_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "an assumed callee contract, an unchecked induction, or a vacuous \
+             precondition must not prove this; `{name}` got: {o}"
+        );
+    }
+}
+
 /// A slice's length is read through the *one* rvalue the compiler prints, on any
 /// toolchain.
 ///

@@ -4970,6 +4970,143 @@ pub fn relay_two(v: &mut &mut u8) {
     **v = 5;
 }
 
+/// A helper whose own `ensures` is false: the body returns 3, not 5.
+///
+/// Its purpose is the *caller* below. Assuming a callee's `ensures` instead of
+/// inlining its body is the canonical way a verifier proves a false contract, so
+/// this pair pins the property that the frontend never does.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_helper_whose_contract_is_false() -> u8 {
+    3
+}
+
+/// The caller of [`a_helper_whose_contract_is_false`]. If the callee's `ensures`
+/// were assumed rather than its body inlined, this false contract would verify.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_caller_of_a_lying_helper_cannot_prove_this() -> u8 {
+    a_helper_whose_contract_is_false()
+}
+
+/// The same call with the contract the body actually satisfies, so the *shape* is
+/// shown to be decidable and only the false direction fails.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_caller_of_a_lying_helper_knows_the_truth() -> u8 {
+    a_helper_whose_contract_is_false()
+}
+
+/// A helper with an unsatisfiable precondition.
+/// requires: x == 99
+/// ensures: ret == x
+pub fn a_helper_that_needs_99(x: u8) -> u8 {
+    x
+}
+
+/// A call that violates its callee's precondition.
+///
+/// This one *verifies*, and that is the honest answer rather than a false proof:
+/// a callee's `requires` is not turned into an obligation at the call site, the
+/// body is inlined instead, and `needs_99` returns its argument whatever it is, so
+/// `ret == 7` really does hold. The name says `_is_not_checked` rather than
+/// `_cannot_prove_this` because this entry is *not* a false-direction probe and
+/// must not be counted as one.
+/// requires: true
+/// ensures: ret == 7
+pub fn a_call_that_violates_a_precondition_is_not_checked() -> u8 {
+    a_helper_that_needs_99(7)
+}
+
+/// A helper whose precondition rules out zero, so its division is safe.
+/// requires: x != 0
+/// ensures: ret == 10 / x
+pub fn a_helper_that_divides_ten(x: u8) -> u8 {
+    10 / x
+}
+
+/// The same call-site violation, but where the callee's body *panics* on the
+/// violated input. Inlining the body is what catches this: the division by zero
+/// is an obligation of the inlined path, so the false `ret == 5` fails on a panic
+/// rather than verifying. This is why "the precondition is not checked at the
+/// call site" is sound-incomplete and not unsound.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_call_that_divides_by_zero_cannot_prove_this() -> u8 {
+    a_helper_that_divides_ten(0)
+}
+
+/// A helper with an *unsatisfiable* precondition and a postcondition that is false
+/// for its body.
+///
+/// The dangerous shape: a verifier that reads "the precondition is vacuous, so the
+/// contract holds trivially" may then assume `ret == 99` after any call. The body
+/// returns its argument, so that assumption is a false proof.
+/// requires: x > 200 && x < 10
+/// ensures: ret == 99
+pub fn a_vacuous_helper_whose_postcondition_is_false(x: u8) -> u8 {
+    x
+}
+
+/// The caller of [`a_vacuous_helper_whose_postcondition_is_false`]. If the callee's
+/// postcondition were assumed, this false contract would verify.
+/// requires: true
+/// ensures: ret == 99
+pub fn a_caller_inheriting_a_vacuous_lie_cannot_prove_this() -> u8 {
+    a_vacuous_helper_whose_postcondition_is_false(0)
+}
+
+/// The honest direction of the same call: what the body actually returns.
+/// requires: true
+/// ensures: ret == 0
+pub fn a_caller_of_a_vacuous_helper_knows_the_truth() -> u8 {
+    a_vacuous_helper_whose_postcondition_is_false(0)
+}
+
+/// Recursion whose contract is false. Assuming the recursive call's postcondition
+/// is the inductive step of a false proof.
+/// requires: true
+/// ensures: ret == 0
+pub fn a_recursive_contract_that_is_false_cannot_prove_this(n: u8) -> u8 {
+    if n == 0 { 0 } else { a_recursive_contract_that_is_false_cannot_prove_this(n - 1) + 1 }
+}
+
+/// One half of a mutually recursive pair whose contracts are false.
+/// requires: true
+/// ensures: ret == 0
+pub fn a_mutual_lie_a_cannot_prove_this(n: u8) -> u8 {
+    if n == 0 { 0 } else { a_mutual_lie_b_cannot_prove_this(n - 1) + 1 }
+}
+
+/// The other half of the mutually recursive pair.
+/// requires: true
+/// ensures: ret == 0
+pub fn a_mutual_lie_b_cannot_prove_this(n: u8) -> u8 {
+    if n == 0 { 0 } else { a_mutual_lie_a_cannot_prove_this(n - 1) + 1 }
+}
+
+/// An invariant that is false where the loop is entered. Checking initiation is
+/// what stops an arbitrary induction hypothesis being taken on faith.
+/// requires: n <= 3
+/// invariant: i == 5
+/// ensures: ret <= 3
+pub fn an_invariant_false_on_entry_cannot_prove_this(n: u8) -> u8 {
+    let mut i = 0u8;
+    while i < n { i += 1; }
+    i
+}
+
+/// An invariant the body does not preserve. Checking preservation is the other
+/// half of the induction.
+/// requires: n <= 3
+/// invariant: i == 0
+/// ensures: ret == 0
+pub fn an_invariant_not_preserved_cannot_prove_this(n: u8) -> u8 {
+    let mut i = 0u8;
+    while i < n { i += 1; }
+    i
+}
+
 /// A type whose method's tail collides with a *free function* of the same name.
 ///
 /// The collision is deliberately on names used by nothing else in this file: a
