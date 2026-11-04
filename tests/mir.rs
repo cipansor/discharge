@@ -2712,6 +2712,64 @@ fn a_cast_in_a_contract_can_be_ordered() {
     }
 }
 
+/// The `.wrapping_*` methods are the method-call spelling of the wrapping
+/// operators the contract language already models, and reading them is what lets a
+/// contract say what a body that uses them *means*.
+///
+/// Before this, every `x.wrapping_add(y)` in a contract was "cannot read contract",
+/// which leaves the function silently outside the check set -- the outcome the
+/// frontend exists to avoid. A two-variable relational sweep (208 pairs of
+/// `requires`/`ensures` over `u8` `x`, `y`, exhaustive ground truth over all 2^16
+/// pairs) went from **120 decided / 88 skipped** to **208 decided / 0 skipped**,
+/// with 0 unsound and 0 discrepancies, so the desugaring agrees with Rust on every
+/// pair it now reads.
+///
+/// The two refusals are the teeth: `x.wrapping_add(300)` is a rustc error for its
+/// `300` (the wrapping semantics excuse the overflow of the *result*, not an
+/// out-of-range literal), and `1.wrapping_add(2)` is `E0689` (an ambiguous
+/// `{integer}` receiver). Both must be refused, never given a verdict.
+#[test]
+fn a_wrapping_method_in_a_contract_is_read_as_the_operator_it_denotes() {
+    let names = [
+        "contract_wrapping_add_reads",
+        "contract_wrapping_add_is_a_value_tripwire",
+        "contract_wrapping_sub_mul_chain_reads",
+        "contract_wrapping_agrees_with_the_plain_operators",
+        "contract_wrapping_neg_on_unsigned_reads",
+        "contract_wrapping_neg_on_signed_reads",
+        "contract_wrapping_add_of_constants_wraps",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in [
+        "contract_wrapping_add_reads",
+        "contract_wrapping_sub_mul_chain_reads",
+        "contract_wrapping_agrees_with_the_plain_operators",
+        "contract_wrapping_neg_on_unsigned_reads",
+        "contract_wrapping_neg_on_signed_reads",
+        "contract_wrapping_add_of_constants_wraps",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let o = outcome(&report, "contract_wrapping_add_is_a_value_tripwire");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "the wrapping add is a value, so `+ 1` on it is false for every input; got: {o}"
+    );
+
+    for name in [
+        "contract_wrapping_add_of_an_out_of_range_literal_is_refused",
+        "contract_wrapping_add_on_an_untyped_receiver_is_refused",
+    ] {
+        let Some(report) = verify_realistic(&[name]) else { return };
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Skipped { .. }),
+            "`{name}` is a rustc error and must be refused, never given a verdict, got: {o}"
+        );
+    }
+}
+
 /// The contract operators that were missing (`/ % << >>`), and the precedence
 /// they need. A missing operator is a dropped obligation -- the contract is
 /// unreadable and the function silently leaves the check set -- so each entry

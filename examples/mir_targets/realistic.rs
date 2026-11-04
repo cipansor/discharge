@@ -1816,6 +1816,101 @@ pub fn contract_cast_relational_positive_tripwire(x: u8) -> u8 {
     x
 }
 
+/// `a.wrapping_add(b)` is the method-call spelling of the wrapping add the
+/// contract language already models as `a + b`, so the two must denote one term.
+/// The precondition is a *relation* between the two inputs, which is the shape the
+/// reader has to reason about rather than fold, and the body computes exactly the
+/// term the postcondition names.
+/// requires: x < y
+/// ensures: ret == x.wrapping_add(y)
+pub fn contract_wrapping_add_reads(x: u8, y: u8) -> u8 {
+    x.wrapping_add(y)
+}
+
+/// The tripwire: the wrapping add is a *value*, not a free variable, so naming it
+/// one too high is false for every input. Without this, a reader that treated
+/// `x.wrapping_add(y)` as an uninterpreted call would prove the true entry above
+/// and this one too.
+/// requires: x < y
+/// ensures: ret == x.wrapping_add(y).wrapping_add(1)
+pub fn contract_wrapping_add_is_a_value_tripwire(x: u8, y: u8) -> u8 {
+    x.wrapping_add(y)
+}
+
+/// The same sugar for `-` and `*`, and the chained form: the postfix applies left
+/// to right, so `x.wrapping_sub(1).wrapping_mul(2)` is `(x - 1) * 2` computed with
+/// wrapping at eight bits. The body writes the same wrapping operations, which
+/// pins that the two spellings denote one term on every input -- including the
+/// `x == 0` case, where the plain operators would instead panic on overflow.
+/// requires: true
+/// ensures: ret == x.wrapping_sub(1).wrapping_mul(2)
+pub fn contract_wrapping_sub_mul_chain_reads(x: u8) -> u8 {
+    x.wrapping_sub(1).wrapping_mul(2)
+}
+
+/// And the agreement with the *plain* operators where no overflow can occur: in
+/// `1..=100` the wrapping and the checked operations coincide, so the body may
+/// write `(x - 1) * 2` and the contract's sugar must denote the same value. This
+/// is the entry that separates "the sugar is the operator" from "the sugar is an
+/// uninterpreted call", which the entry above cannot: there the body is wrapping
+/// too, so a reader that modelled both as a fresh variable would still agree.
+/// requires: x >= 1 && x <= 100
+/// ensures: ret == x.wrapping_sub(1).wrapping_mul(2)
+pub fn contract_wrapping_agrees_with_the_plain_operators(x: u8) -> u8 {
+    (x - 1) * 2
+}
+
+/// `wrapping_neg` is `0 - x` at the operand's width, and it is legal for an
+/// *unsigned* receiver where the unary `-` is not: `(1u8).wrapping_neg()` is
+/// `255`. A reader that reused the unary negation's signed-only rule would refuse
+/// this, so the entry pins that the sugar is read as the wrapping operator it is.
+/// requires: true
+/// ensures: ret == (1u8).wrapping_neg()
+pub fn contract_wrapping_neg_on_unsigned_reads() -> u8 {
+    255
+}
+
+/// And on a signed receiver: `y.wrapping_neg()` for an `i8` is `0 - y`, which at
+/// `y == i8::MIN` is `i8::MIN` again rather than an overflow, so the body's
+/// `wrapping_neg` and the contract's are one value.
+/// requires: true
+/// ensures: ret == y.wrapping_neg()
+pub fn contract_wrapping_neg_on_signed_reads(y: i8) -> i8 {
+    y.wrapping_neg()
+}
+
+/// The deliberate difference from `+`: a *constant* `+` that overflows its type is
+/// refused (`200u8 + 100u8` is a rustc error), but `200u8.wrapping_add(100u8)` is
+/// a legal program whose value is `44`. So the sugar must not run the overflow
+/// fold -- it takes the engine's wrapping value, which is what Rust computes. This
+/// entry fails if the reader refuses the shape, and is refuted if it computes
+/// `300`.
+/// requires: true
+/// ensures: ret == 200u8.wrapping_add(100u8)
+pub fn contract_wrapping_add_of_constants_wraps() -> u8 {
+    44
+}
+
+/// The operands' literals are still range-checked against the type they meet:
+/// `x.wrapping_add(300)` is a rustc error for its `300`, so the shape is refused
+/// rather than decided, even though the *method* is a wrapping one. The wrapping
+/// semantics excuse the overflow of the *result*, not an out-of-range literal.
+/// requires: true
+/// ensures: ret == x.wrapping_add(300)
+pub fn contract_wrapping_add_of_an_out_of_range_literal_is_refused(x: u8) -> u8 {
+    x
+}
+
+/// A receiver whose type is not known is refused: Rust rejects
+/// `1.wrapping_add(2)` with `E0689` ("can't call method on ambiguous numeric type
+/// `{integer}`"), so the reader must not silently give the bare literal the
+/// scope's width and decide the shape.
+/// requires: true
+/// ensures: ret == 1.wrapping_add(2)
+pub fn contract_wrapping_add_on_an_untyped_receiver_is_refused(x: u8) -> u8 {
+    x
+}
+
 /// Unary `-` binds *tighter* than `as` in Rust, so `-x as u8` is `(-x) as u8`,
 /// not `-(x as u8)`. The two readings agree on the value here — negation and
 /// truncation commute — but not on the *type*: Rust's is `u8`, the other is

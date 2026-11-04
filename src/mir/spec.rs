@@ -3361,6 +3361,78 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_atom(&mut self) -> Result<(Var, Sign), SpecError> {
+        let (v, s) = self.parse_primary()?;
+        self.parse_wrapping_postfix(v, s)
+    }
+
+    /// A postfix `.wrapping_add(arg)` / `.wrapping_sub(arg)` / `.wrapping_mul(arg)`
+    /// / `.wrapping_neg()` on a value -- the method-call spelling of the wrapping
+    /// operators the contract language already models.
+    ///
+    /// The desugaring is exact, and that is the whole reason it can be read: `a + b`
+    /// in a contract *is* a bit-vector add, which wraps at the operand width, so
+    /// `a.wrapping_add(b)` and `a + b` denote the same term. The one deliberate
+    /// difference is the constant-overflow refusal: `200 + 100` is refused because
+    /// rustc rejects that constant expression, where `200u8.wrapping_add(100u8)` is
+    /// a legal program whose value is `44`, so the sugar must *not* run the fold --
+    /// the engine's own wrapping operator is the value Rust computes. The operands'
+    /// literals are still range-checked against the type they meet (`x.wrapping_add(300)`
+    /// is a rustc error for its `300`), which is what `align_widths` does.
+    ///
+    /// The receiver's type must be *fixed*. Rust refuses `1.wrapping_add(2)` with
+    /// `E0689` (the receiver is an ambiguous `{integer}`), so a receiver that is
+    /// only a bare literal is refused rather than silently given the scope's width.
+    fn parse_wrapping_postfix(&mut self, v: Var, sgn: Sign) -> Result<(Var, Sign), SpecError> {
+        let (mut v, mut sgn) = (v, sgn);
+        loop {
+            if !matches!(self.peek(), Some(Tok::Op(o)) if o == ".") {
+                return Ok((v, sgn));
+            }
+            let Some(Tok::Ident(name)) = self.toks.get(self.pos + 1).cloned() else {
+                return Ok((v, sgn));
+            };
+            let takes_arg = match name.as_str() {
+                "wrapping_add" | "wrapping_sub" | "wrapping_mul" => true,
+                "wrapping_neg" => false,
+                // Any other method is left in place: the caller reports the
+                // trailing token, exactly as before this sugar existed.
+                _ => return Ok((v, sgn)),
+            };
+            if !sgn.fixes_type() {
+                return Err(self.err(format!(
+                    "`{name}` needs a receiver whose integer type is known; a bare literal is an \
+                     ambiguous `{{integer}}` in Rust"
+                )));
+            }
+            self.pos += 2;
+            if !self.eat_op("(") {
+                return Err(self.err(format!("`{name}` is a call: write `{name}(..)`")));
+            }
+            let (r, rs) = if takes_arg {
+                self.parse_expr()?
+            } else {
+                (v, sgn)
+            };
+            if !self.eat_op(")") {
+                return Err(self.err(format!("`{name}` is missing its closing `)`")));
+            }
+            let out = Sign::combine(sgn, rs);
+            let (l, r) = self.align_widths(v, sgn, r, rs, out)?;
+            v = match name.as_str() {
+                "wrapping_add" => smt::add(l, r),
+                "wrapping_sub" => smt::sub(l, r),
+                "wrapping_mul" => smt::mul(l, r),
+                // `wrapping_neg` is `0 - x` at the operand's width, and it is legal
+                // for an *unsigned* receiver too -- `(1u8).wrapping_neg()` is `255`,
+                // which the unary `-` (signed-only) deliberately refuses.
+                _ => smt::sub(smt::word(0, smt::bits(l)), l),
+            };
+            self.record_fold_result(v, l, r, out);
+            sgn = out;
+        }
+    }
+
+    fn parse_primary(&mut self) -> Result<(Var, Sign), SpecError> {
         match self.peek().cloned() {
             Some(Tok::Num(n, suffix)) => {
                 self.pos += 1;

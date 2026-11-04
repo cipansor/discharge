@@ -5355,3 +5355,59 @@ entries while never once being asked to support an inference. The dimension to l
 one every existing entry holds constant -- here, that the only operator the cast ever meets is
 `==`.
 
+## A method the contract language does not read is an obligation silently dropped
+
+The two-variable relational sweep (208 `requires`/`ensures` pairs over a `u8` `x` and `y`,
+exhaustive ground truth over all 2^16 pairs) decided 120 and *skipped* 88. Every one of the 88
+had the same cause: `x.wrapping_add(y)` in a contract was "cannot read contract". Since a
+refused contract means the function is not verified *at all*, that is the worst outcome the
+frontend can produce -- not a wrong verdict, but a silently absent one.
+
+The fix is exact by construction, which is why it is safe: `a + b` in a contract already *is* a
+bit-vector add, which wraps at the operand width, so `a.wrapping_add(b)` and `a + b` denote the
+same term. `wrapping_add`, `wrapping_sub`, `wrapping_mul` and `wrapping_neg` are now read as a
+postfix on an atom. The receiver's type must be *fixed*: rustc refuses `1.wrapping_add(2)` with
+`E0689` (an ambiguous `{integer}`), so a bare-literal receiver is refused rather than silently
+given the scope's width.
+
+Two details are the whole subtlety, and both come from what Rust checks rather than what it
+computes:
+
+* The sugar must **not** run the constant-overflow fold. `200u8 + 100u8` is a rustc error, but
+  `200u8.wrapping_add(100u8)` is a legal program whose value is `44`, so the sugar takes the
+  engine's own wrapping value instead of `fold_const_arith`.
+* The operands' literals are **still** range-checked against the type they meet: `x.wrapping_add(300)`
+  is a rustc error for its `300`. The wrapping semantics excuse the overflow of the *result*, not
+  an out-of-range literal, which is what `align_widths` already enforces.
+
+`wrapping_neg` is `0 - x` at the operand's width and is legal for an *unsigned* receiver where
+the unary `-` deliberately is not (`(1u8).wrapping_neg()` is `255`), so it is built as a `Sub`
+rather than routed through `parse_neg`'s signed-only refusal.
+
+**Evidence.** The relational sweep went from **120 decided / 88 skipped** to **208 decided / 0
+skipped**, with **0 unsound, 0 discrepancies**. A second sweep pinned the sugar's *value* against
+an exhaustive model over all four operators, both signednesses, and 8- and 16-bit widths:
+**839 decided, 0 failures** -- where the body returns the model's constant, so only the contract's
+value is under test. A third sweep, with Rust's own wrapping operation in the body, was
+**0 refuted, 0 false proofs**; its 128 skips were all 16-bit `wrapping_mul` *bodies*, i.e. the
+same documented scaling wall as `sat_mul`, not the contract.
+
+The corpus carries eight entries and `a_wrapping_method_in_a_contract_is_read_as_the_operator_it_denotes`
+pins them: five verified (`contract_wrapping_add_reads`, `..._sub_mul_chain_reads`,
+`..._agrees_with_the_plain_operators`, `..._neg_on_unsigned_reads`, `..._neg_on_signed_reads`,
+`..._add_of_constants_wraps`), one tripwire (`..._add_is_a_value_tripwire`), and two refusals
+(`..._add_of_an_out_of_range_literal_is_refused`, `..._add_on_an_untyped_receiver_is_refused`).
+The entry was confirmed to have teeth: returning early from `parse_wrapping_postfix` turns the
+test red.
+
+A note on the sweeps themselves, because two of them were wrong before they were right, and the
+mistakes are the kind a differential oracle exists to catch. The first version wrote the *unary*
+form `-127i8.wrapping_add(x)` in the contract and `(-127i8).wrapping_add(x)` in the body; Rust
+binds a method call tighter than unary minus, so the two are `-(127i8.wrapping_add(x))` and
+`(-127i8).wrapping_add(x)` -- different expressions, and the 220 "failures" were the sweep's, not
+the engine's. The second version put the real `wrapping_mul` in the body and read the engine's
+documented 16-bit incompleteness as a contract failure. A sweep that does not model its own
+program correctly reports the engine's bugs as its own and its own as the engine's; each was
+resolved by asking rustc what the program *means* (a MIR dump, not a guess) before believing the
+verdict.
+
