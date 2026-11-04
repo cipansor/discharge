@@ -656,6 +656,12 @@ pub fn set_five(v: &mut u8) {
     *v = 5;
 }
 
+/// A scalar helper that writes its own *by-value* argument and returns it.
+pub fn set_five_by_value(mut x: u8) -> u8 {
+    x = 5;
+    x
+}
+
 /// A helper's field write through a `&mut` reaches the caller.
 ///
 /// The write happens one frame down: `set_lo_through_ref(c)` runs `c.lo = 5` in
@@ -796,6 +802,62 @@ pub fn conditional_helper_write_reaches_the_caller(mut x: u8, c: bool) -> u8 {
 /// ensures: ret == 0
 pub fn a_conditional_helper_write_cannot_prove_this(mut x: u8, c: bool) -> u8 {
     set_five_if(&mut x, c);
+    x
+}
+
+/// A helper writes through a `&mut` to an *array element* target.
+///
+/// The reference names `a[0]`, so the callee is handed a scalar and its store for
+/// that local is the caller's array carried in for the read. Copying the callee's
+/// store back unconditionally would carry the poison its whole-place write left on
+/// that store, so the caller's *untouched* `a[1]` would read unknown. Gating the
+/// element copy-back on a whole-local target is what keeps the sibling readable.
+/// requires: true
+/// ensures: ret == 5
+pub fn helper_write_reaches_an_element_target(mut a: [u8; 3]) -> u8 {
+    set_five(&mut a[0]);
+    a[0]
+}
+
+/// The false direction of [`helper_write_reaches_an_element_target`].
+/// requires: a[0] == 0
+/// ensures: ret == 0
+pub fn a_stale_element_target_cannot_prove_this(mut a: [u8; 3]) -> u8 {
+    set_five(&mut a[0]);
+    a[0]
+}
+
+/// A write to one element leaves its *sibling* alone.
+/// requires: a[1] == 7
+/// ensures: ret == 7
+pub fn an_element_write_leaves_its_sibling(mut a: [u8; 3]) -> u8 {
+    set_five(&mut a[0]);
+    a[1]
+}
+
+/// The false direction of [`an_element_write_leaves_its_sibling`].
+/// requires: a[1] == 7
+/// ensures: ret == 0
+pub fn a_stale_element_sibling_cannot_prove_this(mut a: [u8; 3]) -> u8 {
+    set_five(&mut a[0]);
+    a[1]
+}
+
+/// A callee's write to a *by-value* argument is its own copy and must not reach
+/// the caller.
+/// requires: x == 3
+/// ensures: ret == 3
+pub fn a_by_value_callee_write_stays_in_the_callee(x: u8) -> u8 {
+    let _ = set_five_by_value(x);
+    x
+}
+
+/// The false direction of [`a_by_value_callee_write_stays_in_the_callee`]: if the
+/// callee's write leaked back, `ret == 5` would prove.
+/// requires: x == 3
+/// ensures: ret == 5
+pub fn a_by_value_callee_write_cannot_prove_this(x: u8) -> u8 {
+    let _ = set_five_by_value(x);
     x
 }
 

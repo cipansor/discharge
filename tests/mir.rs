@@ -1606,6 +1606,49 @@ fn a_helper_write_lands_on_the_targets_projection() {
     }
 }
 
+/// A reference to an array *element* (`set5(&mut a[0])`) is a sub-place target too,
+/// and a by-value argument's callee write must stay in the callee.
+///
+/// Two opposite directions in one test. The element target has to land the write at
+/// `a[0]` and leave `a[1]` readable: the callee holds the caller's array under its
+/// own local, its whole-place write poisons that store, and copying the store back
+/// unconditionally would make the *untouched* sibling unknown -- which is why the
+/// copy-back is gated on a whole-local target. The by-value pair is the other
+/// direction: `set_five_by_value(x)` writes its own copy, so the caller must still
+/// read its seed, and a leak back would prove the false `ret == 5`.
+#[test]
+fn an_element_target_is_written_and_a_by_value_copy_is_not() {
+    let Some(report) = verify_realistic(&[
+        "helper_write_reaches_an_element_target",
+        "a_stale_element_target_cannot_prove_this",
+        "an_element_write_leaves_its_sibling",
+        "a_stale_element_sibling_cannot_prove_this",
+        "a_by_value_callee_write_stays_in_the_callee",
+        "a_by_value_callee_write_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "helper_write_reaches_an_element_target",
+        "an_element_write_leaves_its_sibling",
+        "a_by_value_callee_write_stays_in_the_callee",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "this contract must verify; got: {o}");
+    }
+    for name in [
+        "a_stale_element_target_cannot_prove_this",
+        "a_stale_element_sibling_cannot_prove_this",
+        "a_by_value_callee_write_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a stale caller value must not prove this false contract; got: {o}"
+        );
+    }
+}
+
 /// A slice's length is read through the *one* rvalue the compiler prints, on any
 /// toolchain.
 ///

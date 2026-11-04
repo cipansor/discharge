@@ -2139,8 +2139,19 @@ where
                         let cl = target.local;
                         // An indexed referent (`&mut [T]` / `&mut [T; N]`): the
                         // callee's element store *is* the caller's post-state.
-                        if let Some(s) = st.env.indexed.get(cal) {
-                            env.indexed.insert(cl, s.clone());
+                        //
+                        // Only when the target is the *whole* local. For a
+                        // sub-place target (`set5(&mut a[0])`) the callee's local
+                        // is a scalar `&mut u8`, and the store the callee holds for
+                        // it is the caller's array carried in for the read -- which
+                        // the callee's whole-place write *poisoned*. Copying that
+                        // poison back would make the caller's untouched `a[0]` read
+                        // unknown, turning a decidable contract into an incomplete
+                        // one.
+                        if target.proj.is_empty() {
+                            if let Some(s) = st.env.indexed.get(cal) {
+                                env.indexed.insert(cl, s.clone());
+                            }
                         }
                         // A whole-referent write (`*v = x`). The whole place was
                         // replaced, so the caller's derived parts are dropped

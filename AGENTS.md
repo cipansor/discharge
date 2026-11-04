@@ -5609,11 +5609,12 @@ store, single-field parts and nested parts, keyed on the pointee for a reference
 cloned into the callee's env. `read_modify_write_through_helper` goes from incomplete to
 verified on this.
 
-Thirteen corpus entries, pinned by three tests
+Nineteen corpus entries, pinned by four tests
 (`a_helpers_write_through_a_mutable_reference_reaches_the_caller`,
 `a_helpers_nested_and_read_modify_write_through_a_reference_are_modelled`,
-`a_helper_write_lands_on_the_targets_projection`). The first seven are the write-back
-itself:
+`a_helper_write_lands_on_the_targets_projection`,
+`an_element_target_is_written_and_a_by_value_copy_is_not`). The first seven are the
+write-back itself:
 
 | entry | shape | verdict |
 |---|---|---|
@@ -5652,8 +5653,23 @@ alone: the callee writes on one path and not the other, so the caller's value ha
 back from the path taken. With the write-back removed, the flag case would read the seed
 and the `ret == 5` contract would be refuted while the `ret == 0` twin *verified*.
 
-**Evidence.** Corpus `decided 181 of 333` -> **`188 of 346`**; `cargo test --workspace
---features std` **608 -> 612** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+**The copy-back is per-store, and only for a whole-local target.** Gating the *element*
+copy-back the same way exposed the other half of the same idea. A reference to an element
+(`set_five(&mut a[0])`) hands the callee a *scalar*; the callee's store for that local is
+the caller's array, carried in so its read is modelled. The callee's whole-place write
+poisons that store, and copying it back unconditionally made the caller's *untouched*
+`a[1]` read unknown -- an incomplete contract where a decision was available. The element
+copy-back now runs only for a whole-local target, so `an_element_write_leaves_its_sibling`
+decides while the false twins stay refuted.
+
+The opposite direction is pinned in the same test: a callee that writes its own *by-value*
+argument (`set_five_by_value(x)`) must leave the caller's value alone, so
+`a_by_value_callee_write_stays_in_the_callee` verifies and the `ret == 5` twin is refuted.
+That is the boundary the whole write-back exists to keep: a reference shares storage, a
+value does not.
+
+**Evidence.** Corpus `decided 181 of 333` -> **`191 of 352`**; `cargo test --workspace
+--features std` **608 -> 613** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
 `mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.
@@ -5662,4 +5678,6 @@ Still not modelled, and named so the boundary is honest: the write-back merges t
 callee's state for a reference argument, so a callee that stores a *coarser* shape than
 the caller reads (`&mut _1.0` handed over as a whole-place target) drops the caller's
 parts under `_1` rather than tracking the sub-place -- precision is lost, never a stale
-value kept.
+value kept. A `&mut` target whose element the callee *did* write is still not copied back
+(a `&mut [T]` argument is the case that is); the caller's own store keeps the value it
+held, so the read is stale rather than unknown only when the caller never wrote it.
