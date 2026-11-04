@@ -4080,6 +4080,44 @@ pub fn a_method_with_an_argument(t: Couple) -> u8 {
     t.shift_by(4)
 }
 
+/// A *reborrow* target: `set_five(&mut *r)` where `r: &mut u8`.
+///
+/// The `&mut *r` names the place `r` already addresses, so the write belongs to the
+/// caller's `x`, not to the local `r`. `resolve` collapses the deref, which is what
+/// makes this one store.
+/// requires: true
+/// ensures: ret == 5
+pub fn a_reborrow_target_reaches_the_caller(mut x: u8) -> u8 {
+    let r = &mut x;
+    set_five(&mut *r);
+    x
+}
+
+/// The false direction of [`a_reborrow_target_reaches_the_caller`].
+/// requires: x == 0
+/// ensures: ret == 0
+pub fn a_stale_reborrow_cannot_prove_this(mut x: u8) -> u8 {
+    let r = &mut x;
+    set_five(&mut *r);
+    x
+}
+
+/// A write through a `&mut` to a *tuple component* target (`&mut t.0`).
+/// requires: true
+/// ensures: ret == 5
+pub fn a_tuple_component_target_reaches_the_caller(mut t: Pair) -> u8 {
+    set_five(&mut t.0);
+    t.0
+}
+
+/// The false direction of [`a_tuple_component_target_reaches_the_caller`].
+/// requires: t.0 == 0
+/// ensures: ret == 0
+pub fn a_stale_tuple_component_cannot_prove_this(mut t: Pair) -> u8 {
+    set_five(&mut t.0);
+    t.0
+}
+
 /// A type whose method's tail collides with a *free function* of the same name.
 ///
 /// The collision is deliberately on names used by nothing else in this file: a

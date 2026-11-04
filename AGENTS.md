@@ -5685,7 +5685,17 @@ The five shapes a method takes were then probed and all decide: a generic receiv
 returns `&mut Self`, a trait method on a concrete receiver, and a `&self` read -- on a
 tuple struct and with an argument. They are in the same test.
 
-**Evidence.** Corpus `decided 181 of 333` -> **`199 of 363`**; `cargo test --workspace
+Two more sub-place targets are decided and in the corpus: a *reborrow* (`set_five(&mut
+*r)` where `r: &mut u8`, which `resolve` collapses onto the caller's `x`) and a *tuple
+component* (`&mut t.0`). Both verify, both have a refuted false twin.
+
+A shape that is *refused* rather than decided, and named so it is not mistaken for a
+decision: a place like `o.a[0]` -- an element of a struct's array field -- is not readable
+in a contract (`unknown field`), because `Ty::Struct` has no layout, so a contract naming
+it is skipped and a bare `ret == 5` there goes `incomplete`. That is a missing decision,
+not a wrong one: the write itself lands, and no false contract is proved.
+
+**Evidence.** Corpus `decided 181 of 333` -> **`201 of 367`**; `cargo test --workspace
 --features std` **608 -> 614** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3

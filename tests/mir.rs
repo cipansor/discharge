@@ -1672,6 +1672,10 @@ fn a_method_is_inlined_by_its_tail_and_an_ambiguous_tail_is_refused() {
         "a_trait_method",
         "a_tuple_struct_read_method",
         "a_method_with_an_argument",
+        "a_reborrow_target_reaches_the_caller",
+        "a_stale_reborrow_cannot_prove_this",
+        "a_tuple_component_target_reaches_the_caller",
+        "a_stale_tuple_component_cannot_prove_this",
     ]) else {
         return;
     };
@@ -1692,6 +1696,25 @@ fn a_method_is_inlined_by_its_tail_and_an_ambiguous_tail_is_refused() {
         assert!(o.is_verified(), "a method write must reach its caller; got: {o}");
     }
     for name in ["a_method_write_cannot_prove_this", "a_stale_sibling_cannot_prove_this"] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a stale caller value must not prove this false contract; got: {o}"
+        );
+    }
+    // A reborrow (`&mut *r`) and a tuple component (`&mut t.0`) are sub-place targets
+    // too, and both land on the caller's storage.
+    for name in [
+        "a_reborrow_target_reaches_the_caller",
+        "a_tuple_component_target_reaches_the_caller",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a sub-place target must reach the caller; got: {o}");
+    }
+    for name in [
+        "a_stale_reborrow_cannot_prove_this",
+        "a_stale_tuple_component_cannot_prove_this",
+    ] {
         let o = outcome(&report, name);
         assert!(
             matches!(o, FnOutcome::Failed { .. }),
