@@ -2272,6 +2272,53 @@ fn a_deep_term_walk_is_refused_not_allowed_to_overflow_the_stack() {
     );
 }
 
+/// A pin applies to an aggregate *part*, not only to a whole argument.
+///
+/// `requires: w.v == -7` names a struct field, `requires: o.i.v == -7` names a nested
+/// path, and `requires: xs[0] == -7` names an array element. All three are the same shape
+/// as the argument-level pin -- a closed equality in the precondition, under any nesting of
+/// `&&` -- but the variable the contract binds is a part's, not a local's. Keying the pin by
+/// the argument's *local* reached none of them, so the body's `w.v / 3` stayed symbolic and
+/// built the 64-bit restoring divider: `incomplete` in ~1.2s, decided in ~0s once the pin is
+/// keyed by the variable's own index.
+///
+/// The `cannot_prove_this` companions are the point of the test. Without them, an engine
+/// that answered `Verified` for everything would pass the positive assertions, so the
+/// negatives are what make "decided" mean "decided correctly": the fold refutes a wrong
+/// claim about the same pinned part, which is only possible if the value really is `-7`.
+#[test]
+fn a_pin_reaches_an_aggregate_part_not_only_a_whole_argument() {
+    let Some(report) = verify_realistic(&[
+        "a_field_pinned_division_at_i64",
+        "a_field_pinned_division_cannot_prove_this",
+        "a_nested_pinned_division_at_i64",
+        "a_nested_pinned_division_cannot_prove_this",
+        "an_element_pinned_division_at_i64",
+        "an_element_pinned_division_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "a_field_pinned_division_at_i64",
+        "a_nested_pinned_division_at_i64",
+        "an_element_pinned_division_at_i64",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a pinned aggregate part must be decided; `{name}` got: {o}");
+    }
+    for name in [
+        "a_field_pinned_division_cannot_prove_this",
+        "a_nested_pinned_division_cannot_prove_this",
+        "an_element_pinned_division_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            !o.is_verified(),
+            "a false claim about a pinned part must be refuted, not proved; `{name}` got: {o}"
+        );
+    }
+}
+
 /// A callee's contract is never taken on faith: its body is inlined, so a lying
 /// `ensures` cannot be inherited by a caller, and a vacuous `requires` cannot be
 /// used to assume a false postcondition.

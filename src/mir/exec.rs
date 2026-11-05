@@ -1357,12 +1357,16 @@ pub struct Seeds {
     /// contract names, so `m.Data` in a contract and `((_1 as Data).0)` in the
     /// body name one variable rather than two that look alike.
     pub payload_seeds: Vec<(u32, u64, Var, u8, bool)>,
-    /// `(local, value)` for each argument the precondition pins to a constant.
+    /// `(variable index, value)` for each variable the precondition pins to a
+    /// constant.
     ///
-    /// The argument is seeded with the literal instead of a fresh symbolic input.
-    /// Sound -- every model of the precondition has the argument equal to it -- and
-    /// it is what lets a body whose only operand is pinned build its operations on a
-    /// literal, where the constant folds collapse them. See [`crate::smt::pinned_vars`].
+    /// The variable is seeded with the literal instead of a fresh symbolic input.
+    /// Sound -- every model of the precondition has it equal to that -- and it is
+    /// what lets a body whose only operand is pinned build its operations on a
+    /// literal, where the constant folds collapse them. Keyed by the variable's own
+    /// index, so a pin applies wherever that variable is seeded: an argument (whose
+    /// index is its local), a struct field, a nested path, or an element. See
+    /// [`crate::smt::pinned_vars`].
     pub pins: Vec<(u32, u64)>,
 }
 
@@ -1422,27 +1426,39 @@ where
     };
 
     let mut env = Env::with_enums(&prog.enums);
+    // A pinned variable takes the literal its precondition fixes it to, so the
+    // body's operations fold instead of building a circuit over an input that has
+    // only one value. The pin is keyed by *variable index*, so it applies wherever
+    // that variable is seeded -- an argument (whose index is its local) and an
+    // aggregate part (a field, a nested path, an element) alike. See
+    // [`crate::smt::pinned_vars`].
+    let pin_of = |v: Var| -> Option<u64> {
+        let idx = smt::index(v);
+        seeds.pins.iter().find(|(i, _)| *i == idx).map(|(_, k)| *k)
+    };
+    // The literal for a pinned variable, masked to the variable's own width: the
+    // value a precondition writes is signed (`-7`), and the pattern the seed needs
+    // is two's complement at that width (`249` at eight bits).
+    let lit_of = |v: Var, k: u64| -> Var {
+        let w = smt::bits(v);
+        let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        smt::word(k & mask, w)
+    };
     for &l in &f.arg_locals {
         let ty = f.ty_of(l).cloned().unwrap_or(Ty::Other("?".into()));
-        // A pinned argument takes the literal the precondition fixes it to, so the
-        // body's operations fold instead of building a circuit over an input that
-        // has only one value. See [`crate::smt::pinned_vars`].
-        let pin = seeds.pins.iter().find(|(local, _)| *local == l).map(|(_, k)| *k);
-        let v = match (ty.width(), pin) {
-            (Some(w), Some(k)) => {
-                let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                let lit = smt::word(k & mask, w);
-                if w == 1 {
-                    Val::Bool(smt::truth(k & 1 != 0))
-                } else {
-                    Val::Sym(lit, Sign::of(&ty))
+        let v = match ty.width() {
+            Some(w) => {
+                let sym = smt::var_named(l, w);
+                match pin_of(sym) {
+                    Some(k) if w == 1 => Val::Bool(smt::truth(k & 1 != 0)),
+                    Some(k) => Val::Sym(lit_of(sym, k), Sign::of(&ty)),
+                    None if w == 1 => Val::Bool(sym.eq_val(1)),
+                    // The argument's own type declares its sign, so the value
+                    // carries it rather than a later site having to look it up.
+                    None => Val::Sym(sym, Sign::of(&ty)),
                 }
             }
-            (Some(1), None) => Val::Bool(smt::var_named(l, 1).eq_val(1)),
-            // The argument's own type declares its sign, so the value carries it
-            // rather than a later site having to look it up.
-            (Some(w), None) => Val::Sym(smt::var_named(l, w), Sign::of(&ty)),
-            (None, _) => Val::Unknown,
+            None => Val::Unknown,
         };
         env.locals.insert(l, v);
         // A `&T` argument may be dereferenced: `Ty::Ref` is modelled as its
@@ -1455,13 +1471,21 @@ where
     // variable, and the body's `((*_1).0)` reads it from here, so the two are the
     // same symbolic input rather than two that merely look alike.
     for &(local, field, v, signed) in &seeds.fields {
-        env.fields.insert((local, field), Val::Sym(v, Sign::of_bool(signed)));
+        let val = match pin_of(v) {
+            Some(k) => Val::Sym(lit_of(v, k), Sign::of_bool(signed)),
+            None => Val::Sym(v, Sign::of_bool(signed)),
+        };
+        env.fields.insert((local, field), val);
     }
     // Nested field paths the contract names, keyed by the whole projection chain
     // so the body's `(((*_1).0).0)` reads the same variable the contract's `o.i.v`
     // was rewritten to.
     for &(local, ref chain, v, signed) in &seeds.nested {
-        env.nested.insert((local, chain.clone()), Val::Sym(v, Sign::of_bool(signed)));
+        let val = match pin_of(v) {
+            Some(k) => Val::Sym(lit_of(v, k), Sign::of_bool(signed)),
+            None => Val::Sym(v, Sign::of_bool(signed)),
+        };
+        env.nested.insert((local, chain.clone()), val);
     }
     // Slice lengths and elements the contract names. The contract's `xs.len()` and
     // `xs[0]` and the body's `PtrMetadata(_1)` and `(*_1)[0]` must be one value,
@@ -1492,6 +1516,10 @@ where
     }
     for &(local, index, v, _) in &seeds.elems {
         if let Some(s) = env.indexed.get_mut(&local) {
+            let v = match pin_of(v) {
+                Some(k) => lit_of(v, k),
+                None => v,
+            };
             s.elems.insert(index, v);
         }
     }

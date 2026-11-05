@@ -5540,3 +5540,70 @@ pub fn a_signed_division_by_a_non_power_of_two_at_i64(a: i64) -> i64 {
 pub fn a_symbolic_division_by_a_non_power_of_two_at_i64(a: i64) -> i64 {
     a / 3
 }
+
+/// A precondition can pin a *field* to a constant, not just an argument.
+///
+/// `requires: w.v == -7` fixes the only input the body reads, so `w.v / 3` folds to a
+/// literal quotient exactly as the argument-level pin does. Before the pin was keyed by
+/// the variable's index rather than the argument's local, this field stayed symbolic: the
+/// 64-bit restoring divider was built in full and the query was refused for the size of
+/// its own diagram (1.18s, `incomplete`) even though the precondition left one value.
+/// [`a_field_pinned_division_cannot_prove_this`] is the false direction, so the entry
+/// above is a proof and not a vacuous `true`.
+pub struct WideBox {
+    pub v: i64,
+}
+
+/// requires: w.v == -7
+/// ensures: ret == -2
+pub fn a_field_pinned_division_at_i64(w: WideBox) -> i64 {
+    w.v / 3
+}
+
+/// The same field pin with a claim the fold refutes, so the entry above cannot pass by
+/// being decided to `true` for the wrong reason.
+/// requires: w.v == -7
+/// ensures: ret == 99
+pub fn a_field_pinned_division_cannot_prove_this(w: WideBox) -> i64 {
+    w.v / 3
+}
+
+/// A pin on a *nested* path (`o.i.v`) folds the body that reads it, for the same reason:
+/// the variable the contract names is the one the body's projection reads. The fields are
+/// `i64` so the general divider is the expensive shape the pin has to close.
+pub struct WideInner {
+    pub v: i64,
+}
+
+pub struct WideOuter {
+    pub i: WideInner,
+}
+
+/// requires: o.i.v == -7
+/// ensures: ret == -2
+pub fn a_nested_pinned_division_at_i64(o: WideOuter) -> i64 {
+    o.i.v / 3
+}
+
+/// The false direction of the nested pin.
+/// requires: o.i.v == -7
+/// ensures: ret == 99
+pub fn a_nested_pinned_division_cannot_prove_this(o: WideOuter) -> i64 {
+    o.i.v / 3
+}
+
+/// A pin reaches an *element* of an array, not just a field. `requires: xs[0] == -7` names
+/// an element, and the body reads the same element, so the divider folds.
+/// requires: xs[0] == -7
+/// ensures: ret == -2
+pub fn an_element_pinned_division_at_i64(xs: [i64; 2]) -> i64 {
+    xs[0] / 3
+}
+
+/// The false direction of the element pin.
+/// requires: xs[0] == -7
+/// ensures: ret == 99
+pub fn an_element_pinned_division_cannot_prove_this(xs: [i64; 2]) -> i64 {
+    xs[0] / 3
+}
+

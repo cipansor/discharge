@@ -311,6 +311,35 @@ Two things this exposed, both worth remembering:
   it. **When a fix makes a query decidable, check what else used that query as a
   stress vehicle.**
 
+## A pin is keyed by the variable's index, not the argument's local
+
+The pin above worked for a whole argument because an argument's symbolic variable
+*is* its local (`var_named(l, w)`), so `pins` could be a list of `(local, k)` and the
+seed loop could look up by local. That is a coincidence of the argument case, not a
+property of the pin. An aggregate part's variable is allocated from a different index
+space (`spec.rs` gives a field `base + next_slot`, past `max_local + 1`), so the same
+lookup never matched: `requires: w.v == -7` with the body `w.v / 3` was extracted as a
+pin and then *discarded*, and the field stayed symbolic.
+
+The cost is not small. The field is `i64`, so `w.v / 3` builds the full 64-bit
+restoring divider -- the same ~262-deep term the symbolic-division vehicle uses -- and
+the query is refused for the size of its own diagram even though the precondition
+leaves exactly one value. Measured: `incomplete` in 1.18 s before, `verified` in 0.00 s
+after.
+
+`pins` is now `(variable index, k)` and the seed loop keys by `smt::index(v)`, so one
+pin reaches wherever that variable is seeded: an argument, a struct field, a nested
+path, an array element. `lit_of` masks to the *variable's own* width rather than the
+argument's, because the pin value is written signed (`-7`) and each part needs its own
+two's-complement pattern (`249` at eight bits, `-7` as `u64` at 64).
+
+The general lesson: **an identity that holds for one seeding site is not an identity of
+the pin.** The pin is about a *variable*; anything keyed to a local, an argument name,
+or a MIR place is keyed to the wrong thing and will silently drop the pins it does not
+recognise. The corpus is what catches it: the aggregate-part targets are the only ones
+that distinguish the two keys, and before they existed a mutation that deleted the
+field/nested/element arms passed every test.
+
 ## The imperative layer (`wp.rs`) has three traps
 
 If you touch verification-condition generation, these are the mistakes that make
