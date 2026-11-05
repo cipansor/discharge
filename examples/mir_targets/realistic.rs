@@ -5622,6 +5622,7 @@ pub fn an_element_pinned_division_cannot_prove_this(xs: [i64; 2]) -> i64 {
 /// requires: a == 5 && b == a + 1 && c == b * 2
 /// ensures: ret == 3
 pub fn a_transitive_pin_chain_folds_the_body(a: i64, b: i64, c: i64) -> i64 {
+    let _ = (a, b);
     c / 4
 }
 
@@ -5630,6 +5631,7 @@ pub fn a_transitive_pin_chain_folds_the_body(a: i64, b: i64, c: i64) -> i64 {
 /// requires: a == 5 && b == a + 1 && c == b * 2
 /// ensures: ret == 99
 pub fn a_transitive_pin_chain_cannot_prove_this(a: i64, b: i64, c: i64) -> i64 {
+    let _ = (a, b);
     c / 4
 }
 
