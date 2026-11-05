@@ -5907,8 +5907,20 @@ corrupting it and watching the test fail. That check is what the tests below are
 `evaluate`-vs-`blast` sweep, the `truncate` widening sweep, and the constant-multiply arm were
 each confirmed to fail on a corrupted `blast` before being kept.
 
+**The signed story is pinned against Rust's own order.** `slt` has no `Op::Slt`: it is
+`negative` and the *unsigned* `ult`, on the reasoning that equal signs make the two orders
+agree and differing signs mean the negative one is smaller. That reasoning carries the
+signed-cast and signed-overflow paths, so it is swept exhaustively at 4 bits against `i8` --
+including the unsigned pair, since a wrong `ult` is a wrong `slt` at equal signs. The
+constant-amount shifts are swept past the width too, because `blast` and the folder compute
+the `k >= w` boundary in visibly different ways (`bit >= sh` and `sh < w - bit` versus
+`sh >= w`), and an arithmetic shift there must fill from the sign bit rather than with zero.
+Corrupting `slt` to use the wrong sign case, corrupting the `ashr` sign-fill to a zero-fill,
+and making `ult` skip the top bit are each caught (`4-bit 0 < 8`, `4-bit 8 ashr at 4 bits`,
+`4-bit 0 <= 8`).
+
 **Evidence.** Corpus `decided 181 of 333` -> **`256 of 476`**; `cargo test --workspace
---features std` **608 -> 644** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+--features std` **608 -> 647** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
 `mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.

@@ -214,18 +214,19 @@ fn agree_at_unary(
     out_w: u8,
     x: u64,
     name: &str,
-    op: fn(smt::Var, u8) -> smt::Var,
+    op: fn(smt::Var, u8, u32) -> smt::Var,
     want: u64,
+    arg: u32,
 ) {
     let in_mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
     let out_mask = if out_w >= 64 { u64::MAX } else { (1u64 << out_w) - 1 };
     let x = x & in_mask;
     let want = want & out_mask;
-    let folded = smt::with_fresh(|| smt::evaluate(op(smt::var(w), out_w), |_| Some(x)));
+    let folded = smt::with_fresh(|| smt::evaluate(op(smt::var(w), out_w, arg), |_| Some(x)));
     let verdict = smt::with_fresh(|| {
         let a = smt::var(w);
         let pinned = smt::eq(a, smt::word(x, w));
-        let term = op(a, out_w);
+        let term = op(a, out_w, arg);
         smt::prove(smt::or(smt::not(pinned), smt::eq(term, smt::word(want, out_w))))
     });
     assert_eq!(
@@ -252,13 +253,13 @@ fn truncate_agrees_between_the_two_evaluators() {
         for out_w in [1u8, 2, 3] {
             let out_mask = (1u64 << out_w) - 1;
             for x in 0..16u64 {
-                agree_at_unary(4, out_w, x, "truncate", smt::truncate, x & out_mask);
+                agree_at_unary(4, out_w, x, "truncate", |a, ow, _| smt::truncate(a, ow), x & out_mask, 0);
             }
         }
         // Widening: zero-fill, which must *not* replicate the sign bit.
         for out_w in [5u8, 8, 16] {
             for x in 0..16u64 {
-                agree_at_unary(4, out_w, x, "truncate", smt::truncate, x);
+                agree_at_unary(4, out_w, x, "truncate", |a, ow, _| smt::truncate(a, ow), x, 0);
             }
         }
     });
@@ -282,7 +283,116 @@ fn sign_extend_agrees_between_the_two_evaluators() {
                 } else {
                     x
                 };
-                agree_at_unary(4, wide, x, "sign_extend", smt::sign_extend, want);
+                agree_at_unary(4, wide, x, "sign_extend", |a, ow, _| smt::sign_extend(a, ow), want, 0);
+            }
+        }
+    });
+}
+
+/// A predicate, checked the same two ways.
+fn agree_pred_at(
+    w: u8,
+    x: u64,
+    y: u64,
+    name: &str,
+    pred: fn(smt::Var, smt::Var) -> smt::Pred,
+    want: bool,
+) {
+    let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+    let (x, y) = (x & mask, y & mask);
+    let folded = smt::with_fresh(|| {
+        smt::evaluate_pred(pred(smt::var(w), smt::var(w)), |i| {
+            Some(if i == 0 { x } else { y })
+        })
+    });
+    let verdict = smt::with_fresh(|| {
+        let a = smt::var(w);
+        let b = smt::var(w);
+        let pinned = smt::and(smt::eq(a, smt::word(x, w)), smt::eq(b, smt::word(y, w)));
+        let p = pred(a, b);
+        smt::prove(smt::or(smt::not(pinned), smt::iff(p, smt::truth(want))))
+    });
+    assert_eq!(
+        verdict,
+        Verdict::Valid,
+        "{w}-bit {x} {name} {y}: blast disagreed with {want} (evaluate folded {folded:?})"
+    );
+    assert_eq!(folded, Some(want), "{w}-bit {x} {name} {y}: evaluate is wrong");
+}
+
+/// The signed comparisons, over the whole 4-bit domain, against Rust's `i8` order.
+///
+/// `slt` has no `Op::Slt`: it is built from `negative` and the *unsigned* `ult`, on the
+/// reasoning that equal signs make the two orders agree and differing signs mean the
+/// negative one is smaller. That reasoning is the whole of the signed-cast and
+/// signed-overflow story, so it is checked exhaustively rather than sampled -- and
+/// against `i8`, whose domain is the 4-bit domain sign-extended, so the test cannot
+/// inherit the engine's own idea of what signed means.
+#[test]
+fn signed_comparisons_agree_with_rusts_own_order() {
+    on_big_stack(|| {
+        let mask = 0b1111u64;
+        let signed = |v: u64| if v & 0b1000 != 0 { (v as i64) - 16 } else { v as i64 };
+        for x in 0..=mask {
+            for y in 0..=mask {
+                let (ix, iy) = (signed(x), signed(y));
+                agree_pred_at(4, x, y, "<", smt::slt, ix < iy);
+                agree_pred_at(4, x, y, "<=", smt::sle, ix <= iy);
+                agree_pred_at(4, x, y, ">", smt::sgt, ix > iy);
+                agree_pred_at(4, x, y, ">=", smt::sge, ix >= iy);
+                // The unsigned pair is here because `slt` is *built* from `ult`: a wrong
+                // `ult` would be a wrong `slt` at equal signs, and this is the half that
+                // pins it.
+                agree_pred_at(4, x, y, "u<", smt::ult, x < y);
+                agree_pred_at(4, x, y, "u<=", smt::ule, x <= y);
+            }
+        }
+    });
+}
+
+/// `negative` is "the top bit is set", and it is the sign test the whole signed story
+/// rests on.
+#[test]
+fn negative_agrees_with_the_sign_bit() {
+    on_big_stack(|| {
+        for w in [1u8, 4, 8] {
+            let mask = (1u64 << w) - 1;
+            for x in 0..=mask {
+                let want = x >> (w - 1) & 1 == 1;
+                agree_pred_at(w, x, 0, "negative", |a, _| smt::negative(a), want);
+            }
+        }
+    });
+}
+
+/// The constant-amount shifts, swept past the width.
+///
+/// `k >= w` is the boundary the bit-blaster and the term folder compute in visibly
+/// different ways -- `blast` tests `bit >= sh` and `sh < w - bit`, the folder branches on
+/// `sh >= w` -- so it is swept rather than assumed. The arithmetic shift is the one with
+/// the interesting answer there: an all-ones or all-zeros fill from the sign bit, not
+/// zero, which is exactly what a logical shift would get wrong.
+#[test]
+fn constant_shifts_agree_past_the_width() {
+    on_big_stack(|| {
+        for w in [4u8] {
+            let mask = (1u64 << w) - 1;
+            for k in 0..=(w as u32 + 2) {
+                for x in 0..=mask {
+                    let sign = x >> (w - 1) & 1;
+                    let want_shl = if k >= w as u32 { 0 } else { (x << k) & mask };
+                    let want_lshr = if k >= w as u32 { 0 } else { x >> k };
+                    let want_ashr = if k >= w as u32 {
+                        if sign == 1 { mask } else { 0 }
+                    } else if sign == 1 {
+                        ((x >> k) | !(mask >> k)) & mask
+                    } else {
+                        x >> k
+                    };
+                    agree_at_unary(4, w, x, "shl", |a, _, k| smt::shl(a, k), want_shl, k);
+                    agree_at_unary(4, w, x, "lshr", |a, _, k| smt::lshr(a, k), want_lshr, k);
+                    agree_at_unary(4, w, x, "ashr", |a, _, k| smt::ashr(a, k), want_ashr, k);
+                }
             }
         }
     });
