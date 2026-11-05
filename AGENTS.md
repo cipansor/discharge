@@ -3321,12 +3321,15 @@ optional file argument, which is what made the measurement cheap.)
   `v4 = 9`) pins it: with the new branch disabled both go `incomplete`.
   Three holes remain next to it, all *coverage* rather than soundness (nothing false can be
   proved: each is an unreadable contract or an `Unknown` read, never a pass). A *two-level*
-  nested return path (`mk_outer(o.i).j.v`) is still `incomplete` -- the merge copies the
-  callee's `_0` parts one level, and a read of `.j.v` on the destination needs the nested key
-  re-rooted through the destination too. An *array literal of aggregates* (`[o.i, o.j]`) is
-  `incomplete`, because the literal path stores under `elems` by index and does not carry the
-  element aggregates' parts. And an *array whose type is a field* (`o.a[0]`) is skipped, since
-  the `indexed` store is keyed by local only (see the note below).
+  nested return path (`mk_outer(o.i).i.v`) is now closed: `_0 = OuterBox { i: copy _1, .. }`
+  stores the field value but not the operand aggregate's own parts, so `Rvalue::Struct`
+  re-roots an aggregate operand's parts onto the field (`rebase_parts`, gated on the operand's
+  type, because a by-value struct argument reads `Unknown` as a whole). Pinned by
+  `nested_return_carries_the_field` / `nested_return_is_not_the_stale_field`. An *array literal
+  of aggregates* (`[o.i, o.j]`) is still `incomplete`, because the literal path stores under
+  `elems` by index and does not carry the element aggregates' parts. And an *array whose type is
+  a field* (`o.a[0]`) is skipped, since the `indexed` store is keyed by local only (see the note
+  below).
   Two notes on what this did *not* need. The nested literal always reaches the
   store through a temp, so `Rvalue::Struct`/`Aggregate` do **not** need to write
   under `dest.proj`; and making `Aggregate` do so *drops* a nested tuple write

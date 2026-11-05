@@ -5561,6 +5561,33 @@ pub fn nested_aggregate_argument_is_not_the_stale_destination(mut o: OuterBox) -
     identity_inner_box(o.i).v
 }
 
+/// Build an `OuterBox` around an inner value, so a returned struct *field* can be read.
+pub fn wrap_inner_box(x: InnerBox) -> OuterBox {
+    OuterBox { i: x, j: InnerBox { v: 0 } }
+}
+
+/// A returned struct's *field* is read back through a two-level path.
+///
+/// `wrap_inner_box(o.i)` lowers to `_0 = OuterBox { i: copy _1, j: move _2 }`, so the returned
+/// field's own parts have to be re-rooted onto `_0.i` -- the `Struct` literal stores the field
+/// value but not the operand aggregate's `v`. The precondition pins the leaf so the returned
+/// `9` is the value that crossed.
+/// requires: o.i.v == 9
+/// ensures: ret == 9
+pub fn nested_return_carries_the_field(mut o: OuterBox) -> u8 {
+    wrap_inner_box(o.i).i.v
+}
+
+/// The false twin of [`nested_return_carries_the_field`].
+///
+/// Same body, but the contract claims a different leaf survived. It must be refuted, with the
+/// seeded `9` as the witness.
+/// requires: o.i.v == 9
+/// ensures: ret == 3
+pub fn nested_return_is_not_the_stale_field(mut o: OuterBox) -> u8 {
+    wrap_inner_box(o.i).i.v
+}
+
 /// The inner type of [`nested_tuple_projection_reads`].
 pub struct NestedPair { pub p: Pair }
 

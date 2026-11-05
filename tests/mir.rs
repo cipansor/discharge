@@ -1510,6 +1510,8 @@ fn a_nested_seed_is_invalidated_by_a_write_and_carried_by_a_copy() {
         "nested_swap_is_not_the_stale_side",
         "nested_aggregate_argument_reaches_the_helper",
         "nested_aggregate_argument_is_not_the_stale_destination",
+        "nested_return_carries_the_field",
+        "nested_return_is_not_the_stale_field",
         "whole_struct_copy_carries_nested_paths",
     ]) else {
         return;
@@ -1574,6 +1576,20 @@ fn a_nested_seed_is_invalidated_by_a_write_and_carried_by_a_copy() {
     assert!(
         matches!(through_stale, FnOutcome::Failed { .. }),
         "a returned nested aggregate must not keep a stale field; got: {through_stale}"
+    );
+    // A returned struct's *field* read back through a two-level path: the `Struct` literal
+    // stores the field value but not the operand aggregate's own parts, so the field's parts
+    // have to be re-rooted. The positive verdict is the value that crossed; the twin claims a
+    // different leaf and must be refuted.
+    let field = outcome(&report, "nested_return_carries_the_field");
+    assert!(
+        field.is_verified(),
+        "a returned struct's field must keep its parts; got: {field}"
+    );
+    let field_stale = outcome(&report, "nested_return_is_not_the_stale_field");
+    assert!(
+        matches!(field_stale, FnOutcome::Failed { .. }),
+        "a returned struct's field must not keep a stale leaf; got: {field_stale}"
     );
 }
 

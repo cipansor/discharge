@@ -2658,18 +2658,18 @@ where
                             // through `copy_parts`, which writes `fields`/`nested`. Copying
                             // only `elems` lost them, so `id_inner(o.i).v` -- a nested
                             // aggregate handed to a helper by value and read back -- read
-                            // `Unknown` while the contract was true of the body. Fields are
-                            // set before nested paths, because a field write forgets the
-                            // nested paths beneath it; and only when the destination is a
-                            // whole local, which is the shape a call's destination has.
+                            // `Unknown` while the contract was true of the body. This runs
+                            // after the `elems` loop because clearing the destination's old
+                            // fields must not also clear the tuple components just written;
+                            // the nested paths are set last so the intermediate field write
+                            // (which forgets the paths beneath it) cannot drop a leaf.
+                            //
+                            // Only when the destination is a whole local, which is the shape
+                            // a call's destination has. A returned whole value replaces every
+                            // part, so the destination's old fields and nested paths are
+                            // dropped first: keeping one the callee did not write would be a
+                            // *wrong* value rather than a missing one.
                             if dest.proj.is_empty() {
-                                // The return replaces the whole value, so the caller's
-                                // previous fields and nested paths under `dest` must not
-                                // survive a field the callee did not write: a part of a
-                                // value that is no longer there is a *wrong* value, not a
-                                // missing one. (The `elems` loop above keeps its existing
-                                // behaviour; this closes the field-shaped hole the struct
-                                // return opens.)
                                 env.fields.retain(|(l, _), _| *l != dest.local);
                                 env.nested.retain(|(l, _), _| *l != dest.local);
                                 for ((l, f), v) in st.env.fields.iter() {
@@ -3362,7 +3362,22 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
             // `Field(N)` projections index, so position `i` here is field `i`.
             for (i, o) in ops.iter().enumerate() {
                 let v = operand(env, o);
-                env.set(&Place { local: dest.local, proj: vec![Proj::Field(i as u32)] }, v);
+                let dst = Place { local: dest.local, proj: vec![Proj::Field(i as u32)] };
+                env.set(&dst, v);
+                // An *aggregate operand* keeps its value in its parts, so `Outer { i: x, .. }`
+                // stores the field's value but not `x`'s own `v`. A later read of the returned
+                // `mk_outer(o.i).i.v` walks the nested chain and finds nothing. The parts are
+                // re-rooted onto the field *after* the `set` above, because a field write
+                // forgets the paths beneath it; the operand's own parts are untouched, so this
+                // is a copy of what it holds rather than an assumption about it. The gate is the
+                // operand's *type*, not its value: a by-value struct argument's parts live in
+                // `fields`, so it reads `Unknown` as a whole and would be missed by a value
+                // test.
+                if let Operand::Copy(q) | Operand::Move(q) = o {
+                    if matches!(v, Val::Agg) || matches!(type_of_place(f, q), Some(Ty::Other(_))) {
+                        env.rebase_parts(q, &dst);
+                    }
+                }
             }
             Val::Agg
         }
