@@ -2653,6 +2653,46 @@ where
                                 };
                                 env.set(&p, *v);
                             }
+                            // A *struct* return keeps its fields and nested paths in the
+                            // field stores, not in `elems`: `_0 = _1` copies `_1`'s parts
+                            // through `copy_parts`, which writes `fields`/`nested`. Copying
+                            // only `elems` lost them, so `id_inner(o.i).v` -- a nested
+                            // aggregate handed to a helper by value and read back -- read
+                            // `Unknown` while the contract was true of the body. Fields are
+                            // set before nested paths, because a field write forgets the
+                            // nested paths beneath it; and only when the destination is a
+                            // whole local, which is the shape a call's destination has.
+                            if dest.proj.is_empty() {
+                                // The return replaces the whole value, so the caller's
+                                // previous fields and nested paths under `dest` must not
+                                // survive a field the callee did not write: a part of a
+                                // value that is no longer there is a *wrong* value, not a
+                                // missing one. (The `elems` loop above keeps its existing
+                                // behaviour; this closes the field-shaped hole the struct
+                                // return opens.)
+                                env.fields.retain(|(l, _), _| *l != dest.local);
+                                env.nested.retain(|(l, _), _| *l != dest.local);
+                                for ((l, f), v) in st.env.fields.iter() {
+                                    if *l != 0 {
+                                        continue;
+                                    }
+                                    let p = Place {
+                                        local: dest.local,
+                                        proj: vec![Proj::Field(*f)],
+                                    };
+                                    env.set(&p, *v);
+                                }
+                                for ((l, chain), v) in st.env.nested.iter() {
+                                    if *l != 0 {
+                                        continue;
+                                    }
+                                    let p = Place {
+                                        local: dest.local,
+                                        proj: chain.iter().map(|i| Proj::Field(*i)).collect(),
+                                    };
+                                    env.set(&p, *v);
+                                }
+                            }
                         }
                     }
                     // Restore the caller's loop cut, which entering the callee

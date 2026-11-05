@@ -3307,6 +3307,18 @@ optional file argument, which is what made the measurement cheap.)
   refuted) is what makes the *either-side* guard load-bearing: with the guard
   narrowed to "destination nested" both entries go `incomplete`, which is exactly
   the mistake the pair catches.
+  A *returned* nested aggregate is the mirror image of the argument side. `id_inner(o.i).v`
+  lowers to `_3 = move (_1.0); _2 = id_inner(move _3); _0 = copy (_2.0)`, so the argument
+  is a sub-place (whose parts the re-based copy-in already carries) and the callee's
+  `_0 = _1` return builds `_0`'s fields field-by-field. The return merge only copied
+  `elems` (the tuple components), so a struct return lost its `fields`/`nested` and the
+  caller's read was `Unknown` while the contract was true. The merge now copies the
+  callee's `_0` fields and nested paths into the destination too, clearing the
+  destination's old parts first (a returned whole value must not keep a stale field the
+  callee did not write -- that would be a *wrong* value, not a missing one). The pair
+  `nested_aggregate_argument_reaches_the_helper` (true `ret == 9`, verified) and
+  `nested_aggregate_argument_is_not_the_stale_destination` (claims `7`; refuted, witness
+  `v4 = 9`) pins it: with the new branch disabled both go `incomplete`.
   Two notes on what this did *not* need. The nested literal always reaches the
   store through a temp, so `Rvalue::Struct`/`Aggregate` do **not** need to write
   under `dest.proj`; and making `Aggregate` do so *drops* a nested tuple write

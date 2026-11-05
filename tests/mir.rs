@@ -1508,6 +1508,8 @@ fn a_nested_seed_is_invalidated_by_a_write_and_carried_by_a_copy() {
         "whole_inner_move_is_not_the_stale_destination",
         "nested_swap_carries_the_other_side",
         "nested_swap_is_not_the_stale_side",
+        "nested_aggregate_argument_reaches_the_helper",
+        "nested_aggregate_argument_is_not_the_stale_destination",
         "whole_struct_copy_carries_nested_paths",
     ]) else {
         return;
@@ -1557,6 +1559,21 @@ fn a_nested_seed_is_invalidated_by_a_write_and_carried_by_a_copy() {
     assert!(
         matches!(swap_stale, FnOutcome::Failed { .. }),
         "a nested swap must not keep each side's own leaf; got: {swap_stale}"
+    );
+    // A nested aggregate handed to a helper by value and read back: the callee's return is a
+    // struct it built field-by-field, so the merge has to carry the *fields* (not only the
+    // tuple components). The positive verdict is the value that crossed; the twin claims a
+    // different one survived and must be refuted.
+    let through = outcome(&report, "nested_aggregate_argument_reaches_the_helper");
+    assert!(
+        through.is_verified(),
+        "a returned nested aggregate must keep its fields; got: {through}"
+    );
+    let through_stale =
+        outcome(&report, "nested_aggregate_argument_is_not_the_stale_destination");
+    assert!(
+        matches!(through_stale, FnOutcome::Failed { .. }),
+        "a returned nested aggregate must not keep a stale field; got: {through_stale}"
     );
 }
 

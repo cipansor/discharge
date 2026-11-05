@@ -5529,6 +5529,38 @@ pub fn nested_swap_is_not_the_stale_side(mut o: OuterBox) -> u8 {
     o.i.v
 }
 
+/// Identity, so a nested aggregate can be handed to a helper and read back.
+///
+/// The helper's return is an aggregate the callee built field-by-field, so the merge has to
+/// carry the *fields*, not only the tuple components; without that the caller's `id_inner(o.i).v`
+/// reads `Unknown` while the contract is true of the body.
+pub fn identity_inner_box(x: InnerBox) -> InnerBox {
+    x
+}
+
+/// A nested aggregate handed to a helper by value, and the helper's return read back.
+///
+/// `id_inner(o.i)` lowers to `_3 = move (_1.0); _2 = id_inner(move _3)`, so the aggregate
+/// argument is a *sub-place* whose parts have to be carried in, and the callee's `_0 = _1`
+/// return has to carry its fields back. The precondition pins the leaf so the returned `9` is
+/// the value that crossed, not a fresh variable.
+/// requires: o.i.v == 9
+/// ensures: ret == 9
+pub fn nested_aggregate_argument_reaches_the_helper(mut o: OuterBox) -> u8 {
+    identity_inner_box(o.i).v
+}
+
+/// The false twin of [`nested_aggregate_argument_reaches_the_helper`].
+///
+/// Same body, but the contract claims a different value survived. A merge that dropped the
+/// returned field would leave the read `Unknown` (a lost proof); one that kept a *stale* field
+/// would prove this. It must be refuted, with the seeded `9` as the witness.
+/// requires: o.i.v == 9
+/// ensures: ret == 7
+pub fn nested_aggregate_argument_is_not_the_stale_destination(mut o: OuterBox) -> u8 {
+    identity_inner_box(o.i).v
+}
+
 /// The inner type of [`nested_tuple_projection_reads`].
 pub struct NestedPair { pub p: Pair }
 
