@@ -3269,6 +3269,32 @@ optional file argument, which is what made the measurement cheap.)
   (the same `Val::Agg` convention an aggregate literal uses) instead of clearing
   them. `struct_reassign_then_field_read` moved from *incomplete* to **refuted**:
   the false contract is now a counterexample, not a shrug.
+* **A *nested* aggregate assignment — DONE.** `o.i = Inner { v: 9 }` lowers to a
+  struct literal into a temp followed by `(_1.0) = move _2`, so the parts being
+  moved are keyed under the temp and the destination is the nested place `_1.0`.
+  `copy_parts` is reached only for a whole-place destination, so the temp's `v`
+  never landed under `_1.0` and the later read `(_1.0).0` -- the *nested* store,
+  keyed by the whole chain -- found nothing. The body's value was then unknown,
+  and a contract that is false of the body was reported unreadable instead of
+  refuted. `Env::copy_parts_under` re-roots the source's parts beneath the
+  destination's field path, called *after* `set` (whose field arm forgets the
+  stale nested paths first, and the helper is what puts the source's parts back).
+  Only an all-field path is re-keyed: a deref, index or downcast names a store
+  the helper does not re-root, and writing a part where no read consults it would
+  be a lost proof at best, so those are refused. `whole_inner_write_makes_nested_seed_stale`
+  moved from *incomplete* to **refuted**, and its positive companion
+  `whole_inner_write_is_seen_by_the_leaf` verifies -- the pair rules out a blanket
+  refusal, which is what an "`!is_verified()`" assertion on the false entry alone
+  would have let through.
+  Two notes on what this did *not* need. The nested literal always reaches the
+  store through a temp, so `Rvalue::Struct`/`Aggregate` do **not** need to write
+  under `dest.proj`; and making `Aggregate` do so *drops* a nested tuple write
+  (`(_1.0) = (5, 6)` writes `(_1.0.0)`, a `Field(0) + Index(0)` chain the `set`
+  catch-all does not re-root), so the tempting "consistency" edit is a
+  regression. The minimal, evidence-backed change is the assignment hook alone.
+  The deep `i64 / 3` wall is *not* part of this: that entry is the deliberate
+  `MAX_WALK_DEPTH` refusal vehicle (`a_symbolic_division_by_a_non_power_of_two_at_i64`,
+  whose contract is false in general), so its `incomplete` is intended, not a bug.
 * **`Rvalue::Discriminant` and `Downcast` for a real enum match — DONE.**
   A `match` on an enum lowers to `_2 = discriminant(_1); switchInt(move _2)`,
   so the tag is a symbolic input whose *domain is the set of variant
