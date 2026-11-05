@@ -3428,6 +3428,107 @@ fn eval_binary(op: BinOp, a: Val, b: Val, width: Option<u8>) -> Val {
 /// dischargeable and an overflowing program would be reported panic-free — the
 /// exact failure mode the README calls out, where an unsound engine reports a
 /// *better-looking* result than the truth.
+/// The signed range of a `w`-bit two's complement value, in `i128` so that the
+/// `w == 64` case fits without a special case.
+fn signed_range(w: u8) -> (i128, i128) {
+    let half = 1i128 << (w - 1);
+    (-half, half - 1)
+}
+
+/// Reinterpret a `w`-bit two's complement bit pattern as a signed value.
+fn as_signed(raw: u64, w: u8) -> i128 {
+    if w >= 64 {
+        (raw as i64) as i128
+    } else {
+        let r = raw as i128;
+        if r >= (1i128 << (w - 1)) {
+            r - (1i128 << w)
+        } else {
+            r
+        }
+    }
+}
+
+/// `a / b` rounded toward negative infinity, with `b > 0`.
+///
+/// Rust's `/` truncates toward zero, and the two differ exactly on the negative
+/// side, which is the side this whole computation lives on.
+fn floor_div(a: i128, b: i128) -> i128 {
+    let q = a / b;
+    if a % b != 0 && (a < 0) != (b < 0) {
+        q - 1
+    } else {
+        q
+    }
+}
+
+/// `a / b` rounded toward positive infinity, with `b > 0`.
+fn ceil_div(a: i128, b: i128) -> i128 {
+    let q = a / b;
+    if a % b != 0 && (a < 0) == (b < 0) {
+        q + 1
+    } else {
+        q
+    }
+}
+
+/// Whether a *signed* `v * c` wraps at width `w`, for a constant `c`.
+///
+/// `x * c` is monotone in `x` on each side of zero, so the exact product leaves the
+/// `w`-bit signed range on a *prefix* `x < lo` or a *suffix* `x > hi`. Both bounds are
+/// a division of the range end by `c` rounded one way or the other, computed exactly
+/// in `i128`.
+///
+/// That is the whole point of the construction: **nothing here needs the product**,
+/// only the two bounds, so it works at `w == 64` where the general path has no wider
+/// width to compute the product in and refuses. The general path's comment says the
+/// gap is deliberate because a weaker predicate there would be worse than a refusal;
+/// this is not weaker, it is exact -- `x * c` is inside the range exactly when `x` is
+/// between the bounds -- which is why it is worth having rather than a compromise.
+///
+/// `c == 0` is the one constant the formula cannot take: the bounds are a division by
+/// `c`, and it is the only one that would divide by zero. `c == 1` is a cheap early
+/// return and the formula agrees with it anyway.
+///
+/// `c == -1` is deliberately *not* in the set, which is the one place this construction
+/// is easy to get wrong by hand. `-1 * MIN` is `2^(w-1)`, and the largest signed value is
+/// `2^(w-1) - 1` -- so multiplying by minus one *does* overflow, at exactly `MIN`. (It is
+/// easy to say instead that `MIN * -1` "wraps back to `MIN`", which is true of the
+/// *wrapped* result and is precisely the overflow.) An earlier version of this function
+/// special-cased `-1` as never wrapping, which was wrong and is caught by
+/// `a_signed_constant_multiply_overflow_is_exact` at `2-bit -2 * -1`.
+fn signed_mul_wraps_at(v: Var, c: i128, w: u8) -> Pred {
+    if c == 0 || c == 1 {
+        return smt::truth(false);
+    }
+    let (mn, mx) = signed_range(w);
+    // For `c > 0` the product leaves low when `x * c < mn` and high when `x * c > mx`,
+    // so the bounds are `mn / c` rounded up and `mx / c` rounded down.
+    //
+    // For `c < 0` the product is decreasing, and the two ends swap: `x` below
+    // `floor(mn / |c|) + 1` gives a product *above* `mx`, and `x` above `2^(w-1) / |c|`
+    // gives one *below* `mn`. Getting the swap right is the whole difficulty of the
+    // negative case, and it is checked against brute force in the test below.
+    let (lo, hi) = if c > 0 {
+        (ceil_div(mn, c), mx / c)
+    } else {
+        let d = -c;
+        (floor_div(mn, d) + 1, (1i128 << (w - 1)) / d)
+    };
+    let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+    let mut wraps = smt::truth(false);
+    // A bound outside the range describes no `x` at all, so the guard is dropped
+    // rather than built: `slt(x, MIN)` would be a constant `false` term, and a
+    // constant term in a predicate is noise the diagram does not need.
+    if lo > mn {
+        wraps = smt::or(wraps, smt::slt(v, smt::word((lo as u64) & mask, w)));
+    }
+    if hi < mx {
+        wraps = smt::or(wraps, smt::sgt(v, smt::word((hi as u64) & mask, w)));
+    }
+    wraps
+}
+
 fn overflow_pred(op: BinOp, a: Val, b: Val, w: u8) -> Option<Pred> {
     // The sign is the operand's, read from the operand, for the same reason
     // `eval_binary` does: a wrong sign here is a wrong overflow predicate, and an
@@ -3496,25 +3597,29 @@ fn overflow_pred(op: BinOp, a: Val, b: Val, w: u8) -> Option<Pred> {
             // three signs, and a predicate that is too weak there is a false proof
             // rather than a refusal, so it keeps the general path rather than
             // taking on that risk for this payoff.
-            if !signed {
-                let const_side = match (smt::evaluate(x, |_| None), smt::evaluate(y, |_| None)) {
-                    // `(v, k)`: the non-constant operand and the constant one.
-                    (Some(_), None) => Some((y, x)),
-                    (None, Some(_)) => Some((x, y)),
-                    _ => None,
-                };
-                if let Some((v, k)) = const_side {
-                    let c = smt::evaluate(k, |_| None).expect("the constant side, just matched");
+            let const_side = match (smt::evaluate(x, |_| None), smt::evaluate(y, |_| None)) {
+                // `(v, k)`: the non-constant operand and the constant one.
+                (Some(_), None) => Some((y, x)),
+                (None, Some(_)) => Some((x, y)),
+                _ => None,
+            };
+            if let Some((v, k)) = const_side {
+                let raw = smt::evaluate(k, |_| None).expect("the constant side, just matched");
+                if !signed {
                     let max = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
                     // `c <= 1` is both cases where `MAX / c + 1` would not fit in
                     // `w` bits: `c == 0` never wraps, and `c == 1` cannot exceed
                     // `MAX`. The predicate is the sound one for every other `c`.
-                    return Some(if c <= 1 {
+                    return Some(if raw <= 1 {
                         smt::truth(false)
                     } else {
-                        smt::uge_const(v, max / c + 1)
+                        smt::uge_const(v, max / raw + 1)
                     });
                 }
+                // Signed, and the same idea with a range that has two ends. This is
+                // the case the general path below cannot reach at `w == 64`, and the
+                // reason a scaled index in signed code stayed `incomplete`.
+                return Some(signed_mul_wraps_at(v, as_signed(raw, w), w));
             }
             let wide = w.saturating_mul(2).min(64);
             if wide <= w {
@@ -4354,6 +4459,157 @@ fn count_via_helper(_1: u8) -> u8 {
         assert!(
             !matches!(out, crate::mir::verify::FnOutcome::Verified { .. }),
             "a weak invariant must not be rescued by the restored cut, got {out:?}"
+        );
+    }
+
+    /// The *signed* constant multiply's predicate is exact, two-sided, at every width.
+    ///
+    /// This is the predicate that closes the `i64` gap, so it is the one that most needs
+    /// the two-sided check: a predicate that is too *weak* here does not merely refuse a
+    /// proof, it lets an overflowing `assert` discharge and reports an overflowing
+    /// function as panic-free. A predicate that is too *strong* refuses safe code, which
+    /// is the failure the old `wide > 16` bound was avoiding by refusing everything.
+    ///
+    /// So the whole domain is enumerated at widths where that is possible, against Rust's
+    /// own `checked_mul` -- the oracle is the standard library's idea of overflow, not
+    /// this file's. The negative constants are the interesting half: `x * c` is monotone
+    /// but *decreasing* for `c < 0`, so the low and high bounds swap ends, and that swap
+    /// is where a hand-derived bound goes wrong.
+    #[test]
+    fn a_signed_constant_multiply_overflow_is_exact() {
+        // `true` when the engine's predicate says the multiply wraps. The oracle is
+        // `i128`, which holds the exact product of any two values this test uses.
+        let wraps = |w: u8, c: i128, v: i128| -> bool {
+            smt::with_fresh(|| {
+                // The constant has to be built as a `w`-bit bit pattern: `smt::word`
+                // rejects a value that does not fit, and a negative constant does not fit
+                // as written. Two's complement is the same pattern the frontend produces.
+                let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                let x = smt::var(w);
+                let y = smt::word((c as u64) & mask, w);
+                let p = overflow_pred(
+                    BinOp::Mul,
+                    Val::Sym(x, Sign::Signed),
+                    Val::Sym(y, Sign::Signed),
+                    w,
+                )
+                .expect("a constant multiply must produce a predicate");
+                // The predicate is over the fresh variable, so asking whether it holds at
+                // this point means substituting the point and evaluating. `v` is negative
+                // for some cases, so it goes in as its own `w`-bit pattern too.
+                smt::evaluate_pred(p, |_| Some((v as u64) & mask)).expect("predicate is over `x`")
+            })
+        };
+
+        // Exhaustive where the domain is small enough to enumerate. Both signs of `c`
+        // and every value of `x`, so the monotone-decreasing half is covered too.
+        for w in [2u8, 3, 4, 5] {
+            let half = 1i128 << (w - 1);
+            let (mn, mx) = (-half, half - 1);
+            for c in mn..=mx {
+                for v in mn..=mx {
+                    let want = v.checked_mul(c).is_none_or(|p| p < mn || p > mx);
+                    assert_eq!(
+                        wraps(w, c, v),
+                        want,
+                        "{w}-bit {v} * {c}: predicate said {} but wrapping is {want}",
+                        wraps(w, c, v)
+                    );
+                }
+            }
+        }
+
+        // `i64`, the width this predicate exists for and the one that cannot be
+        // enumerated. The constants are chosen at the ends of the range and at powers of
+        // two, where the bounds land on the edge of the domain; `x` is swept across each
+        // constant's own boundary from `i64::MIN` to `i64::MAX`, which is the whole span
+        // that matters for that constant.
+        for c in [
+            2i128,
+            3,
+            -2,
+            -3,
+            1 << 31,
+            -(1 << 31),
+            1 << 62,
+            -(1 << 62),
+            (1 << 62) - 1,
+            i64::MAX as i128,
+            i64::MIN as i128,
+        ] {
+            let (mn, mx) = (i64::MIN as i128, i64::MAX as i128);
+            // A bound derived the same way the implementation derives it, so the sweep
+            // covers the two values straddling it and the error a fencepost would make.
+            let lo = if c > 0 { mn.div_euclid(c) } else { mn / -c };
+            let hi = if c > 0 { mx / c } else { mx.div_euclid(c) };
+            let probes = [
+                mn,
+                mn + 1,
+                lo - 1,
+                lo,
+                lo + 1,
+                -1,
+                0,
+                1,
+                hi - 1,
+                hi,
+                hi + 1,
+                mx - 1,
+                mx,
+            ];
+            for v in probes {
+                let want = v.checked_mul(c).is_none_or(|p| p < mn || p > mx);
+                assert_eq!(
+                    wraps(64, c, v),
+                    want,
+                    "64-bit {v} * {c}: predicate said {} but wrapping is {want}",
+                    wraps(64, c, v)
+                );
+            }
+        }
+    }
+
+    /// The unsigned arm is untouched by the signed one: both signs are asked the same
+    /// question and must give different answers where signedness matters.
+    ///
+    /// `-1` at `i8` is `255u8`, and `255 * 255` wraps *unsigned* (the product is past
+    /// `255`) while `-1 * -1` does not wrap *signed*. A predicate that read the bit
+    /// pattern without the sign would give one answer to both, so the two are asked
+    /// together and required to differ.
+    #[test]
+    fn the_signed_and_unsigned_arms_are_not_confused() {
+        let wraps = |signed: bool, w: u8, c: u64, v: u64| -> bool {
+            smt::with_fresh(|| {
+                let x = smt::var(w);
+                let y = smt::word(c, w);
+                let sign = if signed { Sign::Signed } else { Sign::Unsigned };
+                let p = overflow_pred(BinOp::Mul, Val::Sym(x, sign), Val::Sym(y, sign), w)
+                    .expect("a constant multiply must produce a predicate");
+                smt::evaluate_pred(p, |_| Some(v)).expect("predicate is over `x`")
+            })
+        };
+        // `-1 * -1` is `1` in `i8`: no signed overflow. `255 * 255` is `65025`: unsigned
+        // overflow at 8 bits.
+        assert!(
+            !wraps(true, 8, 0xFF, 0xFF),
+            "-1 * -1 must not wrap as signed"
+        );
+        assert!(
+            wraps(false, 8, 0xFF, 0xFF),
+            "255 * 255 must wrap as unsigned"
+        );
+        // `127 * -1` is `-127`, representable, while the *same bits* read unsigned are
+        // `127 * 255`, far past `255`. A predicate that ignored the sign would answer one
+        // of these wrong.
+        assert!(!wraps(true, 8, 0xFF, 0x7F), "127 * -1 must not wrap as signed");
+        assert!(wraps(false, 8, 0xFF, 0x7F), "127 * 255 must wrap as unsigned");
+        // The regression for the minus-one bound: `-1 * MIN` is `2^(w-1)`, one past the
+        // largest signed value, so it *does* overflow -- while the same product read as
+        // unsigned magnitudes is `128 * 255`, which also overflows but for its own
+        // reason. The first version of the predicate called the signed one safe.
+        assert!(
+            wraps(true, 8, 0xFF, 0x80),
+            "MIN * -1 must wrap as signed: 2^(w-1) is not representable"
         );
     }
 

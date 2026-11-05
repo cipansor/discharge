@@ -5930,8 +5930,26 @@ query. Width 1 is the important one -- `divmod` has a *separate* implementation 
 and `x & !y`) with its own `y == 0` case, and the first version of the test asked only 4.
 Dropping that `y == 0` case is caught at `1-bit 0 / 0`.
 
-**Evidence.** Corpus `decided 181 of 333` -> **`256 of 476`**; `cargo test --workspace
---features std` **608 -> 650** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+**Signed constant multiply is decided at every width, `i64` included.** The general multiply
+path widens to `2w` and refuses past 16 bits; at `w == 64` there is no wider width at all, so
+`a * 2` on an `i64` was `incomplete`. The constant path needs no product: `x * c` is monotone
+on each side of zero, so it leaves the signed range on a prefix `x < lo` or a suffix
+`x > hi`, and both bounds are a division of a range end by `c` in `i128` -- compile-time
+constants. For `c > 0` the bounds are `ceil(MIN / c)` and `MAX / c`; for `c < 0` the product
+*decreases*, so the two ends swap. `c == 0` is excluded (it would divide by zero) and `c == 1`
+returns early. The predicate is exact, not merely sufficient, so it is checked two-sided
+against Rust's `checked_mul` -- exhaustively at 2..5 bits over both signs of `c`, and at 64
+bits across each constant's own boundary.
+
+**`c == -1` does overflow, at exactly `MIN`.** The first version special-cased `-1` as never
+wrapping, on the reasoning that `MIN * -1` "wraps back to `MIN`" -- which is true of the
+*wrapped* result and is the overflow. `-1 * MIN` is `2^(w-1)`, one past `MAX`. That is the
+weak-predicate direction, which makes an overflowing `assert` discharge; the exhaustive sweep
+caught it at `2-bit -2 * -1`, and a corpus entry now pins it at `i64::MIN`. Dropping the low
+bound is caught at `2-bit -2 * -2`, and swapping the negative-`c` bounds at `2-bit 0 * -2`.
+
+**Evidence.** Corpus `decided 181 of 333` -> **`257 of 478`**; `cargo test --workspace
+--features std` **608 -> 652** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
 `mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.

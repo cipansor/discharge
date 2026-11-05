@@ -5248,17 +5248,38 @@ pub fn a_signed_constant_multiply_of_a_wide_value_cannot_prove_this(a: i32) -> i
     a * 2
 }
 
-/// The signed multiply *at `i64`* is still `incomplete`, and honestly so.
+/// The signed multiply *at `i64`* is decided, which is the case the `2w`-bit widening
+/// could never reach.
 ///
-/// There is nowhere to widen to at the widest width, so no predicate is available and
-/// the path is reported unknown. The name carries no `_cannot_prove_this` because
-/// `incomplete` is a refusal, not a refutation -- and this entry is here so that a
-/// later attempt to close the gap has to change a test rather than quietly widen what
-/// the tool claims.
+/// This was `incomplete` and its name said so: at the widest width there is no wider
+/// width to compute the exact product in, so the general path has no predicate to offer.
+/// The constant path does not need the product -- `x * c` is inside the signed range
+/// exactly when `x` is between `MAX / c` and `MIN / c` rounded one way or the other, and
+/// both bounds are compile-time constants -- so it works here.
 /// requires: a == 3
 /// ensures: ret == 6
-pub fn a_signed_constant_multiply_at_i64_is_still_incomplete(a: i64) -> i64 {
+pub fn a_signed_constant_multiply_at_i64(a: i64) -> i64 {
     a * 2
+}
+
+/// The false direction of [`a_signed_constant_multiply_at_i64`], so the entry above is a
+/// proof rather than a query the engine waved through.
+/// requires: a == 3
+/// ensures: ret == 7
+pub fn a_signed_constant_multiply_at_i64_cannot_prove_this(a: i64) -> i64 {
+    a * 2
+}
+
+/// A signed `i64` multiply by minus one at the one input it overflows on.
+///
+/// `-1 * i64::MIN` is `2^63`, one past `i64::MAX`. That is the case the first version of
+/// the predicate called safe, by taking `-1` as never wrapping, so the entry is here to
+/// keep the bound honest: the contract is *false* at `MIN`, and the tool must say so
+/// rather than prove it.
+/// requires: a == -9223372036854775808
+/// ensures: ret == 0
+pub fn a_signed_constant_multiply_by_minus_one_at_the_edge_cannot_prove_this(a: i64) -> i64 {
+    a * -1
 }
 
 /// The unsigned multiply at `i64`'s width *is* decided, which is what makes the entry
