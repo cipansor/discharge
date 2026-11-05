@@ -5869,8 +5869,28 @@ so the signed width gap is kept. `overflow_pred`'s exactness is checked exhausti
 by `a_constant_multiply_overflow_is_exact`, which was confirmed to fail on an off-by-one
 predicate.
 
-**Evidence.** Corpus `decided 181 of 333` -> **`254 of 473`**; `cargo test --workspace
---features std` **608 -> 629** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+**`blast` multiplies by a constant as a sum of shifts.** With one operand a `Const`,
+`Op::Mul` in `blast` is `sum over the set bits k of c of (x << k)` -- the distributive law,
+so exact -- instead of the `w`-by-`w` schoolbook rows. That is `popcount(c)` shift-adds
+rather than `w^2` AND/XOR rows, which is what lets the frontend's overflow predicate run at
+`u32`/`usize` width for `i * 4`-shaped code (and at `i32`, which the signed bound used to
+refuse). Cost at 64 bits is the *size* of the shifts, not just the popcount: `x * 4` decides,
+`x * 17` (`x + (x << 4)`) is already `Unknown`. `i64` signed stays `incomplete` -- there is
+nowhere to widen to at the widest width -- and is pinned by a corpus entry.
+
+**The dropped carry, and why the first test missed it.** The shift-sum adder was written as
+`out ^ shifted` and a carry, forgetting the `^ carry` in the sum; the carry-out was right, so
+it agreed whenever the accumulator bit matched the shift. The first test for this swept
+`x * c` exhaustively against Rust's `*` and passed -- because `evaluate`, the term folder,
+has its own `wrapping_mul` and never calls `blast`. `prove` calls `blast`. A concrete test
+written with `evaluate` is therefore no evidence at all about the bit-blaster, which is the
+same trap the `shift_var` bug set. `tests/mul.rs` now labels each test with the layer it
+covers, and the ones that matter go through `prove` against an independently built shift sum
+(`smt::shl`/`smt::add`), which shares no code with either multiply arm. Both were confirmed
+to fail on the dropped carry.
+
+**Evidence.** Corpus `decided 181 of 333` -> **`256 of 476`**; `cargo test --workspace
+--features std` **608 -> 634** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
 `mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.

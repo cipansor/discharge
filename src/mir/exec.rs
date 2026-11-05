@@ -3529,7 +3529,14 @@ fn overflow_pred(op: BinOp, a: Val, b: Val, w: u8) -> Option<Pred> {
             // declines is better than one that hangs, and a *weaker* predicate
             // here would be worse than either, because it would make an
             // overflowing function look panic-free.
-            if wide > 16 {
+            // The widening is the BDD wall, but a *constant* operand makes both the
+            // exact product and the wrapped one a sum of shifts rather than a
+            // `2w`-bit schoolbook multiply (`blast`'s `Op::Mul` arm), so the cost
+            // that motivated this bound is not paid and the test can run at the full
+            // width. Without this the *signed* `i * 4` stayed `incomplete` at every
+            // width past 16 even though the unsigned one was decided.
+            let constant_operand = smt::const_of(x).is_some() || smt::const_of(y).is_some();
+            if wide > 16 && !constant_operand {
                 return None;
             }
             if signed {

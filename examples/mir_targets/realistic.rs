@@ -5228,17 +5228,44 @@ pub fn a_constant_multiply_by_one_cannot_prove_this(a: u32) -> u32 {
     a * 1
 }
 
-/// A *signed* constant multiply stays on the general path and is still
-/// `incomplete` past 16 bits.
+/// A *signed* constant multiply is decided too, once the constant arm makes the
+/// widened product a sum of shifts instead of a `2w`-bit schoolbook multiply.
 ///
-/// This is the deliberate half of the trade: the signed condition has one case per
-/// combination of the three signs, and a predicate that is too weak there is a
-/// false proof rather than a refusal, so the width gap is kept rather than closed
-/// unsoundly. The name carries no `_cannot_prove_this` because `incomplete` is an
-/// honest answer, not a refutation.
+/// This was `incomplete` and its name said so. The signed condition has one case per
+/// combination of the three signs, so the arm is what made it affordable rather than
+/// any change to the predicate -- the predicate was already exact, and only the width
+/// bound stood in the way.
 /// requires: a == 3
 /// ensures: ret == 6
-pub fn a_signed_constant_multiply_is_still_incomplete(a: i32) -> i32 {
+pub fn a_signed_constant_multiply_of_a_wide_value(a: i32) -> i32 {
+    a * 2
+}
+
+/// The false direction of [`a_signed_constant_multiply_of_a_wide_value`].
+/// requires: a == 3
+/// ensures: ret == 7
+pub fn a_signed_constant_multiply_of_a_wide_value_cannot_prove_this(a: i32) -> i32 {
+    a * 2
+}
+
+/// The signed multiply *at `i64`* is still `incomplete`, and honestly so.
+///
+/// There is nowhere to widen to at the widest width, so no predicate is available and
+/// the path is reported unknown. The name carries no `_cannot_prove_this` because
+/// `incomplete` is a refusal, not a refutation -- and this entry is here so that a
+/// later attempt to close the gap has to change a test rather than quietly widen what
+/// the tool claims.
+/// requires: a == 3
+/// ensures: ret == 6
+pub fn a_signed_constant_multiply_at_i64_is_still_incomplete(a: i64) -> i64 {
+    a * 2
+}
+
+/// The unsigned multiply at `i64`'s width *is* decided, which is what makes the entry
+/// above a width story rather than a sign story.
+/// requires: a == 3
+/// ensures: ret == 6
+pub fn an_unsigned_constant_multiply_at_u64(a: u64) -> u64 {
     a * 2
 }
 

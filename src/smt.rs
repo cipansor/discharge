@@ -1330,6 +1330,30 @@ impl Ctx {
 
     // ------------------------- bit-blasting -------------------------
 
+    /// The constant operand of a binary term, if exactly one is a `Const`.
+    ///
+    /// Both constant is deliberately `None`: the product would be constant, and
+    /// folding it here would need the `w`-bit truncation this function does not
+    /// have. Falling through to the schoolbook path is correct and rare.
+    fn const_operand(&mut self, a: Term, b: Term) -> Option<u64> {
+        let ca = self.node_of(a).op == Op::Const;
+        let cb = self.node_of(b).op == Op::Const;
+        if ca == cb {
+            return None;
+        }
+        Some(self.const_value(if ca { a } else { b }))
+    }
+
+    /// The operand of a binary term that is *not* the constant one. The caller has
+    /// established with [`Self::const_operand`] that exactly one is constant.
+    fn other_operand(&mut self, a: Term, b: Term) -> Term {
+        if self.node_of(a).op == Op::Const {
+            b
+        } else {
+            a
+        }
+    }
+
     fn blast(&mut self, t: Term, out: &mut [u32; 64]) {
         // Bound the work before doing any of it. See `MAX_BLAST_STEPS`: the memo below
         // makes the fold walks cheap, but only this counter makes the pass *guaranteed* to
@@ -1479,11 +1503,60 @@ impl Ctx {
                 }
             }
             Op::Mul => {
-                let mut a = [FALSE; 64];
-                let mut b = [FALSE; 64];
-                self.blast(Term(n.a), &mut a);
-                self.blast(Term(n.b), &mut b);
-                out[..w].fill(FALSE);
+                // One constant operand makes this a sum of shifts instead of a
+                // schoolbook multiply. `x * c` is `sum over the set bits k of c of
+                // (x << k)`, which is *exact* -- it is the distributive law, not an
+                // approximation -- and it is `popcount(c)` shift-adds rather than
+                // `w^2` AND/XOR rows, so `x * 4` is one shift and `x * 255` is eight
+                // additions where the multiply was 64 rows.
+                //
+                // This is the same shape the frontend's overflow predicate needs:
+                // `i * 4`, an index scaled by an element size. It also makes the
+                // *signed* case cheap, because the identity holds for a two's
+                // complement word regardless of sign -- no widening is needed to
+                // build the product, only to decide whether it wrapped.
+                //
+                // `c == 0` yields zero and `c == 1` yields `x` with no shifts at all.
+                if let Some(c) = self.const_operand(Term(n.a), Term(n.b)) {
+                    let operand = self.other_operand(Term(n.a), Term(n.b));
+                    let mut x = [FALSE; 64];
+                    self.blast(operand, &mut x);
+                    // `c == 0` is the product zero, which is also what an accumulator
+                    // left untouched would be -- but the shifts below never run for it,
+                    // so the fill is what makes that case right rather than whatever the
+                    // buffer happened to hold.
+                    out[..w].fill(FALSE);
+                    for k in 0..w as u32 {
+                        if (c >> k) & 1 == 0 {
+                            continue;
+                        }
+                        // `x << k` at width `w`: bits below `k` are zero, and the bits
+                        // at and above `k` come from `x` at `bit - k`.
+                        // A full adder, matching the schoolbook arm below: the sum is
+                        // `out ^ shifted ^ carry`, and the carry out is
+                        // `(out & shifted) | (carry & (out ^ shifted))`. Dropping the
+                        // `^ carry` from the sum is the one-line version of this that
+                        // looks right and is not -- it agrees whenever the accumulator
+                        // bit and the shift agree, which is most of the time.
+                        let mut carry = FALSE;
+                        for bit in 0..w {
+                            let shifted = if (bit as u32) < k { FALSE } else { x[bit - k as usize] };
+                            let s1 = self.xor(out[bit], shifted);
+                            let s2 = self.xor(s1, carry);
+                            let c1 = self.and(out[bit], shifted);
+                            let c2 = self.and(carry, s1);
+                            carry = self.or(c1, c2);
+                            out[bit] = s2;
+                        }
+                    }
+                    // Only the low `w` bits of `c` can contribute: `x << k` for
+                    // `k >= w` is zero at this width, which is the `0..w` bound above.
+                } else {
+                    let mut a = [FALSE; 64];
+                    let mut b = [FALSE; 64];
+                    self.blast(Term(n.a), &mut a);
+                    self.blast(Term(n.b), &mut b);
+                    out[..w].fill(FALSE);
                 for j in 0..w {
                     let mut carry = FALSE;
                     for i in j..w {
@@ -1495,6 +1568,7 @@ impl Ctx {
                         carry = self.or(c1, c2);
                         out[i] = s2;
                     }
+                }
                 }
             }
             Op::Eq => {
