@@ -3292,6 +3292,13 @@ optional file argument, which is what made the measurement cheap.)
   (`(_1.0) = (5, 6)` writes `(_1.0.0)`, a `Field(0) + Index(0)` chain the `set`
   catch-all does not re-root), so the tempting "consistency" edit is a
   regression. The minimal, evidence-backed change is the assignment hook alone.
+  The destination is *resolved* before the path is read, and one leading `Deref`
+  is stripped as `field_chain` strips one: `o.i = Inner { v: 9 }` through an
+  `&mut Outer` lowers to `((*_1).0) = move _2`, and an `&mut T` argument is
+  modelled as its referent, so `resolve` leaves the lone deref in place. Without
+  the strip the write is refused for the wrong reason and the leaf reads
+  `Unknown` -- `whole_inner_write_through_a_mutable_reference_is_seen` verifies
+  after it and is `incomplete` before, the tripwire for the deref case.
   The deep `i64 / 3` wall is *not* part of this: that entry is the deliberate
   `MAX_WALK_DEPTH` refusal vehicle (`a_symbolic_division_by_a_non_power_of_two_at_i64`,
   whose contract is false in general), so its `incomplete` is intended, not a bug.

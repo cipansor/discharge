@@ -729,15 +729,29 @@ impl Env {
     /// `prefix` is the destination's projection. Only an all-field path is re-keyed: any
     /// other projection (a deref, an index, a downcast) names a store this helper does not
     /// re-root, and writing a part where no read consults it would be a lost proof at best,
-    /// so those are refused. The source must be a bare local for the same reason
-    /// [`Self::copy_parts`] requires it -- a source that is itself a projection has no parts
-    /// under a local to move.
-    fn copy_parts_under(&mut self, src: &Place, dst: u32, prefix: &[Proj]) {
+    /// so those are refused. The destination is *resolved* first, so a write through a
+    /// reference (`o.i = Inner { v: 9 }` on an `&mut Outer` lowers to `((*_1).0) = move _2`)
+    /// reaches the target's field path rather than stopping at the leading deref, which is
+    /// what makes the write and the read meet in one store. The source must be a bare local
+    /// for the same reason [`Self::copy_parts`] requires it -- a source that is itself a
+    /// projection has no parts under a local to move.
+    fn copy_parts_under(&mut self, src: &Place, dst: &Place) {
         let src = self.resolve(src);
-        if !src.proj.is_empty() || src.local == dst {
+        let dst = self.resolve(dst);
+        if !src.proj.is_empty() || src.local == dst.local {
             return;
         }
-        let leaf: Vec<u32> = match prefix
+        // The destination's projection as a field chain. A leading `Deref` is stripped first,
+        // exactly as [`field_chain`] strips one: an `&mut T` *argument* is modelled as its
+        // referent, so `resolve` leaves its lone deref in place and the field path is the
+        // tail. Any other projection (an index, a downcast, a second deref) names a store this
+        // helper does not re-root, so the write is refused rather than sent where no read
+        // consults it.
+        let steps = match dst.proj.first() {
+            Some(Proj::Deref) => &dst.proj[1..],
+            _ => &dst.proj[..],
+        };
+        let leaf: Vec<u32> = match steps
             .iter()
             .map(|p| match p {
                 Proj::Field(i) => Some(*i),
@@ -748,7 +762,7 @@ impl Env {
             Some(v) if !v.is_empty() => v,
             _ => return,
         };
-        let s = src.local;
+        let (s, d) = (src.local, dst.local);
         // The source's parts as the two shapes the field stores use: a chain of fields (the
         // `nested` store) and a single field (the `fields` store). A part is re-keyed under
         // `leaf`, and since `leaf` is non-empty every such key is a chain of length two or
@@ -764,12 +778,12 @@ impl Env {
         for (chain, v) in nested {
             let mut c = leaf.clone();
             c.extend(chain);
-            self.nested.insert((dst, c), v);
+            self.nested.insert((d, c), v);
         }
         for (k, v) in fields {
             let mut c = leaf.clone();
             c.push(k);
-            self.nested.insert((dst, c), v);
+            self.nested.insert((d, c), v);
         }
     }
 
@@ -2279,19 +2293,22 @@ where
                 }
                 st.env.set(dest, v);
                 // A *nested* aggregate assignment (`o.i = Inner { v: 9 }` lowers to
-                // `(_1.0) = move _2`) moves the source's parts under the destination's
-                // prefix. `set` alone cannot do it: the value it is handed is the source
-                // local, which has no bit-vector meaning, and the parts live in the field
-                // stores keyed by the source's own local. It is done *after* `set` because
-                // the field arm of `set` forgets the nested paths beneath the destination
-                // -- correct, since they are stale -- and this is what puts the source's
-                // parts back. Without it the temp's `v` never lands under `_1.0`, and
-                // `(_1.0).0` reads `Unknown`.
+                // `(_1.0) = move _2`, or `((*_1).0) = move _2` through a reference) moves the
+                // source's parts under the destination's field path. `set` alone cannot do
+                // it: the value it is handed is the source local, which has no bit-vector
+                // meaning, and the parts live in the field stores keyed by the source's own
+                // local. It is done *after* `set` because the field arm of `set` forgets the
+                // nested paths beneath the destination -- correct, since they are stale --
+                // and this is what puts the source's parts back. Without it the temp's `v`
+                // never lands under `_1.0`, and `(_1.0).0` reads `Unknown`.
+                //
+                // The source is still required to be a bare local (the helper refuses a
+                // source that is itself a projection). A nested-to-nested move (`o.i = o.j`)
+                // would need the source's own prefix re-rooted as well; that shape is not in
+                // the corpus, so it is left to the helper's refusal rather than guessed at.
                 if !dest.proj.is_empty() {
                     if let Rvalue::Use(Operand::Copy(q) | Operand::Move(q)) = rv {
-                        if q.proj.is_empty() {
-                            st.env.copy_parts_under(q, dest.local, &dest.proj);
-                        }
+                        st.env.copy_parts_under(q, dest);
                     }
                 }
             }

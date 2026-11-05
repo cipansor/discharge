@@ -5455,6 +5455,21 @@ pub fn whole_inner_write_is_seen_by_the_leaf(mut o: OuterBox) -> u8 {
     o.i.v
 }
 
+/// The same nested aggregate literal, written *through a mutable reference*.
+///
+/// On an `&mut OuterBox` the assignment lowers to `((*_1).0) = move _2`, so the
+/// destination's projection carries a leading deref. The re-rooting helper must strip that
+/// deref -- as the nested *read* does, because an `&mut T` argument is modelled as its
+/// referent -- or the write is refused for the wrong reason and the leaf reads `Unknown`.
+/// `verified` here is the evidence the write reached the target's field path, and it is the
+/// `&mut` companion to `whole_inner_write_is_seen_by_the_leaf`.
+/// requires: true
+/// ensures: ret == 9
+pub fn whole_inner_write_through_a_mutable_reference_is_seen(o: &mut OuterBox) -> u8 {
+    o.i = InnerBox { v: 9 };
+    o.i.v
+}
+
 /// The inner type of [`nested_tuple_projection_reads`].
 pub struct NestedPair { pub p: Pair }
 

@@ -1503,6 +1503,7 @@ fn a_nested_seed_is_invalidated_by_a_write_and_carried_by_a_copy() {
     let Some(report) = verify_realistic(&[
         "whole_inner_write_makes_nested_seed_stale",
         "whole_inner_write_is_seen_by_the_leaf",
+        "whole_inner_write_through_a_mutable_reference_is_seen",
         "whole_struct_copy_carries_nested_paths",
     ]) else {
         return;
@@ -1519,6 +1520,13 @@ fn a_nested_seed_is_invalidated_by_a_write_and_carried_by_a_copy() {
     assert!(
         landed.is_verified(),
         "a nested aggregate write must land where the leaf reads it; got: {landed}"
+    );
+    // The `&mut` companion: the same write's destination carries a leading deref, so the
+    // re-rooting must resolve it or the field path never matches the read.
+    let via_ref = outcome(&report, "whole_inner_write_through_a_mutable_reference_is_seen");
+    assert!(
+        via_ref.is_verified(),
+        "a nested aggregate write through a &mut must reach the target's field path; got: {via_ref}"
     );
     let copy = outcome(&report, "whole_struct_copy_carries_nested_paths");
     assert!(copy.is_verified(), "a whole-struct copy must carry nested paths; got: {copy}");
