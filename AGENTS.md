@@ -5889,8 +5889,26 @@ covers, and the ones that matter go through `prove` against an independently bui
 (`smt::shl`/`smt::add`), which shares no code with either multiply arm. Both were confirmed
 to fail on the dropped carry.
 
+**The two evaluators are checked against each other, per operator.** `evaluate` (the term
+folder) and `blast` (the bit-blaster behind `prove`) are independent implementations of the
+same operators, and both bugs above landed in `blast` while a concrete `evaluate` test passed.
+`tests/op_differential.rs` closes the class instead of the instance: for every binary operator
+it sweeps the whole 4-bit domain with both operands symbolic *and* with a `Const` on either
+side, and for `truncate`/`sign_extend` it sweeps narrowing and widening separately, asserting
+`evaluate` and `blast` agree at every point. The two sweeps are deliberately separate: the
+symbolic-only version passed on a `blast` whose constant arm had the dropped carry, because
+`var * var` never reaches that arm.
+
+**A test that does not reach the branch guards nothing.** The `truncate` sweep was first
+written with only narrowing widths, so the zero-fill-on-widen branch was never taken, and a
+deliberate corruption of that branch went undetected -- the same shape as the two bugs above,
+one level down. Every branch named in a test's doc-comment is now confirmed to be reachable by
+corrupting it and watching the test fail. That check is what the tests below are worth; the
+`evaluate`-vs-`blast` sweep, the `truncate` widening sweep, and the constant-multiply arm were
+each confirmed to fail on a corrupted `blast` before being kept.
+
 **Evidence.** Corpus `decided 181 of 333` -> **`256 of 476`**; `cargo test --workspace
---features std` **608 -> 634** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+--features std` **608 -> 644** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
 `mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.
