@@ -5857,8 +5857,20 @@ the value's width) missed it. The regression test must go through `prove`, not `
 or it guards nothing; both are present and the symbolic one was checked against the
 unfixed code. Pinned by `a_wider_shift_amount_is_read_at_its_own_width{,_symbolically}`.
 
-**Evidence.** Corpus `decided 181 of 333` -> **`248 of 462`**; `cargo test --workspace
---features std` **608 -> 628** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+**A constant multiply is decided without a wide multiplier.** `a * 2` at `u32` was
+`incomplete` -- the general overflow path widens to `2w` and refuses past 16 bits -- while
+the same expression at `u8` verified, so the gap was width-only. With one operand a
+constant, `x * c` wraps exactly when `x > MAX / c`, which is one comparison against a
+compile-time constant; `i * 4` (an index scaled by an element size, usually `usize`) is the
+shape it is for. Unsigned only: the signed condition has one case per combination of the
+three signs, and a predicate that is too weak there is a false proof rather than a refusal,
+so the signed width gap is kept. `overflow_pred`'s exactness is checked exhaustively at
+`u8` (all 256 values against every constant) and at the `ceil(2^32 / c)` boundary for `u32`
+by `a_constant_multiply_overflow_is_exact`, which was confirmed to fail on an off-by-one
+predicate.
+
+**Evidence.** Corpus `decided 181 of 333` -> **`254 of 473`**; `cargo test --workspace
+--features std` **608 -> 629** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
 `mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.

@@ -5144,6 +5144,104 @@ pub fn an_arithmetic_shift_by_a_wider_amount_cannot_prove_this(a: i8, b: u32) ->
     a >> b
 }
 
+/// A constant operand makes the multiply-overflow test exact without a `2w`-bit
+/// multiplier, so it decides at widths the general path refuses.
+///
+/// `a * 2` at `u32` was `incomplete` -- the general path widens to `2w` and gives
+/// up past 16 bits -- while the same expression at `u8` verified. With one operand
+/// a constant, `x * c` wraps exactly when `x > MAX / c`, which is one comparison
+/// against a compile-time constant. An index scaled by an element size is the
+/// shape this is for, and it is usually `usize`.
+/// requires: a == 3
+/// ensures: ret == 6
+pub fn a_constant_multiply_of_a_wide_unsigned(a: u32) -> u32 {
+    a * 2
+}
+
+/// The false direction of [`a_constant_multiply_of_a_wide_unsigned`].
+/// requires: a == 3
+/// ensures: ret == 7
+pub fn a_constant_multiply_of_a_wide_unsigned_cannot_prove_this(a: u32) -> u32 {
+    a * 2
+}
+
+/// The constant on the *left* must behave the same as on the right.
+/// requires: a == 3
+/// ensures: ret == 6
+pub fn a_constant_multiply_with_the_constant_on_the_left(a: u32) -> u32 {
+    2 * a
+}
+
+/// A scaled index: the element size is the constant and the type is `usize`.
+/// requires: a == 3
+/// ensures: ret == 24
+pub fn a_scaled_index(a: usize) -> usize {
+    a * 8
+}
+
+/// The false direction of [`a_scaled_index`].
+/// requires: a == 3
+/// ensures: ret == 25
+pub fn a_scaled_index_cannot_prove_this(a: usize) -> usize {
+    a * 8
+}
+
+/// The last value that does *not* wrap: `ceil(2^32 / 2) - 1`, where the product is
+/// `2^32 - 2`. This is the boundary that separates an exact predicate from a
+/// merely sufficient one.
+/// requires: a == 2147483647
+/// ensures: ret == 4294967294
+pub fn a_constant_multiply_at_the_last_safe_value(a: u32) -> u32 {
+    a * 2
+}
+
+/// One past that boundary: the product is `2^32`, so the multiply wraps and rustc's
+/// `assert` must fail. A predicate that were too weak here would call this
+/// panic-free, which is the failure mode that reports a *better* result than the
+/// truth.
+/// requires: a == 2147483648
+/// ensures: ret == 0
+pub fn a_constant_multiply_that_overflows_cannot_prove_this(a: u32) -> u32 {
+    a * 2
+}
+
+/// Multiplying by zero cannot wrap, even at the type's maximum.
+/// requires: a == 4294967295
+/// ensures: ret == 0
+pub fn a_constant_multiply_by_zero_never_overflows(a: u32) -> u32 {
+    a * 0
+}
+
+/// Multiplying by one cannot wrap either, and this is the case where `MAX / c`
+/// itself would not fit -- so it is decided by a constant `false` rather than by a
+/// comparison.
+/// requires: a == 4294967295
+/// ensures: ret == 4294967295
+pub fn a_constant_multiply_by_one_never_overflows(a: u32) -> u32 {
+    a * 1
+}
+
+/// The false direction of [`a_constant_multiply_by_one_never_overflows`].
+/// requires: a == 4294967295
+/// ensures: ret == 0
+pub fn a_constant_multiply_by_one_cannot_prove_this(a: u32) -> u32 {
+    a * 1
+}
+
+/// A *signed* constant multiply stays on the general path and is still
+/// `incomplete` past 16 bits.
+///
+/// This is the deliberate half of the trade: the signed condition has one case per
+/// combination of the three signs, and a predicate that is too weak there is a
+/// false proof rather than a refusal, so the width gap is kept rather than closed
+/// unsoundly. The name carries no `_cannot_prove_this` because `incomplete` is an
+/// honest answer, not a refutation.
+/// requires: a == 3
+/// ensures: ret == 6
+pub fn a_signed_constant_multiply_is_still_incomplete(a: i32) -> i32 {
+    a * 2
+}
+
 /// A type whose method's tail collides with a *free function* of the same name.
 ///
 /// The collision is deliberately on names used by nothing else in this file: a

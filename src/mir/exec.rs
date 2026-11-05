@@ -3485,6 +3485,37 @@ fn overflow_pred(op: BinOp, a: Val, b: Val, w: u8) -> Option<Pred> {
         // sign-extended product is built here, and the equality is what is
         // checked.
         BinOp::Mul => {
+            // A *constant* operand makes the test exact and cheap without a
+            // `2w`-bit multiplier: `x * c` wraps, for unsigned operands, exactly
+            // when `x > MAX / c`, and `MAX / c` is a compile-time constant, so the
+            // whole predicate is one comparison. `i * 4` -- an index scaled by an
+            // element size -- is the common shape and is usually `usize`/`u32`,
+            // which is precisely what the general path below refuses past 16 bits.
+            //
+            // Unsigned only. The signed case has one case per combination of the
+            // three signs, and a predicate that is too weak there is a false proof
+            // rather than a refusal, so it keeps the general path rather than
+            // taking on that risk for this payoff.
+            if !signed {
+                let const_side = match (smt::evaluate(x, |_| None), smt::evaluate(y, |_| None)) {
+                    // `(v, k)`: the non-constant operand and the constant one.
+                    (Some(_), None) => Some((y, x)),
+                    (None, Some(_)) => Some((x, y)),
+                    _ => None,
+                };
+                if let Some((v, k)) = const_side {
+                    let c = smt::evaluate(k, |_| None).expect("the constant side, just matched");
+                    let max = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                    // `c <= 1` is both cases where `MAX / c + 1` would not fit in
+                    // `w` bits: `c == 0` never wraps, and `c == 1` cannot exceed
+                    // `MAX`. The predicate is the sound one for every other `c`.
+                    return Some(if c <= 1 {
+                        smt::truth(false)
+                    } else {
+                        smt::uge_const(v, max / c + 1)
+                    });
+                }
+            }
             let wide = w.saturating_mul(2).min(64);
             if wide <= w {
                 // At the widest supported width there is nowhere to widen to, so
@@ -4317,5 +4348,80 @@ fn count_via_helper(_1: u8) -> u8 {
             !matches!(out, crate::mir::verify::FnOutcome::Verified { .. }),
             "a weak invariant must not be rescued by the restored cut, got {out:?}"
         );
+    }
+
+    /// `overflow_pred` is *exact* for a constant multiply, checked exhaustively at
+    /// a width small enough to enumerate and at the real boundary of a wide one.
+    ///
+    /// The predicate is one comparison against `MAX / c`, and the reason it is
+    /// worth a test of its own is the failure mode: a predicate that is merely
+    /// *sufficient* would still refuse the safe cases, and a predicate that is too
+    /// *weak* would let rustc's `assert(!overflow)` discharge on a program that
+    /// overflows, reporting a false panic-free result. So the check is two-sided --
+    /// it must fire on every wrapping input and on no other.
+    ///
+    /// At `u8` the whole domain is 256 values, so "no other" is checked rather than
+    /// sampled. `u32` cannot be enumerated, so the two values straddling the
+    /// boundary `ceil(2^32 / c) - 1` are used, which is where a fencepost error
+    /// lives.
+    #[test]
+    fn a_constant_multiply_overflow_is_exact() {
+        // `true` when the engine's predicate says the multiply wraps.
+        let wraps = |w: u8, c: u64, v: u64| -> bool {
+            smt::with_fresh(|| {
+                // `x` must be *symbolic*: with both operands constant the
+                // constant-operand path is not taken at all, and the test would
+                // exercise the widening path it is meant to be independent of.
+                let x = smt::var(w);
+                let y = smt::word(c, w);
+                let p = overflow_pred(
+                    BinOp::Mul,
+                    Val::Sym(x, Sign::Unsigned),
+                    Val::Sym(y, Sign::Unsigned),
+                    w,
+                )
+                .expect("a constant multiply must produce a predicate");
+                // The predicate is over fresh variables, so asking whether it holds
+                // for this one point means substituting the point and evaluating.
+                smt::evaluate_pred(p, |_| Some(v)).expect("the predicate is over `x`")
+            })
+        };
+
+        // Exhaustive at `u8`: every value against every constant that can wrap.
+        for w in [4u8, 8] {
+            let max = (1u64 << w) - 1;
+            for c in 0..=max {
+                for v in 0..=max {
+                    let want = v.checked_mul(c).is_none_or(|p| p > max);
+                    assert_eq!(
+                        wraps(w, c, v),
+                        want,
+                        "{w}-bit {v} * {c}: predicate said {} but wrapping is {want}",
+                        wraps(w, c, v)
+                    );
+                }
+            }
+        }
+
+        // The boundary of a wide width, where a fencepost error would sit.
+        for c in [2u64, 3, 5, 7, 8, 1000] {
+            let boundary = (1u64 << 32).div_ceil(c); // ceil(2^32 / c)
+            for v in [boundary - 1, boundary] {
+                let want = (v as u128) * (c as u128) > (u32::MAX as u128);
+                assert_eq!(wraps(32, c, v), want, "32-bit {v} * {c}");
+            }
+        }
+
+        // Multiplying by zero and by one never wraps, at any width -- the two cases
+        // that are decided by a constant `false` rather than by a comparison, and so
+        // the two that would panic if `MAX / c` were computed for them.
+        for w in [1u8, 8, 16, 32, 64] {
+            let max = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+            for c in [0u64, 1] {
+                for v in [0u64, 1, max] {
+                    assert!(!wraps(w, c, v), "{w}-bit {v} * {c} must not wrap");
+                }
+            }
+        }
     }
 }
