@@ -6113,14 +6113,31 @@ both referents so they also exercise the carry-in. The false twins read the *oth
 target and would verify if the two collapsed onto one place. Ten entries, pinned by
 `two_reference_targets_in_one_call_stay_independent`.
 
-**Not yet modelled, and *silently* so.** A *field whose type is an array* (`o.a[0]`) and
-an *array of arrays* (`m[1][0]`) cannot be named in a contract at all -- the refusal is
-`unknown field`, and an `ensures` about the value is reported as unreadable, so such a
-function is *skipped* rather than decided. This is a coverage hole rather than a
-soundness one (nothing false can be proved, since the contract cannot be written), and it
-is the next precision target: the `indexed` store is keyed by *local* only, so an array
-reached through a projection has no entry. Closing it means keying `indexed` by a place
-and re-basing element keys on the projection, the same shape as the `nested`-store work.
+**Not yet modelled, and *silently* so.** An *array of arrays* (`m[1][0]`) cannot be named
+in a contract at all -- the refusal is `unknown name`, and an `ensures` about the value is
+reported as unreadable, so such a function is *skipped* rather than decided. This is a
+coverage hole rather than a soundness one (nothing false can be proved, since the contract
+cannot be written). A *field whose type is an array* (`o.a[0]`) used to be in this hole and
+is now modelled: the element store is keyed by the whole path, so a contract's `o.a[0]` and
+the body's `(_1.0)[_2]` are one word. See "An array element reached through a field path"
+below.
+
+**An array element reached through a field path is one word.** `x.a[0] = 9; x.a[0]` lowers
+to `(_1.0)[_2] = 9` and `_0 = copy (_1.0)[_4]`: the *field chain* is part of the element's
+key, not the local and index alone. Before this the write landed in a store keyed by the
+local and index, so the read consulted a different key, returned the *seed*, and a contract
+claiming the pre-write value (`ret == 5`) was **proved** against a body returning 9 -- a
+false proof, not a lost one. The store (`Env::elems_path`) is keyed by
+`(local, field chain, index)`, so `x.a[0]` and `x.b[0]` cannot collide; a sibling array's
+element is left alone and the two are independent. The contract side records every
+array-typed field as subscriptable (`FieldEnv::path_elem_types`, both first-level `x.a` and
+nested `o.i.a`), binds `path[digits]` to a variable of the element's own width and
+signedness, and refuses an index past the array's declared length rather than binding a
+variable for an element that does not exist. The mangled name is built from the *chain*,
+never the dotted path: a `.` in a generated name would be read by the parser as a field
+access. The symbolic subscript `(_1.0)[_4]` reads and writes the same store, and an index
+the run cannot pin poisons the path rather than guessing. Four entries with their false
+twins, pinned by `a_field_array_element_is_one_word_for_contract_and_body`.
 
 **A scalar field crosses a reference argument.** A helper reading `d.v` through a
 `&DuoBox` and one writing it through a `&mut DuoBox` both decide: the referent's *parts*

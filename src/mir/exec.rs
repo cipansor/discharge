@@ -402,6 +402,16 @@ struct Env {
     locals: BTreeMap<u32, Val>,
     /// Array elements, keyed by (local, index).
     elems: BTreeMap<(u32, u64), Val>,
+    /// An element of an array reached through a *field path*: `o.a[0]` is keyed by
+    /// `(local, [the field chain before the index], index)`.
+    ///
+    /// A separate store from [`Self::elems`] because that one is keyed by `(local, index)`
+    /// only, so `o.a[0]` and `o.b[0]` would collide on `(local, 0)` -- reading the wrong
+    /// array's element. And separate from [`Self::indexed`], which is keyed by local and holds
+    /// an *argument*'s array or slice; a field array is not the local itself. Only elements
+    /// this run explicitly wrote are served from here; a read of an element that was never
+    /// written is `Unknown`, never a seed or a literal.
+    elems_path: BTreeMap<(u32, Vec<u32>, u64), Val>,
     /// Tuple fields, keyed by (local, field).
     fields: BTreeMap<(u32, u32), Val>,
     /// A *nested* field path, keyed by (local, the projection chain from the
@@ -545,6 +555,7 @@ impl Env {
         Env {
             locals: BTreeMap::new(),
             elems: BTreeMap::new(),
+            elems_path: BTreeMap::new(),
             fields: BTreeMap::new(),
             nested: BTreeMap::new(),
             payloads: BTreeMap::new(),
@@ -777,11 +788,35 @@ impl Env {
                 rels.push((Vec::new(), *v));
             }
         }
-        let any = !rels.is_empty();
+        // Elements of field-path arrays under the source path move with the value, re-keyed the
+        // same way. An element *at* the source path (its chain equals `sp`) is an element of the
+        // whole destination value, which the plain `elems` store answers; a deeper one keeps its
+        // tail under the destination path.
+        let mut elem_rels: Vec<(Vec<u32>, u64, Val)> = Vec::new();
+        for ((l, chain, k), v) in &self.elems_path {
+            if *l == s {
+                if let Some(tail) = chain.strip_prefix(sp.as_slice()) {
+                    elem_rels.push((tail.to_vec(), *k, *v));
+                }
+            }
+        }
+        let any = !rels.is_empty() || !elem_rels.is_empty();
         // A whole destination is replaced outright, so its previous parts must not survive; a
         // nested destination keeps the parts outside the written path.
         if dp.is_empty() && s != dst.local {
             self.forget_parts(dst.local);
+        } else if !dp.is_empty() {
+            self.elems_path
+                .retain(|(l, c, _), _| *l != dst.local || !c.starts_with(dp.as_slice()));
+        }
+        for (tail, k, v) in elem_rels {
+            let mut full = dp.clone();
+            full.extend(tail);
+            if full.is_empty() {
+                self.elems.insert((dst.local, k), v);
+            } else {
+                self.elems_path.insert((dst.local, full, k), v);
+            }
         }
         for (rel, v) in rels {
             let mut full = dp.clone();
@@ -841,15 +876,28 @@ impl Env {
             .filter(|((l, _), _)| *l == s)
             .map(|((_, chain), v)| (chain.clone(), *v))
             .collect();
+        // Elements of a field-path array are parts of the local too: `c = d` has to carry
+        // `d.a[0]` to `c.a[0]`, or a later read of the destination's element finds nothing (or,
+        // worse, the destination's own pre-copy element).
+        let path_elems: Vec<(Vec<u32>, u64, Val)> = self
+            .elems_path
+            .iter()
+            .filter(|((l, _, _), _)| *l == s)
+            .map(|((_, chain, k), v)| (chain.clone(), *k, *v))
+            .collect();
         let any = !fields.is_empty()
             || !elems.is_empty()
             || !payloads.is_empty()
             || !nested.is_empty()
+            || !path_elems.is_empty()
             || disc.is_some()
             || indexed.is_some();
         self.forget_parts(dst);
         for (chain, v) in nested {
             self.nested.insert((dst, chain), v);
+        }
+        for (chain, k, v) in path_elems {
+            self.elems_path.insert((dst, chain, k), v);
         }
         for (k, v) in fields {
             self.fields.insert((dst, k), v);
@@ -944,7 +992,25 @@ impl Env {
                         // for a caller that did not.
                         None => Val::Unknown,
                     },
-                    None => *self.elems.get(&(p.local, *k)).unwrap_or(&Val::Unknown),
+                    // An element of an array reached through a *field path*: `o.a[0]` is keyed
+                    // by `(local, the field chain before the index, index)`. The path form is
+                    // tried first; a whole-local array has an empty chain, which is the plain
+                    // `o[0]` case the `elems` map below answers. Only an element this run
+                    // explicitly wrote is served; a path no write reached is `Unknown`, never a
+                    // seed or a literal, so `o.a[0]` cannot read a value the body never stored.
+                    None => {
+                        let chain = field_steps(&p.proj[..i]).unwrap_or_default();
+                        if chain.is_empty() {
+                            // A whole-local array (an array literal): the plain `elems` map
+                            // keeps answering it, exactly as before.
+                            *self.elems.get(&(p.local, *k)).unwrap_or(&Val::Unknown)
+                        } else {
+                            *self
+                                .elems_path
+                                .get(&(p.local, chain, *k))
+                                .unwrap_or(&Val::Unknown)
+                        }
+                    }
                 },
                 // `(*_1)[_2]` — a subscript that is a local. The element is
                 // looked up by the index's *value*: a constant index names one
@@ -964,7 +1030,17 @@ impl Env {
                                 let sign = Sign::of_bool(s.elem_signed);
                                 s.elems.get(&k).map(|v| Val::Sym(*v, sign)).unwrap_or(Val::Unknown)
                             }
-                            None => *self.elems.get(&(p.local, k)).unwrap_or(&Val::Unknown),
+                            None => {
+                                let chain = field_steps(&p.proj[..i]).unwrap_or_default();
+                                if chain.is_empty() {
+                                    *self.elems.get(&(p.local, k)).unwrap_or(&Val::Unknown)
+                                } else {
+                                    *self
+                                        .elems_path
+                                        .get(&(p.local, chain, k))
+                                        .unwrap_or(&Val::Unknown)
+                                }
+                            }
                         },
                         // A symbolic subscript: `get` takes `&self`, so it cannot
                         // create the elements the chain needs. The operand path
@@ -1130,6 +1206,40 @@ impl Env {
                     self.nested.insert((p.local, chain), v);
                     return;
                 }
+                // An element of an array reached through a field path: `(_1.0)[k] = v`. The
+                // whole projection is the key, so `o.a[0]` and `o.b[0]` cannot collide. The
+                // write replaces that element and leaves the siblings; the element's *type*
+                // was not seeded, so a read of an element this run did not write stays
+                // `Unknown` rather than inventing a value.
+                if let [fields @ .., last] = rest {
+                    let index = match last {
+                        Proj::Index(k) => Some(*k),
+                        // A symbolic subscript is only writable when the run can pin its
+                        // value; otherwise the store cannot say which element changed, so the
+                        // whole path is dropped rather than left stale.
+                        Proj::IndexVar(li) => match self.locals.get(li) {
+                            Some(Val::Sym(x, _)) => smt::evaluate(*x, |_| None),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(chain) = field_steps(fields) {
+                        if !chain.is_empty() {
+                            match index {
+                                Some(k) => {
+                                    self.write_elem_at(p.local, chain, k, v);
+                                    return;
+                                }
+                                None => {
+                                    self.elems_path.retain(|(l, c, _), _| {
+                                        *l != p.local || c.as_slice() != chain.as_slice()
+                                    });
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
                 // A shape the arms above do not cover. `*a = v` (a whole-store
                 // write through a `&mut [T; N]`) would need a new store, so it is
                 // dropped. For an indexed local that leaves the store describing a
@@ -1159,12 +1269,19 @@ impl Env {
     fn forget_nested_under(&mut self, local: u32, prefix: &[u32]) {
         self.nested
             .retain(|(l, chain), _| *l != local || !chain.starts_with(prefix));
+        // The elements of an array reached through this prefix describe a value that is no
+        // longer there once the intermediate aggregate is overwritten, so they are dropped too.
+        // A stale element is a wrong value, not a missing one.
+        self.elems_path.retain(|(l, chain, _), _| *l != local || !chain.starts_with(prefix));
     }
 
     fn forget_parts(&mut self, local: u32) {
         self.fields.retain(|(l, _), _| *l != local);
         self.nested.retain(|(l, _), _| *l != local);
         self.elems.retain(|(l, _), _| *l != local);
+        // Elements of field-path arrays under a whole-value write describe a value that is no
+        // longer there; keeping them would be a stale read of the old array.
+        self.elems_path.retain(|(l, _, _), _| *l != local);
         self.payloads.retain(|(l, _), _| *l != local);
         self.discriminants.remove(&local);
         self.tag_widths.remove(&local);
@@ -1208,6 +1325,15 @@ impl Env {
             // left stale.
             None => self.elems.retain(|(l, _), _| *l != local),
         }
+    }
+
+    /// Record an element of an array reached through a field path, `o.a[k] = v`.
+    ///
+    /// The whole path is the key, so `o.a[0]` and `o.b[0]` cannot collide. Any
+    /// previous value at that element is replaced; siblings are untouched.
+    fn write_elem_at(&mut self, local: u32, chain: Vec<u32>, index: u64, v: Val) {
+        self.elems_path.retain(|(l, c, k), _| *l != local || *c != chain || *k != index);
+        self.elems_path.insert((local, chain, index), v);
     }
 
     /// Record the payload of a modelled `Option`, with its width.
@@ -1440,6 +1566,10 @@ pub struct Seeds {
     pub slice_steps: Vec<(u32, u64)>,
     /// `(local, index, variable, signed)` for each element a contract names.
     pub elems: Vec<(u32, u64, Var, bool)>,
+    /// `(local, field chain, index, variable, signed)` for each element of an array reached
+    /// through a field path (`o.a[0]`) that a contract names. Keyed by the whole path, so
+    /// `o.a[0]` and `o.b[0]` cannot collide.
+    pub path_elems: Vec<(u32, Vec<u32>, u64, Var, bool)>,
     /// `(local, tag variable, tag width, discriminants)` for each enum-typed
     /// argument a contract names a variant of.
     ///
@@ -1619,6 +1749,16 @@ where
             };
             s.elems.insert(index, v);
         }
+    }
+    // Elements of field-path arrays the contract names, keyed by the whole path. The body's
+    // `(_1.0)[k]` write lands on the same key, so a contract's `o.a[0]` and the body's write are
+    // one value. Pins apply here as elsewhere: a pinned element is a *literal*, not an input.
+    for &(local, ref chain, index, v, _signed) in &seeds.path_elems {
+        let val = match pin_of(v) {
+            Some(k) => Val::Sym(lit_of(v, k), Sign::of_bool(_signed)),
+            None => Val::Sym(v, Sign::of_bool(_signed)),
+        };
+        env.elems_path.insert((local, chain.clone(), index), val);
     }
     // Enum tags a contract names a variant of. The tag is seeded so the body's
     // `discriminant(_1)` reads the same variable the contract's `m` does, and the
@@ -2672,6 +2812,7 @@ where
                             if dest.proj.is_empty() {
                                 env.fields.retain(|(l, _), _| *l != dest.local);
                                 env.nested.retain(|(l, _), _| *l != dest.local);
+                                env.elems_path.retain(|(l, _, _), _| *l != dest.local);
                                 for ((l, f), v) in st.env.fields.iter() {
                                     if *l != 0 {
                                         continue;
@@ -2681,6 +2822,12 @@ where
                                         proj: vec![Proj::Field(*f)],
                                     };
                                     env.set(&p, *v);
+                                }
+                                for ((l, chain, k), v) in st.env.elems_path.iter() {
+                                    if *l != 0 {
+                                        continue;
+                                    }
+                                    env.elems_path.insert((dest.local, chain.clone(), *k), *v);
                                 }
                                 for ((l, chain), v) in st.env.nested.iter() {
                                     if *l != 0 {

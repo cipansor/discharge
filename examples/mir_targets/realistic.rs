@@ -5821,3 +5821,82 @@ pub fn an_unsigned_power_of_two_division_cannot_prove_this(n: u64) -> u64 {
 pub fn an_unsigned_power_of_two_remainder_is_decided(n: u64) -> u64 {
     n % 4
 }
+
+
+/// An element of an array reached through a struct field, written and read back.
+///
+/// `x.a[0] = 9; x.a[0]` lowers to `(_1.0)[_2] = const 9_u8` and `_0 = copy (_1.0)[_4]`: the
+/// store is keyed by the whole path (the local, the field chain to the array, the index),
+/// so `x.a[0]` and `x.b[0]` are different words and the write is visible to the read. Before
+/// this the write was dropped and the read returned the *seed*, which is the false-proof
+/// direction: a contract claiming the pre-write value would have been proved.
+///
+/// [`a_field_array_write_is_not_the_seed`] is the false direction, so the entry above is a
+/// proof and not a `true` that a broken store would also produce.
+/// requires: x.a[0] == 5
+/// ensures: ret == 9
+pub fn a_field_array_write_is_read_back(mut x: Boxed) -> u8 {
+    x.a[0] = 9;
+    x.a[0]
+}
+
+/// The false direction of the field-array write: the body stores 9, so a claim of the seed
+/// is refuted rather than proved.
+/// requires: x.a[0] == 5
+/// ensures: ret == 5
+pub fn a_field_array_write_is_not_the_seed(mut x: Boxed) -> u8 {
+    x.a[0] = 9;
+    x.a[0]
+}
+
+/// Writing one field's array element leaves the sibling array's element alone.
+///
+/// The whole path is the key, so `x.a[0] = 9` must not disturb `x.b[0]`. A store keyed by
+/// the local and index alone would collide the two and prove `ret == 7` against the wrong
+/// element.
+/// requires: x.b[0] == 7
+/// ensures: ret == 7
+pub fn a_sibling_field_array_is_untouched(mut x: Boxed) -> u8 {
+    x.a[0] = 9;
+    x.b[0]
+}
+
+/// A struct with two arrays, so a contract can name both fields' elements.
+pub struct Boxed {
+    pub a: [u8; 4],
+    pub b: [u8; 4],
+}
+
+/// An array element reached through a *nested* field path is the same word on both sides.
+///
+/// `o.i.a[0] = 9; o.i.a[0]` lowers to `(_1.0.0)[_2] = 9` and `_0 = copy (_1.0.0)[_4]`. The
+/// element's key is the *whole* field chain, so a nested array is not mistaken for the
+/// first-level `o.i`; the store and the contract agree on the deeper path.
+///
+/// [`a_nested_field_array_write_is_not_the_seed`] is the false direction.
+/// requires: o.i.a[0] == 5
+/// ensures: ret == 9
+pub fn a_nested_field_array_write_is_read_back(mut o: NestedArrays) -> u8 {
+    o.i.a[0] = 9;
+    o.i.a[0]
+}
+
+/// The false direction of the nested field-array write: the body stores 9, so a claim of
+/// the seed is refuted rather than proved.
+/// requires: o.i.a[0] == 5
+/// ensures: ret == 5
+pub fn a_nested_field_array_write_is_not_the_seed(mut o: NestedArrays) -> u8 {
+    o.i.a[0] = 9;
+    o.i.a[0]
+}
+
+/// A struct whose array lives one aggregate down, so the contract's path is `o.i.a[0]`.
+pub struct NestedArrays {
+    pub i: ArrayHolder,
+    pub k: u8,
+}
+
+/// The inner aggregate holding the array.
+pub struct ArrayHolder {
+    pub a: [u8; 4],
+}

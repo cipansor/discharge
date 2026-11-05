@@ -1626,6 +1626,68 @@ fn a_helpers_write_through_a_mutable_reference_reaches_the_caller() {
     }
 }
 
+/// An array element reached through a struct field is one word for the contract and
+/// the body, and the write does not spill onto a sibling array's element.
+///
+/// `x.a[0] = 9; x.a[0]` lowers to `(_1.0)[_2] = 9` and `_0 = copy (_1.0)[_4]`. The
+/// element store used to be keyed by the local and index alone, so the write landed
+/// under a key the read never consulted and the read returned the *seed* -- the false
+/// direction, where `ret == 5` was proved against a body returning 9. The pair below
+/// toothes both directions, and the sibling entry catches a store that collides
+/// `x.a[0]` with `x.b[0]`.
+#[test]
+fn a_field_array_element_is_one_word_for_contract_and_body() {
+    let Some(report) = verify_realistic(&[
+        "a_field_array_write_is_read_back",
+        "a_field_array_write_is_not_the_seed",
+        "a_sibling_field_array_is_untouched",
+    ]) else {
+        return;
+    };
+    let read_back = outcome(&report, "a_field_array_write_is_read_back");
+    assert!(
+        read_back.is_verified(),
+        "a write to `x.a[0]` must be seen by the read of `x.a[0]`; got: {read_back}"
+    );
+    let seed = outcome(&report, "a_field_array_write_is_not_the_seed");
+    assert!(
+        matches!(seed, FnOutcome::Failed { .. }),
+        "the pre-write seed must not prove a contract the body refutes; got: {seed}"
+    );
+    let sibling = outcome(&report, "a_sibling_field_array_is_untouched");
+    assert!(
+        sibling.is_verified(),
+        "writing `x.a[0]` must leave `x.b[0]` alone; got: {sibling}"
+    );
+}
+
+/// A *nested* array field is the same word on both sides, and the false direction is
+/// refuted rather than proved.
+///
+/// `o.i.a[0] = 9; o.i.a[0]` lowers to `(_1.0.0)[_2] = 9` and `_0 = copy (_1.0.0)[_4]`. The
+/// element's key is the whole field chain, so a store that stopped at the first field
+/// (`o.i`) would key the write and the read differently and leave the read at the seed --
+/// the false direction, where `ret == 5` was proved against a body returning 9.
+#[test]
+fn a_nested_field_array_element_is_one_word_for_contract_and_body() {
+    let Some(report) = verify_realistic(&[
+        "a_nested_field_array_write_is_read_back",
+        "a_nested_field_array_write_is_not_the_seed",
+    ]) else {
+        return;
+    };
+    let read_back = outcome(&report, "a_nested_field_array_write_is_read_back");
+    assert!(
+        read_back.is_verified(),
+        "a nested `o.i.a[0]` write must be seen by the read; got: {read_back}"
+    );
+    let seed = outcome(&report, "a_nested_field_array_write_is_not_the_seed");
+    assert!(
+        matches!(seed, FnOutcome::Failed { .. }),
+        "the nested pre-write seed must not prove a refuted contract; got: {seed}"
+    );
+}
+
 /// A helper's write-back covers a *nested* field and a read-modify-write, and the
 /// caller's field seed crosses *into* the callee so the callee's read is modelled.
 ///
