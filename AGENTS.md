@@ -3319,6 +3319,14 @@ optional file argument, which is what made the measurement cheap.)
   `nested_aggregate_argument_reaches_the_helper` (true `ret == 9`, verified) and
   `nested_aggregate_argument_is_not_the_stale_destination` (claims `7`; refuted, witness
   `v4 = 9`) pins it: with the new branch disabled both go `incomplete`.
+  Three holes remain next to it, all *coverage* rather than soundness (nothing false can be
+  proved: each is an unreadable contract or an `Unknown` read, never a pass). A *two-level*
+  nested return path (`mk_outer(o.i).j.v`) is still `incomplete` -- the merge copies the
+  callee's `_0` parts one level, and a read of `.j.v` on the destination needs the nested key
+  re-rooted through the destination too. An *array literal of aggregates* (`[o.i, o.j]`) is
+  `incomplete`, because the literal path stores under `elems` by index and does not carry the
+  element aggregates' parts. And an *array whose type is a field* (`o.a[0]`) is skipped, since
+  the `indexed` store is keyed by local only (see the note below).
   Two notes on what this did *not* need. The nested literal always reaches the
   store through a temp, so `Rvalue::Struct`/`Aggregate` do **not** need to write
   under `dest.proj`; and making `Aggregate` do so *drops* a nested tuple write
