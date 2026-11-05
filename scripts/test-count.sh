@@ -11,10 +11,14 @@
 # nothing was wrong. A count that survives a failure is worse than no count, because it
 # gets quoted. So a failure, a compile error, or a binary that never ran is a hard error
 # here, and the count is printed only when the whole run is green.
+#
+# It runs the whole workspace: `discharge` and `discharge-arithmetic` are two crates, and
+# a count that covered only one of them would be exactly the kind of half-truth this
+# script exists to prevent.
 set -e
 cd "$(dirname "$0")/.."
 
-out=$(cargo test --features std 2>&1) || {
+out=$(cargo test --workspace --features std 2>&1) || {
   echo "test-count: cargo test FAILED; not printing a count" >&2
   printf '%s\n' "$out" | grep -E '^(test result: FAILED|error(\[|:)|failures:)' >&2 || true
   exit 1

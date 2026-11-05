@@ -148,6 +148,100 @@ fn barrel_agrees_with_the_constant_path_symbolically() {
     });
 }
 
+/// The shift amount may be *wider* than the value, which is the shape rustc
+/// actually prints: `_1: u8, _2: u32` gives `Shr(copy _1, copy _2)`.
+///
+/// Every other test here passes the amount at the value's own width, so this one
+/// covers the case the frontend meets in ordinary code and the rest never
+/// exercised. It is the width mismatch, not the barrel shifter's logic, that was
+/// the bug: the stages tested bit `i` of the amount against a mask built at the
+/// *value's* width, so `n & mask` mixed 32 bits with 8 and the whole query came
+/// back ill-formed. The frontend then refused the function rather than answering,
+/// which is why a variable shift of a `u8` by a `u32` was `incomplete` while the
+/// same shift by a `u8` verified.
+///
+/// The comparison is against Rust's own result at the wide amount's width, so the
+/// stages are still read from the amount and not from the value.
+#[test]
+fn a_wider_shift_amount_is_read_at_its_own_width() {
+    for value_w in [1u8, 4, 8, 16, 32, 64] {
+        for amount_w in [8u8, 16, 32, 64] {
+            if amount_w < value_w {
+                continue;
+            }
+            on_big_stack(move || {
+                let vmask = if value_w >= 64 { u64::MAX } else { (1u64 << value_w) - 1 };
+                let amask = if amount_w >= 64 { u64::MAX } else { (1u64 << amount_w) - 1 };
+                for x in [0u64, 1, 3, vmask, vmask & 0xAA] {
+                    for n in [0u64, 1, value_w as u64 - 1, value_w as u64, value_w as u64 + 1, amask] {
+                        // The expectation must be computed from the value *as the
+                        // word holds it*: `3` at one bit is `1`, and shifting the
+                        // unmasked `3` would compare against a value the model
+                        // never sees.
+                        let xm = x & vmask;
+                        smt::with_fresh(|| {
+                            let xv = smt::word(xm, value_w);
+                            let nv = smt::word(n & amask, amount_w);
+                            let shl = smt::evaluate(smt::shift_var(Shift::Left, xv, nv), |_| None);
+                            let want = if n >= value_w as u64 { 0 } else { (xm << n) & vmask };
+                            assert_eq!(
+                                shl, Some(want),
+                                "{value_w}-bit {xm} << {n} with a {amount_w}-bit amount"
+                            );
+                            let lshr =
+                                smt::evaluate(smt::shift_var(Shift::LogicalRight, xv, nv), |_| None);
+                            let want = if n >= value_w as u64 { 0 } else { xm >> n };
+                            assert_eq!(
+                                lshr, Some(want),
+                                "{value_w}-bit {xm} >> {n} with a {amount_w}-bit amount"
+                            );
+                        });
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// The same width mismatch on the *symbolic* path, which is the one the frontend
+/// takes.
+///
+/// The concrete test above does not catch the bug: `evaluate` folds a term even
+/// when `require_same_width` has marked it ill-formed, so the mixed-width `n & mask`
+/// still produced the right number. It is `prove` that refuses an ill-formed term,
+/// and `prove` is what the MIR frontend calls -- which is why the frontend answered
+/// `incomplete` for `u8 >> u32` while the concrete path looked correct. A regression
+/// test for this must therefore go through `prove`, or it guards nothing.
+#[test]
+fn a_wider_shift_amount_is_read_at_its_own_width_symbolically() {
+    for value_w in [4u8, 8, 16] {
+        for amount_w in [16u8, 32, 64] {
+            if amount_w <= value_w {
+                continue;
+            }
+            on_big_stack(move || {
+                for k in [0u32, 1, 2, 3] {
+                    if k >= value_w as u32 {
+                        continue;
+                    }
+                    smt::with_fresh(|| {
+                        let x = smt::var(value_w);
+                        let n = smt::word(k as u64, amount_w);
+                        let via_barrel = smt::shift_var(Shift::Left, x, n);
+                        let via_const = smt::shl(x, k);
+                        assert_eq!(
+                            smt::prove(smt::eq(via_barrel, via_const)),
+                            Verdict::Valid,
+                            "x << {k} at {value_w} bits with a {amount_w}-bit amount must \
+                             agree through both paths"
+                        );
+                    });
+                }
+            });
+        }
+    }
+}
+
 #[test]
 fn a_variable_shift_is_not_the_identity() {
     // The direction that keeps the model honest: if the barrel shifter were

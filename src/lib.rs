@@ -87,10 +87,18 @@ pub mod sym;
 pub mod vc;
 pub mod wp;
 
+// The proved runtime primitives live in a sibling crate so that the arithmetic a
+// safety build ships is `no_std`, `#![forbid(unsafe_code)]` and dependency-free
+// on its own, with its proofs carried inside it. Re-exported so that
+// `discharge::discharge_arithmetic` resolves without the caller having to name
+// the workspace layout.
+pub use discharge_arithmetic;
+
 /// The names you almost always want: the prover entry points, the symbolic
 /// constructors, and the verification macros.
 pub mod prelude {
     pub use crate::contract::{Contract, ContractError};
+    pub use crate::discharge_arithmetic::prove::{self as arithmetic_proofs, Verdict as ProofVerdict};
     pub use crate::exhaustive::{
         find_violation_u8, find_violation_u8_2, for_all_u8, for_all_u8_2, for_all_u16,
     };

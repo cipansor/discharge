@@ -353,3 +353,32 @@ pub fn div_by_always_zero(a: u8, d: u8) -> u8 {
     let z = d & 0;
     a / z
 }
+
+/// A struct whose fields a contract names, in the regression corpus.
+///
+/// `realistic.rs` shows the capability; this file *requires* every function to be
+/// decided, so putting it here makes a regression in field support a failing test
+/// rather than a quietly-lower coverage number.
+pub struct Bounds {
+    /// The low bound.
+    pub lo: u8,
+    /// The high bound.
+    pub hi: u8,
+}
+
+/// A clamp against a struct's fields, verified from the fields themselves.
+///
+/// The MIR dump prints `_1: &Bounds` and never the layout, so both the field
+/// *index* and the field *width* come from the source. If the frontend lost
+/// either, this would be skipped and the corpus test would fail.
+/// requires: b.lo <= b.hi
+/// ensures: ret >= b.lo && ret <= b.hi
+pub fn clamp_bounds(b: &Bounds, v: u8) -> u8 {
+    if v < b.lo {
+        b.lo
+    } else if v > b.hi {
+        b.hi
+    } else {
+        v
+    }
+}

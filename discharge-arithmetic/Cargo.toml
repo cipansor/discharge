@@ -1,0 +1,18 @@
+[package]
+name = "discharge-arithmetic"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Integer primitives for safety-critical Rust whose central properties are proved inside the crate by exhaustive enumeration: checked and saturating arithmetic, overflow-free mul_div, Q16.16 fixed point, and a refinement-typed Bounded. no_std, zero dependencies."
+license = "Apache-2.0"
+authors = ["Yayasan Pesantren Cipansor and contributors <halo@cipansor.or.id>"]
+keywords = ["no_std", "safety-critical", "fixed-point", "checked-arithmetic", "formal-verification"]
+categories = ["no-std", "no-std::no-alloc", "embedded"]
+
+# No features at all. The crate is `no_std` and zero-dependency unconditionally;
+# there is nothing to turn on. The `smt` engine that cross-checks these proofs is
+# an *oracle* and lives in the parent `discharge` crate, which depends on this one
+# and not the other way round -- so a build of this crate links `core` and nothing
+# else, which is the property the parent's gate 4 enforces.
+[features]
+default = []

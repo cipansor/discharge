@@ -163,3 +163,46 @@ fn wide_divisor_case_is_not_run_through_the_restoring_loop() {
         concrete(w, (1u64 << (w - 1)) - 1, 1u64 << (w - 1));
     }
 }
+
+/// A wide division by a *non-power-of-two constant* must return a verdict, not hang.
+///
+/// This is the shape that regressed, and it is a different wall from the ones the
+/// tests above probe. `MAX_BLAST_STEPS` bounds the *term-DAG* walk (`blast`), and
+/// for `x / 15` that walk is tiny -- a few hundred steps at every width -- so the
+/// old budget never saw the blow-up. The cost is entirely in the BDD `apply2`,
+/// which recurses over the *diagram*: `x / 15` for a `u64` has a BDD far larger
+/// than its formula, `apply2` runs past 4 000 000 calls with no counter of its
+/// own, and `prove` simply never returns. `MAX_APPLY_STEPS` charges the apply, so
+/// the query trips the budget, falls back to the SAT engine, and answers.
+///
+/// The assertion is deliberately weak: `Valid`, `Unsat`, `Counterexample` and
+/// `Unknown` are all accepted, because the property being pinned is *termination*,
+/// not the answer. Before the fix the call did not return at all, so reaching the
+/// assertion is the whole test. The one thing that must never come back is
+/// `Valid`: `x / 15 == 0` is false for `x == 15`, and a truncated encoding read as
+/// a proof is exactly the unsoundness the budget must not introduce.
+///
+/// `15` rather than `7` is the divisor because at these widths `7` stays under
+/// the budget (it is decided) while `15` does not, so `15` is the smallest shape
+/// that exercises the bound. The big stack is required regardless of the budget:
+/// the restoring divider's `blast` recursion is about four frames per bit, which
+/// is a pre-existing property of the engine (see the README's scaling note), not
+/// something this fix changes.
+#[test]
+fn a_wide_constant_divisor_returns_a_verdict_instead_of_hanging() {
+    on_big_stack(|| {
+        for w in [24u8, 28, 32, 64] {
+            smt::with_fresh(|| {
+                let x = smt::var(w);
+                let y = smt::word(15, w);
+                let verdict = smt::prove(smt::eq(smt::udiv(x, y), smt::word(0, w)));
+                assert_ne!(
+                    verdict,
+                    Verdict::Valid,
+                    "`x / 15 == 0` is not valid at width {w}; a budget-truncated encoding \
+                     must not read as a proof"
+                );
+            });
+        }
+    });
+}

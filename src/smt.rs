@@ -31,6 +31,77 @@ use core::cell::RefCell;
 /// Node budget for the arena. This is the only tuning knob.
 pub const CAP: usize = 1 << 14;
 
+/// Slots in each bit-blaster's memo, rounded to a power of two.
+///
+/// The blasters walk a term as a tree, but a term built by a fold (`pow`, the divider) is
+/// a *DAG*: a shared subterm is re-walked once per path to it, and for a 32-step fold that
+/// is 2^32 walks of the same few hundred nodes. The arena never fills, so the existing
+/// overflow guard never fires, and the query simply never returns. A memo on the blasted
+/// value of each term collapses those paths: the same query drops from more than 10^8
+/// visits to a few hundred. 128 slots is enough for the fold terms a single query touches;
+/// it is deliberately small because the table lives in the arena (see `Ctx`), which is
+/// allocated once and must stay well inside a thread's stack.
+const BLAST_MEMO_N: usize = 128;
+
+/// Step budget for one bit-blasting pass, the companion to [`BLAST_MEMO_N`].
+///
+/// A memo makes the fold walks cheap, but a memo is a cache, not a guarantee: a term shape
+/// that evicts its own entries could still recompute. This bounds the *work* directly. When
+/// it trips, the pass stops and the query degrades exactly as an arena overflow does -- the
+/// BDD pass hands off to the SAT engine, the SAT pass reports `Unknown` -- so the answer
+/// stays sound and the call always returns. The value is far above every query in the test
+/// corpus (the largest measured pass is a few thousand steps) and far below the 10^8-step
+/// blow-up it exists to stop.
+pub(crate) const MAX_BLAST_STEPS: u32 = 1 << 22;
+
+/// Step budget for the BDD *apply* during one query, the third of the engine's bounds.
+///
+/// `MAX_BLAST_STEPS` counts visits to the term DAG, which is where a fold (`pow`, the
+/// divider) blows up when it is walked as a tree. But the DAG walk is not the only place
+/// that can run away: the BDD `apply2` recurses over the *diagram*, and a boolean function
+/// whose BDD is exponentially larger than its formula -- a wide division by a
+/// non-power-of-two constant is the shape here -- makes that recursion, not the DAG walk,
+/// the unbounded work. Measured on `udiv(x, 15)`: the DAG walk is ~330 steps while `apply2`
+/// passes 4 000 000, and with no budget of its own the query never returns.
+///
+/// The bound is chosen from measurement, not taste. Over both corpus files the largest
+/// legitimate query takes **57 191** apply steps (a u64 comparison); the pathological one
+/// exceeds 4 000 000. 1 << 19 = 524 288 sits an order of magnitude above every decided
+/// query and an order of magnitude below the blow-up, so it never changes a verdict in the
+/// corpus while turning a hang into an answer. Because it is *charged per apply* it also
+/// bounds the latency: the pathological query returned in about six seconds instead of
+/// never (4 194 304 steps, the old pass's implied ceiling, took ~50s).
+pub(crate) const MAX_APPLY_STEPS: u32 = 1 << 19;
+
+/// Depth budget for the recursive term walk, the fourth of the engine's bounds.
+///
+/// The other three budgets count *steps*, and steps are not what a stack overflow is made
+/// of. A term walk that is 262 levels deep takes only a few hundred steps, so it passes
+/// every step budget and then aborts the process on the recursion -- which is worse than a
+/// slow answer, because the crate's whole contract is that an undecidable query is
+/// *reported*, never a crash. The shape that reaches this depth is a fold-built term: a
+/// wide division by a non-power-of-two constant builds a chain of adders and muxes whose
+/// length is proportional to the width, and the walk has no memo for the *stack*, only for
+/// the visits.
+///
+/// The bound is chosen from measurement. Over both corpus files the deepest legitimate walk
+/// is **138** levels; `udiv(x, 3)` at 64 bits reaches **262** and is the query that
+/// overflowed a 2 MiB stack in release (a `blast` frame is ~2.3 KiB, so the walk wanted
+/// ~600 KiB and then some). 128 would refuse a query the corpus already decides, so the
+/// bound sits at **192**: above every decided query with margin, below the observed blow-up.
+/// A trip sets `overflow`, so the query routes to the SAT fallback and from there to
+/// `Unknown` -- sound, and it *returns*.
+pub(crate) const MAX_WALK_DEPTH: u32 = 192;
+
+/// How many leaves of an `And`/`Or` spine the structural cancellation in
+/// [`Ctx::cancel_through_spine`] inspects.
+///
+/// A path condition is a left-nested chain, so the conjunct that cancels a later term
+/// can sit deeper than the root; walking the spine is what reaches it. The cap keeps the
+/// check O(1) per connective -- it is on the construction path of every `and`/`or`, so it
+/// has to be cheap -- and truncating it only *misses* cancellations, never invents one.
+pub(crate) const MAX_CONJ: usize = 16;
+
 /// Worst-case arena memory in bytes, so an integrator can budget statically.
 pub const ARENA_BYTES: usize =
     CAP * (core::mem::size_of::<Node>() + 2 * core::mem::size_of::<u32>());
@@ -342,6 +413,28 @@ pub(crate) struct Ctx {
     var_width: [u8; MAX_VARS],
     n_vars: usize,
     overflow: bool,
+    /// Memo for the BDD blaster: the blasted bits of a term, keyed by term id.
+    ///
+    /// Validity is scoped by the arena [`Ctx::generation`]: the key stores the term id
+    /// *including* its generation bits, and a reset recycles slots under a new generation,
+    /// so a stale entry can never be read as a current term's value. Cleared with the arena.
+    blast_memo_key: [u32; BLAST_MEMO_N],
+    blast_memo_bits: [[u32; 64]; BLAST_MEMO_N],
+    /// Steps taken by the BDD blaster in the current query, against [`MAX_BLAST_STEPS`].
+    blast_steps: u32,
+    /// Steps taken by the BDD *apply* in the current query, against [`MAX_APPLY_STEPS`].
+    ///
+    /// A separate counter from `blast_steps`: the two bound different work (the term-DAG
+    /// walk and the diagram recursion), and a query can blow up in either while staying
+    /// small in the other. Both reset per query and both trip `overflow`.
+    apply_steps: u32,
+    /// Steps taken by the SAT blaster in the current query, against [`MAX_BLAST_STEPS`].
+    sat_blast_steps: u32,
+    /// Current recursion depth of the term walk, against [`MAX_WALK_DEPTH`].
+    ///
+    /// A field rather than a parameter so the recursive walkers do not have to thread it,
+    /// and reset per query alongside the step counters.
+    walk_depth: u32,
     /// Set when a variable index past `MAX_VARS` was requested.
     ///
     /// `overflow` alone is not enough to decide whether to fall back to the SAT engine.
@@ -397,6 +490,41 @@ pub(crate) struct Ctx {
 /// Sentinel: variable `i` has no replacement.
 const NO_SUBST: u32 = u32::MAX;
 
+/// A compile-time gate that [`Ctx`] is `!Send` and `!Sync`.
+///
+/// The bare-metal [`with_ctx`] hands out `&'static mut Ctx` from a single global
+/// `static mut CTX`, which is sound only while nothing else can reach that
+/// context -- no second thread, and no re-entrant call. The `_not_shared` marker
+/// is what makes that true, and until now only a comment said so: delete the
+/// marker and `Ctx` is auto-`Send` and auto-`Sync` (every remaining field is a
+/// plain array or integer), the crate still builds, and the safety argument is
+/// quietly false. This turns "the marker is load-bearing" into something the
+/// compiler checks on every build.
+///
+/// The mechanism is inference ambiguity, not a reading of the impls. The trait is
+/// implemented for *every* type at `AmbiguousIfImpl<()>`, and again at
+/// `AmbiguousIfImpl<InvalidSend>` for every `Send` type. If `Ctx` is `!Send` only
+/// the first applies, so the `_` below infers to `()` and this compiles. If `Ctx`
+/// *were* `Send`, both would apply and `_` would have no unique value -- an
+/// inference error, which is the gate firing. `Sync` is checked the same way, so
+/// the fact that this file compiles *is* the proof.
+const _: fn() = || {
+    trait AmbiguousIfImpl<A> {
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+
+    #[allow(dead_code)]
+    enum InvalidSend {}
+    impl<T: ?Sized + Send> AmbiguousIfImpl<InvalidSend> for T {}
+
+    #[allow(dead_code)]
+    enum InvalidSync {}
+    impl<T: ?Sized + Sync> AmbiguousIfImpl<InvalidSync> for T {}
+
+    let _ = <Ctx as AmbiguousIfImpl<_>>::some_item;
+};
+
 impl Ctx {
     const fn new() -> Self {
         Ctx {
@@ -424,6 +552,12 @@ impl Ctx {
             var_width: [0; MAX_VARS],
             n_vars: 0,
             overflow: false,
+            blast_memo_key: [0; BLAST_MEMO_N],
+            blast_memo_bits: [[FALSE; 64]; BLAST_MEMO_N],
+            blast_steps: 0,
+            apply_steps: 0,
+            sat_blast_steps: 0,
+            walk_depth: 0,
             var_overflow: false,
             ready: false,
             subst_val: [NO_SUBST; MAX_VARS],
@@ -446,6 +580,13 @@ impl Ctx {
         self.n_nodes = 2;
         self.n_vars = 0;
         self.overflow = false;
+        // The memo is keyed by term id *including* its generation, and the generation is
+        // bumped below, so the old keys can never match a term in the new arena. Nothing to
+        // clear -- only the counters, which are per query, not per arena.
+        self.blast_steps = 0;
+        self.apply_steps = 0;
+        self.sat_blast_steps = 0;
+        self.walk_depth = 0;
         self.var_overflow = false;
         self.ready = false;
         for i in 0..CAP {
@@ -805,6 +946,30 @@ impl Ctx {
         self.stale = true;
     }
 
+    /// Charge one step to the SAT blaster, returning `true` once [`MAX_BLAST_STEPS`] is
+    /// spent. The SAT blaster runs after the BDD pass has given up, so it gets its own
+    /// counter; both are reset per query.
+    pub(crate) fn charge_sat_step(&mut self) -> bool {
+        self.sat_blast_steps = self.sat_blast_steps.saturating_add(1);
+        self.sat_blast_steps > MAX_BLAST_STEPS
+    }
+
+    /// Charge one level of recursion to the term walk, returning `true` once
+    /// [`MAX_WALK_DEPTH`] is spent.
+    ///
+    /// The SAT blaster walks the same terms as the BDD one, so it shares the counter. A
+    /// trip is reported the way the step budgets are: the query falls through to the
+    /// engine that can still answer it, and `Unknown` if none can.
+    pub(crate) fn charge_walk_depth(&mut self) -> bool {
+        self.walk_depth = self.walk_depth.saturating_add(1);
+        self.walk_depth > MAX_WALK_DEPTH
+    }
+
+    /// Release a level charged by [`Self::charge_walk_depth`].
+    pub(crate) fn release_walk_depth(&mut self) {
+        self.walk_depth = self.walk_depth.saturating_sub(1);
+    }
+
     /// Mark the query ill-formed, so it answers `Unknown`. Used by the SAT blaster for the
     /// same reason the BDD one sets the flag directly: a width the blaster cannot represent
     /// must refuse the query rather than index past its buffer.
@@ -891,14 +1056,226 @@ impl Ctx {
         }
     }
 
+    /// Constant-fold a word operation, so a term whose operands are both literals
+    /// collapses to the literal it denotes.
+    ///
+    /// This is a capability fix, not a speed one. A frontend reads real code, and a
+    /// constant operand there is the rule rather than the exception: a scaled index
+    /// (`i * 4`), a masked flag (`x & 0xff`), a remainder by a literal (`n % 10`).
+    /// Without the fold every one of those builds its full circuit -- `n % 10` at 64
+    /// bits is a restoring divider, ~262 terms deep -- and the query is refused for
+    /// being *too big to pose* even when both operands are known. The `-7 / 3` case
+    /// that motivated this is the extreme: every input is a literal and the answer
+    /// was still `Unknown`, because the divider was blasted and then walked.
+    ///
+    /// Folding is what keeps a query *small* when it is not *interesting*: a
+    /// division whose dividend is pinned to a literal by a precondition becomes a
+    /// single constant, and the obligation that mentions it collapses with it.
+    ///
+    /// Sound because the fold is the operator's own definition -- the same
+    /// `wrapping_*` on the same masked values `eval_term_body` uses -- applied to a
+    /// pair that has one value each. `None` when either operand is not a literal,
+    /// or when the widths disagree (`require_same_width` reports that, as it does
+    /// for the unfolded path).
+    ///
+    /// `0 - x` is the one subtraction deliberately left unfolded. There is no unary
+    /// negation in the term language, so a negation is *spelled* `0 - x`, and the
+    /// frontend keys its literal-range bookkeeping on that node being distinct from
+    /// the literal it negates: `-128` for an `i8` is legal while the bare literal
+    /// `128` is not, and both are the same eight bits, so the only thing that tells
+    /// them apart is that one is a `Sub` node and the other a `Const`. Folding the
+    /// negation to the literal merges the two and refuses `-128`. Every other
+    /// subtraction still folds, including the `x - y` the restoring divider is
+    /// built from.
+    fn const_fold_word(&mut self, op: Op, a: Term, b: Term) -> Option<Term> {
+        let na = self.node_of(a);
+        if na.op != Op::Const {
+            return None;
+        }
+        let nb = self.node_of(b);
+        if nb.op != Op::Const {
+            return None;
+        }
+        if na.width != nb.width {
+            return None;
+        }
+        let w = na.width;
+        let x = self.const_of(a);
+        let y = self.const_of(b);
+        if op == Op::Sub && x == 0 {
+            return None;
+        }
+        let v = match op {
+            Op::Add => x.wrapping_add(y),
+            Op::Sub => x.wrapping_sub(y),
+            Op::Mul => x.wrapping_mul(y),
+            Op::And => x & y,
+            Op::Or => x | y,
+            Op::Xor => x ^ y,
+            _ => return None,
+        };
+        Some(self.konst(v, w))
+    }
+
     fn bin_word(&mut self, op: Op, a: Term, b: Term) -> Term {
         self.require_same_width(a, b, "binary word operation");
+        if let Some(t) = self.const_fold_word(op, a, b) {
+            return t;
+        }
         let w = self.width_of(a);
         self.mk_term(Node { op, a: a.0, b: b.0, c: 0, width: w, hi: 0 })
     }
 
+    /// The leaves of an associative `op` tree, iteratively and with a cap.
+    ///
+    /// A leaf is `t` itself when its root is not `op`; otherwise the union of its operands'
+    /// leaves. The walk is iterative because a path condition is as deep as the path is
+    /// long, and a recursive walk over it would be the same stack risk that
+    /// [`MAX_WALK_DEPTH`] exists to bound. Leaving an `op` node undecomposed at the cap is
+    /// sound for the caller: the node is still entailed by the tree it came from, so a
+    /// cancellation found through it is a real one.
+    fn op_leaves(&mut self, op: Op, t: Term, out: &mut [Term; MAX_CONJ]) -> usize {
+        let mut n = 0usize;
+        let mut stack = [Term(0); MAX_CONJ];
+        let mut sp = 1usize;
+        stack[0] = t;
+        while sp > 0 && n < MAX_CONJ {
+            sp -= 1;
+            let cur = stack[sp];
+            let node = self.node_of(cur);
+            if node.op == op && node.width == 1 && sp + 2 <= MAX_CONJ {
+                stack[sp] = Term(node.a);
+                sp += 1;
+                stack[sp] = Term(node.b);
+                sp += 1;
+            } else {
+                out[n] = cur;
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// `Some(constant)` when `op(a, b)` is decided by a cancellation through the operands'
+    /// spines: each side contributes a leaf `x` and `!x`, which makes `And` false and `Or`
+    /// true. `None` when no such pair exists.
+    ///
+    /// This is what a path condition needs and a top-level identity check cannot give. The
+    /// `sat_mul` shape is the example: the path into the multiply is `b == 0 && a <= MAX / b`
+    /// and the overflow test is `b != 0 && a > MAX / b`, so the conjuncts cancel pairwise --
+    /// but they cancel *across* two spines, not at either root. Without the fold the
+    /// bit-blaster expands the divider inside both terms before any solver sees the
+    /// contradiction, and the query has no verdict.
+    ///
+    /// `!x` is a `Not` node whose child is `x`, so a cancellation is a `Not` leaf on one side
+    /// whose child is a leaf on the other. Reading it that way avoids building a `Not` per
+    /// leaf just to test for one.
+    fn cancel_through_spine(&mut self, op: Op, a: Term, b: Term) -> Option<Term> {
+        let mut left = [Term(0); MAX_CONJ];
+        let mut right = [Term(0); MAX_CONJ];
+        let ln = self.op_leaves(op, a, &mut left);
+        let rn = self.op_leaves(op, b, &mut right);
+        let child_of_not = |me: &mut Self, t: Term| -> Option<u32> {
+            let n = me.node_of(t);
+            if n.op == Op::Not && n.width == 1 { Some(n.a) } else { None }
+        };
+        for l in left.iter().take(ln) {
+            if let Some(child) = child_of_not(self, *l) {
+                if right[..rn].iter().any(|r| r.0 == child) {
+                    return Some(self.konst((op == Op::Or) as u64, 1));
+                }
+            }
+        }
+        for r in right.iter().take(rn) {
+            if let Some(child) = child_of_not(self, *r) {
+                if left[..ln].iter().any(|l| l.0 == child) {
+                    return Some(self.konst((op == Op::Or) as u64, 1));
+                }
+            }
+        }
+        None
+    }
+
     /// Boolean op (result width = 1).
     fn bin_bool(&mut self, op: Op, a: Term, b: Term) -> Term {
+        // Structural simplification, before any node is created. These are the
+        // boolean-algebra identities, and they are not a micro-optimisation: a
+        // contradiction such as `p && !p` *is* a literal false, but without the
+        // fold the bit-blaster expands both copies of `p` first, and when `p`
+        // contains a wide divider the diagram blows up before the SAT engine ever
+        // sees the false literal. The `udiv`-guarded saturation idiom
+        // (`if b != 0 && a > MAX / b`) is exactly that shape -- its guard is the
+        // unsigned multiply-overflow predicate -- so the missing fold cost a whole
+        // class of queries a verdict.
+        let na = self.node_of(a);
+        let nb = self.node_of(b);
+        let konst = |n: Node| -> Option<u64> {
+            if n.op == Op::Const && n.width == 1 { Some(n.a as u64) } else { None }
+        };
+        let is_not_of = |n: Node, t: Term| n.op == Op::Not && n.width == 1 && n.a == t.0;
+        match op {
+            Op::And => {
+                if konst(na) == Some(0) || konst(nb) == Some(0) {
+                    return self.konst(0, 1);
+                }
+                if konst(na) == Some(1) {
+                    return b;
+                }
+                if konst(nb) == Some(1) {
+                    return a;
+                }
+                if a.0 == b.0 {
+                    return a;
+                }
+                if is_not_of(nb, a) || is_not_of(na, b) {
+                    return self.konst(0, 1);
+                }
+            }
+            Op::Or => {
+                if konst(na) == Some(1) || konst(nb) == Some(1) {
+                    return self.konst(1, 1);
+                }
+                if konst(na) == Some(0) {
+                    return b;
+                }
+                if konst(nb) == Some(0) {
+                    return a;
+                }
+                if a.0 == b.0 {
+                    return a;
+                }
+                if is_not_of(nb, a) || is_not_of(na, b) {
+                    return self.konst(1, 1);
+                }
+            }
+            Op::Xor => {
+                if konst(na) == Some(0) {
+                    return b;
+                }
+                if konst(nb) == Some(0) {
+                    return a;
+                }
+                if a.0 == b.0 {
+                    return self.konst(0, 1);
+                }
+                if is_not_of(nb, a) || is_not_of(na, b) {
+                    return self.konst(1, 1);
+                }
+                // `p ^ 1` is `!p`.
+                if konst(na) == Some(1) {
+                    return self.un_bool(Op::Not, b);
+                }
+                if konst(nb) == Some(1) {
+                    return self.un_bool(Op::Not, a);
+                }
+            }
+            _ => {}
+        }
+        if matches!(op, Op::And | Op::Or) {
+            if let Some(k) = self.cancel_through_spine(op, a, b) {
+                return k;
+            }
+        }
         self.mk_term(Node { op, a: a.0, b: b.0, c: 0, width: 1, hi: 0 })
     }
 
@@ -910,15 +1287,66 @@ impl Ctx {
 
     fn cmp(&mut self, op: Op, a: Term, b: Term) -> Term {
         self.require_same_width(a, b, "comparison");
+        // Two literals compare to a literal, and the result is a *predicate*: a
+        // one-bit constant, not one carrying the operand width. That distinction is
+        // the whole point of the fold -- a comparison node stores its operands'
+        // width (`Op::Eq` on two `u32` has width 32) even though it denotes one bit,
+        // so leaving the folded node wide would hand a later width check a term of
+        // the wrong shape. Returning the one-bit constant is what the blaster would
+        // have computed, in one node instead of a chain of XOR/AND gates.
+        //
+        // This is what lets a *constant* dividend fold all the way through the
+        // restoring divider: the loop's `ule(y, rem)` compares two literals at every
+        // step, so with this fold the whole divider collapses to the quotient instead
+        // of building `w` stages of adder and mux.
+        let na = self.node_of(a);
+        let nb = self.node_of(b);
+        if na.op == Op::Const && nb.op == Op::Const && na.width == nb.width {
+            let x = self.const_of(a);
+            let y = self.const_of(b);
+            let r = match op {
+                Op::Eq => x == y,
+                Op::Ult => x < y,
+                Op::Ule => x <= y,
+                _ => false,
+            };
+            return self.konst(u64::from(r), 1);
+        }
         let w = self.width_of(a);
         self.mk_term(Node { op, a: a.0, b: b.0, c: 0, width: w, hi: 0 })
     }
 
     fn un_bool(&mut self, op: Op, a: Term) -> Term {
+        if op == Op::Not {
+            let n = self.node_of(a);
+            // `!!p == p`. Both widths have to be 1. The inner `Not` is 1-bit by
+            // construction, but its *child* need not be: a comparison node carries the
+            // operand width (`Op::Eq` on two `u32` has width 32) even though it denotes a
+            // single bit. Returning that child would hand the caller a wide term where a
+            // predicate belongs, and a later `require_same_width` then marks the arena
+            // ill-formed -- which turns a decidable query into `Unknown`.
+            if n.op == Op::Not && n.width == 1 && self.width_of(Term(n.a)) == 1 {
+                return Term(n.a);
+            }
+            // `!0 == 1`, `!1 == 0`.
+            if n.op == Op::Const && n.width == 1 {
+                return self.konst((n.a as u64) ^ 1, 1);
+            }
+        }
         self.mk_term(Node { op, a: a.0, b: 0, c: 0, width: 1, hi: 0 })
     }
 
     /// Change a term's width, keeping the low bits and zero-filling any new ones.
+    ///
+    /// Deliberately *not* constant-folded, though the value is computable. The
+    /// frontend spells a *named* bound (`i8::MIN`) as `truncate(word(k, 64), w)`
+    /// precisely so that it does *not* hash-cons with the literal `word(k, w)`:
+    /// `i8::MIN` and `128i8` are the same eight bits, and the literal-range
+    /// bookkeeping keys on the term id to tell a legal bound from an illegal
+    /// literal. Folding a literal through `Trunc` merges the two and makes
+    /// `y == i8::MIN` inherit `128i8`'s out-of-range envelope, so a valid contract
+    /// is refused. Nothing is lost by leaving it: the folds that carry the
+    /// divider's constant path are in [`Self::cmp`] and [`Self::bin_word`].
     fn trunc(&mut self, a: Term, width: u8) -> Term {
         let src = self.width_of(a);
         self.mk_term(Node {
@@ -1059,6 +1487,32 @@ impl Ctx {
     }
 
     fn apply2(&mut self, op: u8, a: u32, b: u32) -> u32 {
+        // The diagram recursion is bounded by `MAX_APPLY_STEPS` below, but that is a step
+        // count and a deep diagram can be narrow. Guard the depth too; see `MAX_WALK_DEPTH`.
+        self.walk_depth += 1;
+        if self.walk_depth > MAX_WALK_DEPTH {
+            self.overflow = true;
+            self.walk_depth -= 1;
+            return FALSE;
+        }
+        let r = self.apply2_bounded(op, a, b);
+        self.walk_depth -= 1;
+        r
+    }
+
+    /// [`Self::apply2`] with the depth already charged.
+    fn apply2_bounded(&mut self, op: u8, a: u32, b: u32) -> u32 {
+        // Charge the *diagram* recursion, not just the term-DAG walk `blast` charges. A
+        // function whose BDD is exponentially larger than its formula (a wide division by a
+        // non-power-of-two constant) blows up here, where `blast`'s counter never sees it;
+        // without this the query never returns. Tripping sets `overflow`, which routes the
+        // query to the SAT engine and from there to `Unknown`, exactly as the DAG budget and
+        // the arena cap do -- so the answer stays sound and the call always returns.
+        self.apply_steps = self.apply_steps.saturating_add(1);
+        if self.apply_steps > MAX_APPLY_STEPS {
+            self.overflow = true;
+            return FALSE;
+        }
         if op == 0 {
             if a == FALSE || b == FALSE {
                 return FALSE;
@@ -1206,14 +1660,82 @@ impl Ctx {
 
     // ------------------------- bit-blasting -------------------------
 
+    /// The constant operand of a binary term, if exactly one is a `Const`.
+    ///
+    /// Both constant is deliberately `None`: the product would be constant, and
+    /// folding it here would need the `w`-bit truncation this function does not
+    /// have. Falling through to the schoolbook path is correct and rare.
+    fn const_operand(&mut self, a: Term, b: Term) -> Option<u64> {
+        let ca = self.node_of(a).op == Op::Const;
+        let cb = self.node_of(b).op == Op::Const;
+        if ca == cb {
+            return None;
+        }
+        Some(self.const_value(if ca { a } else { b }))
+    }
+
+    /// The operand of a binary term that is *not* the constant one. The caller has
+    /// established with [`Self::const_operand`] that exactly one is constant.
+    fn other_operand(&mut self, a: Term, b: Term) -> Term {
+        if self.node_of(a).op == Op::Const {
+            b
+        } else {
+            a
+        }
+    }
+
     fn blast(&mut self, t: Term, out: &mut [u32; 64]) {
+        // Bound the *depth* before the step budget, because a step budget cannot see a
+        // stack overflow: a 262-level walk is a few hundred steps. See `MAX_WALK_DEPTH`.
+        self.walk_depth += 1;
+        if self.walk_depth > MAX_WALK_DEPTH {
+            self.overflow = true;
+            out.fill(FALSE);
+            self.walk_depth -= 1;
+            return;
+        }
+        self.blast_bounded(t, out);
+        self.walk_depth -= 1;
+    }
+
+    /// [`Self::blast`] with the depth already charged. Split so the guard has one place to
+    /// unwind from, which is what keeps `walk_depth` correct on the early returns below.
+    fn blast_bounded(&mut self, t: Term, out: &mut [u32; 64]) {
+        // Bound the work before doing any of it. See `MAX_BLAST_STEPS`: the memo below
+        // makes the fold walks cheap, but only this counter makes the pass *guaranteed* to
+        // end. Tripping it sets `overflow`, which routes the query to the SAT engine and
+        // from there to `Unknown` -- never to a verdict about a half-built diagram.
+        self.blast_steps = self.blast_steps.saturating_add(1);
+        if self.blast_steps > MAX_BLAST_STEPS {
+            self.overflow = true;
+            out.fill(FALSE);
+            return;
+        }
         // Check `stale` first, so once any stale handle has been touched the whole
         // traversal stops. Checking only the current node is not enough: a constructor can
         // read a stale node and then *build* a current node that refers back to the stale
         // id, so the graph contains a cycle whose every node is current. Stopping the
         // whole traversal on the first stale touch is what breaks it.
+        //
+        // `overflow` is checked here for the same reason and it is not optional: once the
+        // node table is full every `mk_node` returns `FALSE` *without* setting `overflow`
+        // again, so nothing below this point can notice, and the traversal keeps recursing.
+        // A term built by a fold (`pow`, the divider) is a DAG with heavy sharing, and
+        // walking it to completion visits a shared subterm once per path to it -- millions
+        // of times for a 32-step fold. That is not a slow answer, it is a hang: the query
+        // never returns to the caller that would have fallen back to the SAT engine. The
+        // check turns "the arena is full" into "stop now", and the caller's `overflow` test
+        // then routes the query to the fallback.
         if self.stale || t.gen_bits() != self.gen_masked() {
             self.stale = true;
+            out.fill(FALSE);
+            return;
+        }
+        // `overflow` stops the walk too, but it is *not* `stale`: an overflowed arena is a
+        // full one, not a wrong one, and the caller routes it to the SAT fallback rather
+        // than refusing. Setting `stale` here would turn a fallback into a refusal and
+        // would hide the SAT engine behind a query that never reaches it.
+        if self.overflow {
             out.fill(FALSE);
             return;
         }
@@ -1229,6 +1751,14 @@ impl Ctx {
         if w == 0 || w > 64 {
             self.ill_formed = true;
             out.fill(FALSE);
+            return;
+        }
+        // The memo turns the shared-DAG walk from exponential into linear. See
+        // `BLAST_MEMO_N`. A hit is always sound: the key is the term id, and identical ids
+        // mean identical terms, whose blasted bits are deterministic.
+        let memo_i = (t.0 as usize) & (BLAST_MEMO_N - 1);
+        if self.blast_memo_key[memo_i] == t.0 {
+            out[..w].copy_from_slice(&self.blast_memo_bits[memo_i][..w]);
             return;
         }
         match n.op {
@@ -1319,11 +1849,60 @@ impl Ctx {
                 }
             }
             Op::Mul => {
-                let mut a = [FALSE; 64];
-                let mut b = [FALSE; 64];
-                self.blast(Term(n.a), &mut a);
-                self.blast(Term(n.b), &mut b);
-                out[..w].fill(FALSE);
+                // One constant operand makes this a sum of shifts instead of a
+                // schoolbook multiply. `x * c` is `sum over the set bits k of c of
+                // (x << k)`, which is *exact* -- it is the distributive law, not an
+                // approximation -- and it is `popcount(c)` shift-adds rather than
+                // `w^2` AND/XOR rows, so `x * 4` is one shift and `x * 255` is eight
+                // additions where the multiply was 64 rows.
+                //
+                // This is the same shape the frontend's overflow predicate needs:
+                // `i * 4`, an index scaled by an element size. It also makes the
+                // *signed* case cheap, because the identity holds for a two's
+                // complement word regardless of sign -- no widening is needed to
+                // build the product, only to decide whether it wrapped.
+                //
+                // `c == 0` yields zero and `c == 1` yields `x` with no shifts at all.
+                if let Some(c) = self.const_operand(Term(n.a), Term(n.b)) {
+                    let operand = self.other_operand(Term(n.a), Term(n.b));
+                    let mut x = [FALSE; 64];
+                    self.blast(operand, &mut x);
+                    // `c == 0` is the product zero, which is also what an accumulator
+                    // left untouched would be -- but the shifts below never run for it,
+                    // so the fill is what makes that case right rather than whatever the
+                    // buffer happened to hold.
+                    out[..w].fill(FALSE);
+                    for k in 0..w as u32 {
+                        if (c >> k) & 1 == 0 {
+                            continue;
+                        }
+                        // `x << k` at width `w`: bits below `k` are zero, and the bits
+                        // at and above `k` come from `x` at `bit - k`.
+                        // A full adder, matching the schoolbook arm below: the sum is
+                        // `out ^ shifted ^ carry`, and the carry out is
+                        // `(out & shifted) | (carry & (out ^ shifted))`. Dropping the
+                        // `^ carry` from the sum is the one-line version of this that
+                        // looks right and is not -- it agrees whenever the accumulator
+                        // bit and the shift agree, which is most of the time.
+                        let mut carry = FALSE;
+                        for bit in 0..w {
+                            let shifted = if (bit as u32) < k { FALSE } else { x[bit - k as usize] };
+                            let s1 = self.xor(out[bit], shifted);
+                            let s2 = self.xor(s1, carry);
+                            let c1 = self.and(out[bit], shifted);
+                            let c2 = self.and(carry, s1);
+                            carry = self.or(c1, c2);
+                            out[bit] = s2;
+                        }
+                    }
+                    // Only the low `w` bits of `c` can contribute: `x << k` for
+                    // `k >= w` is zero at this width, which is the `0..w` bound above.
+                } else {
+                    let mut a = [FALSE; 64];
+                    let mut b = [FALSE; 64];
+                    self.blast(Term(n.a), &mut a);
+                    self.blast(Term(n.b), &mut b);
+                    out[..w].fill(FALSE);
                 for j in 0..w {
                     let mut carry = FALSE;
                     for i in j..w {
@@ -1335,6 +1914,7 @@ impl Ctx {
                         carry = self.or(c1, c2);
                         out[i] = s2;
                     }
+                }
                 }
             }
             Op::Eq => {
@@ -1390,6 +1970,12 @@ impl Ctx {
                     *slot = if bit < src { a[bit] } else { FALSE };
                 }
             }
+        }
+        // Memoise the result, but never after an overflow: an overflowed pass produced a
+        // truncated diagram, and caching it would hand that truncation to a later query.
+        if !self.overflow {
+            self.blast_memo_key[memo_i] = t.0;
+            self.blast_memo_bits[memo_i] = *out;
         }
     }
 
@@ -1450,6 +2036,10 @@ impl Ctx {
     }
 
     fn query_valid(&mut self, t: Term) -> Verdict {
+        self.blast_steps = 0;
+        self.apply_steps = 0;
+        self.sat_blast_steps = 0;
+        self.walk_depth = 0;
         let node = self.blast_bool(t);
         if self.stale || self.ill_formed || self.var_overflow {
             return Verdict::Unknown;
@@ -1468,6 +2058,10 @@ impl Ctx {
     }
 
     fn query_model(&mut self, t: Term) -> Verdict {
+        self.blast_steps = 0;
+        self.apply_steps = 0;
+        self.sat_blast_steps = 0;
+        self.walk_depth = 0;
         let node = self.blast_bool(t);
         if self.stale || self.ill_formed || self.var_overflow {
             return Verdict::Unknown;
@@ -1700,8 +2294,92 @@ pub fn bits(v: Var) -> u8 {
 /// Widths are honoured: results are masked to the term's own width, shifts are by the
 /// constant amount stored in the node, and `Shr` is arithmetic (the sign bit
 /// replicates), matching the bit-blaster exactly.
+///
+/// # Why this must not be inlined into a recursive caller
+///
+/// The [`EvalMemo`] is a local, and it is 12 KiB: `1024 * (4 + 8)` bytes. When the
+/// optimiser inlines this function into a caller that *recurses*, that 12 KiB
+/// temporary is allocated in the caller's frame and stays live for the whole
+/// recursive descent, so one level of recursion costs 12 KiB of stack instead of a
+/// few hundred bytes. The contract reader is exactly that caller -- `const_value`
+/// is `evaluate`, and the parser calls it at every operator level -- and in a debug
+/// build the frame grows to ~12.7 KiB per level, so `x >> ((2 << 7) + 1)` reached
+/// past the 2 MiB a test thread gets and *aborted*. An abort is a crash in the
+/// caller's process, not a refusal, which is the one thing the front end is not
+/// allowed to do.
+///
+/// `#[inline(never)]` keeps the memo inside this frame, alive only for the walk.
+/// Measured on the nested-amount contract, the parse depth falls from 254 KiB to
+/// 15 KiB. It is deliberately not a `Box`: `no_std` without an allocator cannot
+/// heap-allocate, so the memo has to be a stack local -- and being a stack local is
+/// only safe once the function that owns it is not inlined into a recursion.
+#[inline(never)]
 pub fn evaluate(t: Var, value: impl Fn(u32) -> Option<u64>) -> Option<u64> {
-    with_ctx(|c| eval_term(c, t.0, &value))
+    // The memo is local to this call, so it needs no invalidation: it cannot
+    // outlive the assignment it was computed under, and a later call starts from
+    // an empty table. It is bounded and small so that `Ctx` -- whose size the
+    // crate budgets statically -- does not grow by an arena's worth of memo.
+    let mut memo = EvalMemo::new();
+    with_ctx(|c| eval_term(c, t.0, &value, &mut memo))
+}
+
+/// A bounded memo for one [`evaluate`] walk.
+///
+/// `eval_term` walks a term's DAG, and a term built by a fold (`pow`, the
+/// divider) shares subterms heavily: without a memo the walk visits a shared
+/// subterm once per path to it, which is exponential in the number of steps. It
+/// is the same blow-up the BDD `neg` cache exists for, one layer up.
+///
+/// The table is direct-indexed by term slot with linear probing. A collision
+/// evicts the older entry rather than failing, which is sound because a miss only
+/// costs a recomputation -- the value is a pure function of the term and the
+/// assignment. The size is a working-set estimate: a `pow` fold is a few hundred
+/// terms, and the probe bound stops a pathological case from turning a memo miss
+/// into a linear scan.
+struct EvalMemo {
+    /// Term slot, or [`EVAL_MEMO_EMPTY`] when the entry is free.
+    slot: [u32; EVAL_MEMO_SLOTS],
+    val: [u64; EVAL_MEMO_SLOTS],
+}
+
+const EVAL_MEMO_SLOTS: usize = 1024;
+const EVAL_MEMO_EMPTY: u32 = u32::MAX;
+/// How far a lookup probes before giving up. A miss recomputes; it never fails.
+const EVAL_MEMO_PROBES: usize = 8;
+
+impl EvalMemo {
+    fn new() -> Self {
+        EvalMemo { slot: [EVAL_MEMO_EMPTY; EVAL_MEMO_SLOTS], val: [0; EVAL_MEMO_SLOTS] }
+    }
+
+    fn get(&self, slot: u32) -> Option<u64> {
+        let mut i = (slot as usize) & (EVAL_MEMO_SLOTS - 1);
+        for _ in 0..EVAL_MEMO_PROBES {
+            let k = self.slot[i];
+            if k == EVAL_MEMO_EMPTY {
+                return None;
+            }
+            if k == slot {
+                return Some(self.val[i]);
+            }
+            i = (i + 1) & (EVAL_MEMO_SLOTS - 1);
+        }
+        None
+    }
+
+    fn put(&mut self, slot: u32, val: u64) {
+        let mut i = (slot as usize) & (EVAL_MEMO_SLOTS - 1);
+        for _ in 0..EVAL_MEMO_PROBES {
+            if self.slot[i] == EVAL_MEMO_EMPTY || self.slot[i] == slot {
+                self.slot[i] = slot;
+                self.val[i] = val;
+                return;
+            }
+            i = (i + 1) & (EVAL_MEMO_SLOTS - 1);
+        }
+        // Every probe in the window is taken by another slot; drop the entry.
+        // Losing a memo costs time, never an answer.
+    }
 }
 
 /// [`evaluate`] for a predicate. `None` when some input is unknown.
@@ -1709,25 +2387,65 @@ pub fn evaluate_pred(p: Pred, value: impl Fn(u32) -> Option<u64>) -> Option<bool
     evaluate(Var(p.0), value).map(|v| v != 0)
 }
 
-fn eval_term(ctx: &mut Ctx, t: Term, value: &impl Fn(u32) -> Option<u64>) -> Option<u64> {
+fn eval_term(
+    ctx: &mut Ctx,
+    t: Term,
+    value: &impl Fn(u32) -> Option<u64>,
+    memo: &mut EvalMemo,
+) -> Option<u64> {
     if !ctx.is_current_term(t) {
         // A stale handle has no meaning to evaluate; `None` is "cannot say", which is
         // what `evaluate` already means by it.
         return None;
     }
+    // This walk is the other recursion over a fold-built term, and it has the same failure
+    // mode as the blasters: a chain of `2 * width` terms is a few hundred levels, which no
+    // step budget sees and the stack cannot hold. See `MAX_WALK_DEPTH`. `None` is "cannot
+    // say", which is sound here -- an unknown value can weaken a proof but never create
+    // one.
+    if ctx.charge_walk_depth() {
+        ctx.release_walk_depth();
+        return None;
+    }
+    let r = eval_term_inner(ctx, t, value, memo);
+    ctx.release_walk_depth();
+    r
+}
+
+fn eval_term_inner(
+    ctx: &mut Ctx,
+    t: Term,
+    value: &impl Fn(u32) -> Option<u64>,
+    memo: &mut EvalMemo,
+) -> Option<u64> {
+    let slot = t.slot() as u32;
+    if let Some(v) = memo.get(slot) {
+        return Some(v);
+    }
+    let v = eval_term_body(ctx, t, value, memo)?;
+    memo.put(slot, v);
+    Some(v)
+}
+
+fn eval_term_body(
+    ctx: &mut Ctx,
+    t: Term,
+    value: &impl Fn(u32) -> Option<u64>,
+    memo: &mut EvalMemo,
+) -> Option<u64> {
     let n = ctx.node_of(t);
     let w = n.width;
     let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
     let v = match n.op {
         Op::Var => return value(n.a).map(|x| x & mask),
         Op::Const => (n.a as u64) | ((n.hi as u64) << 32),
-        Op::Not => !eval_term(ctx, Term(n.a), value)? & mask,
-        Op::And => eval_term(ctx, Term(n.a), value)? & eval_term(ctx, Term(n.b), value)? & mask,
-        Op::Or => eval_term(ctx, Term(n.a), value)? | eval_term(ctx, Term(n.b), value)? & mask,
-        Op::Xor => eval_term(ctx, Term(n.a), value)? ^ eval_term(ctx, Term(n.b), value)? & mask,
+        Op::Not => !eval_term(ctx, Term(n.a), value, memo)? & mask,
+        Op::And => eval_term(ctx, Term(n.a), value, memo)? & eval_term(ctx, Term(n.b), value, memo)? & mask,
+        Op::Or => eval_term(ctx, Term(n.a), value, memo)? | eval_term(ctx, Term(n.b), value, memo)? & mask,
+        Op::Xor => eval_term(ctx, Term(n.a), value, memo)? ^ eval_term(ctx, Term(n.b), value, memo)? & mask,
         // The shift amount lives in the node, not in a term; see `shift`.
         Op::Shl => {
-            let a = eval_term(ctx, Term(n.a), value)?;
+            let a = eval_term(ctx, Term(n.a), value, memo)?;
             let sh = n.b;
             if sh >= 64 {
                 0
@@ -1736,7 +2454,7 @@ fn eval_term(ctx: &mut Ctx, t: Term, value: &impl Fn(u32) -> Option<u64>) -> Opt
             }
         }
         Op::LShr => {
-            let a = eval_term(ctx, Term(n.a), value)?;
+            let a = eval_term(ctx, Term(n.a), value, memo)?;
             let sh = n.b;
             if sh >= 64 {
                 0
@@ -1746,7 +2464,7 @@ fn eval_term(ctx: &mut Ctx, t: Term, value: &impl Fn(u32) -> Option<u64>) -> Opt
         }
         Op::Shr => {
             // Arithmetic: replicate the sign bit, matching the bit-blaster.
-            let a = eval_term(ctx, Term(n.a), value)? & mask;
+            let a = eval_term(ctx, Term(n.a), value, memo)? & mask;
             let sh = n.b;
             if sh >= w as u32 {
                 if a >> (w - 1) & 1 == 1 {
@@ -1759,29 +2477,29 @@ fn eval_term(ctx: &mut Ctx, t: Term, value: &impl Fn(u32) -> Option<u64>) -> Opt
                 (a >> sh) | (sign_fill & !(mask >> sh))
             }
         }
-        Op::Add => eval_term(ctx, Term(n.a), value)?.wrapping_add(eval_term(ctx, Term(n.b), value)?) & mask,
-        Op::Sub => eval_term(ctx, Term(n.a), value)?.wrapping_sub(eval_term(ctx, Term(n.b), value)?) & mask,
-        Op::Mul => eval_term(ctx, Term(n.a), value)?.wrapping_mul(eval_term(ctx, Term(n.b), value)?) & mask,
+        Op::Add => eval_term(ctx, Term(n.a), value, memo)?.wrapping_add(eval_term(ctx, Term(n.b), value, memo)?) & mask,
+        Op::Sub => eval_term(ctx, Term(n.a), value, memo)?.wrapping_sub(eval_term(ctx, Term(n.b), value, memo)?) & mask,
+        Op::Mul => eval_term(ctx, Term(n.a), value, memo)?.wrapping_mul(eval_term(ctx, Term(n.b), value, memo)?) & mask,
         Op::Eq => {
-            u64::from(eval_term(ctx, Term(n.a), value)? == eval_term(ctx, Term(n.b), value)?)
+            u64::from(eval_term(ctx, Term(n.a), value, memo)? == eval_term(ctx, Term(n.b), value, memo)?)
         }
         Op::Ult => {
-            u64::from(eval_term(ctx, Term(n.a), value)? < eval_term(ctx, Term(n.b), value)?)
+            u64::from(eval_term(ctx, Term(n.a), value, memo)? < eval_term(ctx, Term(n.b), value, memo)?)
         }
         Op::Ule => {
-            u64::from(eval_term(ctx, Term(n.a), value)? <= eval_term(ctx, Term(n.b), value)?)
+            u64::from(eval_term(ctx, Term(n.a), value, memo)? <= eval_term(ctx, Term(n.b), value, memo)?)
         }
         Op::Ite => {
-            let c = eval_term(ctx, Term(n.a), value)?;
+            let c = eval_term(ctx, Term(n.a), value, memo)?;
             if c != 0 {
-                eval_term(ctx, Term(n.b), value)?
+                eval_term(ctx, Term(n.b), value, memo)?
             } else {
-                eval_term(ctx, Term(n.c), value)?
+                eval_term(ctx, Term(n.c), value, memo)?
             }
         }
         Op::Trunc => {
             // Keep the low bits, zero-fill the rest.
-            let a = eval_term(ctx, Term(n.a), value)?;
+            let a = eval_term(ctx, Term(n.a), value, memo)?;
             let src = n.b;
             if src >= 64 {
                 a & mask
@@ -1931,6 +2649,21 @@ pub fn negative(x: Var) -> Pred {
     // `x >= 2^(w-1)` is exactly "the top bit is set".
     uge_const(x, 1u64 << (w - 1))
 }
+/// Whether bit `k` of `x` is set. `k` is a *constant*, so bit 0 is the `& 1`
+/// test and bit `k` is a constant shift followed by the same test.
+///
+/// A shift is used rather than a comparison against `2^k` because the two differ
+/// at the top bit: `x >= 2^(w-1)` and `bit(w-1)` agree, but a reader that took
+/// `x >= 2^k` as "bit `k`" would be right only up to the width, and the shift
+/// spelling has no such edge. A `k` past the width yields `false` rather than a
+/// shift the engine would have to define.
+pub fn bit_set(x: Var, k: u32) -> Pred {
+    let w = bits(x);
+    if k >= u32::from(w) {
+        return truth(false);
+    }
+    eq_const(band(lshr(x, k), word(1, w)), 1)
+}
 /// `x < y` (signed, two's complement).
 ///
 /// The unsigned comparison next to this one is *wrong* for a signed operand, and
@@ -2002,6 +2735,60 @@ pub fn uge_const(x: Var, k: u64) -> Pred {
         Pred(c.cmp(Op::Ule, kt, x.0))
     })
 }
+/// `x / c` and `x % c` for a constant `c` whose magnitude is a power of two.
+///
+/// This exists because the *signed* divider is a BDD wall at 64 bits, and it is not the
+/// divider that costs -- the unsigned `divmod` blasts a constant divisor in milliseconds.
+/// The cost is the sign fixup in [`sdivmod`]: it negates and selects on a 64-bit value
+/// whose bits are the divider's symbolic output, which is the shape that blows the
+/// diagram up. Measured on the pinned-quotient query, `udiv(x, 2)` at 64 bits is 47ms and
+/// `sdiv(x, 2)` is 9.3 seconds, so a signed `a / 2` -- the shape that actually appears in
+/// code -- was reported `incomplete`.
+///
+/// Dividing by `2^k` needs neither of those. On the positive side it is a shift. On the
+/// negative side it is a shift after adding `2^k - 1`, which turns truncation toward zero
+/// into a floor: `trunc(x / 2^k) == floor((x + (2^k - 1 if x < 0 else 0)) / 2^k)`, and an
+/// arithmetic shift *is* that floor. The bias is `(2^k - 1)` masked by the sign, and the
+/// sign mask is the sign bit replicated, which is one arithmetic shift by `w - 1`.
+///
+/// So the whole thing is constant shifts, a `band`, an `add`, a `sub` and (for a negative
+/// `c`) a negation -- no divider, no `ite` over a symbolic value. The remainder is
+/// `x - q * 2^k`, and it needs no sign fixup at all: `x % -c == x % c`, because a
+/// remainder takes the dividend's sign.
+///
+/// `|c| >= 2` is required, and that is what makes this safe to use rather than merely
+/// fast: `MIN / c` is representable for every such `c`, so this path can never disagree
+/// with the overflow the signed divider reports. `|c| == 1` is left out on purpose --
+/// `x / -1` overflows at `MIN` and is the one constant where the general path's explicit
+/// handling is wanted -- and `c == 0` is a different obligation entirely.
+pub fn sdivmod_pow2(x: Var, c: i128, w: u8) -> Option<(Var, Var)> {
+    let d = c.unsigned_abs();
+    if d < 2 || !d.is_power_of_two() {
+        return None;
+    }
+    let k = d.trailing_zeros();
+    if k >= u32::from(w) {
+        return None;
+    }
+    // `d <= 2^(w-1)` for any representable `c`, so `d - 1` fits in `w` bits.
+    let mask = word((d - 1) as u64, w);
+    // All-ones when `x` is negative, zero otherwise: the sign bit replicated across
+    // the word by one arithmetic shift.
+    let sign_mask = ashr(x, u32::from(w) - 1);
+    let biased = add(x, band(sign_mask, mask));
+    // `trunc(x / |c|)`. The remainder is built from *this* and not from the sign-fixed
+    // quotient: `x % c == x % |c|` for every `c`, since a remainder takes the dividend's
+    // sign, so negating first would flip it.
+    let magnitude_quotient = ashr(biased, k);
+    let quotient = if c < 0 {
+        sub(word(0, w), magnitude_quotient)
+    } else {
+        magnitude_quotient
+    };
+    let remainder = sub(x, shl(magnitude_quotient, k));
+    Some((quotient, remainder))
+}
+
 /// `x / y` and `x % y`, unsigned, as a *restoring divider* built from the
 /// operators the engine already has.
 ///
@@ -2026,6 +2813,22 @@ pub fn uge_const(x: Var, k: u64) -> Pred {
 /// frontend does, because `rustc` emits that assert for them.
 pub fn divmod(x: Var, y: Var) -> (Var, Var) {
     let w = bits(x);
+    // Two literals divide to two literals. The restoring loop below is *exact*, so
+    // this is not a shortcut past the semantics -- it is the same answer the loop
+    // computes, reached without building `w` stages of adder and mux. That matters
+    // because the loop is what makes the query too big to *pose* when nothing about
+    // it is unknown: `-7 / 3` under `requires: a == -7` is a query with no symbolic
+    // input at all, and it was reported `Unknown` purely for the size of its own
+    // circuit. `y == 0` keeps the same defined result as the general path.
+    if let (Some(xv), Some(yv)) = (const_of(x), const_of(y)) {
+        let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let xv = xv & mask;
+        let yv = yv & mask;
+        if yv == 0 {
+            return (all_ones(w), word(xv, w));
+        }
+        return (word(xv / yv, w), word(xv % yv, w));
+    }
     if w == 1 {
         // 1-bit: for a nonzero divisor the quotient is `x & y` and the remainder
         // is `x & !y`. The `y == 0` case still has to go through the same
@@ -2077,6 +2880,21 @@ pub fn urem(x: Var, y: Var) -> Var {
     divmod(x, y).1
 }
 
+/// Interpret the low `w` bits of `v` as a two's-complement signed value.
+///
+/// Used only by the constant path of [`sdivmod`]; the symbolic path never needs it
+/// because the sign lives in the bit pattern and the circuits handle it.
+fn signed_value(v: u64, w: u8) -> i128 {
+    let masked = if w >= 64 { v } else { v & ((1u64 << w) - 1) };
+    if w >= 64 {
+        masked as i64 as i128
+    } else if masked & (1u64 << (w - 1)) != 0 {
+        masked as i128 - (1i128 << w)
+    } else {
+        masked as i128
+    }
+}
+
 /// `x / y` and `x % y`, *signed*, two's complement, truncating toward zero.
 ///
 /// The unsigned divider computes a non-negative quotient from non-negative
@@ -2092,6 +2910,34 @@ pub fn urem(x: Var, y: Var) -> Var {
 /// nonzero divisor here, so the two holes are independent.
 pub fn sdivmod(x: Var, y: Var) -> (Var, Var) {
     let w = bits(x);
+    // Two literals divide to two literals, signed and truncating toward zero --
+    // Rust's own `/` and `%` on `i128`, which is exact for every width the engine
+    // models. The general path below is the definition; this is that definition
+    // reached without building the magnitudes, the divider and the sign fixups.
+    // Without it a *fully literal* query such as `-7 / 3` still builds the whole
+    // circuit, and the circuit is what gets the query refused for size rather than
+    // for anything being unknown. The three special cases are the general path's:
+    // `y == 0` is all-ones with the dividend as remainder, and `MIN / -1` is `MIN`.
+    if let (Some(xv), Some(yv)) = (const_of(x), const_of(y)) {
+        let sx = signed_value(xv, w);
+        let sy = signed_value(yv, w);
+        if sy == 0 {
+            return (all_ones(w), x);
+        }
+        let min = -(1i128 << (w - 1));
+        if sx == min && sy == -1 {
+            return (word(1u64 << (w - 1), w), word(0, w));
+        }
+        // Mask before `word`: a negative quotient is a full-width two's-complement
+        // pattern, and `word` rejects a value that does not fit its width -- the
+        // check that catches a caller's modelling mistake. The pattern is the
+        // answer here, so it is narrowed to the width it denotes rather than
+        // handed over un-masked.
+        let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let q = (sx / sy) as u64 & mask;
+        let r = (sx % sy) as u64 & mask;
+        return (word(q, w), word(r, w));
+    }
     let zero = word(0, w);
     let nx = negative(x);
     let ny = negative(y);
@@ -2158,10 +3004,11 @@ pub fn mul_eq(x: Var, y: Var, z: Var) -> Pred {
 ///
 /// `None` for anything else. The MIR frontend uses this to keep a shift by a
 /// *constant* amount on the cheap `Op::Shl` path instead of paying for a barrel
-/// shifter; both paths agree, but only one of them is free. Gated on `std` because
-/// the frontend that calls it is: without it this is dead code, and the bare-metal
-/// gate builds with warnings denied.
-#[cfg(feature = "std")]
+/// shifter; both paths agree, but only one of them is free. `pow_fold` uses it for
+/// the same reason: a constant exponent lets the fold skip the steps that cannot
+/// run instead of building them behind a zero gate. The divider's constant paths
+/// ([`divmod`], [`sdivmod`]) use it too, which is why it is *not* gated on `std`:
+/// those run at every build, including bare metal.
 pub(crate) fn const_of(v: Var) -> Option<u64> {
     with_ctx(|c| {
         let n = c.node_of(v.0);
@@ -2267,13 +3114,22 @@ pub fn shift_var(op: Shift, x: Var, n: Var) -> Var {
             Shift::LogicalRight => Op::LShr,
             Shift::ArithmeticRight => Op::Shr,
         };
+        // The amount is tested in *its own* width, not the value's. `_1 >> _2`
+        // where `_1: u8` and `_2: u32` is the ordinary shape -- Rust takes the
+        // shift amount as any integer type -- and building the mask at the
+        // value's width made `n & mask` mix 32 bits with 8, which is ill-formed
+        // and refused the whole function. `n`'s width is at least the `log2(w)`
+        // bits the stages read for every real shift-amount type, so no bit is
+        // lost; an amount *narrower* than the value is the case the mask has to
+        // be read from, and it is read from `n`.
+        let nw = c.width_of(n.0);
         let mut acc = x;
         let mut i = 0u32;
         while (1u32 << i) < w as u32 {
             let amt = 1u32 << i;
             // Bit `i` of `n`, as `(n & 2^i) == 2^i`. Testing the masked value
             // against the mask avoids needing a bit-extraction primitive.
-            let mask = c.konst(amt as u64, w);
+            let mask = c.konst(amt as u64, nw);
             let masked = c.bin_word(Op::And, n.0, mask);
             let bit = c.cmp(Op::Eq, masked, mask);
             let shifted = c.shift(hop, acc.0, amt);
@@ -2286,7 +3142,9 @@ pub fn shift_var(op: Shift, x: Var, n: Var) -> Var {
         // out-of-range value explicitly. Without this, `x << 4` at 4 bits returns
         // `x`, which is neither the documented value nor anything Rust does;
         // `tests/shift.rs` pins it.
-        let wt = c.konst(w as u64, w);
+        // `w <= 64` and every shift-amount type is at least 8 bits wide, so this
+        // constant is exact in `n`'s width rather than truncated.
+        let wt = c.konst(w as u64, nw);
         let in_range = c.cmp(Op::Ult, n.0, wt);
         let oor = match op {
             // An arithmetic shift by `w - 1` replicates the sign bit across the
@@ -2319,6 +3177,13 @@ pub fn ite(c: Pred, t: Var, e: Var) -> Var {
     with_ctx(|c_| {
         c_.require_same_width(t.0, e.0, "ite branches");
         let w = c_.width_of(t.0);
+        // A literal condition selects a branch: the term is that branch, not a mux
+        // with a constant selector. This is what lets a constant-pinned dividend
+        // reach the divider's constant path instead of building the general loop.
+        let cn = c_.node_of(c.0);
+        if cn.op == Op::Const {
+            return if c_.const_of(c.0) != 0 { t } else { e };
+        }
         Var(c_.mk_term(Node { op: Op::Ite, a: c.0.0, b: t.0.0, c: e.0.0, width: w, hi: 0 }))
     })
 }
@@ -2400,6 +3265,61 @@ pub fn substitute(p: Pred, bindings: &[(Var, Var)]) -> Pred {
             c.bind_subst(from.0, to.0);
         }
         Pred(c.subst(p.0))
+    })
+}
+
+/// The most variables one precondition may pin to a constant.
+///
+/// `std`-only for the same reason as [`pinned_vars`]: its only caller is the MIR
+/// frontend, which is behind the feature.
+#[cfg(feature = "std")]
+pub(crate) const MAX_PINS: usize = 16;
+
+/// `(variable index, value)` for each conjunct of `p` that pins a variable to a
+/// constant: `v == k` or `k == v`, under any nesting of `&&`.
+///
+/// The caller seeds a pinned argument with its literal instead of a fresh symbolic
+/// input. That is *sound* -- every model of `p` has `v == k`, so evaluating the body
+/// at `v == k` leaves the obligation under `p` unchanged -- and it is what makes a
+/// query whose precondition pins a variable decidable. The body then builds its
+/// operations on a literal, and the constant folds collapse them; a symbolic operand
+/// instead builds the whole circuit and the query is refused for the size of its own
+/// diagram. `requires: a == -7` with the body `a / 3` is the motivating shape: the
+/// 64-bit restoring divider is a documented scaling wall, and the precondition says
+/// there is only one `a` to divide.
+///
+/// Only a *closed* right-hand side pins. `v == w` between two variables is not a pin
+/// -- it is a relation, and folding it would fix both -- so it is left alone.
+#[cfg(feature = "std")]
+pub(crate) fn pinned_vars(p: Pred, out: &mut [(u32, u64); MAX_PINS]) -> usize {
+    with_ctx(|c| {
+        let mut leaves = [Term(0); MAX_CONJ];
+        let n = c.op_leaves(Op::And, p.0, &mut leaves);
+        let mut memo = EvalMemo::new();
+        let mut count = 0usize;
+        for leaf in leaves[..n].iter() {
+            if count >= MAX_PINS {
+                break;
+            }
+            let node = c.node_of(*leaf);
+            if node.op != Op::Eq {
+                continue;
+            }
+            let (a, b) = (Term(node.a), Term(node.b));
+            let (na, nb) = (c.node_of(a), c.node_of(b));
+            // One side a variable, the other a closed term. A variable on *both*
+            // sides is a relation rather than a pin.
+            let (idx, other) = match (na.op, nb.op) {
+                (Op::Var, Op::Var) => continue,
+                (Op::Var, _) => (na.a, b),
+                (_, Op::Var) => (nb.a, a),
+                _ => continue,
+            };
+            let Some(k) = eval_term(c, other, &|_| None, &mut memo) else { continue };
+            out[count] = (idx, k);
+            count += 1;
+        }
+        count
     })
 }
 
@@ -2500,6 +3420,106 @@ mod subst_tests {
 }
 
 #[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    fn pins(p: Pred) -> Vec<(u32, u64)> {
+        let mut buf = [(0u32, 0u64); MAX_PINS];
+        let n = pinned_vars(p, &mut buf);
+        buf[..n].to_vec()
+    }
+
+    /// `v == k` pins `v` to `k`, whichever side the constant is written on.
+    ///
+    /// The value is the *bit pattern*, not the signed number: `-7` at eight bits is
+    /// `249`. That is deliberate -- the caller masks it to the argument's width and
+    /// builds a literal from it, and `word(249, 8)` *is* `-7` at eight bits. A
+    /// signed value here would have to be re-signed at the caller's width, which is
+    /// exactly the width information this function does not have.
+    #[test]
+    fn an_equality_to_a_constant_pins_the_variable() {
+        with_fresh(|| {
+            let a = var_named(1, 8);
+            assert_eq!(pins(eq_const(a, 200)), vec![(1, 200)]);
+        });
+        // The constant on the left is the same pin.
+        with_fresh(|| {
+            let a = var_named(1, 8);
+            assert_eq!(pins(eq(word(200, 8), a)), vec![(1, 200)]);
+        });
+        // A negated literal, as the spec parser spells it: `0 - 7` at eight bits.
+        with_fresh(|| {
+            let a = var_named(1, 8);
+            let neg7 = sub(word(0, 8), word(7, 8));
+            assert_eq!(pins(eq(a, neg7)), vec![(1, 249)], "`-7` at eight bits is the bit pattern 249");
+        });
+    }
+
+    /// A relation between two variables is *not* a pin, and a non-equality is not
+    /// either.
+    ///
+    /// `v == w` fixes neither one on its own: seeding either with a literal would
+    /// discard the relation and could decide a query that the precondition does not
+    /// actually leave decided. The honest answer is no pin, which is what this
+    /// asserts -- the negative direction, without which a function that pinned every
+    /// `Eq` it saw would pass the test above.
+    #[test]
+    fn a_relation_between_two_variables_is_not_a_pin() {
+        with_fresh(|| {
+            let a = var_named(1, 8);
+            let b = var_named(2, 8);
+            assert!(pins(eq(a, b)).is_empty(), "`a == b` must not pin either side");
+        });
+        // `a < 200` constrains `a` without fixing it.
+        with_fresh(|| {
+            let a = var_named(1, 8);
+            assert!(pins(ult(a, word(200, 8))).is_empty(), "`a < 200` must not pin `a`");
+        });
+    }
+
+    /// The conjuncts are found under any nesting of `&&`, and a conjunct that is
+    /// itself a disjunction is *not* decomposed: `a == 1 || a == 2` leaves two
+    /// values, so it pins nothing.
+    #[test]
+    fn a_pin_is_found_through_conjunction_but_not_disjunction() {
+        with_fresh(|| {
+            let a = var_named(1, 8);
+            let b = var_named(2, 8);
+            let p = and(eq_const(a, 1), and(eq_const(b, 2), ult(a, word(9, 8))));
+            let mut got = pins(p);
+            got.sort_unstable();
+            assert_eq!(got, vec![(1, 1), (2, 2)], "both pins must be found under a nested `&&`");
+        });
+        with_fresh(|| {
+            let a = var_named(1, 8);
+            let p = or(eq_const(a, 1), eq_const(a, 2));
+            assert!(pins(p).is_empty(), "a disjunction of two values is not a pin");
+        });
+    }
+
+    /// The pin is *sound*: the query under the precondition is unchanged by
+    /// specialising the variable. `a == 5 && a / 2 == 2` holds for exactly one `a`,
+    /// and pinning `a := 5` must keep it `Valid` rather than change the answer.
+    #[test]
+    fn pinning_a_variable_preserves_the_query_under_its_precondition() {
+        with_fresh(|| {
+            let a = var_named(1, 8);
+            let pre = eq_const(a, 5);
+            let goal = eq(udiv(a, word(2, 8)), word(2, 8));
+            // Under `pre`, the goal holds. Substitute the pin and the closed formula
+            // is still `Valid` -- which is the property the executor relies on.
+            let pinned = substitute(goal, &[(a, word(5, 8))]);
+            assert_eq!(prove(pinned), Verdict::Valid);
+            // The *false* direction stays false, so the pin does not make anything true.
+            let bad = eq(udiv(a, word(2, 8)), word(3, 8));
+            let pinned_bad = substitute(bad, &[(a, word(5, 8))]);
+            assert_eq!(prove(pinned_bad), Verdict::Unsat);
+            let _ = pre;
+        });
+    }
+}
+
+#[cfg(test)]
 mod var_tests {
     use super::*;
 
@@ -2570,6 +3590,155 @@ mod word_tests {
         // And it does not trip the out-of-range check.
         with_fresh(|| {
             assert_eq!(prove(eq_const(all_ones(8), 255)), Verdict::Valid);
+        });
+    }
+}
+
+#[cfg(test)]
+mod const_fold_tests {
+    use super::*;
+
+    /// A predicate read as a word, for the folds that produce one.
+    fn pv(p: Pred) -> Var {
+        Var(p.0)
+    }
+
+    /// A word operation on two literals collapses to the literal, and the value is
+    /// the operator's own wrapping definition.
+    #[test]
+    fn a_word_operation_on_two_literals_is_the_literal() {
+        with_fresh(|| {
+            let a = word(200, 8);
+            let b = word(100, 8);
+            // `200 + 100` wraps to `44` at eight bits, exactly as `eval_term_body` says.
+            assert_eq!(const_of(add(a, b)), Some(44));
+            assert_eq!(const_of(sub(a, b)), Some(100));
+            assert_eq!(const_of(mul(a, b)), Some(32));
+            assert_eq!(const_of(band(word(0xf0, 8), word(0x3c, 8))), Some(0x30));
+            assert_eq!(const_of(bor(word(0xf0, 8), word(0x0f, 8))), Some(0xff));
+            assert_eq!(const_of(bxor(word(0xff, 8), word(0x0f, 8))), Some(0xf0));
+        });
+    }
+
+    /// A comparison of two literals is a *one-bit* constant, not one carrying the
+    /// operand width. A comparison node stores its operands' width even though it
+    /// denotes one bit, and a folded node left wide would hand a later width check a
+    /// term of the wrong shape -- the bug the `un_bool` guard exists for.
+    #[test]
+    fn a_comparison_of_two_literals_is_one_bit() {
+        with_fresh(|| {
+            let lt = ult(word(3, 32), word(5, 32));
+            assert_eq!(const_of(pv(lt)), Some(1));
+            assert_eq!(bits(pv(lt)), 1, "a folded comparison must be one bit wide");
+            let eq = eq(word(4, 64), word(9, 64));
+            assert_eq!(const_of(pv(eq)), Some(0));
+            assert_eq!(bits(pv(eq)), 1, "a folded comparison must be one bit wide");
+            let le = ule(word(5, 8), word(5, 8));
+            assert_eq!(const_of(pv(le)), Some(1));
+        });
+    }
+
+    /// The whole point of the fold: a query with no symbolic input at all is
+    /// *decided*, at every width, instead of being refused for the size of its own
+    /// circuit. `sdiv(-7, 3)` is `-2` -- `prove` on a closed formula must not be
+    /// `Unknown` merely because the formula is a divider.
+    #[test]
+    fn a_fully_literal_signed_division_is_decided_at_every_width() {
+        for w in [8u8, 16, 32, 64] {
+            with_fresh(|| {
+                let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                let minus7 = word((-7i64 as u64) & mask, w);
+                let three = word(3, w);
+                let minus2 = word((-2i64 as u64) & mask, w);
+                let q = sdiv(minus7, three);
+                assert_eq!(
+                    const_of(q),
+                    Some((-2i64 as u64) & mask),
+                    "`-7 / 3` at {w} bits must fold to `-2`"
+                );
+                assert_eq!(
+                    prove(eq(q, minus2)),
+                    Verdict::Valid,
+                    "a closed `-7 / 3 == -2` at {w} bits must be proved, not refused"
+                );
+            });
+        }
+    }
+
+    /// The division folds agree with Rust's own `/` and `%` on the edges the
+    /// general path special-cases: a zero divisor and `MIN / -1`.
+    #[test]
+    fn the_constant_divider_matches_the_general_path_on_its_edges() {
+        with_fresh(|| {
+            // `y == 0`: quotient all ones, remainder the dividend.
+            let (q, r) = sdivmod(word(5, 8), word(0, 8));
+            assert_eq!(const_of(q), Some(255));
+            assert_eq!(const_of(r), Some(5));
+        });
+        with_fresh(|| {
+            // `i8::MIN / -1` wraps to `i8::MIN`, remainder zero.
+            let (q, r) = sdivmod(word(128, 8), word(255, 8));
+            assert_eq!(const_of(q), Some(128));
+            assert_eq!(const_of(r), Some(0));
+        });
+        with_fresh(|| {
+            // The unsigned divider's zero case, for the same reason.
+            let (q, r) = divmod(word(5, 8), word(0, 8));
+            assert_eq!(const_of(q), Some(255));
+            assert_eq!(const_of(r), Some(5));
+        });
+    }
+
+    /// A *negation* (`0 - x`) is deliberately not folded, because the frontend
+    /// spells a unary `-` that way and tells `-128` from the bare literal `128` by
+    /// the node being a `Sub` rather than a `Const`. Folding it would merge the two
+    /// and refuse a valid `y == -128`. The other subtractions still fold.
+    #[test]
+    fn a_negation_is_not_folded_but_a_real_subtraction_is() {
+        with_fresh(|| {
+            let n = sub(word(0, 8), word(128, 8));
+            assert_eq!(
+                const_of(n),
+                None,
+                "`0 - x` must stay a `Sub` node: the frontend keys literal-range \
+                 bookkeeping on it not aliasing the literal it negates"
+            );
+        });
+        with_fresh(|| {
+            // `x - y` with a nonzero left operand still folds -- the divider is built
+            // from it.
+            assert_eq!(const_of(sub(word(10, 8), word(3, 8))), Some(7));
+        });
+    }
+
+    /// `truncate` is deliberately not folded: the frontend builds a named bound
+    /// (`i8::MIN`) as `truncate(word(k, 64), w)` so it does *not* hash-cons with the
+    /// literal `word(k, w)`. Folding a literal through `Trunc` would merge them and
+    /// make the bound inherit the literal's out-of-range envelope.
+    #[test]
+    fn a_truncated_literal_keeps_its_own_term() {
+        with_fresh(|| {
+            let t = truncate(word(128, 64), 8);
+            assert_ne!(
+                t.0 .0, word(128, 8).0 .0,
+                "`truncate(word(128,64), 8)` must not hash-cons with `word(128, 8)`"
+            );
+            assert_eq!(evaluate(t, |_| None), Some(128), "but it still denotes 128");
+        });
+    }
+
+    /// A fold may not change a verdict: the folded term and the circuit it replaces
+    /// must satisfy the same predicates. This pins the property rather than a list
+    /// of cases, by evaluating both.
+    #[test]
+    fn a_fold_preserves_the_value_it_replaces() {
+        with_fresh(|| {
+            let a = word(37, 8);
+            let b = word(11, 8);
+            let folded = add(a, b);
+            let wide = add(truncate(a, 16), truncate(b, 16));
+            assert_eq!(evaluate(folded, |_| None), Some(48));
+            assert_eq!(evaluate(wide, |_| None), Some(48));
         });
     }
 }
@@ -2646,5 +3815,69 @@ mod generation_tests {
                 assert_eq!(prove(eq(c, c)), Verdict::Valid, "word(1, {w}) must hold");
             });
         }
+    }
+
+    /// The boolean identities are folded at construction, and the two that matter most
+    /// are the ones a *path condition* needs.
+    ///
+    /// A contradiction has to become a literal `false` before the bit-blaster runs. If it
+    /// does not, both copies of the operand are expanded first, and when the operand
+    /// contains a wide divider the diagram blows up before any solver sees the false
+    /// literal -- which is how the `u16` saturating multiply stayed undecided.
+    #[test]
+    fn boolean_identities_fold_at_construction() {
+        with_fresh(|| {
+            let p = ult(var(8), word(5, 8));
+            // `p && !p` is `false`, and `p || !p` is `true`, at the root.
+            assert_eq!(prove(and(p, not(p))), Verdict::Unsat);
+            assert_eq!(prove(or(p, not(p))), Verdict::Valid);
+            // The same with the two operands built independently: hash-consing returns the
+            // same handle, so this is the same term, and the fold must not be matching a
+            // handle by accident.
+            let q = || ult(var_named(0, 8), word(5, 8));
+            assert_eq!(prove(and(q(), not(q()))), Verdict::Unsat);
+            // `!!p == p`, and the fold must not turn a predicate into a wide term: a
+            // comparison node carries the operand width, so the width check is what keeps
+            // the arena well-formed.
+            assert_eq!(prove_equiv(p, not(not(p))), Verdict::Valid);
+            assert!(!is_ill_formed(), "the double-negation fold must not change a width");
+            // Constants.
+            assert_eq!(prove_equiv(and(truth(true), p), p), Verdict::Valid);
+            assert_eq!(prove(not(truth(true))), Verdict::Unsat);
+        });
+    }
+
+    /// Cancellation through the `&&`/`||` spine, which is what a path condition needs.
+    ///
+    /// The `sat_mul` shape: the path into the multiply is the conjunction
+    /// `b == 0 && a <= MAX / b` and the overflow test is `b != 0 && a > MAX / b`. The
+    /// conjuncts cancel pairwise, but across two `&&` spines rather than at either root --
+    /// so a top-level identity check misses it, and the divider inside both terms is
+    /// blasted before any solver sees the contradiction.
+    #[test]
+    fn a_path_contradiction_cancels_through_the_spine() {
+        with_fresh(|| {
+            let w = 16u8;
+            let a = var(w);
+            let b = var(w);
+            let max = word((1u64 << w) - 1, w);
+            let zero = word(0, w);
+            // The exact unsigned multiply-overflow predicate, as `exec::overflow_pred`
+            // builds it: `b != 0 && a > MAX / b`.
+            let over = and(not(eq(b, zero)), ult(udiv(max, b), a));
+            // The path that reaches the multiply when the guard does not fire. This is the
+            // conjunction rustc's two `switchInt`s leave on the path: `b == 0` from the
+            // first, `!(a > MAX / b)` from the second.
+            let path = and(eq(b, zero), not(ult(udiv(max, b), a)));
+            // `path && over` is unsatisfiable, and it has to be decided without the
+            // 16-bit divider ever being blasted -- which is exactly what the spine
+            // cancellation buys. If the fold were missing this would come back `Unknown`
+            // after expanding both dividers, not `Unsat`.
+            assert_eq!(
+                find_model(and(path, over)),
+                Verdict::Unsat,
+                "the guard and its negation must cancel across the spine"
+            );
+        });
     }
 }

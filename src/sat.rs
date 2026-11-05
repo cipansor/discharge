@@ -269,6 +269,15 @@ impl Cnf {
         self.overflow
     }
 
+    /// Mark the encoding as truncated. The bit-blaster calls this when its *step* budget is
+    /// spent: the CNF is then only a partial encoding of the query, and `overflowed` routes
+    /// it to `Unknown` exactly as a capacity overflow does. Without it a step-limited
+    /// encoding could be solved as if it were complete and yield a counterexample for the
+    /// wrong reason.
+    pub fn mark_overflow(&mut self) {
+        self.overflow = true;
+    }
+
     fn push_clause(&mut self, lits: &[Lit]) {
         if self.n_clauses >= MAX_CLAUSES || self.n_lits + lits.len() > MAX_LITS {
             self.overflow = true;
