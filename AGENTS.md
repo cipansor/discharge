@@ -3276,29 +3276,46 @@ optional file argument, which is what made the measurement cheap.)
   never landed under `_1.0` and the later read `(_1.0).0` -- the *nested* store,
   keyed by the whole chain -- found nothing. The body's value was then unknown,
   and a contract that is false of the body was reported unreadable instead of
-  refuted. `Env::copy_parts_under` re-roots the source's parts beneath the
-  destination's field path, called *after* `set` (whose field arm forgets the
-  stale nested paths first, and the helper is what puts the source's parts back).
-  Only an all-field path is re-keyed: a deref, index or downcast names a store
-  the helper does not re-root, and writing a part where no read consults it would
-  be a lost proof at best, so those are refused. `whole_inner_write_makes_nested_seed_stale`
-  moved from *incomplete* to **refuted**, and its positive companion
-  `whole_inner_write_is_seen_by_the_leaf` verifies -- the pair rules out a blanket
-  refusal, which is what an "`!is_verified()`" assertion on the false entry alone
-  would have let through.
+  refuted. `Env::rebase_parts` moves the source's parts to the destination,
+  re-rooting both when either place is nested, called *after* `set` (whose field
+  arm forgets the stale nested paths first, and the helper is what puts the
+  source's parts back). It generalises `copy_parts`, which is the
+  whole-to-whole case and carries the element/payload/tag/index stores too; the
+  re-rooting one moves the two field-shaped stores and is reached when *either*
+  side is nested -- a struct literal into a nested field (`o.i = Inner { v: 9 }`),
+  and a nested-to-nested move (`o.i = o.j` lowers to `_2 = move (_1.1); (_1.0) =
+  move _2`, so a *nested source* into a whole temp, then a whole source into a
+  nested destination). `copy_parts` refuses a nested source, which is why the
+  nested-to-nested move was `incomplete` before. A part is re-keyed *relative* to
+  the source's own path: the entry at `(src, sp)` -- or the single-field entry
+  whose key *is* `sp` -- is the value at `src`, and it lands at the destination's
+  path. A whole destination drops all its parts first; a nested destination keeps
+  its siblings, because only the paths under it are written. Only an all-field
+  path is re-keyed: a deref, index or downcast names a store the helper does not
+  re-root, and writing a part where no read consults it would be a lost proof at
+  best, so those are refused.
+  `whole_inner_write_makes_nested_seed_stale` moved from *incomplete* to
+  **refuted**, and its positive companion `whole_inner_write_is_seen_by_the_leaf`
+  verifies -- the pair rules out a blanket refusal, which is what an
+  "`!is_verified()`" assertion on the false entry alone would have let through.
+  The nested-to-nested pair `whole_inner_move_carries_the_source_leaf` (true
+  `ret == 3`, verified) and `whole_inner_move_is_not_the_stale_destination` (the
+  destination's pre-move `7` claimed to survive; refuted, witness `o.i.v = 7`)
+  pins both directions: a model that kept the stale leaf would *prove* the twin.
   Two notes on what this did *not* need. The nested literal always reaches the
   store through a temp, so `Rvalue::Struct`/`Aggregate` do **not** need to write
   under `dest.proj`; and making `Aggregate` do so *drops* a nested tuple write
   (`(_1.0) = (5, 6)` writes `(_1.0.0)`, a `Field(0) + Index(0)` chain the `set`
   catch-all does not re-root), so the tempting "consistency" edit is a
   regression. The minimal, evidence-backed change is the assignment hook alone.
-  The destination is *resolved* before the path is read, and one leading `Deref`
-  is stripped as `field_chain` strips one: `o.i = Inner { v: 9 }` through an
-  `&mut Outer` lowers to `((*_1).0) = move _2`, and an `&mut T` argument is
-  modelled as its referent, so `resolve` leaves the lone deref in place. Without
-  the strip the write is refused for the wrong reason and the leaf reads
-  `Unknown` -- `whole_inner_write_through_a_mutable_reference_is_seen` verifies
-  after it and is `incomplete` before, the tripwire for the deref case.
+  Both projections are *resolved* before the path is read, and one leading
+  `Deref` is stripped as `field_steps` strips one (it now backs `field_chain`):
+  `o.i = Inner { v: 9 }` through an `&mut Outer` lowers to `((*_1).0) = move _2`,
+  and an `&mut T` argument is modelled as its referent, so `resolve` leaves the
+  lone deref in place. Without the strip the write is refused for the wrong
+  reason and the leaf reads `Unknown` --
+  `whole_inner_write_through_a_mutable_reference_is_seen` verifies after it and
+  is `incomplete` before, the tripwire for the deref case.
   The deep `i64 / 3` wall is *not* part of this: that entry is the deliberate
   `MAX_WALK_DEPTH` refusal vehicle (`a_symbolic_division_by_a_non_power_of_two_at_i64`,
   whose contract is false in general), so its `incomplete` is intended, not a bug.

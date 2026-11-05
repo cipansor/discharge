@@ -1504,6 +1504,8 @@ fn a_nested_seed_is_invalidated_by_a_write_and_carried_by_a_copy() {
         "whole_inner_write_makes_nested_seed_stale",
         "whole_inner_write_is_seen_by_the_leaf",
         "whole_inner_write_through_a_mutable_reference_is_seen",
+        "whole_inner_move_carries_the_source_leaf",
+        "whole_inner_move_is_not_the_stale_destination",
         "whole_struct_copy_carries_nested_paths",
     ]) else {
         return;
@@ -1530,6 +1532,20 @@ fn a_nested_seed_is_invalidated_by_a_write_and_carried_by_a_copy() {
     );
     let copy = outcome(&report, "whole_struct_copy_carries_nested_paths");
     assert!(copy.is_verified(), "a whole-struct copy must carry nested paths; got: {copy}");
+    // A nested-to-nested move: the *source* is a projection, which `copy_parts` refuses, so
+    // the re-rooting has to run on a nested source too. The pair pins both directions -- the
+    // source's leaf arrives (true `ret == 3`), and the destination's stale leaf is gone (the
+    // false `ret == 7` is refuted rather than proved against the seed the move replaced).
+    let carried = outcome(&report, "whole_inner_move_carries_the_source_leaf");
+    assert!(
+        carried.is_verified(),
+        "a nested-to-nested move must carry the source's leaf; got: {carried}"
+    );
+    let stale_move = outcome(&report, "whole_inner_move_is_not_the_stale_destination");
+    assert!(
+        matches!(stale_move, FnOutcome::Failed { .. }),
+        "the destination's pre-move leaf must not survive the move; got: {stale_move}"
+    );
 }
 
 /// A helper's write through a `&mut` argument reaches the caller, and the false

@@ -715,76 +715,91 @@ impl Env {
         }
     }
 
-    /// Re-root the source's separately stored parts under the destination's field path.
+    /// Move the parts stored under `src` to `dst`, re-rooting them when either place is
+    /// nested, and report whether there were any.
     ///
-    /// This is [`Self::copy_parts`] one level down, and it is what a *nested* aggregate
-    /// assignment needs. `o.i = InnerBox { v: 9 }` lowers to a struct literal into a temp
-    /// followed by `(_1.0) = move _2`, so the parts being moved are keyed under `_2` and the
-    /// destination is the nested place `_1.0`. [`Self::copy_parts`] is reached only for a
-    /// whole-place destination, so without this the temp's `v` never lands under `_1.0` and
-    /// the later read `(_1.0).0` -- the nested store, keyed by the whole chain -- finds
-    /// nothing. The body's value is then unknown, and a contract that *is* false of the body
-    /// is reported unreadable instead of refuted.
+    /// This generalises [`Self::copy_parts`], which is the whole-place-to-whole-place case and
+    /// carries the element, payload, tag and index stores as well. This one is reached when a
+    /// nested place is on at least one side, and it moves the two field-shaped stores:
     ///
-    /// `prefix` is the destination's projection. Only an all-field path is re-keyed: any
-    /// other projection (a deref, an index, a downcast) names a store this helper does not
-    /// re-root, and writing a part where no read consults it would be a lost proof at best,
-    /// so those are refused. The destination is *resolved* first, so a write through a
-    /// reference (`o.i = Inner { v: 9 }` on an `&mut Outer` lowers to `((*_1).0) = move _2`)
-    /// reaches the target's field path rather than stopping at the leading deref, which is
-    /// what makes the write and the read meet in one store. The source must be a bare local
-    /// for the same reason [`Self::copy_parts`] requires it -- a source that is itself a
-    /// projection has no parts under a local to move.
-    fn copy_parts_under(&mut self, src: &Place, dst: &Place) {
+    /// - a struct literal into a nested field, `o.i = InnerBox { v: 9 }` -> `(_1.0) = move _2`
+    ///   (whole source, nested destination);
+    /// - a nested-to-nested move, `o.i = o.j` -> `_2 = move (_1.1); (_1.0) = move _2` (the
+    ///   first step is a nested source into a whole temp, the second a whole source into a
+    ///   nested destination).
+    ///
+    /// [`Self::copy_parts`] is reached only when both places are whole, so without this the
+    /// parts never land under the nested place and the later read (`(_1.0).0`, the nested
+    /// store keyed by the whole chain) finds nothing. The body's value is then unknown, and a
+    /// contract that *is* false of the body is reported unreadable instead of refuted.
+    ///
+    /// Both projections are read as field paths (`field_steps`), and both are *resolved*
+    /// first, so a write through a reference (`((*_1).0) = move _2`) reaches the target's
+    /// field path rather than stopping at the leading deref -- what makes the write and the
+    /// read meet in one store. Any other projection (an index, a downcast, a second deref)
+    /// names a store this helper does not re-root, and writing a part where no read consults
+    /// it would be a lost proof at best, so those are refused.
+    ///
+    /// A part is re-keyed relative to the source's own path: the entry at `(src.local, sp)`
+    /// (or the single-field entry whose key *is* `sp`) is the value at `src`, and it lands at
+    /// the destination's path. A whole destination replaces every part it had, so its old
+    /// parts are dropped first; a nested destination keeps its siblings, because only the
+    /// paths under it are being written. A path that re-roots to the whole local (a field of
+    /// one moved into a whole place) becomes the local's value.
+    fn rebase_parts(&mut self, src: &Place, dst: &Place) -> bool {
         let src = self.resolve(src);
         let dst = self.resolve(dst);
-        if !src.proj.is_empty() || src.local == dst.local {
-            return;
+        let Some(sp) = field_steps(&src.proj) else { return false };
+        let Some(dp) = field_steps(&dst.proj) else { return false };
+        if src.local == dst.local && sp == dp {
+            return false;
         }
-        // The destination's projection as a field chain. A leading `Deref` is stripped first,
-        // exactly as [`field_chain`] strips one: an `&mut T` *argument* is modelled as its
-        // referent, so `resolve` leaves its lone deref in place and the field path is the
-        // tail. Any other projection (an index, a downcast, a second deref) names a store this
-        // helper does not re-root, so the write is refused rather than sent where no read
-        // consults it.
-        let steps = match dst.proj.first() {
-            Some(Proj::Deref) => &dst.proj[1..],
-            _ => &dst.proj[..],
-        };
-        let leaf: Vec<u32> = match steps
-            .iter()
-            .map(|p| match p {
-                Proj::Field(i) => Some(*i),
-                _ => None,
-            })
-            .collect::<Option<Vec<u32>>>()
-        {
-            Some(v) if !v.is_empty() => v,
-            _ => return,
-        };
-        let (s, d) = (src.local, dst.local);
-        // The source's parts as the two shapes the field stores use: a chain of fields (the
-        // `nested` store) and a single field (the `fields` store). A part is re-keyed under
-        // `leaf`, and since `leaf` is non-empty every such key is a chain of length two or
-        // more, which is exactly what the nested store is read by.
-        let nested: Vec<(Vec<u32>, Val)> = self
-            .nested
-            .iter()
-            .filter(|((l, _), _)| *l == s)
-            .map(|((_, chain), v)| (chain.clone(), *v))
-            .collect();
-        let fields: Vec<(u32, Val)> =
-            self.fields.iter().filter(|((l, _), _)| *l == s).map(|((_, k), v)| (*k, *v)).collect();
-        for (chain, v) in nested {
-            let mut c = leaf.clone();
-            c.extend(chain);
-            self.nested.insert((d, c), v);
+        let s = src.local;
+        // The source's parts, keyed relative to the source's own path. The `nested` store is
+        // the chain-shaped one (length two or more) and the `fields` store the single-field
+        // one; a source path `sp` selects the entries under it, and the entry *at* it (a
+        // single-field source) is the whole moved value.
+        let mut rels: Vec<(Vec<u32>, Val)> = Vec::new();
+        for ((l, chain), v) in &self.nested {
+            if *l == s {
+                if let Some(tail) = chain.strip_prefix(sp.as_slice()) {
+                    rels.push((tail.to_vec(), *v));
+                }
+            }
         }
-        for (k, v) in fields {
-            let mut c = leaf.clone();
-            c.push(k);
-            self.nested.insert((d, c), v);
+        for ((l, k), v) in &self.fields {
+            if *l != s {
+                continue;
+            }
+            if sp.is_empty() {
+                rels.push((vec![*k], *v));
+            } else if sp.as_slice() == [*k] {
+                rels.push((Vec::new(), *v));
+            }
         }
+        let any = !rels.is_empty();
+        // A whole destination is replaced outright, so its previous parts must not survive; a
+        // nested destination keeps the parts outside the written path.
+        if dp.is_empty() && s != dst.local {
+            self.forget_parts(dst.local);
+        }
+        for (rel, v) in rels {
+            let mut full = dp.clone();
+            full.extend(rel);
+            match full.len() {
+                // The value *at* the source path becomes the whole destination value.
+                0 => {
+                    self.locals.insert(dst.local, v);
+                }
+                1 => {
+                    self.fields.insert((dst.local, full[0]), v);
+                }
+                _ => {
+                    self.nested.insert((dst.local, full), v);
+                }
+            }
+        }
+        any
     }
 
     /// Copy every derived part of `src`'s local onto `dst`, and report whether the
@@ -1245,13 +1260,23 @@ impl Env {
 /// A *single* field is not a chain here: `[_1.0]` returns `None` so the
 /// single-field store keeps answering it, and the two stores stay disjoint.
 fn field_chain(proj: &[Proj]) -> Option<Vec<u32>> {
+    let chain = field_steps(proj)?;
+    if chain.len() < 2 {
+        return None;
+    }
+    Some(chain)
+}
+
+/// A projection read as a chain of field indices, stripping one leading `Deref`.
+///
+/// `None` for any step that is not a field (an index, a downcast, a second deref): those
+/// name a store the caller does not re-root. An empty chain is a whole place, which is
+/// `Some(vec![])` -- the caller decides whether that is meaningful.
+fn field_steps(proj: &[Proj]) -> Option<Vec<u32>> {
     let steps = match proj.first() {
         Some(Proj::Deref) => &proj[1..],
         _ => proj,
     };
-    if steps.len() < 2 {
-        return None;
-    }
     let mut chain = Vec::with_capacity(steps.len());
     for s in steps {
         match s {
@@ -2292,23 +2317,21 @@ where
                     }
                 }
                 st.env.set(dest, v);
-                // A *nested* aggregate assignment (`o.i = Inner { v: 9 }` lowers to
-                // `(_1.0) = move _2`, or `((*_1).0) = move _2` through a reference) moves the
-                // source's parts under the destination's field path. `set` alone cannot do
-                // it: the value it is handed is the source local, which has no bit-vector
-                // meaning, and the parts live in the field stores keyed by the source's own
-                // local. It is done *after* `set` because the field arm of `set` forgets the
-                // nested paths beneath the destination -- correct, since they are stale --
-                // and this is what puts the source's parts back. Without it the temp's `v`
-                // never lands under `_1.0`, and `(_1.0).0` reads `Unknown`.
+                // A *nested* aggregate assignment moves the source's parts under the
+                // destination's path. Two shapes need it: a struct literal into a nested field
+                // (`o.i = Inner { v: 9 }` -> `(_1.0) = move _2`), and a nested-to-nested move
+                // (`o.i = o.j` -> `_2 = move (_1.1); (_1.0) = move _2`, so a *nested source*
+                // into a whole temp, then a whole source into a nested destination).
                 //
-                // The source is still required to be a bare local (the helper refuses a
-                // source that is itself a projection). A nested-to-nested move (`o.i = o.j`)
-                // would need the source's own prefix re-rooted as well; that shape is not in
-                // the corpus, so it is left to the helper's refusal rather than guessed at.
-                if !dest.proj.is_empty() {
-                    if let Rvalue::Use(Operand::Copy(q) | Operand::Move(q)) = rv {
-                        st.env.copy_parts_under(q, dest);
+                // `copy_parts` in `eval_rvalue` handles only whole-to-whole, and a nested
+                // source is one it refuses, so this runs whenever *either* side is nested.
+                // It is done *after* `set` because the field arm of `set` forgets the nested
+                // paths beneath the destination -- correct, since they are stale -- and this
+                // is what puts the source's parts back. Without it the temp's `v` never lands
+                // under `_1.0`, and `(_1.0).0` reads `Unknown`.
+                if let Rvalue::Use(Operand::Copy(q) | Operand::Move(q)) = rv {
+                    if !q.proj.is_empty() || !dest.proj.is_empty() {
+                        st.env.rebase_parts(q, dest);
                     }
                 }
             }

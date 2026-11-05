@@ -5470,6 +5470,34 @@ pub fn whole_inner_write_through_a_mutable_reference_is_seen(o: &mut OuterBox) -
     o.i.v
 }
 
+/// A nested-to-nested move, `o.i = o.j`.
+///
+/// The first step is the *nested source* `(_1.1)` moved into a whole temp, the second a whole
+/// source into the nested destination `(_1.0)`. `copy_parts` refuses a nested source, so
+/// without the re-rooting the leaf reads `Unknown`. The precondition pins `o.i.v` to `7`, which
+/// the move overwrites with the source's `3` -- so the true `ret == 3` is the evidence the
+/// *source's* leaf arrived.
+/// requires: o.i.v == 7
+/// ensures: ret == 3
+pub fn whole_inner_move_carries_the_source_leaf(mut o: OuterBox) -> u8 {
+    o.j.v = 3;
+    o.i = o.j;
+    o.i.v
+}
+
+/// The false twin of [`whole_inner_move_carries_the_source_leaf`].
+///
+/// Same body, but the contract claims the *destination's* pre-move leaf survived. A model
+/// that kept `o.i.v`'s stale `7` instead of the source's `3` would prove this; it must be
+/// refuted, and the witness is `o.i.v` at its seeded `7` (the value the move replaced).
+/// requires: o.i.v == 7
+/// ensures: ret == 7
+pub fn whole_inner_move_is_not_the_stale_destination(mut o: OuterBox) -> u8 {
+    o.j.v = 3;
+    o.i = o.j;
+    o.i.v
+}
+
 /// The inner type of [`nested_tuple_projection_reads`].
 pub struct NestedPair { pub p: Pair }
 
