@@ -4571,10 +4571,19 @@ fn count_via_helper(_1: u8) -> u8 {
             i64::MIN as i128,
         ] {
             let (mn, mx) = (i64::MIN as i128, i64::MAX as i128);
-            // A bound derived the same way the implementation derives it, so the sweep
-            // covers the two values straddling it and the error a fencepost would make.
-            let lo = if c > 0 { mn.div_euclid(c) } else { mn / -c };
-            let hi = if c > 0 { mx / c } else { mx.div_euclid(c) };
+            // The *safe* interval `[lo, hi]` -- the `x` whose product with `c` stays in
+            // range -- derived here from the true interval, not from the implementation.
+            // `x * c` is monotone but decreasing for `c < 0`, so the two ends of the
+            // range swap: the low bound comes from `mx` and the high from `mn`. Deriving
+            // both from `mn` (as an earlier version did) put the probes on the *negative*
+            // side for every negative `c` and never straddled the positive transition at
+            // `2^63 / |c|`, which is the boundary the negative arm is most likely to get
+            // wrong. The probes below now bracket `lo` and `hi` on both signs.
+            let (lo, hi) = if c > 0 {
+                (ceil_div(mn, c), floor_div(mx, c))
+            } else {
+                (ceil_div(mx, c), floor_div(mn, c))
+            };
             let probes = [
                 mn,
                 mn + 1,

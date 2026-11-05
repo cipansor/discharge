@@ -725,6 +725,33 @@ Both directions are pinned: `exceeding_max_vars_reports_unknown_not_a_proof` and
 `a_query_within_max_vars_is_decided_normally`, so the guard cannot pass by answering `Unknown`
 to everything.
 
+## An oracle that sweeps the poles does not test the boundary
+
+`a_signed_constant_multiply_overflow_is_exact` checks the `i64` multiply-overflow
+predicate, whose whole reason to exist is the `w == 64` arithmetic that the small-width
+sweep cannot reach (`1i128 << 63`, the width mask). The `i64` sweep derived its probe
+points as `lo = mn / |c|` and `hi = mx / c` for *both* signs of `c`. That is right for
+`c > 0` and wrong for `c < 0`, where the product is decreasing and the safe interval
+runs from the negative bound to the *positive* transition at `2^63 / |c|`. Deriving both
+ends from `mn` put every negative-`c` probe near `-4.6e18` and never reached `+4.6e18`.
+
+The tell was not a failure -- it was a **pass**. The small-width sweep covers the same
+formula, so the test was green; what was untested was the 64-bit path specifically. To
+show the hole is real, mutate the implementation in a way that only `w == 64` can
+observe (`+ 1` guarded by `w >= 64` on the high bound) and run the test with the old
+probes: it **passes**. With the probes bracketing the true interval it fails on
+`4611686018427387905 * -2`, which is exactly the boundary. Two lessons:
+
+- **A width-specific test must fail on a width-specific mutation.** If a bug that only
+  `w == 64` can exhibit does not turn the `i64` sweep red, the sweep is decoration -- the
+  small-width loop is doing the work. Mutate, then confirm the red.
+- **Derive a probe bound from the true interval, never from the implementation.** The old
+  derivation was "the same way the implementation derives it", which is exactly backwards:
+  a bound copied from the code under test moves when the code moves, so it can never
+  straddle a fencepost the code got wrong. Here the two ends *swap* for `c < 0`, and the
+  honest derivation (`ceil_div(mx, c)` low, `floor_div(mn, c)` high) is what makes the
+  boundary visible.
+
 ## The evidence for a refutation is also a claim
 
 The ninth hole was in `Cex`: the model returned with a `Counterexample` verdict. It inlines 16
