@@ -3268,6 +3268,61 @@ pub fn substitute(p: Pred, bindings: &[(Var, Var)]) -> Pred {
     })
 }
 
+/// The most variables one precondition may pin to a constant.
+///
+/// `std`-only for the same reason as [`pinned_vars`]: its only caller is the MIR
+/// frontend, which is behind the feature.
+#[cfg(feature = "std")]
+pub(crate) const MAX_PINS: usize = 16;
+
+/// `(variable index, value)` for each conjunct of `p` that pins a variable to a
+/// constant: `v == k` or `k == v`, under any nesting of `&&`.
+///
+/// The caller seeds a pinned argument with its literal instead of a fresh symbolic
+/// input. That is *sound* -- every model of `p` has `v == k`, so evaluating the body
+/// at `v == k` leaves the obligation under `p` unchanged -- and it is what makes a
+/// query whose precondition pins a variable decidable. The body then builds its
+/// operations on a literal, and the constant folds collapse them; a symbolic operand
+/// instead builds the whole circuit and the query is refused for the size of its own
+/// diagram. `requires: a == -7` with the body `a / 3` is the motivating shape: the
+/// 64-bit restoring divider is a documented scaling wall, and the precondition says
+/// there is only one `a` to divide.
+///
+/// Only a *closed* right-hand side pins. `v == w` between two variables is not a pin
+/// -- it is a relation, and folding it would fix both -- so it is left alone.
+#[cfg(feature = "std")]
+pub(crate) fn pinned_vars(p: Pred, out: &mut [(u32, u64); MAX_PINS]) -> usize {
+    with_ctx(|c| {
+        let mut leaves = [Term(0); MAX_CONJ];
+        let n = c.op_leaves(Op::And, p.0, &mut leaves);
+        let mut memo = EvalMemo::new();
+        let mut count = 0usize;
+        for leaf in leaves[..n].iter() {
+            if count >= MAX_PINS {
+                break;
+            }
+            let node = c.node_of(*leaf);
+            if node.op != Op::Eq {
+                continue;
+            }
+            let (a, b) = (Term(node.a), Term(node.b));
+            let (na, nb) = (c.node_of(a), c.node_of(b));
+            // One side a variable, the other a closed term. A variable on *both*
+            // sides is a relation rather than a pin.
+            let (idx, other) = match (na.op, nb.op) {
+                (Op::Var, Op::Var) => continue,
+                (Op::Var, _) => (na.a, b),
+                (_, Op::Var) => (nb.a, a),
+                _ => continue,
+            };
+            let Some(k) = eval_term(c, other, &|_| None, &mut memo) else { continue };
+            out[count] = (idx, k);
+            count += 1;
+        }
+        count
+    })
+}
+
 #[cfg(test)]
 mod subst_tests {
     use super::*;
@@ -3360,6 +3415,106 @@ mod subst_tests {
             let p = and(eq_const(x, 1), eq_const(y, 2));
             let q = substitute(p, &[(x, word(1, 8)), (y, word(2, 8))]);
             assert_eq!(prove(q), Verdict::Valid);
+        });
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    fn pins(p: Pred) -> Vec<(u32, u64)> {
+        let mut buf = [(0u32, 0u64); MAX_PINS];
+        let n = pinned_vars(p, &mut buf);
+        buf[..n].to_vec()
+    }
+
+    /// `v == k` pins `v` to `k`, whichever side the constant is written on.
+    ///
+    /// The value is the *bit pattern*, not the signed number: `-7` at eight bits is
+    /// `249`. That is deliberate -- the caller masks it to the argument's width and
+    /// builds a literal from it, and `word(249, 8)` *is* `-7` at eight bits. A
+    /// signed value here would have to be re-signed at the caller's width, which is
+    /// exactly the width information this function does not have.
+    #[test]
+    fn an_equality_to_a_constant_pins_the_variable() {
+        with_fresh(|| {
+            let a = var_named(1, 8);
+            assert_eq!(pins(eq_const(a, 200)), vec![(1, 200)]);
+        });
+        // The constant on the left is the same pin.
+        with_fresh(|| {
+            let a = var_named(1, 8);
+            assert_eq!(pins(eq(word(200, 8), a)), vec![(1, 200)]);
+        });
+        // A negated literal, as the spec parser spells it: `0 - 7` at eight bits.
+        with_fresh(|| {
+            let a = var_named(1, 8);
+            let neg7 = sub(word(0, 8), word(7, 8));
+            assert_eq!(pins(eq(a, neg7)), vec![(1, 249)], "`-7` at eight bits is the bit pattern 249");
+        });
+    }
+
+    /// A relation between two variables is *not* a pin, and a non-equality is not
+    /// either.
+    ///
+    /// `v == w` fixes neither one on its own: seeding either with a literal would
+    /// discard the relation and could decide a query that the precondition does not
+    /// actually leave decided. The honest answer is no pin, which is what this
+    /// asserts -- the negative direction, without which a function that pinned every
+    /// `Eq` it saw would pass the test above.
+    #[test]
+    fn a_relation_between_two_variables_is_not_a_pin() {
+        with_fresh(|| {
+            let a = var_named(1, 8);
+            let b = var_named(2, 8);
+            assert!(pins(eq(a, b)).is_empty(), "`a == b` must not pin either side");
+        });
+        // `a < 200` constrains `a` without fixing it.
+        with_fresh(|| {
+            let a = var_named(1, 8);
+            assert!(pins(ult(a, word(200, 8))).is_empty(), "`a < 200` must not pin `a`");
+        });
+    }
+
+    /// The conjuncts are found under any nesting of `&&`, and a conjunct that is
+    /// itself a disjunction is *not* decomposed: `a == 1 || a == 2` leaves two
+    /// values, so it pins nothing.
+    #[test]
+    fn a_pin_is_found_through_conjunction_but_not_disjunction() {
+        with_fresh(|| {
+            let a = var_named(1, 8);
+            let b = var_named(2, 8);
+            let p = and(eq_const(a, 1), and(eq_const(b, 2), ult(a, word(9, 8))));
+            let mut got = pins(p);
+            got.sort_unstable();
+            assert_eq!(got, vec![(1, 1), (2, 2)], "both pins must be found under a nested `&&`");
+        });
+        with_fresh(|| {
+            let a = var_named(1, 8);
+            let p = or(eq_const(a, 1), eq_const(a, 2));
+            assert!(pins(p).is_empty(), "a disjunction of two values is not a pin");
+        });
+    }
+
+    /// The pin is *sound*: the query under the precondition is unchanged by
+    /// specialising the variable. `a == 5 && a / 2 == 2` holds for exactly one `a`,
+    /// and pinning `a := 5` must keep it `Valid` rather than change the answer.
+    #[test]
+    fn pinning_a_variable_preserves_the_query_under_its_precondition() {
+        with_fresh(|| {
+            let a = var_named(1, 8);
+            let pre = eq_const(a, 5);
+            let goal = eq(udiv(a, word(2, 8)), word(2, 8));
+            // Under `pre`, the goal holds. Substitute the pin and the closed formula
+            // is still `Valid` -- which is the property the executor relies on.
+            let pinned = substitute(goal, &[(a, word(5, 8))]);
+            assert_eq!(prove(pinned), Verdict::Valid);
+            // The *false* direction stays false, so the pin does not make anything true.
+            let bad = eq(udiv(a, word(2, 8)), word(3, 8));
+            let pinned_bad = substitute(bad, &[(a, word(5, 8))]);
+            assert_eq!(prove(pinned_bad), Verdict::Unsat);
+            let _ = pre;
         });
     }
 }

@@ -1357,6 +1357,13 @@ pub struct Seeds {
     /// contract names, so `m.Data` in a contract and `((_1 as Data).0)` in the
     /// body name one variable rather than two that look alike.
     pub payload_seeds: Vec<(u32, u64, Var, u8, bool)>,
+    /// `(local, value)` for each argument the precondition pins to a constant.
+    ///
+    /// The argument is seeded with the literal instead of a fresh symbolic input.
+    /// Sound -- every model of the precondition has the argument equal to it -- and
+    /// it is what lets a body whose only operand is pinned build its operations on a
+    /// literal, where the constant folds collapse them. See [`crate::smt::pinned_vars`].
+    pub pins: Vec<(u32, u64)>,
 }
 
 /// Verify one function from a parsed program.
@@ -1417,12 +1424,25 @@ where
     let mut env = Env::with_enums(&prog.enums);
     for &l in &f.arg_locals {
         let ty = f.ty_of(l).cloned().unwrap_or(Ty::Other("?".into()));
-        let v = match ty.width() {
-            Some(1) => Val::Bool(smt::var_named(l, 1).eq_val(1)),
+        // A pinned argument takes the literal the precondition fixes it to, so the
+        // body's operations fold instead of building a circuit over an input that
+        // has only one value. See [`crate::smt::pinned_vars`].
+        let pin = seeds.pins.iter().find(|(local, _)| *local == l).map(|(_, k)| *k);
+        let v = match (ty.width(), pin) {
+            (Some(w), Some(k)) => {
+                let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                let lit = smt::word(k & mask, w);
+                if w == 1 {
+                    Val::Bool(smt::truth(k & 1 != 0))
+                } else {
+                    Val::Sym(lit, Sign::of(&ty))
+                }
+            }
+            (Some(1), None) => Val::Bool(smt::var_named(l, 1).eq_val(1)),
             // The argument's own type declares its sign, so the value carries it
             // rather than a later site having to look it up.
-            Some(w) => Val::Sym(smt::var_named(l, w), Sign::of(&ty)),
-            None => Val::Unknown,
+            (Some(w), None) => Val::Sym(smt::var_named(l, w), Sign::of(&ty)),
+            (None, _) => Val::Unknown,
         };
         env.locals.insert(l, v);
         // A `&T` argument may be dereferenced: `Ty::Ref` is modelled as its
@@ -3613,6 +3633,30 @@ fn overflow_pred(op: BinOp, a: Val, b: Val, w: u8) -> Option<Pred> {
         // sign-extended product is built here, and the equality is what is
         // checked.
         BinOp::Mul => {
+            // Both operands constant: the product is a literal, so the overflow
+            // is a literal too. This arm is reachable only once an argument can
+            // be pinned to a constant by its precondition (`a == 3` with the body
+            // `a * 2`), which makes the *other* operand constant as well; rustc
+            // folds a genuinely constant body before the frontend sees it. Without
+            // this arm the pair fell through to the general path below, which has
+            // no sound predicate at `w == 64` and returned `None`, so a query whose
+            // every input was known came back `incomplete`.
+            let both = match (smt::evaluate(x, |_| None), smt::evaluate(y, |_| None)) {
+                (Some(xr), Some(yr)) => Some((xr, yr)),
+                _ => None,
+            };
+            if let Some((xr, yr)) = both {
+                let wraps = if signed {
+                    let p = as_signed(xr, w) * as_signed(yr, w);
+                    let (mn, mx) = signed_range(w);
+                    p < mn || p > mx
+                } else {
+                    let p = (xr as u128) * (yr as u128);
+                    let max = if w >= 64 { u64::MAX as u128 } else { (1u128 << w) - 1 };
+                    p > max
+                };
+                return Some(smt::truth(wraps));
+            }
             // A *constant* operand makes the test exact and cheap: `x * c` wraps,
             // for unsigned operands, exactly when `x > MAX / c`, and `MAX / c` is a
             // compile-time constant, so the whole predicate is one comparison --
@@ -4653,6 +4697,87 @@ fn count_via_helper(_1: u8) -> u8 {
             wraps(true, 8, 0xFF, 0x80),
             "MIN * -1 must wrap as signed: 2^(w-1) is not representable"
         );
+    }
+
+    /// A multiply with *both* operands constant is decided, and exactly.
+    ///
+    /// Both operands are literals only when the precondition pins the argument to a
+    /// constant (`a == 3` with the body `a * 2`), because rustc folds a genuinely
+    /// constant body itself. That shape used to fall through to the general signed
+    /// path, which has no sound predicate at `w == 64` and returned `None` -- so the
+    /// `assert(!overflow)` that follows was unmodelled and the whole query came back
+    /// `incomplete` even though every input was known. The oracle is `i128`, and the
+    /// negative constants are the interesting half because the product's sign follows
+    /// the *signs*, not the magnitudes.
+    #[test]
+    fn a_constant_times_a_constant_multiply_is_decided() {
+        // `overflow_pred` with both operands literal, at the width `w`.
+        let wraps = |signed: bool, w: u8, a: i128, b: i128| -> bool {
+            smt::with_fresh(|| {
+                let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                let sign = if signed { Sign::Signed } else { Sign::Unsigned };
+                let x = smt::word((a as u64) & mask, w);
+                let y = smt::word((b as u64) & mask, w);
+                let p = overflow_pred(BinOp::Mul, Val::Sym(x, sign), Val::Sym(y, sign), w)
+                    .expect("two constant operands must still produce a predicate");
+                smt::evaluate_pred(p, |_| None).expect("a constant predicate must be evaluable")
+            })
+        };
+
+        // Exhaustive at the small widths, both signs: every pair of values, against the
+        // true product. This is what pins the arms rather than a hand-picked few.
+        for w in [2u8, 3, 4, 5] {
+            let half = 1i128 << (w - 1);
+            let (mn, mx) = (-half, half - 1);
+            let umax = (1i128 << w) - 1;
+            for a in mn..=mx {
+                for b in mn..=mx {
+                    let want = a.checked_mul(b).is_none_or(|p| p < mn || p > mx);
+                    assert_eq!(
+                        wraps(true, w, a, b),
+                        want,
+                        "{w}-bit signed {a} * {b}: said {} but wrapping is {want}",
+                        wraps(true, w, a, b)
+                    );
+                }
+            }
+            for a in 0..=umax {
+                for b in 0..=umax {
+                    let want = (a as u128) * (b as u128) > umax as u128;
+                    assert_eq!(
+                        wraps(false, w, a, b),
+                        want,
+                        "{w}-bit unsigned {a} * {b}: said {} but wrapping is {want}",
+                        wraps(false, w, a, b)
+                    );
+                }
+            }
+        }
+
+        // `i64`, where the bug bit. The pairs straddle the representable boundary:
+        // `MIN * -1` is one past `MAX` and must wrap; `MIN * 1` and `-1 * -1` do not.
+        for (a, b) in [
+            (1i128, 1i128),
+            (i64::MAX as i128, 1),
+            (i64::MAX as i128, 2),
+            (i64::MIN as i128, 1),
+            (i64::MIN as i128, -1),
+            (-1, -1),
+            (-1, 1),
+            (1 << 31, 1 << 31),
+            (1 << 31, -(1 << 31)),
+            (i64::MIN as i128, i64::MIN as i128),
+            (0, i64::MIN as i128),
+        ] {
+            let (mn, mx) = (i64::MIN as i128, i64::MAX as i128);
+            let want = a.checked_mul(b).is_none_or(|p| p < mn || p > mx);
+            assert_eq!(
+                wraps(true, 64, a, b),
+                want,
+                "64-bit signed {a} * {b}: said {} but wrapping is {want}",
+                wraps(true, 64, a, b)
+            );
+        }
     }
 
     /// `overflow_pred` is *exact* for a constant multiply, checked exhaustively at

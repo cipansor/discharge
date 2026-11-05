@@ -441,6 +441,19 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         })
     };
 
+    // Arguments the precondition pins to a constant. The executor seeds those
+    // arguments with their literal, which is sound -- every model of `pre` has the
+    // argument equal to it -- and is what makes a body whose operand is pinned build
+    // its operations on a literal, where the constant folds collapse them. Without
+    // it a pinned 64-bit divider is built symbolically and the query is refused for
+    // the size of its own diagram even though the precondition leaves one input.
+    let mut pin_buf = [(0u32, 0u64); smt::MAX_PINS];
+    let n_pins = match pre {
+        Some(p) => smt::pinned_vars(p, &mut pin_buf),
+        None => 0,
+    };
+    let pins: Vec<(u32, u64)> = pin_buf[..n_pins].to_vec();
+
     let report = exec::verify_fn(
         prog,
         f,
@@ -456,6 +469,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
             elems: fields.elem_seeds.clone(),
             tags: fields.tag_seeds.clone(),
             payload_seeds: fields.payload_seeds.clone(),
+            pins,
         },
     );
 

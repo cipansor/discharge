@@ -5516,8 +5516,27 @@ pub fn a_signed_constant_division_by_a_negative_power_of_two_at_i64(a: i64) -> i
 /// `3` has no shift identity, so this stays on the general divider. It is the shape that
 /// used to overflow the stack rather than report: the fold-built term is deep, and the walk
 /// had no depth bound.
+///
+/// The precondition pins `a`, so the divider folds to a literal and the query is decided.
+/// [`a_symbolic_division_by_a_non_power_of_two_at_i64`] is the same body *without* the pin,
+/// which keeps the general divider built -- that one is the deep-walk vehicle.
 /// requires: a == -7
 /// ensures: ret == -2
 pub fn a_signed_division_by_a_non_power_of_two_at_i64(a: i64) -> i64 {
+    a / 3
+}
+
+/// The same general divider with a *symbolic* dividend, so the precondition does not pin
+/// `a` and the constant folds cannot collapse the division.
+///
+/// This is the deepest legitimate term walk in the corpus: the 64-bit restoring divider is
+/// a chain of adders and muxes ~262 terms deep, which no step budget sees. It is the shape
+/// that aborted the process before `MAX_WALK_DEPTH`, and it is the vehicle for
+/// `a_deep_term_walk_is_refused_not_allowed_to_overflow_the_stack`. The contract is false in
+/// general (`a / 3 == -2` only for some `a`), so a decided verdict is a counterexample and an
+/// undecided one is the refusal -- never `Verified`, and never a crash.
+/// requires: true
+/// ensures: ret == -2
+pub fn a_symbolic_division_by_a_non_power_of_two_at_i64(a: i64) -> i64 {
     a / 3
 }

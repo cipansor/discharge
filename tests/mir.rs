@@ -2231,21 +2231,37 @@ fn no_cannot_prove_entry_is_ever_verified() {
 /// (SIGABRT) instead of failing an assertion. The division-by-a-non-power-of-two shape is
 /// the deepest legitimate walk in the corpus; the assertion that it reports rather than
 /// panics is the whole point.
+///
+/// The deep walk needs a *symbolic* dividend: a precondition that pins the dividend folds
+/// the whole divider to a literal (see [`a_signed_division_by_a_non_power_of_two_at_i64`]),
+/// so the pinned shape no longer builds the deep term at all. The companion
+/// [`a_symbolic_division_by_a_non_power_of_two_at_i64`] keeps the dividend free and is the
+/// vehicle here.
 #[test]
 fn a_deep_term_walk_is_refused_not_allowed_to_overflow_the_stack() {
     let Some(report) = verify_realistic(&[
+        "a_symbolic_division_by_a_non_power_of_two_at_i64",
         "a_signed_division_by_a_non_power_of_two_at_i64",
         "a_signed_constant_division_at_i64",
     ]) else {
         return;
     };
-    // The non-power-of-two case is the one that used to crash. Either answer but
-    // `Verified` is acceptable -- the general divider is a documented scaling wall -- and
-    // the unacceptable one is a false proof. Reaching this assertion at all is the fix.
-    let deep = outcome(&report, "a_signed_division_by_a_non_power_of_two_at_i64");
+    // The symbolic case is the one that used to crash. Either answer but `Verified` is
+    // acceptable -- the general divider is a documented scaling wall -- and the
+    // unacceptable one is a false proof. Reaching this assertion at all is the fix.
+    let deep = outcome(&report, "a_symbolic_division_by_a_non_power_of_two_at_i64");
     assert!(
         !deep.is_verified(),
         "the general divider must not be reported verified: {deep}"
+    );
+    // The *pinned* shape is now decided: the precondition leaves one dividend, the fold
+    // collapses the divider to a literal, and the false contract is refuted. This is the
+    // positive evidence that the fold, not a tighter budget, is what closed it -- a depth
+    // bound that refused both shapes would pass the assertion above and be useless.
+    let pinned = outcome(&report, "a_signed_division_by_a_non_power_of_two_at_i64");
+    assert!(
+        pinned.is_verified(),
+        "the pinned divider must be decided by the fold, got: {pinned}"
     );
     // The power-of-two fast path is shallow and must still be *decided*, so the depth
     // bound cannot be so tight that it refuses the queries the engine already answers.

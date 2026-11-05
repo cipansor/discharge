@@ -223,12 +223,18 @@ that reaches the solver is a single constant instead of the circuit that compute
 it.
 
 The motivating measurement is the cleanest possible demonstration that the engine
-was refusing queries for their *size* rather than for anything unknown. Under
-`requires: a == -7`, the query `a / 3 == -2` at `i64` has **no symbolic input at
-all**, and it came back `Unknown` in ~1.1 s: the divider was blasted, walked, and
-refused before the constant was ever looked at. With the fold the same query is
-`Valid` in 0.000 s, and the term count drops from 660 to 5 -- the divider's whole
-circuit replaced by the two literals it computes.
+was refusing queries for their *size* rather than for anything unknown. A query
+whose operands are *all* literals -- `-7 / 3 == -2` at `i64` -- has **no symbolic
+input at all**, and it came back `Unknown` in ~1.1 s: the divider was blasted,
+walked, and refused before the constant was ever looked at. With the fold the same
+query is `Valid` in 0.000 s, and the term count drops from 660 to 5 -- the divider's
+whole circuit replaced by the two literals it computes.
+
+That is the fold's half of the story. The other half is getting the literals *into*
+the body at all: a frontend builds `a / 3` from the symbolic value of `a`, so under
+`requires: a == -7` the operands were a variable and a literal, not two literals,
+and the fold had nothing to fold. Seeding a pinned argument with its literal is what
+closes that gap; see the next section.
 
 Where the fold must *not* go, because each one silently breaks the frontend's
 literal-range bookkeeping -- these were regressions, caught by the corpus, not
@@ -257,6 +263,53 @@ is not a neutral optimisation -- it *merges* the two nodes.** When the frontend
 distinguishes two things by node identity rather than by value, a fold that erases
 the distinction is a wrong verdict. Fold where the frontend does not depend on the
 shape, and say why in the comment when you decline.
+
+## A pinned argument is seeded with its literal, so a body over it folds
+
+Folding (previous section) only reaches a query whose operands are literals, and a
+frontend builds an operation from the *symbolic* values of its operands. So a
+precondition that pins an argument -- `requires: a == -7` with the body `a / 3` --
+left the body building `sdiv(a, 3)` over a fresh variable, and the fold had nothing
+to fold: the `sdivmod` general path spells its magnitudes `0 - x`, the one
+subtraction the fold deliberately declines, so a symbolic `sdiv` never collapses.
+The pin was in `pre` and the fold was in the body, and nothing carried one to the
+other.
+
+`verify_fn` now seeds a pinned argument with the literal instead of a fresh
+variable, and `smt::pinned_vars` extracts the pins from `pre`. The rule is
+*closed* right-hand sides only: `v == k` (either operand order) under any nesting
+of `&&` pins `v := k`; `v == w` between two variables pins neither, because it is a
+relation and fixing either side would discard it. A disjunction of values (`a == 1
+|| a == 2`) pins nothing -- two values remain, and `op_leaves` walks `&&` only.
+
+Sound because the pin is a consequence of `pre`, not an assumption beside it:
+`pre` is assumed as the path condition, and `pre => goal` is unchanged when `goal`
+is specialised to a value every model of `pre` already fixes. The extraction is
+therefore *not* an extra assumption, and it cannot turn a false contract true --
+`a == 3` with the body `a * 2` and the claim `ret == 7` is still refuted (the corpus
+carries that false direction, `a_signed_constant_multiply_at_i64_cannot_prove_this`).
+
+Two things this exposed, both worth remembering:
+
+- **A latent hole in `overflow_pred` for `Mul`.** That predicate had an arm for one
+  constant operand (`x * c`), derived from the monotone bounds, but none for *both*
+  constant -- which rustc never produces itself, so the arm was unreachable until a
+  pin made the second operand a literal. The pair then fell through to the general
+  signed path, which has no sound predicate at `w == 64` and returns `None`, so the
+  `assert(!overflow)` was unmodelled and `a_signed_constant_multiply_at_i64` came
+  back `incomplete`. The fix is a both-constant arm that computes the exact product
+  and compares it against the range; it is checked exhaustively at 2..5 bits and at
+  `i64`'s boundary. **A new capability reaches code that was correct-by-vacuity: the
+  arm was sound but never asked, and only the pin asked it.**
+- **The deep-walk guard needs a symbolic dividend.** `MAX_WALK_DEPTH` exists because
+  `i64 / 3` builds a ~262-deep divider that aborts on a 2 MiB stack, and
+  `a_deep_term_walk_is_refused_not_allowed_to_overflow_the_stack` held it with the
+  pinned shape. Pinning folds that divider away, so the guard lost its vehicle: the
+  test now drives a *symbolic* companion
+  (`a_symbolic_division_by_a_non_power_of_two_at_i64`) and asserts the pinned shape
+  is `verified` -- the positive evidence that the fold, not a tighter budget, closed
+  it. **When a fix makes a query decidable, check what else used that query as a
+  stress vehicle.**
 
 ## The imperative layer (`wp.rs`) has three traps
 
