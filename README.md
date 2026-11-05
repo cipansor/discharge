@@ -1151,29 +1151,29 @@ $ DISCHARGE_RUSTC=$(rustup which --toolchain nightly rustc) \
     cargo run --features std --example mir_demo
 === examples/mir_targets/actuator.rs ===
 clamp            verified (3 obligation(s), 0 panic(s) ruled out)
-rate_limit       verified (5 obligation(s), 0 panic(s) ruled out)
-sat_add          verified (4 obligation(s), 0 panic(s) ruled out)
-sat_sub          verified (1 obligation(s), 0 panic(s) ruled out)
-shift_const      verified (1 obligation(s), 0 panic(s) ruled out)
+rate_limit       verified (5 obligation(s), 2 panic(s) ruled out)
+sat_add          verified (4 obligation(s), 2 panic(s) ruled out)
+sat_sub          verified (1 obligation(s), 1 panic(s) ruled out)
+shift_const      verified (1 obligation(s), 1 panic(s) ruled out)
 shift_left       FAILED: panic: attempt to shift left by `{}`, which would overflow — v2:u16 = 16
-sat_shift        verified (1 obligation(s), 0 panic(s) ruled out)
-sat_mul          incomplete (2 reason(s))
-      - unmodelled assert condition: attempt to compute `{} * {}`, which would overflow
+sat_shift        verified (1 obligation(s), 1 panic(s) ruled out)
+sat_mul          verified (3 obligation(s), 3 panic(s) ruled out)
 unchecked_add    FAILED: panic: attempt to compute `{} + {}`, which would overflow — v1:u16 = 32768, v2:u16 = 32768
 unchecked_sub    FAILED: panic: attempt to compute `{} - {}`, which would overflow — v1:u16 = 0, v2:u16 = 32768
 unchecked_div    FAILED: panic: attempt to divide `{}` by zero — v2:u32 = 0
 unchecked_mul    FAILED: panic: attempt to compute `{} * {}`, which would overflow — v1:u8 = 128, v2:u8 = 128
 off_by_one_guard FAILED: postcondition — v1:u16 = 32768, v2:u16 = 32768
 clamp_signed     verified (3 obligation(s), 0 panic(s) ruled out)
-checked_div_signed verified (3 obligation(s), 0 panic(s) ruled out)
+checked_div_signed verified (3 obligation(s), 2 panic(s) ruled out)
 unchecked_div_signed FAILED: panic: attempt to divide `{}` by zero — v2:u16 = 0
 signed_add_misguarded FAILED: panic: attempt to compute `{} + {}`, which would overflow — v1:u8 = 128, v2:u8 = 128
-signed_add_guarded verified (2 obligation(s), 0 panic(s) ruled out)
-signed_mul_guarded verified (2 obligation(s), 0 panic(s) ruled out)
+signed_add_guarded verified (2 obligation(s), 1 panic(s) ruled out)
+signed_mul_guarded verified (2 obligation(s), 1 panic(s) ruled out)
 signed_mul_negative FAILED: panic: attempt to compute `{} * {}`, which would overflow — v1:u8 = 128, v2:u8 = 128
-checked_neg      verified (2 obligation(s), 0 panic(s) ruled out)
+checked_neg      verified (2 obligation(s), 1 panic(s) ruled out)
 
-verified=11 failed=9 incomplete=1
+verified=12 failed=9 incomplete=0
+All expectations met.
 ```
 
 `unchecked_add` is `fn unchecked_add(a: u16, b: u16) -> u16 { a + b }` — ordinary
@@ -1544,16 +1544,24 @@ and `MulWithOverflow`, and `/` comes with a `assert(!(_6))` for a zero divisor. 
 `!` matters: rustc prints the failing polarity, and dropping it inverts every
 check. `tests/mir.rs` and the parser's unit tests pin that.
 
-Modelling overflow exactly needed a widened product, which exposed a fact worth
-writing down: **`smt::truncate` zero-extends when the target is wider.** `a * b`
-at `u16` is computed at 32 bits and tested against `2^16`, so the predicate is
-exact rather than approximate. Division needed something the engine did not have,
-so `smt::divmod` builds a restoring divider out of shifts, subtract, compare and
-select. It is exact — `tests/divmod.rs` checks it against Rust's own `/` and `%`
-at every interesting boundary and proves `(x / y) * y + x % y == x` and
-`x % y < y` symbolically. `y == 0` is given a *defined* value (quotient all ones,
-remainder the dividend) rather than being left as a hole, and rustc's own
-divide-by-zero assert is what turns that case into a reported panic.
+Modelling overflow exactly needed a widened product for the *signed* case, which
+exposed a fact worth writing down: **`smt::truncate` zero-extends when the target
+is wider.** A signed `a * b` at `u16` is computed at 32 bits and compared with the
+sign-extension of the wrapped result, so the predicate is exact rather than
+approximate. The *unsigned* test is exact *without* widening, because
+`x * y > MAX` iff `y != 0 && x > floor(MAX / y)`: the restoring divider decides it,
+no `2w`-bit multiplier is built, and the form matches the guard a saturating
+multiply is written with. That is what turned `sat_mul` from `incomplete` into
+`verified` — the guard and the overflow test become structurally identical terms, so
+the boolean fold collapses `guard && !guard` to `false` before the divider is ever
+blasted (see the note on the multiply-overflow predicate below). Division needed
+something the engine did not have, so `smt::divmod` builds a restoring divider out
+of shifts, subtract, compare and select. It is exact — `tests/divmod.rs` checks it
+against Rust's own `/` and `%` at every interesting boundary and proves
+`(x / y) * y + x % y == x` and `x % y < y` symbolically. `y == 0` is given a
+*defined* value (quotient all ones, remainder the dividend) rather than being left
+as a hole, and rustc's own divide-by-zero assert is what turns that case into a
+reported panic.
 
 A *variable* shift amount needed two things that turned out to be one. The engine
 gained `smt::shift_var`, a barrel shifter of `log2(w)` conditional stages, so
@@ -1622,8 +1630,12 @@ The frontend refuses far more than it accepts, and every refusal is reported:
 
 - **MIR it cannot parse.** An unrecognized statement becomes `Unknown`, which
   makes the path "not modelled", never "proved".
-- **Widened products past 16 bits.** `sat_mul` at `u16` needs a 32-bit product,
-  which is the BDD scaling wall. The honest answer is `incomplete`.
+- **A signed multiply whose overflow test needs a `2w`-bit product past 16 bits.**
+  For a signed non-constant multiply at `w > 8` the predicate is about the
+  sign-extended product, and there is no division form that is exact for every
+  combination of the three signs, so the path is reported `incomplete`. The
+  *unsigned* multiply no longer lands here: its test is the exact division form
+  (`y != 0 && x > MAX / y`), which needs no widening and works at `u64`.
 - **`core::num` operations other than the modelled families.** `checked_*`,
   `saturating_*` and `wrapping_*` for `add`/`sub`/`mul`/`div`/`rem` and the
   bitwise ops are computed from their operands (see below). Every other

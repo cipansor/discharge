@@ -75,8 +75,8 @@ lowers it to. Five facts about it cost the most time to discover:
    from `_3` gives 64 for every type, which silently mis-sizes the overflow test.
    The width comes from `_3.0`.
 4. **`smt::truncate` zero-extends when the target is wider.** That is what makes
-   the multiplication-overflow predicate exact: compute at `2w`, test the top
-   `w` bits against zero.
+   the *signed* multiplication-overflow predicate exact: compute at `2w`, test the
+   top `w` bits. The unsigned case no longer widens at all -- see below.
 5. **The output path matters.** `-o /dev/stdout` makes rustc try to create a temp
    directory in `/dev` and fail; the MIR goes to a unique temp file. The name must
    be unique per *call*, not per process, or parallel tests delete each other's
@@ -95,18 +95,18 @@ Three engine consequences worth remembering:
   multiplier does not. An out-of-range amount has a defined value (zero, or sign
   fill for an arithmetic right shift), matching the shift-count-masking choice the
   differential oracle already pins.
-- **Widened products past 16 bits are declined, not approximated.** `sat_mul` at
-  `u16` needs a 32-bit product, which is the BDD wall. A *weaker* overflow
-  predicate would be worse than declining, because it would make an overflowing
-  function look panic-free. So the code returns "no predicate" and the path is
-  reported `incomplete`.
+- **Widened products past 16 bits are declined, not approximated -- for the *signed*
+  case.** A signed non-constant multiply at `w > 8` needs a `2w`-bit product, which
+  is the BDD wall, and a *weaker* overflow predicate would be worse than declining,
+  because it would make an overflowing function look panic-free. So the code returns
+  "no predicate" and the path is reported `incomplete`.
   This was measured rather than assumed. The engine does have a SAT fallback for
   when the arena fills, so the tempting fix is to raise the width and let the
   fallback take it. Raising the threshold from 16 to 32 does not reach the
-  fallback: `mir_demo` on `sat_mul` then runs past 300 s and has to be killed,
-  because the cost is in *building* the 32-bit diagram, before the arena ever
-  fills. The threshold is a time guard, and 16 is where it sits. If you raise it,
-  time the demo rather than trusting the fallback's existence.
+  fallback: `mir_demo` on a widening multiply then runs past 300 s and has to be
+  killed, because the cost is in *building* the 32-bit diagram, before the arena
+  ever fills. The threshold is a time guard, and 16 is where it sits. If you raise
+  it, time the demo rather than trusting the fallback's existence.
 
 - **Signedness is part of the *value*, not a display detail.** The engine's
   arithmetic is bit-vector arithmetic, so every operation has one bit-pattern
@@ -128,6 +128,63 @@ Three engine consequences worth remembering:
     sign-extended product equals the sign-extension of the wrapped result.
     `smt::sign_extend` exists for exactly this, because `truncate` zero-fills and
     a zero-extended `-1` has the wrong magnitude.
+
+## The unsigned multiply-overflow test is exact *division*, not a widened product
+
+`sat_mul` (`if b != 0 && a > u16::MAX / b { u16::MAX } else { a * b }`) used to be the
+corpus's one `incomplete`. It is now `verified`, and the two changes that got it there
+are worth keeping apart because they fix different halves of the same query.
+
+**1. The predicate is `y != 0 && x > MAX / y`, not a `2w`-bit product.** For unsigned
+operands this is *exact*, not a sufficient condition: for `y != 0`, `x * y > MAX` iff
+`x > floor(MAX / y)`, and `y == 0` can never wrap. It costs the restoring divider
+(`smt::divmod`) the engine already has, and no `2w`-bit multiplier -- so the BDD wall
+the old comment describes is never built. It also works at `w == 64`, where there is no
+width left to widen to and the old path could not produce a predicate at all. The signed
+case still widens and still refuses past 16 bits: its predicate is about the
+sign-extended product, and there is no division form that is exact for every combination
+of the three signs.
+
+The form is deliberately the one the guard in the saturation idiom is written in
+(`if b != 0 && a > MAX / b`), in the same operand order, so the two terms are
+*structurally identical*. That is what the second change exploits.
+
+**2. The boolean fold cancels through the `&&`/`||` spine.** `smt::bin_bool` folds the
+boolean identities at construction (`p && !p == false`, `p && true == p`, `!!p == p`, and
+the `Or`/`Xor` duals), and `Ctx::cancel_through_spine` extends the cancellation to a
+`p`/`!p` pair that sits anywhere in the operands' `&&` spines rather than at their roots.
+
+That second part is what the query actually needed, and the measurement is unambiguous.
+The path into the multiply is the conjunction `b == 0 && a <= MAX / b`; the overflow
+obligation is `b != 0 && a > MAX / b`. The conjuncts cancel pairwise, but *across* the two
+spines, so a root-only identity check does not see it. Without the fold the bit-blaster
+expands the 16-bit divider inside both terms before any solver sees the contradiction:
+
+- `find_model(path && over)` at `u16`, spine fold absent: `Unknown` in ~0.49 s.
+- the same query with the fold: `Unsat` in ~25 µs.
+
+The time is the point: the verdict is not just faster, it *exists*, because the divider
+is never blasted. A standalone `find_model(over)` at `u16` is still `Unknown` (the divider
+alone is the wall), so this is not "the divider got cheap" -- it is "the contradiction is
+found before the divider is reached".
+
+Guards on the fold, because each one is a way to be wrong rather than slow:
+
+- **Both widths of `!!p == p` must be 1.** A comparison node carries the *operand* width
+  (`Op::Eq` on two `u32` has width 32) even though it denotes one bit, so returning its
+  child where a predicate belongs hands back a wide term. A later `require_same_width`
+  then marks the arena ill-formed and turns a decidable query into `Unknown` -- which is
+  exactly what happened, and it is why `the_contract_reader_agrees_with_rustc_on_a_grid`
+  caught it (`8 / 4 / 2` at `u32`).
+- **`op_leaves` is iterative and capped** (`MAX_CONJ`). A path condition is as deep as the
+  path is long, so a recursive walk would be the same stack risk `MAX_WALK_DEPTH` exists
+  to bound. Truncating at the cap only *misses* cancellations, never invents one: a leaf
+  left undecomposed is still entailed by the tree it came from.
+- **The cancellation is soundness-neutral.** Every fold here rewrites a predicate to one
+  *equivalent* to it (`p && !p` really is false), so it can turn `Unknown` into a verdict
+  but never a `Valid` into a `Counterexample` or the reverse. That is why the width guard
+  above is a *correctness* fix and not a soundness one, and why the fold needs no new
+  oracle: the differential oracles already pin the semantics it must preserve.
 
 Three traps that cost time here, all in the frontend rather than the engine:
 

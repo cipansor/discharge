@@ -583,18 +583,25 @@ fn verified_functions_do_not_panic_concretely() {
 }
 
 #[test]
-fn sat_mul_is_reported_incomplete_not_verified() {
+fn sat_mul_is_verified_by_the_exact_division_overflow_test() {
     let Some(report) = verify_all() else { return };
     let o = outcome(&report, "sat_mul");
-    // The widened 32-bit product is the documented BDD scaling wall. The one
-    // unacceptable answer is `Verified`, because the check was not completed.
+    // `sat_mul` guards `a * b` with `b != 0 && a > u16::MAX / b`. That guard *is* the
+    // exact unsigned multiply-overflow predicate, so the path into the multiply
+    // refutes the overflow obligation -- no 32-bit product is built, and the widened
+    // product that used to be the documented BDD wall is never posed.
+    //
+    // This was `Incomplete` before, for a reason worth keeping visible: the predicate
+    // used to be `x > MAX / c` only for a *constant* operand, and the general path
+    // widened to `2w` bits and refused past 16. The two obligations were then
+    // `b == 0 && a <= MAX / b` (path) against `b != 0 && a > MAX / b` (overflow), which
+    // cancel pairwise but only *across* two `&&` spines -- so the boolean fold has to
+    // see through the spines for the query to close. Both halves are what this test
+    // pins: the exact division predicate, and the spine-aware cancellation that lets it
+    // fold against the guard.
     assert!(
-        !o.is_verified(),
-        "sat_mul must not be reported verified when the engine declined: {o}"
-    );
-    assert!(
-        matches!(o, FnOutcome::Incomplete { .. }),
-        "sat_mul should be incomplete, got: {o}"
+        o.is_verified(),
+        "sat_mul must be verified now that the multiply-overflow test is exact: {o}"
     );
 }
 

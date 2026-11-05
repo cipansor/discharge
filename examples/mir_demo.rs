@@ -24,9 +24,10 @@ const TARGET: &str = "examples/mir_targets/actuator.rs";
 ///
 /// `Incomplete` is a first-class expectation, not a failure of the demo. It is
 /// what an honest bounded checker returns when the query is beyond its engine,
-/// and saying so is the point: `sat_mul` at `u16` needs a 32-bit product, which
-/// is the BDD scaling wall this crate documents, so the right answer is "I could
-/// not decide" rather than a guess in either direction.
+/// and saying so is the point. `sat_mul` used to be the example of that -- its
+/// `u16` guard is a statement about a 32-bit product -- but the multiply-overflow
+/// test is now the exact division form (`y != 0 && x > MAX / y`), which the
+/// divider decides and which folds against the guard, so it is `Verified`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Expect {
     Verified,
@@ -47,8 +48,10 @@ pub fn expectations() -> [(&'static str, Expect); 21] {
         // reports `n == 16` as a panic, so this must fail.
         ("shift_left", Failed),
         ("sat_shift", Verified),
-        // The widened product is past the wall; declining is correct here.
-        ("sat_mul", Incomplete),
+        // The guard is `b != 0 && a > u16::MAX / b`, which *is* the exact unsigned
+        // multiply-overflow predicate, so the path into `a * b` refutes the overflow
+        // obligation without the 32-bit product ever being built.
+        ("sat_mul", Verified),
         ("unchecked_add", Failed),
         ("unchecked_sub", Failed),
         ("unchecked_div", Failed),

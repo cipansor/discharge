@@ -93,6 +93,15 @@ pub(crate) const MAX_APPLY_STEPS: u32 = 1 << 19;
 /// `Unknown` -- sound, and it *returns*.
 pub(crate) const MAX_WALK_DEPTH: u32 = 192;
 
+/// How many leaves of an `And`/`Or` spine the structural cancellation in
+/// [`Ctx::cancel_through_spine`] inspects.
+///
+/// A path condition is a left-nested chain, so the conjunct that cancels a later term
+/// can sit deeper than the root; walking the spine is what reaches it. The cap keeps the
+/// check O(1) per connective -- it is on the construction path of every `and`/`or`, so it
+/// has to be cheap -- and truncating it only *misses* cancellations, never invents one.
+pub(crate) const MAX_CONJ: usize = 16;
+
 /// Worst-case arena memory in bytes, so an integrator can budget statically.
 pub const ARENA_BYTES: usize =
     CAP * (core::mem::size_of::<Node>() + 2 * core::mem::size_of::<u32>());
@@ -1053,8 +1062,156 @@ impl Ctx {
         self.mk_term(Node { op, a: a.0, b: b.0, c: 0, width: w, hi: 0 })
     }
 
+    /// The leaves of an associative `op` tree, iteratively and with a cap.
+    ///
+    /// A leaf is `t` itself when its root is not `op`; otherwise the union of its operands'
+    /// leaves. The walk is iterative because a path condition is as deep as the path is
+    /// long, and a recursive walk over it would be the same stack risk that
+    /// [`MAX_WALK_DEPTH`] exists to bound. Leaving an `op` node undecomposed at the cap is
+    /// sound for the caller: the node is still entailed by the tree it came from, so a
+    /// cancellation found through it is a real one.
+    fn op_leaves(&mut self, op: Op, t: Term, out: &mut [Term; MAX_CONJ]) -> usize {
+        let mut n = 0usize;
+        let mut stack = [Term(0); MAX_CONJ];
+        let mut sp = 1usize;
+        stack[0] = t;
+        while sp > 0 && n < MAX_CONJ {
+            sp -= 1;
+            let cur = stack[sp];
+            let node = self.node_of(cur);
+            if node.op == op && node.width == 1 && sp + 2 <= MAX_CONJ {
+                stack[sp] = Term(node.a);
+                sp += 1;
+                stack[sp] = Term(node.b);
+                sp += 1;
+            } else {
+                out[n] = cur;
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// `Some(constant)` when `op(a, b)` is decided by a cancellation through the operands'
+    /// spines: each side contributes a leaf `x` and `!x`, which makes `And` false and `Or`
+    /// true. `None` when no such pair exists.
+    ///
+    /// This is what a path condition needs and a top-level identity check cannot give. The
+    /// `sat_mul` shape is the example: the path into the multiply is `b == 0 && a <= MAX / b`
+    /// and the overflow test is `b != 0 && a > MAX / b`, so the conjuncts cancel pairwise --
+    /// but they cancel *across* two spines, not at either root. Without the fold the
+    /// bit-blaster expands the divider inside both terms before any solver sees the
+    /// contradiction, and the query has no verdict.
+    ///
+    /// `!x` is a `Not` node whose child is `x`, so a cancellation is a `Not` leaf on one side
+    /// whose child is a leaf on the other. Reading it that way avoids building a `Not` per
+    /// leaf just to test for one.
+    fn cancel_through_spine(&mut self, op: Op, a: Term, b: Term) -> Option<Term> {
+        let mut left = [Term(0); MAX_CONJ];
+        let mut right = [Term(0); MAX_CONJ];
+        let ln = self.op_leaves(op, a, &mut left);
+        let rn = self.op_leaves(op, b, &mut right);
+        let child_of_not = |me: &mut Self, t: Term| -> Option<u32> {
+            let n = me.node_of(t);
+            if n.op == Op::Not && n.width == 1 { Some(n.a) } else { None }
+        };
+        for l in left.iter().take(ln) {
+            if let Some(child) = child_of_not(self, *l) {
+                if right[..rn].iter().any(|r| r.0 == child) {
+                    return Some(self.konst((op == Op::Or) as u64, 1));
+                }
+            }
+        }
+        for r in right.iter().take(rn) {
+            if let Some(child) = child_of_not(self, *r) {
+                if left[..ln].iter().any(|l| l.0 == child) {
+                    return Some(self.konst((op == Op::Or) as u64, 1));
+                }
+            }
+        }
+        None
+    }
+
     /// Boolean op (result width = 1).
     fn bin_bool(&mut self, op: Op, a: Term, b: Term) -> Term {
+        // Structural simplification, before any node is created. These are the
+        // boolean-algebra identities, and they are not a micro-optimisation: a
+        // contradiction such as `p && !p` *is* a literal false, but without the
+        // fold the bit-blaster expands both copies of `p` first, and when `p`
+        // contains a wide divider the diagram blows up before the SAT engine ever
+        // sees the false literal. The `udiv`-guarded saturation idiom
+        // (`if b != 0 && a > MAX / b`) is exactly that shape -- its guard is the
+        // unsigned multiply-overflow predicate -- so the missing fold cost a whole
+        // class of queries a verdict.
+        let na = self.node_of(a);
+        let nb = self.node_of(b);
+        let konst = |n: Node| -> Option<u64> {
+            if n.op == Op::Const && n.width == 1 { Some(n.a as u64) } else { None }
+        };
+        let is_not_of = |n: Node, t: Term| n.op == Op::Not && n.width == 1 && n.a == t.0;
+        match op {
+            Op::And => {
+                if konst(na) == Some(0) || konst(nb) == Some(0) {
+                    return self.konst(0, 1);
+                }
+                if konst(na) == Some(1) {
+                    return b;
+                }
+                if konst(nb) == Some(1) {
+                    return a;
+                }
+                if a.0 == b.0 {
+                    return a;
+                }
+                if is_not_of(nb, a) || is_not_of(na, b) {
+                    return self.konst(0, 1);
+                }
+            }
+            Op::Or => {
+                if konst(na) == Some(1) || konst(nb) == Some(1) {
+                    return self.konst(1, 1);
+                }
+                if konst(na) == Some(0) {
+                    return b;
+                }
+                if konst(nb) == Some(0) {
+                    return a;
+                }
+                if a.0 == b.0 {
+                    return a;
+                }
+                if is_not_of(nb, a) || is_not_of(na, b) {
+                    return self.konst(1, 1);
+                }
+            }
+            Op::Xor => {
+                if konst(na) == Some(0) {
+                    return b;
+                }
+                if konst(nb) == Some(0) {
+                    return a;
+                }
+                if a.0 == b.0 {
+                    return self.konst(0, 1);
+                }
+                if is_not_of(nb, a) || is_not_of(na, b) {
+                    return self.konst(1, 1);
+                }
+                // `p ^ 1` is `!p`.
+                if konst(na) == Some(1) {
+                    return self.un_bool(Op::Not, b);
+                }
+                if konst(nb) == Some(1) {
+                    return self.un_bool(Op::Not, a);
+                }
+            }
+            _ => {}
+        }
+        if matches!(op, Op::And | Op::Or) {
+            if let Some(k) = self.cancel_through_spine(op, a, b) {
+                return k;
+            }
+        }
         self.mk_term(Node { op, a: a.0, b: b.0, c: 0, width: 1, hi: 0 })
     }
 
@@ -1071,6 +1228,22 @@ impl Ctx {
     }
 
     fn un_bool(&mut self, op: Op, a: Term) -> Term {
+        if op == Op::Not {
+            let n = self.node_of(a);
+            // `!!p == p`. Both widths have to be 1. The inner `Not` is 1-bit by
+            // construction, but its *child* need not be: a comparison node carries the
+            // operand width (`Op::Eq` on two `u32` has width 32) even though it denotes a
+            // single bit. Returning that child would hand the caller a wide term where a
+            // predicate belongs, and a later `require_same_width` then marks the arena
+            // ill-formed -- which turns a decidable query into `Unknown`.
+            if n.op == Op::Not && n.width == 1 && self.width_of(Term(n.a)) == 1 {
+                return Term(n.a);
+            }
+            // `!0 == 1`, `!1 == 0`.
+            if n.op == Op::Const && n.width == 1 {
+                return self.konst((n.a as u64) ^ 1, 1);
+            }
+        }
         self.mk_term(Node { op, a: a.0, b: 0, c: 0, width: 1, hi: 0 })
     }
 
@@ -3174,5 +3347,69 @@ mod generation_tests {
                 assert_eq!(prove(eq(c, c)), Verdict::Valid, "word(1, {w}) must hold");
             });
         }
+    }
+
+    /// The boolean identities are folded at construction, and the two that matter most
+    /// are the ones a *path condition* needs.
+    ///
+    /// A contradiction has to become a literal `false` before the bit-blaster runs. If it
+    /// does not, both copies of the operand are expanded first, and when the operand
+    /// contains a wide divider the diagram blows up before any solver sees the false
+    /// literal -- which is how the `u16` saturating multiply stayed undecided.
+    #[test]
+    fn boolean_identities_fold_at_construction() {
+        with_fresh(|| {
+            let p = ult(var(8), word(5, 8));
+            // `p && !p` is `false`, and `p || !p` is `true`, at the root.
+            assert_eq!(prove(and(p, not(p))), Verdict::Unsat);
+            assert_eq!(prove(or(p, not(p))), Verdict::Valid);
+            // The same with the two operands built independently: hash-consing returns the
+            // same handle, so this is the same term, and the fold must not be matching a
+            // handle by accident.
+            let q = || ult(var_named(0, 8), word(5, 8));
+            assert_eq!(prove(and(q(), not(q()))), Verdict::Unsat);
+            // `!!p == p`, and the fold must not turn a predicate into a wide term: a
+            // comparison node carries the operand width, so the width check is what keeps
+            // the arena well-formed.
+            assert_eq!(prove_equiv(p, not(not(p))), Verdict::Valid);
+            assert!(!is_ill_formed(), "the double-negation fold must not change a width");
+            // Constants.
+            assert_eq!(prove_equiv(and(truth(true), p), p), Verdict::Valid);
+            assert_eq!(prove(not(truth(true))), Verdict::Unsat);
+        });
+    }
+
+    /// Cancellation through the `&&`/`||` spine, which is what a path condition needs.
+    ///
+    /// The `sat_mul` shape: the path into the multiply is the conjunction
+    /// `b == 0 && a <= MAX / b` and the overflow test is `b != 0 && a > MAX / b`. The
+    /// conjuncts cancel pairwise, but across two `&&` spines rather than at either root --
+    /// so a top-level identity check misses it, and the divider inside both terms is
+    /// blasted before any solver sees the contradiction.
+    #[test]
+    fn a_path_contradiction_cancels_through_the_spine() {
+        with_fresh(|| {
+            let w = 16u8;
+            let a = var(w);
+            let b = var(w);
+            let max = word((1u64 << w) - 1, w);
+            let zero = word(0, w);
+            // The exact unsigned multiply-overflow predicate, as `exec::overflow_pred`
+            // builds it: `b != 0 && a > MAX / b`.
+            let over = and(not(eq(b, zero)), ult(udiv(max, b), a));
+            // The path that reaches the multiply when the guard does not fire. This is the
+            // conjunction rustc's two `switchInt`s leave on the path: `b == 0` from the
+            // first, `!(a > MAX / b)` from the second.
+            let path = and(eq(b, zero), not(ult(udiv(max, b), a)));
+            // `path && over` is unsatisfiable, and it has to be decided without the
+            // 16-bit divider ever being blasted -- which is exactly what the spine
+            // cancellation buys. If the fold were missing this would come back `Unknown`
+            // after expanding both dividers, not `Unsat`.
+            assert_eq!(
+                find_model(and(path, over)),
+                Verdict::Unsat,
+                "the guard and its negation must cancel across the spine"
+            );
+        });
     }
 }

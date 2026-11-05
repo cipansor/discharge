@@ -3592,13 +3592,17 @@ fn overflow_pred(op: BinOp, a: Val, b: Val, w: u8) -> Option<Pred> {
         BinOp::Sub => smt::ult(x, y),
         // `x * y` wraps exactly when the exact product needs more than `w` bits.
         //
-        // The engine has no wide multiplication, so the high half is computed by
-        // widening: `smt::truncate` zero-extends when the target width is larger,
-        // so the operands are widened to `2w`, multiplied exactly there, and the
-        // overflow test is `>= 2^w`. That is exact rather than a sufficient
-        // condition, which matters because a too-weak predicate here would make
-        // the `assert` look dischargeable and report an overflowing function as
-        // panic-free.
+        // The two signs need different tests, and only the signed one widens.
+        // Unsigned `x * y` wraps exactly when `y != 0 && x > MAX / y`, which is a
+        // division and needs no wide product at all -- see the arm below. The
+        // *signed* predicate is about the sign-extended product, and there is no
+        // division form that is exact for every combination of the three signs, so
+        // it is computed by widening: `smt::truncate` zero-extends when the target
+        // width is larger, so the operands are widened to `2w`, multiplied exactly
+        // there, and compared with the sign-extension of the wrapped result. Either
+        // way the test is exact rather than a sufficient condition, which matters
+        // because a too-weak predicate here would make the `assert` look
+        // dischargeable and report an overflowing function as panic-free.
         //
         // Widening is where signedness matters, and the direction is worth being
         // exact about. rustc computes the *sign-extended* product and then tests
@@ -3609,17 +3613,16 @@ fn overflow_pred(op: BinOp, a: Val, b: Val, w: u8) -> Option<Pred> {
         // sign-extended product is built here, and the equality is what is
         // checked.
         BinOp::Mul => {
-            // A *constant* operand makes the test exact and cheap without a
-            // `2w`-bit multiplier: `x * c` wraps, for unsigned operands, exactly
-            // when `x > MAX / c`, and `MAX / c` is a compile-time constant, so the
-            // whole predicate is one comparison. `i * 4` -- an index scaled by an
-            // element size -- is the common shape and is usually `usize`/`u32`,
-            // which is precisely what the general path below refuses past 16 bits.
+            // A *constant* operand makes the test exact and cheap: `x * c` wraps,
+            // for unsigned operands, exactly when `x > MAX / c`, and `MAX / c` is a
+            // compile-time constant, so the whole predicate is one comparison --
+            // no divider and no `2w`-bit multiplier. `i * 4` -- an index scaled by
+            // an element size -- is the common shape.
             //
             // Unsigned only. The signed case has one case per combination of the
             // three signs, and a predicate that is too weak there is a false proof
-            // rather than a refusal, so it keeps the general path rather than
-            // taking on that risk for this payoff.
+            // rather than a refusal, so it takes `signed_mul_wraps_at` rather than
+            // this comparison.
             let const_side = match (smt::evaluate(x, |_| None), smt::evaluate(y, |_| None)) {
                 // `(v, k)`: the non-constant operand and the constant one.
                 (Some(_), None) => Some((y, x)),
@@ -3644,48 +3647,55 @@ fn overflow_pred(op: BinOp, a: Val, b: Val, w: u8) -> Option<Pred> {
                 // reason a scaled index in signed code stayed `incomplete`.
                 return Some(signed_mul_wraps_at(v, as_signed(raw, w), w));
             }
+            // Non-constant operands, unsigned. `x * y` wraps exactly when
+            // `y != 0 && x > MAX / y`, and the division is *exact* rather than
+            // sufficient: for `y != 0`, `x * y > MAX` iff `x > floor(MAX / y)`, and
+            // `y == 0` can never wrap. No `2w`-bit product is built, so this costs
+            // the divider the engine already has rather than the multiplier that is
+            // the BDD scaling wall -- and it works at `w == 64`, where there is no
+            // width left to widen to and the widened test below cannot exist at all.
+            //
+            // The shape is deliberately the one the guard in the saturation idiom is
+            // written in (`if b != 0 && a > MAX / b`), in the same operand order, so
+            // the two terms are structurally identical. That is what lets the boolean
+            // fold in `smt::bin_bool` collapse `guard && !guard` to `false` without
+            // ever blasting the divider: the difference between a verdict and
+            // `Unknown` for a `u16` saturating multiply, whose guard is exactly this
+            // predicate.
+            if !signed {
+                let max = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                let nonzero = smt::not(smt::eq(y, smt::word(0, w)));
+                let over = smt::ult(smt::udiv(smt::word(max, w), y), x);
+                return Some(smt::and(nonzero, over));
+            }
             let wide = w.saturating_mul(2).min(64);
             if wide <= w {
-                // At the widest supported width there is nowhere to widen to, so
-                // no sound predicate is available.
+                // Signed at the widest supported width: the sign-extended product
+                // needs `2w` bits and there is nowhere to put them, so no sound
+                // predicate is available.
                 return None;
             }
-            // The widened product is a BDD-hostile shape: a `2w`-bit multiplier
-            // is the scaling wall this crate documents. Past 16 bits the query
-            // is not worth posing, so no predicate is produced and the path is
-            // reported unknown. That is the deliberate trade -- a verifier that
-            // declines is better than one that hangs, and a *weaker* predicate
-            // here would be worse than either, because it would make an
-            // overflowing function look panic-free.
-            // The widening is the BDD wall, but a *constant* operand makes both the
-            // exact product and the wrapped one a sum of shifts rather than a
-            // `2w`-bit schoolbook multiply (`blast`'s `Op::Mul` arm), so the cost
-            // that motivated this bound is not paid and the test can run at the full
-            // width. Without this the *signed* `i * 4` stayed `incomplete` at every
-            // width past 16 even though the unsigned one was decided.
-            let constant_operand = smt::const_of(x).is_some() || smt::const_of(y).is_some();
-            if wide > 16 && !constant_operand {
+            // Signed, non-constant. The widened product is a BDD-hostile shape -- a
+            // `2w`-bit multiplier is the scaling wall this crate documents -- so past
+            // 16 bits the query is not worth posing. A verifier that declines is
+            // better than one that hangs, and a *weaker* predicate here would be worse
+            // than either, because it would make an overflowing function look
+            // panic-free. (An unsigned operand no longer takes this path: the exact
+            // division test above replaces the widening there.)
+            if wide > 16 {
                 return None;
             }
-            if signed {
-                // Sign-extend the operands, so the product is exact; the
-                // `2w`-bit product of two `w`-bit signed values always fits in
-                // `2w` signed bits, so this multiply cannot itself wrap.
-                let exact = smt::mul(smt::sign_extend(x, wide), smt::sign_extend(y, wide));
-                // The exact product is right exactly when it equals the `w`-bit
-                // wrapped result *sign-extended* back to `2w`. Sign-extending the
-                // wrapped result is what makes this rustc's test rather than a
-                // magnitude test -- comparing a zero-extended result would fire
-                // on every negative product.
-                let want = smt::sign_extend(smt::mul(x, y), wide);
-                smt::not(smt::eq(exact, want))
-            } else {
-                let exact = smt::mul(smt::truncate(x, wide), smt::truncate(y, wide));
-                // 2^w, as a constant in the widened width.
-                let limit = 1u64 << (w - 1);
-                let limit = limit.saturating_mul(2);
-                smt::uge_const(exact, limit)
-            }
+            // Sign-extend the operands, so the product is exact; the
+            // `2w`-bit product of two `w`-bit signed values always fits in
+            // `2w` signed bits, so this multiply cannot itself wrap.
+            let exact = smt::mul(smt::sign_extend(x, wide), smt::sign_extend(y, wide));
+            // The exact product is right exactly when it equals the `w`-bit
+            // wrapped result *sign-extended* back to `2w`. Sign-extending the
+            // wrapped result is what makes this rustc's test rather than a
+            // magnitude test -- comparing a zero-extended result would fire
+            // on every negative product.
+            let want = smt::sign_extend(smt::mul(x, y), wide);
+            smt::not(smt::eq(exact, want))
         }
         _ => return None,
     })
