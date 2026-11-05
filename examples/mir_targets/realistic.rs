@@ -5471,3 +5471,53 @@ pub fn nested_named_field_is_the_body_value(o: &OuterBox) -> u8 {
 /// The named-field types for the nested named-field entries above.
 pub struct InnerBox { pub v: u8 }
 pub struct OuterBox { pub i: InnerBox, pub j: InnerBox }
+
+/// A signed `i64` division by a constant power of two, which the divider's sign fixup
+/// could not reach.
+///
+/// `a / 2` is a shift on a power-of-two divisor, so it needs neither the restoring
+/// divider nor the sign fixup that made the general path a wall at this width.
+/// requires: a == -7
+/// ensures: ret == -3
+pub fn a_signed_constant_division_at_i64(a: i64) -> i64 {
+    a / 2
+}
+
+/// The false direction of [`a_signed_constant_division_at_i64`], so the entry is a proof
+/// rather than a query the engine waved through.
+/// requires: a == -7
+/// ensures: ret == -4
+pub fn a_signed_constant_division_at_i64_cannot_prove_this(a: i64) -> i64 {
+    a / 2
+}
+
+/// A signed `i64` remainder by a constant power of two.
+///
+/// `-7 % 2` is `-1`: the remainder takes the *dividend's* sign, and the constant path
+/// builds it as `x - q * 2^k` from the `|c|` quotient, so it needs no sign fixup either.
+/// requires: a == -7
+/// ensures: ret == -1
+pub fn a_signed_constant_remainder_at_i64(a: i64) -> i64 {
+    a % 2
+}
+
+/// A signed `i64` division by a *negative* constant power of two.
+///
+/// `-7 / -2` is `3` in Rust: truncation toward zero, so the sign of the result follows the
+/// signs of the operands. The constant path negates the magnitude quotient for this case.
+/// requires: a == -7
+/// ensures: ret == 3
+pub fn a_signed_constant_division_by_a_negative_power_of_two_at_i64(a: i64) -> i64 {
+    a / -2
+}
+
+/// A signed `i64` division by a constant that is *not* a power of two.
+///
+/// `3` has no shift identity, so this stays on the general divider. It is the shape that
+/// used to overflow the stack rather than report: the fold-built term is deep, and the walk
+/// had no depth bound.
+/// requires: a == -7
+/// ensures: ret == -2
+pub fn a_signed_division_by_a_non_power_of_two_at_i64(a: i64) -> i64 {
+    a / 3
+}

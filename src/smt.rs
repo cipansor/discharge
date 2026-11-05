@@ -73,6 +73,26 @@ pub(crate) const MAX_BLAST_STEPS: u32 = 1 << 22;
 /// never (4 194 304 steps, the old pass's implied ceiling, took ~50s).
 pub(crate) const MAX_APPLY_STEPS: u32 = 1 << 19;
 
+/// Depth budget for the recursive term walk, the fourth of the engine's bounds.
+///
+/// The other three budgets count *steps*, and steps are not what a stack overflow is made
+/// of. A term walk that is 262 levels deep takes only a few hundred steps, so it passes
+/// every step budget and then aborts the process on the recursion -- which is worse than a
+/// slow answer, because the crate's whole contract is that an undecidable query is
+/// *reported*, never a crash. The shape that reaches this depth is a fold-built term: a
+/// wide division by a non-power-of-two constant builds a chain of adders and muxes whose
+/// length is proportional to the width, and the walk has no memo for the *stack*, only for
+/// the visits.
+///
+/// The bound is chosen from measurement. Over both corpus files the deepest legitimate walk
+/// is **138** levels; `udiv(x, 3)` at 64 bits reaches **262** and is the query that
+/// overflowed a 2 MiB stack in release (a `blast` frame is ~2.3 KiB, so the walk wanted
+/// ~600 KiB and then some). 128 would refuse a query the corpus already decides, so the
+/// bound sits at **192**: above every decided query with margin, below the observed blow-up.
+/// A trip sets `overflow`, so the query routes to the SAT fallback and from there to
+/// `Unknown` -- sound, and it *returns*.
+pub(crate) const MAX_WALK_DEPTH: u32 = 192;
+
 /// Worst-case arena memory in bytes, so an integrator can budget statically.
 pub const ARENA_BYTES: usize =
     CAP * (core::mem::size_of::<Node>() + 2 * core::mem::size_of::<u32>());
@@ -401,6 +421,11 @@ pub(crate) struct Ctx {
     apply_steps: u32,
     /// Steps taken by the SAT blaster in the current query, against [`MAX_BLAST_STEPS`].
     sat_blast_steps: u32,
+    /// Current recursion depth of the term walk, against [`MAX_WALK_DEPTH`].
+    ///
+    /// A field rather than a parameter so the recursive walkers do not have to thread it,
+    /// and reset per query alongside the step counters.
+    walk_depth: u32,
     /// Set when a variable index past `MAX_VARS` was requested.
     ///
     /// `overflow` alone is not enough to decide whether to fall back to the SAT engine.
@@ -523,6 +548,7 @@ impl Ctx {
             blast_steps: 0,
             apply_steps: 0,
             sat_blast_steps: 0,
+            walk_depth: 0,
             var_overflow: false,
             ready: false,
             subst_val: [NO_SUBST; MAX_VARS],
@@ -551,6 +577,7 @@ impl Ctx {
         self.blast_steps = 0;
         self.apply_steps = 0;
         self.sat_blast_steps = 0;
+        self.walk_depth = 0;
         self.var_overflow = false;
         self.ready = false;
         for i in 0..CAP {
@@ -918,6 +945,22 @@ impl Ctx {
         self.sat_blast_steps > MAX_BLAST_STEPS
     }
 
+    /// Charge one level of recursion to the term walk, returning `true` once
+    /// [`MAX_WALK_DEPTH`] is spent.
+    ///
+    /// The SAT blaster walks the same terms as the BDD one, so it shares the counter. A
+    /// trip is reported the way the step budgets are: the query falls through to the
+    /// engine that can still answer it, and `Unknown` if none can.
+    pub(crate) fn charge_walk_depth(&mut self) -> bool {
+        self.walk_depth = self.walk_depth.saturating_add(1);
+        self.walk_depth > MAX_WALK_DEPTH
+    }
+
+    /// Release a level charged by [`Self::charge_walk_depth`].
+    pub(crate) fn release_walk_depth(&mut self) {
+        self.walk_depth = self.walk_depth.saturating_sub(1);
+    }
+
     /// Mark the query ill-formed, so it answers `Unknown`. Used by the SAT blaster for the
     /// same reason the BDD one sets the flag directly: a width the blaster cannot represent
     /// must refuse the query rather than index past its buffer.
@@ -1172,6 +1215,21 @@ impl Ctx {
     }
 
     fn apply2(&mut self, op: u8, a: u32, b: u32) -> u32 {
+        // The diagram recursion is bounded by `MAX_APPLY_STEPS` below, but that is a step
+        // count and a deep diagram can be narrow. Guard the depth too; see `MAX_WALK_DEPTH`.
+        self.walk_depth += 1;
+        if self.walk_depth > MAX_WALK_DEPTH {
+            self.overflow = true;
+            self.walk_depth -= 1;
+            return FALSE;
+        }
+        let r = self.apply2_bounded(op, a, b);
+        self.walk_depth -= 1;
+        r
+    }
+
+    /// [`Self::apply2`] with the depth already charged.
+    fn apply2_bounded(&mut self, op: u8, a: u32, b: u32) -> u32 {
         // Charge the *diagram* recursion, not just the term-DAG walk `blast` charges. A
         // function whose BDD is exponentially larger than its formula (a wide division by a
         // non-power-of-two constant) blows up here, where `blast`'s counter never sees it;
@@ -1355,6 +1413,22 @@ impl Ctx {
     }
 
     fn blast(&mut self, t: Term, out: &mut [u32; 64]) {
+        // Bound the *depth* before the step budget, because a step budget cannot see a
+        // stack overflow: a 262-level walk is a few hundred steps. See `MAX_WALK_DEPTH`.
+        self.walk_depth += 1;
+        if self.walk_depth > MAX_WALK_DEPTH {
+            self.overflow = true;
+            out.fill(FALSE);
+            self.walk_depth -= 1;
+            return;
+        }
+        self.blast_bounded(t, out);
+        self.walk_depth -= 1;
+    }
+
+    /// [`Self::blast`] with the depth already charged. Split so the guard has one place to
+    /// unwind from, which is what keeps `walk_depth` correct on the early returns below.
+    fn blast_bounded(&mut self, t: Term, out: &mut [u32; 64]) {
         // Bound the work before doing any of it. See `MAX_BLAST_STEPS`: the memo below
         // makes the fold walks cheap, but only this counter makes the pass *guaranteed* to
         // end. Tripping it sets `overflow`, which routes the query to the SAT engine and
@@ -1693,6 +1767,7 @@ impl Ctx {
         self.blast_steps = 0;
         self.apply_steps = 0;
         self.sat_blast_steps = 0;
+        self.walk_depth = 0;
         let node = self.blast_bool(t);
         if self.stale || self.ill_formed || self.var_overflow {
             return Verdict::Unknown;
@@ -1714,6 +1789,7 @@ impl Ctx {
         self.blast_steps = 0;
         self.apply_steps = 0;
         self.sat_blast_steps = 0;
+        self.walk_depth = 0;
         let node = self.blast_bool(t);
         if self.stale || self.ill_formed || self.var_overflow {
             return Verdict::Unknown;
@@ -2050,6 +2126,26 @@ fn eval_term(
         // what `evaluate` already means by it.
         return None;
     }
+    // This walk is the other recursion over a fold-built term, and it has the same failure
+    // mode as the blasters: a chain of `2 * width` terms is a few hundred levels, which no
+    // step budget sees and the stack cannot hold. See `MAX_WALK_DEPTH`. `None` is "cannot
+    // say", which is sound here -- an unknown value can weaken a proof but never create
+    // one.
+    if ctx.charge_walk_depth() {
+        ctx.release_walk_depth();
+        return None;
+    }
+    let r = eval_term_inner(ctx, t, value, memo);
+    ctx.release_walk_depth();
+    r
+}
+
+fn eval_term_inner(
+    ctx: &mut Ctx,
+    t: Term,
+    value: &impl Fn(u32) -> Option<u64>,
+    memo: &mut EvalMemo,
+) -> Option<u64> {
     let slot = t.slot() as u32;
     if let Some(v) = memo.get(slot) {
         return Some(v);
@@ -2367,6 +2463,60 @@ pub fn uge_const(x: Var, k: u64) -> Pred {
         Pred(c.cmp(Op::Ule, kt, x.0))
     })
 }
+/// `x / c` and `x % c` for a constant `c` whose magnitude is a power of two.
+///
+/// This exists because the *signed* divider is a BDD wall at 64 bits, and it is not the
+/// divider that costs -- the unsigned `divmod` blasts a constant divisor in milliseconds.
+/// The cost is the sign fixup in [`sdivmod`]: it negates and selects on a 64-bit value
+/// whose bits are the divider's symbolic output, which is the shape that blows the
+/// diagram up. Measured on the pinned-quotient query, `udiv(x, 2)` at 64 bits is 47ms and
+/// `sdiv(x, 2)` is 9.3 seconds, so a signed `a / 2` -- the shape that actually appears in
+/// code -- was reported `incomplete`.
+///
+/// Dividing by `2^k` needs neither of those. On the positive side it is a shift. On the
+/// negative side it is a shift after adding `2^k - 1`, which turns truncation toward zero
+/// into a floor: `trunc(x / 2^k) == floor((x + (2^k - 1 if x < 0 else 0)) / 2^k)`, and an
+/// arithmetic shift *is* that floor. The bias is `(2^k - 1)` masked by the sign, and the
+/// sign mask is the sign bit replicated, which is one arithmetic shift by `w - 1`.
+///
+/// So the whole thing is constant shifts, a `band`, an `add`, a `sub` and (for a negative
+/// `c`) a negation -- no divider, no `ite` over a symbolic value. The remainder is
+/// `x - q * 2^k`, and it needs no sign fixup at all: `x % -c == x % c`, because a
+/// remainder takes the dividend's sign.
+///
+/// `|c| >= 2` is required, and that is what makes this safe to use rather than merely
+/// fast: `MIN / c` is representable for every such `c`, so this path can never disagree
+/// with the overflow the signed divider reports. `|c| == 1` is left out on purpose --
+/// `x / -1` overflows at `MIN` and is the one constant where the general path's explicit
+/// handling is wanted -- and `c == 0` is a different obligation entirely.
+pub fn sdivmod_pow2(x: Var, c: i128, w: u8) -> Option<(Var, Var)> {
+    let d = c.unsigned_abs();
+    if d < 2 || !d.is_power_of_two() {
+        return None;
+    }
+    let k = d.trailing_zeros();
+    if k >= u32::from(w) {
+        return None;
+    }
+    // `d <= 2^(w-1)` for any representable `c`, so `d - 1` fits in `w` bits.
+    let mask = word((d - 1) as u64, w);
+    // All-ones when `x` is negative, zero otherwise: the sign bit replicated across
+    // the word by one arithmetic shift.
+    let sign_mask = ashr(x, u32::from(w) - 1);
+    let biased = add(x, band(sign_mask, mask));
+    // `trunc(x / |c|)`. The remainder is built from *this* and not from the sign-fixed
+    // quotient: `x % c == x % |c|` for every `c`, since a remainder takes the dividend's
+    // sign, so negating first would flip it.
+    let magnitude_quotient = ashr(biased, k);
+    let quotient = if c < 0 {
+        sub(word(0, w), magnitude_quotient)
+    } else {
+        magnitude_quotient
+    };
+    let remainder = sub(x, shl(magnitude_quotient, k));
+    Some((quotient, remainder))
+}
+
 /// `x / y` and `x % y`, unsigned, as a *restoring divider* built from the
 /// operators the engine already has.
 ///

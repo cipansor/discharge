@@ -2269,6 +2269,51 @@ through `verify_function` with a postcondition, because the postcondition is wha
 path cost more than the last; and it runs on a 64 MB thread, because the harness's default
 stack is smaller than the main thread's and the workload overflows it.
 
+## A step budget is not a depth budget
+
+The engine promised "refuse, never crash" and then aborted the process. `i64 / 3` -- a
+division by a constant that is not a power of two -- overflowed the stack on the default
+2 MiB test-thread stack (SIGABRT), in release as well as debug. Every budget the engine had
+counted *steps*: `MAX_BLAST_STEPS`, `MAX_APPLY_STEPS`, the arena capacity, the path budget.
+A stack overflow is not made of steps. The walk that overflows is ~262 levels deep and
+costs only a few hundred steps, so it passed every budget and died on the recursion.
+
+The root cause took four wrong guesses to find, and the way each was falsified is the
+useful part:
+
+1. **"It is the BDD, so `bitblast::blast`."** Depth there is 267 -- deepest candidate, and
+   wrong. Measured release frames put 267 of them well under the stack that failed, so
+   depth alone there was not the explanation.
+2. **"It is `subst`."** Plausible, since substitution rebuilds terms. Instrumented: depth 0.
+   It never ran on this query.
+3. **"It is the frame size."** Also wrong, and this one nearly ended the search. `objdump`
+   on the *rlib* showed `bitblast::blast` with `sub 0x1000,%rsp`, which looks fatal at depth
+   267. It is not the function's frame: the symbol's prologue is a stack-probe for a large
+   `[Lit; 64]` local, and the real frame is 840 bytes. Reading a disassembly is not the same
+   as knowing which code runs.
+4. **"It is the step budget, so raise it."** No budget was involved at all.
+
+What settled it was measuring depth per recursion site, not guessing from shape. `smt::blast`
+is depth 262 with a 2.3 KiB release frame, so 262 x 2.3 KiB ~ 600 KiB -- the number that
+matches a 2 MiB stack failing and 3 MiB succeeding. The deepest legitimate walk in the whole
+corpus is 138, so the fix is a fourth bound, `MAX_WALK_DEPTH = 192`, charged by every
+recursive walker: `smt::blast`, `smt::apply2`, `bitblast::blast`, and `eval_term`. A trip
+sets the existing `overflow` flag, so the query routes to the SAT fallback and from there to
+`Unknown` -- the same sound path the step budgets use.
+
+Two lessons. First, **a budget on one resource is not a budget on the others** -- this is the
+second time (the first was the path budget above) and the resource is now *stack depth*.
+When a tool promises never to crash, each unbounded recursion needs its own guard; a step
+counter will not see it, because the failing shape is deep and narrow. Second, **measure the
+resource the failure is made of**. Every step-based measurement here was green while the
+process aborted; only a depth measurement found it.
+
+The regression test is `a_deep_term_walk_is_refused_not_allowed_to_overflow_the_stack` in
+`tests/mir.rs`. It runs on the test thread's own stack, so removing the guard aborts the test
+binary rather than failing an assertion -- verified by disabling the guard and watching it
+SIGABRT. The split of each walker into a thin guarded wrapper and a `*_bounded` body is what
+keeps the counter correct on the early returns inside the body.
+
 ## Cutting a loop at its invariant: the header must havoc what the loop writes
 
 Loop invariants landed in the MIR frontend, and the first version was **unsound**. It

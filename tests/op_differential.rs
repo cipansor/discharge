@@ -514,6 +514,133 @@ fn the_divider_satisfies_its_defining_identity() {
     });
 }
 
+/// The constant power-of-two division is a shift, and the shift identity is checked
+/// exhaustively rather than trusted.
+///
+/// This path exists because the signed divider's sign fixup is a BDD wall at 64 bits:
+/// `sdiv(x, 2)` took 9.3 seconds and was reported `incomplete`, while `udiv(x, 2)` took
+/// 47ms. The replacement is `trunc(x / 2^k) == (x + (2^k - 1 if x < 0 else 0)) >> k`, with
+/// an arithmetic shift, and the bias is the sign bit replicated and masked.
+///
+/// Two things make it worth the exhaustive sweep rather than a spot check. The bias is
+/// only added on the negative side, and `>>` on a negative value is where the identity is
+/// easy to get wrong; and the remainder is built as `x - q * 2^k` from the *magnitude*
+/// quotient, so a negative divisor is the case that would give it the wrong sign. Both
+/// signs of `c` are swept for that reason.
+#[test]
+fn constant_power_of_two_division_is_exact() {
+    on_big_stack(|| {
+        // Exhaustive at widths small enough to enumerate, against Rust's own `/` and `%`.
+        for w in [2u8, 3, 4, 5, 6] {
+            let half = 1i128 << (w - 1);
+            let (mn, mx) = (-half, half - 1);
+            let mask = (1u64 << w) - 1;
+            for k in 1..w {
+                let d = 1i128 << k;
+                for c in [d, -d] {
+                    for x in mn..=mx {
+                        // The terms and the point they are pinned to are built in one
+                        // scope: `sdivmod_pow2` produces fresh variables, so asking about
+                        // a point means substituting into the same context that built them.
+                        let (got_q, got_r) = smt::with_fresh(|| {
+                            let v = smt::var(w);
+                            let (q, r) = smt::sdivmod_pow2(v, c, w)
+                                .expect("a power of two must be handled");
+                            let pin = smt::eq(v, smt::word((x as u64) & mask, w));
+                            (
+                                smt::prove(smt::implies(
+                                    pin,
+                                    smt::eq(q, smt::word((q_val(x, c) as u64) & mask, w)),
+                                )),
+                                smt::prove(smt::implies(
+                                    pin,
+                                    smt::eq(r, smt::word((r_val(x, c) as u64) & mask, w)),
+                                )),
+                            )
+                        });
+                        assert_eq!(
+                            got_q,
+                            Verdict::Valid,
+                            "{w}-bit {x} / {c}: quotient disagreed with {}",
+                            q_val(x, c)
+                        );
+                        assert_eq!(
+                            got_r,
+                            Verdict::Valid,
+                            "{w}-bit {x} % {c}: remainder disagreed with {}",
+                            r_val(x, c)
+                        );
+                    }
+                }
+            }
+        }
+
+        // 64 bits, where the path is the only one available. The values straddle the
+        // boundaries of each constant and sit at the ends of the range, including `MIN`,
+        // which is where `x + 2^k - 1` would overflow if the bias were added on the
+        // wrong side.
+        let mask = u64::MAX;
+        for k in [1u32, 2, 31, 62] {
+            let d = 1i128 << k;
+            for c in [d, -d] {
+                for x in [
+                    i64::MIN as i128,
+                    i64::MIN as i128 + 1,
+                    -d - 1,
+                    -d,
+                    -d + 1,
+                    -1,
+                    0,
+                    1,
+                    d - 1,
+                    d,
+                    d + 1,
+                    i64::MAX as i128,
+                ] {
+                    let (got_q, got_r) = smt::with_fresh(|| {
+                        let v = smt::var(64);
+                        let (q, r) = smt::sdivmod_pow2(v, c, 64).unwrap();
+                        let pin = smt::eq(v, smt::word((x as u64) & mask, 64));
+                        (
+                            smt::prove(smt::implies(
+                                pin,
+                                smt::eq(q, smt::word((q_val(x, c) as u64) & mask, 64)),
+                            )),
+                            smt::prove(smt::implies(
+                                pin,
+                                smt::eq(r, smt::word((r_val(x, c) as u64) & mask, 64)),
+                            )),
+                        )
+                    });
+                    assert_eq!(got_q, Verdict::Valid, "64-bit {x} / {c}: quotient");
+                    assert_eq!(got_r, Verdict::Valid, "64-bit {x} % {c}: remainder");
+                }
+            }
+        }
+
+        // The cases the shift identity must *refuse*, so the fast path cannot quietly
+        // become a claim about every divisor. `|c| == 1` is the one that matters: `MIN / -1`
+        // overflows and the general path handles that explicitly, so a no-op shift here
+        // would be a wrong answer rather than a slow one.
+        for c in [0i128, 1, -1, 3, -3, 6, -6, 100, -100] {
+            assert!(
+                smt::with_fresh(|| smt::sdivmod_pow2(smt::var(64), c, 64)).is_none(),
+                "{c} must not take the power-of-two path"
+            );
+        }
+    });
+}
+
+/// Truncating signed division, toward zero, for the test above.
+fn q_val(x: i128, c: i128) -> i128 {
+    x / c
+}
+
+/// Truncating signed remainder, taking the dividend's sign.
+fn r_val(x: i128, c: i128) -> i128 {
+    x % c
+}
+
 /// The divider is one implementation, not two -- `blast` has no `Op::Div` and the
 /// divider is built from primitives -- so this compares `evaluate`'s division against
 /// Rust's rather than against a second `blast` arm. It is here because the same file

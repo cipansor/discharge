@@ -2210,6 +2210,45 @@ fn no_cannot_prove_entry_is_ever_verified() {
          has the naming convention changed?"
     );
 }
+/// A deep term is refused, not allowed to overflow the stack.
+///
+/// The engine's contract is that a query it cannot decide is *reported*: `Unknown`,
+/// `Incomplete`, a budget trip -- never a crash. Every budget before this one counted
+/// *steps*, and steps are not what a stack overflow is made of: `udiv(x, 3)` at 64 bits
+/// builds a chain of adders and muxes ~262 terms deep, which is a few hundred steps, so it
+/// passed every step budget and then aborted the process. On a 2 MiB stack -- the default
+/// for a Rust test thread -- the walk wanted ~600 KiB in release and more in debug.
+///
+/// The guard is `MAX_WALK_DEPTH`, and this test is what holds it: it runs on the test
+/// thread's own stack, so a regression that removes the guard aborts the test binary
+/// (SIGABRT) instead of failing an assertion. The division-by-a-non-power-of-two shape is
+/// the deepest legitimate walk in the corpus; the assertion that it reports rather than
+/// panics is the whole point.
+#[test]
+fn a_deep_term_walk_is_refused_not_allowed_to_overflow_the_stack() {
+    let Some(report) = verify_realistic(&[
+        "a_signed_division_by_a_non_power_of_two_at_i64",
+        "a_signed_constant_division_at_i64",
+    ]) else {
+        return;
+    };
+    // The non-power-of-two case is the one that used to crash. Either answer but
+    // `Verified` is acceptable -- the general divider is a documented scaling wall -- and
+    // the unacceptable one is a false proof. Reaching this assertion at all is the fix.
+    let deep = outcome(&report, "a_signed_division_by_a_non_power_of_two_at_i64");
+    assert!(
+        !deep.is_verified(),
+        "the general divider must not be reported verified: {deep}"
+    );
+    // The power-of-two fast path is shallow and must still be *decided*, so the depth
+    // bound cannot be so tight that it refuses the queries the engine already answers.
+    let shallow = outcome(&report, "a_signed_constant_division_at_i64");
+    assert!(
+        shallow.is_verified(),
+        "the power-of-two fast path must still verify: {shallow}"
+    );
+}
+
 /// A callee's contract is never taken on faith: its body is inlined, so a lying
 /// `ensures` cannot be inherited by a caller, and a vacuous `requires` cannot be
 /// used to assume a false postcondition.

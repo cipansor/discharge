@@ -3365,6 +3365,29 @@ fn eval_binary(op: BinOp, a: Val, b: Val, width: Option<u8>) -> Val {
                     // unprinted sign is a refusal: the unsigned divider returns a
                     // huge positive quotient for `-7 / 2`, a wrong value rather
                     // than a weaker proof.
+                    // A constant power-of-two divisor is a shift, not a division, and
+                    // the difference is not a micro-optimisation: the signed divider's
+                    // sign fixup is a BDD wall at 64 bits (9.3s for `sdiv(x, 2)` against
+                    // 47ms for `udiv(x, 2)`), so `a / 2` on an `i64` was reported
+                    // `incomplete`. The constant path is the shift identity and needs no
+                    // fixup. `|c| == 1` is deliberately not taken -- `x / -1` overflows at
+                    // `MIN` and the general path handles that explicitly -- and it would
+                    // be a no-op shift anyway.
+                    let Some(w) = width else { return Val::Unknown };
+                    if signed == Some(true) {
+                        if let Some((q, r)) = smt::const_of(y)
+                            .map(|v| as_signed(v, w))
+                            .and_then(|c| smt::sdivmod_pow2(x, c, w))
+                        {
+                            return Val::Sym(
+                                match op {
+                                    BinOp::Div => q,
+                                    _ => r,
+                                },
+                                sign,
+                            );
+                        }
+                    }
                     match (signed, op) {
                         (Some(true), BinOp::Div) => smt::sdiv(x, y),
                         (Some(true), BinOp::Rem) => smt::srem(x, y),

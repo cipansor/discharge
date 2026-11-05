@@ -41,6 +41,22 @@ pub const MAX_BITS: usize = 64;
 
 /// Blast `t` into `out[..width]`, adding gates to `cnf`.
 pub(crate) fn blast(ctx: &mut Ctx, cnf: &mut Cnf, t: Term, out: &mut [Lit; MAX_BITS]) {
+    // Charge the depth before the step budget. The two bound different failures: a step
+    // budget stops unbounded *work*, and cannot stop a stack overflow, because a walk deep
+    // enough to overflow the stack takes only a few hundred steps. See `MAX_WALK_DEPTH`.
+    if ctx.charge_walk_depth() {
+        cnf.mark_overflow();
+        let f = cnf.false_lit();
+        out.fill(f);
+        ctx.release_walk_depth();
+        return;
+    }
+    blast_bounded(ctx, cnf, t, out);
+    ctx.release_walk_depth();
+}
+
+/// [`blast`] with the depth already charged, so the guard has one place to unwind from.
+fn blast_bounded(ctx: &mut Ctx, cnf: &mut Cnf, t: Term, out: &mut [Lit; MAX_BITS]) {
     // Charge a step and stop once the budget is spent, exactly as the BDD blaster does.
     // A fold-built term is a shared DAG, so an unmemoised walk costs one visit per path;
     // stopping leaves the caller's `overflow` path to report `Unknown`, which is sound
