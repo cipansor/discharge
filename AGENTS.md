@@ -3302,6 +3302,11 @@ optional file argument, which is what made the measurement cheap.)
   `ret == 3`, verified) and `whole_inner_move_is_not_the_stale_destination` (the
   destination's pre-move `7` claimed to survive; refuted, witness `o.i.v = 7`)
   pins both directions: a model that kept the stale leaf would *prove* the twin.
+  The swap pair `nested_swap_carries_the_other_side` (seeds `3`/`4`, true `ret == 4`)
+  and `nested_swap_is_not_the_stale_side` (the pre-swap `3` claimed to survive;
+  refuted) is what makes the *either-side* guard load-bearing: with the guard
+  narrowed to "destination nested" both entries go `incomplete`, which is exactly
+  the mistake the pair catches.
   Two notes on what this did *not* need. The nested literal always reaches the
   store through a temp, so `Rvalue::Struct`/`Aggregate` do **not** need to write
   under `dest.proj`; and making `Aggregate` do so *drops* a nested tuple write

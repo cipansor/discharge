@@ -1506,6 +1506,8 @@ fn a_nested_seed_is_invalidated_by_a_write_and_carried_by_a_copy() {
         "whole_inner_write_through_a_mutable_reference_is_seen",
         "whole_inner_move_carries_the_source_leaf",
         "whole_inner_move_is_not_the_stale_destination",
+        "nested_swap_carries_the_other_side",
+        "nested_swap_is_not_the_stale_side",
         "whole_struct_copy_carries_nested_paths",
     ]) else {
         return;
@@ -1545,6 +1547,16 @@ fn a_nested_seed_is_invalidated_by_a_write_and_carried_by_a_copy() {
     assert!(
         matches!(stale_move, FnOutcome::Failed { .. }),
         "the destination's pre-move leaf must not survive the move; got: {stale_move}"
+    );
+    // A nested swap: both sides are nested, so this is the shape that needs the guard to be
+    // "either side nested". The two seeds are distinct, so the positive verdict is the
+    // *other* side's leaf, and the twin claims the pre-swap one survived.
+    let swap = outcome(&report, "nested_swap_carries_the_other_side");
+    assert!(swap.is_verified(), "a nested swap must exchange the leaves; got: {swap}");
+    let swap_stale = outcome(&report, "nested_swap_is_not_the_stale_side");
+    assert!(
+        matches!(swap_stale, FnOutcome::Failed { .. }),
+        "a nested swap must not keep each side's own leaf; got: {swap_stale}"
     );
 }
 

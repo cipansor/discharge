@@ -5498,6 +5498,37 @@ pub fn whole_inner_move_is_not_the_stale_destination(mut o: OuterBox) -> u8 {
     o.i.v
 }
 
+/// A nested swap through a temp, `let t = o.i; o.i = o.j; o.j = t`.
+///
+/// Two nested sources and two nested destinations, so it only works if the re-rooting runs
+/// on a nested source as well as a nested destination: the guard is "either side nested", not
+/// "destination nested". The precondition pins the two sides apart (`3` and `4`), so the
+/// returned `4` proves the *other* side arrived rather than the one that was already there.
+/// requires: o.i.v == 3
+/// requires: o.j.v == 4
+/// ensures: ret == 4
+pub fn nested_swap_carries_the_other_side(mut o: OuterBox) -> u8 {
+    let tmp = o.i;
+    o.i = o.j;
+    o.j = tmp;
+    o.i.v
+}
+
+/// The false twin of [`nested_swap_carries_the_other_side`].
+///
+/// Same body, but the contract claims the pre-swap `o.i.v == 3` survived. A model that
+/// dropped the nested-to-nested move -- keeping each side's own leaf -- would prove this; it
+/// must be refuted, and the witness is the two seeds (`3` and `4`) that the swap exchanged.
+/// requires: o.i.v == 3
+/// requires: o.j.v == 4
+/// ensures: ret == 3
+pub fn nested_swap_is_not_the_stale_side(mut o: OuterBox) -> u8 {
+    let tmp = o.i;
+    o.i = o.j;
+    o.j = tmp;
+    o.i.v
+}
+
 /// The inner type of [`nested_tuple_projection_reads`].
 pub struct NestedPair { pub p: Pair }
 
