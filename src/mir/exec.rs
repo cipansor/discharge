@@ -715,6 +715,64 @@ impl Env {
         }
     }
 
+    /// Re-root the source's separately stored parts under the destination's field path.
+    ///
+    /// This is [`Self::copy_parts`] one level down, and it is what a *nested* aggregate
+    /// assignment needs. `o.i = InnerBox { v: 9 }` lowers to a struct literal into a temp
+    /// followed by `(_1.0) = move _2`, so the parts being moved are keyed under `_2` and the
+    /// destination is the nested place `_1.0`. [`Self::copy_parts`] is reached only for a
+    /// whole-place destination, so without this the temp's `v` never lands under `_1.0` and
+    /// the later read `(_1.0).0` -- the nested store, keyed by the whole chain -- finds
+    /// nothing. The body's value is then unknown, and a contract that *is* false of the body
+    /// is reported unreadable instead of refuted.
+    ///
+    /// `prefix` is the destination's projection. Only an all-field path is re-keyed: any
+    /// other projection (a deref, an index, a downcast) names a store this helper does not
+    /// re-root, and writing a part where no read consults it would be a lost proof at best,
+    /// so those are refused. The source must be a bare local for the same reason
+    /// [`Self::copy_parts`] requires it -- a source that is itself a projection has no parts
+    /// under a local to move.
+    fn copy_parts_under(&mut self, src: &Place, dst: u32, prefix: &[Proj]) {
+        let src = self.resolve(src);
+        if !src.proj.is_empty() || src.local == dst {
+            return;
+        }
+        let leaf: Vec<u32> = match prefix
+            .iter()
+            .map(|p| match p {
+                Proj::Field(i) => Some(*i),
+                _ => None,
+            })
+            .collect::<Option<Vec<u32>>>()
+        {
+            Some(v) if !v.is_empty() => v,
+            _ => return,
+        };
+        let s = src.local;
+        // The source's parts as the two shapes the field stores use: a chain of fields (the
+        // `nested` store) and a single field (the `fields` store). A part is re-keyed under
+        // `leaf`, and since `leaf` is non-empty every such key is a chain of length two or
+        // more, which is exactly what the nested store is read by.
+        let nested: Vec<(Vec<u32>, Val)> = self
+            .nested
+            .iter()
+            .filter(|((l, _), _)| *l == s)
+            .map(|((_, chain), v)| (chain.clone(), *v))
+            .collect();
+        let fields: Vec<(u32, Val)> =
+            self.fields.iter().filter(|((l, _), _)| *l == s).map(|((_, k), v)| (*k, *v)).collect();
+        for (chain, v) in nested {
+            let mut c = leaf.clone();
+            c.extend(chain);
+            self.nested.insert((dst, c), v);
+        }
+        for (k, v) in fields {
+            let mut c = leaf.clone();
+            c.push(k);
+            self.nested.insert((dst, c), v);
+        }
+    }
+
     /// Copy every derived part of `src`'s local onto `dst`, and report whether the
     /// source had any.
     ///
@@ -2220,6 +2278,22 @@ where
                     }
                 }
                 st.env.set(dest, v);
+                // A *nested* aggregate assignment (`o.i = Inner { v: 9 }` lowers to
+                // `(_1.0) = move _2`) moves the source's parts under the destination's
+                // prefix. `set` alone cannot do it: the value it is handed is the source
+                // local, which has no bit-vector meaning, and the parts live in the field
+                // stores keyed by the source's own local. It is done *after* `set` because
+                // the field arm of `set` forgets the nested paths beneath the destination
+                // -- correct, since they are stale -- and this is what puts the source's
+                // parts back. Without it the temp's `v` never lands under `_1.0`, and
+                // `(_1.0).0` reads `Unknown`.
+                if !dest.proj.is_empty() {
+                    if let Rvalue::Use(Operand::Copy(q) | Operand::Move(q)) = rv {
+                        if q.proj.is_empty() {
+                            st.env.copy_parts_under(q, dest.local, &dest.proj);
+                        }
+                    }
+                }
             }
         }
     }

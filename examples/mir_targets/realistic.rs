@@ -5437,6 +5437,24 @@ pub fn whole_struct_copy_carries_nested_paths(mut c: OuterBox, d: OuterBox) -> u
     c.i.v
 }
 
+/// A *nested* aggregate literal lands where the read looks, and the false direction of
+/// [`whole_inner_write_makes_nested_seed_stale`] is its tripwire.
+///
+/// `o.i = InnerBox { v: 9 }` lowers to a struct literal into a temp followed by
+/// `(_1.0) = move _2`, so the parts being moved are keyed under `_2` and the destination
+/// is the nested place `_1.0`. The copy that moves a *whole* local re-roots its parts; a
+/// copy whose destination is itself nested did not, so the temp's `v` never landed under
+/// `_1.0` and the later read `(_1.0).0` found nothing. The body then had no value, and
+/// this true contract was `incomplete` rather than verified. `verified` here is the
+/// positive evidence the re-rooting happened; the companion's refutation is the evidence
+/// it happened in the direction the read consults.
+/// requires: true
+/// ensures: ret == 9
+pub fn whole_inner_write_is_seen_by_the_leaf(mut o: OuterBox) -> u8 {
+    o.i = InnerBox { v: 9 };
+    o.i.v
+}
+
 /// The inner type of [`nested_tuple_projection_reads`].
 pub struct NestedPair { pub p: Pair }
 

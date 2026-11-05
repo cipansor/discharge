@@ -1488,22 +1488,37 @@ fn a_nested_field_write_through_a_mutable_reference_is_applied() {
 /// part of, and carried across by a whole-struct copy.
 ///
 /// Both are the "parts" rules one level down. `o.i = Inner { v: 9 }` makes the seed
-/// for `o.i.v` stale, so the false entry must not be *proved* against the
-/// pre-write leaf. And `c = d` must move `c.i.v` with the copy, so the true entry
-/// verifies -- it pins `c.i.v` and `d.i.v` to different values, so `verified` is
-/// the evidence the copy moved the right one rather than leaving `c`'s own seed.
+/// for `o.i.v` stale, so the false entry must be *refuted*: the body returns 9, and
+/// `ret == 3` holds for no input. Refutation and not merely "not proved" is the
+/// assertion, because a refusal also satisfies "not proved" and says nothing about
+/// whether the write landed. The body lowers to a struct literal into a temp
+/// followed by `(_1.0) = move _2`, so reaching the refutation is the evidence the
+/// temp's parts were re-rooted under the destination's nested place.
+///
+/// And `c = d` must move `c.i.v` with the copy, so the true entry verifies -- it
+/// pins `c.i.v` and `d.i.v` to different values, so `verified` is the evidence the
+/// copy moved the right one rather than leaving `c`'s own seed.
 #[test]
 fn a_nested_seed_is_invalidated_by_a_write_and_carried_by_a_copy() {
     let Some(report) = verify_realistic(&[
         "whole_inner_write_makes_nested_seed_stale",
+        "whole_inner_write_is_seen_by_the_leaf",
         "whole_struct_copy_carries_nested_paths",
     ]) else {
         return;
     };
     let stale = outcome(&report, "whole_inner_write_makes_nested_seed_stale");
     assert!(
-        !stale.is_verified(),
-        "a stale nested seed must not prove a false contract; got: {stale}"
+        matches!(stale, FnOutcome::Failed { .. }),
+        "a stale nested seed must let the false contract be refuted, not refused; got: {stale}"
+    );
+    // The positive direction: the same body's true contract (`ret == 9`) verifies, so
+    // the refutation above is the write landing and not a blanket refusal. Without this
+    // pair, an engine that answered `Unknown` for the whole shape would pass.
+    let landed = outcome(&report, "whole_inner_write_is_seen_by_the_leaf");
+    assert!(
+        landed.is_verified(),
+        "a nested aggregate write must land where the leaf reads it; got: {landed}"
     );
     let copy = outcome(&report, "whole_struct_copy_carries_nested_paths");
     assert!(copy.is_verified(), "a whole-struct copy must carry nested paths; got: {copy}");
