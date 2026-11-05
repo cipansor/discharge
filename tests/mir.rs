@@ -5205,3 +5205,36 @@ fn a_transitive_pin_chain_folds_the_body() {
         "a false claim about a transitively pinned chain must be refuted; got: {bad}"
     );
 }
+
+/// An unsigned division by a power of two is a shift, and the body over a *symbolic*
+/// dividend is decided rather than refused for the divider's diagram.
+///
+/// The signed fast path existed; the unsigned side did not, so `n / 4` on a `u64` with
+/// only a bound on `n` built the full restoring divider and came back `incomplete` in
+/// ~0.9 s. The remainder is the other half of the same helper (`n & 3`), and it is here so
+/// a future edit that wires only the quotient fails.
+///
+/// The `cannot_prove_this` companion is what keeps "decided" meaning "decided correctly":
+/// without it, a fast path that returned a wrong value for every input could still pass.
+#[test]
+fn an_unsigned_power_of_two_division_is_a_shift_not_a_divider() {
+    let Some(report) = verify_realistic(&[
+        "an_unsigned_power_of_two_division_is_decided",
+        "an_unsigned_power_of_two_division_cannot_prove_this",
+        "an_unsigned_power_of_two_remainder_is_decided",
+    ]) else {
+        return;
+    };
+    for name in [
+        "an_unsigned_power_of_two_division_is_decided",
+        "an_unsigned_power_of_two_remainder_is_decided",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "an unsigned power-of-two op must be decided; `{name}` got: {o}");
+    }
+    let bad = outcome(&report, "an_unsigned_power_of_two_division_cannot_prove_this");
+    assert!(
+        !bad.is_verified(),
+        "a false claim about an unsigned division must be refuted; got: {bad}"
+    );
+}

@@ -531,6 +531,42 @@ decided by the diagram is lost. The corpus confirms the direction: `realistic.rs
 264 of 490, with zero function changing verdict in either direction, and the
 `a == 5 && b == a + 1 && c == b * 2` with body `c / 4` moves from `incomplete` to `verified`.
 
+## A division by a power of two is a shift, on both signs
+
+The restoring divider is exact, and exact is expensive: the term it builds is ~`2 * w` deep,
+so an obligation that reads a *symbolic* dividend through it is refused for the size of its
+own diagram rather than for anything about the property. The shapes that pay for this are
+the ordinary ones — `n / 4`, `i / 8`, `x % 16` — where the divisor is a literal power of two
+and the identity is elementary.
+
+The signed case came first, because the *signed* divider is the worse of the two: its sign
+fixup negates and selects on a 64-bit value whose bits are the divider's symbolic output,
+and that is the shape that blows the diagram up. `sdiv(x, 2)` took 9.3 seconds against 47ms
+for `udiv(x, 2)`, so `a / 2` on an `i64` was `incomplete`. Dividing by `2^k` needs no
+divider at all: on the positive side it is a shift, and on the negative side it is a shift
+after adding `2^k - 1`, which turns truncation toward zero into a floor. The bias is that
+constant masked by the sign, and the sign mask is the sign bit replicated — one arithmetic
+shift.
+
+The unsigned case looked like the cheap one and was left alone, which was wrong in a way
+the corpus could not show: the general unsigned divider is *not* the signed one's wall, but
+it is still a `2 * w`-deep term, and a symbolic dividend through it is refused all the same.
+`requires: n <= 1000; n / 4` at `u64` was `incomplete` in 0.9 s while the *signed* twin of
+the same body was already decided. The unsigned identity is the simplest of the four: `x /
+2^k` is `x >> k` and `x % 2^k` is `x & (2^k - 1)`, two operators and no fixup.
+
+Both fast paths are guarded to `d >= 2` and a divisor that fits below the width. `d == 1`
+is deliberately left to the general path — the guard then reads the same on both sides — and
+`d == 0` never reaches either, so the general divider's *defined* zero case (all-ones
+quotient, dividend remainder) is the one that still answers. Neither path can shadow it.
+
+The tests are two-level, and the second level is the one that matters. A concrete sweep
+walks every dividend at a width where the whole domain fits, against Rust's own `/` and `%`.
+Then the engine is asked to prove the shift-and-mask expression *equal to the general
+divider* with `x` free — that is the property a splice into a body depends on, and it is a
+statement about all inputs rather than about the ones the sweep happened to try. The signed
+sweep includes the negatives, since the bias and the negation exist for exactly those.
+
 ## Mixed-width operations are refused, not truncated
 
 A bit-vector operation has no natural width when its operands disagree. The engine used to

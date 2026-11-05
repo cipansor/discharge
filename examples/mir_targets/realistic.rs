@@ -5633,3 +5633,38 @@ pub fn a_transitive_pin_chain_cannot_prove_this(a: i64, b: i64, c: i64) -> i64 {
     c / 4
 }
 
+
+/// An *unsigned* division by a power of two, with a symbolic dividend.
+///
+/// The signed twin of this shape was already a shift, but the unsigned side fell through
+/// to the general restoring divider -- a term ~`2 * w` deep -- and a symbolic dividend
+/// through it was refused for the diagram's size: `incomplete` in ~0.9 s at `u64`. The
+/// quotient of an unsigned value by `2^k` is the logical shift `n >> k`, so the body folds
+/// to a handful of terms and the bound decides it.
+///
+/// [`an_unsigned_power_of_two_division_cannot_prove_this`] is the false direction, so the
+/// entry above is a proof and not a `true` that a too-permissive fast path would also
+/// produce.
+/// requires: n >= 4 && n <= 7
+/// ensures: ret == 1
+pub fn an_unsigned_power_of_two_division_is_decided(n: u64) -> u64 {
+    n / 4
+}
+
+/// The false direction of the unsigned shift identity: `n` in `[4, 7]` makes `n / 4` one,
+/// so the claim of two is refuted.
+/// requires: n >= 4 && n <= 7
+/// ensures: ret == 2
+pub fn an_unsigned_power_of_two_division_cannot_prove_this(n: u64) -> u64 {
+    n / 4
+}
+
+/// An *unsigned* remainder by a power of two, which is a mask rather than a divider.
+///
+/// The companion to the division above, and it exercises the other half of
+/// `udivmod_pow2`: `n % 4 == n & 3`. The general divider would be built for a mask.
+/// requires: n >= 4 && n <= 7
+/// ensures: ret <= 3
+pub fn an_unsigned_power_of_two_remainder_is_decided(n: u64) -> u64 {
+    n % 4
+}

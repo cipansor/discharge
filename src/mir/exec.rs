@@ -3436,6 +3436,25 @@ fn eval_binary(op: BinOp, a: Val, b: Val, width: Option<u8>) -> Val {
                             );
                         }
                     }
+                    // The unsigned twin: a logical shift and a mask, with no sign to
+                    // fix up. The general unsigned divider is not the signed one's wall,
+                    // but it is still a `2 * w`-deep term, and a *symbolic* dividend
+                    // through it is refused for the diagram's size -- `n / 4` on a `u64`
+                    // with `n <= 1000` was `incomplete` in ~0.9 s. `d == 1` is left to the
+                    // general path so the guard matches the signed branch.
+                    if signed == Some(false) {
+                        if let Some((q, r)) = smt::const_of(y)
+                            .and_then(|d| smt::udivmod_pow2(x, d, w))
+                        {
+                            return Val::Sym(
+                                match op {
+                                    BinOp::Div => q,
+                                    _ => r,
+                                },
+                                sign,
+                            );
+                        }
+                    }
                     match (signed, op) {
                         (Some(true), BinOp::Div) => smt::sdiv(x, y),
                         (Some(true), BinOp::Rem) => smt::srem(x, y),

@@ -206,3 +206,105 @@ fn a_wide_constant_divisor_returns_a_verdict_instead_of_hanging() {
         }
     });
 }
+
+// ---------------------------------------------------------------------------
+// The power-of-two fast paths
+// ---------------------------------------------------------------------------
+
+/// `udivmod_pow2` must agree with the general divider on every input.
+///
+/// The fast path is a *replacement*, so "it is faster" is not the claim -- "it is the
+/// same function" is. Two checks, because they catch different bugs. The concrete sweep
+/// walks every dividend at a width where the whole domain fits, against Rust's own `/`
+/// and `%`. The symbolic check asks the engine whether the shift-and-mask expression and
+/// the restoring divider denote the same value for a *symbolic* `x`, which is what makes
+/// it a proof over all inputs rather than a spot check.
+///
+/// `d == 1` and `d == 0` are the guard's edges. `udivmod_pow2` returns `None` for both --
+/// `1` is not a power of two above the threshold and `0` is not a power of two at all --
+/// so neither can reach the fast path and shadow the general divider's defined zero case.
+#[test]
+fn the_unsigned_power_of_two_fast_path_agrees_with_the_divider() {
+    for w in [4u8, 8, 16] {
+        let max = (1u64 << w) - 1;
+        for d in [1u64, 2, 4, 8, 16, 32, 64] {
+            for x in 0..=max {
+                // Built and evaluated inside one epoch: a term from outside is stale
+                // here, and a stale handle evaluates to `None`, which would look like a
+                // disagreement rather than a reset.
+                smt::with_fresh(|| {
+                    let Some((q, r)) = smt::udivmod_pow2(smt::word(x, w), d, w) else {
+                        // The guard refused: only `d == 1` (and `d` too wide) can, and the
+                        // general path is then the only path, so nothing is being compared.
+                        return;
+                    };
+                    assert_eq!(
+                        (smt::evaluate(q, |_| None), smt::evaluate(r, |_| None)),
+                        (Some(x / d), Some(x % d)),
+                        "{w}-bit {x} / {d}"
+                    );
+                });
+            }
+        }
+    }
+}
+
+/// The fast path is *symbolically* the same function as the general divider.
+///
+/// The concrete sweep above fixes `x`; this asks the engine to prove the two
+/// expressions equal with `x` free, which is the property that matters when the fast
+/// path is spliced into a body. A width where the general divider is still decidable is
+/// what makes the comparison possible at all -- the point is to pin the identity, not to
+/// stress the engine.
+#[test]
+fn the_unsigned_power_of_two_fast_path_is_the_divider_symbolically() {
+    on_big_stack(|| {
+        for d in [2u64, 4, 8] {
+            smt::with_fresh(|| {
+                let x = smt::var(4);
+                let (fq, fr) = smt::udivmod_pow2(x, d, 4).expect("a power of two in range");
+                let (gq, gr) = smt::divmod(x, smt::word(d, 4));
+                assert_eq!(
+                    smt::prove(smt::eq(fq, gq)),
+                    Verdict::Valid,
+                    "the shift quotient must equal the divider's for /{d}"
+                );
+                assert_eq!(
+                    smt::prove(smt::eq(fr, gr)),
+                    Verdict::Valid,
+                    "the mask remainder must equal the divider's for %{d}"
+                );
+            });
+        }
+    });
+}
+
+/// The signed fast path, pinned the same way: `sdivmod_pow2` is the signed divider.
+///
+/// The same two levels as the unsigned case, against Rust's truncating `/` and `%`. The
+/// negatives are the whole reason the signed path has a bias and a negation, so they are
+/// the values this test exists for.
+#[test]
+fn the_signed_power_of_two_fast_path_agrees_with_the_divider() {
+    for w in [4u8, 8] {
+        let min = -(1i64 << (w - 1));
+        let max = (1i64 << (w - 1)) - 1;
+        for d in [2i64, 4, -2, -4] {
+            for x in min..=max {
+                let bits = (x as u64) & ((1u64 << w) - 1);
+                let mask = (1u64 << w) - 1;
+                let trunc = |v: i64| -> u64 { (v as u64) & mask };
+                smt::with_fresh(|| {
+                    let Some((q, r)) = smt::sdivmod_pow2(smt::word(bits, w), d as i128, w) else {
+                        return;
+                    };
+                    assert_eq!(
+                        (smt::evaluate(q, |_| None), smt::evaluate(r, |_| None)),
+                        (Some(trunc(x / d)), Some(trunc(x % d))),
+                        "{w}-bit {x} / {d}"
+                    );
+                });
+            }
+        }
+    }
+}

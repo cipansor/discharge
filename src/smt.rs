@@ -2789,6 +2789,36 @@ pub fn sdivmod_pow2(x: Var, c: i128, w: u8) -> Option<(Var, Var)> {
     Some((quotient, remainder))
 }
 
+/// `x / 2^k` and `x % 2^k`, *unsigned*, as a logical shift and a mask.
+///
+/// The unsigned twin of [`sdivmod_pow2`], and it is simpler for the reason the signed one
+/// is expensive: there is no sign to fix up. Truncating division of an unsigned value by
+/// `2^k` *is* the logical shift `x >> k`, and the remainder is the low `k` bits, `x &
+/// (2^k - 1)`. No divider, no bias, no negation -- two operators.
+///
+/// This exists because the general [`divmod`] blasts a restoring divider whose term is
+/// ~`2 * w` deep, and an obligation that reads a *symbolic* dividend through it is refused
+/// for the size of the diagram: `requires: n <= 1000; n / 4` at `u64` was `incomplete` in
+/// ~0.9 s, while the same body with a signed `n` was already decided by the signed fast
+/// path. The shift identity costs a handful of terms.
+///
+/// `d >= 2` is required rather than `d >= 1`, matching [`sdivmod_pow2`]. It is a
+/// convenience and not a soundness need -- `x / 1` and `x % 1` are `x` and `0` for any
+/// unsigned `x`, with no overflow to worry about -- and leaving `1` to the general path
+/// keeps the two functions' guards identical. `d == 0` is excluded by the power-of-two
+/// test, so a division by zero never reaches here.
+pub fn udivmod_pow2(x: Var, d: u64, w: u8) -> Option<(Var, Var)> {
+    if d < 2 || !d.is_power_of_two() {
+        return None;
+    }
+    let k = d.trailing_zeros();
+    if k >= u32::from(w) {
+        return None;
+    }
+    // `d <= 2^(w-1)` for any `d` that fits in `w` bits, so `d - 1` is a `w`-bit mask.
+    Some((lshr(x, k), band(x, word(d - 1, w))))
+}
+
 /// `x / y` and `x % y`, unsigned, as a *restoring divider* built from the
 /// operators the engine already has.
 ///
