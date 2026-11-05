@@ -2737,6 +2737,31 @@ where
                                 dropped = true;
                             }
                         }
+                        // Elements of field-path arrays (`x.a[0]`) the callee wrote.
+                        // These live in their own store, keyed by the whole chain, so
+                        // the loop above never sees them: without this one a helper's
+                        // `x.a[0] = 9` died with the frame and the caller read its own
+                        // seed, so the false `ret == 5` was **proved** against a body
+                        // returning 9. A whole-local target re-bases the callee's chain
+                        // under the caller's local unchanged; a sub-place target whose
+                        // chain is a field chain prefixes it (`&mut o.i` makes the
+                        // callee's `_1.a[0]` the caller's `o.i.a[0]`), and one that is
+                        // not (an element target, `&mut x.a[0]`) has no representable
+                        // key, so the caller's parts go rather than a stale value being
+                        // kept.
+                        for ((l, chain, k), v) in st.env.elems_path.iter() {
+                            if *l != *cal {
+                                continue;
+                            }
+                            match &rest_chain {
+                                Some(rc) => {
+                                    let mut full = rc.clone();
+                                    full.extend_from_slice(chain);
+                                    env.elems_path.insert((cl, full, *k), *v);
+                                }
+                                None => dropped = true,
+                            }
+                        }
                         if dropped {
                             env.forget_parts(cl);
                         }
@@ -3154,6 +3179,19 @@ where
                             env.elems.insert((l, *k), *v);
                         }
                     }
+                    // Elements of field-path arrays (`o.a[0]`) are carried in for the
+                    // same reason the plain elements are: the callee's `(_1.0)[k]` is
+                    // the caller's `o.a[k]`, so a helper that *reads* one has to see
+                    // the caller's seed. Without this the callee read `Unknown`, and a
+                    // helper that wrote the element had its write die with the frame --
+                    // the caller read its own seed, so `requires: x.a[0] == 5;
+                    // ensures: ret == 5` on `set_first(x); x.a[0]` was **proved**
+                    // against a body that returns 9.
+                    for ((l0, chain, k), v) in st.env.elems_path.iter() {
+                        if *l0 == sl {
+                            env.elems_path.insert((l, chain.clone(), *k), *v);
+                        }
+                    }
                 } else if is_ref {
                     // A sub-place target whose own type is an aggregate: `&mut
                     // o.i`. The callee's `i.v` is the caller's `o.i.v`, so the
@@ -3190,6 +3228,22 @@ where
                                 _ => {
                                     env.nested.insert((l, rem.to_vec()), *v);
                                 }
+                            }
+                        }
+                        // Elements of field-path arrays under a sub-place target, the
+                        // same re-basing as the nested parts above: `&mut o.i` makes the
+                        // caller's `o.i.a[0]` the callee's `_1.a[0]`, so the chain has
+                        // the target's prefix dropped. Without this a helper that only
+                        // *reads* the element through its argument (`read_inner(&o.i)` ->
+                        // `i.a[0]`) saw `Unknown` and its contract was unreadable -- an
+                        // incompleteness where the true contract should decide.
+                        for ((l0, chain, k), v) in st.env.elems_path.iter() {
+                            if *l0 != sl || !chain.starts_with(&rc) {
+                                continue;
+                            }
+                            let rem = &chain[rc.len()..];
+                            if !rem.is_empty() {
+                                env.elems_path.insert((l, rem.to_vec(), *k), *v);
                             }
                         }
                     }

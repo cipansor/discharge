@@ -1688,6 +1688,47 @@ fn a_nested_field_array_element_is_one_word_for_contract_and_body() {
     );
 }
 
+/// A helper's write to a field-array element crosses back through a `&mut`, and the read
+/// crosses *in* through a `&`; both directions are pinned, with their false twins.
+///
+/// The callee's write lands in its own element store, so the caller's store has to be
+/// re-based on return -- for a whole-local target (`set_first_element(&mut x)`) unchanged,
+/// and for a sub-place target (`set_holder_first_element(&mut o.i)`) prefixed with the
+/// target's chain. Without either the write died with the frame, the caller read its seed,
+/// and the false `ret == 5` was **proved** against a body returning 9. The read direction is
+/// the same re-basing run the other way: `read_holder_first_element(&o.i)` reads the
+/// caller's `o.i.a[0]`, so its contract decides rather than being unreadable.
+#[test]
+fn a_field_array_element_crosses_a_reference_argument() {
+    let Some(report) = verify_realistic(&[
+        "a_helper_field_array_write_is_read_back",
+        "a_helper_field_array_write_is_not_the_seed",
+        "a_helper_nested_aggregate_element_write_is_read_back",
+        "a_helper_nested_aggregate_element_write_is_not_the_seed",
+        "a_helper_nested_aggregate_element_read",
+    ]) else {
+        return;
+    };
+    for name in [
+        "a_helper_field_array_write_is_read_back",
+        "a_helper_nested_aggregate_element_write_is_read_back",
+        "a_helper_nested_aggregate_element_read",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must decide and verify; got: {o}");
+    }
+    for name in [
+        "a_helper_field_array_write_is_not_the_seed",
+        "a_helper_nested_aggregate_element_write_is_not_the_seed",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "`{name}` claims the caller's seed after the helper wrote; must be refuted, got: {o}"
+        );
+    }
+}
+
 /// A helper's write-back covers a *nested* field and a read-modify-write, and the
 /// caller's field seed crosses *into* the callee so the callee's read is modelled.
 ///

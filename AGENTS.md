@@ -6139,6 +6139,19 @@ access. The symbolic subscript `(_1.0)[_4]` reads and writes the same store, and
 the run cannot pin poisons the path rather than guessing. Four entries with their false
 twins, pinned by `a_field_array_element_is_one_word_for_contract_and_body`.
 
+**A field-array element crosses a reference argument in both directions.** A helper's write
+to `x.a[0]` through a `&mut` lands in the *callee's* element store, so the caller's store has
+to be re-based on return: unchanged for a whole-local target (`set_first_element(&mut x)`),
+and prefixed with the target's chain for a sub-place one (`set_holder_first_element(&mut
+o.i)` makes the callee's `_1.a[0]` the caller's `o.i.a[0]`). Without the re-base the write
+died with the frame, the caller read its seed, and the false `ret == 5` was **proved** against
+a body returning 9. The read direction is the same re-base run the other way, on the way
+*in*: `read_holder_first_element(&o.i)` reads the caller's `o.i.a[0]`, so its contract
+decides rather than being unreadable. A by-value argument is deliberately *not* carried back
+(its writes die with the frame), and the sibling element of another array is untouched. Three
+entries with their false twins, pinned by
+`a_field_array_element_crosses_a_reference_argument`.
+
 **A scalar field crosses a reference argument.** A helper reading `d.v` through a
 `&DuoBox` and one writing it through a `&mut DuoBox` both decide: the referent's *parts*
 are carried in, so the callee's `d.v` resolves to the caller's `d.v`, and the write-back
@@ -6313,3 +6326,17 @@ parts under `_1` rather than tracking the sub-place -- precision is lost, never 
 value kept. A `&mut` target whose element the callee *did* write is still not copied back
 (a `&mut [T]` argument is the case that is); the caller's own store keeps the value it
 held, so the read is stale rather than unknown only when the caller never wrote it.
+
+**An array handed over *as* a reference target is incomplete, never wrong.** When the
+argument is the *array itself* rather than the whole local that holds it -- `set_first_of(&mut
+x.a)` or `peek_of(&x.a)`, a `&mut [u8; 4]` / `&[u8; 4]` whose target is the field `x.a` -- the
+callee's `(*_1)[0]` does not meet the caller's field-path element store. The contract is then
+reported *unreadable* (the read is unknown), so a function like this is *skipped* rather than
+decided: `set_first_of(&mut x.a); x.a[0]` is incomplete for both the true `ret == 9` and the
+false `ret == 5`. That is the honest direction -- nothing false is proved, and no stale value
+is kept -- but it is a coverage hole, not a modelled case. It predates the field-path work
+(confirmed unchanged against the previous commit) and is the next precision target: the store
+is keyed by the *chain*, and a reference target that is an array rather than an aggregate
+needs the chain to cross the frame as the element's own key, the same re-basing the aggregate
+targets already do. A whole-*local* array through `&mut` (`set_arr(&mut a); a[0]`) does
+decide, since the target has no projection and the store is keyed by the local alone.

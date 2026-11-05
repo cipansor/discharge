@@ -5900,3 +5900,73 @@ pub struct NestedArrays {
 pub struct ArrayHolder {
     pub a: [u8; 4],
 }
+
+/// A helper's write to a *field-array element* through `&mut` must cross back to the caller.
+///
+/// `set_first(x); x.a[0]` calls `set_first(&mut Boxed)` which stores `x.a[0] = 9`. The
+/// callee's write lands in `elems_path` under its own local, so the caller's store has to be
+/// re-based on return -- without that the write died with the frame and the caller read its
+/// *seed*, proving the false `ret == 5` against a body returning 9.
+///
+/// [`a_helper_field_array_write_is_not_the_seed`] is the false direction.
+/// requires: x.a[0] == 5
+/// ensures: ret == 9
+pub fn a_helper_field_array_write_is_read_back(x: &mut Boxed) -> u8 {
+    set_first_element(x);
+    x.a[0]
+}
+
+/// The false direction of the helper field-array write: the helper stores 9, so a claim of
+/// the caller's seed is refuted rather than proved.
+/// requires: x.a[0] == 5
+/// ensures: ret == 5
+pub fn a_helper_field_array_write_is_not_the_seed(x: &mut Boxed) -> u8 {
+    set_first_element(x);
+    x.a[0]
+}
+
+/// The helper that writes one field-array element through its `&mut` argument.
+fn set_first_element(x: &mut Boxed) {
+    x.a[0] = 9;
+}
+
+/// A helper handed a *nested aggregate* (`&mut o.i`) that writes an element of the array
+/// inside it: the callee's `_1.a[0]` is the caller's `o.i.a[0]`, so the write-back has to
+/// prefix the target's chain. The sibling `o.k` is left alone.
+///
+/// [`a_helper_nested_aggregate_element_write_is_not_the_seed`] is the false direction.
+/// requires: o.i.a[0] == 5
+/// ensures: ret == 9
+pub fn a_helper_nested_aggregate_element_write_is_read_back(mut o: NestedArrays) -> u8 {
+    set_holder_first_element(&mut o.i);
+    o.i.a[0]
+}
+
+/// The false direction of the nested-aggregate element write: the helper stores 9, so a
+/// claim of the seed is refuted rather than proved.
+/// requires: o.i.a[0] == 5
+/// ensures: ret == 5
+pub fn a_helper_nested_aggregate_element_write_is_not_the_seed(mut o: NestedArrays) -> u8 {
+    set_holder_first_element(&mut o.i);
+    o.i.a[0]
+}
+
+/// A helper handed a *shared* nested aggregate that only *reads* the array element: the
+/// caller's seed has to cross *into* the callee, or the callee's read is unknown and the
+/// true contract is unreadable rather than decided.
+/// requires: o.i.a[0] == 5
+/// ensures: ret == 5
+pub fn a_helper_nested_aggregate_element_read(mut o: NestedArrays) -> u8 {
+    read_holder_first_element(&o.i)
+}
+
+/// The reading helper: its argument is a `&ArrayHolder`, and `i.a[0]` is the caller's
+/// `o.i.a[0]`.
+fn read_holder_first_element(i: &ArrayHolder) -> u8 {
+    i.a[0]
+}
+
+/// The writing helper for a nested aggregate target: `i.a[0]` is the caller's `o.i.a[0]`.
+fn set_holder_first_element(i: &mut ArrayHolder) {
+    i.a[0] = 9;
+}
