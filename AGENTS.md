@@ -5919,8 +5919,19 @@ Corrupting `slt` to use the wrong sign case, corrupting the `ashr` sign-fill to 
 and making `ult` skip the top bit are each caught (`4-bit 0 < 8`, `4-bit 8 ashr at 4 bits`,
 `4-bit 0 <= 8`).
 
+**`ite` and the divider, through `prove`.** `ite` reads its condition differently in the two
+evaluators -- `blast` selects on `c[0]`, the folder branches on `c != 0` -- so both arms are
+swept with the condition true and false; swapping the arms is caught at `1-bit 0 ite-taken`.
+The divider is *built* from primitives rather than being an `Op`, so there is no second arm to
+compare against, but the built circuit is what `prove` reasons over and is a different object
+from the folder that reads the same term: it is now asked point by point at widths 1, 2 and 4,
+and asked its defining identity (`x == q * y + r`, and `y != 0 => r < y`) as a single validity
+query. Width 1 is the important one -- `divmod` has a *separate* implementation there (`x & y`
+and `x & !y`) with its own `y == 0` case, and the first version of the test asked only 4.
+Dropping that `y == 0` case is caught at `1-bit 0 / 0`.
+
 **Evidence.** Corpus `decided 181 of 333` -> **`256 of 476`**; `cargo test --workspace
---features std` **608 -> 647** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
+--features std` **608 -> 650** passed, 0 failed, on both `1.99.1` and the MSRV `1.85.1`;
 `cargo clippy --workspace --features std --all-targets -- -D warnings` clean;
 `scripts/gate.sh` green (bare-metal build, zero-dependency and no_std gates included), z3
 `mismatch=0`, kani `mismatch=0`. Zero dependencies and `no_std` untouched.

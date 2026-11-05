@@ -205,28 +205,30 @@ fn bxor_agrees_between_the_two_evaluators() {
     });
 }
 
-/// A unary operator, checked the same two ways.
+/// Check one unary term at one point: `evaluate` against `blast`, both against `want`.
 ///
-/// `op` maps a variable to a term at the *result* width, so the comparison is against
-/// the operator's own semantics at that width rather than at the input's.
-fn agree_at_unary(
+/// `build` is given the input variable and returns the term under test, so the caller
+/// spells the operator out rather than threading its parameters through this helper. An
+/// earlier version took `(out_w, arg)` and passed `arg` for the shifts and `0` for the
+/// casts, which meant two of the three call sites carried a parameter they had no use
+/// for -- a signature that described the caller's accident rather than the check.
+fn agree_unary(
     w: u8,
     out_w: u8,
     x: u64,
     name: &str,
-    op: fn(smt::Var, u8, u32) -> smt::Var,
     want: u64,
-    arg: u32,
+    build: impl Fn(smt::Var) -> smt::Var,
 ) {
     let in_mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
     let out_mask = if out_w >= 64 { u64::MAX } else { (1u64 << out_w) - 1 };
     let x = x & in_mask;
     let want = want & out_mask;
-    let folded = smt::with_fresh(|| smt::evaluate(op(smt::var(w), out_w, arg), |_| Some(x)));
+    let folded = smt::with_fresh(|| smt::evaluate(build(smt::var(w)), |_| Some(x)));
     let verdict = smt::with_fresh(|| {
         let a = smt::var(w);
         let pinned = smt::eq(a, smt::word(x, w));
-        let term = op(a, out_w, arg);
+        let term = build(a);
         smt::prove(smt::or(smt::not(pinned), smt::eq(term, smt::word(want, out_w))))
     });
     assert_eq!(
@@ -253,13 +255,13 @@ fn truncate_agrees_between_the_two_evaluators() {
         for out_w in [1u8, 2, 3] {
             let out_mask = (1u64 << out_w) - 1;
             for x in 0..16u64 {
-                agree_at_unary(4, out_w, x, "truncate", |a, ow, _| smt::truncate(a, ow), x & out_mask, 0);
+                agree_unary(4, out_w, x, "truncate", x & out_mask, |a| smt::truncate(a, out_w));
             }
         }
         // Widening: zero-fill, which must *not* replicate the sign bit.
         for out_w in [5u8, 8, 16] {
             for x in 0..16u64 {
-                agree_at_unary(4, out_w, x, "truncate", |a, ow, _| smt::truncate(a, ow), x, 0);
+                agree_unary(4, out_w, x, "truncate", x, |a| smt::truncate(a, out_w));
             }
         }
     });
@@ -283,7 +285,7 @@ fn sign_extend_agrees_between_the_two_evaluators() {
                 } else {
                     x
                 };
-                agree_at_unary(4, wide, x, "sign_extend", |a, ow, _| smt::sign_extend(a, ow), want, 0);
+                agree_unary(4, wide, x, "sign_extend", want, |a| smt::sign_extend(a, wide));
             }
         }
     });
@@ -389,11 +391,125 @@ fn constant_shifts_agree_past_the_width() {
                     } else {
                         x >> k
                     };
-                    agree_at_unary(4, w, x, "shl", |a, _, k| smt::shl(a, k), want_shl, k);
-                    agree_at_unary(4, w, x, "lshr", |a, _, k| smt::lshr(a, k), want_lshr, k);
-                    agree_at_unary(4, w, x, "ashr", |a, _, k| smt::ashr(a, k), want_ashr, k);
+                    agree_unary(4, w, x, "shl", want_shl, |a| smt::shl(a, k));
+                    agree_unary(4, w, x, "lshr", want_lshr, |a| smt::lshr(a, k));
+                    agree_unary(4, w, x, "ashr", want_ashr, |a| smt::ashr(a, k));
                 }
             }
+        }
+    });
+}
+
+/// `ite` has an arm in each evaluator, and the two read the condition differently.
+///
+/// `blast` selects on `c[0]`, the condition's low bit; `evaluate` branches on `c != 0`.
+/// Those agree for a one-bit condition, which is what `Pred` is, but the two spellings
+/// are a real place for a divergence to hide, so both branches are swept over the whole
+/// 4-bit domain of the arms with the condition true and false.
+#[test]
+fn ite_agrees_between_the_two_evaluators() {
+    on_big_stack(|| {
+        for w in [1u8, 4] {
+            let mask = (1u64 << w) - 1;
+            for cond in [false, true] {
+                for t in 0..=mask {
+                    for e in 0..=mask {
+                        let want = if cond { t } else { e };
+                        agree_unary(w, w, t, "ite-taken", want, |tv| {
+                            smt::ite(smt::truth(cond), tv, smt::word(e, w))
+                        });
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// The divider through `prove`, not just through the folder.
+///
+/// `tests/divmod.rs` and the `division_agrees_with_rusts_own` test above both go through
+/// `evaluate`. The divider is *built* from primitives, so there is no second `Op::Div`
+/// arm to compare against -- but the built circuit is what `prove` reasons over, and a
+/// circuit is a different object from the folder that reads the same term. This asks
+/// `prove` directly, at every point, so the circuit itself is checked rather than the
+/// arithmetic it was built from.
+#[test]
+fn division_agrees_through_prove() {
+    on_big_stack(|| {
+        // `1` is not padding: `divmod` has a *separate* implementation for width 1 (the
+        // quotient is `x & y`, the remainder `x & !y`), so the narrowest width is where a
+        // divergence between the two implementations would live, and the first version of
+        // this test only asked 4.
+        for w in [1u8, 2, 4] {
+            let mask = (1u64 << w) - 1;
+            for x in 0..=mask {
+                for y in 0..=mask {
+                    let (want_q, want_r) = if y == 0 { (mask, x) } else { (x / y, x % y) };
+                    smt::with_fresh(|| {
+                        let a = smt::var(w);
+                        let b = smt::var(w);
+                        let pinned =
+                            smt::and(smt::eq(a, smt::word(x, w)), smt::eq(b, smt::word(y, w)));
+                        assert_eq!(
+                            smt::prove(smt::or(
+                                smt::not(pinned),
+                                smt::eq(smt::udiv(a, b), smt::word(want_q, w))
+                            )),
+                            Verdict::Valid,
+                            "{w}-bit {x} / {y}: the divider circuit disagreed with {want_q}"
+                        );
+                        assert_eq!(
+                            smt::prove(smt::or(
+                                smt::not(pinned),
+                                smt::eq(smt::urem(a, b), smt::word(want_r, w))
+                            )),
+                            Verdict::Valid,
+                            "{w}-bit {x} % {y}: the divider circuit disagreed with {want_r}"
+                        );
+                    });
+                }
+            }
+        }
+    });
+}
+
+/// The divider's own defining identity, which holds for *every* input and so can be
+/// asked as a single validity query rather than point by point.
+///
+/// `x == q * y + r` with `r < y` is what makes a divider a divider. Asking it this way
+/// exercises the circuit on the whole domain at once, and it is the property the
+/// frontend's `%` and `/` obligations reduce to.
+#[test]
+fn the_divider_satisfies_its_defining_identity() {
+    on_big_stack(|| {
+        // `1` and `2` cover the width-1 fast path and the smallest general path.
+        for w in [1u8, 2, 4] {
+            smt::with_fresh(|| {
+                let x = smt::var(w);
+                let y = smt::var(w);
+                let (q, r) = smt::divmod(x, y);
+                // Reconstruct: `q * y + r == x`. The divider defines `y == 0` as
+                // quotient all-ones and remainder the dividend, and `q * y + r` is `x`
+                // there too, so the identity needs no exception for zero.
+                let recon = smt::add(smt::mul(q, y), r);
+                assert_eq!(
+                    smt::prove(smt::eq(recon, x)),
+                    Verdict::Valid,
+                    "{w}-bit: q * y + r != x"
+                );
+                // And the remainder is below the divisor whenever the divisor is not
+                // zero, which is the half that constrains the quotient. Spelled as an
+                // `implies` rather than as a disjunction: `A => B` is `!A | B`, and the
+                // first version of this wrote `A | B` with `A` the *non*-zero guard,
+                // which is the implication's consequent-side error and was reported as a
+                // counterexample at `y == 0` -- the one point the guard exists to excuse.
+                let nonzero = smt::not(smt::eq(y, smt::word(0, w)));
+                assert_eq!(
+                    smt::prove(smt::implies(nonzero, smt::ult(r, y))),
+                    Verdict::Valid,
+                    "{w}-bit: y != 0 => r < y failed"
+                );
+            });
         }
     });
 }
