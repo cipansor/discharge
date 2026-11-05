@@ -5199,10 +5199,15 @@ fn a_transitive_pin_chain_folds_the_body() {
     };
     let good = outcome(&report, "a_transitive_pin_chain_folds_the_body");
     assert!(good.is_verified(), "a transitive pin chain must fold the body; got: {good}");
+    // The negative must be *refuted*, not merely "not verified". A refusal and a
+    // counterexample are both "not verified", and only the second is evidence the
+    // rewrite did anything: the point of rewriting the pins into the path is that the
+    // multiply leaves the assumption and the false claim becomes decidable. Asserting
+    // the weaker property would let a regression back to `incomplete` pass.
     let bad = outcome(&report, "a_transitive_pin_chain_cannot_prove_this");
     assert!(
-        !bad.is_verified(),
-        "a false claim about a transitively pinned chain must be refuted; got: {bad}"
+        matches!(bad, FnOutcome::Failed { .. }),
+        "a false claim about a transitively pinned chain must be refuted, not refused; got: {bad}"
     );
 }
 

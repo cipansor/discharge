@@ -1633,7 +1633,7 @@ where
             break;
         }
         explored += 1;
-        run_state(prog, st, &post, &mut report, &mut work);
+        run_state(prog, st, &post, &mut report, &mut work, &seeds.pins);
     }
     report
 }
@@ -1781,6 +1781,90 @@ fn eval_invariant_here(f: &MirFn, env: &Env, text: &str) -> Result<Pred, String>
     crate::mir::spec::eval_invariant(text, &names, &signed_names(f)).map_err(|e| e.to_string())
 }
 
+/// The `(variable, literal)` bindings for the pins, masked to each variable's width.
+///
+/// A pin records a *bit pattern*, not a signed number: `-7` at eight bits is `249`. The
+/// width comes from the variable's own declaration ([`smt::var_width`]), so the literal is
+/// the same term the seeding uses. A pin whose variable is not declared in this context is
+/// skipped: there is no width to mask to, and a wrong width would substitute a term of the
+/// wrong size.
+fn pin_bindings(pins: &[(u32, u64)]) -> Vec<(Var, Var)> {
+    pins.iter()
+        .filter_map(|&(idx, k)| {
+            let w = smt::var_width(idx);
+            if w == 0 {
+                return None;
+            }
+            let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+            Some((smt::var_named(idx, w), smt::word(k & mask, w)))
+        })
+        .collect()
+}
+
+/// Apply the precondition's pins to a path and the goal built over it, at one obligation.
+///
+/// A pin is a *forced* value: the precondition entails `v == k`, so rewriting `v` to `k`
+/// throughout `(P => Q)` gives `(P[v:=k] => Q[v:=k])`, which has the same truth value --
+/// a model of `!P` restricts, and a model of `!P[v:=k]` extends by `v := k`. The rewrite is
+/// therefore an equivalence: it can turn a refusal into a proof or a refutation, and it can
+/// never manufacture a verdict.
+///
+/// It is applied to the *whole path* and not to the precondition alone, and that is the
+/// load-bearing part. The executor's path is not just the precondition: a `match` on an enum
+/// tag, an `assert`, a branch each conjoin their own constraint. Rewriting only the
+/// precondition would drop the relation between the tag and the value the pin gives it --
+/// `m == Mode::Run` pins the tag to `2`, and a path that then splits on `tag == 0` is
+/// infeasible *because* the pin says `2`. Rewriting the path keeps every split and every
+/// pin, and takes the deep term (`c == b * 2`) out of the assumption the diagram is built
+/// over. See [`crate::smt::pinned_vars`].
+fn pinned_pair(path: Pred, goal: Pred, pins: &[(u32, u64)]) -> (Pred, Pred) {
+    if pins.is_empty() {
+        return (path, goal);
+    }
+    let bindings = pin_bindings(pins);
+    if bindings.is_empty() {
+        return (path, goal);
+    }
+    (smt::substitute(path, &bindings), smt::substitute(goal, &bindings))
+}
+
+/// Decide `path => goal`, retrying with the pins rewritten in only if the engine refuses.
+///
+/// The unrewritten query is tried first and its answer is kept whenever it is decided. That
+/// ordering is what preserves the *witness*: the rewrite removes the pinned variables, so a
+/// counterexample found under it cannot name the input, and the counterexample is the more
+/// useful answer. The fallback exists for the one case the rewrite is for -- an `Unknown`
+/// the pins can lift -- and [`pinned_pair`] is an equivalence, so a decided answer from the
+/// retry is the same answer the first attempt would have given had it been able to decide.
+fn prove_obligation(path: Pred, goal: Pred, pins: &[(u32, u64)]) -> Verdict {
+    let v = smt::prove_implies(path, goal);
+    if !matches!(v, Verdict::Unknown) || pins.is_empty() {
+        return v;
+    }
+    let (path, goal) = pinned_pair(path, goal, pins);
+    let v2 = smt::prove_implies(path, goal);
+    if matches!(v2, Verdict::Unknown) {
+        v
+    } else {
+        v2
+    }
+}
+
+/// [`smt::find_model`] with the same pins fallback as [`prove_obligation`].
+fn find_obligation(path: Pred, pins: &[(u32, u64)]) -> Verdict {
+    let v = smt::find_model(path);
+    if !matches!(v, Verdict::Unknown) || pins.is_empty() {
+        return v;
+    }
+    let (path, _) = pinned_pair(path, smt::truth(true), pins);
+    let v2 = smt::find_model(path);
+    if matches!(v2, Verdict::Unknown) {
+        v
+    } else {
+        v2
+    }
+}
+
 /// Push the successor states of an edge to `target`, applying the loop cut when
 /// this edge enters the invariant's header.
 ///
@@ -1793,6 +1877,7 @@ fn advance(
     target: usize,
     report: &mut MirReport,
     work: &mut Vec<State>,
+    pins: &[(u32, u64)],
 ) {
     let cut = match st.cut.clone() {
         Some(c) if c.func == st.frame.func && c.header == target => c,
@@ -1817,7 +1902,7 @@ fn advance(
     };
     report.obligations.push(Obligation {
         kind,
-        verdict: smt::prove_implies(st.path, inv),
+        verdict: prove_obligation(st.path, inv, pins),
     });
     // The cut closes here. A back edge is not followed: the assertion above is
     // the induction step, and re-entering the header would be the unwinding this
@@ -2045,7 +2130,14 @@ fn operand_width(f: &MirFn, o: &Operand) -> Option<u8> {
     }
 }
 
-fn run_state<F>(prog: &MirProgram, mut st: State, post: &Option<F>, report: &mut MirReport, work: &mut Vec<State>)
+fn run_state<F>(
+    prog: &MirProgram,
+    mut st: State,
+    post: &Option<F>,
+    report: &mut MirReport,
+    work: &mut Vec<State>,
+    pins: &[(u32, u64)],
+)
 where
     F: Fn(Option<Var>, &[(u32, Var)]) -> Result<Pred, String>,
 {
@@ -2135,7 +2227,7 @@ where
     // Terminator. Every successor goes through `advance`, which is where a loop
     // edge into the invariant's header is checked instead of followed.
     match &block.term {
-        Term::Goto(b) => advance(prog, st, *b, report, work),
+        Term::Goto(b) => advance(prog, st, *b, report, work, pins),
         Term::Return => {
             let ret = st.env.get(&Place::new(0));
             match st.frame.caller.take() {
@@ -2210,10 +2302,9 @@ where
                         };
                         match post(rv, &projs) {
                             Ok(p) => {
-                                let v = smt::prove_implies(st.path, p);
                                 report.obligations.push(Obligation {
                                     kind: ObligationKind::Postcondition,
-                                    verdict: v,
+                                    verdict: prove_obligation(st.path, p, pins),
                                 });
                             }
                             Err(e) => report
@@ -2474,7 +2565,7 @@ where
         Term::Unreachable => {
             report.obligations.push(Obligation {
                 kind: ObligationKind::Unreachable,
-                verdict: smt::find_model(st.path),
+                verdict: find_obligation(st.path, pins),
             });
         }
         Term::Assert { cond, negated, msg, target, .. } => {
@@ -2498,7 +2589,7 @@ where
             let bad = smt::and(st.path, smt::not(satisfied));
             report.obligations.push(Obligation {
                 kind: ObligationKind::Panic { message: msg.clone() },
-                verdict: smt::find_model(bad),
+                verdict: find_obligation(bad, pins),
             });
             // An assert that did *not* fire is an assumption, and the fall-through
             // path has to carry it. Without this the guard is discarded, which is
@@ -2511,7 +2602,7 @@ where
             // terminator, so the guard is assumed for either.
             let path = smt::and(st.path, satisfied);
             let next = State { block: *target, path, ..st };
-            advance(prog, next, *target, report, work);
+            advance(prog, next, *target, report, work, pins);
         }
         Term::SwitchInt { discr, cases, otherwise } => {
             let d = operand(&mut st.env, discr);
@@ -2543,7 +2634,7 @@ where
                     depth: st.depth,
                     cut: st.cut.clone(),
                 };
-                advance(prog, next, *target, report, work);
+                advance(prog, next, *target, report, work, pins);
             }
             let mut negs = Vec::new();
             for (k, _) in cases {
@@ -2564,7 +2655,7 @@ where
                 depth: st.depth,
                 cut: st.cut.clone(),
             };
-            advance(prog, next, *otherwise, report, work);
+            advance(prog, next, *otherwise, report, work, pins);
         }
         Term::Call { callee, args, dest, target } => {
             let Callee::Name(name) = callee else {
@@ -2598,7 +2689,7 @@ where
                             return;
                         }
                     };
-                    advance(prog, next, *target, report, work);
+                    advance(prog, next, *target, report, work, pins);
                     return;
                 }
             }

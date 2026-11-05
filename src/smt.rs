@@ -769,6 +769,15 @@ impl Ctx {
         self.terms[t.slot()].width
     }
 
+    /// The declared width of variable `idx`, or 0 when it was never declared.
+    pub(crate) fn var_width_at(&self, idx: u32) -> u8 {
+        if (idx as usize) < MAX_VARS {
+            self.var_width[idx as usize]
+        } else {
+            0
+        }
+    }
+
     /// Read a term's node. Exposed to the crate so the SMT-LIB exporter can walk
     /// the same IR the solver reasons about, instead of re-deriving it.
     pub(crate) fn node_pub(&mut self, t: Term) -> Node {
@@ -2274,6 +2283,16 @@ pub fn bits(v: Var) -> u8 {
     with_ctx(|c| c.width_of(v.0))
 }
 
+/// The declared width of variable `idx`, or 0 when it was never declared.
+///
+/// A pin ([`pinned_vars`]) is keyed by variable index and carries a bit pattern rather
+/// than a width, so a caller that rebuilds the pinned variable as a literal needs the width
+/// it was declared at. Zero means "no such variable", which lets a caller skip a pin whose
+/// variable is not part of the query.
+pub fn var_width(idx: u32) -> u8 {
+    with_ctx(|c| c.var_width_at(idx))
+}
+
 /// Evaluate a term under a concrete assignment, if every input is known.
 ///
 /// This is the concrete semantics of the symbolic language, and it exists so that a
@@ -3595,6 +3614,19 @@ mod pin_tests {
             let a = var_named(1, 8);
             let p = or(eq_const(a, 1), eq_const(a, 2));
             assert!(pins(p).is_empty(), "a disjunction of two values is not a pin");
+        });
+    }
+
+    /// A variable's declared width is readable by index, and an index never declared
+    /// reports zero -- which is what lets a caller skip a pin it cannot rebuild.
+    #[test]
+    fn var_width_reports_the_declared_width_or_zero() {
+        with_fresh(|| {
+            let _ = var_named(1, 8);
+            let _ = var_named(3, 64);
+            assert_eq!(var_width(1), 8);
+            assert_eq!(var_width(3), 64);
+            assert_eq!(var_width(2), 0, "an undeclared index has no width");
         });
     }
 
