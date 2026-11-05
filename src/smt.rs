@@ -1056,8 +1056,72 @@ impl Ctx {
         }
     }
 
+    /// Constant-fold a word operation, so a term whose operands are both literals
+    /// collapses to the literal it denotes.
+    ///
+    /// This is a capability fix, not a speed one. A frontend reads real code, and a
+    /// constant operand there is the rule rather than the exception: a scaled index
+    /// (`i * 4`), a masked flag (`x & 0xff`), a remainder by a literal (`n % 10`).
+    /// Without the fold every one of those builds its full circuit -- `n % 10` at 64
+    /// bits is a restoring divider, ~262 terms deep -- and the query is refused for
+    /// being *too big to pose* even when both operands are known. The `-7 / 3` case
+    /// that motivated this is the extreme: every input is a literal and the answer
+    /// was still `Unknown`, because the divider was blasted and then walked.
+    ///
+    /// Folding is what keeps a query *small* when it is not *interesting*: a
+    /// division whose dividend is pinned to a literal by a precondition becomes a
+    /// single constant, and the obligation that mentions it collapses with it.
+    ///
+    /// Sound because the fold is the operator's own definition -- the same
+    /// `wrapping_*` on the same masked values `eval_term_body` uses -- applied to a
+    /// pair that has one value each. `None` when either operand is not a literal,
+    /// or when the widths disagree (`require_same_width` reports that, as it does
+    /// for the unfolded path).
+    ///
+    /// `0 - x` is the one subtraction deliberately left unfolded. There is no unary
+    /// negation in the term language, so a negation is *spelled* `0 - x`, and the
+    /// frontend keys its literal-range bookkeeping on that node being distinct from
+    /// the literal it negates: `-128` for an `i8` is legal while the bare literal
+    /// `128` is not, and both are the same eight bits, so the only thing that tells
+    /// them apart is that one is a `Sub` node and the other a `Const`. Folding the
+    /// negation to the literal merges the two and refuses `-128`. Every other
+    /// subtraction still folds, including the `x - y` the restoring divider is
+    /// built from.
+    fn const_fold_word(&mut self, op: Op, a: Term, b: Term) -> Option<Term> {
+        let na = self.node_of(a);
+        if na.op != Op::Const {
+            return None;
+        }
+        let nb = self.node_of(b);
+        if nb.op != Op::Const {
+            return None;
+        }
+        if na.width != nb.width {
+            return None;
+        }
+        let w = na.width;
+        let x = self.const_of(a);
+        let y = self.const_of(b);
+        if op == Op::Sub && x == 0 {
+            return None;
+        }
+        let v = match op {
+            Op::Add => x.wrapping_add(y),
+            Op::Sub => x.wrapping_sub(y),
+            Op::Mul => x.wrapping_mul(y),
+            Op::And => x & y,
+            Op::Or => x | y,
+            Op::Xor => x ^ y,
+            _ => return None,
+        };
+        Some(self.konst(v, w))
+    }
+
     fn bin_word(&mut self, op: Op, a: Term, b: Term) -> Term {
         self.require_same_width(a, b, "binary word operation");
+        if let Some(t) = self.const_fold_word(op, a, b) {
+            return t;
+        }
         let w = self.width_of(a);
         self.mk_term(Node { op, a: a.0, b: b.0, c: 0, width: w, hi: 0 })
     }
@@ -1223,6 +1287,31 @@ impl Ctx {
 
     fn cmp(&mut self, op: Op, a: Term, b: Term) -> Term {
         self.require_same_width(a, b, "comparison");
+        // Two literals compare to a literal, and the result is a *predicate*: a
+        // one-bit constant, not one carrying the operand width. That distinction is
+        // the whole point of the fold -- a comparison node stores its operands'
+        // width (`Op::Eq` on two `u32` has width 32) even though it denotes one bit,
+        // so leaving the folded node wide would hand a later width check a term of
+        // the wrong shape. Returning the one-bit constant is what the blaster would
+        // have computed, in one node instead of a chain of XOR/AND gates.
+        //
+        // This is what lets a *constant* dividend fold all the way through the
+        // restoring divider: the loop's `ule(y, rem)` compares two literals at every
+        // step, so with this fold the whole divider collapses to the quotient instead
+        // of building `w` stages of adder and mux.
+        let na = self.node_of(a);
+        let nb = self.node_of(b);
+        if na.op == Op::Const && nb.op == Op::Const && na.width == nb.width {
+            let x = self.const_of(a);
+            let y = self.const_of(b);
+            let r = match op {
+                Op::Eq => x == y,
+                Op::Ult => x < y,
+                Op::Ule => x <= y,
+                _ => false,
+            };
+            return self.konst(u64::from(r), 1);
+        }
         let w = self.width_of(a);
         self.mk_term(Node { op, a: a.0, b: b.0, c: 0, width: w, hi: 0 })
     }
@@ -1248,6 +1337,16 @@ impl Ctx {
     }
 
     /// Change a term's width, keeping the low bits and zero-filling any new ones.
+    ///
+    /// Deliberately *not* constant-folded, though the value is computable. The
+    /// frontend spells a *named* bound (`i8::MIN`) as `truncate(word(k, 64), w)`
+    /// precisely so that it does *not* hash-cons with the literal `word(k, w)`:
+    /// `i8::MIN` and `128i8` are the same eight bits, and the literal-range
+    /// bookkeeping keys on the term id to tell a legal bound from an illegal
+    /// literal. Folding a literal through `Trunc` merges the two and makes
+    /// `y == i8::MIN` inherit `128i8`'s out-of-range envelope, so a valid contract
+    /// is refused. Nothing is lost by leaving it: the folds that carry the
+    /// divider's constant path are in [`Self::cmp`] and [`Self::bin_word`].
     fn trunc(&mut self, a: Term, width: u8) -> Term {
         let src = self.width_of(a);
         self.mk_term(Node {
@@ -2714,6 +2813,22 @@ pub fn sdivmod_pow2(x: Var, c: i128, w: u8) -> Option<(Var, Var)> {
 /// frontend does, because `rustc` emits that assert for them.
 pub fn divmod(x: Var, y: Var) -> (Var, Var) {
     let w = bits(x);
+    // Two literals divide to two literals. The restoring loop below is *exact*, so
+    // this is not a shortcut past the semantics -- it is the same answer the loop
+    // computes, reached without building `w` stages of adder and mux. That matters
+    // because the loop is what makes the query too big to *pose* when nothing about
+    // it is unknown: `-7 / 3` under `requires: a == -7` is a query with no symbolic
+    // input at all, and it was reported `Unknown` purely for the size of its own
+    // circuit. `y == 0` keeps the same defined result as the general path.
+    if let (Some(xv), Some(yv)) = (const_of(x), const_of(y)) {
+        let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let xv = xv & mask;
+        let yv = yv & mask;
+        if yv == 0 {
+            return (all_ones(w), word(xv, w));
+        }
+        return (word(xv / yv, w), word(xv % yv, w));
+    }
     if w == 1 {
         // 1-bit: for a nonzero divisor the quotient is `x & y` and the remainder
         // is `x & !y`. The `y == 0` case still has to go through the same
@@ -2765,6 +2880,21 @@ pub fn urem(x: Var, y: Var) -> Var {
     divmod(x, y).1
 }
 
+/// Interpret the low `w` bits of `v` as a two's-complement signed value.
+///
+/// Used only by the constant path of [`sdivmod`]; the symbolic path never needs it
+/// because the sign lives in the bit pattern and the circuits handle it.
+fn signed_value(v: u64, w: u8) -> i128 {
+    let masked = if w >= 64 { v } else { v & ((1u64 << w) - 1) };
+    if w >= 64 {
+        masked as i64 as i128
+    } else if masked & (1u64 << (w - 1)) != 0 {
+        masked as i128 - (1i128 << w)
+    } else {
+        masked as i128
+    }
+}
+
 /// `x / y` and `x % y`, *signed*, two's complement, truncating toward zero.
 ///
 /// The unsigned divider computes a non-negative quotient from non-negative
@@ -2780,6 +2910,34 @@ pub fn urem(x: Var, y: Var) -> Var {
 /// nonzero divisor here, so the two holes are independent.
 pub fn sdivmod(x: Var, y: Var) -> (Var, Var) {
     let w = bits(x);
+    // Two literals divide to two literals, signed and truncating toward zero --
+    // Rust's own `/` and `%` on `i128`, which is exact for every width the engine
+    // models. The general path below is the definition; this is that definition
+    // reached without building the magnitudes, the divider and the sign fixups.
+    // Without it a *fully literal* query such as `-7 / 3` still builds the whole
+    // circuit, and the circuit is what gets the query refused for size rather than
+    // for anything being unknown. The three special cases are the general path's:
+    // `y == 0` is all-ones with the dividend as remainder, and `MIN / -1` is `MIN`.
+    if let (Some(xv), Some(yv)) = (const_of(x), const_of(y)) {
+        let sx = signed_value(xv, w);
+        let sy = signed_value(yv, w);
+        if sy == 0 {
+            return (all_ones(w), x);
+        }
+        let min = -(1i128 << (w - 1));
+        if sx == min && sy == -1 {
+            return (word(1u64 << (w - 1), w), word(0, w));
+        }
+        // Mask before `word`: a negative quotient is a full-width two's-complement
+        // pattern, and `word` rejects a value that does not fit its width -- the
+        // check that catches a caller's modelling mistake. The pattern is the
+        // answer here, so it is narrowed to the width it denotes rather than
+        // handed over un-masked.
+        let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let q = (sx / sy) as u64 & mask;
+        let r = (sx % sy) as u64 & mask;
+        return (word(q, w), word(r, w));
+    }
     let zero = word(0, w);
     let nx = negative(x);
     let ny = negative(y);
@@ -2848,10 +3006,9 @@ pub fn mul_eq(x: Var, y: Var, z: Var) -> Pred {
 /// *constant* amount on the cheap `Op::Shl` path instead of paying for a barrel
 /// shifter; both paths agree, but only one of them is free. `pow_fold` uses it for
 /// the same reason: a constant exponent lets the fold skip the steps that cannot
-/// run instead of building them behind a zero gate. Gated on `std` because the
-/// frontend that calls it is: without it this is dead code, and the bare-metal
-/// gate builds with warnings denied.
-#[cfg(feature = "std")]
+/// run instead of building them behind a zero gate. The divider's constant paths
+/// ([`divmod`], [`sdivmod`]) use it too, which is why it is *not* gated on `std`:
+/// those run at every build, including bare metal.
 pub(crate) fn const_of(v: Var) -> Option<u64> {
     with_ctx(|c| {
         let n = c.node_of(v.0);
@@ -3020,6 +3177,13 @@ pub fn ite(c: Pred, t: Var, e: Var) -> Var {
     with_ctx(|c_| {
         c_.require_same_width(t.0, e.0, "ite branches");
         let w = c_.width_of(t.0);
+        // A literal condition selects a branch: the term is that branch, not a mux
+        // with a constant selector. This is what lets a constant-pinned dividend
+        // reach the divider's constant path instead of building the general loop.
+        let cn = c_.node_of(c.0);
+        if cn.op == Op::Const {
+            return if c_.const_of(c.0) != 0 { t } else { e };
+        }
         Var(c_.mk_term(Node { op: Op::Ite, a: c.0.0, b: t.0.0, c: e.0.0, width: w, hi: 0 }))
     })
 }
@@ -3271,6 +3435,155 @@ mod word_tests {
         // And it does not trip the out-of-range check.
         with_fresh(|| {
             assert_eq!(prove(eq_const(all_ones(8), 255)), Verdict::Valid);
+        });
+    }
+}
+
+#[cfg(test)]
+mod const_fold_tests {
+    use super::*;
+
+    /// A predicate read as a word, for the folds that produce one.
+    fn pv(p: Pred) -> Var {
+        Var(p.0)
+    }
+
+    /// A word operation on two literals collapses to the literal, and the value is
+    /// the operator's own wrapping definition.
+    #[test]
+    fn a_word_operation_on_two_literals_is_the_literal() {
+        with_fresh(|| {
+            let a = word(200, 8);
+            let b = word(100, 8);
+            // `200 + 100` wraps to `44` at eight bits, exactly as `eval_term_body` says.
+            assert_eq!(const_of(add(a, b)), Some(44));
+            assert_eq!(const_of(sub(a, b)), Some(100));
+            assert_eq!(const_of(mul(a, b)), Some(32));
+            assert_eq!(const_of(band(word(0xf0, 8), word(0x3c, 8))), Some(0x30));
+            assert_eq!(const_of(bor(word(0xf0, 8), word(0x0f, 8))), Some(0xff));
+            assert_eq!(const_of(bxor(word(0xff, 8), word(0x0f, 8))), Some(0xf0));
+        });
+    }
+
+    /// A comparison of two literals is a *one-bit* constant, not one carrying the
+    /// operand width. A comparison node stores its operands' width even though it
+    /// denotes one bit, and a folded node left wide would hand a later width check a
+    /// term of the wrong shape -- the bug the `un_bool` guard exists for.
+    #[test]
+    fn a_comparison_of_two_literals_is_one_bit() {
+        with_fresh(|| {
+            let lt = ult(word(3, 32), word(5, 32));
+            assert_eq!(const_of(pv(lt)), Some(1));
+            assert_eq!(bits(pv(lt)), 1, "a folded comparison must be one bit wide");
+            let eq = eq(word(4, 64), word(9, 64));
+            assert_eq!(const_of(pv(eq)), Some(0));
+            assert_eq!(bits(pv(eq)), 1, "a folded comparison must be one bit wide");
+            let le = ule(word(5, 8), word(5, 8));
+            assert_eq!(const_of(pv(le)), Some(1));
+        });
+    }
+
+    /// The whole point of the fold: a query with no symbolic input at all is
+    /// *decided*, at every width, instead of being refused for the size of its own
+    /// circuit. `sdiv(-7, 3)` is `-2` -- `prove` on a closed formula must not be
+    /// `Unknown` merely because the formula is a divider.
+    #[test]
+    fn a_fully_literal_signed_division_is_decided_at_every_width() {
+        for w in [8u8, 16, 32, 64] {
+            with_fresh(|| {
+                let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                let minus7 = word((-7i64 as u64) & mask, w);
+                let three = word(3, w);
+                let minus2 = word((-2i64 as u64) & mask, w);
+                let q = sdiv(minus7, three);
+                assert_eq!(
+                    const_of(q),
+                    Some((-2i64 as u64) & mask),
+                    "`-7 / 3` at {w} bits must fold to `-2`"
+                );
+                assert_eq!(
+                    prove(eq(q, minus2)),
+                    Verdict::Valid,
+                    "a closed `-7 / 3 == -2` at {w} bits must be proved, not refused"
+                );
+            });
+        }
+    }
+
+    /// The division folds agree with Rust's own `/` and `%` on the edges the
+    /// general path special-cases: a zero divisor and `MIN / -1`.
+    #[test]
+    fn the_constant_divider_matches_the_general_path_on_its_edges() {
+        with_fresh(|| {
+            // `y == 0`: quotient all ones, remainder the dividend.
+            let (q, r) = sdivmod(word(5, 8), word(0, 8));
+            assert_eq!(const_of(q), Some(255));
+            assert_eq!(const_of(r), Some(5));
+        });
+        with_fresh(|| {
+            // `i8::MIN / -1` wraps to `i8::MIN`, remainder zero.
+            let (q, r) = sdivmod(word(128, 8), word(255, 8));
+            assert_eq!(const_of(q), Some(128));
+            assert_eq!(const_of(r), Some(0));
+        });
+        with_fresh(|| {
+            // The unsigned divider's zero case, for the same reason.
+            let (q, r) = divmod(word(5, 8), word(0, 8));
+            assert_eq!(const_of(q), Some(255));
+            assert_eq!(const_of(r), Some(5));
+        });
+    }
+
+    /// A *negation* (`0 - x`) is deliberately not folded, because the frontend
+    /// spells a unary `-` that way and tells `-128` from the bare literal `128` by
+    /// the node being a `Sub` rather than a `Const`. Folding it would merge the two
+    /// and refuse a valid `y == -128`. The other subtractions still fold.
+    #[test]
+    fn a_negation_is_not_folded_but_a_real_subtraction_is() {
+        with_fresh(|| {
+            let n = sub(word(0, 8), word(128, 8));
+            assert_eq!(
+                const_of(n),
+                None,
+                "`0 - x` must stay a `Sub` node: the frontend keys literal-range \
+                 bookkeeping on it not aliasing the literal it negates"
+            );
+        });
+        with_fresh(|| {
+            // `x - y` with a nonzero left operand still folds -- the divider is built
+            // from it.
+            assert_eq!(const_of(sub(word(10, 8), word(3, 8))), Some(7));
+        });
+    }
+
+    /// `truncate` is deliberately not folded: the frontend builds a named bound
+    /// (`i8::MIN`) as `truncate(word(k, 64), w)` so it does *not* hash-cons with the
+    /// literal `word(k, w)`. Folding a literal through `Trunc` would merge them and
+    /// make the bound inherit the literal's out-of-range envelope.
+    #[test]
+    fn a_truncated_literal_keeps_its_own_term() {
+        with_fresh(|| {
+            let t = truncate(word(128, 64), 8);
+            assert_ne!(
+                t.0 .0, word(128, 8).0 .0,
+                "`truncate(word(128,64), 8)` must not hash-cons with `word(128, 8)`"
+            );
+            assert_eq!(evaluate(t, |_| None), Some(128), "but it still denotes 128");
+        });
+    }
+
+    /// A fold may not change a verdict: the folded term and the circuit it replaces
+    /// must satisfy the same predicates. This pins the property rather than a list
+    /// of cases, by evaluating both.
+    #[test]
+    fn a_fold_preserves_the_value_it_replaces() {
+        with_fresh(|| {
+            let a = word(37, 8);
+            let b = word(11, 8);
+            let folded = add(a, b);
+            let wide = add(truncate(a, 16), truncate(b, 16));
+            assert_eq!(evaluate(folded, |_| None), Some(48));
+            assert_eq!(evaluate(wide, |_| None), Some(48));
         });
     }
 }

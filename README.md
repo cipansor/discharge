@@ -473,6 +473,35 @@ same file's teeth: it also asserts the six are *different* from one another, so 
 that wires every literal operator to `add` fails rather than passing six consistent
 identities. (The DSL had no test file before this, which is how the gap survived.)
 
+## Constant operands are folded, so a closed query is decided rather than refused
+
+A verifier reading real code meets a literal on almost every operation: a scaled index
+(`i * 4`), a masked flag (`x & 0xff`), a remainder by a literal (`n % 10`), and — the case
+that found this — a *dividend pinned to a literal by a precondition*. The engine used to
+build the full circuit for each of those and then refuse the query for the size of its own
+diagram. The measurement that makes the point is a query with no symbolic input at all:
+under `requires: a == -7`, `a / 3 == -2` at `i64` came back `Unknown` in ~1.1 s, because the
+64-bit divider was blasted and walked before anyone looked at the constant.
+
+Operations whose operands are both literals now fold to the literal they denote — the word
+operations, the comparisons, and the divider itself. The same closed query is `Valid` in
+0.000 s, and its term count falls from 660 to 5.
+
+Two folds are deliberately withheld, and each is a way to get a *wrong verdict* rather than
+a slow one, because the term arena is hash-consed and a fold that lands on an existing node
+does not just shorten the term — it *merges* two nodes the frontend needs to tell apart:
+
+- `0 - x` stays a `Sub` node. There is no unary negation in the term language, so a frontend
+  spells one that way, and it distinguishes `-128` (legal for an `i8`) from the bare literal
+  `128` (illegal) by the node's shape. Both are the same eight bits. Folding merged them and
+  refused valid `y == -128` contracts.
+- `truncate` does not fold a literal. A *named* bound (`i8::MIN`) is spelled
+  `truncate(word(k, 64), w)` precisely so it does not hash-cons with `word(k, w)`. Folding
+  made the bound inherit `128i8`'s out-of-range envelope and refused `y == i8::MIN`.
+
+The corpus caught both. That is the reason `examples/mir_targets/realistic.rs` exists: a fold
+is not a neutral optimisation, and the coverage baseline is what says so.
+
 ## Mixed-width operations are refused, not truncated
 
 A bit-vector operation has no natural width when its operands disagree. The engine used to

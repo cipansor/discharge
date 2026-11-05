@@ -212,6 +212,52 @@ against rustc's code generator rather than against another model. `tests/divmod.
 does the same for the divider, against Rust's own `/` and `%`; `tests/shift.rs`
 does it for the barrel shifter, against Rust's own `<<` and `>>`.
 
+## Constant operands are folded, so a closed query is decided rather than refused
+
+A frontend reading real code meets a literal on almost every operation: a scaled
+index (`i * 4`), a masked flag (`x & 0xff`), a remainder by a literal (`n % 10`),
+and -- the case that found this -- a *dividend pinned to a literal by a
+precondition*. `Ctx::bin_word` and `Ctx::cmp` now fold an operation whose operands
+are both literals, and `divmod`/`sdivmod` fold when both are literals, so the term
+that reaches the solver is a single constant instead of the circuit that computes
+it.
+
+The motivating measurement is the cleanest possible demonstration that the engine
+was refusing queries for their *size* rather than for anything unknown. Under
+`requires: a == -7`, the query `a / 3 == -2` at `i64` has **no symbolic input at
+all**, and it came back `Unknown` in ~1.1 s: the divider was blasted, walked, and
+refused before the constant was ever looked at. With the fold the same query is
+`Valid` in 0.000 s, and the term count drops from 660 to 5 -- the divider's whole
+circuit replaced by the two literals it computes.
+
+Where the fold must *not* go, because each one silently breaks the frontend's
+literal-range bookkeeping -- these were regressions, caught by the corpus, not
+theory:
+
+- **`0 - x` must stay a `Sub` node.** The term language has no unary negation, so a
+  frontend spells one `0 - x`, and it tells `-128` (legal for an `i8`) from the bare
+  literal `128` (illegal) by the node being a `Sub` rather than a `Const`. Both are
+  the same eight bits, so the node *is* the only evidence. Folding the negation
+  merged them and refused valid `y == -128` contracts. Every other subtraction
+  still folds, including the `x - y` the restoring divider is built from.
+- **`truncate` must not fold a literal.** The frontend spells a *named* bound
+  (`i8::MIN`) as `truncate(word(k, 64), w)` precisely so it does not hash-cons with
+  the literal `word(k, w)`. Folding a literal through `Trunc` merged the two and
+  made the bound inherit `128i8`'s out-of-range envelope, refusing
+  `y == i8::MIN`. Nothing is lost: the folds that carry the divider's constant path
+  are in `cmp` and `bin_word`, not in `trunc`.
+- **A folded comparison is a *one-bit* constant.** A comparison node stores its
+  operands' width even though it denotes one bit, so a folded comparison left wide
+  would hand a later `require_same_width` a term of the wrong shape -- the same
+  trap the `!!p == p` width guard exists for.
+
+The general lesson is worth stating because it recurs: **the term arena is
+hash-consed, so a fold that produces a value which some other node already denotes
+is not a neutral optimisation -- it *merges* the two nodes.** When the frontend
+distinguishes two things by node identity rather than by value, a fold that erases
+the distinction is a wrong verdict. Fold where the frontend does not depend on the
+shape, and say why in the comment when you decline.
+
 ## The imperative layer (`wp.rs`) has three traps
 
 If you touch verification-condition generation, these are the mistakes that make
