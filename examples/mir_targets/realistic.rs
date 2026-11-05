@@ -5607,3 +5607,29 @@ pub fn an_element_pinned_division_cannot_prove_this(xs: [i64; 2]) -> i64 {
     xs[0] / 3
 }
 
+/// A pin whose right-hand side names an *earlier* pinned variable, so the chain has to be
+/// followed before the body folds.
+///
+/// `b == a + 1` does not evaluate until `a`'s pin exists, so a single-pass extraction
+/// pinned only `a` and left `b` symbolic -- and a symbolic operand builds the full circuit
+/// whatever the other operand is. The three links here (`a`, then `b` through an add, then
+/// `c` through a multiply) are the shape the fixpoint exists for, and the multiply is
+/// deliberate: the *pin* makes the body's dividend a literal, but the path condition still
+/// carries `c == b * 2` at 64 bits, which is the diagram the goal check has to get past.
+///
+/// [`a_transitive_pin_chain_cannot_prove_this`] is the false direction, so the entry above
+/// is a proof rather than a `true` that a broken extraction would also produce.
+/// requires: a == 5 && b == a + 1 && c == b * 2
+/// ensures: ret == 3
+pub fn a_transitive_pin_chain_folds_the_body(a: i64, b: i64, c: i64) -> i64 {
+    c / 4
+}
+
+/// The false direction of the transitive chain: the pin fixes `c` at `12`, so the claim is
+/// refuted by the fold rather than proved.
+/// requires: a == 5 && b == a + 1 && c == b * 2
+/// ensures: ret == 99
+pub fn a_transitive_pin_chain_cannot_prove_this(a: i64, b: i64, c: i64) -> i64 {
+    c / 4
+}
+

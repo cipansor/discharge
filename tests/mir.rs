@@ -5175,3 +5175,33 @@ fn a_typed_constant_mask_keeps_its_type() {
         assert!(o.is_verified(), "{name} is well-typed and must verify, got: {o}");
     }
 }
+
+/// A pin is *transitive*: a right-hand side that names an earlier pinned variable is
+/// pinned too, and the body folds as if the whole chain had been written as literals.
+///
+/// `a == 5 && b == a + 1 && c == b * 2` fixes `c` at `12` by transitivity, so `c / 4` is
+/// `12 / 4` and the obligation is a fact about numbers. A single-pass extraction pinned
+/// only `a`, left `b` and `c` symbolic, and built the full divider — `incomplete` however
+/// small the contract was. The multiply is the second half of the shape: it makes the
+/// *path condition* expensive even once every operand is a literal, which is what the
+/// closed-goal check in `prove_implies` exists for.
+///
+/// The `cannot_prove_this` companion is the point: without it, an engine that answered
+/// `Verified` for everything would pass, so the negative is what makes the positive a
+/// proof rather than a vacuous `true`.
+#[test]
+fn a_transitive_pin_chain_folds_the_body() {
+    let Some(report) = verify_realistic(&[
+        "a_transitive_pin_chain_folds_the_body",
+        "a_transitive_pin_chain_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    let good = outcome(&report, "a_transitive_pin_chain_folds_the_body");
+    assert!(good.is_verified(), "a transitive pin chain must fold the body; got: {good}");
+    let bad = outcome(&report, "a_transitive_pin_chain_cannot_prove_this");
+    assert!(
+        !bad.is_verified(),
+        "a false claim about a transitively pinned chain must be refuted; got: {bad}"
+    );
+}

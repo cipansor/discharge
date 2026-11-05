@@ -502,6 +502,35 @@ does not just shorten the term — it *merges* two nodes the frontend needs to t
 The corpus caught both. That is the reason `examples/mir_targets/realistic.rs` exists: a fold
 is not a neutral optimisation, and the coverage baseline is what says so.
 
+## A pin is transitive, and a closed goal is decided without its assumption
+
+A precondition that fixes a variable is what makes a query with a wide divider decidable at
+all: `requires: a == 5` seeds `a` with the literal `5`, the body's operations fold, and the
+obligation is a fact about numbers rather than a circuit. The pin extraction used to be one
+pass, so it only saw a right-hand side that was closed on its own. `a == 5 && b == a + 1`
+left `b` symbolic, because `a + 1` does not evaluate until `a`'s pin exists — and the chain
+`a == 5 && b == a + 1 && c == b * 2` lost every link past the first.
+
+The extraction now runs to a *fixpoint*: each round re-scans the conjuncts with the pins
+found so far in scope, and a round that adds nothing ends it. Every pin is still a
+consequence of the precondition by transitivity — `b == a + 1` *and* `a == 5` are both
+conjuncts — so nothing is assumed beside `p`, and a value the conjuncts do not force stays
+unpinned.
+
+That closed the pin list but not the obligation. With `a`, `b`, `c` all pinned, the body
+`c / 4` folds to the literal `3` and the goal becomes the closed fact `12 / 4 == 3`, which
+the engine decides by evaluation in microseconds. `prove_implies` nevertheless built
+`!pre || post` first, and `pre` still carried `c == b * 2` — a 64-bit multiply whose diagram
+is refused for its own size. The query came back `Unknown` with a *trivial* goal.
+
+So `prove_implies` now checks the goal on its own before it builds the implication: a closed
+term that evaluates to true is a theorem unconditionally, whatever the assumption says, and
+the check is a walk over the goal's own (small) DAG. The assumption is not weakened — the
+path condition is untouched, so the ordinary route still sees it and nothing that used to be
+decided by the diagram is lost. The corpus confirms the direction: `realistic.rs` stays at
+264 of 490, with zero function changing verdict in either direction, and the
+`a == 5 && b == a + 1 && c == b * 2` with body `c / 4` moves from `incomplete` to `verified`.
+
 ## Mixed-width operations are refused, not truncated
 
 A bit-vector operation has no natural width when its operands disagree. The engine used to

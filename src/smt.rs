@@ -3208,9 +3208,47 @@ pub fn is_ill_formed() -> bool {
     with_ctx(|c| c.ill_formed)
 }
 
+/// Whether `p` is a closed predicate that evaluates to true.
+///
+/// The [`EvalMemo`] is a 12 KiB local, so it lives here rather than in
+/// [`prove_implies`]: `#[inline(never)]` keeps that temporary inside this frame and
+/// alive only for the walk, the same reason [`evaluate`] is marked so. `prove_implies`
+/// is not itself recursive, but it is called from the executor and from the macro
+/// expansion, and a 12 KiB frame that the optimiser is free to hoist into a caller is
+/// exactly the stack cost the crate budgets for elsewhere.
+///
+/// `false` means "not this arm", never "false theorem": an open term, a closed false
+/// term, an ill-formed arena and a stale handle all return `false` and send the caller
+/// to the engine. So a wrong `false` can only lose a proof, never invent one.
+#[inline(never)]
+fn goal_is_closed_true(ctx: &mut Ctx, p: Term) -> bool {
+    if ctx.ill_formed || ctx.var_overflow {
+        return false;
+    }
+    let mut memo = EvalMemo::new();
+    eval_term(ctx, p, &|_| None, &mut memo) == Some(1)
+}
+
 /// Prove that `pre` implies `post` for every input.
+///
+/// A goal that is closed and true is decided without building the implication's
+/// diagram. That case is worth its own arm because the *goal* can be tiny while the
+/// assumption is not: an obligation whose postcondition is a closed arithmetic fact
+/// (`12 / 4 == 3`, once the body's operands folded to literals) follows from any
+/// precondition at all, yet the ordinary route first builds `!pre || post` -- and when
+/// `pre` carries a 64-bit multiply the diagram is refused for its own size before the
+/// trivial goal is ever examined. Evaluating the goal alone is a walk over the goal's
+/// own DAG, which is small, and it is exactly the check that says "nothing to prove".
+///
+/// Soundness does not depend on the assumption: a closed term has one value for every
+/// input, so a `true` from [`eval_term`] is a proof that the goal holds
+/// unconditionally. A goal with a free variable, or a closed false one, falls through
+/// to the engine.
 pub fn prove_implies(pre: Pred, post: Pred) -> Verdict {
     with_ctx(|c| {
+        if goal_is_closed_true(c, post.0) {
+            return Verdict::Valid;
+        }
         let np = c.un_bool(Op::Not, pre.0);
         let goal = c.bin_bool(Op::Or, np, post.0);
         c.query_valid(goal)
@@ -3288,37 +3326,70 @@ pub(crate) const MAX_PINS: usize = 16;
 /// 64-bit restoring divider is a documented scaling wall, and the precondition says
 /// there is only one `a` to divide.
 ///
-/// Only a *closed* right-hand side pins. `v == w` between two variables is not a pin
-/// -- it is a relation, and folding it would fix both -- so it is left alone.
+/// The extraction runs to a *fixpoint*, not one pass, because a pin's right-hand side
+/// may name a variable another conjunct pins. `a == 5 && b == a + 1` pins `a := 5` in
+/// the first pass and `b := 6` in the second, and the same chain reaches any depth the
+/// pin list has room for. Each round is justified by the rounds before it: `b := 6`
+/// follows from `b == a + 1` *and* `a == 5`, and both are conjuncts, so `b := 6` is a
+/// consequence of `p` by the same transitivity that makes `a := 5` one. Nothing here
+/// is an assumption beside `p`; a value the conjuncts do not force stays unpinned and
+/// the body keeps its symbolic operand.
+///
+/// Only a *closed* right-hand side pins -- closed meaning "the pins so far evaluate it
+/// to a value", not "it contains no variable". `v == w` between two variables whose
+/// values the pins do not fix is not a pin -- it is a relation, and folding it would
+/// fix both -- so it is left alone.
 #[cfg(feature = "std")]
 pub(crate) fn pinned_vars(p: Pred, out: &mut [(u32, u64); MAX_PINS]) -> usize {
     with_ctx(|c| {
         let mut leaves = [Term(0); MAX_CONJ];
         let n = c.op_leaves(Op::And, p.0, &mut leaves);
-        let mut memo = EvalMemo::new();
+        let mut pins = [(0u32, 0u64); MAX_PINS];
         let mut count = 0usize;
-        for leaf in leaves[..n].iter() {
-            if count >= MAX_PINS {
+        // Each round re-scans every conjunct with the pins found so far in scope, so a
+        // right-hand side that names an already-pinned variable evaluates. A round that
+        // adds nothing ends the walk: `count` only grows, so it terminates in at most
+        // `MAX_PINS` rounds, and a chain longer than the list simply stops being pinned
+        // rather than looping.
+        loop {
+            let before = count;
+            for leaf in leaves[..n].iter() {
+                if count >= MAX_PINS {
+                    break;
+                }
+                let node = c.node_of(*leaf);
+                if node.op != Op::Eq {
+                    continue;
+                }
+                let (a, b) = (Term(node.a), Term(node.b));
+                let (na, nb) = (c.node_of(a), c.node_of(b));
+                // One side a variable, the other a term the pins evaluate. A variable on
+                // *both* sides is a relation rather than a pin.
+                let (idx, other) = match (na.op, nb.op) {
+                    (Op::Var, Op::Var) => continue,
+                    (Op::Var, _) => (na.a, b),
+                    (_, Op::Var) => (nb.a, a),
+                    _ => continue,
+                };
+                // The first pin of a variable is the one to keep: a second conjunct
+                // naming it restates what the first already fixed (or contradicts it, in
+                // which case the precondition is unsatisfiable and no pin is needed).
+                if pins[..count].iter().any(|&(i, _)| i == idx) {
+                    continue;
+                }
+                // A fresh memo per round: the closure changed, so a term that evaluated
+                // to `None` last round (and so was not cached) must be asked again.
+                let mut memo = EvalMemo::new();
+                let lookup = |i: u32| pins[..count].iter().find(|&&(j, _)| j == i).map(|&(_, k)| k);
+                let Some(k) = eval_term(c, other, &lookup, &mut memo) else { continue };
+                pins[count] = (idx, k);
+                count += 1;
+            }
+            if count == before {
                 break;
             }
-            let node = c.node_of(*leaf);
-            if node.op != Op::Eq {
-                continue;
-            }
-            let (a, b) = (Term(node.a), Term(node.b));
-            let (na, nb) = (c.node_of(a), c.node_of(b));
-            // One side a variable, the other a closed term. A variable on *both*
-            // sides is a relation rather than a pin.
-            let (idx, other) = match (na.op, nb.op) {
-                (Op::Var, Op::Var) => continue,
-                (Op::Var, _) => (na.a, b),
-                (_, Op::Var) => (nb.a, a),
-                _ => continue,
-            };
-            let Some(k) = eval_term(c, other, &|_| None, &mut memo) else { continue };
-            out[count] = (idx, k);
-            count += 1;
         }
+        out[..count].copy_from_slice(&pins[..count]);
         count
     })
 }
@@ -3515,6 +3586,113 @@ mod pin_tests {
             let pinned_bad = substitute(bad, &[(a, word(5, 8))]);
             assert_eq!(prove(pinned_bad), Verdict::Unsat);
             let _ = pre;
+        });
+    }
+
+    /// A pin whose right-hand side names an already-pinned variable is pinned too, in
+    /// a later round.
+    ///
+    /// `a == 5 && b == a + 1` leaves `b` fixed at `6` by transitivity, so the second
+    /// round must find it. One pass would miss it, because `a + 1` does not evaluate
+    /// without `a`'s value -- and the whole point of the fixpoint is that the *first*
+    /// round's result is what makes the second round's right-hand side closed.
+    #[test]
+    fn a_pin_whose_rhs_names_a_pinned_variable_is_found_in_a_later_round() {
+        with_fresh(|| {
+            let a = var_named(1, 8);
+            let b = var_named(2, 8);
+            let p = and(eq_const(a, 5), eq(b, add(a, word(1, 8))));
+            let mut got = pins(p);
+            got.sort_unstable();
+            assert_eq!(got, vec![(1, 5), (2, 6)], "`b == a + 1` must pin `b := 6`");
+        });
+        // The same through a multiply, and through a three-link chain, so the walk is
+        // not accidentally limited to one extra round.
+        with_fresh(|| {
+            let a = var_named(1, 8);
+            let b = var_named(2, 8);
+            let p = and(eq_const(a, 6), eq(b, mul(a, word(2, 8))));
+            let mut got = pins(p);
+            got.sort_unstable();
+            assert_eq!(got, vec![(1, 6), (2, 12)]);
+        });
+        with_fresh(|| {
+            let a = var_named(1, 8);
+            let b = var_named(2, 8);
+            let c = var_named(3, 8);
+            let p = and(
+                eq_const(a, 5),
+                and(eq(b, add(a, word(1, 8))), eq(c, mul(b, word(2, 8)))),
+            );
+            let mut got = pins(p);
+            got.sort_unstable();
+            assert_eq!(got, vec![(1, 5), (2, 6), (3, 12)], "a three-link chain must resolve");
+        });
+    }
+
+    /// A chain whose root is missing pins nothing, and that is the honest answer.
+    ///
+    /// `b == a + 1 && c == b * 2` fixes neither `b` nor `c`: `a` is free, so every `b`
+    /// is possible. The fixpoint must not invent a value for `a` to make the chain
+    /// resolve -- the negative direction of the test above.
+    #[test]
+    fn a_chain_with_no_pinned_root_stays_unpinned() {
+        with_fresh(|| {
+            let a = var_named(1, 8);
+            let b = var_named(2, 8);
+            let c = var_named(3, 8);
+            let p = and(eq(b, add(a, word(1, 8))), eq(c, mul(b, word(2, 8))));
+            assert!(pins(p).is_empty(), "a free root must not be pinned to anything");
+        });
+    }
+}
+
+#[cfg(test)]
+mod prove_implies_tests {
+    use super::*;
+
+    /// A closed goal that is true is proved without building the implication.
+    ///
+    /// The assumption carries a 64-bit multiply, which is the shape that made the
+    /// engine refuse the whole query for the size of its diagram even though the goal
+    /// -- `12 / 4 == 3`, as the interpreter's divider spells it -- is a fact about
+    /// literals. The goal alone is what the short-circuit evaluates.
+    #[test]
+    fn a_closed_true_goal_is_proved_even_when_the_assumption_is_a_wall() {
+        with_fresh(|| {
+            let a = var_named(1, 64);
+            let b = var_named(2, 64);
+            let c = var_named(3, 64);
+            let pre = and(
+                and(eq_const(a, 5), eq(b, add(a, word(1, 64)))),
+                eq(c, mul(b, word(2, 64))),
+            );
+            let twelve = word(12, 64);
+            let quotient = ashr(add(twelve, band(ashr(twelve, 63), word(3, 64))), 2);
+            assert_eq!(prove_implies(pre, eq(quotient, word(3, 64))), Verdict::Valid);
+        });
+    }
+
+    /// The short-circuit must not decide a goal that is closed but *false*, and it
+    /// must not decide one that is still open.
+    ///
+    /// This is the negative direction of the test above, and it is the one that keeps
+    /// the arm from being a "prove anything" rule: a closed false goal evaluates to
+    /// `Some(0)` and a goal with a free variable evaluates to `None`, so both fall
+    /// through to the engine rather than being reported `Valid`. The engine's own
+    /// verdict for each is not what this test pins down -- only that neither is a
+    /// proof.
+    #[test]
+    fn a_closed_false_goal_and_an_open_goal_still_go_to_the_engine() {
+        with_fresh(|| {
+            let v = prove_implies(truth(true), eq(word(12, 8), word(13, 8)));
+            assert_ne!(v, Verdict::Valid, "a closed false goal is not a theorem");
+        });
+        with_fresh(|| {
+            let x = var_named(1, 8);
+            let v = prove_implies(truth(true), eq(x, word(3, 8)));
+            assert_ne!(v, Verdict::Valid, "an open goal is not decided by evaluation alone");
+            assert!(matches!(v, Verdict::Counterexample(_)), "and the engine must find its witness");
         });
     }
 }
