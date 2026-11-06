@@ -4127,11 +4127,11 @@ in CI rather than in a downstream build. It follows the Ferrocene/Kani conventio
 an absent toolchain, or a `thumbv7em-none-eabihf` target not installed *for that
 toolchain*, is reported and skipped rather than folded into a pass. CI installs
 both the 1.85 toolchain and that target for it so the gate actually runs. The gate
-numbering is now **15 steps**; it was 13 when this note was written, and two steps
+numbering is now **16 steps**; it was 13 when this note was written, and three steps
 were appended without renumbering the earlier ones (so the "gate 3/4/9" references
 elsewhere still name the same gates).
 
-The two appended steps hold the *tree* rather than the logic, and each closes a
+The three appended steps hold the *tree* rather than the logic, and each closes a
 recurrence rather than a one-off:
 
 - **Step 14: rustdoc builds both crates with `-D warnings`.** The crate is
@@ -4147,6 +4147,12 @@ recurrence rather than a one-off:
   a cleanup commit untracked six root `.rlib`s the oracle runs had left behind, and the
   next `git add -A` put them straight back. A `.gitignore` cannot help -- ignore rules
   are consulted only for *untracked* paths -- so the fix is a check, not a pattern.
+- **Step 16: the `unsafe` surface is pinned and justified.** `SECURITY.md` told a reporter
+  there were *three* `unsafe` blocks in `src/`; there are two, and the paragraph named only
+  `smt.rs` while `sat.rs` held the second. A count in prose is a claim like any other, and
+  this one is security-relevant, so it is checked: the gate fails unless there are exactly
+  two `unsafe {` blocks, each preceded by a `// SAFETY:` in its contiguous comment block
+  (not a fixed number of lines -- the justifications here run to several).
 
 ## The bit-blaster walked a DAG as a tree, and no budget noticed
 

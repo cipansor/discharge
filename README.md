@@ -2008,12 +2008,14 @@ run the Kani, Verus, Lean and Coq differential oracles and the `rustc_public` MI
 tools are present and *skip them loudly* when they are not, because all three are large
 downloads (Kani: a pinned nightly plus CBMC; Verus: a self-contained bundle with its own z3;
 the MIR oracle: a nightly with the `rustc-dev` and `llvm-tools-preview` components) that a normal local run should not
-pay for; CI installs them and runs them as hard gates. The last two gates hold the *tree*
+pay for; CI installs them and runs them as hard gates. The last three gates hold the *tree*
 rather than the logic: rustdoc must build both crates with `-D warnings` (the crate is
 `#![deny(missing_docs)]`, but that says nothing about whether a doc link still *resolves*),
-and no compiled output may be tracked (`git ls-files` must not list a `.rlib` or a
-`target/` path — a `git add -A` re-committed six stray `.rlib`s once, and a `.gitignore`
-does not untrack a file that is already in the index).
+no compiled output may be tracked (`git ls-files` must not list a `.rlib` or a `target/`
+path — a `git add -A` re-committed six stray `.rlib`s once, and a `.gitignore` does not
+untrack a file that is already in the index), and the `unsafe` surface must stay at the two
+blocks `SECURITY.md` names, each with a `// SAFETY:` justification (a count in prose is a
+claim like any other, and this one is security-relevant).
 
 ### The third oracle: rustc's own MIR, against the parser
 
