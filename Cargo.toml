@@ -49,7 +49,8 @@ discharge-arithmetic = { path = "discharge-arithmetic", version = "0.1.0" }
 # features (`no_std`). Without this, the published docs would silently omit every `std`-only
 # item -- the whole `mir` frontend, the proc-macro surface, the file-backed tools -- and a
 # reader would see a crate smaller than the one that ships. `--all-features` documents the
-# union, and the doc gate (step 14) already builds both feature sets with `-D warnings`.
+# union, and the doc gate (step 14) already builds all three configurations (default,
+# `std`, all-features) with `-D warnings`.
 #
 # No `rustdoc-args`: nothing here is gated on a `docsrs` cfg (the crate is stable, uses no
 # nightly rustdoc features, and marks platform-specific items with `#[cfg(feature = "std")]`

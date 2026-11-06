@@ -1994,6 +1994,10 @@ scripts/gate.sh
 # Host, with the thread-local arena and the full test suite
 cargo test --features std
 
+# Lint both halves -- `--features std` alone never compiles the `no_std` items
+cargo clippy --features std --all-targets
+cargo clippy --no-default-features --lib
+
 # Bare metal: no std, no allocator, no dependencies
 rustup target add thumbv7em-none-eabihf
 cargo build --no-default-features --target thumbv7em-none-eabihf
