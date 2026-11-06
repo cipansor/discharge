@@ -45,6 +45,18 @@ exclude = ["*.rlib", "target/", ".sweep/"]
 # by hand; the two move together.
 discharge-arithmetic = { path = "discharge-arithmetic", version = "0.1.0" }
 
+# docs.rs builds with default features unless told otherwise, and the default here is *no*
+# features (`no_std`). Without this, the published docs would silently omit every `std`-only
+# item -- the whole `mir` frontend, the proc-macro surface, the file-backed tools -- and a
+# reader would see a crate smaller than the one that ships. `--all-features` documents the
+# union, and the doc gate (step 14) already builds both feature sets with `-D warnings`.
+#
+# No `rustdoc-args`: nothing here is gated on a `docsrs` cfg (the crate is stable, uses no
+# nightly rustdoc features, and marks platform-specific items with `#[cfg(feature = "std")]`
+# rather than `#[doc(cfg)]`), so defining one would be a flag with no reader.
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 # No default features: the crate is `no_std` + zero-dependency out of the box,
 # which is what a bare-metal safety build wants. `std` only adds the thread-local

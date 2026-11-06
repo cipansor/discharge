@@ -219,14 +219,23 @@ echo "== 14/16 documentation builds with no warnings =="
 # passed: the point is the *public* surface, the one a reader sees, and a private-item link
 # from a public item is exactly the warning this is meant to catch.
 #
-# Both crates are checked, one command each. `--workspace --features std` happens to work,
-# but only because this cargo tolerates a feature a member does not declare; naming each
-# package avoids leaning on that. `discharge-arithmetic` takes no `--features std` -- it has
-# no features, and naming one there would be a build error. It had the same class of warning
-# this gate exists for (`prove.rs` linked its private `forall_pair_bounded` from three public
-# items), which a parent-only gate would have left.
+# Both crates are checked, one command each. `discharge-arithmetic` takes no `--features std`
+# -- it has no features, and naming one there would be a build error. It had the same class
+# of warning this gate exists for (`prove.rs` linked its private `forall_pair_bounded` from
+# three public items), which a parent-only gate would have left.
+#
+# `discharge` is built three ways, because the doc surface *differs* between feature sets and
+# docs.rs publishes the default one. `--no-default-features` is the `no_std` build; `--features
+# std` adds the whole `mir` frontend; `--all-features` is the union that
+# `[package.metadata.docs.rs]` requests. A link to a `#[cfg(feature = "std")]` item resolves
+# in the last two and *not* in the first -- which is exactly how `smtscript` shipped an
+# unresolved link to `Query::to_smtlib2_string` that only the default build could see.
+RUSTDOCFLAGS="-D warnings" cargo doc -q -p discharge --no-deps \
+  || fail "rustdoc warnings (discharge, no_std)"
 RUSTDOCFLAGS="-D warnings" cargo doc -q -p discharge --no-deps --features std \
-  || fail "rustdoc warnings (discharge)"
+  || fail "rustdoc warnings (discharge, std)"
+RUSTDOCFLAGS="-D warnings" cargo doc -q -p discharge --no-deps --all-features \
+  || fail "rustdoc warnings (discharge, all features)"
 RUSTDOCFLAGS="-D warnings" cargo doc -q -p discharge-arithmetic --no-deps \
   || fail "rustdoc warnings (discharge-arithmetic)"
 

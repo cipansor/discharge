@@ -4141,7 +4141,13 @@ recurrence rather than a one-off:
   `bind`, and `smt.rs` linked three private items (`pinned_vars`, `EvalMemo`, `eval_term`)
   from public docs. `discharge-arithmetic` had the same class (`prove.rs` linked its
   private `forall_pair_bounded` from three public items), which is why the step checks
-  both crates and not just the parent.
+  both crates and not just the parent. `discharge` is built *three* ways -- default
+  (`no_std`), `--features std`, and `--all-features` -- because the doc surface differs
+  between them: a link to a `#[cfg(feature = "std")]` item resolves in the last two and not
+  the first, which is how `smtscript` shipped an unresolved link to
+  `Query::to_smtlib2_string` that only the default build could see. docs.rs publishes the
+  default build, so `[package.metadata.docs.rs] all-features = true` makes the published
+  docs the union instead.
 - **Step 15: no compiled output is tracked.** `git ls-files` must not list a `.rlib`,
   `.rmeta`, `.o`, `.bc`, `.d`, a `target/` path or a `__pycache__` path. This recurred:
   a cleanup commit untracked six root `.rlib`s the oracle runs had left behind, and the
