@@ -6371,3 +6371,13 @@ is keyed by the *chain*, and a reference target that is an array rather than an 
 needs the chain to cross the frame as the element's own key, the same re-basing the aggregate
 targets already do. A whole-*local* array through `&mut` (`set_arr(&mut a); a[0]`) does
 decide, since the target has no projection and the store is keyed by the local alone.
+
+It is now *pinned* rather than only documented: the corpus carries
+`a_whole_array_target_is_incomplete` and its false twin `a_whole_array_target_cannot_prove_this`,
+and `tests/mir.rs::a_whole_array_target_is_incomplete_and_never_a_false_proof` asserts the
+first is `Incomplete` and the second is not `Verified`. The reason to pin a *hole* is that the
+precision fix is the dangerous change: a re-basing that connects the two stores the wrong way
+turns the false twin `Verified` before it turns the true contract verified, and nothing else in
+the suite would notice. The test is deliberately weaker than "this must stay incomplete" --
+a future change that makes the true direction verify is an improvement, and the assertion is
+updated with it -- while the twin's "not verified" is unconditional.

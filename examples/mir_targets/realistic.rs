@@ -5970,3 +5970,42 @@ fn read_holder_first_element(i: &ArrayHolder) -> u8 {
 fn set_holder_first_element(i: &mut ArrayHolder) {
     i.a[0] = 9;
 }
+
+/// The whole-array-target boundary: an array handed over *as* a reference target
+/// (`&mut x.a`) is incomplete, never wrong.
+///
+/// `set_first_of(&mut x.a)` passes a `&mut [u8; 4]` whose target is the *field* `x.a`,
+/// not the whole local. The callee's `(*_1)[0] = 9` lands in the callee's own element
+/// store, and the return path has no representable key to re-base it onto the caller's
+/// field-path element store (`elems_path` is keyed by a chain of *fields*, and an
+/// element target is not one), so the caller's `x.a[0]` read stays `Unknown` and the
+/// `ensures` is unreadable. Both directions come back `Incomplete`.
+///
+/// That is the honest direction -- nothing false is proved, and no stale value is kept
+/// -- but it is a coverage hole rather than a modelled case, and the false twin below
+/// is what keeps it honest: if a future re-basing ever connects the two stores, the
+/// twin must not turn `Verified`. The whole-*local* form (`set_arr(&mut a); a[0]`)
+/// decides, because the target has no projection and the store is keyed by the local
+/// alone.
+/// requires: x.a[0] == 5
+/// ensures: ret == 9
+pub fn a_whole_array_target_is_incomplete(mut x: Boxed) -> u8 {
+    set_first_of(&mut x.a);
+    x.a[0]
+}
+
+/// The false direction of the whole-array target, named so the corpus-wide
+/// `no_cannot_prove_entry_is_ever_verified` invariant holds it as well: it must never
+/// become `Verified`.
+/// requires: x.a[0] == 5
+/// ensures: ret == 5
+pub fn a_whole_array_target_cannot_prove_this(mut x: Boxed) -> u8 {
+    set_first_of(&mut x.a);
+    x.a[0]
+}
+
+/// The helper handed the *array itself* (`&mut [u8; 4]`) rather than the local that
+/// holds it.
+fn set_first_of(a: &mut [u8; 4]) {
+    a[0] = 9;
+}

@@ -1729,6 +1729,45 @@ fn a_field_array_element_crosses_a_reference_argument() {
     }
 }
 
+/// An array handed over *as* a reference target (`&mut x.a`) is `Incomplete` in both
+/// directions -- and that is the point.
+///
+/// The callee's `(*_1)[0] = 9` lands in its own element store, and the return path has no
+/// key to re-base it onto the caller's field-path store (`elems_path` is keyed by a chain
+/// of *fields*, and the target here is an element). So the caller's `x.a[0]` read stays
+/// `Unknown` and the `ensures` is unreadable: the true contract `ret == 9` is *not*
+/// proved and the false `ret == 5` is *not* proved either. Nothing false is claimed.
+///
+/// This test is a tripwire on the *precision* fix, not on the bug. The tempting fix is to
+/// make the element target's write-back land somewhere; a wrong one would connect the
+/// callee's store to the caller's `x.a[0]` in the false direction first, and the false
+/// twin would turn `Verified`. So the twin is asserted to be *not* verified here, and the
+/// corpus-wide `no_cannot_prove_entry_is_ever_verified` invariant holds it too. If a
+/// future change makes these decide, it must make the true one verify and leave the twin
+/// refuted -- which is a strictly stronger result than this test, and this test is then
+/// updated with it.
+#[test]
+fn a_whole_array_target_is_incomplete_and_never_a_false_proof() {
+    let Some(report) = verify_realistic(&[
+        "a_whole_array_target_is_incomplete",
+        "a_whole_array_target_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    let o = outcome(&report, "a_whole_array_target_is_incomplete");
+    assert!(
+        matches!(o, FnOutcome::Incomplete { .. }),
+        "a `&mut x.a` array target has no representable key, so it must be incomplete \
+         rather than decided; got: {o}"
+    );
+    let twin = outcome(&report, "a_whole_array_target_cannot_prove_this");
+    assert!(
+        !twin.is_verified(),
+        "the false twin of the whole-array target must never be verified -- a false proof; \
+         got: {twin}"
+    );
+}
+
 /// A helper's write-back covers a *nested* field and a read-modify-write, and the
 /// caller's field seed crosses *into* the callee so the callee's read is modelled.
 ///
