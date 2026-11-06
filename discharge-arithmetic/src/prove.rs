@@ -190,7 +190,7 @@ fn forall_one(w: u8, p: impl Fn(u64) -> bool) -> Verdict {
     Verdict::Valid
 }
 
-/// Check that the rectangle [`forall_pair_bounded`] walks is *exactly* the set the
+/// Check that the rectangle `forall_pair_bounded` walks is *exactly* the set the
 /// precondition selects, so the restricted enumeration is the same question and
 /// not a smaller one.
 ///
@@ -241,7 +241,7 @@ pub fn restricted_domain_matches(w: u8, pre_bound: u64, rect_bound: u64) -> Verd
     Verdict::Counterexample(Witness::two(witness.0, witness.1))
 }
 
-/// Check that [`forall_pair_bounded`] visits *exactly* its rectangle, edges
+/// Check that `forall_pair_bounded` visits *exactly* its rectangle, edges
 /// included — the implementation half of the soundness argument, which
 /// [`restricted_domain_matches`] does not cover (that one is about the bounds, this
 /// one is about the walk).
@@ -411,7 +411,7 @@ pub const FIXED_ADD_BOUND: u64 = (1u64 << 14) - 1;
 ///
 /// Enumerated over the `2^28` pairs that satisfy the precondition, not the
 /// `2^32` pairs of the whole 16-bit domain. The statement is unchanged — it still
-/// carries the `!pre ||` guard — but [`forall_pair_bounded`] visits only the
+/// carries the `!pre ||` guard — but `forall_pair_bounded` visits only the
 /// points where the guard can matter. The shortcut is checked by
 /// [`restricted_domain_matches`] rather than trusted.
 pub fn fixed_add_no_overflow() -> Verdict {

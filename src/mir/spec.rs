@@ -718,7 +718,7 @@ impl FieldEnv {
         self.declared.insert(name.to_string());
     }
 
-    /// [`bind`] by width and signedness, for callers outside the crate that
+    /// `bind` by width and signedness, for callers outside the crate that
     /// cannot name the IR's `Ty`.
     ///
     /// This is the primitive; `bind` is the typed wrapper. Keeping the IR

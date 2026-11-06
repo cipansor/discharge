@@ -2285,7 +2285,7 @@ pub fn bits(v: Var) -> u8 {
 
 /// The declared width of variable `idx`, or 0 when it was never declared.
 ///
-/// A pin ([`pinned_vars`]) is keyed by variable index and carries a bit pattern rather
+/// A pin (`pinned_vars`) is keyed by variable index and carries a bit pattern rather
 /// than a width, so a caller that rebuilds the pinned variable as a literal needs the width
 /// it was declared at. Zero means "no such variable", which lets a caller skip a pin whose
 /// variable is not part of the query.
@@ -2316,7 +2316,7 @@ pub fn var_width(idx: u32) -> u8 {
 ///
 /// # Why this must not be inlined into a recursive caller
 ///
-/// The [`EvalMemo`] is a local, and it is 12 KiB: `1024 * (4 + 8)` bytes. When the
+/// The `EvalMemo` is a local, and it is 12 KiB: `1024 * (4 + 8)` bytes. When the
 /// optimiser inlines this function into a caller that *recurses*, that 12 KiB
 /// temporary is allocated in the caller's frame and stays live for the whole
 /// recursive descent, so one level of recursion costs 12 KiB of stack instead of a
@@ -3290,7 +3290,7 @@ fn goal_is_closed_true(ctx: &mut Ctx, p: Term) -> bool {
 /// own DAG, which is small, and it is exactly the check that says "nothing to prove".
 ///
 /// Soundness does not depend on the assumption: a closed term has one value for every
-/// input, so a `true` from [`eval_term`] is a proof that the goal holds
+/// input, so a `true` from `eval_term` is a proof that the goal holds
 /// unconditionally. A goal with a free variable, or a closed false one, falls through
 /// to the engine.
 pub fn prove_implies(pre: Pred, post: Pred) -> Verdict {

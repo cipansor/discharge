@@ -4127,8 +4127,26 @@ in CI rather than in a downstream build. It follows the Ferrocene/Kani conventio
 an absent toolchain, or a `thumbv7em-none-eabihf` target not installed *for that
 toolchain*, is reported and skipped rather than folded into a pass. CI installs
 both the 1.85 toolchain and that target for it so the gate actually runs. The gate
-numbering is now **13 steps**, not 12; the README and `ci.yml` were renumbered
-with it.
+numbering is now **15 steps**; it was 13 when this note was written, and two steps
+were appended without renumbering the earlier ones (so the "gate 3/4/9" references
+elsewhere still name the same gates).
+
+The two appended steps hold the *tree* rather than the logic, and each closes a
+recurrence rather than a one-off:
+
+- **Step 14: rustdoc builds both crates with `-D warnings`.** The crate is
+  `#![deny(missing_docs)]`, but that only checks that a doc comment *exists* -- it says
+  nothing about whether an intra-doc link still *resolves*, and `cargo test` and `cargo
+  clippy` never run rustdoc. Four warnings had shipped: `mir/spec.rs` linked a renamed
+  `bind`, and `smt.rs` linked three private items (`pinned_vars`, `EvalMemo`, `eval_term`)
+  from public docs. `discharge-arithmetic` had the same class (`prove.rs` linked its
+  private `forall_pair_bounded` from three public items), which is why the step checks
+  both crates and not just the parent.
+- **Step 15: no compiled output is tracked.** `git ls-files` must not list a `.rlib`,
+  `.rmeta`, `.o`, `.bc`, `.d`, a `target/` path or a `__pycache__` path. This recurred:
+  a cleanup commit untracked six root `.rlib`s the oracle runs had left behind, and the
+  next `git add -A` put them straight back. A `.gitignore` cannot help -- ignore rules
+  are consulted only for *untracked* paths -- so the fix is a check, not a pattern.
 
 ## The bit-blaster walked a DAG as a tree, and no budget noticed
 
