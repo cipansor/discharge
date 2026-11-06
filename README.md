@@ -1999,7 +1999,8 @@ rustup target add thumbv7em-none-eabihf
 cargo build --no-default-features --target thumbv7em-none-eabihf
 ```
 
-`scripts/gate.sh` runs clippy (with `-D warnings`), the test suite, the bare-metal
+`scripts/gate.sh` runs clippy (with `-D warnings`, over both the `std` and the `no_std` half
+of the crate), the test suite, the bare-metal
 `no_std` build, a zero-dependency check, and the z3 differential oracle. It exists because
 the gates were previously five separate commands quoted in prose, which is how a gate
 quietly stops being run. It also refuses to report success when the z3 oracle is not

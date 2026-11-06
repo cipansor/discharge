@@ -26,6 +26,7 @@ cargo test --features std
 
 # Lint (must stay at zero warnings)
 cargo clippy --features std --all-targets
+cargo clippy --no-default-features --lib   # the `no_std` half, which the line above never compiles
 
 # Docs (must stay at zero warnings)
 cargo doc --features std --no-deps

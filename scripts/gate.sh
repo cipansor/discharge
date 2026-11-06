@@ -10,8 +10,15 @@ cd "$(dirname "$0")/.."
 
 fail() { echo "GATE FAILED: $1" >&2; exit 1; }
 
-echo "== 1/16 clippy (all targets, std) =="
-cargo clippy --workspace --features std --all-targets -- -D warnings || fail "clippy"
+echo "== 1/16 clippy (all targets, std; and the no_std lib) =="
+cargo clippy --workspace --features std --all-targets -- -D warnings || fail "clippy (std)"
+# `--features std` compiles only the host half. Every `#[cfg(not(feature = "std"))]` item --
+# the bare-metal arena, the `static mut` discipline, the whole shipped engine -- is *not*
+# compiled by the line above, so a lint in that half would never be seen. Only `--lib` is
+# linted here: the integration tests are `std`-only by construction and do not build without
+# the feature, which is the point of the gate rather than a gap in it. This is the half that
+# goes to a microcontroller, so it is the half that most deserves the lint.
+cargo clippy --no-default-features --lib -- -D warnings || fail "clippy (no_std)"
 
 echo "== 2/16 tests (std), with a count that fails on failure =="
 sh scripts/test-count.sh || fail "tests"
