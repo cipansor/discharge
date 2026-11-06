@@ -1729,42 +1729,62 @@ fn a_field_array_element_crosses_a_reference_argument() {
     }
 }
 
-/// An array handed over *as* a reference target (`&mut x.a`) is `Incomplete` in both
-/// directions -- and that is the point.
+/// An array handed over *as* a reference target (`&mut x.a`) used to be `Incomplete` in
+/// both directions. It now *decides*: the true contract is `Verified` and the false twin is
+/// refuted -- and the pair is what makes the decision trustworthy.
 ///
-/// The callee's `(*_1)[0] = 9` lands in its own element store, and the return path has no
-/// key to re-base it onto the caller's field-path store (`elems_path` is keyed by a chain
-/// of *fields*, and the target here is an element). So the caller's `x.a[0]` read stays
-/// `Unknown` and the `ensures` is unreadable: the true contract `ret == 9` is *not*
-/// proved and the false `ret == 5` is *not* proved either. Nothing false is claimed.
+/// The callee's `(*_1)[0] = 9` lands in its own element store, and the return path re-bases
+/// it onto the caller's field-path store (`elems_path`, keyed by the target's *field* chain
+/// `x.a`) instead of dropping it. So the caller's `x.a[0]` read is the callee's write, and
+/// `ensures: ret == 9` is provable while `ensures: ret == 5` is refuted.
 ///
-/// This test is a tripwire on the *precision* fix, not on the bug. The tempting fix is to
-/// make the element target's write-back land somewhere; a wrong one would connect the
-/// callee's store to the caller's `x.a[0]` in the false direction first, and the false
-/// twin would turn `Verified`. So the twin is asserted to be *not* verified here, and the
-/// corpus-wide `no_cannot_prove_entry_is_ever_verified` invariant holds it too. If a
-/// future change makes these decide, it must make the true one verify and leave the twin
-/// refuted -- which is a strictly stronger result than this test, and this test is then
-/// updated with it.
+/// This test is the tripwire the *hole* was pinned with, kept in its stronger form. While
+/// the shape was unmodelled it asserted `Incomplete`; the fix that made it decide is the
+/// change the pin existed to police, because a re-basing that connected the two stores the
+/// *wrong* way would turn the false twin `Verified` first. It did not: the twin is `Failed`.
+/// If a later change makes this shape incomplete again, this test fails and the two
+/// assertions say exactly which direction broke.
 #[test]
-fn a_whole_array_target_is_incomplete_and_never_a_false_proof() {
+fn a_whole_array_target_decides_without_a_false_proof() {
     let Some(report) = verify_realistic(&[
-        "a_whole_array_target_is_incomplete",
+        "a_whole_array_target_crosses_a_reference_argument",
         "a_whole_array_target_cannot_prove_this",
+        "a_whole_array_target_sibling_cannot_prove_this",
+        "a_whole_array_target_read_crosses_a_reference_argument",
+        "a_whole_array_target_read_cannot_prove_this",
     ]) else {
         return;
     };
-    let o = outcome(&report, "a_whole_array_target_is_incomplete");
+    let o = outcome(&report, "a_whole_array_target_crosses_a_reference_argument");
     assert!(
-        matches!(o, FnOutcome::Incomplete { .. }),
-        "a `&mut x.a` array target has no representable key, so it must be incomplete \
-         rather than decided; got: {o}"
+        o.is_verified(),
+        "a `&mut x.a` array target re-bases the callee's element onto the caller's \
+         field-path store, so the true contract `ret == 9` must verify; got: {o}"
     );
     let twin = outcome(&report, "a_whole_array_target_cannot_prove_this");
     assert!(
-        !twin.is_verified(),
-        "the false twin of the whole-array target must never be verified -- a false proof; \
-         got: {twin}"
+        matches!(twin, FnOutcome::Failed { .. }),
+        "the false twin of the whole-array target must be refuted -- a false proof is the \
+         only unacceptable outcome, and `Verified` here would be one; got: {twin}"
+    );
+    let sibling = outcome(&report, "a_whole_array_target_sibling_cannot_prove_this");
+    assert!(
+        !sibling.is_verified(),
+        "the write to `x.a` must not leak into the sibling `x.b`, so claiming `x.b[0]` \
+         changed must not verify; got: {sibling}"
+    );
+    let read = outcome(&report, "a_whole_array_target_read_crosses_a_reference_argument");
+    assert!(
+        read.is_verified(),
+        "the read-only direction (`peek_of(&x.a)`) must also decide -- the carry-in \
+         re-bases the caller's field-path element onto the callee's store, so `ret == 5` \
+         verifies; got: {read}"
+    );
+    let read_twin = outcome(&report, "a_whole_array_target_read_cannot_prove_this");
+    assert!(
+        !read_twin.is_verified(),
+        "the false read-only twin (`ret == 7` against a seed of 5) must not verify; \
+         got: {read_twin}"
     );
 }
 

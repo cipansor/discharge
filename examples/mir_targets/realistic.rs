@@ -5971,25 +5971,25 @@ fn set_holder_first_element(i: &mut ArrayHolder) {
     i.a[0] = 9;
 }
 
-/// The whole-array-target boundary: an array handed over *as* a reference target
-/// (`&mut x.a`) is incomplete, never wrong.
+/// The whole-array-target case: an array handed over *as* a reference target
+/// (`&mut x.a`) crosses the frame.
 ///
 /// `set_first_of(&mut x.a)` passes a `&mut [u8; 4]` whose target is the *field* `x.a`,
 /// not the whole local. The callee's `(*_1)[0] = 9` lands in the callee's own element
-/// store, and the return path has no representable key to re-base it onto the caller's
-/// field-path element store (`elems_path` is keyed by a chain of *fields*, and an
-/// element target is not one), so the caller's `x.a[0]` read stays `Unknown` and the
-/// `ensures` is unreadable. Both directions come back `Incomplete`.
+/// store, and the return path re-bases it onto the caller's field-path element store
+/// (`elems_path`, keyed by the field chain `x.a`) -- the key the caller's `x.a[0]` read
+/// consults. So the write crosses the frame and the contract decides: `ret == 9`
+/// verifies.
 ///
-/// That is the honest direction -- nothing false is proved, and no stale value is kept
-/// -- but it is a coverage hole rather than a modelled case, and the false twin below
-/// is what keeps it honest: if a future re-basing ever connects the two stores, the
-/// twin must not turn `Verified`. The whole-*local* form (`set_arr(&mut a); a[0]`)
-/// decides, because the target has no projection and the store is keyed by the local
-/// alone.
+/// The false twin below is the other half, and it is what makes the decision
+/// trustworthy: a re-basing that connected the two stores the *wrong* way would turn
+/// the twin `Verified` before it turned this one verified. It does not -- the twin is
+/// refuted -- so no false proof is claimed. The whole-*local* form
+/// (`set_arr(&mut a); a[0]`) also decides, because the target has no projection and the
+/// store is keyed by the local alone.
 /// requires: x.a[0] == 5
 /// ensures: ret == 9
-pub fn a_whole_array_target_is_incomplete(mut x: Boxed) -> u8 {
+pub fn a_whole_array_target_crosses_a_reference_argument(mut x: Boxed) -> u8 {
     set_first_of(&mut x.a);
     x.a[0]
 }
@@ -6008,4 +6008,46 @@ pub fn a_whole_array_target_cannot_prove_this(mut x: Boxed) -> u8 {
 /// holds it.
 fn set_first_of(a: &mut [u8; 4]) {
     a[0] = 9;
+}
+
+/// The read-only half of the whole-array-target case: `&x.a` crosses the frame the same
+/// way `&mut x.a` does.
+///
+/// `peek_of(&x.a)` hands the callee the array `x.a` as a `&[u8; 4]`, so the callee's
+/// `a[0]` is the caller's `x.a[0]`. The carry-in re-bases the caller's field-path element
+/// onto the callee's whole-local element store, so the read finds the seed and the
+/// contract decides: `ret == 5` verifies. Without it the callee read `Unknown` and this
+/// was `Incomplete` -- the exact mirror of the write direction above.
+/// requires: x.a[0] == 5
+/// ensures: ret == 5
+pub fn a_whole_array_target_read_crosses_a_reference_argument(x: Boxed) -> u8 {
+    peek_of(&x.a)
+}
+
+/// The false direction of the read-only whole-array target: the seed is 5, not 7.
+/// requires: x.a[0] == 5
+/// ensures: ret == 7
+pub fn a_whole_array_target_read_cannot_prove_this(x: Boxed) -> u8 {
+    peek_of(&x.a)
+}
+
+/// The reading helper for a whole-array target: its argument is the array `x.a` itself.
+fn peek_of(a: &[u8; 4]) -> u8 {
+    a[0]
+}
+
+/// The sibling-field direction of the whole-array target: the write to `x.a` must not
+/// leak into `x.b`.
+///
+/// `set_first_of(&mut x.a)` writes `x.a[0]`, so `x.b[0]` is still the seed. Claiming
+/// `ret == 9` here is false of the body and must be refuted; a re-basing that keyed the
+/// callee's element on the local alone -- the field chain dropped -- would land the
+/// write on whichever field the caller happened to read and *prove* this. The suffix
+/// also puts it under the corpus-wide `no_cannot_prove_entry_is_ever_verified`
+/// invariant.
+/// requires: x.b[0] == 5
+/// ensures: ret == 9
+pub fn a_whole_array_target_sibling_cannot_prove_this(mut x: Boxed) -> u8 {
+    set_first_of(&mut x.a);
+    x.b[0]
 }

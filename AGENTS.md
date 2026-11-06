@@ -6358,26 +6358,44 @@ value kept. A `&mut` target whose element the callee *did* write is still not co
 (a `&mut [T]` argument is the case that is); the caller's own store keeps the value it
 held, so the read is stale rather than unknown only when the caller never wrote it.
 
-**An array handed over *as* a reference target is incomplete, never wrong.** When the
-argument is the *array itself* rather than the whole local that holds it -- `set_first_of(&mut
-x.a)` or `peek_of(&x.a)`, a `&mut [u8; 4]` / `&[u8; 4]` whose target is the field `x.a` -- the
-callee's `(*_1)[0]` does not meet the caller's field-path element store. The contract is then
-reported *unreadable* (the read is unknown), so a function like this is *skipped* rather than
-decided: `set_first_of(&mut x.a); x.a[0]` is incomplete for both the true `ret == 9` and the
-false `ret == 5`. That is the honest direction -- nothing false is proved, and no stale value
-is kept -- but it is a coverage hole, not a modelled case. It predates the field-path work
-(confirmed unchanged against the previous commit) and is the next precision target: the store
-is keyed by the *chain*, and a reference target that is an array rather than an aggregate
-needs the chain to cross the frame as the element's own key, the same re-basing the aggregate
-targets already do. A whole-*local* array through `&mut` (`set_arr(&mut a); a[0]`) does
-decide, since the target has no projection and the store is keyed by the local alone.
+**An array handed over *as* a reference target is modelled.** When the argument is the
+*array itself* rather than the whole local that holds it -- `set_first_of(&mut x.a)` or
+`peek_of(&x.a)`, a `&mut [u8; 4]` / `&[u8; 4]` whose target is the field `x.a` -- the callee's
+`(*_1)[0]` write is re-based onto the caller's field-path element store, so
+`set_first_of(&mut x.a); x.a[0]` *decides*: the true `ret == 9` verifies and the false
+`ret == 5` is refuted. This used to be a coverage hole (incomplete in *both* directions) and
+is the shape the note below pinned before it was closed.
 
-It is now *pinned* rather than only documented: the corpus carries
-`a_whole_array_target_is_incomplete` and its false twin `a_whole_array_target_cannot_prove_this`,
-and `tests/mir.rs::a_whole_array_target_is_incomplete_and_never_a_false_proof` asserts the
-first is `Incomplete` and the second is not `Verified`. The reason to pin a *hole* is that the
-precision fix is the dangerous change: a re-basing that connects the two stores the wrong way
-turns the false twin `Verified` before it turns the true contract verified, and nothing else in
-the suite would notice. The test is deliberately weaker than "this must stay incomplete" --
-a future change that makes the true direction verify is an improvement, and the assertion is
-updated with it -- while the twin's "not verified" is unconditional.
+The mechanism, and why it took a second store: the callee's `&mut [u8; 4]` argument is the
+array, so its element write lands in the callee's plain element store (`elems`), keyed by the
+local. The caller's `x.a[0]` read consults `elems_path`, keyed by the *field chain* `x.a`. The
+return path already re-based the callee's `elems_path` entries and its `fields`/`nested`
+entries onto the target's chain, but the plain `elems` entries under a sub-place target were
+*dropped* -- there was no key for them, and dropping is the honest direction (a stale value
+would be worse). The fix is one mirrored arm: a sub-place target that *is* a field chain
+(`&mut x.a`, chain `[0]`) re-bases the callee's `elems[k]` onto `elems_path[(cl, chain, k)]`,
+which is exactly the key the caller's read consults. A sub-place target that is not a field
+chain (`&mut x.a[0]`, `&mut t.0` on a tuple) still drops -- the `rest_chain` `None` arm -- so
+an unrepresentable key is never invented. The guard is structural, not a value test: only an
+*array* argument ever has plain `elems` entries at the callee's local (a struct or tuple
+argument's parts live in `fields`/`nested`), so this arm cannot re-base a scalar onto an array
+key. A sibling field is untouched: `set_second(&mut x.a); x.b[1]` is refuted, so there is no
+cross-field contamination.
+
+The *read* direction is the mirror and needs the mirror of the same arm. `peek_of(&x.a)` hands
+the callee the array as a whole local, so the callee's `_1[k]` read consults its plain `elems`
+store; the carry-in re-bases the caller's `elems_path[(sl, chain, k)]` *onto* that store when
+the target chain is exactly the caller's field chain (`rem.is_empty()`), and onto `elems_path`
+with the prefix dropped otherwise (the `&o.i` case). Both directions were `Incomplete` before
+and both decide now, and the two are separate loops because one runs at the call and one at the
+return.
+
+It is *pinned*: the corpus carries `a_whole_array_target_crosses_a_reference_argument` (the
+true direction, `ret == 9`) and its false twin
+`a_whole_array_target_cannot_prove_this`, and
+`tests/mir.rs::a_whole_array_target_decides_without_a_false_proof` asserts the first is
+`Verified` and the second is `Failed`. The pin is what made closing the hole safe to do: the
+dangerous change is a re-basing that connects the two stores the *wrong* way, which would turn
+the false twin `Verified` before the true contract verified, and nothing else in the suite
+would notice. The twin's `Failed` assertion is the unconditional half; if a later change makes
+this shape incomplete again, the test fails and the two assertions say which direction broke.

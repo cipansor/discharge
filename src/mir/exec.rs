@@ -2729,11 +2729,25 @@ where
                             }
                             if rest.is_empty() {
                                 env.elems.insert((cl, *k), *v);
+                            } else if let Some(rc) = &rest_chain {
+                                // An array *argument* handed over as a whole field-path
+                                // target (`&mut x.a`): the callee's `_1` is the array, so
+                                // its element `k` is the caller's `<target>[k]`, which lives
+                                // in `elems_path` under the target's field chain. Without
+                                // this the element was dropped and the caller read its own
+                                // seed (`set_first_of(&mut x.a); x.a[0]` was `Incomplete` in
+                                // *both* directions). The chain is non-empty here -- the
+                                // empty one is the whole-local arm above -- and the entry
+                                // exists only because the argument is an array: a struct or
+                                // tuple argument's parts live in `fields`/`nested`, never
+                                // here, so this cannot re-base a scalar onto an array key.
+                                env.elems_path.insert((cl, rc.clone(), *k), *v);
                             } else {
-                                // An element under a sub-place target has no key in
-                                // this store. Leaving the caller's element would be a
-                                // stale value, so the caller's parts go instead --
-                                // precision lost, never a wrong value kept.
+                                // An element under a sub-place target that is not a field
+                                // chain (`&mut x.a[0]`) has no key in this store. Leaving the
+                                // caller's element would be a stale value, so the caller's
+                                // parts go instead -- precision lost, never a wrong value
+                                // kept.
                                 dropped = true;
                             }
                         }
@@ -3242,7 +3256,17 @@ where
                                 continue;
                             }
                             let rem = &chain[rc.len()..];
-                            if !rem.is_empty() {
+                            if rem.is_empty() {
+                                // The target *is* the array (`peek_of(&x.a)`): in the
+                                // callee's terms its argument is a whole local, so the
+                                // callee's `_1[k]` read consults the *plain* element store,
+                                // not the field-path one. Without this the callee read
+                                // `Unknown` and a read-only helper's contract was
+                                // unreadable -- an incompleteness where the true contract
+                                // should decide. This is the exact inverse of the write-back
+                                // arm that re-bases a whole-array target's element.
+                                env.elems.insert((l, *k), *v);
+                            } else {
                                 env.elems_path.insert((l, rem.to_vec(), *k), *v);
                             }
                         }
