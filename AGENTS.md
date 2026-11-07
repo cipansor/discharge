@@ -6085,8 +6085,10 @@ reborrowed receiver (`let r = &mut o; r.i.set_leaf(5)`), a `&self` read feeding 
 write, and a leaf write that leaves the target's sibling at the caller's seed. Ten entries
 with their false twins, pinned by
 `a_method_receiver_is_a_sub_place_like_any_other_argument`. A whole-aggregate replacement
-through a sub-place target (`*i = n` for `&mut o.i`) is *sound-incomplete* rather than
-decided: a leaf write cannot spell a whole value, so the caller's leaf reads unknown.
+through a sub-place target (`*i = n` for `&mut o.i`) also decides: the moved value's leaf
+reaches the caller's `o.i.v`, the sibling `o.j.v` keeps its seed, and a value built in a
+local behaves the same -- see "A whole-aggregate replacement through a sub-place target
+decides" below.
 
 **A reference crosses a call in both directions.** A reference *returned* by a helper was
 the sharpest case, and it was a **false proof**: `let r = identity(&mut x); *r = 5` lowers
@@ -6436,3 +6438,57 @@ be named in a contract at all: `g.rows[0][0]` is refused with `unknown field`, s
 function is *skipped* rather than decided. A *tuple* field target (`&mut w.t`) is refused the
 same way (`unknown field t of w`). Both are coverage holes, not soundness ones -- the contract
 cannot be written, so nothing false is proved.
+
+**An array that is a struct *field* carries its elements when the aggregate moves.** This was
+a coverage hole, not a false proof: `ArrayHolder { a: [9, 1, 2, 3] }` builds the array in a temp
+whose elements live in the whole-local `elems` store, then moves it into the field
+(`_2.0 = move _3`), and `Env::rebase_parts` -- which re-bases `elems_path` (field-path arrays)
+and `fields`/`nested` -- did not carry `elems`. So `_2.0` held the array's *value* but none of
+its elements, `x.a[0]` read `Unknown`, and the contract stayed `Incomplete` in *both*
+directions. A bare array literal (`let a = [9, 1, 2, 3]; a[0]`) always worked, because there the
+elements and the read share the whole-local store; only the field case had the hole, which is
+why it went unnoticed. A missing value proves nothing, so nothing false was ever proved -- the
+true direction was merely lost.
+
+The fix is one mirrored pair of loops in `rebase_parts`: a *whole* source's `elems` entries move
+with the value, re-keyed onto the destination -- a whole destination takes them as whole-local
+`elems`, and a nested destination (`o.i = ...`) takes them under the destination's field chain
+in `elems_path`. The gate is `field_steps(&src.proj)` being empty, not a type test: only a whole
+source has `elems` (a nested source's elements are already in `elems_path` and were handled), so
+this cannot invent an element for a sub-place move. Because `rebase_parts` runs on the
+reference-argument write-back too, the same carry makes a whole-field replacement through
+`&mut` (`set_holder(&mut o.i, ArrayHolder { a: [9, 1, 2, 3] }); o.i.a[0]`) decide as well.
+
+Pinned by `tests/mir.rs::an_array_field_of_a_moved_aggregate_carries_its_elements`, whose
+corpus entries are `a_struct_literal_array_element_is_read_back` (and its second-element
+sibling, so a carry that pinned index 0 for all elements is caught),
+`a_nested_struct_literal_array_element_is_read_back` (the longer destination chain),
+`a_whole_field_assignment_carries_its_array_elements` (the same carry across a call boundary),
+`a_whole_field_assignment_leaves_its_sibling` (no spill onto a neighbouring scalar), and
+`an_array_field_argument_is_read_by_element` -- each with its `_cannot_prove_this` twin, so the
+corpus-wide `no_cannot_prove_entry_is_ever_verified` invariant holds them too. Verified to fail
+without the fix by reverting the two loops: the test then reports the true direction as
+`incomplete`.
+
+**Evidence.** Corpus `decided 289 of 538` -> **`298 of 556`** (eighteen new entries: the six
+array-field and six whole-replacement true directions now decide, and all twelve twins stay
+`Failed`); `cargo test --workspace --features std` **684 -> 686** passed, 0 failed; `cargo
+clippy --workspace --features std --all-targets -- -D warnings` clean; `scripts/gate.sh` 16/16
+green (bare-metal build, zero-dependency and `no_std` gates included), z3 `agree=845
+mismatch=0`, kani `agree=57 mismatch=0`, verus `0 differ`, rustc_public oracle `realistic.rs 622
+typed, 621 agree, 0 differ`. Zero dependencies and `no_std` untouched.
+
+**A whole-aggregate replacement through a sub-place target decides.** `set_whole(&mut o.i, n)`
+with `set_whole(i: &mut InnerBox, n: InnerBox) { *i = n }` replaces the whole referent, and the
+moved value's leaf reaches the caller: `o.i.v` reads the new value, the sibling `o.j.v` keeps
+its seed, and a value built in a caller local (`let n = InnerBox { v: 9 }; set_whole(&mut o.i, n)`)
+behaves the same. The re-based write-back (`rest ++ key`) re-roots the callee's `fields` entry
+for the moved value under the target's chain, which is the same mechanism that carries a *leaf*
+write; a whole value and a leaf are both a `fields` entry in this store, so the shape was never
+actually the blocker it was once believed to be. This paragraph replaces an earlier claim that
+the shape was *sound-incomplete*: that was measured on a version whose write-back dropped the
+part keys for a sub-place target (the false proof the paragraph above fixes), and it is no
+longer true. Pinned by
+`tests/mir.rs::a_whole_aggregate_replacement_through_a_sub_place_decides`, whose corpus entries
+`whole_replacement_through_sub_place`, `whole_replacement_leaves_the_sibling` and
+`whole_replacement_from_a_local` each carry their `_cannot_prove_this` twin.

@@ -2511,6 +2511,102 @@ fn a_reference_to_a_reference_crosses_a_frame_only_when_refused() {
     );
 }
 
+/// An array that is a struct *field* carries its elements when the aggregate is moved.
+///
+/// `ArrayHolder { a: [9, 1, 2, 3] }` builds the array in a temp whose elements live in the
+/// whole-local `elems` store, then moves it into the field. `rebase_parts` re-based
+/// `elems_path` (field-path arrays) but missed `elems`, so `x.a[0]` read `Unknown` and the
+/// contract stayed `Incomplete` in *both* directions -- a coverage hole, not a false proof,
+/// since a missing value proves nothing. A bare array literal always worked, so the hole
+/// was specific to the field case. The whole-field write through a reference (`*h = n`)
+/// exercises the same carry across a frame, and the sibling check keeps the re-base from
+/// spilling the elements onto a neighbouring scalar.
+#[test]
+fn an_array_field_of_a_moved_aggregate_carries_its_elements() {
+    let Some(report) = verify_realistic(&[
+        "a_struct_literal_array_element_is_read_back",
+        "a_struct_literal_array_element_is_not_the_seed_cannot_prove_this",
+        "a_struct_literal_array_second_element_is_read_back",
+        "a_struct_literal_array_second_element_is_not_the_first_cannot_prove_this",
+        "a_nested_struct_literal_array_element_is_read_back",
+        "a_nested_struct_literal_array_element_is_not_the_seed_cannot_prove_this",
+        "a_whole_field_assignment_carries_its_array_elements",
+        "a_stale_whole_field_array_element_cannot_prove_this",
+        "a_whole_field_assignment_leaves_its_sibling",
+        "a_whole_field_assignment_leaves_its_sibling_cannot_prove_this",
+        "an_array_field_argument_is_read_by_element",
+        "an_array_field_argument_is_read_by_element_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "a_struct_literal_array_element_is_read_back",
+        "a_struct_literal_array_second_element_is_read_back",
+        "a_nested_struct_literal_array_element_is_read_back",
+        "a_whole_field_assignment_carries_its_array_elements",
+        "a_whole_field_assignment_leaves_its_sibling",
+        "an_array_field_argument_is_read_by_element",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "an array field's elements must reach the read; got: {o}");
+    }
+    for name in [
+        "a_struct_literal_array_element_is_not_the_seed_cannot_prove_this",
+        "a_struct_literal_array_second_element_is_not_the_first_cannot_prove_this",
+        "a_nested_struct_literal_array_element_is_not_the_seed_cannot_prove_this",
+        "a_stale_whole_field_array_element_cannot_prove_this",
+        "a_whole_field_assignment_leaves_its_sibling_cannot_prove_this",
+        "an_array_field_argument_is_read_by_element_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a stale or misdirected array-field element must not prove this; got: {o}"
+        );
+    }
+}
+
+/// A whole-aggregate replacement through a sub-place target decides.
+///
+/// `set_whole(&mut o.i, InnerBox { v: 9 })` replaces the whole referent. This was once
+/// believed *sound-incomplete* -- a leaf write "cannot spell a whole value" -- but the
+/// re-based write-back re-roots the callee's `fields` entry for the moved value under the
+/// target's chain, and in this store a whole value and a leaf are both a `fields` entry, so
+/// the shape was never actually the blocker. The sibling check keeps the re-root from
+/// landing on the whole local, and the local-built value makes the carry come from a temp.
+#[test]
+fn a_whole_aggregate_replacement_through_a_sub_place_decides() {
+    let Some(report) = verify_realistic(&[
+        "whole_replacement_through_sub_place",
+        "whole_replacement_through_sub_place_cannot_prove_this",
+        "whole_replacement_leaves_the_sibling",
+        "whole_replacement_leaves_the_sibling_cannot_prove_this",
+        "whole_replacement_from_a_local",
+        "whole_replacement_from_a_local_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "whole_replacement_through_sub_place",
+        "whole_replacement_leaves_the_sibling",
+        "whole_replacement_from_a_local",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a whole replacement must reach the caller's leaf; got: {o}");
+    }
+    for name in [
+        "whole_replacement_through_sub_place_cannot_prove_this",
+        "whole_replacement_leaves_the_sibling_cannot_prove_this",
+        "whole_replacement_from_a_local_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a stale or misdirected whole replacement must not prove this; got: {o}"
+        );
+    }
+}
+
 /// The whole-corpus direction invariant: a function whose *name* says it must not be
 /// provable may never come back `verified`.
 ///

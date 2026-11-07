@@ -6294,3 +6294,181 @@ impl Boxed {
         &mut self.a[i]
     }
 }
+
+/// A struct literal's array field carries its elements.
+///
+/// `ArrayHolder { a: [9, 1, 2, 3] }` builds the array in a temp whose elements live in
+/// `elems`, then moves it into the field `_2.0`. The move carried the field's *value* but
+/// not its elements -- `rebase_parts` re-based `elems_path` (field-path arrays) and missed
+/// the whole-local `elems` store -- so `x.a[0]` read `Unknown` and the contract stayed
+/// `Incomplete` in *both* directions. That is a coverage hole, not a false proof: a
+/// missing value proves nothing, so the true `ret == 9` was merely lost. A bare array
+/// literal (`let a = [9, 1, 2, 3]; a[0]`) always worked, which is why only the field case
+/// showed the hole.
+/// requires: true
+/// ensures: ret == 9
+pub fn a_struct_literal_array_element_is_read_back() -> u8 {
+    let x = ArrayHolder { a: [9, 1, 2, 3] };
+    x.a[0]
+}
+
+/// The false direction of [`a_struct_literal_array_element_is_read_back`]: a carry that
+/// landed every element on index 0, or dropped the indices, would decide the wrong one.
+/// requires: true
+/// ensures: ret == 1
+pub fn a_struct_literal_array_element_is_not_the_seed_cannot_prove_this() -> u8 {
+    let x = ArrayHolder { a: [9, 1, 2, 3] };
+    x.a[0]
+}
+
+/// The element at a *different* index, so a fix that pinned the first element for all of
+/// them is caught.
+/// requires: true
+/// ensures: ret == 1
+pub fn a_struct_literal_array_second_element_is_read_back() -> u8 {
+    let x = ArrayHolder { a: [9, 1, 2, 3] };
+    x.a[1]
+}
+
+/// The false direction of [`a_struct_literal_array_second_element_is_read_back`].
+/// requires: true
+/// ensures: ret == 9
+pub fn a_struct_literal_array_second_element_is_not_the_first_cannot_prove_this() -> u8 {
+    let x = ArrayHolder { a: [9, 1, 2, 3] };
+    x.a[1]
+}
+
+/// A *nested* struct literal: the array field is one level deeper, so the move re-roots the
+/// elements under a longer destination chain.
+/// requires: true
+/// ensures: ret == 9
+pub fn a_nested_struct_literal_array_element_is_read_back() -> u8 {
+    let o = NestedArrays { i: ArrayHolder { a: [9, 1, 2, 3] }, k: 0 };
+    o.i.a[0]
+}
+
+/// The false direction of [`a_nested_struct_literal_array_element_is_read_back`].
+/// requires: true
+/// ensures: ret == 1
+pub fn a_nested_struct_literal_array_element_is_not_the_seed_cannot_prove_this() -> u8 {
+    let o = NestedArrays { i: ArrayHolder { a: [9, 1, 2, 3] }, k: 0 };
+    o.i.a[0]
+}
+
+/// A whole-field assignment through a reference carries the array field's elements to the
+/// caller. The callee's `*h = n` replaces the field, and the elements of the moved array
+/// have to reach the caller's store or `o.i.a[0]` reads its seed.
+/// requires: o.i.a[0] == 7
+/// ensures: ret == 9
+pub fn a_whole_field_assignment_carries_its_array_elements(mut o: NestedArrays) -> u8 {
+    set_holder(&mut o.i, ArrayHolder { a: [9, 1, 2, 3] });
+    o.i.a[0]
+}
+
+/// The false direction of [`a_whole_field_assignment_carries_its_array_elements`].
+/// requires: o.i.a[0] == 7
+/// ensures: ret == 7
+pub fn a_stale_whole_field_array_element_cannot_prove_this(mut o: NestedArrays) -> u8 {
+    set_holder(&mut o.i, ArrayHolder { a: [9, 1, 2, 3] });
+    o.i.a[0]
+}
+
+/// The whole-field replacement must not disturb a sibling scalar.
+/// requires: o.k == 5
+/// ensures: ret == 5
+pub fn a_whole_field_assignment_leaves_its_sibling(mut o: NestedArrays) -> u8 {
+    set_holder(&mut o.i, ArrayHolder { a: [9, 1, 2, 3] });
+    o.k
+}
+
+/// The false direction of [`a_whole_field_assignment_leaves_its_sibling`]: a re-base that
+/// spilled the moved elements onto the sibling would decide this.
+/// requires: o.k == 5
+/// ensures: ret == 9
+pub fn a_whole_field_assignment_leaves_its_sibling_cannot_prove_this(mut o: NestedArrays) -> u8 {
+    set_holder(&mut o.i, ArrayHolder { a: [9, 1, 2, 3] });
+    o.k
+}
+
+/// An array *field* read through a reference argument: the referent's elements are carried
+/// in, so the callee's `h.a[0]` reads the caller's element.
+/// requires: h.a[0] == 5
+/// ensures: ret == 5
+pub fn an_array_field_argument_is_read_by_element(h: ArrayHolder) -> u8 {
+    h.a[0]
+}
+
+/// The false direction of [`an_array_field_argument_is_read_by_element`].
+/// requires: h.a[0] == 5
+/// ensures: ret == 9
+pub fn an_array_field_argument_is_read_by_element_cannot_prove_this(h: ArrayHolder) -> u8 {
+    h.a[0]
+}
+
+/// A helper replacing a whole `ArrayHolder` through a reference.
+pub fn set_holder(h: &mut ArrayHolder, n: ArrayHolder) {
+    *h = n;
+}
+
+/// A whole-aggregate replacement through a sub-place target decides.
+///
+/// `set_whole(&mut o.i, InnerBox { v: 9 })` replaces the whole referent, and the moved value's
+/// leaf must reach the caller. This was once believed *sound-incomplete*; it is not -- the
+/// re-based write-back re-roots the callee's `fields` entry under the target's chain, and a
+/// whole value and a leaf write are both a `fields` entry there.
+/// requires: o.i.v == 7
+/// ensures: ret == 9
+pub fn whole_replacement_through_sub_place(mut o: OuterBox) -> u8 {
+    set_whole(&mut o.i, InnerBox { v: 9 });
+    o.i.v
+}
+
+/// The false direction of [`whole_replacement_through_sub_place`]: a dropped replacement
+/// would leave the seed, so this would verify.
+/// requires: o.i.v == 7
+/// ensures: ret == 7
+pub fn whole_replacement_through_sub_place_cannot_prove_this(mut o: OuterBox) -> u8 {
+    set_whole(&mut o.i, InnerBox { v: 9 });
+    o.i.v
+}
+
+/// The replacement must not spill onto the sibling field.
+/// requires: o.j.v == 5
+/// ensures: ret == 5
+pub fn whole_replacement_leaves_the_sibling(mut o: OuterBox) -> u8 {
+    set_whole(&mut o.i, InnerBox { v: 9 });
+    o.j.v
+}
+
+/// The false direction of [`whole_replacement_leaves_the_sibling`]: a write-back that
+/// re-rooted onto the whole local instead of the target's chain would prove this.
+/// requires: o.j.v == 5
+/// ensures: ret == 9
+pub fn whole_replacement_leaves_the_sibling_cannot_prove_this(mut o: OuterBox) -> u8 {
+    set_whole(&mut o.i, InnerBox { v: 9 });
+    o.j.v
+}
+
+/// A replacement whose value is built in a caller local, so the carry crosses the frame
+/// from a temp rather than a literal.
+/// requires: o.i.v == 7
+/// ensures: ret == 9
+pub fn whole_replacement_from_a_local(mut o: OuterBox) -> u8 {
+    let n = InnerBox { v: 9 };
+    set_whole(&mut o.i, n);
+    o.i.v
+}
+
+/// The false direction of [`whole_replacement_from_a_local`].
+/// requires: o.i.v == 7
+/// ensures: ret == 7
+pub fn whole_replacement_from_a_local_cannot_prove_this(mut o: OuterBox) -> u8 {
+    let n = InnerBox { v: 9 };
+    set_whole(&mut o.i, n);
+    o.i.v
+}
+
+/// A helper replacing a whole aggregate through a reference.
+pub fn set_whole(i: &mut InnerBox, n: InnerBox) {
+    *i = n;
+}

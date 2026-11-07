@@ -828,7 +828,22 @@ impl Env {
                 }
             }
         }
-        let any = !rels.is_empty() || !elem_rels.is_empty();
+        // A whole-local array's elements live in `elems`, not `elems_path`, and they move with
+        // the value too. Without this, an array that is a struct *field* built by a literal
+        // (`ArrInner { a: [9, 1, 2, 3] }`) lost its elements at the assignment: `_2.0` held the
+        // array's value but not its parts, so `o.i.a[0]` read `Unknown` and the contract stayed
+        // `Incomplete` in both directions -- a coverage hole, not a false proof, since a missing
+        // value proves nothing. Only a *whole* source has `elems` (a nested source's elements
+        // are in `elems_path` and are handled above), so this is gated on an empty `sp`.
+        let mut whole_elem_rels: Vec<(u64, Val)> = Vec::new();
+        if sp.is_empty() {
+            for ((l, k), v) in &self.elems {
+                if *l == s {
+                    whole_elem_rels.push((*k, *v));
+                }
+            }
+        }
+        let any = !rels.is_empty() || !elem_rels.is_empty() || !whole_elem_rels.is_empty();
         // A whole destination is replaced outright, so its previous parts must not survive; a
         // nested destination keeps the parts outside the written path.
         if dp.is_empty() && s != dst.local {
@@ -844,6 +859,16 @@ impl Env {
                 self.elems.insert((dst.local, k), v);
             } else {
                 self.elems_path.insert((dst.local, full, k), v);
+            }
+        }
+        // A whole-local element of the source lands on the destination at the same shape: a
+        // whole destination takes it as a whole-local element, and a nested destination takes
+        // it under the destination's field chain.
+        for (k, v) in whole_elem_rels {
+            if dp.is_empty() {
+                self.elems.insert((dst.local, k), v);
+            } else {
+                self.elems_path.insert((dst.local, dp.clone(), k), v);
             }
         }
         for (rel, v) in rels {
