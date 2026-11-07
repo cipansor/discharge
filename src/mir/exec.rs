@@ -402,6 +402,16 @@ struct Env {
     locals: BTreeMap<u32, Val>,
     /// Array elements, keyed by (local, index).
     elems: BTreeMap<(u32, u64), Val>,
+    /// An element of an array reached through a *field path*: `o.a[0]` is keyed by
+    /// `(local, [the field chain before the index], index)`.
+    ///
+    /// A separate store from [`Self::elems`] because that one is keyed by `(local, index)`
+    /// only, so `o.a[0]` and `o.b[0]` would collide on `(local, 0)` -- reading the wrong
+    /// array's element. And separate from [`Self::indexed`], which is keyed by local and holds
+    /// an *argument*'s array or slice; a field array is not the local itself. Only elements
+    /// this run explicitly wrote are served from here; a read of an element that was never
+    /// written is `Unknown`, never a seed or a literal.
+    elems_path: BTreeMap<(u32, Vec<u32>, u64), Val>,
     /// Tuple fields, keyed by (local, field).
     fields: BTreeMap<(u32, u32), Val>,
     /// A *nested* field path, keyed by (local, the projection chain from the
@@ -545,6 +555,7 @@ impl Env {
         Env {
             locals: BTreeMap::new(),
             elems: BTreeMap::new(),
+            elems_path: BTreeMap::new(),
             fields: BTreeMap::new(),
             nested: BTreeMap::new(),
             payloads: BTreeMap::new(),
@@ -715,6 +726,145 @@ impl Env {
         }
     }
 
+    /// A place whose `IndexVar` steps are replaced by the literal they hold *in
+    /// this frame*.
+    ///
+    /// A returned reference's origin is a place in the callee's terms, and a
+    /// `&mut self.a[0]` records the *local* that held `0` -- `_2` -- not the
+    /// literal, because `_2` is the index the dump names. That local dies at the
+    /// call boundary, so a caller that translates the origin gets a place no
+    /// `elems_path` entry is ever keyed by, and a write through the returned
+    /// reference is dropped. Resolving the index here, while the callee's locals
+    /// are still live, turns it into the literal the caller's store agrees on.
+    ///
+    /// A symbolic index is left as it is: its value is not a single element the
+    /// caller could name either, so refusing to pin it is what keeps the write
+    /// from landing on an arbitrary element.
+    fn pin_index_vars(&self, p: &Place) -> Place {
+        let mut proj = p.proj.clone();
+        for step in &mut proj {
+            if let Proj::IndexVar(li) = step {
+                if let Some(Val::Sym(x, _)) = self.locals.get(li) {
+                    if let Some(k) = smt::evaluate(*x, |_| None) {
+                        *step = Proj::Index(k);
+                    }
+                }
+            }
+        }
+        Place { local: p.local, proj }
+    }
+
+    /// Move the parts stored under `src` to `dst`, re-rooting them when either place is
+    /// nested, and report whether there were any.
+    ///
+    /// This generalises [`Self::copy_parts`], which is the whole-place-to-whole-place case and
+    /// carries the element, payload, tag and index stores as well. This one is reached when a
+    /// nested place is on at least one side, and it moves the two field-shaped stores:
+    ///
+    /// - a struct literal into a nested field, `o.i = InnerBox { v: 9 }` -> `(_1.0) = move _2`
+    ///   (whole source, nested destination);
+    /// - a nested-to-nested move, `o.i = o.j` -> `_2 = move (_1.1); (_1.0) = move _2` (the
+    ///   first step is a nested source into a whole temp, the second a whole source into a
+    ///   nested destination).
+    ///
+    /// [`Self::copy_parts`] is reached only when both places are whole, so without this the
+    /// parts never land under the nested place and the later read (`(_1.0).0`, the nested
+    /// store keyed by the whole chain) finds nothing. The body's value is then unknown, and a
+    /// contract that *is* false of the body is reported unreadable instead of refuted.
+    ///
+    /// Both projections are read as field paths (`field_steps`), and both are *resolved*
+    /// first, so a write through a reference (`((*_1).0) = move _2`) reaches the target's
+    /// field path rather than stopping at the leading deref -- what makes the write and the
+    /// read meet in one store. Any other projection (an index, a downcast, a second deref)
+    /// names a store this helper does not re-root, and writing a part where no read consults
+    /// it would be a lost proof at best, so those are refused.
+    ///
+    /// A part is re-keyed relative to the source's own path: the entry at `(src.local, sp)`
+    /// (or the single-field entry whose key *is* `sp`) is the value at `src`, and it lands at
+    /// the destination's path. A whole destination replaces every part it had, so its old
+    /// parts are dropped first; a nested destination keeps its siblings, because only the
+    /// paths under it are being written. A path that re-roots to the whole local (a field of
+    /// one moved into a whole place) becomes the local's value.
+    fn rebase_parts(&mut self, src: &Place, dst: &Place) -> bool {
+        let src = self.resolve(src);
+        let dst = self.resolve(dst);
+        let Some(sp) = field_steps(&src.proj) else { return false };
+        let Some(dp) = field_steps(&dst.proj) else { return false };
+        if src.local == dst.local && sp == dp {
+            return false;
+        }
+        let s = src.local;
+        // The source's parts, keyed relative to the source's own path. The `nested` store is
+        // the chain-shaped one (length two or more) and the `fields` store the single-field
+        // one; a source path `sp` selects the entries under it, and the entry *at* it (a
+        // single-field source) is the whole moved value.
+        let mut rels: Vec<(Vec<u32>, Val)> = Vec::new();
+        for ((l, chain), v) in &self.nested {
+            if *l == s {
+                if let Some(tail) = chain.strip_prefix(sp.as_slice()) {
+                    rels.push((tail.to_vec(), *v));
+                }
+            }
+        }
+        for ((l, k), v) in &self.fields {
+            if *l != s {
+                continue;
+            }
+            if sp.is_empty() {
+                rels.push((vec![*k], *v));
+            } else if sp.as_slice() == [*k] {
+                rels.push((Vec::new(), *v));
+            }
+        }
+        // Elements of field-path arrays under the source path move with the value, re-keyed the
+        // same way. An element *at* the source path (its chain equals `sp`) is an element of the
+        // whole destination value, which the plain `elems` store answers; a deeper one keeps its
+        // tail under the destination path.
+        let mut elem_rels: Vec<(Vec<u32>, u64, Val)> = Vec::new();
+        for ((l, chain, k), v) in &self.elems_path {
+            if *l == s {
+                if let Some(tail) = chain.strip_prefix(sp.as_slice()) {
+                    elem_rels.push((tail.to_vec(), *k, *v));
+                }
+            }
+        }
+        let any = !rels.is_empty() || !elem_rels.is_empty();
+        // A whole destination is replaced outright, so its previous parts must not survive; a
+        // nested destination keeps the parts outside the written path.
+        if dp.is_empty() && s != dst.local {
+            self.forget_parts(dst.local);
+        } else if !dp.is_empty() {
+            self.elems_path
+                .retain(|(l, c, _), _| *l != dst.local || !c.starts_with(dp.as_slice()));
+        }
+        for (tail, k, v) in elem_rels {
+            let mut full = dp.clone();
+            full.extend(tail);
+            if full.is_empty() {
+                self.elems.insert((dst.local, k), v);
+            } else {
+                self.elems_path.insert((dst.local, full, k), v);
+            }
+        }
+        for (rel, v) in rels {
+            let mut full = dp.clone();
+            full.extend(rel);
+            match full.len() {
+                // The value *at* the source path becomes the whole destination value.
+                0 => {
+                    self.locals.insert(dst.local, v);
+                }
+                1 => {
+                    self.fields.insert((dst.local, full[0]), v);
+                }
+                _ => {
+                    self.nested.insert((dst.local, full), v);
+                }
+            }
+        }
+        any
+    }
+
     /// Copy every derived part of `src`'s local onto `dst`, and report whether the
     /// source had any.
     ///
@@ -754,15 +904,28 @@ impl Env {
             .filter(|((l, _), _)| *l == s)
             .map(|((_, chain), v)| (chain.clone(), *v))
             .collect();
+        // Elements of a field-path array are parts of the local too: `c = d` has to carry
+        // `d.a[0]` to `c.a[0]`, or a later read of the destination's element finds nothing (or,
+        // worse, the destination's own pre-copy element).
+        let path_elems: Vec<(Vec<u32>, u64, Val)> = self
+            .elems_path
+            .iter()
+            .filter(|((l, _, _), _)| *l == s)
+            .map(|((_, chain, k), v)| (chain.clone(), *k, *v))
+            .collect();
         let any = !fields.is_empty()
             || !elems.is_empty()
             || !payloads.is_empty()
             || !nested.is_empty()
+            || !path_elems.is_empty()
             || disc.is_some()
             || indexed.is_some();
         self.forget_parts(dst);
         for (chain, v) in nested {
             self.nested.insert((dst, chain), v);
+        }
+        for (chain, k, v) in path_elems {
+            self.elems_path.insert((dst, chain, k), v);
         }
         for (k, v) in fields {
             self.fields.insert((dst, k), v);
@@ -857,7 +1020,25 @@ impl Env {
                         // for a caller that did not.
                         None => Val::Unknown,
                     },
-                    None => *self.elems.get(&(p.local, *k)).unwrap_or(&Val::Unknown),
+                    // An element of an array reached through a *field path*: `o.a[0]` is keyed
+                    // by `(local, the field chain before the index, index)`. The path form is
+                    // tried first; a whole-local array has an empty chain, which is the plain
+                    // `o[0]` case the `elems` map below answers. Only an element this run
+                    // explicitly wrote is served; a path no write reached is `Unknown`, never a
+                    // seed or a literal, so `o.a[0]` cannot read a value the body never stored.
+                    None => {
+                        let chain = field_steps(&p.proj[..i]).unwrap_or_default();
+                        if chain.is_empty() {
+                            // A whole-local array (an array literal): the plain `elems` map
+                            // keeps answering it, exactly as before.
+                            *self.elems.get(&(p.local, *k)).unwrap_or(&Val::Unknown)
+                        } else {
+                            *self
+                                .elems_path
+                                .get(&(p.local, chain, *k))
+                                .unwrap_or(&Val::Unknown)
+                        }
+                    }
                 },
                 // `(*_1)[_2]` — a subscript that is a local. The element is
                 // looked up by the index's *value*: a constant index names one
@@ -877,7 +1058,17 @@ impl Env {
                                 let sign = Sign::of_bool(s.elem_signed);
                                 s.elems.get(&k).map(|v| Val::Sym(*v, sign)).unwrap_or(Val::Unknown)
                             }
-                            None => *self.elems.get(&(p.local, k)).unwrap_or(&Val::Unknown),
+                            None => {
+                                let chain = field_steps(&p.proj[..i]).unwrap_or_default();
+                                if chain.is_empty() {
+                                    *self.elems.get(&(p.local, k)).unwrap_or(&Val::Unknown)
+                                } else {
+                                    *self
+                                        .elems_path
+                                        .get(&(p.local, chain, k))
+                                        .unwrap_or(&Val::Unknown)
+                                }
+                            }
                         },
                         // A symbolic subscript: `get` takes `&self`, so it cannot
                         // create the elements the chain needs. The operand path
@@ -1043,6 +1234,40 @@ impl Env {
                     self.nested.insert((p.local, chain), v);
                     return;
                 }
+                // An element of an array reached through a field path: `(_1.0)[k] = v`. The
+                // whole projection is the key, so `o.a[0]` and `o.b[0]` cannot collide. The
+                // write replaces that element and leaves the siblings; the element's *type*
+                // was not seeded, so a read of an element this run did not write stays
+                // `Unknown` rather than inventing a value.
+                if let [fields @ .., last] = rest {
+                    let index = match last {
+                        Proj::Index(k) => Some(*k),
+                        // A symbolic subscript is only writable when the run can pin its
+                        // value; otherwise the store cannot say which element changed, so the
+                        // whole path is dropped rather than left stale.
+                        Proj::IndexVar(li) => match self.locals.get(li) {
+                            Some(Val::Sym(x, _)) => smt::evaluate(*x, |_| None),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(chain) = field_steps(fields) {
+                        if !chain.is_empty() {
+                            match index {
+                                Some(k) => {
+                                    self.write_elem_at(p.local, chain, k, v);
+                                    return;
+                                }
+                                None => {
+                                    self.elems_path.retain(|(l, c, _), _| {
+                                        *l != p.local || c.as_slice() != chain.as_slice()
+                                    });
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
                 // A shape the arms above do not cover. `*a = v` (a whole-store
                 // write through a `&mut [T; N]`) would need a new store, so it is
                 // dropped. For an indexed local that leaves the store describing a
@@ -1072,12 +1297,19 @@ impl Env {
     fn forget_nested_under(&mut self, local: u32, prefix: &[u32]) {
         self.nested
             .retain(|(l, chain), _| *l != local || !chain.starts_with(prefix));
+        // The elements of an array reached through this prefix describe a value that is no
+        // longer there once the intermediate aggregate is overwritten, so they are dropped too.
+        // A stale element is a wrong value, not a missing one.
+        self.elems_path.retain(|(l, chain, _), _| *l != local || !chain.starts_with(prefix));
     }
 
     fn forget_parts(&mut self, local: u32) {
         self.fields.retain(|(l, _), _| *l != local);
         self.nested.retain(|(l, _), _| *l != local);
         self.elems.retain(|(l, _), _| *l != local);
+        // Elements of field-path arrays under a whole-value write describe a value that is no
+        // longer there; keeping them would be a stale read of the old array.
+        self.elems_path.retain(|(l, _, _), _| *l != local);
         self.payloads.retain(|(l, _), _| *l != local);
         self.discriminants.remove(&local);
         self.tag_widths.remove(&local);
@@ -1121,6 +1353,15 @@ impl Env {
             // left stale.
             None => self.elems.retain(|(l, _), _| *l != local),
         }
+    }
+
+    /// Record an element of an array reached through a field path, `o.a[k] = v`.
+    ///
+    /// The whole path is the key, so `o.a[0]` and `o.b[0]` cannot collide. Any
+    /// previous value at that element is replaced; siblings are untouched.
+    fn write_elem_at(&mut self, local: u32, chain: Vec<u32>, index: u64, v: Val) {
+        self.elems_path.retain(|(l, c, k), _| *l != local || *c != chain || *k != index);
+        self.elems_path.insert((local, chain, index), v);
     }
 
     /// Record the payload of a modelled `Option`, with its width.
@@ -1173,13 +1414,23 @@ impl Env {
 /// A *single* field is not a chain here: `[_1.0]` returns `None` so the
 /// single-field store keeps answering it, and the two stores stay disjoint.
 fn field_chain(proj: &[Proj]) -> Option<Vec<u32>> {
+    let chain = field_steps(proj)?;
+    if chain.len() < 2 {
+        return None;
+    }
+    Some(chain)
+}
+
+/// A projection read as a chain of field indices, stripping one leading `Deref`.
+///
+/// `None` for any step that is not a field (an index, a downcast, a second deref): those
+/// name a store the caller does not re-root. An empty chain is a whole place, which is
+/// `Some(vec![])` -- the caller decides whether that is meaningful.
+fn field_steps(proj: &[Proj]) -> Option<Vec<u32>> {
     let steps = match proj.first() {
         Some(Proj::Deref) => &proj[1..],
         _ => proj,
     };
-    if steps.len() < 2 {
-        return None;
-    }
     let mut chain = Vec::with_capacity(steps.len());
     for s in steps {
         match s {
@@ -1343,6 +1594,10 @@ pub struct Seeds {
     pub slice_steps: Vec<(u32, u64)>,
     /// `(local, index, variable, signed)` for each element a contract names.
     pub elems: Vec<(u32, u64, Var, bool)>,
+    /// `(local, field chain, index, variable, signed)` for each element of an array reached
+    /// through a field path (`o.a[0]`) that a contract names. Keyed by the whole path, so
+    /// `o.a[0]` and `o.b[0]` cannot collide.
+    pub path_elems: Vec<(u32, Vec<u32>, u64, Var, bool)>,
     /// `(local, tag variable, tag width, discriminants)` for each enum-typed
     /// argument a contract names a variant of.
     ///
@@ -1357,12 +1612,16 @@ pub struct Seeds {
     /// contract names, so `m.Data` in a contract and `((_1 as Data).0)` in the
     /// body name one variable rather than two that look alike.
     pub payload_seeds: Vec<(u32, u64, Var, u8, bool)>,
-    /// `(local, value)` for each argument the precondition pins to a constant.
+    /// `(variable index, value)` for each variable the precondition pins to a
+    /// constant.
     ///
-    /// The argument is seeded with the literal instead of a fresh symbolic input.
-    /// Sound -- every model of the precondition has the argument equal to it -- and
-    /// it is what lets a body whose only operand is pinned build its operations on a
-    /// literal, where the constant folds collapse them. See [`crate::smt::pinned_vars`].
+    /// The variable is seeded with the literal instead of a fresh symbolic input.
+    /// Sound -- every model of the precondition has it equal to that -- and it is
+    /// what lets a body whose only operand is pinned build its operations on a
+    /// literal, where the constant folds collapse them. Keyed by the variable's own
+    /// index, so a pin applies wherever that variable is seeded: an argument (whose
+    /// index is its local), a struct field, a nested path, or an element. See
+    /// [`crate::smt::pinned_vars`].
     pub pins: Vec<(u32, u64)>,
 }
 
@@ -1422,27 +1681,39 @@ where
     };
 
     let mut env = Env::with_enums(&prog.enums);
+    // A pinned variable takes the literal its precondition fixes it to, so the
+    // body's operations fold instead of building a circuit over an input that has
+    // only one value. The pin is keyed by *variable index*, so it applies wherever
+    // that variable is seeded -- an argument (whose index is its local) and an
+    // aggregate part (a field, a nested path, an element) alike. See
+    // [`crate::smt::pinned_vars`].
+    let pin_of = |v: Var| -> Option<u64> {
+        let idx = smt::index(v);
+        seeds.pins.iter().find(|(i, _)| *i == idx).map(|(_, k)| *k)
+    };
+    // The literal for a pinned variable, masked to the variable's own width: the
+    // value a precondition writes is signed (`-7`), and the pattern the seed needs
+    // is two's complement at that width (`249` at eight bits).
+    let lit_of = |v: Var, k: u64| -> Var {
+        let w = smt::bits(v);
+        let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        smt::word(k & mask, w)
+    };
     for &l in &f.arg_locals {
         let ty = f.ty_of(l).cloned().unwrap_or(Ty::Other("?".into()));
-        // A pinned argument takes the literal the precondition fixes it to, so the
-        // body's operations fold instead of building a circuit over an input that
-        // has only one value. See [`crate::smt::pinned_vars`].
-        let pin = seeds.pins.iter().find(|(local, _)| *local == l).map(|(_, k)| *k);
-        let v = match (ty.width(), pin) {
-            (Some(w), Some(k)) => {
-                let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                let lit = smt::word(k & mask, w);
-                if w == 1 {
-                    Val::Bool(smt::truth(k & 1 != 0))
-                } else {
-                    Val::Sym(lit, Sign::of(&ty))
+        let v = match ty.width() {
+            Some(w) => {
+                let sym = smt::var_named(l, w);
+                match pin_of(sym) {
+                    Some(k) if w == 1 => Val::Bool(smt::truth(k & 1 != 0)),
+                    Some(k) => Val::Sym(lit_of(sym, k), Sign::of(&ty)),
+                    None if w == 1 => Val::Bool(sym.eq_val(1)),
+                    // The argument's own type declares its sign, so the value
+                    // carries it rather than a later site having to look it up.
+                    None => Val::Sym(sym, Sign::of(&ty)),
                 }
             }
-            (Some(1), None) => Val::Bool(smt::var_named(l, 1).eq_val(1)),
-            // The argument's own type declares its sign, so the value carries it
-            // rather than a later site having to look it up.
-            (Some(w), None) => Val::Sym(smt::var_named(l, w), Sign::of(&ty)),
-            (None, _) => Val::Unknown,
+            None => Val::Unknown,
         };
         env.locals.insert(l, v);
         // A `&T` argument may be dereferenced: `Ty::Ref` is modelled as its
@@ -1455,13 +1726,21 @@ where
     // variable, and the body's `((*_1).0)` reads it from here, so the two are the
     // same symbolic input rather than two that merely look alike.
     for &(local, field, v, signed) in &seeds.fields {
-        env.fields.insert((local, field), Val::Sym(v, Sign::of_bool(signed)));
+        let val = match pin_of(v) {
+            Some(k) => Val::Sym(lit_of(v, k), Sign::of_bool(signed)),
+            None => Val::Sym(v, Sign::of_bool(signed)),
+        };
+        env.fields.insert((local, field), val);
     }
     // Nested field paths the contract names, keyed by the whole projection chain
     // so the body's `(((*_1).0).0)` reads the same variable the contract's `o.i.v`
     // was rewritten to.
     for &(local, ref chain, v, signed) in &seeds.nested {
-        env.nested.insert((local, chain.clone()), Val::Sym(v, Sign::of_bool(signed)));
+        let val = match pin_of(v) {
+            Some(k) => Val::Sym(lit_of(v, k), Sign::of_bool(signed)),
+            None => Val::Sym(v, Sign::of_bool(signed)),
+        };
+        env.nested.insert((local, chain.clone()), val);
     }
     // Slice lengths and elements the contract names. The contract's `xs.len()` and
     // `xs[0]` and the body's `PtrMetadata(_1)` and `(*_1)[0]` must be one value,
@@ -1492,8 +1771,22 @@ where
     }
     for &(local, index, v, _) in &seeds.elems {
         if let Some(s) = env.indexed.get_mut(&local) {
+            let v = match pin_of(v) {
+                Some(k) => lit_of(v, k),
+                None => v,
+            };
             s.elems.insert(index, v);
         }
+    }
+    // Elements of field-path arrays the contract names, keyed by the whole path. The body's
+    // `(_1.0)[k]` write lands on the same key, so a contract's `o.a[0]` and the body's write are
+    // one value. Pins apply here as elsewhere: a pinned element is a *literal*, not an input.
+    for &(local, ref chain, index, v, _signed) in &seeds.path_elems {
+        let val = match pin_of(v) {
+            Some(k) => Val::Sym(lit_of(v, k), Sign::of_bool(_signed)),
+            None => Val::Sym(v, Sign::of_bool(_signed)),
+        };
+        env.elems_path.insert((local, chain.clone(), index), val);
     }
     // Enum tags a contract names a variant of. The tag is seeded so the body's
     // `discriminant(_1)` reads the same variable the contract's `m` does, and the
@@ -1605,7 +1898,7 @@ where
             break;
         }
         explored += 1;
-        run_state(prog, st, &post, &mut report, &mut work);
+        run_state(prog, st, &post, &mut report, &mut work, &seeds.pins);
     }
     report
 }
@@ -1753,6 +2046,90 @@ fn eval_invariant_here(f: &MirFn, env: &Env, text: &str) -> Result<Pred, String>
     crate::mir::spec::eval_invariant(text, &names, &signed_names(f)).map_err(|e| e.to_string())
 }
 
+/// The `(variable, literal)` bindings for the pins, masked to each variable's width.
+///
+/// A pin records a *bit pattern*, not a signed number: `-7` at eight bits is `249`. The
+/// width comes from the variable's own declaration ([`smt::var_width`]), so the literal is
+/// the same term the seeding uses. A pin whose variable is not declared in this context is
+/// skipped: there is no width to mask to, and a wrong width would substitute a term of the
+/// wrong size.
+fn pin_bindings(pins: &[(u32, u64)]) -> Vec<(Var, Var)> {
+    pins.iter()
+        .filter_map(|&(idx, k)| {
+            let w = smt::var_width(idx);
+            if w == 0 {
+                return None;
+            }
+            let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+            Some((smt::var_named(idx, w), smt::word(k & mask, w)))
+        })
+        .collect()
+}
+
+/// Apply the precondition's pins to a path and the goal built over it, at one obligation.
+///
+/// A pin is a *forced* value: the precondition entails `v == k`, so rewriting `v` to `k`
+/// throughout `(P => Q)` gives `(P[v:=k] => Q[v:=k])`, which has the same truth value --
+/// a model of `!P` restricts, and a model of `!P[v:=k]` extends by `v := k`. The rewrite is
+/// therefore an equivalence: it can turn a refusal into a proof or a refutation, and it can
+/// never manufacture a verdict.
+///
+/// It is applied to the *whole path* and not to the precondition alone, and that is the
+/// load-bearing part. The executor's path is not just the precondition: a `match` on an enum
+/// tag, an `assert`, a branch each conjoin their own constraint. Rewriting only the
+/// precondition would drop the relation between the tag and the value the pin gives it --
+/// `m == Mode::Run` pins the tag to `2`, and a path that then splits on `tag == 0` is
+/// infeasible *because* the pin says `2`. Rewriting the path keeps every split and every
+/// pin, and takes the deep term (`c == b * 2`) out of the assumption the diagram is built
+/// over. See [`crate::smt::pinned_vars`].
+fn pinned_pair(path: Pred, goal: Pred, pins: &[(u32, u64)]) -> (Pred, Pred) {
+    if pins.is_empty() {
+        return (path, goal);
+    }
+    let bindings = pin_bindings(pins);
+    if bindings.is_empty() {
+        return (path, goal);
+    }
+    (smt::substitute(path, &bindings), smt::substitute(goal, &bindings))
+}
+
+/// Decide `path => goal`, retrying with the pins rewritten in only if the engine refuses.
+///
+/// The unrewritten query is tried first and its answer is kept whenever it is decided. That
+/// ordering is what preserves the *witness*: the rewrite removes the pinned variables, so a
+/// counterexample found under it cannot name the input, and the counterexample is the more
+/// useful answer. The fallback exists for the one case the rewrite is for -- an `Unknown`
+/// the pins can lift -- and [`pinned_pair`] is an equivalence, so a decided answer from the
+/// retry is the same answer the first attempt would have given had it been able to decide.
+fn prove_obligation(path: Pred, goal: Pred, pins: &[(u32, u64)]) -> Verdict {
+    let v = smt::prove_implies(path, goal);
+    if !matches!(v, Verdict::Unknown) || pins.is_empty() {
+        return v;
+    }
+    let (path, goal) = pinned_pair(path, goal, pins);
+    let v2 = smt::prove_implies(path, goal);
+    if matches!(v2, Verdict::Unknown) {
+        v
+    } else {
+        v2
+    }
+}
+
+/// [`smt::find_model`] with the same pins fallback as [`prove_obligation`].
+fn find_obligation(path: Pred, pins: &[(u32, u64)]) -> Verdict {
+    let v = smt::find_model(path);
+    if !matches!(v, Verdict::Unknown) || pins.is_empty() {
+        return v;
+    }
+    let (path, _) = pinned_pair(path, smt::truth(true), pins);
+    let v2 = smt::find_model(path);
+    if matches!(v2, Verdict::Unknown) {
+        v
+    } else {
+        v2
+    }
+}
+
 /// Push the successor states of an edge to `target`, applying the loop cut when
 /// this edge enters the invariant's header.
 ///
@@ -1765,6 +2142,7 @@ fn advance(
     target: usize,
     report: &mut MirReport,
     work: &mut Vec<State>,
+    pins: &[(u32, u64)],
 ) {
     let cut = match st.cut.clone() {
         Some(c) if c.func == st.frame.func && c.header == target => c,
@@ -1789,7 +2167,7 @@ fn advance(
     };
     report.obligations.push(Obligation {
         kind,
-        verdict: smt::prove_implies(st.path, inv),
+        verdict: prove_obligation(st.path, inv, pins),
     });
     // The cut closes here. A back edge is not followed: the assertion above is
     // the induction step, and re-entering the header would be the unwinding this
@@ -2017,7 +2395,14 @@ fn operand_width(f: &MirFn, o: &Operand) -> Option<u8> {
     }
 }
 
-fn run_state<F>(prog: &MirProgram, mut st: State, post: &Option<F>, report: &mut MirReport, work: &mut Vec<State>)
+fn run_state<F>(
+    prog: &MirProgram,
+    mut st: State,
+    post: &Option<F>,
+    report: &mut MirReport,
+    work: &mut Vec<State>,
+    pins: &[(u32, u64)],
+)
 where
     F: Fn(Option<Var>, &[(u32, Var)]) -> Result<Pred, String>,
 {
@@ -2100,6 +2485,23 @@ where
                     }
                 }
                 st.env.set(dest, v);
+                // A *nested* aggregate assignment moves the source's parts under the
+                // destination's path. Two shapes need it: a struct literal into a nested field
+                // (`o.i = Inner { v: 9 }` -> `(_1.0) = move _2`), and a nested-to-nested move
+                // (`o.i = o.j` -> `_2 = move (_1.1); (_1.0) = move _2`, so a *nested source*
+                // into a whole temp, then a whole source into a nested destination).
+                //
+                // `copy_parts` in `eval_rvalue` handles only whole-to-whole, and a nested
+                // source is one it refuses, so this runs whenever *either* side is nested.
+                // It is done *after* `set` because the field arm of `set` forgets the nested
+                // paths beneath the destination -- correct, since they are stale -- and this
+                // is what puts the source's parts back. Without it the temp's `v` never lands
+                // under `_1.0`, and `(_1.0).0` reads `Unknown`.
+                if let Rvalue::Use(Operand::Copy(q) | Operand::Move(q)) = rv {
+                    if !q.proj.is_empty() || !dest.proj.is_empty() {
+                        st.env.rebase_parts(q, dest);
+                    }
+                }
             }
         }
     }
@@ -2107,7 +2509,7 @@ where
     // Terminator. Every successor goes through `advance`, which is where a loop
     // edge into the invariant's header is checked instead of followed.
     match &block.term {
-        Term::Goto(b) => advance(prog, st, *b, report, work),
+        Term::Goto(b) => advance(prog, st, *b, report, work, pins),
         Term::Return => {
             let ret = st.env.get(&Place::new(0));
             match st.frame.caller.take() {
@@ -2182,10 +2584,9 @@ where
                         };
                         match post(rv, &projs) {
                             Ok(p) => {
-                                let v = smt::prove_implies(st.path, p);
                                 report.obligations.push(Obligation {
                                     kind: ObligationKind::Postcondition,
-                                    verdict: v,
+                                    verdict: prove_obligation(st.path, p, pins),
                                 });
                             }
                             Err(e) => report
@@ -2356,12 +2757,51 @@ where
                             }
                             if rest.is_empty() {
                                 env.elems.insert((cl, *k), *v);
+                            } else if let Some(rc) = &rest_chain {
+                                // An array *argument* handed over as a whole field-path
+                                // target (`&mut x.a`): the callee's `_1` is the array, so
+                                // its element `k` is the caller's `<target>[k]`, which lives
+                                // in `elems_path` under the target's field chain. Without
+                                // this the element was dropped and the caller read its own
+                                // seed (`set_first_of(&mut x.a); x.a[0]` was `Incomplete` in
+                                // *both* directions). The chain is non-empty here -- the
+                                // empty one is the whole-local arm above -- and the entry
+                                // exists only because the argument is an array: a struct or
+                                // tuple argument's parts live in `fields`/`nested`, never
+                                // here, so this cannot re-base a scalar onto an array key.
+                                env.elems_path.insert((cl, rc.clone(), *k), *v);
                             } else {
-                                // An element under a sub-place target has no key in
-                                // this store. Leaving the caller's element would be a
-                                // stale value, so the caller's parts go instead --
-                                // precision lost, never a wrong value kept.
+                                // An element under a sub-place target that is not a field
+                                // chain (`&mut x.a[0]`) has no key in this store. Leaving the
+                                // caller's element would be a stale value, so the caller's
+                                // parts go instead -- precision lost, never a wrong value
+                                // kept.
                                 dropped = true;
+                            }
+                        }
+                        // Elements of field-path arrays (`x.a[0]`) the callee wrote.
+                        // These live in their own store, keyed by the whole chain, so
+                        // the loop above never sees them: without this one a helper's
+                        // `x.a[0] = 9` died with the frame and the caller read its own
+                        // seed, so the false `ret == 5` was **proved** against a body
+                        // returning 9. A whole-local target re-bases the callee's chain
+                        // under the caller's local unchanged; a sub-place target whose
+                        // chain is a field chain prefixes it (`&mut o.i` makes the
+                        // callee's `_1.a[0]` the caller's `o.i.a[0]`), and one that is
+                        // not (an element target, `&mut x.a[0]`) has no representable
+                        // key, so the caller's parts go rather than a stale value being
+                        // kept.
+                        for ((l, chain, k), v) in st.env.elems_path.iter() {
+                            if *l != *cal {
+                                continue;
+                            }
+                            match &rest_chain {
+                                Some(rc) => {
+                                    let mut full = rc.clone();
+                                    full.extend_from_slice(chain);
+                                    env.elems_path.insert((cl, full, *k), *v);
+                                }
+                                None => dropped = true,
                             }
                         }
                         if dropped {
@@ -2389,6 +2829,31 @@ where
                         // than aimed at a foreign place.
                         if let Some(o) = st.env.ref_origin.get(&0).cloned() {
                             if let Some(src) = st.env.arg_source.get(&o.local).cloned() {
+                                // Two rewrites turn the callee's origin into a place in
+                                // the caller, and both are needed for an *element*:
+                                //
+                                // `resolve` collapses a deref of a local whose address
+                                // was recorded; then a leading deref is stripped
+                                // outright, because the head here is a reference
+                                // *argument* (`arg_source` holds only those) and `src`
+                                // already names its referent. `&mut a[0]` on a
+                                // whole-array argument is `(*_1)[_2]`, and `_1` is that
+                                // argument, so without the strip the deref lands in the
+                                // middle of the caller's place where no store is keyed
+                                // -- the write is dropped and a false contract about the
+                                // seed is *proved*.
+                                //
+                                // `pin_index_vars` then resolves the `IndexVar` the dump
+                                // prints (`_2` for the literal `0`), which dies at the
+                                // call boundary. Only the callee's own projection is
+                                // pinned: the caller's `src.proj` names *caller* locals,
+                                // so resolving it against this frame would read the
+                                // wrong local and is carried through as it is.
+                                let mut o = st.env.resolve(&o);
+                                if matches!(o.proj.first(), Some(Proj::Deref)) {
+                                    o.proj.remove(0);
+                                }
+                                let o = st.env.pin_index_vars(&o);
                                 let mut proj = src.proj.clone();
                                 proj.extend_from_slice(&o.proj);
                                 let place = Place { local: src.local, proj };
@@ -2420,6 +2885,53 @@ where
                                 };
                                 env.set(&p, *v);
                             }
+                            // A *struct* return keeps its fields and nested paths in the
+                            // field stores, not in `elems`: `_0 = _1` copies `_1`'s parts
+                            // through `copy_parts`, which writes `fields`/`nested`. Copying
+                            // only `elems` lost them, so `id_inner(o.i).v` -- a nested
+                            // aggregate handed to a helper by value and read back -- read
+                            // `Unknown` while the contract was true of the body. This runs
+                            // after the `elems` loop because clearing the destination's old
+                            // fields must not also clear the tuple components just written;
+                            // the nested paths are set last so the intermediate field write
+                            // (which forgets the paths beneath it) cannot drop a leaf.
+                            //
+                            // Only when the destination is a whole local, which is the shape
+                            // a call's destination has. A returned whole value replaces every
+                            // part, so the destination's old fields and nested paths are
+                            // dropped first: keeping one the callee did not write would be a
+                            // *wrong* value rather than a missing one.
+                            if dest.proj.is_empty() {
+                                env.fields.retain(|(l, _), _| *l != dest.local);
+                                env.nested.retain(|(l, _), _| *l != dest.local);
+                                env.elems_path.retain(|(l, _, _), _| *l != dest.local);
+                                for ((l, f), v) in st.env.fields.iter() {
+                                    if *l != 0 {
+                                        continue;
+                                    }
+                                    let p = Place {
+                                        local: dest.local,
+                                        proj: vec![Proj::Field(*f)],
+                                    };
+                                    env.set(&p, *v);
+                                }
+                                for ((l, chain, k), v) in st.env.elems_path.iter() {
+                                    if *l != 0 {
+                                        continue;
+                                    }
+                                    env.elems_path.insert((dest.local, chain.clone(), *k), *v);
+                                }
+                                for ((l, chain), v) in st.env.nested.iter() {
+                                    if *l != 0 {
+                                        continue;
+                                    }
+                                    let p = Place {
+                                        local: dest.local,
+                                        proj: chain.iter().map(|i| Proj::Field(*i)).collect(),
+                                    };
+                                    env.set(&p, *v);
+                                }
+                            }
                         }
                     }
                     // Restore the caller's loop cut, which entering the callee
@@ -2446,7 +2958,7 @@ where
         Term::Unreachable => {
             report.obligations.push(Obligation {
                 kind: ObligationKind::Unreachable,
-                verdict: smt::find_model(st.path),
+                verdict: find_obligation(st.path, pins),
             });
         }
         Term::Assert { cond, negated, msg, target, .. } => {
@@ -2470,7 +2982,7 @@ where
             let bad = smt::and(st.path, smt::not(satisfied));
             report.obligations.push(Obligation {
                 kind: ObligationKind::Panic { message: msg.clone() },
-                verdict: smt::find_model(bad),
+                verdict: find_obligation(bad, pins),
             });
             // An assert that did *not* fire is an assumption, and the fall-through
             // path has to carry it. Without this the guard is discarded, which is
@@ -2483,7 +2995,7 @@ where
             // terminator, so the guard is assumed for either.
             let path = smt::and(st.path, satisfied);
             let next = State { block: *target, path, ..st };
-            advance(prog, next, *target, report, work);
+            advance(prog, next, *target, report, work, pins);
         }
         Term::SwitchInt { discr, cases, otherwise } => {
             let d = operand(&mut st.env, discr);
@@ -2515,7 +3027,7 @@ where
                     depth: st.depth,
                     cut: st.cut.clone(),
                 };
-                advance(prog, next, *target, report, work);
+                advance(prog, next, *target, report, work, pins);
             }
             let mut negs = Vec::new();
             for (k, _) in cases {
@@ -2536,7 +3048,7 @@ where
                 depth: st.depth,
                 cut: st.cut.clone(),
             };
-            advance(prog, next, *otherwise, report, work);
+            advance(prog, next, *otherwise, report, work, pins);
         }
         Term::Call { callee, args, dest, target } => {
             let Callee::Name(name) = callee else {
@@ -2570,7 +3082,7 @@ where
                             return;
                         }
                     };
-                    advance(prog, next, *target, report, work);
+                    advance(prog, next, *target, report, work, pins);
                     return;
                 }
             }
@@ -2734,6 +3246,19 @@ where
                             env.elems.insert((l, *k), *v);
                         }
                     }
+                    // Elements of field-path arrays (`o.a[0]`) are carried in for the
+                    // same reason the plain elements are: the callee's `(_1.0)[k]` is
+                    // the caller's `o.a[k]`, so a helper that *reads* one has to see
+                    // the caller's seed. Without this the callee read `Unknown`, and a
+                    // helper that wrote the element had its write die with the frame --
+                    // the caller read its own seed, so `requires: x.a[0] == 5;
+                    // ensures: ret == 5` on `set_first(x); x.a[0]` was **proved**
+                    // against a body that returns 9.
+                    for ((l0, chain, k), v) in st.env.elems_path.iter() {
+                        if *l0 == sl {
+                            env.elems_path.insert((l, chain.clone(), *k), *v);
+                        }
+                    }
                 } else if is_ref {
                     // A sub-place target whose own type is an aggregate: `&mut
                     // o.i`. The callee's `i.v` is the caller's `o.i.v`, so the
@@ -2770,6 +3295,32 @@ where
                                 _ => {
                                     env.nested.insert((l, rem.to_vec()), *v);
                                 }
+                            }
+                        }
+                        // Elements of field-path arrays under a sub-place target, the
+                        // same re-basing as the nested parts above: `&mut o.i` makes the
+                        // caller's `o.i.a[0]` the callee's `_1.a[0]`, so the chain has
+                        // the target's prefix dropped. Without this a helper that only
+                        // *reads* the element through its argument (`read_inner(&o.i)` ->
+                        // `i.a[0]`) saw `Unknown` and its contract was unreadable -- an
+                        // incompleteness where the true contract should decide.
+                        for ((l0, chain, k), v) in st.env.elems_path.iter() {
+                            if *l0 != sl || !chain.starts_with(&rc) {
+                                continue;
+                            }
+                            let rem = &chain[rc.len()..];
+                            if rem.is_empty() {
+                                // The target *is* the array (`peek_of(&x.a)`): in the
+                                // callee's terms its argument is a whole local, so the
+                                // callee's `_1[k]` read consults the *plain* element store,
+                                // not the field-path one. Without this the callee read
+                                // `Unknown` and a read-only helper's contract was
+                                // unreadable -- an incompleteness where the true contract
+                                // should decide. This is the exact inverse of the write-back
+                                // arm that re-bases a whole-array target's element.
+                                env.elems.insert((l, *k), *v);
+                            } else {
+                                env.elems_path.insert((l, rem.to_vec(), *k), *v);
                             }
                         }
                     }
@@ -3089,7 +3640,22 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
             // `Field(N)` projections index, so position `i` here is field `i`.
             for (i, o) in ops.iter().enumerate() {
                 let v = operand(env, o);
-                env.set(&Place { local: dest.local, proj: vec![Proj::Field(i as u32)] }, v);
+                let dst = Place { local: dest.local, proj: vec![Proj::Field(i as u32)] };
+                env.set(&dst, v);
+                // An *aggregate operand* keeps its value in its parts, so `Outer { i: x, .. }`
+                // stores the field's value but not `x`'s own `v`. A later read of the returned
+                // `mk_outer(o.i).i.v` walks the nested chain and finds nothing. The parts are
+                // re-rooted onto the field *after* the `set` above, because a field write
+                // forgets the paths beneath it; the operand's own parts are untouched, so this
+                // is a copy of what it holds rather than an assumption about it. The gate is the
+                // operand's *type*, not its value: a by-value struct argument's parts live in
+                // `fields`, so it reads `Unknown` as a whole and would be missed by a value
+                // test.
+                if let Operand::Copy(q) | Operand::Move(q) = o {
+                    if matches!(v, Val::Agg) || matches!(type_of_place(f, q), Some(Ty::Other(_))) {
+                        env.rebase_parts(q, &dst);
+                    }
+                }
             }
             Val::Agg
         }
@@ -3398,6 +3964,25 @@ fn eval_binary(op: BinOp, a: Val, b: Val, width: Option<u8>) -> Val {
                         if let Some((q, r)) = smt::const_of(y)
                             .map(|v| as_signed(v, w))
                             .and_then(|c| smt::sdivmod_pow2(x, c, w))
+                        {
+                            return Val::Sym(
+                                match op {
+                                    BinOp::Div => q,
+                                    _ => r,
+                                },
+                                sign,
+                            );
+                        }
+                    }
+                    // The unsigned twin: a logical shift and a mask, with no sign to
+                    // fix up. The general unsigned divider is not the signed one's wall,
+                    // but it is still a `2 * w`-deep term, and a *symbolic* dividend
+                    // through it is refused for the diagram's size -- `n / 4` on a `u64`
+                    // with `n <= 1000` was `incomplete` in ~0.9 s. `d == 1` is left to the
+                    // general path so the guard matches the signed branch.
+                    if signed == Some(false) {
+                        if let Some((q, r)) = smt::const_of(y)
+                            .and_then(|d| smt::udivmod_pow2(x, d, w))
                         {
                             return Val::Sym(
                                 match op {

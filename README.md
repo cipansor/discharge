@@ -502,6 +502,71 @@ does not just shorten the term — it *merges* two nodes the frontend needs to t
 The corpus caught both. That is the reason `examples/mir_targets/realistic.rs` exists: a fold
 is not a neutral optimisation, and the coverage baseline is what says so.
 
+## A pin is transitive, and a closed goal is decided without its assumption
+
+A precondition that fixes a variable is what makes a query with a wide divider decidable at
+all: `requires: a == 5` seeds `a` with the literal `5`, the body's operations fold, and the
+obligation is a fact about numbers rather than a circuit. The pin extraction used to be one
+pass, so it only saw a right-hand side that was closed on its own. `a == 5 && b == a + 1`
+left `b` symbolic, because `a + 1` does not evaluate until `a`'s pin exists — and the chain
+`a == 5 && b == a + 1 && c == b * 2` lost every link past the first.
+
+The extraction now runs to a *fixpoint*: each round re-scans the conjuncts with the pins
+found so far in scope, and a round that adds nothing ends it. Every pin is still a
+consequence of the precondition by transitivity — `b == a + 1` *and* `a == 5` are both
+conjuncts — so nothing is assumed beside `p`, and a value the conjuncts do not force stays
+unpinned.
+
+That closed the pin list but not the obligation. With `a`, `b`, `c` all pinned, the body
+`c / 4` folds to the literal `3` and the goal becomes the closed fact `12 / 4 == 3`, which
+the engine decides by evaluation in microseconds. `prove_implies` nevertheless built
+`!pre || post` first, and `pre` still carried `c == b * 2` — a 64-bit multiply whose diagram
+is refused for its own size. The query came back `Unknown` with a *trivial* goal.
+
+So `prove_implies` now checks the goal on its own before it builds the implication: a closed
+term that evaluates to true is a theorem unconditionally, whatever the assumption says, and
+the check is a walk over the goal's own (small) DAG. The assumption is not weakened — the
+path condition is untouched, so the ordinary route still sees it and nothing that used to be
+decided by the diagram is lost. The corpus confirms the direction: `realistic.rs` stays at
+264 of 490, with zero function changing verdict in either direction, and the
+`a == 5 && b == a + 1 && c == b * 2` with body `c / 4` moves from `incomplete` to `verified`.
+
+## A division by a power of two is a shift, on both signs
+
+The restoring divider is exact, and exact is expensive: the term it builds is ~`2 * w` deep,
+so an obligation that reads a *symbolic* dividend through it is refused for the size of its
+own diagram rather than for anything about the property. The shapes that pay for this are
+the ordinary ones — `n / 4`, `i / 8`, `x % 16` — where the divisor is a literal power of two
+and the identity is elementary.
+
+The signed case came first, because the *signed* divider is the worse of the two: its sign
+fixup negates and selects on a 64-bit value whose bits are the divider's symbolic output,
+and that is the shape that blows the diagram up. `sdiv(x, 2)` took 9.3 seconds against 47ms
+for `udiv(x, 2)`, so `a / 2` on an `i64` was `incomplete`. Dividing by `2^k` needs no
+divider at all: on the positive side it is a shift, and on the negative side it is a shift
+after adding `2^k - 1`, which turns truncation toward zero into a floor. The bias is that
+constant masked by the sign, and the sign mask is the sign bit replicated — one arithmetic
+shift.
+
+The unsigned case looked like the cheap one and was left alone, which was wrong in a way
+the corpus could not show: the general unsigned divider is *not* the signed one's wall, but
+it is still a `2 * w`-deep term, and a symbolic dividend through it is refused all the same.
+`requires: n <= 1000; n / 4` at `u64` was `incomplete` in 0.9 s while the *signed* twin of
+the same body was already decided. The unsigned identity is the simplest of the four: `x /
+2^k` is `x >> k` and `x % 2^k` is `x & (2^k - 1)`, two operators and no fixup.
+
+Both fast paths are guarded to `d >= 2` and a divisor that fits below the width. `d == 1`
+is deliberately left to the general path — the guard then reads the same on both sides — and
+`d == 0` never reaches either, so the general divider's *defined* zero case (all-ones
+quotient, dividend remainder) is the one that still answers. Neither path can shadow it.
+
+The tests are two-level, and the second level is the one that matters. A concrete sweep
+walks every dividend at a width where the whole domain fits, against Rust's own `/` and `%`.
+Then the engine is asked to prove the shift-and-mask expression *equal to the general
+divider* with `x` free — that is the property a splice into a body depends on, and it is a
+statement about all inputs rather than about the ones the sweep happened to try. The signed
+sweep includes the negatives, since the bias and the negation exist for exactly those.
+
 ## Mixed-width operations are refused, not truncated
 
 A bit-vector operation has no natural width when its operands disagree. The engine used to
@@ -1929,12 +1994,17 @@ scripts/gate.sh
 # Host, with the thread-local arena and the full test suite
 cargo test --features std
 
+# Lint both halves -- `--features std` alone never compiles the `no_std` items
+cargo clippy --features std --all-targets
+cargo clippy --no-default-features --lib
+
 # Bare metal: no std, no allocator, no dependencies
 rustup target add thumbv7em-none-eabihf
 cargo build --no-default-features --target thumbv7em-none-eabihf
 ```
 
-`scripts/gate.sh` runs clippy (with `-D warnings`), the test suite, the bare-metal
+`scripts/gate.sh` runs clippy (with `-D warnings`, over both the `std` and the `no_std` half
+of the crate), the test suite, the bare-metal
 `no_std` build, a zero-dependency check, and the z3 differential oracle. It exists because
 the gates were previously five separate commands quoted in prose, which is how a gate
 quietly stops being run. It also refuses to report success when the z3 oracle is not
@@ -1943,7 +2013,14 @@ run the Kani, Verus, Lean and Coq differential oracles and the `rustc_public` MI
 tools are present and *skip them loudly* when they are not, because all three are large
 downloads (Kani: a pinned nightly plus CBMC; Verus: a self-contained bundle with its own z3;
 the MIR oracle: a nightly with the `rustc-dev` and `llvm-tools-preview` components) that a normal local run should not
-pay for; CI installs them and runs them as hard gates.
+pay for; CI installs them and runs them as hard gates. The last three gates hold the *tree*
+rather than the logic: rustdoc must build both crates with `-D warnings` (the crate is
+`#![deny(missing_docs)]`, but that says nothing about whether a doc link still *resolves*),
+no compiled output may be tracked (`git ls-files` must not list a `.rlib` or a `target/`
+path — a `git add -A` re-committed six stray `.rlib`s once, and a `.gitignore` does not
+untrack a file that is already in the index), and the `unsafe` surface must stay at the two
+blocks `SECURITY.md` names, each with a `// SAFETY:` justification (a count in prose is a
+claim like any other, and this one is security-relevant).
 
 ### The third oracle: rustc's own MIR, against the parser
 

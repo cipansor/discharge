@@ -467,6 +467,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
             array_lens: fields.array_lens.clone(),
             slice_steps: fields.slice_chain_steps(),
             elems: fields.elem_seeds.clone(),
+            path_elems: fields.path_elem_seeds.clone(),
             tags: fields.tag_seeds.clone(),
             payload_seeds: fields.payload_seeds.clone(),
             pins,

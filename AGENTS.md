@@ -26,6 +26,7 @@ cargo test --features std
 
 # Lint (must stay at zero warnings)
 cargo clippy --features std --all-targets
+cargo clippy --no-default-features --lib   # the `no_std` half, which the line above never compiles
 
 # Docs (must stay at zero warnings)
 cargo doc --features std --no-deps
@@ -310,6 +311,35 @@ Two things this exposed, both worth remembering:
   is `verified` -- the positive evidence that the fold, not a tighter budget, closed
   it. **When a fix makes a query decidable, check what else used that query as a
   stress vehicle.**
+
+## A pin is keyed by the variable's index, not the argument's local
+
+The pin above worked for a whole argument because an argument's symbolic variable
+*is* its local (`var_named(l, w)`), so `pins` could be a list of `(local, k)` and the
+seed loop could look up by local. That is a coincidence of the argument case, not a
+property of the pin. An aggregate part's variable is allocated from a different index
+space (`spec.rs` gives a field `base + next_slot`, past `max_local + 1`), so the same
+lookup never matched: `requires: w.v == -7` with the body `w.v / 3` was extracted as a
+pin and then *discarded*, and the field stayed symbolic.
+
+The cost is not small. The field is `i64`, so `w.v / 3` builds the full 64-bit
+restoring divider -- the same ~262-deep term the symbolic-division vehicle uses -- and
+the query is refused for the size of its own diagram even though the precondition
+leaves exactly one value. Measured: `incomplete` in 1.18 s before, `verified` in 0.00 s
+after.
+
+`pins` is now `(variable index, k)` and the seed loop keys by `smt::index(v)`, so one
+pin reaches wherever that variable is seeded: an argument, a struct field, a nested
+path, an array element. `lit_of` masks to the *variable's own* width rather than the
+argument's, because the pin value is written signed (`-7`) and each part needs its own
+two's-complement pattern (`249` at eight bits, `-7` as `u64` at 64).
+
+The general lesson: **an identity that holds for one seeding site is not an identity of
+the pin.** The pin is about a *variable*; anything keyed to a local, an argument name,
+or a MIR place is keyed to the wrong thing and will silently drop the pins it does not
+recognise. The corpus is what catches it: the aggregate-part targets are the only ones
+that distinguish the two keys, and before they existed a mutation that deleted the
+field/nested/element arms passed every test.
 
 ## The imperative layer (`wp.rs`) has three traps
 
@@ -3240,6 +3270,84 @@ optional file argument, which is what made the measurement cheap.)
   (the same `Val::Agg` convention an aggregate literal uses) instead of clearing
   them. `struct_reassign_then_field_read` moved from *incomplete* to **refuted**:
   the false contract is now a counterexample, not a shrug.
+* **A *nested* aggregate assignment — DONE.** `o.i = Inner { v: 9 }` lowers to a
+  struct literal into a temp followed by `(_1.0) = move _2`, so the parts being
+  moved are keyed under the temp and the destination is the nested place `_1.0`.
+  `copy_parts` is reached only for a whole-place destination, so the temp's `v`
+  never landed under `_1.0` and the later read `(_1.0).0` -- the *nested* store,
+  keyed by the whole chain -- found nothing. The body's value was then unknown,
+  and a contract that is false of the body was reported unreadable instead of
+  refuted. `Env::rebase_parts` moves the source's parts to the destination,
+  re-rooting both when either place is nested, called *after* `set` (whose field
+  arm forgets the stale nested paths first, and the helper is what puts the
+  source's parts back). It generalises `copy_parts`, which is the
+  whole-to-whole case and carries the element/payload/tag/index stores too; the
+  re-rooting one moves the two field-shaped stores and is reached when *either*
+  side is nested -- a struct literal into a nested field (`o.i = Inner { v: 9 }`),
+  and a nested-to-nested move (`o.i = o.j` lowers to `_2 = move (_1.1); (_1.0) =
+  move _2`, so a *nested source* into a whole temp, then a whole source into a
+  nested destination). `copy_parts` refuses a nested source, which is why the
+  nested-to-nested move was `incomplete` before. A part is re-keyed *relative* to
+  the source's own path: the entry at `(src, sp)` -- or the single-field entry
+  whose key *is* `sp` -- is the value at `src`, and it lands at the destination's
+  path. A whole destination drops all its parts first; a nested destination keeps
+  its siblings, because only the paths under it are written. Only an all-field
+  path is re-keyed: a deref, index or downcast names a store the helper does not
+  re-root, and writing a part where no read consults it would be a lost proof at
+  best, so those are refused.
+  `whole_inner_write_makes_nested_seed_stale` moved from *incomplete* to
+  **refuted**, and its positive companion `whole_inner_write_is_seen_by_the_leaf`
+  verifies -- the pair rules out a blanket refusal, which is what an
+  "`!is_verified()`" assertion on the false entry alone would have let through.
+  The nested-to-nested pair `whole_inner_move_carries_the_source_leaf` (true
+  `ret == 3`, verified) and `whole_inner_move_is_not_the_stale_destination` (the
+  destination's pre-move `7` claimed to survive; refuted, witness `o.i.v = 7`)
+  pins both directions: a model that kept the stale leaf would *prove* the twin.
+  The swap pair `nested_swap_carries_the_other_side` (seeds `3`/`4`, true `ret == 4`)
+  and `nested_swap_is_not_the_stale_side` (the pre-swap `3` claimed to survive;
+  refuted) is what makes the *either-side* guard load-bearing: with the guard
+  narrowed to "destination nested" both entries go `incomplete`, which is exactly
+  the mistake the pair catches.
+  A *returned* nested aggregate is the mirror image of the argument side. `id_inner(o.i).v`
+  lowers to `_3 = move (_1.0); _2 = id_inner(move _3); _0 = copy (_2.0)`, so the argument
+  is a sub-place (whose parts the re-based copy-in already carries) and the callee's
+  `_0 = _1` return builds `_0`'s fields field-by-field. The return merge only copied
+  `elems` (the tuple components), so a struct return lost its `fields`/`nested` and the
+  caller's read was `Unknown` while the contract was true. The merge now copies the
+  callee's `_0` fields and nested paths into the destination too, clearing the
+  destination's old parts first (a returned whole value must not keep a stale field the
+  callee did not write -- that would be a *wrong* value, not a missing one). The pair
+  `nested_aggregate_argument_reaches_the_helper` (true `ret == 9`, verified) and
+  `nested_aggregate_argument_is_not_the_stale_destination` (claims `7`; refuted, witness
+  `v4 = 9`) pins it: with the new branch disabled both go `incomplete`.
+  Three holes remain next to it, all *coverage* rather than soundness (nothing false can be
+  proved: each is an unreadable contract or an `Unknown` read, never a pass). A *two-level*
+  nested return path (`mk_outer(o.i).i.v`) is now closed: `_0 = OuterBox { i: copy _1, .. }`
+  stores the field value but not the operand aggregate's own parts, so `Rvalue::Struct`
+  re-roots an aggregate operand's parts onto the field (`rebase_parts`, gated on the operand's
+  type, because a by-value struct argument reads `Unknown` as a whole). Pinned by
+  `nested_return_carries_the_field` / `nested_return_is_not_the_stale_field`. An *array literal
+  of aggregates* (`[o.i, o.j]`) is still `incomplete`, because the literal path stores under
+  `elems` by index and does not carry the element aggregates' parts. And an *array whose type is
+  a field* (`o.a[0]`) is skipped, since the `indexed` store is keyed by local only (see the note
+  below).
+  Two notes on what this did *not* need. The nested literal always reaches the
+  store through a temp, so `Rvalue::Struct`/`Aggregate` do **not** need to write
+  under `dest.proj`; and making `Aggregate` do so *drops* a nested tuple write
+  (`(_1.0) = (5, 6)` writes `(_1.0.0)`, a `Field(0) + Index(0)` chain the `set`
+  catch-all does not re-root), so the tempting "consistency" edit is a
+  regression. The minimal, evidence-backed change is the assignment hook alone.
+  Both projections are *resolved* before the path is read, and one leading
+  `Deref` is stripped as `field_steps` strips one (it now backs `field_chain`):
+  `o.i = Inner { v: 9 }` through an `&mut Outer` lowers to `((*_1).0) = move _2`,
+  and an `&mut T` argument is modelled as its referent, so `resolve` leaves the
+  lone deref in place. Without the strip the write is refused for the wrong
+  reason and the leaf reads `Unknown` --
+  `whole_inner_write_through_a_mutable_reference_is_seen` verifies after it and
+  is `incomplete` before, the tripwire for the deref case.
+  The deep `i64 / 3` wall is *not* part of this: that entry is the deliberate
+  `MAX_WALK_DEPTH` refusal vehicle (`a_symbolic_division_by_a_non_power_of_two_at_i64`,
+  whose contract is false in general), so its `incomplete` is intended, not a bug.
 * **`Rvalue::Discriminant` and `Downcast` for a real enum match — DONE.**
   A `match` on an enum lowers to `_2 = discriminant(_1); switchInt(move _2)`,
   so the tag is a symbolic input whose *domain is the set of variant
@@ -4020,8 +4128,38 @@ in CI rather than in a downstream build. It follows the Ferrocene/Kani conventio
 an absent toolchain, or a `thumbv7em-none-eabihf` target not installed *for that
 toolchain*, is reported and skipped rather than folded into a pass. CI installs
 both the 1.85 toolchain and that target for it so the gate actually runs. The gate
-numbering is now **13 steps**, not 12; the README and `ci.yml` were renumbered
-with it.
+numbering is now **16 steps**; it was 13 when this note was written, and three steps
+were appended without renumbering the earlier ones (so the "gate 3/4/9" references
+elsewhere still name the same gates).
+
+The three appended steps hold the *tree* rather than the logic, and each closes a
+recurrence rather than a one-off:
+
+- **Step 14: rustdoc builds both crates with `-D warnings`.** The crate is
+  `#![deny(missing_docs)]`, but that only checks that a doc comment *exists* -- it says
+  nothing about whether an intra-doc link still *resolves*, and `cargo test` and `cargo
+  clippy` never run rustdoc. Four warnings had shipped: `mir/spec.rs` linked a renamed
+  `bind`, and `smt.rs` linked three private items (`pinned_vars`, `EvalMemo`, `eval_term`)
+  from public docs. `discharge-arithmetic` had the same class (`prove.rs` linked its
+  private `forall_pair_bounded` from three public items), which is why the step checks
+  both crates and not just the parent. `discharge` is built *three* ways -- default
+  (`no_std`), `--features std`, and `--all-features` -- because the doc surface differs
+  between them: a link to a `#[cfg(feature = "std")]` item resolves in the last two and not
+  the first, which is how `smtscript` shipped an unresolved link to
+  `Query::to_smtlib2_string` that only the default build could see. docs.rs publishes the
+  default build, so `[package.metadata.docs.rs] all-features = true` makes the published
+  docs the union instead.
+- **Step 15: no compiled output is tracked.** `git ls-files` must not list a `.rlib`,
+  `.rmeta`, `.o`, `.bc`, `.d`, a `target/` path or a `__pycache__` path. This recurred:
+  a cleanup commit untracked six root `.rlib`s the oracle runs had left behind, and the
+  next `git add -A` put them straight back. A `.gitignore` cannot help -- ignore rules
+  are consulted only for *untracked* paths -- so the fix is a check, not a pattern.
+- **Step 16: the `unsafe` surface is pinned and justified.** `SECURITY.md` told a reporter
+  there were *three* `unsafe` blocks in `src/`; there are two, and the paragraph named only
+  `smt.rs` while `sat.rs` held the second. A count in prose is a claim like any other, and
+  this one is security-relevant, so it is checked: the gate fails unless there are exactly
+  two `unsafe {` blocks, each preceded by a `// SAFETY:` in its contiguous comment block
+  (not a fixed number of lines -- the justifications here run to several).
 
 ## The bit-blaster walked a DAG as a tree, and no budget noticed
 
@@ -5994,10 +6132,27 @@ Seven entries with their false twins, pinned by
 straight into another (`write_one(identity(&mut c.lo))`), a reborrow of it (`let s = &mut
 *r`), two returned references to *different* fields held at once, and a returned reference
 to a *tuple component* all decide through the same `addressed` mapping. A returned place
-whose key cannot be spelled (an *array element*, `&mut a[0]`) stays sound-incomplete: the
-true contract is refused rather than the write being dropped, which is the honest failure
-mode. Eight entries with their false twins, pinned by
-`a_returned_reference_composes_with_the_next_use`.
+whose key cannot be spelled stays sound-incomplete: the true contract is refused rather
+than the write being dropped, which is the honest failure mode. (An *array element* was
+once in this class; it now decides -- see the next paragraph.) Eight entries with their
+false twins, pinned by `a_returned_reference_composes_with_the_next_use`.
+
+**A returned reference to an array *element* re-bases onto the caller's element.** The
+origin of `&mut a[0]` names the element index with a *local* (`_2` for the literal `0`),
+and the whole-array form is `(*_1)[_2]` -- a deref of the reference argument followed by
+the index. Two things then had to change at the return translation, and the failure mode
+differs between the two forms. A *method* (`&mut self.a[0]`) carried the index local
+through the call boundary, leaving a place no `elems_path` entry is keyed by: the write was
+dropped and the contract was unreadable, `Incomplete` in *both* directions. A *free
+function* handed the whole array (`elem_mut(&mut x.a)`) appended the argument's deref into
+the middle of the caller's place: the write was dropped, the caller read its own seed, and
+the false `ret == 5` was **proved** -- a false proof, not a lost one. The fix resolves the
+`IndexVar` to its literal while the callee's locals are still live (`pin_index_vars`) and
+strips the argument's leading deref (whose referent `arg_source` already names). The true
+directions now verify and every false twin is refuted; a *symbolic* index is left unpinned,
+so an unguarded `x.nth_mut(i)` stays fail-closed while `requires: i == 0` decides. Twelve
+entries -- five true directions and seven false -- pinned by
+`a_returned_reference_to_an_element_reaches_the_caller`.
 
 **Two reference targets in one call stay independent.** Two `&mut` to different
 *aggregate* fields (`&mut o.i, &mut o.j`) and two *elements* of one array through one
@@ -6006,14 +6161,44 @@ both referents so they also exercise the carry-in. The false twins read the *oth
 target and would verify if the two collapsed onto one place. Ten entries, pinned by
 `two_reference_targets_in_one_call_stay_independent`.
 
-**Not yet modelled, and *silently* so.** A *field whose type is an array* (`o.a[0]`) and
-an *array of arrays* (`m[1][0]`) cannot be named in a contract at all -- the refusal is
-`unknown field`, and an `ensures` about the value is reported as unreadable, so such a
-function is *skipped* rather than decided. This is a coverage hole rather than a
-soundness one (nothing false can be proved, since the contract cannot be written), and it
-is the next precision target: the `indexed` store is keyed by *local* only, so an array
-reached through a projection has no entry. Closing it means keying `indexed` by a place
-and re-basing element keys on the projection, the same shape as the `nested`-store work.
+**Not yet modelled, and *silently* so.** An *array of arrays* (`m[1][0]`) cannot be named
+in a contract at all -- the refusal is `unknown name`, and an `ensures` about the value is
+reported as unreadable, so such a function is *skipped* rather than decided. This is a
+coverage hole rather than a soundness one (nothing false can be proved, since the contract
+cannot be written). A *field whose type is an array* (`o.a[0]`) used to be in this hole and
+is now modelled: the element store is keyed by the whole path, so a contract's `o.a[0]` and
+the body's `(_1.0)[_2]` are one word. See "An array element reached through a field path"
+below.
+
+**An array element reached through a field path is one word.** `x.a[0] = 9; x.a[0]` lowers
+to `(_1.0)[_2] = 9` and `_0 = copy (_1.0)[_4]`: the *field chain* is part of the element's
+key, not the local and index alone. Before this the write landed in a store keyed by the
+local and index, so the read consulted a different key, returned the *seed*, and a contract
+claiming the pre-write value (`ret == 5`) was **proved** against a body returning 9 -- a
+false proof, not a lost one. The store (`Env::elems_path`) is keyed by
+`(local, field chain, index)`, so `x.a[0]` and `x.b[0]` cannot collide; a sibling array's
+element is left alone and the two are independent. The contract side records every
+array-typed field as subscriptable (`FieldEnv::path_elem_types`, both first-level `x.a` and
+nested `o.i.a`), binds `path[digits]` to a variable of the element's own width and
+signedness, and refuses an index past the array's declared length rather than binding a
+variable for an element that does not exist. The mangled name is built from the *chain*,
+never the dotted path: a `.` in a generated name would be read by the parser as a field
+access. The symbolic subscript `(_1.0)[_4]` reads and writes the same store, and an index
+the run cannot pin poisons the path rather than guessing. Four entries with their false
+twins, pinned by `a_field_array_element_is_one_word_for_contract_and_body`.
+
+**A field-array element crosses a reference argument in both directions.** A helper's write
+to `x.a[0]` through a `&mut` lands in the *callee's* element store, so the caller's store has
+to be re-based on return: unchanged for a whole-local target (`set_first_element(&mut x)`),
+and prefixed with the target's chain for a sub-place one (`set_holder_first_element(&mut
+o.i)` makes the callee's `_1.a[0]` the caller's `o.i.a[0]`). Without the re-base the write
+died with the frame, the caller read its seed, and the false `ret == 5` was **proved** against
+a body returning 9. The read direction is the same re-base run the other way, on the way
+*in*: `read_holder_first_element(&o.i)` reads the caller's `o.i.a[0]`, so its contract
+decides rather than being unreadable. A by-value argument is deliberately *not* carried back
+(its writes die with the frame), and the sibling element of another array is untouched. Three
+entries with their false twins, pinned by
+`a_field_array_element_crosses_a_reference_argument`.
 
 **A scalar field crosses a reference argument.** A helper reading `d.v` through a
 `&DuoBox` and one writing it through a `&mut DuoBox` both decide: the referent's *parts*
@@ -6189,3 +6374,65 @@ parts under `_1` rather than tracking the sub-place -- precision is lost, never 
 value kept. A `&mut` target whose element the callee *did* write is still not copied back
 (a `&mut [T]` argument is the case that is); the caller's own store keeps the value it
 held, so the read is stale rather than unknown only when the caller never wrote it.
+
+**An array handed over *as* a reference target is modelled.** When the argument is the
+*array itself* rather than the whole local that holds it -- `set_first_of(&mut x.a)` or
+`peek_of(&x.a)`, a `&mut [u8; 4]` / `&[u8; 4]` whose target is the field `x.a` -- the callee's
+`(*_1)[0]` write is re-based onto the caller's field-path element store, so
+`set_first_of(&mut x.a); x.a[0]` *decides*: the true `ret == 9` verifies and the false
+`ret == 5` is refuted. This used to be a coverage hole (incomplete in *both* directions) and
+is the shape the note below pinned before it was closed.
+
+The mechanism, and why it took a second store: the callee's `&mut [u8; 4]` argument is the
+array, so its element write lands in the callee's plain element store (`elems`), keyed by the
+local. The caller's `x.a[0]` read consults `elems_path`, keyed by the *field chain* `x.a`. The
+return path already re-based the callee's `elems_path` entries and its `fields`/`nested`
+entries onto the target's chain, but the plain `elems` entries under a sub-place target were
+*dropped* -- there was no key for them, and dropping is the honest direction (a stale value
+would be worse). The fix is one mirrored arm: a sub-place target that *is* a field chain
+(`&mut x.a`, chain `[0]`) re-bases the callee's `elems[k]` onto `elems_path[(cl, chain, k)]`,
+which is exactly the key the caller's read consults. A sub-place target that is not a field
+chain (`&mut x.a[0]`, `&mut t.0` on a tuple) still drops -- the `rest_chain` `None` arm -- so
+an unrepresentable key is never invented. The guard is structural, not a value test: only an
+*array* argument ever has plain `elems` entries at the callee's local (a struct or tuple
+argument's parts live in `fields`/`nested`), so this arm cannot re-base a scalar onto an array
+key. A sibling field is untouched: `set_second(&mut x.a); x.b[1]` is refuted, so there is no
+cross-field contamination.
+
+The *read* direction is the mirror and needs the mirror of the same arm. `peek_of(&x.a)` hands
+the callee the array as a whole local, so the callee's `_1[k]` read consults its plain `elems`
+store; the carry-in re-bases the caller's `elems_path[(sl, chain, k)]` *onto* that store when
+the target chain is exactly the caller's field chain (`rem.is_empty()`), and onto `elems_path`
+with the prefix dropped otherwise (the `&o.i` case). Both directions were `Incomplete` before
+and both decide now, and the two are separate loops because one runs at the call and one at the
+return.
+
+It is *pinned*, and not only in the two directions that first exposed the hole. The corpus
+carries `a_whole_array_target_crosses_a_reference_argument` (the true direction, `ret == 9`)
+and its false twin `a_whole_array_target_cannot_prove_this`, the read-only pair
+`a_whole_array_target_read_crosses_a_reference_argument` / `..._read_cannot_prove_this`, the
+sibling-field probe `a_whole_array_target_sibling_cannot_prove_this`, and three shapes that
+put the re-basing rule where it is easy to get it *partly* right: a read-modify-write
+(`a_whole_array_target_read_modify_write`, where the carry-in and the write-back must both
+fire in one call), a target two fields deep
+(`a_nested_whole_array_target_crosses_a_reference_argument`, chain `[0, 0]` rather than
+`[0]`), and a write that crosses two frames (`a_whole_array_target_crosses_two_frames`, where
+each frame re-bases independently). Each has its `_cannot_prove_this` twin, so the corpus-wide
+`no_cannot_prove_entry_is_ever_verified` invariant holds them all.
+
+`tests/mir.rs::a_whole_array_target_decides_without_a_false_proof` asserts every one: each
+true direction is `Verified` and each twin is `Failed` (or, for the read-only twin, not
+`Verified`). The pin is what made closing the hole safe to do: the dangerous change is a
+re-basing that connects the two stores the *wrong* way, which would turn a false twin
+`Verified` before the true contract verified, and nothing else in the suite would notice. The
+twins' "must not verify" assertions are the unconditional half; if a later change makes any of
+these shapes incomplete again, the test fails and names the direction that broke.
+
+Still not modelled, and named so the boundary is honest. A *scalar* element target
+(`&mut x.a[0]`, a `&mut u8`) is modelled and decides -- the true `ret == 9` verifies and the
+false `ret == 5` is refuted -- but an *array* element target (`&mut g.rows[0]`, a
+`&mut [u8; 4]` reached through a subscript of a field whose type is an array of arrays) cannot
+be named in a contract at all: `g.rows[0][0]` is refused with `unknown field`, so such a
+function is *skipped* rather than decided. A *tuple* field target (`&mut w.t`) is refused the
+same way (`unknown field t of w`). Both are coverage holes, not soundness ones -- the contract
+cannot be written, so nothing false is proved.

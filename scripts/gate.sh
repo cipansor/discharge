@@ -10,13 +10,20 @@ cd "$(dirname "$0")/.."
 
 fail() { echo "GATE FAILED: $1" >&2; exit 1; }
 
-echo "== 1/13 clippy (all targets, std) =="
-cargo clippy --workspace --features std --all-targets -- -D warnings || fail "clippy"
+echo "== 1/16 clippy (all targets, std; and the no_std lib) =="
+cargo clippy --workspace --features std --all-targets -- -D warnings || fail "clippy (std)"
+# `--features std` compiles only the host half. Every `#[cfg(not(feature = "std"))]` item --
+# the bare-metal arena, the `static mut` discipline, the whole shipped engine -- is *not*
+# compiled by the line above, so a lint in that half would never be seen. Only `--lib` is
+# linted here: the integration tests are `std`-only by construction and do not build without
+# the feature, which is the point of the gate rather than a gap in it. This is the half that
+# goes to a microcontroller, so it is the half that most deserves the lint.
+cargo clippy --no-default-features --lib -- -D warnings || fail "clippy (no_std)"
 
-echo "== 2/13 tests (std), with a count that fails on failure =="
+echo "== 2/16 tests (std), with a count that fails on failure =="
 sh scripts/test-count.sh || fail "tests"
 
-echo "== 3/13 ferrocene: the qualified compiler builds the crate (skipped if absent) =="
+echo "== 3/16 ferrocene: the qualified compiler builds the crate (skipped if absent) =="
 # Ferrocene is the *qualified* Rust toolchain (ISO 26262 ASIL D, IEC 61508 SIL 3, EN 50128,
 # IEC 62304), so it is the one compiler whose word carries weight for a safety-critical
 # claim. The crate's own README says it has no qualification evidence; building the same
@@ -42,7 +49,7 @@ else
   fail "ferrocene build (exit $code)"
 fi
 
-echo "== 4/13 no_std bare-metal build =="
+echo "== 4/16 no_std bare-metal build =="
 # Both crates must build for the target a flight computer actually is. The parent is
 # built without its `std` feature; the arithmetic crate has no features at all, so its
 # default build *is* the bare-metal one.
@@ -56,7 +63,7 @@ cargo build -q -p discharge-arithmetic --target thumbv7em-none-eabihf \
 cargo build -q --no-default-features --target thumbv7em-none-eabihf --example bare_metal \
   || fail "bare-metal build of examples/bare_metal.rs"
 
-echo "== 5/13 no external dependencies =="
+echo "== 5/16 no external dependencies =="
 # The property is not "the tree has one line" any more -- the arithmetic primitives were
 # split into a sibling crate in this repository, so `discharge` legitimately depends on
 # `discharge-arithmetic`. The property that must not change is that *nothing from outside
@@ -76,12 +83,12 @@ if cargo tree -p discharge -e normal --prefix none | tail -n +2 | grep -qE '\((h
   fail "an external (registry or git) dependency has appeared in the tree"
 fi
 
-echo "== 6/13 z3 differential oracle =="
+echo "== 6/16 z3 differential oracle =="
 # This one needs the oracle. If `z3` is absent it exits 2 and says so; that is a failure
 # here too, because "the oracle did not run" is not evidence about the exporter.
 cargo run -q --features std --example z3diff || fail "z3 differential oracle"
 
-echo "== 7/13 kani differential oracle (skipped if kani is absent) =="
+echo "== 7/16 kani differential oracle (skipped if kani is absent) =="
 # Kani is an oracle, not a dependency, and installing it is a large download plus a nightly
 # toolchain plus CBMC. Unlike z3 it is genuinely optional for a normal build, so an absent
 # Kani is *reported and skipped* here rather than failed -- the CI job that installs Kani is
@@ -92,7 +99,7 @@ else
   echo "   (kani not installed; skipped -- 'cargo install --locked kani-verifier && cargo kani setup')"
 fi
 
-echo "== 8/13 MIR frontend, on real rustc MIR (skipped if no rustc is named) =="
+echo "== 8/16 MIR frontend, on real rustc MIR (skipped if no rustc is named) =="
 # The MIR frontend shells out to `rustc --emit=mir`. That works on a *stable* compiler:
 # `-Zunpretty=mir` is nightly-only, but `--emit=mir` is not, so a stable `rustc` is enough
 # for the whole `tests/mir.rs` suite (verified on 1.85, the MSRV, and on current stable).
@@ -107,7 +114,7 @@ else
   echo "   (DISCHARGE_RUSTC not set; skipped -- set it to 'rustup which --toolchain nightly rustc')"
 fi
 
-echo "== 9/13 verus differential oracle (skipped if verus is absent) =="
+echo "== 9/16 verus differential oracle (skipped if verus is absent) =="
 # Same rule as Kani. Verus ships a self-contained bundle, so a run that wants this gate
 # unpacks a release and points VERUS_BIN at the driver.
 if command -v "${VERUS_BIN:-verus}" >/dev/null 2>&1; then
@@ -116,7 +123,7 @@ else
   echo "   (verus not installed; skipped -- set VERUS_BIN to the Verus release driver)"
 fi
 
-echo "== 10/13 rustc_public MIR oracle (skipped if no nightly/rustc-dev) =="
+echo "== 10/16 rustc_public MIR oracle (skipped if no nightly/rustc-dev) =="
 # The frontend reads *textual* MIR, so a rustc release that reprints the dump can
 # break the parser and nothing else would notice. This gate asks `rustc_public`
 # for the same programs' typed MIR and compares the per-function shape -- block
@@ -138,7 +145,7 @@ else
   fail "rustc_public MIR oracle (exit $code)"
 fi
 
-echo "== 11/13 lean differential oracle (skipped if lean is absent) =="
+echo "== 11/16 lean differential oracle (skipped if lean is absent) =="
 # Lean is the strongest of the four backends here: `bv_decide` bit-blasts and then replays
 # the SAT refutation as a Lean proof term the kernel checks, so agreement is with a
 # machine-checked theorem rather than with a solver's word. It is still an oracle, not a
@@ -156,7 +163,7 @@ else
   fi
 fi
 
-echo "== 12/13 coq differential oracle (skipped if coqc is absent) =="
+echo "== 12/16 coq differential oracle (skipped if coqc is absent) =="
 # Coq checks a different thing from the other three: not "does the engine decide this the
 # same way" but "does the engine's arithmetic, transcribed into `Z` with explicit masks,
 # evaluate to the same truth value on every point of the 8-bit domain". It enumerates, so it
@@ -173,7 +180,7 @@ else
   fi
 fi
 
-echo "== 13/13 minimum supported Rust version (skipped if the toolchain is absent) =="
+echo "== 13/16 minimum supported Rust version (skipped if the toolchain is absent) =="
 # `rust-version` in Cargo.toml is a claim, and a claim nothing checks is a claim that rots.
 # This gate builds the crates with the *oldest* compiler the manifests promise to support,
 # so raising the floor without meaning to -- or leaning on a feature newer than it -- fails
@@ -203,6 +210,95 @@ if rustup run "$MSRV" rustc --version >/dev/null 2>&1; then
 else
   echo "   (no $MSRV toolchain; skipped -- install it with 'rustup toolchain install $MSRV')"
   echo "   This is reported, not passed: the floor was not checked."
+fi
+
+echo "== 14/16 documentation builds with no warnings =="
+# The crate `#![deny(missing_docs)]`, so every public item is documented -- but a
+# `missing_docs` deny says nothing about whether those doc comments *build*. Two kinds of
+# rot slip past it: an intra-doc link to an item that was renamed or made private (the link
+# resolves to nothing and rustdoc warns), and a link to a private item from a public one.
+# Both shipped here until this gate: four warnings, none of which any other gate sees,
+# because `cargo test` and `cargo clippy` do not run rustdoc.
+#
+# `-D warnings` makes any warning a failure, so the doc surface is held to the same standard
+# as the code. `--no-deps` keeps a dependency's docs from being built (there are none, but
+# the flag makes the intent explicit), and `--document-private-items` is deliberately *not*
+# passed: the point is the *public* surface, the one a reader sees, and a private-item link
+# from a public item is exactly the warning this is meant to catch.
+#
+# Both crates are checked, one command each. `discharge-arithmetic` takes no `--features std`
+# -- it has no features, and naming one there would be a build error. It had the same class
+# of warning this gate exists for (`prove.rs` linked its private `forall_pair_bounded` from
+# three public items), which a parent-only gate would have left.
+#
+# `discharge` is built three ways, because the doc surface *differs* between feature sets and
+# docs.rs publishes the default one. `--no-default-features` is the `no_std` build; `--features
+# std` adds the whole `mir` frontend; `--all-features` is the union that
+# `[package.metadata.docs.rs]` requests. A link to a `#[cfg(feature = "std")]` item resolves
+# in the last two and *not* in the first -- which is exactly how `smtscript` shipped an
+# unresolved link to `Query::to_smtlib2_string` that only the default build could see.
+RUSTDOCFLAGS="-D warnings" cargo doc -q -p discharge --no-deps \
+  || fail "rustdoc warnings (discharge, no_std)"
+RUSTDOCFLAGS="-D warnings" cargo doc -q -p discharge --no-deps --features std \
+  || fail "rustdoc warnings (discharge, std)"
+RUSTDOCFLAGS="-D warnings" cargo doc -q -p discharge --no-deps --all-features \
+  || fail "rustdoc warnings (discharge, all features)"
+RUSTDOCFLAGS="-D warnings" cargo doc -q -p discharge-arithmetic --no-deps \
+  || fail "rustdoc warnings (discharge-arithmetic)"
+
+echo "== 15/16 the tree ships no build artifacts =="
+# `scripts/gate.sh` runs the oracles, and the oracles run `rustc`, which leaves
+# `lib<name>.rlib` next to the source it compiled. A `git add -A` then commits them. This
+# happened twice: a cleanup commit untracked six root `.rlib`s, and the next `git add -A`
+# put them straight back. A `.gitignore` does not help a file that is already tracked --
+# ignore rules are consulted only for untracked paths -- so the recurrence needs a check,
+# not a pattern. A tracked artifact is dead weight in every clone and, worse, makes the
+# zero-dependency claim harder to audit than it should be.
+#
+# Only tracked files are inspected, and only when `git` is present and this is a work tree,
+# so the gate still runs from a tarball export. `.gitignore` and `Cargo.lock` are tracked on
+# purpose (a binary crate's lock is a build input, and here it pins the sibling path dep),
+# so the pattern is specific to compiled output.
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  artifacts=$(git ls-files | grep -E '(^|/)(target/|\.sweep/)|\.rlib$|\.rmeta$|\.d$|\.o$|\.bc$|__pycache__' || true)
+  if [ -n "$artifacts" ]; then
+    echo "$artifacts" >&2
+    fail "build artifacts are tracked (see the list above; untrack them with 'git rm --cached')"
+  fi
+else
+  echo "   (not a git work tree, or no git; skipped -- the artifact check needs an index)"
+fi
+
+echo "== 16/16 the unsafe surface is pinned and justified =="
+# `SECURITY.md` tells a reporter that "the unsafe code" is in scope and names *two*
+# blocks. That number was wrong in the other direction once -- it claimed three when there
+# were two, and it named only `smt.rs` while `sat.rs` held the second. A count in prose is
+# a claim like any other, and this one is security-relevant, so it is checked rather than
+# trusted.
+#
+# Two things are enforced. First, the number of `unsafe { ... }` blocks in `src/` must be
+# exactly two, so adding one is a deliberate act that updates this gate and `SECURITY.md`
+# together -- an unnoticed `unsafe` in a verifier is exactly the surface a reporter should
+# have been told about. Second, every block must be preceded by a `// SAFETY:` comment: the
+# crate forbids `unsafe_op_in_unsafe_fn` and documents the arena discipline in prose, and a
+# block whose justification is not written down is a block nobody can review.
+#
+# `discharge-arithmetic` is not checked here because it is `#![forbid(unsafe_code)]` -- it
+# cannot have one -- which is the stronger statement.
+unsafe_blocks=$(grep -rc 'unsafe {' src/ --include='*.rs' | awk -F: '{s+=$NF} END {print s+0}')
+[ "$unsafe_blocks" -eq 2 ] || fail "expected exactly 2 'unsafe' blocks in src/, found $unsafe_blocks (update SECURITY.md and this gate together if that is deliberate)"
+# Every `unsafe {` must have a `// SAFETY:` in the *contiguous comment block* directly above
+# it -- not a fixed number of lines, because the justifications here run to several lines.
+# A blank line or any code ends the run, so a `SAFETY:` from an unrelated earlier block does
+# not count.
+unjustified=$(find src -name '*.rs' | sort | xargs awk '
+  /^[[:space:]]*\/\// { if (index($0, "SAFETY:") > 0) seen = 1; next }
+  /^[[:space:]]*$/    { seen = 0; next }
+  { if (index($0, "unsafe {") > 0 && !seen) print FILENAME ":" FNR; seen = 0 }
+')
+if [ -n "$unjustified" ]; then
+  echo "$unjustified" >&2
+  fail "an 'unsafe' block has no '// SAFETY:' justification in the comment block above it"
 fi
 
 echo "ALL GATES GREEN"

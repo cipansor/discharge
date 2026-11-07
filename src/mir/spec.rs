@@ -464,6 +464,25 @@ impl std::fmt::Display for SpecError {
     }
 }
 
+/// An array-typed field a contract may subscript: `o.a` in `o.a[0]`. The chain is the MIR
+/// projection from the argument's base local to the array, so the executor can key the
+/// element by the same path the body's write lands on.
+#[derive(Clone, Debug)]
+pub struct PathElem {
+    /// The argument name, used to build the element's mangled variable name.
+    pub arg: String,
+    /// The local the argument is bound to.
+    pub local: u32,
+    /// The field chain from the local to the array (`[0]` for the first field).
+    pub chain: Vec<u32>,
+    /// The element width in bits.
+    pub elem_w: u8,
+    /// Whether the element is signed.
+    pub elem_signed: bool,
+    /// The array's length, so an index past it is refused rather than bound.
+    pub len: u64,
+}
+
 /// The fields a contract may name, resolved to symbolic variables.
 ///
 /// A contract writes `c.lo`, but the expression language knows only flat
@@ -566,6 +585,17 @@ pub struct FieldEnv {
     /// in a contract and `xs[0]` in the body are one value, not two that look
     /// alike.
     pub elem_seeds: Vec<(u32, u64, Var, bool)>,
+    /// `(local, field chain, index, variable, signed)` for each element of an array
+    /// reached through a *field path* (`o.a[0]`) that a contract names.
+    ///
+    /// Separate from [`elem_seeds`](Self::elem_seeds) because the executor keys these by the
+    /// whole path: `o.a[0]` and `o.b[0]` are different words, and a store keyed by the local
+    /// and index alone would collide them.
+    pub path_elem_seeds: Vec<(u32, Vec<u32>, u64, Var, bool)>,
+    /// `path -> array-field layout` for every array-typed field a contract may subscript
+    /// (`o.a` in `o.a[0]`): the argument name, the local, the field chain to the array, the
+    /// element width and signedness, and the array's length.
+    pub path_elem_types: BTreeMap<String, PathElem>,
     /// `(local, tag variable, tag width, discriminants)` for each enum-typed
     /// argument.
     ///
@@ -688,7 +718,7 @@ impl FieldEnv {
         self.declared.insert(name.to_string());
     }
 
-    /// [`bind`] by width and signedness, for callers outside the crate that
+    /// `bind` by width and signedness, for callers outside the crate that
     /// cannot name the IR's `Ty`.
     ///
     /// This is the primitive; `bind` is the typed wrapper. Keeping the IR
@@ -776,6 +806,48 @@ impl FieldEnv {
         Some(())
     }
 
+    /// Bind an element of an array reached through a field path, `o.a[k]`.
+    ///
+    /// The key is the whole path -- the local, the field chain, the index -- so `o.a[0]` and
+    /// `o.b[0]` are different words and cannot be confused. The mangled name embeds the chain,
+    /// which is what keeps the two apart. An index past the array's declared length is refused
+    /// rather than bound: the element does not exist, and a fresh variable there would make a
+    /// meaningless precondition look real.
+    pub fn bind_path_elem(&mut self, path: &str, index: u64) -> Option<Var> {
+        let PathElem { arg, local, chain, elem_w, elem_signed, len } =
+            self.path_elem_types.get(path)?.clone();
+        if !(1..=64).contains(&elem_w) || index >= len {
+            return None;
+        }
+        // The mangled name is built from the *chain*, not the dotted path: a `.` in a
+        // generated name would be read by the parser as a field access, and the rewrite
+        // hands the name to the parser verbatim. The chain keeps `x.a[0]` and `x.b[0]`
+        // distinct even though both end in `.a`/`.b` of the same local.
+        let mangled = format!(
+            "{arg}__pe{}_e{index}",
+            chain.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("_")
+        );
+        if let Some(v) = self.vars.get(&mangled) {
+            return Some(*v);
+        }
+        if !self.name_is_free(&mangled) {
+            return None;
+        }
+        let slot = self.base + self.next_slot;
+        if slot as usize >= crate::smt::MAX_VARS {
+            return None;
+        }
+        self.next_slot += 1;
+        let v = smt::var_named(slot, elem_w);
+        self.vars.insert(mangled.clone(), v);
+        if elem_signed {
+            self.signed.insert(mangled.clone());
+        }
+        self.paths.insert(format!("{path}[{index}]"), mangled);
+        self.path_elem_seeds.push((local, chain, index, v, elem_signed));
+        Some(v)
+    }
+
     /// Bind every nested field path a contract may name on an argument.
     ///
     /// `arg` is the source name, `ty` the argument's type (already read through a
@@ -838,6 +910,24 @@ impl FieldEnv {
             // into, so its scalar fields are reachable as deeper paths.
             if child.len() >= 2 && fty.width().is_some() {
                 self.bind_nested(w.local, w.arg, &path, &child, fty);
+            }
+            // An array at any depth is subscriptable: `o.i.a[0]`. The first-level
+            // pass only reaches `x.a`, so a nested array is recorded here with the
+            // full chain the executor keys its element store by.
+            if let Ty::Array(elem, n) = fty {
+                if let Some(ew) = elem.width() {
+                    self.path_elem_types.insert(
+                        path.clone(),
+                        PathElem {
+                            arg: w.arg.to_string(),
+                            local: w.local,
+                            chain: child.clone(),
+                            elem_w: ew,
+                            elem_signed: elem.is_signed(),
+                            len: *n,
+                        },
+                    );
+                }
             }
             if matches!(fty, Ty::Other(_) | Ty::Tuple(_)) {
                 self.walk_nested(w, &path, &child, fty);
@@ -1258,6 +1348,28 @@ impl FieldEnv {
                     i += 1;
                 }
                 let ident: String = chars[start..i].iter().collect();
+                // An array reached through a field path, `x.a[0]`. The scanner reads `x` first,
+                // so the dotted run has to be recognised from the *start* of the identifier, not
+                // from a later segment. A run that has an element type recorded and is followed by
+                // `[digits]` binds an element of that array; the whole-argument branch below only
+                // sees the bare `a[0]` spelling, so the two do not overlap.
+                if chars.get(i) == Some(&'.') {
+                    if let Some((end, path)) = longest_dotted_run(&chars, start) {
+                        if self.path_elem_types.contains_key(&path) && chars.get(end) == Some(&'[') {
+                            let mut j = end + 1;
+                            let digits: String =
+                                chars[j..].iter().take_while(|c| c.is_ascii_digit()).collect();
+                            j += digits.len();
+                            if !digits.is_empty() && chars.get(j) == Some(&']') {
+                                if let Ok(k) = digits.parse::<u64>() {
+                                    self.bind_path_elem(&path, k);
+                                }
+                                i = j + 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
                 if chars.get(i) == Some(&'[') {
                     let mut j = i + 1;
                     let digits: String = chars[j..].iter().take_while(|c| c.is_ascii_digit()).collect();
@@ -1364,6 +1476,35 @@ pub fn named_ret_components(texts: &[String]) -> BTreeSet<u32> {
         }
     }
     out
+}
+
+/// The longest dotted run starting at `start` (`ident` then `.seg` repeated), as
+/// `(index past the run, the dotted path)`.
+///
+/// Used to recognise an array reached through a field path (`x.a` in `x.a[0]`). A run that is
+/// not all identifiers ends before the offending character, so a subscript or a call is never
+/// swallowed.
+fn longest_dotted_run(chars: &[char], start: usize) -> Option<(usize, String)> {
+    let mut end = start;
+    while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
+        end += 1;
+    }
+    if end == start {
+        return None;
+    }
+    let mut last = end;
+    while chars.get(end) == Some(&'.') {
+        let mut j = end + 1;
+        while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+            j += 1;
+        }
+        if j == end + 1 {
+            break;
+        }
+        end = j;
+        last = j;
+    }
+    Some((last, chars[start..last].iter().collect()))
 }
 
 /// The longest dotted run starting at `dot` that has a nested binding, as
@@ -1527,6 +1668,29 @@ fn rewrite_fields(text: &str, fields: &FieldEnv) -> Result<String, SpecError> {
                         out.push_str(mangled);
                         i = j;
                         continue;
+                    }
+                    // An element of an array reached through a field path: `x.a[0]`, or a
+                    // deeper `o.i.a[0]`. The dotted run is the array's path and its element
+                    // binding is in `paths`. Tried before the nested match so the subscript
+                    // is not mistaken for the field `x.a` followed by a bracket. The run is
+                    // taken from the start of the identifier, not from the first field, so a
+                    // nested path is not cut short at `o.i`.
+                    if let Some((end, path)) = longest_dotted_run(&chars, start) {
+                        if chars.get(end) == Some(&'[') {
+                            let mut k = end + 1;
+                            let digits: String =
+                                chars[k..].iter().take_while(|c| c.is_ascii_digit()).collect();
+                            k += digits.len();
+                            if !digits.is_empty() && chars.get(k) == Some(&']') {
+                                if let Some(mangled) =
+                                    fields.paths.get(&format!("{path}[{digits}]"))
+                                {
+                                    out.push_str(mangled);
+                                    i = k + 1;
+                                    continue;
+                                }
+                            }
+                        }
                     }
                     // A *nested* path: `o.i.v`. The longest dotted run that has a
                     // binding wins, so `o.i.v` is preferred to a bare `o.i` when
@@ -4460,6 +4624,24 @@ pub fn field_env(
         let Some(def) = structs.get(name) else { continue };
         for (i, (fname, fty)) in def.fields.iter().enumerate() {
             env.bind(l, &arg, fname, i as u32, fty);
+            // An array-typed field is subscriptable: `o.a[0]`. Recorded so a contract's
+            // `o.a[0]` can bind an element variable of the right width, and the executor seeds
+            // it under the same `(local, [i], index)` key the body's write lands on.
+            if let Ty::Array(elem, n) = fty {
+                if let Some(w) = elem.width() {
+                    env.path_elem_types.insert(
+                        format!("{arg}.{fname}"),
+                        PathElem {
+                            arg: arg.clone(),
+                            local: l,
+                            chain: vec![i as u32],
+                            elem_w: w,
+                            elem_signed: elem.is_signed(),
+                            len: *n,
+                        },
+                    );
+                }
+            }
         }
         // Nested paths: `o.i.v` and, for a *named-field* struct, `o.i` too (its
         // field names are not numeric, so the single-field pass above skipped them).

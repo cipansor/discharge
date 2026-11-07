@@ -35,11 +35,16 @@ In scope:
   This includes the bit-blaster disagreeing with Rust's own wrapping arithmetic,
   the two engines (`smt` and `sat`/`bitblast`) disagreeing on the same term
   graph, and a counterexample that does not replay against the compiled function.
-- **The `unsafe` code.** There are three `unsafe` blocks in `src/`. The
-  `static mut CTX` in the `no_std` build (`src/smt.rs`) is a single global
-  guarded by the crate's own discipline rather than by the compiler; a way to
-  reach it that breaks that discipline — in particular from more than one thread
-  on bare metal — is in scope.
+- **The `unsafe` code.** There are two `unsafe` blocks in `src/`, both in the
+  `no_std` build and both taking `&mut` to a `static mut` that the type system
+  cannot see: the term arena `CTX` (`src/smt.rs`) and the CNF/solver pair
+  `CNF`/`SOLVER` (`src/sat.rs`). Each is guarded by the crate's own discipline
+  rather than by the compiler — the arenas are `!Send`/`!Sync` and a bare-metal
+  build is single-threaded — and a way to reach either that breaks that
+  discipline, in particular from more than one thread on bare metal or
+  re-entrantly from an interrupt, is in scope. `scripts/gate.sh` step 16 pins the
+  count and requires a `// SAFETY:` justification on every block, so this
+  paragraph cannot drift from the code.
 - **The MIR frontend.** `discharge::mir` shells out to `rustc --emit=mir` and
   parses the textual dump. A crafted or merely unusual input that makes the
   parser accept something it should refuse (rather than failing closed) is in
