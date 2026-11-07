@@ -6051,3 +6051,81 @@ pub fn a_whole_array_target_sibling_cannot_prove_this(mut x: Boxed) -> u8 {
     set_first_of(&mut x.a);
     x.b[0]
 }
+
+/// A read-modify-write through a whole-array target: the callee *reads* the element it
+/// also writes.
+///
+/// `bump_first_of(&mut x.a)` computes `x.a[0] + 1`, so this exercises both directions at
+/// once -- the carry-in must hand the callee the caller's seed (else `a[0]` reads
+/// `Unknown` and the add is an unmodelled operand) and the write-back must land the
+/// result on the caller's `x.a[0]` (else the caller reads its own seed and `ret == 6`
+/// is unprovable). Both are the same re-basing arm, so a fix that did only one would
+/// fail here.
+/// requires: x.a[0] == 5
+/// ensures: ret == 6
+pub fn a_whole_array_target_read_modify_write(mut x: Boxed) -> u8 {
+    bump_first_of(&mut x.a);
+    x.a[0]
+}
+
+/// The false direction of [`a_whole_array_target_read_modify_write`]: the seed, not the
+/// incremented value. The suffix puts it under the corpus-wide
+/// `no_cannot_prove_entry_is_ever_verified` invariant.
+/// requires: x.a[0] == 5
+/// ensures: ret == 5
+pub fn a_whole_array_target_read_modify_write_cannot_prove_this(mut x: Boxed) -> u8 {
+    bump_first_of(&mut x.a);
+    x.a[0]
+}
+
+/// A whole-array target reached through a *nested* field path: `&mut o.i.a`.
+///
+/// The target's chain is two fields (`[0, 0]`), so the re-basing has to carry a chain of
+/// more than one step, not just a single field. The helper is the same `set_first_of`, so
+/// the difference from the flat case is the target's depth alone.
+/// requires: o.i.a[0] == 5
+/// ensures: ret == 9
+pub fn a_nested_whole_array_target_crosses_a_reference_argument(mut o: NestedArrays) -> u8 {
+    set_first_of(&mut o.i.a);
+    o.i.a[0]
+}
+
+/// The false direction of [`a_nested_whole_array_target_crosses_a_reference_argument`].
+/// requires: o.i.a[0] == 5
+/// ensures: ret == 5
+pub fn a_nested_whole_array_target_cannot_prove_this(mut o: NestedArrays) -> u8 {
+    set_first_of(&mut o.i.a);
+    o.i.a[0]
+}
+
+/// The write crosses *two* frames: the caller hands `&mut x.a` to a helper that hands the
+/// same reference on to [`set_first_of`].
+///
+/// `relay_first_of` only forwards its argument, so the write reaches the caller's
+/// `x.a[0]` through an inner call. Each frame re-bases independently, so this is the
+/// transitivity check on the re-basing rule rather than a new rule.
+/// requires: x.a[0] == 5
+/// ensures: ret == 9
+pub fn a_whole_array_target_crosses_two_frames(mut x: Boxed) -> u8 {
+    relay_first_of(&mut x.a);
+    x.a[0]
+}
+
+/// The false direction of [`a_whole_array_target_crosses_two_frames`].
+/// requires: x.a[0] == 5
+/// ensures: ret == 5
+pub fn a_whole_array_target_crosses_two_frames_cannot_prove_this(mut x: Boxed) -> u8 {
+    relay_first_of(&mut x.a);
+    x.a[0]
+}
+
+/// A read-modify-write helper for a whole-array target: reads and writes element 0.
+fn bump_first_of(a: &mut [u8; 4]) {
+    a[0] = a[0] + 1;
+}
+
+/// A pass-through helper: forwards its whole-array reference to [`set_first_of`], so the
+/// write crosses two frames.
+fn relay_first_of(a: &mut [u8; 4]) {
+    set_first_of(a);
+}

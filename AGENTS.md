@@ -6390,12 +6390,32 @@ with the prefix dropped otherwise (the `&o.i` case). Both directions were `Incom
 and both decide now, and the two are separate loops because one runs at the call and one at the
 return.
 
-It is *pinned*: the corpus carries `a_whole_array_target_crosses_a_reference_argument` (the
-true direction, `ret == 9`) and its false twin
-`a_whole_array_target_cannot_prove_this`, and
-`tests/mir.rs::a_whole_array_target_decides_without_a_false_proof` asserts the first is
-`Verified` and the second is `Failed`. The pin is what made closing the hole safe to do: the
-dangerous change is a re-basing that connects the two stores the *wrong* way, which would turn
-the false twin `Verified` before the true contract verified, and nothing else in the suite
-would notice. The twin's `Failed` assertion is the unconditional half; if a later change makes
-this shape incomplete again, the test fails and the two assertions say which direction broke.
+It is *pinned*, and not only in the two directions that first exposed the hole. The corpus
+carries `a_whole_array_target_crosses_a_reference_argument` (the true direction, `ret == 9`)
+and its false twin `a_whole_array_target_cannot_prove_this`, the read-only pair
+`a_whole_array_target_read_crosses_a_reference_argument` / `..._read_cannot_prove_this`, the
+sibling-field probe `a_whole_array_target_sibling_cannot_prove_this`, and three shapes that
+put the re-basing rule where it is easy to get it *partly* right: a read-modify-write
+(`a_whole_array_target_read_modify_write`, where the carry-in and the write-back must both
+fire in one call), a target two fields deep
+(`a_nested_whole_array_target_crosses_a_reference_argument`, chain `[0, 0]` rather than
+`[0]`), and a write that crosses two frames (`a_whole_array_target_crosses_two_frames`, where
+each frame re-bases independently). Each has its `_cannot_prove_this` twin, so the corpus-wide
+`no_cannot_prove_entry_is_ever_verified` invariant holds them all.
+
+`tests/mir.rs::a_whole_array_target_decides_without_a_false_proof` asserts every one: each
+true direction is `Verified` and each twin is `Failed` (or, for the read-only twin, not
+`Verified`). The pin is what made closing the hole safe to do: the dangerous change is a
+re-basing that connects the two stores the *wrong* way, which would turn a false twin
+`Verified` before the true contract verified, and nothing else in the suite would notice. The
+twins' "must not verify" assertions are the unconditional half; if a later change makes any of
+these shapes incomplete again, the test fails and names the direction that broke.
+
+Still not modelled, and named so the boundary is honest. A *scalar* element target
+(`&mut x.a[0]`, a `&mut u8`) is modelled and decides -- the true `ret == 9` verifies and the
+false `ret == 5` is refuted -- but an *array* element target (`&mut g.rows[0]`, a
+`&mut [u8; 4]` reached through a subscript of a field whose type is an array of arrays) cannot
+be named in a contract at all: `g.rows[0][0]` is refused with `unknown field`, so such a
+function is *skipped* rather than decided. A *tuple* field target (`&mut w.t`) is refused the
+same way (`unknown field t of w`). Both are coverage holes, not soundness ones -- the contract
+cannot be written, so nothing false is proved.

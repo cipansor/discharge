@@ -1752,6 +1752,12 @@ fn a_whole_array_target_decides_without_a_false_proof() {
         "a_whole_array_target_sibling_cannot_prove_this",
         "a_whole_array_target_read_crosses_a_reference_argument",
         "a_whole_array_target_read_cannot_prove_this",
+        "a_whole_array_target_read_modify_write",
+        "a_whole_array_target_read_modify_write_cannot_prove_this",
+        "a_nested_whole_array_target_crosses_a_reference_argument",
+        "a_nested_whole_array_target_cannot_prove_this",
+        "a_whole_array_target_crosses_two_frames",
+        "a_whole_array_target_crosses_two_frames_cannot_prove_this",
     ]) else {
         return;
     };
@@ -1786,6 +1792,30 @@ fn a_whole_array_target_decides_without_a_false_proof() {
         "the false read-only twin (`ret == 7` against a seed of 5) must not verify; \
          got: {read_twin}"
     );
+    // The three shapes below are the re-basing rule applied where it is easy to get it
+    // *partly* right: a read-modify-write (both directions in one call), a target two
+    // fields deep, and a write that crosses two frames. Each true contract must decide
+    // and each false twin must be refuted -- a fix that handled only the write, or only
+    // a single-field chain, or only one frame, would show up as a true direction stuck
+    // `Incomplete` (or, worse, a twin `Verified`).
+    for (name, want) in [
+        ("a_whole_array_target_read_modify_write", true),
+        ("a_whole_array_target_read_modify_write_cannot_prove_this", false),
+        ("a_nested_whole_array_target_crosses_a_reference_argument", true),
+        ("a_nested_whole_array_target_cannot_prove_this", false),
+        ("a_whole_array_target_crosses_two_frames", true),
+        ("a_whole_array_target_crosses_two_frames_cannot_prove_this", false),
+    ] {
+        let got = outcome(&report, name);
+        if want {
+            assert!(got.is_verified(), "`{name}` must verify; got: {got}");
+        } else {
+            assert!(
+                !got.is_verified(),
+                "`{name}` is a false direction and must not verify; got: {got}"
+            );
+        }
+    }
 }
 
 /// A helper's write-back covers a *nested* field and a read-modify-write, and the
