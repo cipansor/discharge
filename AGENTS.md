@@ -6132,10 +6132,27 @@ Seven entries with their false twins, pinned by
 straight into another (`write_one(identity(&mut c.lo))`), a reborrow of it (`let s = &mut
 *r`), two returned references to *different* fields held at once, and a returned reference
 to a *tuple component* all decide through the same `addressed` mapping. A returned place
-whose key cannot be spelled (an *array element*, `&mut a[0]`) stays sound-incomplete: the
-true contract is refused rather than the write being dropped, which is the honest failure
-mode. Eight entries with their false twins, pinned by
-`a_returned_reference_composes_with_the_next_use`.
+whose key cannot be spelled stays sound-incomplete: the true contract is refused rather
+than the write being dropped, which is the honest failure mode. (An *array element* was
+once in this class; it now decides -- see the next paragraph.) Eight entries with their
+false twins, pinned by `a_returned_reference_composes_with_the_next_use`.
+
+**A returned reference to an array *element* re-bases onto the caller's element.** The
+origin of `&mut a[0]` names the element index with a *local* (`_2` for the literal `0`),
+and the whole-array form is `(*_1)[_2]` -- a deref of the reference argument followed by
+the index. Two things then had to change at the return translation, and the failure mode
+differs between the two forms. A *method* (`&mut self.a[0]`) carried the index local
+through the call boundary, leaving a place no `elems_path` entry is keyed by: the write was
+dropped and the contract was unreadable, `Incomplete` in *both* directions. A *free
+function* handed the whole array (`elem_mut(&mut x.a)`) appended the argument's deref into
+the middle of the caller's place: the write was dropped, the caller read its own seed, and
+the false `ret == 5` was **proved** -- a false proof, not a lost one. The fix resolves the
+`IndexVar` to its literal while the callee's locals are still live (`pin_index_vars`) and
+strips the argument's leading deref (whose referent `arg_source` already names). The true
+directions now verify and every false twin is refuted; a *symbolic* index is left unpinned,
+so an unguarded `x.nth_mut(i)` stays fail-closed while `requires: i == 0` decides. Twelve
+entries -- five true directions and seven false -- pinned by
+`a_returned_reference_to_an_element_reaches_the_caller`.
 
 **Two reference targets in one call stay independent.** Two `&mut` to different
 *aggregate* fields (`&mut o.i, &mut o.j`) and two *elements* of one array through one

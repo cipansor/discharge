@@ -726,6 +726,34 @@ impl Env {
         }
     }
 
+    /// A place whose `IndexVar` steps are replaced by the literal they hold *in
+    /// this frame*.
+    ///
+    /// A returned reference's origin is a place in the callee's terms, and a
+    /// `&mut self.a[0]` records the *local* that held `0` -- `_2` -- not the
+    /// literal, because `_2` is the index the dump names. That local dies at the
+    /// call boundary, so a caller that translates the origin gets a place no
+    /// `elems_path` entry is ever keyed by, and a write through the returned
+    /// reference is dropped. Resolving the index here, while the callee's locals
+    /// are still live, turns it into the literal the caller's store agrees on.
+    ///
+    /// A symbolic index is left as it is: its value is not a single element the
+    /// caller could name either, so refusing to pin it is what keeps the write
+    /// from landing on an arbitrary element.
+    fn pin_index_vars(&self, p: &Place) -> Place {
+        let mut proj = p.proj.clone();
+        for step in &mut proj {
+            if let Proj::IndexVar(li) = step {
+                if let Some(Val::Sym(x, _)) = self.locals.get(li) {
+                    if let Some(k) = smt::evaluate(*x, |_| None) {
+                        *step = Proj::Index(k);
+                    }
+                }
+            }
+        }
+        Place { local: p.local, proj }
+    }
+
     /// Move the parts stored under `src` to `dst`, re-rooting them when either place is
     /// nested, and report whether there were any.
     ///
@@ -2801,6 +2829,31 @@ where
                         // than aimed at a foreign place.
                         if let Some(o) = st.env.ref_origin.get(&0).cloned() {
                             if let Some(src) = st.env.arg_source.get(&o.local).cloned() {
+                                // Two rewrites turn the callee's origin into a place in
+                                // the caller, and both are needed for an *element*:
+                                //
+                                // `resolve` collapses a deref of a local whose address
+                                // was recorded; then a leading deref is stripped
+                                // outright, because the head here is a reference
+                                // *argument* (`arg_source` holds only those) and `src`
+                                // already names its referent. `&mut a[0]` on a
+                                // whole-array argument is `(*_1)[_2]`, and `_1` is that
+                                // argument, so without the strip the deref lands in the
+                                // middle of the caller's place where no store is keyed
+                                // -- the write is dropped and a false contract about the
+                                // seed is *proved*.
+                                //
+                                // `pin_index_vars` then resolves the `IndexVar` the dump
+                                // prints (`_2` for the literal `0`), which dies at the
+                                // call boundary. Only the callee's own projection is
+                                // pinned: the caller's `src.proj` names *caller* locals,
+                                // so resolving it against this frame would read the
+                                // wrong local and is carried through as it is.
+                                let mut o = st.env.resolve(&o);
+                                if matches!(o.proj.first(), Some(Proj::Deref)) {
+                                    o.proj.remove(0);
+                                }
+                                let o = st.env.pin_index_vars(&o);
                                 let mut proj = src.proj.clone();
                                 proj.extend_from_slice(&o.proj);
                                 let place = Place { local: src.local, proj };

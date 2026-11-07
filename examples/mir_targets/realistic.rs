@@ -6129,3 +6129,168 @@ fn bump_first_of(a: &mut [u8; 4]) {
 fn relay_first_of(a: &mut [u8; 4]) {
     set_first_of(a);
 }
+
+impl Boxed {
+    /// `&mut self.a[0]` -- the returned reference names an *element*, and the index the
+    /// dump prints is a local (`_2`), not the literal.
+    fn first_mut(&mut self) -> &mut u8 {
+        &mut self.a[0]
+    }
+
+    /// `&mut self.a[1]` -- a second element, so a fix that pinned every returned element
+    /// to index 0 would decide the first case and read the wrong element here.
+    fn second_mut(&mut self) -> &mut u8 {
+        &mut self.a[1]
+    }
+}
+
+/// A method that returns `&mut` to an *element* of a field array: the write through the
+/// returned reference must land on `x.a[0]`.
+///
+/// `x.first_mut()` builds `&mut x.a[0]` from `_1.0[_2]`, where `_2` is the local that held
+/// `0`. The caller's place for the returned reference has to keep that element index, and
+/// `_2` means nothing outside the callee -- so a translation that carried the local through
+/// left a place no element store is keyed by, the write was dropped, and the contract was
+/// unreadable. Pinning the index to its literal while the callee's locals are still live is
+/// what makes `ret == 9` decide; a symbolic index is left alone, so no write lands on an
+/// element the caller never named.
+/// requires: x.a[0] == 5
+/// ensures: ret == 9
+pub fn returned_ref_to_an_element_crosses_the_frame(mut x: Boxed) -> u8 {
+    *x.first_mut() = 9;
+    x.a[0]
+}
+
+/// The false direction of [`returned_ref_to_an_element_crosses_the_frame`]: the seed, not
+/// the write. A re-basing that aimed the write at the wrong element could turn this twin
+/// `Verified` before the true case, so it is held by the corpus-wide
+/// `no_cannot_prove_entry_is_ever_verified` invariant.
+/// requires: x.a[0] == 5
+/// ensures: ret == 5
+pub fn returned_ref_to_an_element_cannot_prove_this(mut x: Boxed) -> u8 {
+    *x.first_mut() = 9;
+    x.a[0]
+}
+
+/// The second element: a fix that pinned every returned element to index 0 would decide the
+/// case above and read the wrong element here.
+/// requires: x.a[1] == 5
+/// ensures: ret == 9
+pub fn returned_ref_to_a_sibling_element(mut x: Boxed) -> u8 {
+    *x.second_mut() = 9;
+    x.a[1]
+}
+
+/// The false direction of [`returned_ref_to_a_sibling_element`].
+/// requires: x.a[1] == 5
+/// ensures: ret == 5
+pub fn returned_ref_to_a_sibling_element_cannot_prove_this(mut x: Boxed) -> u8 {
+    *x.second_mut() = 9;
+    x.a[1]
+}
+
+/// The write through the returned reference must not land on a *different* element.
+///
+/// The method writes `x.a[1]`, so `x.a[0]` is still the seed. Claiming `ret == 9` here is
+/// false of the body; an element index that was dropped or defaulted would prove it.
+/// requires: x.a[0] == 5
+/// ensures: ret == 9
+pub fn returned_ref_write_is_not_the_wrong_element_cannot_prove_this(mut x: Boxed) -> u8 {
+    *x.second_mut() = 9;
+    x.a[0]
+}
+
+/// A helper that returns `&mut` to an element of the array it was handed: the write
+/// through the returned reference must reach the caller's array.
+///
+/// `elem_mut(&mut x.a)` passes the array `x.a` *itself*; inside, `&mut a[0]` is
+/// `(*_1)[_2]` -- a deref of the reference argument followed by the element index. The
+/// translation back to the caller appended that projection to `x.a`, leaving a deref in
+/// the middle of the caller's place where no element store is keyed. The write was
+/// dropped, the caller read its own seed, and the *false* direction below was **proved**
+/// against a body returning 9 -- a false proof, not a lost one. Stripping the argument's
+/// deref (the head `arg_source` already names) and pinning the index is what makes the
+/// true contract decide and the false twin refute.
+/// requires: x.a[0] == 5
+/// ensures: ret == 9
+pub fn returned_ref_to_a_whole_array_element(mut x: Boxed) -> u8 {
+    let r = elem_mut(&mut x.a);
+    *r = 9;
+    x.a[0]
+}
+
+/// The false direction of [`returned_ref_to_a_whole_array_element`]: the seed, not the
+/// write. This is the entry the pre-fix engine *proved*, so it is the sharpest tooth here.
+/// requires: x.a[0] == 5
+/// ensures: ret == 5
+pub fn returned_ref_to_a_whole_array_element_cannot_prove_this(mut x: Boxed) -> u8 {
+    let r = elem_mut(&mut x.a);
+    *r = 9;
+    x.a[0]
+}
+
+/// The reading helper for [`returned_ref_to_a_whole_array_element`]: returns `&mut` to
+/// element 0 of the array it is handed.
+fn elem_mut(a: &mut [u8; 4]) -> &mut u8 {
+    &mut a[0]
+}
+
+/// A returned reference to an element reached through a *nested* field path: the origin is
+/// `(*_1).i.a[_2]`, so the appended projection is a chain of two fields and an index.
+/// requires: o.i.a[0] == 5
+/// ensures: ret == 9
+pub fn returned_ref_to_a_nested_whole_array_element(mut o: NestedArrays) -> u8 {
+    *deep_elem_mut(&mut o) = 9;
+    o.i.a[0]
+}
+
+/// The false direction of [`returned_ref_to_a_nested_whole_array_element`].
+/// requires: o.i.a[0] == 5
+/// ensures: ret == 5
+pub fn returned_ref_to_a_nested_whole_array_element_cannot_prove_this(mut o: NestedArrays) -> u8 {
+    *deep_elem_mut(&mut o) = 9;
+    o.i.a[0]
+}
+
+/// The nested reading helper: `&mut o.i.a[0]`.
+fn deep_elem_mut(o: &mut NestedArrays) -> &mut u8 {
+    &mut o.i.a[0]
+}
+
+/// A returned reference to a *guarded* symbolic element: `x.nth_mut(i)` is `&mut x.a[i]`
+/// and the contract admits only `i == 0`, so the write lands on `x.a[0]` and `ret == 9`
+/// decides. The guard is what makes the symbolic index a single element.
+/// requires: x.a[0] == 5 && i == 0
+/// ensures: ret == 9
+pub fn returned_ref_to_a_guarded_symbolic_element(mut x: Boxed, i: usize) -> u8 {
+    *x.nth_mut(i) = 9;
+    x.a[0]
+}
+
+/// The false direction of [`returned_ref_to_a_guarded_symbolic_element`]: same body, so
+/// claiming the seed must be refuted.
+/// requires: x.a[0] == 5 && i == 0
+/// ensures: ret == 5
+pub fn returned_ref_to_a_guarded_symbolic_element_cannot_prove_this(mut x: Boxed, i: usize) -> u8 {
+    *x.nth_mut(i) = 9;
+    x.a[0]
+}
+
+/// A returned reference to an element under a *symbolic* index the contract does not pin:
+/// `i` may be any of the four elements, so the write cannot be aimed at `x.a[0]`. The
+/// engine must not prove either direction -- the true `ret == 9` is a refusal, and the
+/// false `ret == 5` must not be a false proof.
+/// requires: x.a[0] == 5
+/// ensures: ret == 5
+pub fn returned_ref_to_an_unpinned_symbolic_element_cannot_prove_this(mut x: Boxed, i: usize) -> u8 {
+    *x.nth_mut(i) = 9;
+    x.a[0]
+}
+
+/// `&mut self.a[i]` -- a method whose returned reference names an element under a symbolic
+/// index.
+impl Boxed {
+    fn nth_mut(&mut self, i: usize) -> &mut u8 {
+        &mut self.a[i]
+    }
+}

@@ -1818,6 +1818,66 @@ fn a_whole_array_target_decides_without_a_false_proof() {
     }
 }
 
+/// A method's returned reference to an *element* re-bases onto the caller's element.
+///
+/// `x.first_mut()` is `&mut x.a[0]`, and the dump names the element index with a
+/// local (`_2`), not the literal. Translating the returned reference to the caller
+/// therefore has to resolve that local *before* the callee's frame is gone; carrying
+/// it through left a place no element store is keyed by, the write `*x.first_mut() = 9`
+/// was dropped, and the contract was unreadable -- `Incomplete` in both directions.
+/// The true contract must now decide and the false twin must be refuted; the sibling
+/// element is the second tooth, because a fix that pinned every returned element to
+/// index 0 would decide the first case and read the wrong element here.
+#[test]
+fn a_returned_reference_to_an_element_reaches_the_caller() {
+    let Some(report) = verify_realistic(&[
+        "returned_ref_to_an_element_crosses_the_frame",
+        "returned_ref_to_an_element_cannot_prove_this",
+        "returned_ref_to_a_sibling_element",
+        "returned_ref_to_a_sibling_element_cannot_prove_this",
+        "returned_ref_write_is_not_the_wrong_element_cannot_prove_this",
+        "returned_ref_to_a_whole_array_element",
+        "returned_ref_to_a_whole_array_element_cannot_prove_this",
+        "returned_ref_to_a_nested_whole_array_element",
+        "returned_ref_to_a_nested_whole_array_element_cannot_prove_this",
+        "returned_ref_to_a_guarded_symbolic_element",
+        "returned_ref_to_a_guarded_symbolic_element_cannot_prove_this",
+        "returned_ref_to_an_unpinned_symbolic_element_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "returned_ref_to_an_element_crosses_the_frame",
+        "returned_ref_to_a_sibling_element",
+        "returned_ref_to_a_whole_array_element",
+        "returned_ref_to_a_nested_whole_array_element",
+        "returned_ref_to_a_guarded_symbolic_element",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            o.is_verified(),
+            "the write through the returned element reference must reach the caller's \
+             element, so `{name}` must verify; got: {o}"
+        );
+    }
+    for name in [
+        "returned_ref_to_an_element_cannot_prove_this",
+        "returned_ref_to_a_sibling_element_cannot_prove_this",
+        "returned_ref_write_is_not_the_wrong_element_cannot_prove_this",
+        "returned_ref_to_a_whole_array_element_cannot_prove_this",
+        "returned_ref_to_a_nested_whole_array_element_cannot_prove_this",
+        "returned_ref_to_a_guarded_symbolic_element_cannot_prove_this",
+        "returned_ref_to_an_unpinned_symbolic_element_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            !o.is_verified(),
+            "`{name}` is a false direction -- a write aimed at the wrong element would \
+             prove it; got: {o}"
+        );
+    }
+}
+
 /// A helper's write-back covers a *nested* field and a read-modify-write, and the
 /// caller's field seed crosses *into* the callee so the callee's read is modelled.
 ///
