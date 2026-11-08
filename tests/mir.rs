@@ -5786,3 +5786,83 @@ fn an_unsigned_power_of_two_division_is_a_shift_not_a_divider() {
         "a false claim about an unsigned division must be refuted; got: {bad}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Recursion by contract
+// ---------------------------------------------------------------------------
+
+/// A recursive function is proved by induction, not by unrolling.
+///
+/// The self-call is answered by the function's own contract: its precondition is
+/// proved of `n - 1`, the `decreases:` measure is proved to shrink, and the
+/// postcondition is assumed for the result. The base case is proved by the body,
+/// which is what makes the induction well-founded rather than circular.
+///
+/// Before `decreases:` existed, this function hit `DEFAULT_INLINE_DEPTH` and came
+/// back `Incomplete`, so a proof here is the whole point of the feature.
+#[test]
+fn a_recursive_function_is_proved_by_its_decreases_measure() {
+    let Some(report) = verify_realistic(&["a_recursive_identity"]) else { return };
+    let o = outcome(&report, "a_recursive_identity");
+    assert!(
+        o.is_verified(),
+        "a recursive function with a decreasing measure must be proved by induction, got: {o}"
+    );
+}
+
+/// The inductive assumption must not rescue a body that is simply wrong.
+///
+/// `a_recursive_lie_cannot_prove_this` has `a_recursive_identity`'s contract but a
+/// body that returns `n + 1` in the recursive case. If the postcondition were
+/// assumed at the base case too -- or if the `return` obligations were skipped --
+/// it would come back `verified`, which is a false proof. It must be a definite
+/// failure, with a counterexample.
+#[test]
+fn a_recursive_body_that_does_not_establish_its_postcondition_is_refuted() {
+    let Some(report) = verify_realistic(&["a_recursive_lie_cannot_prove_this"]) else { return };
+    let o = outcome(&report, "a_recursive_lie_cannot_prove_this");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("a recursive body that breaks its postcondition must fail, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "got: {o}");
+}
+
+/// An assumption with no decreasing measure is circular, so it must be refused.
+///
+/// `a_recursive_call_that_does_not_decrease_cannot_prove_this` calls itself on the
+/// same `n`. Its precondition and postcondition are both true of the body, so
+/// nothing but the measure check stands between it and a false proof. It must not
+/// verify.
+#[test]
+fn a_recursive_call_without_a_decreasing_measure_is_not_assumed() {
+    let Some(report) = verify_realistic(&["a_recursive_call_that_does_not_decrease_cannot_prove_this"])
+    else {
+        return;
+    };
+    let o = outcome(&report, "a_recursive_call_that_does_not_decrease_cannot_prove_this");
+    assert!(
+        !o.is_verified(),
+        "an induction without a decreasing measure must not be assumed, got: {o}"
+    );
+}
+
+/// The recursive call's *precondition* is an obligation, not a formality.
+///
+/// `a_recursive_call_out_of_range_cannot_prove_this` has `requires: n <= 3` and
+/// calls itself on `n + 1`, leaving that range. Proving the precondition at the
+/// call is what keeps the induction hypothesis applicable only where the contract
+/// holds; without it the postcondition would be assumed for an input the function
+/// never promised anything about.
+#[test]
+fn a_recursive_call_must_satisfy_its_own_precondition() {
+    let Some(report) =
+        verify_realistic(&["a_recursive_call_out_of_range_cannot_prove_this"])
+    else {
+        return;
+    };
+    let o = outcome(&report, "a_recursive_call_out_of_range_cannot_prove_this");
+    assert!(
+        !o.is_verified(),
+        "a recursive call that violates its own precondition must not be assumed, got: {o}"
+    );
+}

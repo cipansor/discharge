@@ -24,6 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::mir::intrinsics::{self, Outcome};
+use crate::mir::spec::{self, FieldEnv};
 use crate::mir::parse::{
     BinOp, Block, Callee, Const, EnumLayout, MirFn, MirProgram, Operand, Place, Proj, Rvalue, Stmt,
     Term, Ty, UnOp, USIZE_WIDTH,
@@ -173,6 +174,15 @@ pub enum ObligationKind {
     /// The declared loop invariant is left true by one iteration. This is the
     /// step of the induction.
     LoopInvariantPreserve,
+    /// A recursive call's arguments satisfy the function's own precondition. The
+    /// call is not inlined, so the contract is *assumed* -- and the precondition is
+    /// what makes that assumption an induction hypothesis rather than a
+    /// restatement of the goal.
+    RecursivePrecondition,
+    /// The `decreases:` measure is strictly smaller at a recursive call than at
+    /// entry. This is the well-founded basis the induction needs; without it the
+    /// assumption would be circular.
+    RecursiveDecreases,
 }
 
 impl std::fmt::Display for ObligationKind {
@@ -184,6 +194,12 @@ impl std::fmt::Display for ObligationKind {
             ObligationKind::VacuousPrecondition => write!(f, "vacuous precondition"),
             ObligationKind::LoopInvariantInit => write!(f, "loop invariant holds on entry"),
             ObligationKind::LoopInvariantPreserve => write!(f, "loop invariant preserved"),
+            ObligationKind::RecursivePrecondition => {
+                write!(f, "recursive call satisfies the precondition")
+            }
+            ObligationKind::RecursiveDecreases => {
+                write!(f, "recursive call decreases the measure")
+            }
         }
     }
 }
@@ -232,7 +248,9 @@ impl Obligation {
         match self.kind {
             ObligationKind::Postcondition
             | ObligationKind::LoopInvariantInit
-            | ObligationKind::LoopInvariantPreserve => self.verdict.is_proved(),
+            | ObligationKind::LoopInvariantPreserve
+            | ObligationKind::RecursivePrecondition
+            | ObligationKind::RecursiveDecreases => self.verdict.is_proved(),
             ObligationKind::Panic { .. } | ObligationKind::Unreachable => {
                 matches!(self.verdict, Verdict::Unsat)
             }
@@ -283,7 +301,9 @@ impl Obligation {
                 ObligationKind::Postcondition
                 | ObligationKind::VacuousPrecondition
                 | ObligationKind::LoopInvariantInit
-                | ObligationKind::LoopInvariantPreserve => {
+                | ObligationKind::LoopInvariantPreserve
+                | ObligationKind::RecursivePrecondition
+                | ObligationKind::RecursiveDecreases => {
                     "invalid: a `Valid` verdict is a discharge for this kind".to_string()
                 }
             },
@@ -295,8 +315,11 @@ impl Obligation {
                 }
                 // `path => I` false on every input: the invariant can never be
                 // established (or re-established), so the loop proves nothing.
-                ObligationKind::LoopInvariantInit | ObligationKind::LoopInvariantPreserve => {
-                    "the invariant holds for no input (false on every input)".to_string()
+                ObligationKind::LoopInvariantInit
+                | ObligationKind::LoopInvariantPreserve
+                | ObligationKind::RecursivePrecondition
+                | ObligationKind::RecursiveDecreases => {
+                    "the property holds for no input (false on every input)".to_string()
                 }
                 // The good answer for a reachability query, so this is a discharge.
                 ObligationKind::Panic { .. } | ObligationKind::Unreachable => {
@@ -1656,6 +1679,46 @@ pub struct Seeds {
     pub pins: Vec<(u32, u64)>,
 }
 
+/// The contract of the function under verification, in *text* form, so a
+/// recursive call can be checked and assumed at the call site.
+///
+/// A self-call is not inlined: inlining it is what made a recursive function
+/// fail at the depth bound. Instead the call becomes the induction step of a
+/// well-founded recursion -- the precondition is *proved* of the call's
+/// arguments, the `decreases:` measure is *proved* to shrink, and the
+/// postcondition is then *assumed* for the result. The measure is what makes the
+/// assumption an induction hypothesis rather than a restatement of the goal, so
+/// it is required: without one the call falls back to the old inlining.
+///
+/// The text is carried rather than a pre-built predicate because only the
+/// executor knows what the arguments hold at the call site, and the same text has
+/// to be evaluated there rather than at entry.
+#[derive(Clone, Debug)]
+pub struct Recursion {
+    /// Raw `requires:` texts.
+    pub requires: Vec<String>,
+    /// Raw `ensures:` texts. At least one is needed: with no postcondition there
+    /// is nothing to assume, so the call falls back to inlining.
+    pub ensures: Vec<String>,
+    /// The `decreases:` measure.
+    pub decreases: String,
+    /// The argument names whose types are signed, for the measure's relation.
+    pub signed: BTreeSet<String>,
+    /// The program's `const` table, so a measure or contract naming a constant
+    /// resolves the way the body's use site does.
+    pub consts: BTreeMap<String, Const>,
+    /// Whether the return type is signed, for a postcondition comparison.
+    pub ret_signed: bool,
+}
+
+/// The recursion context threaded through the walk: the contract text plus the
+/// measure's value at *entry*, which the decrease test compares against.
+struct RecCtx {
+    rec: Recursion,
+    /// The measure evaluated in the entry state, with its signedness.
+    measure_entry: Option<(Var, bool)>,
+}
+
 /// Verify one function from a parsed program.
 ///
 /// `pre` is the declared precondition (or `None` for `true`); `post` is the
@@ -1683,6 +1746,7 @@ pub fn verify_fn<F>(
     post: Option<F>,
     invariant: Option<&str>,
     seeds: &Seeds,
+    rec: Option<Recursion>,
 ) -> MirReport
 where
     F: Fn(Option<Var>, &[(u32, Var)]) -> Result<Pred, String>,
@@ -1897,6 +1961,28 @@ where
         },
     };
 
+    // The recursion context: the measure evaluated in the *entry* state, which
+    // every recursive call's decrease test compares against. Evaluated here,
+    // once, because the entry state is the one the walk starts from and the walk
+    // itself only ever sees later states. `names` is the entry binding of the
+    // arguments, which is exactly the state the measure is about.
+    let rec_ctx = rec.map(|rec| {
+        let entry_names = spec::arg_vars(f);
+        let measure_entry = spec::eval_measure(&rec.decreases, &entry_names, &rec.signed, &rec.consts)
+            .ok();
+        RecCtx { rec, measure_entry }
+    });
+    // A `decreases:` clause that cannot be read at entry is a refusal, not a
+    // silently-absent measure: without it every recursive call would be reported
+    // unknown, and saying so once here is clearer than at each call.
+    if let Some(rc) = &rec_ctx {
+        if rc.measure_entry.is_none() {
+            report
+                .unknown_paths
+                .push("unreadable `decreases:` measure at entry".into());
+        }
+    }
+
     let mut work = vec![State {
         frame: Frame {
             func: root,
@@ -1929,7 +2015,7 @@ where
             break;
         }
         explored += 1;
-        run_state(prog, st, &post, &mut report, &mut work, &seeds.pins);
+        run_state(prog, st, &post, &mut report, &mut work, &seeds.pins, root, &rec_ctx);
     }
     report
 }
@@ -2160,6 +2246,228 @@ fn find_obligation(path: Pred, pins: &[(u32, u64)]) -> Verdict {
     } else {
         v2
     }
+}
+
+/// Which function in the dump a call name refers to, by the inliner's rule: an
+/// exact match on the printed name, else a *unique* match on the last `::`
+/// component (rustc prints an inherent method with an `<impl at …>` prefix).
+///
+/// `None` means the name resolves to nothing or ambiguously, so the call is not
+/// one this function makes to itself.
+fn same_dump_index(prog: &MirProgram, name: &str) -> Option<usize> {
+    if let Some(i) = prog.fns.iter().position(|g| g.name == name) {
+        return Some(i);
+    }
+    let tail = name.rsplit("::").next();
+    let mut hits = prog.fns.iter().enumerate().filter(|(_, g)| g.name.rsplit("::").next() == tail);
+    match (hits.next(), hits.next()) {
+        (Some((i, _)), None) => Some(i),
+        _ => None,
+    }
+}
+
+/// Answer a self-recursive call by its contract instead of inlining it.
+///
+/// Returns `Some(())` when the call was handled (the caller must then continue at
+/// its own `target`, or stop when the obligation failed), `None` when it was not a
+/// recursive call or recursion is not licensed, so the caller falls through to the
+/// inliner.
+///
+/// # Why this is sound
+///
+/// A self-call inlined once is the *first* unrolling, and `DEFAULT_INLINE_DEPTH`
+/// stops the second. The contract route replaces the unrolling with an induction:
+///
+/// * the callee's precondition is *proved* of the call's arguments (`Pre`), so the
+///   assumption only applies to calls the function itself admits;
+/// * the `decreases:` measure is *proved* to be non-negative at entry and strictly
+///   smaller at the call (`Dec`), which is the well-founded basis; and
+/// * the postcondition is *assumed* of the result.
+///
+/// The measure is what makes this an induction rather than a circular argument: a
+/// strictly decreasing sequence in a well-founded order is finite, so there is a
+/// base case, and at the base case the body must establish the postcondition on
+/// its own. Nothing here *assumes* the postcondition at the base case -- the
+/// `return` obligations still have to be discharged by the body -- so a body that
+/// does not establish it is still a failure.
+///
+/// Every check is an obligation, so a wrong measure or a precondition the
+/// arguments do not meet is a *finding*, not a silent fallback.
+#[allow(clippy::too_many_arguments)]
+fn try_recursive_call(
+    prog: &MirProgram,
+    st: &mut State,
+    root: usize,
+    name: &str,
+    args: &[Operand],
+    dest: &Place,
+    target: usize,
+    rec: &Option<RecCtx>,
+    report: &mut MirReport,
+    work: &mut Vec<State>,
+    pins: &[(u32, u64)],
+) -> Option<()> {
+    // Only a self-call, and only the function under verification: an inlined
+    // callee's frame has a different `func`, and its own recursion is not this
+    // function's induction.
+    //
+    // The name is resolved with the same rule the inliner uses (exact match, else
+    // a unique tail match, because rustc may print the call with a path prefix),
+    // and the result has to be the root itself. A name that resolves to nothing
+    // or ambiguously is not this function calling itself.
+    if st.frame.func != root || same_dump_index(prog, name) != Some(root) {
+        return None;
+    }
+    // The root frame has no caller, so a self-call is recursion by construction.
+    // A frame with a caller is an inlined callee, and reaching the root's name
+    // from there is not the root calling itself.
+    if st.frame.caller.is_some() {
+        return None;
+    }
+    let Some(rc) = rec else { return None };
+    // No postcondition means nothing to assume, so the call has no contract route
+    // and falls back to inlining (which will report the depth cutoff).
+    if rc.rec.ensures.is_empty() {
+        return None;
+    }
+    let f = &prog.fns[root];
+
+    // The argument bindings at the call site: name -> the value the caller holds.
+    // A name that has no value there (an unmodelled operand) makes the whole call
+    // unmodelled, which is the same refusal the inliner would give.
+    let mut names: BTreeMap<String, Var> = BTreeMap::new();
+    for (i, a) in args.iter().enumerate() {
+        let Some(&l) = f.arg_locals.get(i) else { continue };
+        match operand(&mut st.env, a) {
+            Val::Sym(v, _) => {
+                names.insert(f.name_of(l), v);
+            }
+            Val::Bool(p) => {
+                names.insert(f.name_of(l), smt::ite(p, smt::word(1, 1), smt::word(0, 1)));
+            }
+            _ => {
+                report
+                    .unknown_paths
+                    .push(format!("unmodelled argument to a recursive call to `{name}`"));
+                return Some(());
+            }
+        }
+    }
+
+    // `Pre`: the callee's precondition, proved of the call's arguments. This is a
+    // proof obligation, so an unreadable precondition is a refusal rather than a
+    // silently skipped check -- assuming a postcondition without the matching
+    // precondition would be assuming the conclusion.
+    let mut pre_ok = true;
+    let mut pre: Option<Pred> = None;
+    for r in &rc.rec.requires {
+        match spec::eval_requires(r, &names, &rc.rec.signed, &FieldEnv::default()) {
+            Ok(p) => pre = Some(match pre {
+                None => p,
+                Some(prev) => smt::and(prev, p),
+            }),
+            Err(e) => {
+                report
+                    .unknown_paths
+                    .push(format!("unreadable `requires` at a recursive call: {e}"));
+                pre_ok = false;
+                break;
+            }
+        }
+    }
+    if !pre_ok {
+        return Some(());
+    }
+    if let Some(p) = pre {
+        report.obligations.push(Obligation {
+            kind: ObligationKind::RecursivePrecondition,
+            verdict: prove_obligation(st.path, p, pins),
+        });
+    }
+
+    // `Dec`: the measure at the call is non-negative and strictly below its value
+    // at entry. Both halves are needed. Non-negativity is what makes the order
+    // well-founded (a signed measure that goes negative would otherwise
+    // "decrease" forever); strictness is the progress.
+    if let Some((m_entry, signed)) = rc.measure_entry {
+        match spec::eval_measure(&rc.rec.decreases, &names, &rc.rec.signed, &rc.rec.consts) {
+            Ok((m_call, call_signed)) => {
+                if call_signed != signed || smt::bits(m_call) != smt::bits(m_entry) {
+                    report.unknown_paths.push(
+                        "the measure at a recursive call has a different type than at entry"
+                            .into(),
+                    );
+                    return Some(());
+                }
+                let zero = smt::word(0, smt::bits(m_entry));
+                let nonneg = if signed { smt::sge(m_entry, zero) } else { smt::truth(true) };
+                let decreases = if signed {
+                    smt::slt(m_call, m_entry)
+                } else {
+                    smt::ult(m_call, m_entry)
+                };
+                report.obligations.push(Obligation {
+                    kind: ObligationKind::RecursiveDecreases,
+                    verdict: prove_obligation(st.path, smt::and(nonneg, decreases), pins),
+                });
+            }
+            Err(e) => {
+                report.unknown_paths.push(format!("unreadable `decreases`: {e}"));
+                return Some(());
+            }
+        }
+    } else {
+        report.unknown_paths.push(
+            "a recursive call has no `decreases:` measure at entry to compare against".into(),
+        );
+        return Some(());
+    }
+
+    // Assume the postcondition for the result: a fresh variable for `ret`, the
+    // conjuncts of every `ensures`, then write it to the call's destination. The
+    // postcondition is *assumed*, never proved, here -- proving it is the `return`
+    // obligations' job.
+    let Some(w) = f.ret_ty.width() else {
+        report
+            .unknown_paths
+            .push("a recursive call returns an aggregate, which is not modelled".into());
+        return Some(());
+    };
+    let ret_v = smt::var(w);
+    let ret_signed = rc.rec.ret_signed;
+    let mut post_assumed: Option<Pred> = None;
+    for e in &rc.rec.ensures {
+        match spec::eval_ensures(
+            e,
+            &names,
+            Some(ret_v),
+            spec::RET_IS_UNKNOWN,
+            &rc.rec.signed,
+            ret_signed,
+            &FieldEnv::default(),
+        ) {
+            Ok(p) => post_assumed = Some(match post_assumed {
+                None => p,
+                Some(prev) => smt::and(prev, p),
+            }),
+            Err(e) => {
+                report
+                    .unknown_paths
+                    .push(format!("unreadable `ensures` at a recursive call: {e}"));
+                return Some(());
+            }
+        }
+    }
+    let assumed = post_assumed.unwrap_or_else(|| smt::truth(true));
+    st.path = smt::and(st.path, assumed);
+    let ret_val = if w == 1 {
+        Val::Bool(ret_v.eq_val(1))
+    } else {
+        Val::Sym(ret_v, Sign::of_bool(ret_signed))
+    };
+    st.env.set(dest, ret_val);
+    advance(prog, st.clone(), target, report, work, pins);
+    Some(())
 }
 
 /// Push the successor states of an edge to `target`, applying the loop cut when
@@ -2427,6 +2735,7 @@ fn operand_width(f: &MirFn, o: &Operand) -> Option<u8> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_state<F>(
     prog: &MirProgram,
     mut st: State,
@@ -2434,6 +2743,8 @@ fn run_state<F>(
     report: &mut MirReport,
     work: &mut Vec<State>,
     pins: &[(u32, u64)],
+    root: usize,
+    rec: &Option<RecCtx>,
 )
 where
     F: Fn(Option<Var>, &[(u32, Var)]) -> Result<Pred, String>,
@@ -3087,6 +3398,19 @@ where
                 report.unknown_paths.push("indirect call not modelled".into());
                 return;
             };
+            // A self-call is answered by the function's own contract when it
+            // carries a `decreases:` measure, rather than inlined: inlining it
+            // would only unroll once and hit the depth bound. See
+            // [`try_recursive_call`]. It returns `Some` when it handled the call
+            // (including the failure case), and `None` when the call is not
+            // recursive, so the inliner below still sees every other call.
+            if try_recursive_call(
+                prog, &mut st, root, name, args, dest, *target, rec, report, work, pins,
+            )
+            .is_some()
+            {
+                return;
+            }
             // The same-dump lookup runs *first*, and on the full name. A `core::num`
             // name is only an intrinsic when the dump has no body for it: the model in
             // `intrinsics` is a definition of `core`'s function, and a user function

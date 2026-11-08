@@ -459,8 +459,12 @@ and also what makes the frame check load-bearing:
    Do not add an `old` operator to the symbolic layer to "fix" this: it would give a
    name to a value the state no longer contains.
 
-Recursion is deliberately unsupported: a cyclic call graph needs an induction
-principle, which is a different feature rather than a missing branch.
+Recursion is supported for a *self-call* that names a `decreases:` measure: the
+call is answered by the function's own contract under well-founded induction
+rather than inlined. A *mutually* recursive cycle still has no measure to name
+here, so it remains unsupported. The full rule, its soundness argument, and the
+four ways it is pinned are recorded in "Recursion by contract" near the end of
+this file.
 
 ## A verifier needs a differential harness, not just unit tests
 
@@ -6271,9 +6275,11 @@ under a `_cannot_prove_this` name.
 
 **A callee contract is never assumed.** The engine inlines a callee's body rather than
 trusting its `ensures`, so a lying helper cannot hand a caller a proof, and a callee whose
-`requires` is *unsatisfiable* cannot be used to assume a false postcondition. Recursion and
-mutual recursion are the same property under the induction hypothesis and were checked
-separately. One honest incompleteness is pinned rather than left implicit: a callee's
+`requires` is *unsatisfiable* cannot be used to assume a false postcondition. The one
+contract that *is* assumed is the function's **own**, and only for a self-call that names a
+`decreases:` measure: there the assumption is the induction hypothesis, and the measure is
+what makes it well-founded rather than circular. Mutual recursion gets no such route. One
+honest incompleteness is pinned rather than left implicit: a callee's
 `requires` is **not** an obligation at the call site, so a violating call is decided from
 the inlined body -- sound because the body's own panics (a division by zero, say) still
 fail the path, but not a precondition check. That entry is named `..._is_not_checked`, not
@@ -6561,3 +6567,104 @@ last segment (`const L: u8 = 5;` at the top level forces `const a_local::L`), so
 enters the table only when nothing else could be meant by `L`. Verified to fail without the fix
 by neutralising the table lookup: the test then reports the true direction as `incomplete`. The
 parser side is pinned by `mir::parse::tests::named_const_items_are_collected_only_when_literal`.
+
+## Recursion by contract: a self-call answered by the function's own contract
+
+**The feature.** A recursive function used to be verified by *inlining* its self-call
+once, which is the first unrolling and nothing more: the second level hit
+`DEFAULT_INLINE_DEPTH`, and the function came back `Incomplete`. That is the honest
+answer for an unrolling, but it is the wrong tool. A recursive function is proved by
+*induction*, and the induction hypothesis is the function's own contract. A
+`decreases:` line names the measure that makes it well-founded:
+
+```rust,ignore
+/// requires: true
+/// decreases: n
+/// ensures: ret == n
+pub fn count_down(n: u8) -> u8 {
+    if n == 0 { 0 } else { count_down(n - 1) + 1 }
+}
+```
+
+A self-call that names a measure is *not* inlined. It becomes three obligations at
+the call site (`exec::try_recursive_call`), and the result is the assumption of the
+postcondition:
+
+* **`RecursivePrecondition`** -- the callee's `requires` is *proved* of the call's
+  arguments. This is what restricts the assumption to calls the function itself
+  admits. Assuming a postcondition without its precondition would be assuming the
+  conclusion.
+* **`RecursiveDecreases`** -- the measure is proved *non-negative at entry* and
+  *strictly smaller at the call*. Both halves are load-bearing: non-negativity is
+  what makes the order well-founded (a signed measure that runs negative would
+  "decrease" forever), and strictness is the progress. The comparison is `slt`/`ult`
+  according to the measure's own sign, so an `i8` measure is not read as unsigned.
+* **assume `ensures`** -- the postcondition is assumed of a fresh `ret`, which is
+  written to the call's destination. The postcondition is *never proved* here;
+  proving it is the `return` obligations' job, and that is what keeps the base case
+  a real obligation rather than a free pass.
+
+**Why it is sound.** A strictly decreasing sequence in a well-founded order is
+finite, so the recursion has a base case. Nothing is assumed at the base case: the
+body's `return` obligations still have to establish the postcondition on their own.
+The assumption only ever replaces a *smaller* call, so the induction is on the
+measure and cannot be circular. The four ways this is pinned, each with a corpus
+entry that fails on the un-fixed code:
+
+* **Positive** -- `a_recursive_identity` (`decreases: n`, `ensures: ret == n`)
+  verifies; before the feature it was `Incomplete` at the depth bound. Also probed
+  live: a `sum_down` driver and a signed `down` (`requires: n >= 0`) both verify, and
+  a two-argument `keep_a(a, b)` counting down on `b` verifies.
+* **A wrong base case is refuted** --
+  `a_recursive_lie_cannot_prove_this` returns `1` at `n == 0` against
+  `ensures: ret == n`. If the postcondition were assumed at the base case too, this
+  would verify; it fails on the postcondition with a witness (`n == 0`).
+* **A non-shrinking measure is refused** --
+  `a_recursive_call_that_does_not_decrease_cannot_prove_this` calls itself on the
+  same `n`. Probed live: it fails with `kind: "recursive call decreases the measure"`,
+  `detail: "v1:u8 = 128"` -- the call site's measure is not below the entry's.
+* **A signed measure that can start negative is refused** -- probed live with an
+  `i8` measure and no lower bound (`below_zero`), which fails on the same obligation
+  (`detail: "v1:u8 = 128"`). Non-negativity at entry is exactly what supplies the
+  basis, so this is the check that keeps the order well-founded rather than a detail.
+* **A call that leaves its own precondition is refused** --
+  `a_recursive_call_out_of_range_cannot_prove_this` has `requires: n <= 3` and calls
+  itself on `n + 1`.
+
+**The boundary: no measure, no induction.** A self-call with no `decreases:` line
+has no induction principle, so the assumption would be circular. The handler returns
+`None`, the call falls back to the inliner, and the result is `Incomplete` at the
+depth bound -- an honest "I could not decide", never a guess. Pinned by
+`a_recursive_call_without_a_decreasing_measure_is_not_assumed` (corpus:
+`a_recursive_call_that_does_not_decrease_cannot_prove_this` and the no-measure case
+probed live). This is the same discipline as `Verdict::Unknown` in the engine.
+
+**Only a self-call, and only the function under verification.** The handler fires
+when `st.frame.func == root` *and* the callee's name resolves to `root` *and* the
+frame has no caller. An inlined callee's frame has a different `func`, so its own
+recursion is not this function's induction; and a frame with a caller is an inlined
+callee, so reaching the root's name from there is not the root calling itself. The
+name is resolved with the same rule the inliner uses -- exact match, else a unique
+tail match, because rustc may print the call with a path prefix -- and an ambiguous
+tail is not this function calling itself. A `mutual_lie` pair (two functions with
+false contracts calling each other) is in the corpus and still does not verify.
+
+**Several `decreases:` clauses are refused, not guessed.** Two measures would need a
+lexicographic order and there is no way to say which the recursion counts down, so
+more than one is `Skipped` with that reason rather than picking the first. A measure
+that does not parse, or a call-site measure whose type differs from the entry
+measure, is an unmodelled path -- a refusal, not a silently dropped check.
+
+**The measure is evaluated once, at entry, in the entry state.** `verify_fn` computes
+it there and carries `(Var, signed)` in `RecCtx`; the call site re-evaluates the same
+text against the *call's* arguments. Carrying the text rather than a pre-built
+predicate is deliberate: only the executor knows what the arguments hold at the
+call site, and the measure must be evaluated there rather than at entry.
+
+**Tests run without a toolchain too.** The contract reader's half is pinned in
+`mir::spec::tests`: `a_decreases_clause_is_read_and_counts_as_a_claim` (a bare
+`decreases:` is a claim, and its text is kept), `a_measure_takes_its_sign_from_its_arguments`
+(an `i8` argument gives a signed measure through `+`), and `an_unreadable_measure_is_an_error`
+(a dangling `+`, an unknown name, and an empty measure are errors rather than an
+absent measure). The end-to-end half is `tests/mir.rs`'s four recursion tests, which
+need a `rustc`.

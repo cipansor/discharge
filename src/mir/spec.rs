@@ -115,6 +115,22 @@ pub struct FnContract {
     /// lines is refused rather than guessed at, because attaching the wrong
     /// invariant to the wrong loop would be unsound.
     pub invariants: Vec<String>,
+    /// Raw text of each `decreases:` clause, in source order.
+    ///
+    /// A recursive function needs a measure that strictly decreases at each
+    /// recursive call, or the induction has no well-founded basis and assuming the
+    /// callee's contract at the recursive call would assume the conclusion. The
+    /// clause is what licenses that assumption: the call is sound only when the
+    /// measure is smaller at the call than at entry *and* stays non-negative.
+    ///
+    /// It is not inferred. A guessed measure is a guessed proof, which is the same
+    /// reason a loop invariant is supplied rather than synthesised. A function with
+    /// no `decreases` that calls itself is refused at the call rather than assumed.
+    ///
+    /// More than one is refused, like more than one `invariant:`, because two
+    /// measures could disagree and picking either would be guessing which proof the
+    /// source asked for.
+    pub decreases: Vec<String>,
     /// Line number of the `fn` item, for diagnostics.
     pub line: usize,
 }
@@ -384,6 +400,8 @@ pub fn extract(source: &str) -> Specs {
                 pending.ensures.push(r.trim().to_string());
             } else if let Some(r) = t.strip_prefix("invariant:") {
                 pending.invariants.push(r.trim().to_string());
+            } else if let Some(r) = t.strip_prefix("decreases:") {
+                pending.decreases.push(r.trim().to_string());
             }
             continue;
         }
@@ -395,6 +413,7 @@ pub fn extract(source: &str) -> Specs {
             if !pending.requires.is_empty()
                 || !pending.ensures.is_empty()
                 || !pending.invariants.is_empty()
+                || !pending.decreases.is_empty()
             {
                 pending.line = lineno + 1;
                 specs.by_fn.insert(name, std::mem::take(&mut pending));
@@ -1872,6 +1891,32 @@ pub fn eval_invariant(
     let pred = p.parse_or()?;
     p.expect_end()?;
     Ok(pred)
+}
+
+/// Read a `decreases:` measure as a *value* rather than a predicate.
+///
+/// A measure is an expression, not a proposition: `decreases: n` or `decreases:
+/// len - i` names the quantity the induction counts down. So this parses at the
+/// expression level and returns the term with its signedness, rather than a
+/// `Pred`.
+///
+/// The signedness matters because the decrease test is `m < m_entry`, and the
+/// relation that means is the measure's own: a signed measure compares with
+/// `slt` and an unsigned one with `ult`. A measure that does not resolve is an
+/// error, for the same reason an invariant that does not resolve is: a typo must
+/// not become an unconstrained value that makes the decrease test vacuous and the
+/// induction unsound.
+pub fn eval_measure(
+    text: &str,
+    names: &BTreeMap<String, Var>,
+    signed: &BTreeSet<String>,
+    consts: &BTreeMap<String, Const>,
+) -> Result<(Var, bool), SpecError> {
+    let mut p = Parser::new(text, names, None, signed, false);
+    p.consts = consts.clone();
+    let (v, sgn) = p.parse_expr()?;
+    p.expect_end()?;
+    Ok((v, sgn.eval()))
 }
 
 /// The signedness of a subexpression: signed, unsigned, or *not yet known*.
@@ -6377,6 +6422,65 @@ mod tests {
             "the contract after a refused enum must still be read, got: {:?}",
             specs.by_fn.keys().collect::<Vec<_>>()
         );
+    }
+
+    /// A `decreases:` line is read as a contract clause, and it is enough on its
+    /// own to make a function "carry a claim".
+    ///
+    /// Both halves matter. If the extractor dropped `decreases:`, a recursive
+    /// function would silently lose its induction principle and fall back to
+    /// inlining, which reads as "incomplete" rather than as a parse bug. And if a
+    /// bare `decreases:` did not count as a claim, the function would not be in
+    /// `by_fn` at all, so it would neither be verified nor reported skipped.
+    #[test]
+    fn a_decreases_clause_is_read_and_counts_as_a_claim() {
+        let src = "/// decreases: n\n\
+                   pub fn f(n: u8) -> u8 { n }\n";
+        let specs = extract(src);
+        let c = specs.by_fn.get("f").expect("a `decreases:` alone is a claim");
+        assert_eq!(c.decreases, vec!["n".to_string()], "the measure text must be kept");
+        assert!(c.requires.is_empty() && c.ensures.is_empty());
+    }
+
+    /// The measure is evaluated against the arguments, and its signedness travels
+    /// with the value. A signed argument must give a *signed* measure, because the
+    /// decrease test is `slt` rather than `ult` for a signed one -- reading `i8`
+    /// as unsigned would prove `n - 1 < n` for a measure that actually runs
+    /// negative, which is exactly the well-foundedness the check exists to keep.
+    #[test]
+    fn a_measure_takes_its_sign_from_its_arguments() {
+        let mut args = BTreeMap::new();
+        args.insert("n".to_string(), smt::var_named(1, 8));
+        let consts = BTreeMap::new();
+
+        let unsigned = BTreeSet::new();
+        let (_, u_signed) = eval_measure("n", &args, &unsigned, &consts).expect("`n` parses");
+        assert!(!u_signed, "an unsigned argument gives an unsigned measure");
+
+        let signed: BTreeSet<String> = ["n".to_string()].into_iter().collect();
+        let (_, s_signed) = eval_measure("n", &args, &signed, &consts).expect("`n` parses");
+        assert!(s_signed, "a signed argument gives a signed measure");
+
+        // A compound measure keeps the argument's sign through the arithmetic.
+        let (_, sum_signed) =
+            eval_measure("n + 1", &args, &signed, &consts).expect("`n + 1` parses");
+        assert!(sum_signed, "the sign must survive the addition");
+    }
+
+    /// A measure that does not parse is an error, not a silently absent measure.
+    ///
+    /// This is the same rule the other clauses follow: an unreadable clause must
+    /// never become `true` (or here, `None`), because then a function would be
+    /// verified against a contract the reader never understood.
+    #[test]
+    fn an_unreadable_measure_is_an_error() {
+        let mut args = BTreeMap::new();
+        args.insert("n".to_string(), smt::var_named(1, 8));
+        let consts = BTreeMap::new();
+        let signed = BTreeSet::new();
+        assert!(eval_measure("n +", &args, &signed, &consts).is_err(), "a dangling `+`");
+        assert!(eval_measure("nope", &args, &signed, &consts).is_err(), "an unknown name");
+        assert!(eval_measure("", &args, &signed, &consts).is_err(), "an empty measure");
     }
 
     /// A one-line *struct* body must not swallow the functions after it either.

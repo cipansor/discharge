@@ -5085,6 +5085,63 @@ pub fn a_mutual_lie_b_cannot_prove_this(n: u8) -> u8 {
     if n == 0 { 0 } else { a_mutual_lie_a_cannot_prove_this(n - 1) + 1 }
 }
 
+/// A recursive function proved by induction on a `decreases:` measure.
+///
+/// The self-call is *not* inlined. It is answered by this very contract: the
+/// precondition is proved of `n - 1`, the measure `n` is proved to shrink, and
+/// the postcondition is then assumed for the result. The base case (`n == 0`)
+/// is proved by the body itself, which is what stops the assumption from being
+/// circular. Before `decreases:` existed this function hit the inline-depth
+/// bound and was reported incomplete.
+/// requires: true
+/// decreases: n
+/// ensures: ret == n
+pub fn a_recursive_identity(n: u8) -> u8 {
+    if n == 0 { 0 } else { a_recursive_identity(n - 1) + 1 }
+}
+
+/// A recursive function whose *base case* does not establish the postcondition,
+/// so the induction must not save it.
+///
+/// `a_recursive_identity`'s twin: the recursive case is right, but the base case
+/// returns `1` where the contract says `ret == n`, i.e. `ret == 0`. Nothing is
+/// assumed at the base case -- only the body is checked there -- so this is the
+/// one place a circular induction would go wrong. It must FAIL on the
+/// postcondition, with a witness (`n == 0`).
+/// requires: true
+/// decreases: n
+/// ensures: ret == n
+pub fn a_recursive_lie_cannot_prove_this(n: u8) -> u8 {
+    if n == 0 { 1 } else { a_recursive_lie_cannot_prove_this(n - 1) + 1 }
+}
+
+/// A recursive function whose measure does *not* decrease: the call is on the
+/// same `n`, so the induction has no well-founded basis.
+///
+/// The precondition and the postcondition are both true of the body, so nothing
+/// but the measure check stops this from being assumed. It must not verify: an
+/// assumption without a decreasing measure is circular.
+/// requires: true
+/// decreases: n
+/// ensures: ret == 0
+pub fn a_recursive_call_that_does_not_decrease_cannot_prove_this(n: u8) -> u8 {
+    if n == 0 { 0 } else { a_recursive_call_that_does_not_decrease_cannot_prove_this(n) }
+}
+
+/// A recursive function whose recursive call violates its own precondition.
+///
+/// The precondition `n <= 3` is what bounds the recursion, and the call is on
+/// `n + 1`, which leaves that range. Proving the precondition of the call is
+/// what makes the induction hypothesis applicable only where it holds; without
+/// that check the postcondition would be assumed for an input the contract never
+/// promised anything about.
+/// requires: n <= 3
+/// decreases: n
+/// ensures: ret == 0
+pub fn a_recursive_call_out_of_range_cannot_prove_this(n: u8) -> u8 {
+    if n == 0 { 0 } else { a_recursive_call_out_of_range_cannot_prove_this(n + 1) }
+}
+
 /// An invariant that is false where the loop is entered. Checking initiation is
 /// what stops an arbitrary induction hypothesis being taken on faith.
 /// requires: n <= 3

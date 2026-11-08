@@ -1224,8 +1224,11 @@ verifies anyway, because the caller does not read the body. Both are pinned by t
 The discipline is therefore: verify every body against its contract with
 `verify_proc`, and trust nothing else.
 
-Recursion is not supported — a call graph with a cycle would need an induction
-principle, and that is a different feature.
+Recursion is supported for a *self-call* with a `decreases:` measure: the call is
+answered by the function's own contract, the measure is proved to shrink, and the
+postcondition is assumed for the result — well-founded induction, described in
+the MIR frontend section below. A mutually recursive cycle has no such measure to
+name here, so it is still refused rather than guessed.
 
 ## Verifying real Rust: the MIR frontend
 
@@ -1322,6 +1325,39 @@ the loop can write are replaced by fresh values before the invariant is assumed,
 so the state after the loop is *any* state satisfying the invariant and the exit
 condition, not the state of the first pass. Omitting that step would prove false
 postconditions; `AGENTS.md` records the measured case.
+
+### Recursion: a `decreases:` measure
+
+A recursive function is proved by *induction*, not by unrolling. Adding a
+`decreases:` line names a measure — an expression in the arguments — that must be
+non-negative at entry and strictly smaller at every self-call. The self-call is
+then answered by the function's own contract instead of being inlined:
+
+* the call's arguments must satisfy the `requires:`;
+* the measure must strictly decrease (and stay non-negative, for a signed
+  measure);
+* the `ensures:` is *assumed* for the call's result, which is the induction
+  hypothesis.
+
+```rust,ignore
+/// requires: true
+/// decreases: n
+/// ensures: ret == n
+pub fn count_down(n: u8) -> u8 {
+    if n == 0 { 0 } else { count_down(n - 1) + 1 }
+}
+```
+
+The measure is what makes the assumption an induction rather than a circular
+argument: a strictly decreasing sequence in a well-founded order is finite, so
+there is a base case, and nothing is assumed there — the body has to establish
+the postcondition on its own. The base case is therefore still a proof
+obligation, and a body that gets the base case wrong is refuted with a witness
+(`a_recursive_lie_cannot_prove_this` in the corpus). A measure that does not
+shrink, or a call that leaves its own precondition, is likewise a definite
+failure rather than a silent pass. Without a `decreases:` line a self-call has no
+induction principle, so it is inlined once and the result is reported
+`Incomplete` at the depth bound — an honest "I could not decide", never a guess.
 
 A contract may name a field of a struct argument, and a component of a tuple
 return, by the same syntax the Rust body uses:
@@ -1783,8 +1819,12 @@ says "I could not decide" is worth more than one that guesses.
 
 ### The known gaps, stated
 
-1. **Calls are inlined one level, non-recursively.** A call to a function in the
-   same file is symbolically executed; a call to anything else is `Unknown`.
+1. **Calls are inlined one level.** A call to a function in the same file is
+   symbolically executed; a call to anything else is `Unknown`. A *self-call* with
+   a `decreases:` measure is the exception: it is answered by the contract by
+   well-founded induction rather than inlined, so a recursive function with a
+   measure is decidable and one without it is reported incomplete at the depth
+   bound.
 2. **The dump is textual.** The frontend parses `--emit=mir` output rather than
    linking `rustc-dev`. That keeps the dependency count at zero and makes the
    input inspectable, but it means a rustc release that changes the pretty-printer

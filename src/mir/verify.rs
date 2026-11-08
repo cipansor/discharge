@@ -405,6 +405,33 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     } else {
         spec::RET_IS_AGGREGATE
     };
+    // The recursion contract: when the function declares a `decreases:` measure,
+    // a self-call is answered by the contract instead of being inlined. The
+    // measure is required -- without it there is no induction principle and the
+    // assumption would be circular -- so its absence leaves `rec` as `None` and
+    // the call falls back to inlining. See `exec::Recursion`. Built here, before
+    // `signed` is moved into the `post` closure below.
+    let rec = match contract {
+        Some(c) if !c.decreases.is_empty() => {
+            if c.decreases.len() > 1 {
+                return FnOutcome::Skipped {
+                    reason: "several `decreases:` clauses, and there is no way to say which \
+                             measure the recursion counts down"
+                        .to_string(),
+                };
+            }
+            Some(exec::Recursion {
+                requires: c.requires.clone(),
+                ensures: c.ensures.clone(),
+                decreases: c.decreases[0].clone(),
+                signed: signed.clone(),
+                consts: prog.consts.clone(),
+                ret_signed,
+            })
+        }
+        _ => None,
+    };
+
     let post = if ensures.is_empty() {
         None
     } else {
@@ -477,6 +504,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
             payload_seeds: fields.payload_seeds.clone(),
             pins,
         },
+        rec,
     );
 
     // A definite failure outranks incompleteness: a counterexample is a result.
