@@ -188,6 +188,11 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     // same bindings are handed to the executor as seeds, so `c.lo` in a contract
     // and `((*_1).0)` in the body name one variable.
     let mut fields = spec::field_env(f, &specs.structs, &specs.enums);
+    // Named `const` items the contract may name, from the program's own table --
+    // the same one the executor folds a body's `const LIMIT` from, so a contract's
+    // `LIMIT` and the body's `LIMIT` are one value. The executor's `Env` carries
+    // this table for the invariant path already; this is the contract path's copy.
+    fields.consts = prog.consts.clone();
     // Slice element references a contract names, bound before the rewrite runs so
     // each `xs[k]` has a binding to rewrite to. Done here, once, rather than on
     // demand, because the postcondition is evaluated inside a closure that cannot

@@ -2074,7 +2074,8 @@ fn signed_names(f: &MirFn) -> std::collections::BTreeSet<String> {
 /// `true` would discharge both induction obligations and prove nothing.
 fn eval_invariant_here(f: &MirFn, env: &Env, text: &str) -> Result<Pred, String> {
     let names = invariant_names(f, env);
-    crate::mir::spec::eval_invariant(text, &names, &signed_names(f)).map_err(|e| e.to_string())
+    crate::mir::spec::eval_invariant(text, &names, &signed_names(f), &env.consts)
+        .map_err(|e| e.to_string())
 }
 
 /// The `(variable, literal)` bindings for the pins, masked to each variable's width.

@@ -130,6 +130,29 @@ Three engine consequences worth remembering:
     `smt::sign_extend` exists for exactly this, because `truncate` zero-fills and
     a zero-extended `-1` has the wrong magnitude.
 
+- **A contract resolves a bare name against the arguments, then the `const`
+  table.** `verify_function` copies `MirProgram::consts` into `FieldEnv::consts`,
+  and `Parser::parse_primary` looks a name up there after the argument table and
+  after the associated-constant forms (`i8::MIN`). The table is the *same* one the
+  executor folds a body's `const LIMIT` from, so a contract's `LIMIT` and the
+  body's `LIMIT` are one value -- taken once from rustc's const-evaluated dump,
+  they cannot disagree. Four things to keep right if you touch this:
+  - The value is built at the *item's* own width and sign (`const 10_u8`,
+    `const -1_i8` prints as `0xff`), not at the operand's, because a constant has
+    a type of its own -- unlike a bare literal. It goes through `unshared_const`
+    so it does not hash-cons with a literal of the same bit pattern, whose
+    recorded envelope would otherwise be read back as the constant's.
+  - Arguments are checked *first*. Rust rejects a parameter that shadows a
+    constant (`E0005`), but reading the constant there would bind the wrong value
+    -- a false proof, not a refusal.
+  - A name whose printed body is not a literal (`const NEXT: u8 = LIMIT + 1`
+    prints as a `const NEXT: u8 = { ... }` block) is *refused*, not guessed: its
+    value lives in its own body, which the contract reader does not fold. Same for
+    a misspelled name. Both are skips, so nothing is proved either way.
+  - A module-nested item is keyed by its full path (`low::K`), which is how the
+    dump prints both the definition and the use, so it resolves only when the
+    contract spells the path -- a bare `K` does not silently pick one module.
+
 ## The unsigned multiply-overflow test is exact *division*, not a widened product
 
 `sat_mul` (`if b != 0 && a > u16::MAX / b { u16::MAX } else { a * b }`) used to be the

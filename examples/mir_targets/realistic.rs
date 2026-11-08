@@ -6518,10 +6518,10 @@ pub fn named_const_is_read_cannot_prove_this(x: u8) -> u8 {
 }
 
 /// A named constant used as a comparison bound decides. The precondition names the
-/// value the constant holds (`10`), because the contract reader resolves names
-/// against the *arguments*, not the program's `const` items -- so `x < LIMIT` in
-/// the body is compared against a precondition spelled `x < 10`. A wrong inlined
-/// value would make the branch unreachable and the postcondition false.
+/// value the constant holds (`10`) as a plain literal, which is the spelling that
+/// worked before the contract reader could resolve `const` items; the constant
+/// itself is named in the `A contract that names a const` section below. A wrong
+/// inlined value would make the branch unreachable and the postcondition false.
 /// requires: x < 10
 /// ensures: ret == 1
 pub fn named_const_bounds_a_comparison(x: u8) -> u8 {
@@ -6685,4 +6685,107 @@ pub fn nested_module_const_is_read_cannot_prove_this() -> u8 {
 pub fn a_function_local_const_is_not_inlined() -> u8 {
     const L: u8 = 3;
     L
+}
+
+// ---------------------------------------------------------------------------
+// A contract that names a `const`
+//
+// The reader resolves a bare name against the arguments, then against the
+// program's own `const` table -- the *same* table the executor folds a body's
+// `const LIMIT` from. One table means the contract and the body cannot disagree:
+// `requires: x <= LIMIT` and the body's `if x > LIMIT` read one value, because
+// there is one value, taken once from rustc's const-evaluated dump. The value is
+// built at the item's own width and sign (the dump prints `const 10_u8`), so a
+// `const NEG: i8 = -1` compares as `-1`, not `255`.
+
+/// A precondition that names a constant, and a body that names the same one. The
+/// postcondition is only reachable when the reader resolves `LIMIT` to `10` on
+/// both sides; a bare name that resolved to nothing would skip the function
+/// rather than prove it.
+/// requires: x <= LIMIT
+/// ensures: ret <= LIMIT
+pub fn a_contract_names_a_const(x: u8) -> u8 {
+    if x > LIMIT {
+        LIMIT
+    } else {
+        x
+    }
+}
+
+/// The false direction of [`a_contract_names_a_const`]: the body does *not* clamp
+/// to `LIMIT`, so the postcondition that names the constant is false. Reading the
+/// constant as an unbounded argument would leave this unproved either way, so the
+/// entry pins that the name really is a value.
+/// requires: true
+/// ensures: ret <= LIMIT
+pub fn a_contract_names_a_const_cannot_prove_this(x: u8) -> u8 {
+    x
+}
+
+/// A negative constant named in a contract keeps its sign, so the bound is the
+/// signed `-1`. Read as the unsigned `255`, the precondition would be vacuous and
+/// the postcondition false.
+/// requires: y >= NEG
+/// ensures: ret >= NEG
+pub fn a_contract_names_a_negative_const(y: i8) -> i8 {
+    if y < NEG {
+        NEG
+    } else {
+        y
+    }
+}
+
+/// A boolean constant named in a comparison in a contract.
+/// requires: b == ENABLED
+/// ensures: ret == ENABLED
+pub fn a_contract_names_a_bool_const(b: bool) -> bool {
+    let _ = b;
+    ENABLED
+}
+
+/// A module-qualified constant named in a contract, resolved by its full path so
+/// it does not collide with a top-level constant of the same last segment. The
+/// body reads `low::K`, and the contract names the same path.
+/// requires: x <= low::K
+/// ensures: ret <= low::K
+pub fn a_contract_names_a_qualified_const(x: u8) -> u8 {
+    if x > low::K {
+        low::K
+    } else {
+        x
+    }
+}
+
+/// The false direction of [`a_contract_names_a_qualified_const`]: naming the
+/// *other* module's `K` (7) is a value the body never exceeds, but the body clamps
+/// to `low::K` (5), so `ret <= high::K` is true -- this entry instead pins the two
+/// values apart by demanding the body reach `high::K`, which it cannot.
+/// requires: x <= low::K
+/// ensures: ret == high::K
+pub fn a_contract_names_a_qualified_const_cannot_prove_this(x: u8) -> u8 {
+    if x > low::K {
+        low::K
+    } else {
+        x
+    }
+}
+
+/// A constant whose definition is an *expression* is refused when a contract
+/// names it, rather than guessed at: its value lives in its own body, which the
+/// contract reader does not fold. The refusal is a skip, so nothing is proved --
+/// which is the honest answer, not a wrong proof.
+/// requires: x <= NEXT
+/// ensures: ret <= NEXT
+pub fn a_contract_names_an_expression_const(x: u8) -> u8 {
+    let _ = x;
+    NEXT
+}
+
+/// A misspelled constant is refused, not read as an argument that does not exist
+/// nor as zero. The name here differs from `LIMIT` by one letter.
+/// requires: x <= LIMITT
+/// ensures: ret <= LIMIT
+pub fn a_misspelled_const_is_refused(x: u8) -> u8 {
+    let _ = x;
+    LIMIT
 }

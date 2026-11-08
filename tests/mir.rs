@@ -2665,6 +2665,59 @@ fn a_named_const_item_is_inlined_at_its_use_site() {
     }
 }
 
+/// A contract may name a top-level `const` the way the body does.
+///
+/// The reader resolves a bare name against the arguments first, then against the
+/// program's own `const` table -- the *same* table the executor folds a body's
+/// `const LIMIT` from, so the two cannot disagree. The true directions must decide,
+/// and each false twin must be refuted; a name that resolved to nothing (or to a
+/// wrong value) would leave the twin unproved or, worse, prove it.
+///
+/// The two cases that are *refusals* rather than proofs are checked separately: an
+/// expression-bodied constant has no literal to fold, and a misspelled name is not
+/// an argument. Both must be `Skipped`, never `verified` and never a wrong value.
+#[test]
+fn a_contract_may_name_a_const_item() {
+    let Some(report) = verify_realistic(&[
+        "a_contract_names_a_const",
+        "a_contract_names_a_const_cannot_prove_this",
+        "a_contract_names_a_negative_const",
+        "a_contract_names_a_bool_const",
+        "a_contract_names_a_qualified_const",
+        "a_contract_names_a_qualified_const_cannot_prove_this",
+        "a_contract_names_an_expression_const",
+        "a_misspelled_const_is_refused",
+    ]) else {
+        return;
+    };
+    for name in [
+        "a_contract_names_a_const",
+        "a_contract_names_a_negative_const",
+        "a_contract_names_a_bool_const",
+        "a_contract_names_a_qualified_const",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a contract must resolve a named const; got: {o}");
+    }
+    for name in [
+        "a_contract_names_a_const_cannot_prove_this",
+        "a_contract_names_a_qualified_const_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a wrong const value must not prove this; got: {o}"
+        );
+    }
+    for name in ["a_contract_names_an_expression_const", "a_misspelled_const_is_refused"] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Skipped { .. }),
+            "an unresolvable const name must be refused, not guessed; got: {o}"
+        );
+    }
+}
+
 /// The whole-corpus direction invariant: a function whose *name* says it must not be
 /// provable may never come back `verified`.
 ///

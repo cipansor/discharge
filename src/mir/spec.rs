@@ -56,7 +56,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::mir::parse::{split_top_level, Ty, USIZE_WIDTH};
+use crate::mir::parse::{split_top_level, Const, Ty, USIZE_WIDTH};
 use crate::smt::{self, Pred, Var};
 
 /// How long an array may be before a symbolic subscript is refused.
@@ -621,6 +621,20 @@ pub struct FieldEnv {
     /// A name not in here is refused, which keeps a misspelled variant from being
     /// read as an unrelated integer.
     pub variant_consts: BTreeMap<String, (u64, u8)>,
+    /// Named `const` items, name → the value rustc printed for them.
+    ///
+    /// A contract may name a constant the way the body does (`requires: x <=
+    /// LIMIT`), and the name has to resolve to the same value the body reads at its
+    /// use site. This is the *same table* the executor folds a body's `const LIMIT`
+    /// from (`MirProgram::consts`), so the contract and the body cannot disagree:
+    /// there is one value, read once by rustc.
+    ///
+    /// A name that is *not* here is refused rather than guessed at, which keeps a
+    /// misspelled constant from being read as an argument that does not exist, or
+    /// as zero. Only a constant whose printed body is a literal is in the table, so
+    /// a constant built by an expression is refused too -- its value is in its own
+    /// body, not in a declaration the reader can fold.
+    pub consts: BTreeMap<String, Const>,
     /// `arg.Variant` → the mangled payload name, so a contract can name a payload
     /// the way the body's downcast reads it.
     pub payload_paths: BTreeMap<String, String>,
@@ -1792,6 +1806,7 @@ pub fn eval_requires(
     let mut p = Parser::new(&text, &names, None, &sgn, false);
     p.variant_consts = fields.variant_consts.clone();
     p.enum_args = fields.enum_args.clone();
+    p.consts = fields.consts.clone();
     let pred = p.parse_or().map_err(|e| e.about(orig))?;
     p.expect_end().map_err(|e| e.about(orig))?;
     Ok(pred)
@@ -1830,6 +1845,7 @@ pub fn eval_ensures(
     p.ret_absent = ret_absent;
     p.variant_consts = fields.variant_consts.clone();
     p.enum_args = fields.enum_args.clone();
+    p.consts = fields.consts.clone();
     let pred = p.parse_or().map_err(|e| e.about(orig))?;
     p.expect_end().map_err(|e| e.about(orig))?;
     Ok(pred)
@@ -1849,8 +1865,10 @@ pub fn eval_invariant(
     text: &str,
     names: &BTreeMap<String, Var>,
     signed: &BTreeSet<String>,
+    consts: &BTreeMap<String, Const>,
 ) -> Result<Pred, SpecError> {
     let mut p = Parser::new(text, names, None, signed, false);
+    p.consts = consts.clone();
     let pred = p.parse_or()?;
     p.expect_end()?;
     Ok(pred)
@@ -2021,6 +2039,12 @@ struct Parser<'a> {
     /// `variant_consts` can be reported as a bad variant rather than an unknown
     /// constant.
     enum_args: BTreeSet<String>,
+    /// Named `const` items, name → the literal the item was defined with, so a
+    /// contract can name a constant the way the body does. Empty outside a
+    /// contract evaluation that was given the program's table, in which case a
+    /// `const` name is refused rather than guessed at -- the same answer the
+    /// reader gave before this table existed. See [`FieldEnv::consts`].
+    consts: BTreeMap<String, Const>,
     /// The `(min, max)` envelope, as `i128`, of the *literals and folded
     /// intermediate values* in the term a `Var` holds. Rust range-checks every
     /// literal and every constant `+ - *` intermediate against the type the
@@ -2241,6 +2265,7 @@ impl<'a> Parser<'a> {
             ret_signed,
             variant_consts: BTreeMap::new(),
             enum_args: BTreeSet::new(),
+            consts: BTreeMap::new(),
             range: BTreeMap::new(),
             bare_literals: BTreeSet::new(),
             amount_floor: 0,
@@ -2404,6 +2429,43 @@ impl<'a> Parser<'a> {
     /// passes it, exactly as the plain bound did before the envelope map existed.
     fn unshared_const(&self, k: u64, w: u8) -> Var {
         smt::truncate(smt::word(k, 64), w)
+    }
+
+    /// The value a named `const` item denotes, at the item's own width and sign.
+    ///
+    /// The dump prints the item's body const-evaluated and typed (`const LIMIT:
+    /// u8 = const 10_u8;`), so the width and the sign come from the type suffix
+    /// rather than from the operand the constant meets -- a constant has a type of
+    /// its own, unlike a bare literal. The term is built through
+    /// [`Self::unshared_const`] so it does not hash-cons with a literal of the same
+    /// bit pattern, whose recorded envelope would otherwise be read back as the
+    /// constant's and could refuse a valid contract.
+    ///
+    /// A name that is not a literal is refused rather than guessed at: an
+    /// expression-bodied item has its value in its own body, not in a declaration
+    /// the reader can fold, so nothing here can decide it.
+    fn const_item(&self, name: &str, c: &Const) -> Result<(Var, Sign), SpecError> {
+        match c {
+            Const::UInt(n, ty) => match ty.as_ref().and_then(|t| t.width()) {
+                Some(1) => Ok((smt::word(*n as u64 & 1, 1), Sign::Literal)),
+                Some(w) if w <= 64 => {
+                    let signed = ty.as_ref().map(Ty::is_signed).unwrap_or(false);
+                    // A signed item's printed value is two's complement at its width
+                    // (`const NEG: i8 = -1` prints `0xff`), and the sign travels with
+                    // the term so a later comparison reads it as `-1`; an unsigned
+                    // item's is its plain value.
+                    Ok((self.unshared_const(*n as u64, w), Sign::from_bool(signed)))
+                }
+                _ => Err(self.err(format!(
+                    "the constant `{name}` has no bit-vector width, so it is not modelled"
+                ))),
+            },
+            Const::Bool(b) => Ok((smt::word(u64::from(*b), 1), Sign::Literal)),
+            Const::Unit | Const::Other(_) => Err(self.err(format!(
+                "the constant `{name}` is not a literal, so its value is not known to the \
+                 contract reader"
+            ))),
+        }
     }
 
     /// Record `v`'s envelope as the union of its operands' envelopes, so a
@@ -3994,6 +4056,18 @@ impl<'a> Parser<'a> {
                             "`{ty}` has no variant `{a}` (or its layout was not readable)"
                         )));
                     }
+                    // A module-qualified `const` item: `requires: x <= low::K`. The
+                    // dump prints both the definition and the use with the same
+                    // path (`const low::K`), so the table is keyed by it and this is
+                    // an exact lookup -- the same key the executor folds the body's
+                    // `low::K` with. A module-nested item is resolved only when the
+                    // contract spells the path, which is what keeps it from
+                    // colliding with a top-level constant of the same last segment.
+                    if let Some(c) = self.consts.get(&format!("{ty}::{a}")) {
+                        let key = format!("{ty}::{a}");
+                        let c = c.clone();
+                        return self.const_item(&key, &c);
+                    }
                     if let Some((k, w)) = type_bound(&ty, &a) {
                         // The bound is built at the width of the type it *names*,
                         // not at the widest name in scope. `i8::MIN` is the bit
@@ -4015,13 +4089,33 @@ impl<'a> Parser<'a> {
                     }
                     return Err(self.err(format!("unknown constant `{ty}::{a}`")));
                 }
-                let v = self
-                    .args
-                    .get(&name)
-                    .copied()
-                    .ok_or_else(|| self.err(format!("unknown name `{name}` (not an argument)")))?;
-                let s = self.is_signed_name(&name);
-                Ok((v, Sign::from_bool(s)))
+                // An argument wins over a constant of the same name, so a contract
+                // that names an argument keeps resolving to it and the constant
+                // table only ever adds names the reader would otherwise refuse.
+                // Rust lets a parameter shadow a `const` of the same name, and
+                // reading the constant there would bind the wrong value -- a false
+                // proof, not a refusal.
+                if let Some(v) = self.args.get(&name).copied() {
+                    let s = self.is_signed_name(&name);
+                    return Ok((v, Sign::from_bool(s)));
+                }
+                // A named `const` item: `requires: x <= LIMIT`, where the body
+                // reads `_0 = const LIMIT`. Resolved from the program's own table,
+                // the same one the executor folds the use site from, so the
+                // contract and the body name one value and cannot disagree. Built
+                // at the *item's* own width and sign -- the dump prints the body
+                // const-evaluated and typed (`const 10_u8`) -- and as a term of its
+                // own, so an envelope recorded for a literal of the same bit pattern
+                // is not read back as this constant's.
+                //
+                // Checked *after* the associated-constant forms (`i8::MIN`), which
+                // are recognized above: a name like `i8::MIN` is not in the table,
+                // and a table entry is always a plain identifier.
+                if let Some(c) = self.consts.get(&name) {
+                    let c = c.clone();
+                    return self.const_item(&name, &c);
+                }
+                Err(self.err(format!("unknown name `{name}` (not an argument)")))
             }
             Some(Tok::Op(o)) if o == "(" => {
                 self.pos += 1;
@@ -6393,5 +6487,63 @@ mod tests {
         let d = def(src);
         assert_eq!(d.index_of("A"), Some(0));
         assert_eq!(d.index_of("B"), Some(1));
+    }
+
+    fn field_env_with(consts: &[(&str, Const)]) -> FieldEnv {
+        let mut e = FieldEnv::default();
+        for (k, v) in consts {
+            e.consts.insert((*k).to_string(), v.clone());
+        }
+        e
+    }
+
+    /// A contract resolves a named `const` to its literal value, at the item's own
+    /// width and sign.
+    #[test]
+    fn a_contract_reads_a_const_name_as_its_value() {
+        let args = BTreeMap::new();
+        let env = field_env_with(&[
+            ("LIMIT", Const::UInt(10, Some(Ty::U8))),
+            ("NEG", Const::UInt(0xff, Some(Ty::I8))),
+            ("B", Const::Bool(true)),
+        ]);
+        // `LIMIT` is `10`; a precondition demanding `<= 9` is refutable, and one
+        // demanding `<= 10` holds. This pins the value, not just that it parsed.
+        let p = eval_requires("LIMIT <= 10", &args, &BTreeSet::new(), &env).unwrap();
+        assert_eq!(smt::prove(p), smt::Verdict::Valid);
+        let p = eval_requires("LIMIT <= 9", &args, &BTreeSet::new(), &env).unwrap();
+        assert_ne!(smt::prove(p), smt::Verdict::Valid, "LIMIT is 10, so `<= 9` must not hold");
+        // A negative constant keeps its sign: `NEG <= -1` holds, `NEG >= 0` does not.
+        let p = eval_requires("NEG <= -1", &args, &BTreeSet::new(), &env).unwrap();
+        assert_eq!(smt::prove(p), smt::Verdict::Valid);
+        let p = eval_requires("NEG >= 0", &args, &BTreeSet::new(), &env).unwrap();
+        assert_ne!(smt::prove(p), smt::Verdict::Valid, "NEG is -1, so `>= 0` must not hold");
+        // A boolean constant compared against a boolean literal.
+        let p = eval_requires("B == true", &args, &BTreeSet::new(), &env).unwrap();
+        assert_eq!(smt::prove(p), smt::Verdict::Valid);
+    }
+
+    /// An argument shadows a constant of the same name, so a contract naming an
+    /// argument keeps resolving to it. Reading the constant there would bind the
+    /// wrong value -- a false proof, not a refusal.
+    #[test]
+    fn an_argument_shadows_a_const_of_the_same_name() {
+        let mut args = BTreeMap::new();
+        args.insert("LIMIT".to_string(), smt::var_named(1, 8));
+        let env = field_env_with(&[("LIMIT", Const::UInt(10, Some(Ty::U8)))]);
+        // The argument is symbolic, so `LIMIT <= 10` cannot be proved even though
+        // the constant would make it true -- proof that the argument won.
+        let p = eval_requires("LIMIT <= 10", &args, &BTreeSet::new(), &env).unwrap();
+        assert_ne!(smt::prove(p), smt::Verdict::Valid);
+    }
+
+    /// A name that is not a literal constant is refused, not guessed at.
+    #[test]
+    fn a_non_literal_const_name_is_refused() {
+        let args = BTreeMap::new();
+        let env = field_env_with(&[("EXPR", Const::Other("_".into()))]);
+        assert!(eval_requires("EXPR <= 1", &args, &BTreeSet::new(), &env).is_err());
+        // A misspelled name is still refused as an unknown name.
+        assert!(eval_requires("LIMITT <= 1", &args, &BTreeSet::new(), &env).is_err());
     }
 }
