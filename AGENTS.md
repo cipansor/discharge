@@ -6470,13 +6470,27 @@ corpus-wide `no_cannot_prove_entry_is_ever_verified` invariant holds them too. V
 without the fix by reverting the two loops: the test then reports the true direction as
 `incomplete`.
 
-**Evidence.** Corpus `decided 289 of 538` -> **`298 of 556`** (eighteen new entries: the six
-array-field and six whole-replacement true directions now decide, and all twelve twins stay
-`Failed`); `cargo test --workspace --features std` **684 -> 686** passed, 0 failed; `cargo
+**Evidence.** Corpus `decided 289 of 538` -> **`305 of 572`** (the six array-field and six
+whole-replacement true directions now decide, plus six named-`const` true directions; all their
+`_cannot_prove_this` twins stay `Failed`, and two coverage-boundary entries stay `incomplete`);
+`cargo test --workspace --features std` **684 -> 688** passed, 0 failed; `cargo
 clippy --workspace --features std --all-targets -- -D warnings` clean; `scripts/gate.sh` 16/16
 green (bare-metal build, zero-dependency and `no_std` gates included), z3 `agree=845
-mismatch=0`, kani `agree=57 mismatch=0`, verus `0 differ`, rustc_public oracle `realistic.rs 622
-typed, 621 agree, 0 differ`. Zero dependencies and `no_std` untouched.
+mismatch=0`, kani `agree=57 mismatch=0`, verus `0 differ`, rustc_public oracle `realistic.rs 634
+functions typed, 638 text, 633 agree, 0 differ`. Zero dependencies and `no_std` untouched.
+
+**The rustc_public oracle counted `const` bodies as functions, and this was found by the corpus
+addition above.** Adding an expression-initialised `const` to `realistic.rs` turned gate 10 red
+with `NEXT: text (absent)` -- the oracle reported a function the text frontend had dropped. It
+had not: `all_local_items()` returns every item with a body, and a `const` or `static` item has
+one in typed MIR, but the text dump prints an item initialised from a literal as a single line
+and an item initialised from an expression with a body that is *not* introduced by an `fn`
+header, so the text side sees no function there. The oracle now keeps only `ItemKind::Fn`. This
+is the same class of bug the oracle exists to prevent, in the oracle itself: throwing the item
+kind away made a `const` body indistinguishable from a genuinely dropped function, and the
+report it produced was the one report it must never make falsely. The typed/text counts moved
+from `(spurious disagreement)` to `634 typed, 638 text, 633 agree, 0 differ` -- the four-function
+typed/text gap is the documented one (an item with no monomorphised body), not a disagreement.
 
 **A whole-aggregate replacement through a sub-place target decides.** `set_whole(&mut o.i, n)`
 with `set_whole(i: &mut InnerBox, n: InnerBox) { *i = n }` replaces the whole referent, and the
@@ -6492,3 +6506,35 @@ longer true. Pinned by
 `tests/mir.rs::a_whole_aggregate_replacement_through_a_sub_place_decides`, whose corpus entries
 `whole_replacement_through_sub_place`, `whole_replacement_leaves_the_sibling` and
 `whole_replacement_from_a_local` each carry their `_cannot_prove_this` twin.
+
+**A named `const` item is inlined at its use site.** rustc const-evaluates a `const` item and
+prints its *body* separately (`const LIMIT: u8 = const 10_u8;`) while referring to it by name at
+the use site (`_0 = const LIMIT`). The executor read only the name, so a use site was an
+unreadable path constant and any contract that touched the constant was lost -- not wrongly
+proved, but never decided, which for an embedded crate whose bounds checks read named constants
+is the common case. `MirProgram::consts` now collects each item's printed literal (only a
+literal: an item whose body is an *expression* has its own body and locals and is left for a
+future interpreter pass, and an associated constant's `{constant#0}` name is dropped), and
+`operand` folds a use site against that table. The key is the full printed path (`a::K`,
+`low::K`), not the last segment, so two modules with a `const K` cannot collide -- a table keyed
+by the last segment could read the wrong value, which would be a false proof rather than a lost
+one. The item's own type suffix supplies the width and sign, exactly as for an inline literal,
+so a negative `const` stays signed and a wider one keeps its width.
+
+Pinned by `tests/mir.rs::a_named_const_item_is_inlined_at_its_use_site`, whose corpus entries
+`named_const_is_read`, `named_const_keeps_its_width`, `named_bool_const_selects`,
+`named_const_bounds_a_comparison`, `named_const_matches_an_equality`,
+`named_negative_const_is_signed` and `nested_module_const_is_read` each carry their
+`_cannot_prove_this` twin (every twin's postcondition is false on *every* input, so a regression
+that guessed a value would fail the test). One entry pins the boundary where the value is *not*
+inlined and the contract is lost rather than proved: `named_const_of_an_expression_is_not_inlined`
+(an item whose body is an expression has its own body and locals). Another pins a second
+boundary: `a_function_local_const_is_not_inlined`. The two spellings do not meet there -- the
+*use* is printed with the enclosing function's path (`const a_local::L`) while the *definition*
+is printed bare (`const L: u8 = const 3_u8;`), rustc emitting the qualifier only where it is
+needed to disambiguate. That is also what makes the bare key safe rather than a false-proof
+risk: rustc qualifies a function-local item's definition precisely when another item shares its
+last segment (`const L: u8 = 5;` at the top level forces `const a_local::L`), so a bare `const L`
+enters the table only when nothing else could be meant by `L`. Verified to fail without the fix
+by neutralising the table lookup: the test then reports the true direction as `incomplete`. The
+parser side is pinned by `mir::parse::tests::named_const_items_are_collected_only_when_literal`.

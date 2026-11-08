@@ -2607,6 +2607,64 @@ fn a_whole_aggregate_replacement_through_a_sub_place_decides() {
     }
 }
 
+/// A named `const` item's value is inlined at the use site.
+///
+/// rustc const-evaluates a `const` item and prints its *body* separately
+/// (`const LIMIT: u8 = const 10_u8;`) while referring to it by name at the use
+/// site (`_0 = const LIMIT`). Reading only the name left the use site an
+/// unreadable path constant, so a contract that mentioned the constant was lost.
+/// The true directions must decide, and each false twin -- whose postcondition is
+/// false on *every* input -- must be refuted, which is what a regression that
+/// guessed the value would fail.
+#[test]
+fn a_named_const_item_is_inlined_at_its_use_site() {
+    let Some(report) = verify_realistic(&[
+        "named_const_is_read",
+        "named_const_is_read_cannot_prove_this",
+        "named_const_keeps_its_width",
+        "named_const_keeps_its_width_cannot_prove_this",
+        "named_bool_const_selects",
+        "named_bool_const_selects_cannot_prove_this",
+        "named_const_bounds_a_comparison",
+        "named_const_bounds_a_comparison_cannot_prove_this",
+        "named_const_matches_an_equality",
+        "named_const_matches_an_equality_cannot_prove_this",
+        "named_negative_const_is_signed",
+        "named_negative_const_is_signed_cannot_prove_this",
+        "nested_module_const_is_read",
+        "nested_module_const_is_read_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "named_const_is_read",
+        "named_const_keeps_its_width",
+        "named_bool_const_selects",
+        "named_const_bounds_a_comparison",
+        "named_const_matches_an_equality",
+        "named_negative_const_is_signed",
+        "nested_module_const_is_read",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a named const must fold at its use site; got: {o}");
+    }
+    for name in [
+        "named_const_is_read_cannot_prove_this",
+        "named_const_keeps_its_width_cannot_prove_this",
+        "named_bool_const_selects_cannot_prove_this",
+        "named_const_bounds_a_comparison_cannot_prove_this",
+        "named_const_matches_an_equality_cannot_prove_this",
+        "named_negative_const_is_signed_cannot_prove_this",
+        "nested_module_const_is_read_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a wrong inlined const value must not prove this; got: {o}"
+        );
+    }
+}
+
 /// The whole-corpus direction invariant: a function whose *name* says it must not be
 /// provable may never come back `verified`.
 ///

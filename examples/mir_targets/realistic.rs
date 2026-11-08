@@ -6472,3 +6472,217 @@ pub fn whole_replacement_from_a_local_cannot_prove_this(mut o: OuterBox) -> u8 {
 pub fn set_whole(i: &mut InnerBox, n: InnerBox) {
     *i = n;
 }
+
+// ---------------------------------------------------------------------------
+// Named `const` items
+//
+// rustc const-evaluates a `const` item and prints its body separately
+// (`const LIMIT: u8 = const 10_u8;`), referring to it by name at the use site
+// (`_0 = const LIMIT`). Without inlining the definition the use site is an
+// unreadable path constant and the contract is lost -- not wrongly proved, but
+// never decided. These pin the shapes that inlining must decide, each with its
+// false twin so a future regression that *guessed* a value would be caught.
+// ---------------------------------------------------------------------------
+
+/// A limit constant, the shape a bounds check reads.
+const LIMIT: u8 = 10;
+
+/// A wider constant, so the width comes from the item's own suffix.
+const WIDE_LIMIT: u16 = 1000;
+
+/// A constant whose definition is another constant; rustc prints the *evaluated*
+/// value, so `const NEXT: u8 = const 11_u8;`.
+const NEXT: u8 = LIMIT + 1;
+
+/// A negative constant, whose sign must survive inlining.
+const NEG: i8 = -1;
+
+/// A boolean constant.
+const ENABLED: bool = true;
+
+/// Reading a named constant decides.
+/// requires: true
+/// ensures: ret == 10
+pub fn named_const_is_read(x: u8) -> u8 {
+    let _ = x;
+    LIMIT
+}
+
+/// The false direction of [`named_const_is_read`]: a wrong inlined value would prove
+/// this.
+/// requires: true
+/// ensures: ret == 11
+pub fn named_const_is_read_cannot_prove_this(x: u8) -> u8 {
+    let _ = x;
+    LIMIT
+}
+
+/// A named constant used as a comparison bound decides. The precondition names the
+/// value the constant holds (`10`), because the contract reader resolves names
+/// against the *arguments*, not the program's `const` items -- so `x < LIMIT` in
+/// the body is compared against a precondition spelled `x < 10`. A wrong inlined
+/// value would make the branch unreachable and the postcondition false.
+/// requires: x < 10
+/// ensures: ret == 1
+pub fn named_const_bounds_a_comparison(x: u8) -> u8 {
+    if x < LIMIT {
+        1
+    } else {
+        2
+    }
+}
+
+/// The false direction of [`named_const_bounds_a_comparison`].
+/// requires: x < 10
+/// ensures: ret == 2
+pub fn named_const_bounds_a_comparison_cannot_prove_this(x: u8) -> u8 {
+    if x < LIMIT {
+        1
+    } else {
+        2
+    }
+}
+
+/// A named constant used in an equality test decides.
+/// requires: x == 10
+/// ensures: ret == 1
+pub fn named_const_matches_an_equality(x: u8) -> u8 {
+    if x == LIMIT {
+        1
+    } else {
+        2
+    }
+}
+
+/// The false direction of [`named_const_matches_an_equality`].
+/// requires: x == 10
+/// ensures: ret == 2
+pub fn named_const_matches_an_equality_cannot_prove_this(x: u8) -> u8 {
+    if x == LIMIT {
+        1
+    } else {
+        2
+    }
+}
+
+/// A constant whose definition is an *expression* rather than a literal is not
+/// inlined: rustc prints it with its own body and locals (`const NEXT: u8 = {
+/// let mut _0: u8; ... }`), so the use site stays an unreadable path constant and
+/// the contract is not decided. This is a coverage boundary, not a wrong proof --
+/// the value is simply absent, so nothing is proved either way. Inlining it would
+/// mean interpreting the item's body, which the executor already knows how to do
+/// for a function; that is future work, and this entry is the pin that says the
+/// boundary is where it is.
+/// requires: true
+/// ensures: ret == 11
+pub fn named_const_of_an_expression_is_not_inlined(x: u8) -> u8 {
+    let _ = x;
+    NEXT
+}
+
+/// A constant wider than a byte keeps its own width.
+/// requires: true
+/// ensures: ret == 1000
+pub fn named_const_keeps_its_width() -> u16 {
+    WIDE_LIMIT
+}
+
+/// The false direction of [`named_const_keeps_its_width`].
+/// requires: true
+/// ensures: ret == 999
+pub fn named_const_keeps_its_width_cannot_prove_this() -> u16 {
+    WIDE_LIMIT
+}
+
+/// A boolean constant selects a branch at the use site.
+/// requires: true
+/// ensures: ret == 7
+pub fn named_bool_const_selects() -> u8 {
+    if ENABLED {
+        7
+    } else {
+        9
+    }
+}
+
+/// The false direction of [`named_bool_const_selects`].
+/// requires: true
+/// ensures: ret == 9
+pub fn named_bool_const_selects_cannot_prove_this() -> u8 {
+    if ENABLED {
+        7
+    } else {
+        9
+    }
+}
+
+/// A negative constant's sign survives inlining, so the comparison is a signed one.
+/// requires: x >= -1
+/// ensures: ret == 1
+pub fn named_negative_const_is_signed(x: i8) -> i8 {
+    if x < NEG {
+        0
+    } else {
+        1
+    }
+}
+
+/// The false direction of [`named_negative_const_is_signed`]: reading `NEG` as a
+/// positive 1 would make this hold for `x == -1` and `x == 0`, so it is not the
+/// false twin of a wrong *value* alone -- it also pins the signed reading.
+/// requires: x >= -1
+/// ensures: ret == 0
+pub fn named_negative_const_is_signed_cannot_prove_this(x: i8) -> i8 {
+    if x < NEG {
+        0
+    } else {
+        1
+    }
+}
+
+/// Two modules with a `const` of the same last name. rustc prints the definitions
+/// as `const low::K: u8 = const 5_u8;` and the uses as `const low::K`, so keying
+/// the table by the full path is what keeps them apart -- a table keyed by the
+/// last segment would collapse them and could read the wrong value.
+pub mod low {
+    /// The low limit.
+    pub const K: u8 = 5;
+}
+
+/// A second module whose `const K` has a different value.
+pub mod high {
+    /// The high limit.
+    pub const K: u8 = 7;
+}
+
+/// A module-nested constant is inlined by its full path.
+/// requires: true
+/// ensures: ret == 5
+pub fn nested_module_const_is_read() -> u8 {
+    low::K
+}
+
+/// The false direction of [`nested_module_const_is_read`]: reading the *other*
+/// module's `K` (7) would prove this, so the entry pins the path keying.
+/// requires: true
+/// ensures: ret == 7
+pub fn nested_module_const_is_read_cannot_prove_this() -> u8 {
+    low::K
+}
+
+/// A `const` declared *inside* a function body is not inlined, because the two
+/// spellings do not meet: the *use* is printed with the enclosing function's path
+/// (`const a_function_local_const_is_not_inlined::L`) while the *definition* is
+/// printed bare (`const L: u8 = const 3_u8;`), rustc emitting the qualifier only
+/// where it is needed to disambiguate -- and here `L` is the crate's only one. It
+/// stays an unreadable path constant, a coverage boundary rather than a wrong
+/// proof, since no value is read at all. This is also why the bare key is safe:
+/// rustc qualifies a function-local item's definition precisely when another item
+/// shares its last segment, so a bare `const L` is recorded only when there is no
+/// other `L` for it to shadow.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_function_local_const_is_not_inlined() -> u8 {
+    const L: u8 = 3;
+    L
+}

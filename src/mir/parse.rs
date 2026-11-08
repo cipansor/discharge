@@ -561,6 +561,17 @@ pub struct MirProgram {
     /// the caller had no source (the MIR-only entry points), in which case only
     /// the built-in `Option`/`Result` numbering resolves.
     pub enums: BTreeMap<String, EnumLayout>,
+    /// Named `const` items, name → the constant the dump printed for them.
+    ///
+    /// rustc evaluates a `const` item at compile time and prints its *body*
+    /// separately (`const K: u8 = const 5_u8;`) while referring to it by name at
+    /// the use site (`_0 = const K;`). Inlining the definition here is what lets
+    /// the use site fold to a value instead of staying an unreadable
+    /// `Const::Other`, which is the difference between a decided contract and a
+    /// lost proof. Only constants whose printed body is a *literal* are kept: a
+    /// constant built by an expression has its own body with its own locals, and
+    /// re-deriving that value is the interpreter's job, not a table lookup.
+    pub consts: BTreeMap<String, Const>,
 }
 
 /// A variant's name and discriminant, for resolving a downcast.
@@ -1550,6 +1561,39 @@ pub fn parse_program_with(text: &str, enums: &BTreeMap<String, EnumLayout>) -> M
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
+        // A `const` item whose body the dump prints as a single literal:
+        // `const K: u8 = const 5_u8;`. It is recorded so a use site (`_0 = const
+        // K`) can fold to the value. The associated-constant form
+        // (`const ARR::{constant#0}: usize = const 3_usize;`) has a `::`-suffixed
+        // name and is skipped: nothing refers to it by that name, and the array
+        // length it carries is already in the array's type.
+        if let Some(rest) = line.trim_end().strip_prefix("const ") {
+            if !rest.starts_with('{') {
+                if let Some((name, body)) = rest.split_once(" = ") {
+                    // The name/type split is at the `: ` separator, not any colon:
+                    // a qualified name (`ARR::{constant#0}`) contains `::`. A name
+                    // is kept only when it is a `::`-separated path of identifiers
+                    // -- the exact spelling the use site prints (`a::K`,
+                    // `local_const::L`), so the lookup is by full path and a
+                    // module-nested constant cannot collide with a top-level one of
+                    // the same last segment. An associated constant's
+                    // `{constant#0}` fails the identifier test and is dropped.
+                    let name = name.split_once(": ").map_or(name, |(n, _)| n).trim();
+                    let plain = !name.is_empty()
+                        && !name.contains('{')
+                        && name
+                            .split("::")
+                            .all(|seg| !seg.is_empty()
+                                && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+                    if plain {
+                        let body = body.trim().trim_end_matches(';');
+                        if let Some(c) = body.strip_prefix("const ") {
+                            prog.consts.insert(name.to_string(), parse_const(c));
+                        }
+                    }
+                }
+            }
+        }
         // rustc prints a second, `// MIR FOR CTFE`-marked body for an item it
         // const-evaluates -- a tuple-variant constructor called in a `let`, for
         // one. It is a *copy* of an item already printed above it, and the typed
@@ -2008,6 +2052,29 @@ fn add(_1: u32, _2: u32) -> u32 {
         assert!(!wide(&Ty::Array(Box::new(Ty::U64), 8)));
         assert!(!wide(&Ty::Tuple(vec![Ty::U8, Ty::I32])));
         assert!(!wide(&Ty::Other("MyStruct".into())));
+    }
+
+    /// A named `const` item's literal body is collected, and only a literal.
+    ///
+    /// The dump prints the item's body separately from its use, so the value has
+    /// to be gathered before it can be inlined. An item whose body is an
+    /// expression, or a qualified associated constant, must *not* enter the table:
+    /// the first has no literal to read, and the second is never referred to by
+    /// the plain name.
+    #[test]
+    fn named_const_items_are_collected_only_when_literal() {
+        let dump = "const K: u8 = const 5_u8;\n\
+                    const NEG: i8 = const -1_i8;\n\
+                    const B: bool = const true;\n\
+                    const EXPR: u8 = {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                    _0 = const 1_u8;\n        return;\n    }\n}\n\
+                    const ARR::{constant#0}: usize = const 3_usize;\n";
+        let prog = parse_program(dump);
+        assert_eq!(prog.consts.get("K"), Some(&Const::UInt(5, Some(Ty::U8))));
+        assert_eq!(prog.consts.get("NEG"), Some(&Const::UInt(0xff, Some(Ty::I8))));
+        assert_eq!(prog.consts.get("B"), Some(&Const::Bool(true)));
+        assert!(!prog.consts.contains_key("EXPR"), "an expression body is not a literal");
+        assert!(!prog.consts.contains_key("ARR"), "a qualified name is not collected");
     }
 
     /// The front end is total: no input, however mangled, may panic.

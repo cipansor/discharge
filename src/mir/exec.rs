@@ -493,6 +493,10 @@ struct Env {
     /// would put a lifetime on `Env` for every call site of `operand` -- a table
     /// read once per constant is not worth that.
     enums: BTreeMap<String, EnumLayout>,
+    /// The program's named `const` items, so a use site (`_0 = const K`) folds to
+    /// the literal the item was defined with instead of staying unknown. See
+    /// [`crate::mir::parse::MirProgram::consts`].
+    consts: BTreeMap<String, Const>,
     /// The width of each modelled enum tag, keyed by local.
     ///
     /// A tag's width is the *discriminants'*, not the dump's `isize`. Recording
@@ -567,13 +571,15 @@ impl Env {
             indexed: BTreeMap::new(),
             whole_writes: BTreeSet::new(),
             enums: BTreeMap::new(),
+            consts: BTreeMap::new(),
             tag_widths: BTreeMap::new(),
         }
     }
 
-    /// Same as [`Env::new`], with the program's enum layouts attached.
-    fn with_enums(enums: &BTreeMap<String, EnumLayout>) -> Env {
-        Env { enums: enums.clone(), ..Env::new() }
+    /// Same as [`Env::new`], with the program's enum layouts and `const` items
+    /// attached.
+    fn with_enums(enums: &BTreeMap<String, EnumLayout>, consts: &BTreeMap<String, Const>) -> Env {
+        Env { enums: enums.clone(), consts: consts.clone(), ..Env::new() }
     }
 
     /// The element variable for `index` of an indexed value (slice or array)
@@ -1705,7 +1711,7 @@ where
         }
     };
 
-    let mut env = Env::with_enums(&prog.enums);
+    let mut env = Env::with_enums(&prog.enums, &prog.consts);
     // A pinned variable takes the literal its precondition fixes it to, so the
     // body's operations fold instead of building a circuit over an input that has
     // only one value. The pin is keyed by *variable index*, so it applies wherever
@@ -3175,7 +3181,7 @@ where
                 report.unknown_paths.push(format!("callee `{name}` has no body"));
                 return;
             };
-            let mut env = Env::with_enums(&prog.enums);
+            let mut env = Env::with_enums(&prog.enums, &prog.consts);
             // Which caller locals were handed over through a reference, so the
             // return path knows whose store the callee's post-state belongs to.
             let mut by_ref: Vec<(Place, u32)> = Vec::new();
@@ -3453,7 +3459,30 @@ fn operand(env: &mut Env, o: &Operand) -> Val {
             // A variant construction whose destination `eval_rvalue` could not
             // resolve (it has no enum layout) stays unknown; the well-typed path
             // is in `eval_rvalue::Use`, where the destination's width is known.
-            Const::Other(_) => Val::Unknown,
+            // A named `const` item: `_0 = const K`, where the item's own body is
+            // printed separately as `const K: u8 = const 5_u8;`. The value is
+            // inlined from the table rather than left unknown, so the use site
+            // folds. rustc const-evaluates the item, so its body is already a
+            // literal with a type suffix -- which is where the width and sign
+            // come from, exactly as for an inline literal.
+            //
+            // A path constant that is *not* a known `const` -- an enum variant
+            // construction (`Mode::Idle`), or a constant whose body is an
+            // expression rather than a literal -- stays unknown; the enum case is
+            // resolved by the caller in `eval_rvalue`, which knows the
+            // destination's width.
+            Const::Other(name) => match env.consts.get(name) {
+                Some(Const::UInt(v, ty)) => match ty.as_ref().and_then(|t| t.width()) {
+                    Some(1) => Val::Bool(smt::truth(*v == 1)),
+                    Some(w) => {
+                        let sign = ty.as_ref().map(Sign::of).unwrap_or(Sign::Unknown);
+                        Val::Sym(smt::word(*v as u64, w), sign)
+                    }
+                    None => Val::Unknown,
+                },
+                Some(Const::Bool(b)) => Val::Bool(smt::truth(*b)),
+                _ => Val::Unknown,
+            },
             Const::Unit => Val::Unknown,
         },
     }
