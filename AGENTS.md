@@ -6622,11 +6622,20 @@ entry that fails on the un-fixed code:
 * **A non-shrinking measure is refused** --
   `a_recursive_call_that_does_not_decrease_cannot_prove_this` calls itself on the
   same `n`. Probed live: it fails with `kind: "recursive call decreases the measure"`,
-  `detail: "v1:u8 = 128"` -- the call site's measure is not below the entry's.
+  `detail: "v1:u8 = 1"` -- the smallest `n` where the call is reached, and the
+  call site's measure is not below the entry's. (This is a definite `Failed`, not a
+  `Skipped`: the check is decidable and it decides against the function. An earlier
+  note in this file recorded it as `Skipped`, which was wrong, and the witness as
+  `v1:u8 = 128`, which was stale.)
 * **A signed measure that can start negative is refused** -- probed live with an
-  `i8` measure and no lower bound (`below_zero`), which fails on the same obligation
-  (`detail: "v1:u8 = 128"`). Non-negativity at entry is exactly what supplies the
-  basis, so this is the check that keeps the order well-founded rather than a detail.
+  `i8` measure and no lower bound. Written as `below_zero(n - 1)` the *subtraction*
+  panics first at `i8::MIN` (`kind: "panic: attempt to compute \`{} - {}\` …"`,
+  `detail: "v1:u8 = 128"`), which masks the measure check; written with
+  `n.wrapping_sub(1)` -- no arithmetic overflow to hide behind -- the measure
+  obligation is the one that fires, `kind: "recursive call decreases the measure"`,
+  `detail: "v1:u8 = 128"` (the measure can start at `i8::MIN`, so the order is not
+  well-founded). Non-negativity at entry is exactly what supplies the basis, so this
+  is the check that keeps the order well-founded rather than a detail.
 * **A call that leaves its own precondition is refused** --
   `a_recursive_call_out_of_range_cannot_prove_this` has `requires: n <= 3` and calls
   itself on `n + 1`.
