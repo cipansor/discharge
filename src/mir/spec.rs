@@ -163,6 +163,19 @@ pub struct Specs {
     /// contract naming a variant is refused rather than guessed at when it is not
     /// there.
     pub enums: BTreeMap<String, EnumDef>,
+    /// The names of `const` items declared at *module* scope (outside any `fn`
+    /// body), read from the source.
+    ///
+    /// The MIR dump prints a crate-level `const` and a function-local one
+    /// identically (`const L: u8 = const 3_u8;`), so the definition alone cannot
+    /// say which it is. A crate-level item is *used* bare (`const L`) while a
+    /// local one is used qualified (`const f::L`), and that use site is the usual
+    /// tell -- but a crate-level item a contract names and the body never uses has
+    /// no use site at all, so it would be dropped and the contract left
+    /// unreadable. This set is the second tell: a name declared here is
+    /// module-scoped and its bare definition must be kept. See
+    /// [`crate_level_consts`] and `parse::parse_program_scoped`.
+    pub crate_consts: BTreeSet<String>,
 }
 
 /// An enum's variants, in declaration order.
@@ -269,6 +282,97 @@ impl Specs {
     }
 }
 
+/// The names of `const` items declared at module scope -- outside any brace.
+///
+/// The MIR dump prints a crate-level `const` and a function-local one
+/// identically, so the definition alone cannot say which it is; the use site
+/// (`const L` bare vs `const f::L` qualified) is the usual tell. A crate-level
+/// constant that a *contract* names but the body never uses has no use site at
+/// all, so that tell is silent and the definition would be dropped, leaving the
+/// contract unreadable. The source, though, says plainly whether the item is
+/// inside a `fn` body: a crate-level item sits at brace depth zero.
+///
+/// The scan tracks brace depth over the whole file, ignoring braces inside string
+/// and character literals and inside comments, and records the name of every
+/// `const NAME: …` seen at depth zero. It deliberately does not try to be a Rust
+/// parser: a `const` generic parameter or an associated constant inside an `impl`
+/// is at depth > 0 and so is not recorded, which is the safe direction (recording
+/// too much would re-open the local-leak false proof).
+pub fn crate_level_consts(source: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut depth: i32 = 0;
+    let mut in_block_comment = false;
+    for raw in source.lines() {
+        let mut line = raw;
+        // Block comments can span lines; a brace inside one is not code.
+        loop {
+            if in_block_comment {
+                match line.find("*/") {
+                    Some(i) => {
+                        in_block_comment = false;
+                        line = &line[i + 2..];
+                    }
+                    None => line = "",
+                }
+            } else if let Some(i) = line.find("/*") {
+                in_block_comment = true;
+                line = &line[i + 2..];
+            } else {
+                break;
+            }
+        }
+        // A `const NAME: …` at depth zero is a crate-level item. The name is read
+        // before the braces on the line are counted, so `const L: u8 = 3;` is
+        // caught while a `const` inside a `fn` body (depth > 0) is not.
+        if depth == 0 {
+            let t = line.trim_start();
+            let t = t.strip_prefix("pub(crate) ").or_else(|| t.strip_prefix("pub ")).unwrap_or(t);
+            if let Some(after) = t.strip_prefix("const ") {
+                let name: String = after
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                let plain =
+                    name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+                if plain && after[name.len()..].trim_start().starts_with(':') {
+                    out.insert(name);
+                }
+            }
+        }
+        // Count braces outside strings, chars and line comments.
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'/' if bytes.get(i + 1) == Some(&b'/') => break,
+                b'"' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        if bytes[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                b'\'' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'\'' {
+                        if bytes[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Extract contracts from Rust source text.
 ///
 /// The scanner is line-oriented and deliberately shallow: it collects
@@ -284,6 +388,12 @@ pub fn extract(source: &str) -> Specs {
     let mut specs = Specs::default();
     let mut pending = FnContract::default();
     let mut in_block_comment = false;
+    // Which `const` items are declared at the crate root, before any brace opens.
+    // The dump cannot tell a crate-level `const` from a function-local one, so a
+    // contract that names a crate-level constant the body never uses would
+    // otherwise lose its definition and go unreadable. See
+    // [`Specs::crate_consts`].
+    specs.crate_consts = crate_level_consts(source);
 
     // Struct layouts, read in the same pass. The MIR dump names a struct
     // (`_1: &Config`) but never prints its fields, so a contract like
@@ -747,6 +857,16 @@ pub struct FieldEnv {
 }
 
 impl FieldEnv {
+    /// An environment carrying only a `const` table, for evaluating a contract
+    /// that names a constant but binds no fields.
+    ///
+    /// A constant's value does not depend on the call site, so the table is the
+    /// entry state's, not a fresh one; this is the constructor for the places
+    /// (a recursive call) that need the constants without the field bindings.
+    pub fn with_consts(consts: BTreeMap<String, Const>) -> FieldEnv {
+        FieldEnv { consts, ..FieldEnv::default() }
+    }
+
     /// Whether `name` may be introduced as a generated binding.
     ///
     /// It may not when a *source* name already holds it: the generated binding is
@@ -6672,5 +6792,48 @@ mod tests {
         assert!(eval_requires("EXPR <= 1", &args, &BTreeSet::new(), &env).is_err());
         // A misspelled name is still refused as an unknown name.
         assert!(eval_requires("LIMITT <= 1", &args, &BTreeSet::new(), &env).is_err());
+    }
+
+    /// The crate-level `const` scanner reads items at brace depth zero and only
+    /// those.
+    ///
+    /// The dump cannot tell a crate-level `const` from a function-local one, so the
+    /// source's brace depth is the second tell -- the one that catches a
+    /// crate-level constant a contract names but no body uses. Reading too much
+    /// would re-open the local-leak false proof, so the negative cases matter as
+    /// much as the positive one: a local item, an associated constant in an `impl`,
+    /// a `const` generic parameter, and a `const` inside a string or comment must
+    /// all be left out.
+    #[test]
+    fn crate_level_consts_reads_only_module_scope_items() {
+        let src = r#"
+// const COMMENTED: u8 = 1;
+const LIMIT: u8 = 10;
+pub const PUB_LIMIT: u8 = 11;
+const TYPO: u8 = 12;
+
+/// const DOC: u8 = 13;
+pub fn f() -> u8 {
+    const LOCAL: u8 = 3;
+    let s = "const IN_STRING: u8 = 4";
+    let _ = s;
+    LOCAL
+}
+
+impl Foo {
+    const ASSOC: u8 = 5;
+}
+
+fn g<const N: usize>() -> usize { N }
+"#;
+        let names = crate_level_consts(src);
+        assert!(names.contains("LIMIT"), "a crate-level const is read: {names:?}");
+        assert!(names.contains("PUB_LIMIT"), "a `pub const` is read: {names:?}");
+        assert!(names.contains("TYPO"), "a plain crate-level const is read: {names:?}");
+        assert!(!names.contains("COMMENTED"), "a commented-out item is not read: {names:?}");
+        assert!(!names.contains("DOC"), "a doc-comment line is not read: {names:?}");
+        assert!(!names.contains("LOCAL"), "a function-local const is not read: {names:?}");
+        assert!(!names.contains("IN_STRING"), "a const inside a string is not read: {names:?}");
+        assert!(!names.contains("ASSOC"), "an associated const is not read: {names:?}");
     }
 }

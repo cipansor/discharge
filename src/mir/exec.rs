@@ -2265,18 +2265,112 @@ fn find_obligation(path: Pred, pins: &[(u32, u64)]) -> Verdict {
     }
 }
 
-/// Which function in the dump a call name refers to, by the inliner's rule: an
-/// exact match on the printed name, else a *unique* match on the last `::`
-/// component (rustc prints an inherent method with an `<impl at …>` prefix).
+/// The base type name of a path segment, with generic arguments and an
+/// `impl`-projection wrapper stripped: `Vec2` → `Vec2`, `G::<T>` → `G`,
+/// `<S2 as T2>` → `S2`, `core::num::<impl u8>` → `u8`.
 ///
-/// `None` means the name resolves to nothing or ambiguously, so the call is not
-/// one this function makes to itself.
-fn same_dump_index(prog: &MirProgram, name: &str) -> Option<usize> {
+/// rustc prints a method's *definition* with the type it is implemented for
+/// wrapped in `<impl …>` and a *call* with that type bare, so the two have to be
+/// cut to the same shape before they can be compared.
+fn base_type(s: &str) -> String {
+    let s = s.trim();
+    if let Some(rest) = s.split("<impl ").nth(1) {
+        return rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+    }
+    let s = match s.strip_prefix('<') {
+        Some(rest) => rest.split(" as ").next().unwrap_or(rest),
+        None => s,
+    };
+    let s = s.split("::<").next().unwrap_or(s);
+    let s = s.split('<').next().unwrap_or(s);
+    s.rsplit("::").next().unwrap_or(s).trim().to_string()
+}
+
+/// The type a method call is made on: `Vec2` in `Vec2::push`, `G` in
+/// `G::<T>::walk`, `S2` in `<S2 as T2>::go`.
+fn call_type(name: &str) -> Option<String> {
+    Some(base_type(name.rsplit_once("::")?.0))
+}
+
+/// The `self` type of an *instance* method, read from its receiver's declared
+/// type.
+///
+/// rustc prints a method's *definition* as `<impl at FILE:L:C: L:C>::m`, which
+/// names no type, but an instance method's receiver is the first argument and its
+/// `debug` binding is literally `self`, so that local's declared type names the
+/// type the method is implemented for (`&Vec2` gives `Vec2`).
+///
+/// A *static* associated function has no `self`, so it has no `debug self`
+/// binding and this returns `None`. The distinction matters: a static
+/// `Foo::m(x: Vec2)`'s first parameter is an ordinary argument, and reading it as
+/// a receiver would let a call to an *external* `Vec2::m` resolve to `Foo::m` --
+/// answering a call from the wrong body, which is a false proof. A free function
+/// has no `self` either and is also `None`, so callers distinguish the two by the
+/// definition name (see [`is_impl_method`]).
+fn method_self_type(f: &MirFn) -> Option<String> {
+    let self_local = f
+        .debug_bindings
+        .iter()
+        .find_map(|(n, l)| (n == "self").then_some(*l).flatten())?;
+    let ty = f.locals.get(&self_local)?;
+    let inner = match ty {
+        Ty::Ref(inner) => inner.as_ref(),
+        other => other,
+    };
+    match inner {
+        Ty::Other(s) => Some(base_type(s)),
+        _ => None,
+    }
+}
+
+/// Whether the definition name is rustc's printed form for a method in an `impl`
+/// block (`<impl at FILE:L:C: L:C>::m`), as opposed to a free function's bare name.
+fn is_impl_method(f: &MirFn) -> bool {
+    f.name.contains("<impl at")
+}
+
+/// Resolve a call name to the function in the dump it names.
+///
+/// An exact match is the free-function case: rustc prints a same-crate free
+/// function's call and its definition by the same bare name. Otherwise the name
+/// is a qualified call (`Type::m`) whose *definition* rustc prints as
+/// `<impl at …>::m`, so only the tail is shared.
+///
+/// The tail alone is not enough. `Vec2::push` and `Vec::<u8>::push`, or a free
+/// `wrapping_add` and `core::num::<impl u8>::wrapping_add`, share a tail while
+/// naming different functions, and answering such a call from the wrong body is a
+/// false proof. Two guards keep that from happening:
+///
+/// * A call name that still carries an `impl` projection (`…::<impl u8>::…`) is a
+///   `core`/`std` callee. rustc prints a *local* method call with its concrete
+///   type (`Vec2::push`, `<S as T>::m`), never with `<impl`, so such a name is
+///   never a same-dump call and is refused outright.
+/// * A surviving candidate must be the method for the same type: an instance
+///   method's `self` type must equal the call's type, and a static associated
+///   function (whose `self` type cannot be read) is accepted on the unique tail
+///   only. A free function never matches a qualified call, because rustc prints a
+///   same-crate free function's call bare -- the exact-match case above.
+///
+/// `None` means the call is not modelled, which the caller reports rather than
+/// guesses at.
+fn resolve_callee(prog: &MirProgram, name: &str) -> Option<usize> {
     if let Some(i) = prog.fns.iter().position(|g| g.name == name) {
         return Some(i);
     }
-    let tail = name.rsplit("::").next();
-    let mut hits = prog.fns.iter().enumerate().filter(|(_, g)| g.name.rsplit("::").next() == tail);
+    if name.contains("<impl") {
+        return None;
+    }
+    let tail = name.rsplit("::").next()?;
+    let want_ty = call_type(name)?;
+    let mut hits = prog.fns.iter().enumerate().filter(|(_, g)| {
+        if g.name.rsplit("::").next() != Some(tail) {
+            return false;
+        }
+        match method_self_type(g) {
+            Some(self_ty) => self_ty == want_ty,
+            None => is_impl_method(g),
+        }
+    });
     match (hits.next(), hits.next()) {
         (Some((i, _)), None) => Some(i),
         _ => None,
@@ -2329,10 +2423,18 @@ fn try_recursive_call(
     // function's induction.
     //
     // The name is resolved with the same rule the inliner uses (exact match, else
-    // a unique tail match, because rustc may print the call with a path prefix),
-    // and the result has to be the root itself. A name that resolves to nothing
-    // or ambiguously is not this function calling itself.
-    if st.frame.func != root || same_dump_index(prog, name) != Some(root) {
+    // a unique tail match that also agrees on the method's `self` type), and the
+    // result has to be the root itself. A name that resolves to nothing, or
+    // ambiguously, is not this function calling itself.
+    //
+    // This must run *before* the intrinsic dispatch below, but it must not
+    // swallow an intrinsic call. A function named `wrapping_add` that calls
+    // `u8::wrapping_add` is calling the *intrinsic*, not itself; treating the
+    // call as recursive would assume the function's own postcondition in place of
+    // evaluating the intrinsic, which is a false proof. `resolve_callee` refuses
+    // that name because the intrinsic's `self` type (`u8`) is not the local
+    // function's, so the check falls through to the intrinsic model.
+    if st.frame.func != root || resolve_callee(prog, name) != Some(root) {
         return None;
     }
     // The root frame has no caller, so a self-call is recursion by construction.
@@ -2348,6 +2450,13 @@ fn try_recursive_call(
         return None;
     }
     let f = &prog.fns[root];
+    // The contract is evaluated over the call's arguments, so the field bindings
+    // are the call site's and are rebuilt below. The `const` table is not: a
+    // constant has the same value at the call as at entry, and the entry state
+    // already carries it in `rc.rec.consts`. Handing the reader an empty table
+    // here made a contract that names a constant -- `requires: n <= LIMIT` --
+    // unreadable at the self-call, which turned a decidable proof into a refusal.
+    let fields = FieldEnv::with_consts(rc.rec.consts.clone());
 
     // The argument bindings at the call site: name -> the value the caller holds.
     // A name that has no value there (an unmodelled operand) makes the whole call
@@ -2378,7 +2487,7 @@ fn try_recursive_call(
     let mut pre_ok = true;
     let mut pre: Option<Pred> = None;
     for r in &rc.rec.requires {
-        match spec::eval_requires(r, &names, &rc.rec.signed, &FieldEnv::default()) {
+        match spec::eval_requires(r, &names, &rc.rec.signed, &fields) {
             Ok(p) => pre = Some(match pre {
                 None => p,
                 Some(prev) => smt::and(prev, p),
@@ -2461,7 +2570,7 @@ fn try_recursive_call(
             spec::RET_IS_UNKNOWN,
             &rc.rec.signed,
             ret_signed,
-            &FieldEnv::default(),
+            &fields,
         ) {
             Ok(p) => post_assumed = Some(match post_assumed {
                 None => p,
@@ -3495,34 +3604,18 @@ where
                 return;
             }
             // Only same-dump calls can be inlined. Assuming a return value for
-            // anything else would be assuming the conclusion, so it is unknown. The
-            // suffix match is the fallback for a name rustc prints with a path prefix
-            // (`module::f`); an exact match above already took the unambiguous case.
+            // anything else would be assuming the conclusion, so it is unknown.
             //
-            // Both sides are cut to their last `::` component, because the two sides
-            // are printed differently: an inherent method is *defined* as
-            // `<impl at file:line:col>::set_lo` and *called* as `Config::set_lo`, so
-            // matching the call against the whole definition name never fires. Cutting
-            // both to `set_lo` is what lets a method be inlined at all -- without it a
-            // call to any method was "unmodelled function", so a method's write
-            // through `&mut self` could not be seen by its caller.
-            //
-            // The tail match is required to be *unique*. `set_lo` on two types is
-            // two definitions with the same tail, and the call names only one of
-            // them, so picking the first would inline the wrong body -- a wrong
-            // proof, not a lost one. An ambiguous tail is refused instead.
-            let inline_idx = exact.or_else(|| {
-                let tail = name.rsplit("::").next();
-                let mut hits = prog
-                    .fns
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, g)| g.name.rsplit("::").next() == tail);
-                match (hits.next(), hits.next()) {
-                    (Some((i, _)), None) => Some(i),
-                    _ => None,
-                }
-            });
+            // An exact match is the free-function case: rustc prints a same-crate
+            // free function's call and its definition by the same bare name.
+            // Otherwise the call is a method (`Type::m`) whose definition rustc
+            // prints as `<impl at …>::m`, so only the tail is shared -- but the
+            // tail alone is not enough, because `Vec2::push` and `Vec::<u8>::push`
+            // (or a free `wrapping_add` and `core::num::<impl u8>::wrapping_add`)
+            // share one. Inlining the wrong body is a false proof, so the tail
+            // match also requires the same method `self` type and a unique
+            // candidate; see [`resolve_callee`].
+            let inline_idx = resolve_callee(prog, name);
             let Some(idx) = inline_idx else {
                 report.unknown_paths.push(format!("call to unmodelled function `{name}`"));
                 return;
@@ -5865,5 +5958,33 @@ fn count_via_helper(_1: u8) -> u8 {
                 }
             }
         }
+    }
+
+    /// The name-shape rules a call name is resolved by, on the shapes rustc
+    /// actually prints.
+    ///
+    /// These are pure string rules, so they are pinned here rather than only
+    /// through a `rustc` run: the resolver is what stands between a call and the
+    /// body it is answered from, and answering it from the wrong body is a false
+    /// proof, not a lost one. The shapes below are the ones measured from a real
+    /// `--emit=mir` dump.
+    #[test]
+    fn call_names_resolve_to_the_right_body() {
+        // `base_type` strips the wrapper rustc prints on a definition and the
+        // generics it prints on a call, and takes the last path segment.
+        assert_eq!(base_type("Vec2"), "Vec2");
+        assert_eq!(base_type("G::<T>"), "G");
+        assert_eq!(base_type("<S2 as T2>"), "S2");
+        assert_eq!(base_type("core::num::<impl u8>"), "u8");
+        assert_eq!(base_type("&Vec2"), "&Vec2");
+
+        // `call_type` is the type a method is called on.
+        assert_eq!(call_type("Vec2::push").as_deref(), Some("Vec2"));
+        assert_eq!(call_type("G::<T>::walk").as_deref(), Some("G"));
+        assert_eq!(call_type("<S as T>::m").as_deref(), Some("S"));
+        assert_eq!(call_type("free_fn"), None, "a bare name has no type segment");
+
+        // An intrinsic call keeps its `<impl` projection, which marks it external.
+        assert_eq!(call_type("core::num::<impl u8>::wrapping_add").as_deref(), Some("u8"));
     }
 }

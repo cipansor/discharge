@@ -995,14 +995,63 @@ fn push_projs(
 ///
 /// A definition is `const NAME: TYPE`; every other occurrence (`const NAME;`,
 /// `const NAME,`, `const NAME)`) is a use.
+///
+/// Only the *operand* text is scanned. A string literal or a constant-data block
+/// can contain the letters `const L` without that being a use -- a
+/// `debug s => const "const L";` binding or the `alloc` block that backs the
+/// string `"const L"` would otherwise make `L` look bare-used, which hands a
+/// function-local `L` a program-wide key and turns a contract that names it into
+/// a false proof.
 fn bare_const_uses(text: &str) -> std::collections::BTreeSet<String> {
     const KW: &str = "const ";
     let mut out = std::collections::BTreeSet::new();
+    // An `allocN (…) {` block holds the bytes of a string literal (and other
+    // constant data), printed with a gutter and a right-hand column that spells
+    // the bytes out as text. Nothing in it is a use site, and it can contain the
+    // word `const`, so it is skipped whole.
+    let mut in_alloc = false;
     for line in text.lines() {
         if line.trim_start().starts_with("//") {
             continue;
         }
-        let mut rest = line;
+        if in_alloc {
+            if line.trim() == "}" {
+                in_alloc = false;
+            }
+            continue;
+        }
+        if line.trim_start().starts_with("alloc")
+            && line.trim_start()["alloc".len()..].starts_with(|c: char| c.is_ascii_digit())
+            && line.contains('(')
+            && line.trim_end().ends_with('{')
+        {
+            in_alloc = true;
+            continue;
+        }
+        // Drop string literals before scanning, so a `const` inside one is not
+        // read as a use. A `"` toggles in/out of a literal; a `\` escapes the next
+        // character, so `\"` does not close it.
+        let mut operand = String::with_capacity(line.len());
+        let mut in_str = false;
+        let mut escaped = false;
+        for c in line.chars() {
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            if c == '"' {
+                in_str = true;
+                continue;
+            }
+            operand.push(c);
+        }
+        let mut rest = operand.as_str();
         while let Some(i) = rest.find(KW) {
             let after = &rest[i + KW.len()..];
             let name: String =
@@ -1586,6 +1635,21 @@ pub fn parse_program(text: &str) -> MirProgram {
     parse_program_with(text, &BTreeMap::new())
 }
 
+/// [`parse_program_with`] with the crate-level `const` names the source declared.
+///
+/// The dump prints a crate-level `const` and a function-local one identically, so
+/// the bare-use test in [`bare_const_uses`] is the only in-dump tell -- and it is
+/// silent for a crate-level constant that only a *contract* names. This variant
+/// takes the names the source says are module-scoped, so those definitions are
+/// kept as well. See [`crate::mir::spec::crate_level_consts`].
+pub fn parse_program_scoped(
+    text: &str,
+    enums: &BTreeMap<String, EnumLayout>,
+    crate_consts: &std::collections::BTreeSet<String>,
+) -> MirProgram {
+    parse_program_impl(text, enums, crate_consts)
+}
+
 /// [`parse_program`] with the enum layouts from the source.
 ///
 /// A `match` lowers to `(base as Variant)` downcasts whose *variant names* the
@@ -1594,6 +1658,14 @@ pub fn parse_program(text: &str) -> MirProgram {
 /// dump, so it is passed in. An empty map is the old behaviour: `Option`/`Result`
 /// resolve from their built-in numbering and every other enum refuses a downcast.
 pub fn parse_program_with(text: &str, enums: &BTreeMap<String, EnumLayout>) -> MirProgram {
+    parse_program_impl(text, enums, &std::collections::BTreeSet::new())
+}
+
+fn parse_program_impl(
+    text: &str,
+    enums: &BTreeMap<String, EnumLayout>,
+    crate_consts: &std::collections::BTreeSet<String>,
+) -> MirProgram {
     let lines: Vec<&str> = text.lines().collect();
     let mut prog = MirProgram { enums: enums.clone(), ..MirProgram::default() };
     // Which bare names are ever used as a `const` at a use site, so a definition
@@ -1630,15 +1702,21 @@ pub fn parse_program_with(text: &str, enums: &BTreeMap<String, EnumLayout>) -> M
                     if plain {
                         let body = body.trim().trim_end_matches(';');
                         if let Some(c) = body.strip_prefix("const ") {
-                            // A bare key is recorded only when the name is used
-                            // bare somewhere, i.e. only for a crate-level item. A
-                            // function-local item's definition prints the same way
-                            // but its uses are qualified (`const f::L`), so a bare
-                            // key for it would let an unrelated function's contract
-                            // resolve a name its own source could not. A qualified
-                            // definition keeps its qualified key, which is what a
-                            // contract that spells the path resolves.
-                            if name.contains("::") || bare_uses.contains(name) {
+                            // A bare key is recorded when the name is used
+                            // bare somewhere, i.e. for a crate-level item, or when
+                            // the source says the item is module-scoped (a
+                            // crate-level constant that only a contract names has
+                            // no use site to go by). A function-local item's
+                            // definition prints the same way but its uses are
+                            // qualified (`const f::L`), so a bare key for it would
+                            // let an unrelated function's contract resolve a name
+                            // its own source could not. A qualified definition
+                            // keeps its qualified key, which is what a contract
+                            // that spells the path resolves.
+                            if name.contains("::")
+                                || bare_uses.contains(name)
+                                || crate_consts.contains(name)
+                            {
                                 prog.consts.insert(name.to_string(), parse_const(c));
                             }
                         }
@@ -2159,6 +2237,70 @@ fn add(_1: u32, _2: u32) -> u32 {
                     _0 = const 3_u8;\n        return;\n    }\n}\n";
         let prog = parse_program(dump);
         assert!(!prog.consts.contains_key("L"), "a local const must not get a bare key");
+    }
+
+    /// A `const NAME` inside a string literal or an `alloc` block is *data*, not a
+    /// use, and must not make `NAME` look crate-level.
+    ///
+    /// The bare-use scan is the only in-dump tell between a crate-level `const`
+    /// and a function-local one, so a false positive here hands a function-local
+    /// item a program-wide key -- the false proof
+    /// [`a_local_const_does_not_leak_to_another_function`] guards, reopened through
+    /// a string. A `debug s => const "const L";` binding and the `alloc` block
+    /// behind the string both spell `const L` as text. The `alloc` data line is the
+    /// real dump shape -- a gutter and a right-hand column that spells the bytes out
+    /// -- so it is *not* a `//` comment and the comment skip does not cover it.
+    #[test]
+    fn a_string_literal_is_not_a_const_use() {
+        let uses = bare_const_uses(
+            "    debug s => const \"const L\";\n\
+             alloc12 (size: 7, align: 1) {\n\
+             \x20   63 6f 6e 73 74 20 4c 4b                       │ const L\n}\n\
+             \x20   _0 = const L;\n",
+        );
+        assert!(uses.contains("L"), "the real use site is still read: {uses:?}");
+        let only_string = bare_const_uses("    debug s => const \"const M\";\n");
+        assert!(
+            only_string.is_empty(),
+            "a `const NAME` inside a string literal is not a use: {only_string:?}"
+        );
+        let only_alloc = bare_const_uses(
+            "alloc4 (size: 4, align: 1) {\n\
+             \x20   1u8, 1u8, 1u8, 1u8,\n\
+             alloc7 (size: 7, align: 1) {\n\
+             \x20   63 6f 6e 73 74 20 4e 4f 4e                       │ const NON\n}\n",
+        );
+        assert!(
+            only_alloc.is_empty(),
+            "an `alloc` data block is not a use: {only_alloc:?}"
+        );
+    }
+
+    /// A crate-level `const` a contract names but no body uses keeps its bare key,
+    /// because the source says the item is module-scoped.
+    ///
+    /// The bare-use test is silent for a constant with no use site at all, so the
+    /// definition would be dropped and the contract left unreadable -- a lost
+    /// proof. The `crate_consts` set is the source's word on the item's scope.
+    #[test]
+    fn a_crate_level_const_with_no_use_site_is_kept() {
+        let dump = "const ONLY: u8 = const 7_u8;\n\
+                    fn g() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                    _0 = const 3_u8;\n        return;\n    }\n}\n";
+        // Without the source's word, the bare definition is dropped.
+        assert!(!parse_program(dump).consts.contains_key("ONLY"));
+        // With it, the definition is kept so a contract can name it.
+        let mut scoped = std::collections::BTreeSet::new();
+        scoped.insert("ONLY".to_string());
+        let prog = parse_program_scoped(dump, &BTreeMap::new(), &scoped);
+        assert_eq!(prog.consts.get("ONLY"), Some(&Const::UInt(7, Some(Ty::U8))));
+        // The tell must not resurrect a name the source did *not* declare: a
+        // function-local `L` (used qualified) stays out of the table.
+        let dump2 = "fn f() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                     _0 = const f::L;\n        return;\n    }\n}\n\
+                     const L: u8 = const 3_u8;\n";
+        let prog2 = parse_program_scoped(dump2, &BTreeMap::new(), &scoped);
+        assert!(!prog2.consts.contains_key("L"), "a name not in the source's set stays out");
     }
 
     /// The front end is total: no input, however mangled, may panic.

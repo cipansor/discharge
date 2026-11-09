@@ -2010,17 +2010,20 @@ fn an_element_target_is_written_and_a_by_value_copy_is_not() {
     }
 }
 
-/// A method is inlined by its *last* path component, because rustc defines an
-/// inherent method as `<impl at file:line:col>::set_lo` but calls it as
-/// `Config::set_lo`; and an ambiguous tail is refused rather than guessed.
+/// A method is inlined by its *last* path component plus its receiver's type,
+/// because rustc defines an inherent method as `<impl at file:line:col>::set_lo`
+/// but calls it as `Config::set_lo`; a shared tail is disambiguated by the type
+/// rather than guessed at.
 ///
 /// Before the tail match, a call to any method was "unmodelled function", so a
 /// method's write through `&mut self` was invisible to its caller. The tripwire
-/// pins the other direction: `set_lo` is both a method and a free function here, so
-/// the tail names two bodies and the call must be refused -- inlining the free
-/// function would write through the wrong shape and *prove* a false contract.
+/// pins the other direction: `twist` is both a method and a free function here, so
+/// the tail alone names two bodies. The call `w.twist(5)` names the receiver's
+/// type, so it resolves to `Widget::twist`; inlining the free function instead
+/// would write through the wrong shape and *prove* a false contract, so the
+/// resolution must pick the method and refute the claim.
 #[test]
-fn a_method_is_inlined_by_its_tail_and_an_ambiguous_tail_is_refused() {
+fn a_method_is_inlined_by_its_tail_and_a_shared_tail_resolves_by_type() {
     let Some(report) = verify_realistic(&[
         "a_method_write_reaches_the_caller",
         "a_method_write_cannot_prove_this",
@@ -2082,12 +2085,17 @@ fn a_method_is_inlined_by_its_tail_and_an_ambiguous_tail_is_refused() {
             "a stale caller value must not prove this false contract; got: {o}"
         );
     }
-    // Refused, not decided either way: the tail is ambiguous, so any verdict would
-    // come from the wrong body. It surfaces as `Incomplete`, which is not a pass.
+    // The tail `twist` is shared by `Widget::twist` and a free `twist`, but the
+    // call `w.twist(5)` names its receiver's type, so the resolver picks the
+    // method by that type rather than by the tail alone. Answering it from the
+    // free function -- which writes through a `&mut u8` -- would *prove* this
+    // false contract; the correct body sets `w.v = 5`, so the postcondition is
+    // refuted. Refuted is the evidence the right body was chosen.
     let o = outcome(&report, "an_ambiguous_method_tail_cannot_prove_this");
     assert!(
-        matches!(o, FnOutcome::Incomplete { .. }),
-        "an ambiguous method tail must be refused; got: {o}"
+        matches!(o, FnOutcome::Failed { .. }),
+        "a shared method tail must resolve to the receiver's own body and refute \
+         the false contract, not prove it; got: {o}"
     );
 }
 
@@ -5965,4 +5973,136 @@ fn a_contract_on_an_inherent_method_that_is_false_is_refuted() {
         panic!("a method whose postcondition is false must fail, got: {o}");
     };
     assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+}
+
+// ---------------------------------------------------------------------------
+// Frontend soundness regressions (F1-F4)
+//
+// Each of these four was a confirmed defect in the MIR frontend, found by probe
+// and fixed in the same change. They are pinned here so a later refactor cannot
+// quietly reopen them.
+
+/// F1: a free function named exactly like an intrinsic that calls the *intrinsic*
+/// is not calling itself.
+///
+/// `wrapping_add` calls `u8::wrapping_add` on its non-base path. The intrinsic is
+/// printed fully qualified (`core::num::<impl u8>::wrapping_add`), and the old
+/// resolver matched call names to definitions on the last `::` component alone,
+/// so the intrinsic call resolved to *this function*. `try_recursive_call` then
+/// assumed this function's own postcondition for the result -- a genuine false
+/// proof: `ret == 0` was "proved" while the body returns `n` for `n > 0`. The
+/// resolver now also requires the method's `self` type to agree, so `u8` and the
+/// free function are distinct and the intrinsic model handles the call.
+///
+/// The name must be the intrinsic's *exact* tail, and the function needs a
+/// `decreases:` measure, or the recursion route that carries the false proof never
+/// fires -- a name like `wrapping_add_cannot_prove_this` does not reproduce it.
+#[test]
+fn an_intrinsic_call_is_not_a_self_recursive_call() {
+    let Some(report) = verify_realistic(&["wrapping_add"]) else { return };
+    let o = outcome(&report, "wrapping_add");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!(
+            "a function named like an intrinsic that calls the intrinsic must be \
+             refuted, not proved from its own postcondition; got: {o}"
+        );
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+}
+
+/// F1 companion: a free function named like an intrinsic that *does* recurse must
+/// still be proved by induction.
+///
+/// The guard that fixes F1 must not refuse a real self-call just because the name
+/// matches an intrinsic. `wrapping_add_still_recurses` calls itself, printed bare
+/// (`wrapping_add_still_recurses`), which matches it by exact name.
+#[test]
+fn a_free_recursion_named_like_an_intrinsic_still_recurses() {
+    let Some(report) = verify_realistic(&["wrapping_add_still_recurses"]) else { return };
+    let o = outcome(&report, "wrapping_add_still_recurses");
+    assert!(
+        o.is_verified(),
+        "a free function named like an intrinsic that recurses must verify; got: {o}"
+    );
+}
+
+/// F1 companion: a *static associated function* named like an intrinsic that
+/// genuinely recurses must still be proved by induction.
+///
+/// The type check that fixes F1 must not refuse a real self-call just because the
+/// tail matches an intrinsic name. `Recursing::wrapping_sub` calls itself, and a
+/// `core` intrinsic's call name carries an `<impl` projection that the resolver
+/// refuses, so the real self-call still fires.
+#[test]
+fn a_method_named_like_an_intrinsic_still_recurses() {
+    let Some(report) = verify_realistic(&["wrapping_sub"]) else { return };
+    let o = outcome(&report, "wrapping_sub");
+    assert!(o.is_verified(), "a method named like an intrinsic that recurses must verify; got: {o}");
+}
+
+/// F4: a recursive call evaluates the callee's contract with the entry `const`
+/// table, so a contract naming a constant resolves at the self-call.
+///
+/// `a_recursive_contract_naming_a_const_is_resolved` names `LIMIT` in both its
+/// `requires` and its `ensures`. The recursive call rebuilt the contract
+/// environment from `FieldEnv::default()`, whose `const` table is empty, so the
+/// `requires` was unreadable *at the self-call* and the whole function came back
+/// `Skipped` -- a lost proof. The call site now carries the entry constants.
+#[test]
+fn a_recursive_contract_naming_a_const_is_resolved() {
+    let Some(report) = verify_realistic(&["a_recursive_contract_naming_a_const_is_resolved"])
+    else {
+        return;
+    };
+    let o = outcome(&report, "a_recursive_contract_naming_a_const_is_resolved");
+    assert!(
+        o.is_verified(),
+        "a recursive contract naming a crate-level const must resolve at the self-call; got: {o}"
+    );
+}
+
+/// F3: a crate-level `const` a *contract* names but no body uses is kept.
+///
+/// The dump's bare-use test is silent for a constant with no use site at all, so
+/// the definition was dropped and the contract went unreadable -- a lost proof.
+/// The source says the item is module-scoped, and `spec::crate_level_consts`
+/// carries that to the parser.
+#[test]
+fn a_contract_only_const_is_resolved() {
+    let Some(report) = verify_realistic(&["a_contract_only_const_is_resolved"]) else { return };
+    let o = outcome(&report, "a_contract_only_const_is_resolved");
+    assert!(
+        o.is_verified(),
+        "a crate-level const named only by a contract must resolve; got: {o}"
+    );
+}
+
+/// F2: a string literal that spells `const NAME` must not leak a function-local
+/// `const` into the program-wide table.
+///
+/// The bare-use scan reads `const NAME` out of the dump to tell a crate-level
+/// constant from a function-local one. A `debug s => const "const LEAKY";`
+/// binding and the `alloc` block behind the string spell those letters as *data*,
+/// so a scan of the raw line saw a use and gave the local `LEAKY` a program-wide
+/// key -- reopening the exact false proof
+/// `a_local_const_is_not_in_scope_in_another_function` guards. The scan now drops
+/// string literals and skips `alloc` blocks, so the contract's `LEAKY` resolves to
+/// nothing and the function is `Skipped`, never `Verified`.
+///
+/// The local name is *unique* among the file's locals, which is what makes rustc
+/// print its definition bare (`const LEAKY`) -- the spelling that collides with a
+/// crate-level item. A name shared by two locals is printed qualified and does not
+/// reproduce the shape.
+#[test]
+fn a_string_literal_does_not_leak_a_local_const() {
+    let Some(report) =
+        verify_realistic(&["a_string_literal_must_not_leak_a_unique_local_const"])
+    else {
+        return;
+    };
+    let o = outcome(&report, "a_string_literal_must_not_leak_a_unique_local_const");
+    assert!(
+        !o.is_verified(),
+        "a string literal must not leak a function-local const into a contract; got: {o}"
+    );
 }

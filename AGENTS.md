@@ -6887,3 +6887,84 @@ future fix that matched the name but still skipped the body would pass a verdict
 assertion. The false twin is pinned to `Failed { kind: "postcondition" }` so an unrelated
 refusal cannot satisfy it, and the corpus-wide `no_cannot_prove_entry_is_ever_verified`
 sweep holds it as well.
+
+## Four frontend findings, found by probe: one false proof and three lost proofs
+
+Four defects in the MIR frontend, all in the "a name or a call resolved to something
+the function's own source could not have written" family. They were found by hand
+probes against real `rustc` output before any fix, and each is pinned by a test that
+fails if it is undone. F1 was the severe one -- a genuine false proof.
+
+**F1 (false proof): a call to an intrinsic resolved to a local function that shared its
+name.** The inliner and the recursion check matched a call name to a definition on the
+last `::` segment alone. rustc prints a call to `u8::wrapping_add` fully qualified
+(`core::num::<impl u8>::wrapping_add`) and a *free* function named `wrapping_add` by its
+bare name, so a `decreases:`-measured free function that calls the *intrinsic* on its
+non-base path had that call resolved to *itself*: `try_recursive_call` -- which runs
+before the intrinsic model -- assumed the function's own postcondition for the result.
+`ensures: ret == 0` was **proved** while the body returns `n` for `n > 0`. The name must
+be the intrinsic's *exact* tail for the collision to appear, which is why the fixture is
+a plain free `wrapping_add`.
+
+The fix is `resolve_callee`, shared by the recursion check and the inliner. After an
+exact-name match (the free-function case, which rustc prints bare on both sides), a
+qualified call is matched on the tail *and* on the method's `self` type. The receiver's
+type is read from the local whose `debug` binding is literally `self` (`&Vec2` gives
+`Vec2`), which is the one tell that separates an *instance* method from a *static*
+associated function -- a static function's first parameter is an ordinary argument, and
+reading it as a receiver would let an external `Vec2::m` call resolve to a local
+`Foo::m(x: Vec2)`. Two guards keep the tail from resolving to the wrong body: a call
+name that still carries an `<impl` projection is a `core`/`std` callee and is refused
+outright (rustc never prints a *local* method call with `<impl`), and a candidate must
+agree on the type -- an instance method's `self` type must equal the call's, and a
+static associated function (no `self`) is accepted on the unique tail only. The false
+proof now reports `Failed { kind: "postcondition" }`.
+
+This also *improved* the old ambiguous-tail behaviour rather than only refusing it:
+`Widget::twist` and a free `twist` share the tail, and the call `w.twist(5)` names its
+receiver's type, so it now resolves to the method and **refutes** the false contract
+where the old code refused the whole call as `Incomplete`. The corpus fixture and the
+`a_method_is_inlined_by_its_tail_and_a_shared_tail_resolves_by_type` test were updated
+from "refused" to "refuted", because resolving by type is the stronger and correct
+answer.
+
+**F2 (lost proof, and a false-proof path reopened): a string literal spelled
+`const NAME`.** `bare_const_uses` is the only in-dump tell between a crate-level `const`
+and a function-local one. It scanned raw lines, so a `debug s => const "const LEAKY";`
+binding and the `alloc` block behind the string -- both of which spell `const LEAKY` as
+*data* -- looked like a bare use. That gave the local `LEAKY` a program-wide key,
+reopening the exact false proof the local-const fix had closed. The scan now drops
+string literals (honouring `\"` escapes) and skips `alloc` blocks whole. The local's name
+must be *unique* among the file's locals for the shape to appear: rustc qualifies a
+local `const`'s definition (`const f::L`) only when another local shares its name, and
+prints it bare -- the colliding spelling -- when it does not.
+
+**F3 (lost proof): a crate-level `const` a *contract* names but no body uses.** The
+bare-use test is silent for a constant with no use site at all, so the definition was
+dropped and the contract went unreadable. The dump cannot tell a crate-level `const`
+from a function-local one, but the *source* can: a crate-level item sits at brace depth
+zero. `spec::crate_level_consts` reads exactly those, and `parse_program_scoped` keeps a
+bare definition when the name is used bare, is qualified, or is in that set. Reading too
+much would re-open the local-leak false proof, so a local item, an associated constant,
+a `const` generic parameter, and a `const` inside a string or comment are all excluded,
+and the negative cases are unit-tested as well as the positive one.
+
+**F4 (lost proof): a recursive contract that names a `const`.** `try_recursive_call`
+rebuilt the contract environment from `FieldEnv::default()`, whose `const` table is
+empty, so `requires: n <= LIMIT` was unreadable *at the self-call* and the whole
+function came back `Skipped`. A constant has the same value at the call as at entry, so
+the call site now carries the entry constants (`FieldEnv::with_consts`); only the field
+bindings are rebuilt per call site.
+
+**Evidence.** Corpus `decided 313 of 590` -> **`318 of 599`**; `scripts/test-count.sh`
+**704 -> 714** passed, 0 failed; `cargo clippy --workspace --features std --all-targets
+-- -D warnings` and `cargo clippy --no-default-features --lib -- -D warnings` both
+clean; `scripts/gate.sh` **ALL GATES GREEN**; zero dependencies and `no_std` untouched.
+
+Each of the four regression tests was confirmed to *fail* against the un-fixed source
+(stashing only `src/mir/`, keeping the fixtures), so they are not vacuous. The F1
+companions -- a free `wrapping_add_still_recurses` and a static `Recursing::wrapping_sub`
+-- verify on both the fixed and un-fixed source, which is the point: they guard against
+the fix *over*-refusing a real self-call, and pass either way. The static companion uses
+`wrapping_sub`, not `wrapping_add`, because the free `wrapping_add` above already owns
+that report name (a method's outcome key is its bare tail).

@@ -614,7 +614,7 @@ pub fn verify_file_with(
         .map_err(|e| format!("could not read {}: {e}", source.display()))?;
     let specs = spec::extract(&text);
     let mir = emit_mir_with(rustc, source)?;
-    let prog = parse::parse_program_with(&mir, &enum_layouts(&specs));
+    let prog = parse::parse_program_scoped(&mir, &enum_layouts(&specs), &specs.crate_consts);
 
     let mut report = FileReport { source: source.to_path_buf(), ..Default::default() };
 
@@ -667,7 +667,7 @@ pub fn verify_mir_text(
     specs: &Specs,
     only: &[String],
 ) -> Result<FileReport, String> {
-    let prog = parse::parse_program_with(mir, &enum_layouts(specs));
+    let prog = parse::parse_program_scoped(mir, &enum_layouts(specs), &specs.crate_consts);
     let mut report = FileReport::default();
     for name in specs.by_fn.keys() {
         if prog.get(name).is_none() {

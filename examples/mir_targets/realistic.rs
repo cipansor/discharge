@@ -5367,10 +5367,12 @@ pub fn twist(v: &mut u8, x: u8) {
     *v = x;
 }
 
-/// The ambiguity tripwire: the call `w.twist(5)` must not be answered by the free
-/// function `twist`, which takes a different shape and would write through it.
-/// Inlining the wrong body here would *prove* a false contract, so the ambiguous
-/// tail is refused rather than matched to either.
+/// The ambiguity tripwire: the call `w.twist(5)` names its receiver's type, so it
+/// must resolve to `Widget::twist` and not to the free function `twist` that
+/// shares the tail. The free function takes a different shape (`&mut u8`) and
+/// would write through it, so inlining *it* would prove this false contract. The
+/// resolver picks the method by the receiver's type, so the correct body runs and
+/// the postcondition is refuted.
 /// requires: w.v == 0
 /// ensures: ret == 0
 pub fn an_ambiguous_method_tail_cannot_prove_this(mut w: Widget) -> u8 {
@@ -6934,5 +6936,173 @@ impl MethodCounter {
     /// ensures: ret == self.n + 2
     pub fn bump_cannot_prove_this(&self) -> u8 {
         self.n + 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A string literal must not leak a function-local `const`
+//
+// The bare-use scan reads use sites out of the dump to tell a crate-level
+// `const` from a function-local one. A `debug s => const "const LEAKY";` binding
+// (and the `alloc` block that backs the string) spells `const LEAKY` as *data*,
+// not as a use, but a scan that reads the raw line sees the same letters. That
+// made the local `LEAKY` look bare-used, gave it a program-wide key, and let this
+// contract resolve a name its own source could not write -- the very false proof
+// the qualified-use test exists to prevent, reopened through a string.
+//
+// The local name must be *unique* among the file's locals for the shape to
+// appear: rustc qualifies a local `const`'s definition (`const f::L`) only when
+// another local shares its name, and prints it bare (`const LEAKY`) when it does
+// not -- and the bare spelling is the one that collides with a crate-level item.
+
+/// A function whose local `const` no other local shares, so rustc prints its
+/// *definition* bare (`const LEAKY: u8 = const 3_u8;`) -- byte-identical to a
+/// crate-level item's.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_unique_local_const_owner() -> u8 {
+    const LEAKY: u8 = 3;
+    LEAKY
+}
+
+/// A string that contains the text `const LEAKY`, so the leak shape is present.
+/// requires: true
+/// ensures: ret == 0
+pub fn a_string_literal_spells_const_leaky() -> u8 {
+    let s = "const LEAKY";
+    let _ = s;
+    0
+}
+
+/// A contract that names `LEAKY` where no `const LEAKY` is in scope. The only
+/// `const LEAKY` is a local of [`a_unique_local_const_owner`], reachable here only
+/// if a string literal leaked its name into the bare-use set. It must be
+/// `Skipped`, never `Verified`.
+/// requires: LEAKY == 3
+/// ensures: ret == 3
+pub fn a_string_literal_must_not_leak_a_unique_local_const() -> u8 {
+    3
+}
+
+// ---------------------------------------------------------------------------
+// A crate-level `const` a *contract* names but no body uses
+//
+// The bare-use test is silent for a crate-level constant that only a contract
+// names: there is no use site to read. The definition alone cannot say the item
+// is module-scoped, so it was dropped and the contract went unreadable -- a lost
+// proof, not a wrong one. The source knows the item is at brace depth zero, so
+// `spec::crate_level_consts` says so and the definition is kept.
+
+/// A crate-level constant named by a contract below and by no body at all.
+const CONTRACT_ONLY: u8 = 7;
+
+/// The postcondition names [`CONTRACT_ONLY`], which the body never reads. It must
+/// resolve and the function verify; before the crate-scope tell the definition
+/// was dropped and this was `Skipped` (unreadable `ensures`).
+/// requires: true
+/// ensures: ret <= CONTRACT_ONLY
+pub fn a_contract_only_const_is_resolved() -> u8 {
+    3
+}
+
+// ---------------------------------------------------------------------------
+// Recursion and the intrinsic dispatch order
+//
+// `try_recursive_call` runs before the intrinsic model. A function named exactly
+// like an intrinsic that calls the *intrinsic* (`u8::wrapping_add`) is not calling
+// itself, but a resolver that matched on the last `::` component saw the tail
+// `wrapping_add`, took the call for a self-call, and answered it from this
+// function's own postcondition instead of evaluating the intrinsic -- a false
+// proof. The resolver now also requires the method's `self` type to agree, so
+// `u8` and the local function are distinct.
+//
+// The name must be the intrinsic's *exact* tail for the shape to appear: rustc
+// prints a call to the intrinsic as `core::num::<impl u8>::wrapping_add`, so only
+// a local item whose last segment is `wrapping_add` collides with it. A `decreases:`
+// measure is also required, because the false proof is the recursion route
+// assuming the postcondition; without a measure that route never fires.
+
+/// A free function named exactly `wrapping_add` that calls the *intrinsic* on the
+/// non-base path. Its postcondition `ret == 0` is false for `n == 1` (the body
+/// returns `0u8.wrapping_add(1) == 1`), so it must FAIL. Treating the intrinsic
+/// call as a self-call assumed `ret == 0` for the result and proved it.
+/// requires: true
+/// decreases: n
+/// ensures: ret == 0
+pub fn wrapping_add(n: u8) -> u8 {
+    if n == 0 {
+        0
+    } else {
+        0u8.wrapping_add(n)
+    }
+}
+
+/// A free function named exactly `wrapping_add` that *does* call itself. The
+/// type-aware resolver must still fire the recursion: the call `wrapping_add(n-1)`
+/// is printed bare (`wrapping_add`), matches this function by exact name, and its
+/// postcondition is assumed by the induction. This is the companion to the fixture
+/// above -- the intrinsic guard must not refuse a real self-call just because the
+/// tail matches an intrinsic name.
+/// requires: true
+/// decreases: n
+/// ensures: ret <= n
+pub fn wrapping_add_still_recurses(n: u8) -> u8 {
+    if n == 0 {
+        0
+    } else {
+        wrapping_add_still_recurses(n - 1)
+    }
+}
+
+/// A static associated function genuinely named like an intrinsic that recurses on
+/// itself. The tail matches an intrinsic's, but the call `Recursing::wrapping_sub`
+/// resolves to this function -- a `core` intrinsic's name carries an `<impl`
+/// projection and is refused -- so the induction proves the claim. The name is
+/// `wrapping_sub` rather than `wrapping_add` because the free `wrapping_add` above
+/// already owns that outcome key, and a method's report name is its bare tail.
+/// requires: true
+/// ensures: ret <= x
+pub fn a_static_method_named_like_an_intrinsic_still_recurses(x: u8) -> u8 {
+    Recursing::wrapping_sub(x)
+}
+
+/// The receiver for [`a_static_method_named_like_an_intrinsic_still_recurses`].
+pub struct Recursing;
+
+impl Recursing {
+    /// Recurses on `x`, with a measure and a postcondition the induction proves.
+    /// requires: true
+    /// decreases: x
+    /// ensures: ret <= x
+    pub fn wrapping_sub(x: u8) -> u8 {
+        if x == 0 {
+            0
+        } else {
+            Recursing::wrapping_sub(x - 1)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A recursive contract that names a `const`
+//
+// The recursive call evaluates the callee's contract with the *call site's*
+// argument bindings, but a constant is the same at the call as at entry. Handing
+// the reader an empty `const` table there made `requires: n <= LIMIT` unreadable
+// at the self-call, so a decidable proof came back a refusal.
+
+/// A recursive function whose contract names [`LIMIT`]. The constant resolves at
+/// the self-call now, so the induction goes through and this verifies; before,
+/// the self-call's `requires` was unreadable and the function was `Skipped`.
+/// requires: n <= LIMIT
+/// decreases: n
+/// ensures: ret <= LIMIT
+pub fn a_recursive_contract_naming_a_const_is_resolved(n: u8) -> u8 {
+    if n == 0 {
+        0
+    } else if n > LIMIT {
+        0
+    } else {
+        a_recursive_contract_naming_a_const_is_resolved(n - 1)
     }
 }
