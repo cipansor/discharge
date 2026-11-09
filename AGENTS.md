@@ -6721,3 +6721,76 @@ to *run* `discharge` and printed `discharge: not found` before continuing. It st
 every assertion -- the failure was cosmetic -- but a gate that prints a stray error while
 going green trains a reader to ignore its output. Backticks (and `$(...)`) inside an
 unquoted heredoc are code, not prose.
+
+## The MIR frontend: own text parser, `rustc_public` as the oracle only
+
+A recurring question is why the frontend parses rustc's *textual* `--emit=mir` dump
+instead of using `rustc_public` (formerly `stable_mir`), the compiler's own public API for
+internals, which returns *typed* MIR and is strictly richer. The answer is that
+`rustc_public` cannot be the frontend without destroying the crate's identity, and the
+repository already uses it in the one place it is safe: as an oracle.
+
+**What `rustc_public` costs, from `tools/mir-oracle/` itself.** It needs a nightly with the
+`rustc-dev` component, `#![feature(rustc_private)]`, and a link against
+`librustc_driver-*.so` plus `libLLVM-*`. Each of those breaks a promise the crate makes:
+gate 13 pins the floor at stable 1.85, gate 5 forbids external dependencies, the README
+sells "not a nightly feature", and an experimental API that moves every nightly is not a
+foundation for a safety build. The oracle's own manifest says it: "the `discharge` crate
+must build on stable with no dependencies, and `rustc_private` is neither stable nor
+dependency-free." Kani and Verus do link rustc internals -- but they are separate tools,
+and the whole point here is to *not* be that.
+
+**The parser is the cheap part, which is the fact that decides it.** `src/mir/parse.rs` is
+2 157 lines; `shape.rs` another 350. The other 15 473 lines of `src/mir/` -- `exec.rs`,
+`spec.rs`, `intrinsics.rs` -- are the verifier, and every one of them is needed regardless
+of where the MIR came from. So "write our own MIR reader" buys the 2 507-line parser for
+14% of the module, and 61% of the crate is `mir` to begin with. Swapping the frontend would
+delete a seventh of `mir` and add a nightly, a compiler-internal link, and an unstable API.
+
+**The architecture is already the right split**, and gate 10 is what makes it safe:
+
+```
+product:  rustc --emit=mir (text)  ->  parse.rs  ->  exec.rs  ->  verdict
+                                        ^ stable, zero-dep, inspectable
+oracle:   rustc_public (typed MIR) ->  shape.rs --+
+          parse.rs                 ->  shape.rs --+-> compare (gate 10)
+```
+
+A stable, dependency-free reader feeds the product; the rich, nightly API checks that
+reader's *reading* against the compiler's own IR. If rustc changes the pretty-printer and
+the parser drifts, gate 10 fails in CI, not in a user's build. Cheap and stable for the
+product, expensive and rich for the test.
+
+**When to revisit.** Two conditions, either of which flips the decision: (1) `rustc_public`
+stabilises, which would make it strictly better -- typed MIR with no parser to rot; (2) a
+real need for cross-crate or generic-monomorphised verification, where the textual
+frontend's "calls are inlined one level" gap (README gap 1) genuinely bites. Until then the
+text parser stays. A hybrid `--features rustc-public-frontend` was considered and rejected:
+a second frontend to maintain plus a nightly-only path is not worth it yet.
+
+
+The `--emit=mir`-is-stable question itself is settled earlier, in "The MIR frontend needs a
+`rustc`, not a *nightly* `rustc`", with the MSRV/stable parity table; do not re-derive it
+here. Two things in that section were still open, and both are closed now.
+
+**The claim was unpinned.** That section concludes the frontend is a stable-toolchain tool,
+but nothing *ran* it without a nightly: `tests/mir.rs` gates every `rustc`-dependent test on
+`DISCHARGE_RUSTC`, and gate 8 used to skip when it was unset. So the conclusion held only on
+machines that happened to name a compiler -- asserted in prose, checked by nothing. Gate 8
+now falls back to the `rustc` on `PATH` and skips only when there is no `rustc` at all, so
+the claim is exercised with no setup.
+
+**Pinning it surfaced a latent failure.** With gate 8 able to run without `DISCHARGE_RUSTC`,
+`env -u DISCHARGE_RUSTC scripts/test-count.sh` reported **1 test failing**, not skipping:
+`a_one_line_struct_does_not_swallow_the_functions_after_it` called `panic!` on the `None`
+that `verify_src` returns when no compiler is named. It was the only test in the file that
+read "no compiler" as "a bug" -- the other 174 return early -- so the suite's verdict
+depended on the environment. It returns early now. The general lesson: a gate that *skips*
+can hide a test that *fails*, which is the same class of mistake as a gate that never runs,
+and the reason a skip is reported rather than folded into a pass.
+
+Also corrected while here: `verify.rs`'s two error strings blamed "a nightly toolchain" for
+what is really a missing or empty `--emit=mir` output file -- a message that sends a reader
+to install a compiler that would not have helped. They now name the actual condition, and
+its doc comment and the README's source table and example no longer tell the reader to point
+`DISCHARGE_RUSTC` at a nightly.

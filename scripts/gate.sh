@@ -99,19 +99,30 @@ else
   echo "   (kani not installed; skipped -- 'cargo install --locked kani-verifier && cargo kani setup')"
 fi
 
-echo "== 8/17 MIR frontend, on real rustc MIR (skipped if no rustc is named) =="
-# The MIR frontend shells out to `rustc --emit=mir`. That works on a *stable* compiler:
-# `-Zunpretty=mir` is nightly-only, but `--emit=mir` is not, so a stable `rustc` is enough
-# for the whole `tests/mir.rs` suite (verified on 1.85, the MSRV, and on current stable).
-# It takes the compiler from DISCHARGE_RUSTC rather than RUSTC so that naming a different
-# rustc does not disturb the cargo that is building these tests. Without one named, the
-# frontend's tests skip themselves -- so this gate says so rather than passing in silence,
-# exactly like Kani and Verus below. CI names a nightly anyway, out of caution, because a
-# dump-format change is what the rustc_public oracle in step 10 exists to catch.
+echo "== 8/17 MIR frontend, on real rustc MIR =="
+# The MIR frontend shells out to `rustc --emit=mir`. That is a *stable* flag: `-Zunpretty=mir`
+# is the nightly-only spelling, and the frontend deliberately does not use it, so a stable
+# `rustc` runs the whole `tests/mir.rs` suite (verified on 1.85, the MSRV, and on current
+# stable). That makes this gate runnable everywhere rather than only where a nightly happens
+# to be installed, which is the point: the "stable is enough" claim is only worth anything if
+# something checks it on a stable compiler.
+#
+# It takes the compiler from DISCHARGE_RUSTC rather than RUSTC so that naming a *different*
+# rustc -- a nightly, or the oracle's toolchain -- does not disturb the cargo that is building
+# these tests. Falling back to `rustc` on PATH is what lets the gate run with no setup at all;
+# it used to skip in that case, which left the stable claim unpinned. It skips only when no
+# `rustc` can be found at all, and says so, exactly like Kani and Verus below.
+if [ -z "${DISCHARGE_RUSTC:-}" ]; then
+  if command -v rustc >/dev/null 2>&1; then
+    DISCHARGE_RUSTC="$(command -v rustc)"
+    export DISCHARGE_RUSTC
+    echo "   (DISCHARGE_RUSTC not set; using the rustc on PATH: $DISCHARGE_RUSTC)"
+  fi
+fi
 if [ -n "${DISCHARGE_RUSTC:-}" ]; then
   cargo run -q --features std --example mir_demo || fail "MIR demo"
 else
-  echo "   (DISCHARGE_RUSTC not set; skipped -- set it to 'rustup which --toolchain nightly rustc')"
+  echo "   (no rustc on PATH and DISCHARGE_RUSTC unset; skipped -- the frontend needs a rustc)"
 fi
 
 echo "== 9/17 verus differential oracle (skipped if verus is absent) =="

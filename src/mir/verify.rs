@@ -43,14 +43,17 @@ pub enum MirSource {
 
 /// Get MIR text for a Rust file, or explain why not.
 ///
-/// `rustc --emit=mir` requires nightly; the error is returned rather than
-/// papered over, because "the frontend could not run" and "the code is wrong"
-/// must never be reported the same way.
+/// `rustc --emit=mir` is a *stable* flag -- `-Zunpretty=mir` is the nightly-only
+/// spelling, and this frontend deliberately does not use it, so the frontend runs
+/// on the same stable compiler that builds the crate (checked down to the MSRV,
+/// 1.85). The error is returned rather than papered over, because "the frontend
+/// could not run" and "the code is wrong" must never be reported the same way.
 ///
 /// The compiler is taken from `DISCHARGE_RUSTC` when set, and otherwise from
-/// `rustc` on `PATH`. The dedicated variable exists so that pointing this tool
-/// at a nightly does not disturb the `rustc` that cargo is using to build the
-/// test suite -- setting `RUSTC` would do exactly that.
+/// `rustc` on `PATH`. The dedicated variable exists so that pointing this tool at
+/// a *different* compiler -- a nightly, or the rustc_public oracle's toolchain --
+/// does not disturb the `rustc` that cargo is using to build the test suite;
+/// setting `RUSTC` would do exactly that.
 pub fn emit_mir(file: &Path) -> Result<String, String> {
     let rustc = std::env::var("DISCHARGE_RUSTC").unwrap_or_else(|_| "rustc".into());
     emit_mir_with(&rustc, file)
@@ -58,8 +61,9 @@ pub fn emit_mir(file: &Path) -> Result<String, String> {
 
 /// [`emit_mir`] with the compiler named explicitly.
 ///
-/// This exists so a test can point at a nightly toolchain without mutating the
-/// process environment, which is a race when tests run in parallel.
+/// This exists so a test can point at a *specific* toolchain -- the MSRV, say, or
+/// a nightly -- without mutating the process environment, which is a race when
+/// tests run in parallel.
 pub fn emit_mir_with(rustc: &str, file: &Path) -> Result<String, String> {
     // `rustc` writes its intermediate artifacts next to the output path, so the
     // output goes to a temp file rather than to `/dev/stdout` -- pointing it at
@@ -92,14 +96,16 @@ pub fn emit_mir_with(rustc: &str, file: &Path) -> Result<String, String> {
     }
     let text = std::fs::read_to_string(&out_path).map_err(|e| {
         format!(
-            "rustc produced no MIR for {} ({e}); `--emit=mir` needs a nightly toolchain",
+            "rustc produced no MIR for {} ({e}); `--emit=mir` is stable, so this is a \
+             missing output file rather than a toolchain problem",
             file.display()
         )
     })?;
     let _ = std::fs::remove_file(&out_path);
     if text.trim().is_empty() {
         return Err(format!(
-            "rustc produced empty MIR for {}; `--emit=mir` needs a nightly toolchain",
+            "rustc produced empty MIR for {}; `--emit=mir` is stable, so check the \
+             file's crate type and that it defines an item with a body",
             file.display()
         ));
     }

@@ -1244,8 +1244,7 @@ obligations it finds — the overflow, underflow and divide-by-zero `assert`s th
 re-modelled by hand, so there is nothing to keep in sync.
 
 ```console
-$ DISCHARGE_RUSTC=$(rustup which --toolchain nightly rustc) \
-    cargo run --features std --example mir_demo
+$ cargo run --features std --example mir_demo
 === examples/mir_targets/actuator.rs ===
 clamp            verified (3 obligation(s), 0 panic(s) ruled out)
 rate_limit       verified (5 obligation(s), 2 panic(s) ruled out)
@@ -1629,7 +1628,7 @@ constructor runs.
 |---|---|---|
 | the body | `rustc --emit=mir` | the real lowering, including the checks `rustc` inserts |
 | the contract | the source text | MIR carries no attributes or doc comments |
-| the compiler | `DISCHARGE_RUSTC`, else `rustc` | `--emit=mir` needs nightly; naming it separately keeps cargo's `rustc` alone |
+| the compiler | `DISCHARGE_RUSTC`, else `rustc` | `--emit=mir` is stable, so the `rustc` on `PATH` is enough; the variable exists to point the frontend at a *different* compiler without disturbing cargo's own |
 
 The five differential oracles (z3, Kani, Lean, Coq, Verus) all build their terms
 with `smt::` calls, so they start *below* the contract reader. That left the reader
@@ -1652,8 +1651,11 @@ release that stabilised the edition, the floor and the edition are the same
 decision — there is no version that takes one without the other.
 
 The floor is a *lower* bound, not a pin. Everything here builds on the current
-stable (1.99 at the time of writing) and the frontend runs a nightly, so the
-crate is exercised on recent compilers rather than held back to an old one. The
+stable (1.99 at the time of writing), and the MIR frontend runs on that same
+stable `rustc`: `--emit=mir` is a stable flag, checked here down to 1.85, so no
+part of the product needs a nightly. Only two *oracles* do — `tools/mir-oracle`
+links `rustc_public` and the `rustc-dev` component, and Kani tracks a nightly —
+and an oracle is a test tool that never enters the dependency tree. The
 toolchains the oracles pin are newer still and move independently: Verus tracks
 stable (`channel = "1.99.1"`), Kani tracks a nightly, and Ferrocene — the
 qualified compiler, which is the one whose ceiling could matter for a safety
