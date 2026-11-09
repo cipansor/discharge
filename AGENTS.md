@@ -6886,6 +6886,13 @@ the same rule the body resolution uses, so a contract is found for exactly the f
 frontend can name. Because `by_fn` is keyed by bare identifiers, the tail match is unique by
 construction and no ambiguity branch is needed.
 
+> **Superseded (see "A contract on a nested item was keyed by its bare name" below).**
+> `by_fn` is now keyed by the *full source path* (`a::f`, `T::value`, `f::g`), because a
+> nested item's MIR name carries a path a bare key never had -- which dropped the contract
+> and reported the body `Verified { obligations: 0 }`. `resolve` now matches the exact path,
+> then a *unique* `::`-aligned suffix, and an ambiguous suffix is refused rather than taken.
+> The bare-identifier reasoning above held only while every key was a bare name.
+
 **Evidence.** Corpus `decided 312 of 588` -> **`313 of 590`** (the two new method fixtures:
 the true direction is now decided *with* its postcondition checked, the false direction is a
 definite refutation); `scripts/test-count.sh` **702 -> 704** passed, 0 failed; `cargo test
@@ -7032,3 +7039,84 @@ resolution found *a* contract rather than dropping the method (a missing contrac
 would not catch a drop). The `mir_coverage` example now lists methods alongside free
 functions and reports the `Owner::method` key when a tail is ambiguous, so a shared tail
 appears once per method instead of vanishing from the scoreboard.
+
+## A contract on a nested item was keyed by its bare name -- a dropped contract is a false proof
+
+The method fix above keyed a *method* by its `impl`'s location. A **free function**
+had no such key: `Specs::by_fn` was keyed by the bare source name, and `resolve`
+matched only the exact MIR name. But rustc names a function's *definition* by the
+shortest crate-unique path suffix, so a nested item's printed name carries a path
+the bare key never had:
+
+* a free function inside a `mod` is `a::f` (bare `f` only when that is already
+  unique crate-wide), a trait's default method is `T::value`, and a function nested
+  in a function is `f::g`.
+
+None of those matched the bare key, so the contract was **dropped**. A dropped
+contract is not a refusal: `verify_function` builds its precondition and
+postcondition from `contract`, so a missing one means `requires: true` and *no*
+`ensures` -- the body was reported `Verified { obligations: 0 }` and never checked.
+A false postcondition (`/// ensures: ret == 9` on a body returning 7) came back
+**proved**. Two sibling `mod`s that each declared `f` were worse: one bare key, the
+later `insert` overwrote the earlier, so one body was checked against the other's
+claim -- a lost proof for one, a false proof for the other.
+
+Two scan defects sat underneath the same keying:
+
+* **A brace-on-the-next-line header.** `impl Foo` with the `{` on the following
+  line raises no brace depth on its own line, so the old pop ("depth has not
+  increased") fired *before* the header's methods and every method contract was
+  keyed as a free function's -- which then never matched `<impl at …>::m`.
+* **A one-line body.** `impl Foo { pub fn m(&self) -> u8 { 1 } }` raises and
+  returns the depth *within* the line, so a pop keyed on the final depth never
+  fired and the `impl` stayed open over the rest of the file, qualifying every
+  later function as its method.
+
+**The fix.** `enclosing_impls` became `line_scopes`, which returns a `LineScope`
+per line: the innermost `impl`'s `(line, column)` **and** the enclosing
+`mod`/`trait`/`fn` names. A header frame now carries an `opened` flag set when a
+brace opens under it, so the pop waits for the matching close; a header with no
+brace that ends in `;` (`mod a;`) is dropped so it does not linger. `extract` keys
+every non-method contract by its **full source path** (`a::f`, `T::value`, `f::g`).
+`Specs::resolve` matches the exact path first (so `a::f` and `b::a::f` stay apart
+once rustc prints both in full), then a *unique* `::`-aligned suffix
+(`is_path_suffix`); an ambiguous suffix is **refused**, not guessed, and a refusal
+shows up as `missing`, which is visible. `resolve_targets` in `verify.rs` pairs the
+same path-qualified keys to MIR bodies the same way. `select` matches a request
+against the key, the MIR name, or a bare tail of *either*, so `f`, `a::f` and
+`Owner::f` all find their target.
+
+## A `const` generic parameter leaked a function-local `const` -- a false proof
+
+The const table is the second half of the bare-name story. `parse::bare_const_uses`
+scans the whole crate for a bare `const NAME` use site to tell a crate-level `const`
+from a function-local one (the definition alone cannot: the dump prints both
+identically). But a **`const` generic parameter's** *uses* print bare too --
+`fn f<const N: usize>()` is erased from the fn header while `N as u8` prints as
+`const N`, the very spelling a crate-level item's use site gets. So a const-generic
+`N` anywhere made `N` look "used bare", a function-local `const N` in some *other*
+function kept a bare program-wide key, and an unrelated contract naming `N`
+resolved to that local's value. Depending on the claim that is a **false proof**
+(`requires: N != 3` on a leaked `N == 3` is a vacuous precondition) or a spurious
+`Failed`. Both the inline (`fn f<const N: usize>`) and split
+(`fn f<\n const N: usize,\n>`) shapes leaked.
+
+**The fix is positional, in two places.** A `const` generic parameter is always
+written `const NAME:` immediately after a `<` or `,`; a `const` *item* never is.
+`const_generic_params` reads the parameter names (skipping comments and string/char
+literals), and `crate_level_consts` refuses a `const NAME:` whose preceding
+non-space character -- on the same line, or the previous line's last character for
+a split list -- is `<` or `,`. The parser then removes those names from
+`bare_const_uses`, so the const-generic's bare uses no longer mask a local item.
+The name is only *removed from the bare-use set*, not refused outright: a genuine
+crate-level `const N` beside a const-generic `N` is still read (pinned by
+`a_crate_level_const_is_still_read_beside_a_const_generic`).
+
+**Evidence.** `scripts/test-count.sh` **718 -> 728** passed, 0 failed;
+`scripts/gate.sh` **ALL GATES GREEN**; clippy (both halves) and rustdoc clean; zero
+dependencies and `no_std` untouched. Nine new integration tests in `tests/mir.rs`
+and two new unit tests pin the verdicts, and each was checked for teeth by
+reverting its guard: without the path keying the trait-default and module tests
+report `Verified { obligations: 0 }`; without the `bare_uses.remove` loop
+`a_const_generic_does_not_leak_a_local_const` fails; without `prev_last` the split
+`crate_level_consts` case fails.

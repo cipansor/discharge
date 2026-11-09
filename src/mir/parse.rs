@@ -1657,9 +1657,10 @@ pub fn parse_program_scoped(
     text: &str,
     enums: &BTreeMap<String, EnumLayout>,
     crate_consts: &std::collections::BTreeSet<String>,
+    const_generics: &std::collections::BTreeSet<String>,
     impl_owners: &BTreeMap<(usize, usize), String>,
 ) -> MirProgram {
-    parse_program_impl(text, enums, crate_consts, impl_owners)
+    parse_program_impl(text, enums, crate_consts, const_generics, impl_owners)
 }
 
 /// [`parse_program`] with the enum layouts from the source.
@@ -1670,13 +1671,20 @@ pub fn parse_program_scoped(
 /// dump, so it is passed in. An empty map is the old behaviour: `Option`/`Result`
 /// resolve from their built-in numbering and every other enum refuses a downcast.
 pub fn parse_program_with(text: &str, enums: &BTreeMap<String, EnumLayout>) -> MirProgram {
-    parse_program_impl(text, enums, &std::collections::BTreeSet::new(), &BTreeMap::new())
+    parse_program_impl(
+        text,
+        enums,
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
+        &BTreeMap::new(),
+    )
 }
 
 fn parse_program_impl(
     text: &str,
     enums: &BTreeMap<String, EnumLayout>,
     crate_consts: &std::collections::BTreeSet<String>,
+    const_generics: &std::collections::BTreeSet<String>,
     impl_owners: &BTreeMap<(usize, usize), String>,
 ) -> MirProgram {
     let lines: Vec<&str> = text.lines().collect();
@@ -1684,8 +1692,14 @@ fn parse_program_impl(
         MirProgram { enums: enums.clone(), impl_owners: impl_owners.clone(), ..MirProgram::default() };
     // Which bare names are ever used as a `const` at a use site, so a definition
     // can be told a crate-level item from a function-local one. See
-    // [`bare_const_uses`].
-    let bare_uses = bare_const_uses(text);
+    // [`bare_const_uses`]. A `const` generic parameter's uses print bare too but
+    // are not items at all, so its names are removed: otherwise a function-local
+    // `const N` in some other function would keep a bare program-wide key. See
+    // [`crate::mir::spec::const_generic_params`].
+    let mut bare_uses = bare_const_uses(text);
+    for name in const_generics {
+        bare_uses.remove(name);
+    }
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
@@ -2308,14 +2322,14 @@ fn add(_1: u32, _2: u32) -> u32 {
         // With it, the definition is kept so a contract can name it.
         let mut scoped = std::collections::BTreeSet::new();
         scoped.insert("ONLY".to_string());
-        let prog = parse_program_scoped(dump, &BTreeMap::new(), &scoped, &BTreeMap::new());
+        let prog = parse_program_scoped(dump, &BTreeMap::new(), &scoped, &std::collections::BTreeSet::new(), &BTreeMap::new());
         assert_eq!(prog.consts.get("ONLY"), Some(&Const::UInt(7, Some(Ty::U8))));
         // The tell must not resurrect a name the source did *not* declare: a
         // function-local `L` (used qualified) stays out of the table.
         let dump2 = "fn f() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
                      _0 = const f::L;\n        return;\n    }\n}\n\
                      const L: u8 = const 3_u8;\n";
-        let prog2 = parse_program_scoped(dump2, &BTreeMap::new(), &scoped, &BTreeMap::new());
+        let prog2 = parse_program_scoped(dump2, &BTreeMap::new(), &scoped, &std::collections::BTreeSet::new(), &BTreeMap::new());
         assert!(!prog2.consts.contains_key("L"), "a name not in the source's set stays out");
     }
 

@@ -615,7 +615,7 @@ pub fn verify_file_with(
     let specs = spec::extract(&text);
     let mir = emit_mir_with(rustc, source)?;
     let prog =
-        parse::parse_program_scoped(&mir, &enum_layouts(&specs), &specs.crate_consts, &specs.impl_owners);
+        parse::parse_program_scoped(&mir, &enum_layouts(&specs), &specs.crate_consts, &specs.const_generics, &specs.impl_owners);
 
     let (targets, missing) = resolve_targets(&prog, &specs);
     let mut report = FileReport { source: source.to_path_buf(), missing, ..Default::default() };
@@ -674,10 +674,28 @@ fn resolve_targets<'a>(
     let mut targets: Vec<(String, &MirFn)> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
 
-    for name in specs.by_fn.keys() {
-        match prog.get(name) {
-            Some(f) => targets.push((name.clone(), f)),
-            None => missing.push(name.clone()),
+    for key in specs.by_fn.keys() {
+        // The contract key is the full source path; the MIR definition name is the
+        // shortest crate-unique suffix of it. An exact match wins outright (so
+        // `a::f` and `b::a::f` stay apart -- rustc prints both in full once they
+        // collide); only when there is none does a unique `::`-aligned suffix
+        // count. Two suffix candidates is a refusal, not a guess: a wrong pairing
+        // would check one body against another's contract.
+        if let Some(f) = prog.fns.iter().find(|f| f.name == *key) {
+            targets.push((key.clone(), f));
+            continue;
+        }
+        let mut found: Option<&MirFn> = None;
+        let mut count = 0usize;
+        for f in &prog.fns {
+            if spec::is_path_suffix(key, &f.name) {
+                found = Some(f);
+                count += 1;
+            }
+        }
+        match (count, found) {
+            (1, Some(f)) => targets.push((key.clone(), f)),
+            _ => missing.push(key.clone()),
         }
     }
     for (line, col, method) in specs.by_method.keys() {
@@ -721,7 +739,15 @@ fn select<'a>(
     for want in only {
         let mut found = false;
         for (key, f) in targets {
-            if want == key || f.name == *want || f.name.rsplit("::").next() == Some(want.as_str()) {
+            // `key` is the report key (a method's `Owner::method`, or a free
+            // function's full source path). A request matches the key, the MIR
+            // name, or a bare tail of either -- so `f`, `a::f` and `Owner::f` all
+            // find their target without over-matching a different owner.
+            if want == key
+                || f.name == *want
+                || key.rsplit("::").next() == Some(want.as_str())
+                || f.name.rsplit("::").next() == Some(want.as_str())
+            {
                 out.push((key.clone(), *f));
                 found = true;
             }
@@ -742,7 +768,7 @@ pub fn verify_mir_text(
     only: &[String],
 ) -> Result<FileReport, String> {
     let prog =
-        parse::parse_program_scoped(mir, &enum_layouts(specs), &specs.crate_consts, &specs.impl_owners);
+        parse::parse_program_scoped(mir, &enum_layouts(specs), &specs.crate_consts, &specs.const_generics, &specs.impl_owners);
     let (targets, missing) = resolve_targets(&prog, specs);
     let mut report = FileReport { missing, ..Default::default() };
     for (key, f) in select(&prog, &targets, only) {

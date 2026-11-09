@@ -77,12 +77,17 @@ fn main() {
 
     println!("{:<22} {:<12} {:>9}  detail", "function", "outcome", "elapsed");
     let mut decided = 0usize;
-    for name in &names {
-        if let Some(want) = &only {
-            if name != want {
-                continue;
-            }
-        }
+    // With a filter, hand the *whole* requested name to the driver once. The list
+    // above holds bare tails, but a method whose tail is shared is *reported* as
+    // `Owner::method`, so a reader who copies a name out of the output must be
+    // able to paste it back. Passing it through lets `verify_mir_text` match the
+    // report key exactly (one row for one `Owner::method`) while a bare tail still
+    // matches every owner that shares it.
+    let selected: Vec<String> = match &only {
+        Some(want) => vec![want.clone()],
+        None => names.clone(),
+    };
+    for name in &selected {
         let started = Instant::now();
         let Ok(report) = verify::verify_mir_text(&mir, &specs, std::slice::from_ref(name)) else {
             println!("{name:<22} {:<12} {:>9}  driver error", "error", "-");

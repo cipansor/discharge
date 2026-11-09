@@ -6184,3 +6184,165 @@ fn two_impls_with_a_shared_method_tail_do_not_conflate_contracts() {
         assert_eq!(kind, "postcondition", "{key}: the failure must be the postcondition, got `{kind}`");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Path-aware contract resolution (F1/F2/F3/F4)
+//
+// rustc names a function's *definition* by the shortest crate-unique path suffix,
+// not by its bare name: a free function inside `a` is `a::f` when two modules
+// declare `f`, a trait's default method is `T::value`, and a function nested in a
+// function is `f::g`. The contract table used to key every non-method contract by
+// the bare source name and match only the exact MIR name, so any nested item's
+// contract was *dropped* -- and a dropped contract is not a refusal: the function
+// was built with `requires: true` and no `ensures`, and a false postcondition was
+// reported `Verified { obligations: 0 }`. Each test below is a false postcondition
+// that must be *refuted*, or a pair of same-named items that must not share a
+// contract.
+// ---------------------------------------------------------------------------
+
+/// A trait's default method must be checked against its own contract.
+///
+/// The MIR prints the definition `T::value`, but the contract was keyed `value`,
+/// so it was dropped and the false postcondition verified with zero obligations.
+#[test]
+fn a_trait_default_method_is_checked_against_its_contract() {
+    let src = "pub trait T {\n    /// ensures: ret == 9\n    fn value(&self) -> u8 { 7 }\n}\n";
+    let o = verify_src("T::value", src).expect("T::value must be verified, not dropped");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("a trait default with a false postcondition must be refuted, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+}
+
+/// A free function nested in a module must be checked against its own contract.
+///
+/// The MIR prints `m::f`, but the contract was keyed `f`, so the false
+/// postcondition verified with zero obligations.
+#[test]
+fn a_module_nested_free_function_is_checked_against_its_contract() {
+    let src = "pub mod m {\n    /// ensures: ret == 9\n    pub fn f() -> u8 { 7 }\n}\n";
+    let o = verify_src("m::f", src).expect("m::f must be verified, not dropped");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("a module function with a false postcondition must be refuted, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+}
+
+/// Two sibling modules that each declare `f` must not share one contract.
+///
+/// A bare key let the second `f` overwrite the first, so one module's body was
+/// checked against the other's claim: a lost proof for one, a false proof for the
+/// other. Here the left claim is false and the right true, and each must be judged
+/// by its own.
+#[test]
+fn two_sibling_modules_do_not_share_a_contract() {
+    let src = "pub mod a {\n    /// ensures: ret == 9\n    pub fn f() -> u8 { 1 }\n}\n\
+               pub mod b {\n    /// ensures: ret == 2\n    pub fn f() -> u8 { 2 }\n}\n";
+    let left = verify_src("a::f", src).expect("a::f must be present");
+    let FnOutcome::Failed { kind, .. } = left else {
+        panic!("a::f has a false postcondition and must be refuted, got: {left}");
+    };
+    assert_eq!(kind, "postcondition", "a::f: the failure must be the postcondition, got `{kind}`");
+    let right = verify_src("b::f", src).expect("b::f must be present");
+    assert!(right.is_verified(), "b::f's own contract is true and must verify, got: {right}");
+}
+
+/// A trait default and a free function that share a name must keep separate
+/// contracts: `A::v` is the trait's, `v` the function's.
+#[test]
+fn a_trait_default_and_a_free_function_do_not_share_a_contract() {
+    let src = "/// ensures: ret == 9\npub fn v() -> u8 { 1 }\n\
+               pub trait A {\n    /// ensures: ret == 2\n    fn v(&self) -> u8 { 2 }\n}\n";
+    let free = verify_src("v", src).expect("v must be present");
+    let FnOutcome::Failed { kind, .. } = free else {
+        panic!("the free `v` has a false postcondition and must be refuted, got: {free}");
+    };
+    assert_eq!(kind, "postcondition", "v: the failure must be the postcondition, got `{kind}`");
+    let method = verify_src("A::v", src).expect("A::v must be present");
+    assert!(method.is_verified(), "the trait default's own contract is true, got: {method}");
+}
+
+/// F1: an `impl` header whose `{` is on the next line still owns its methods.
+///
+/// A brace-on-the-next-line header raises no depth on its own line, so a pop
+/// keyed on "depth has not increased" dropped it before its methods and each
+/// contract was keyed as a free function's -- which then never matched the
+/// `<impl at …>::m` name, and the false postcondition verified with zero
+/// obligations.
+#[test]
+fn a_multiline_impl_header_still_owns_its_methods() {
+    let src = "pub struct Foo;\nimpl Foo\n{\n    /// ensures: ret == 9\n    pub fn m(&self) -> u8 { 1 }\n}\n";
+    let o = verify_src("m", src).expect("m must be present");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("a method of a multiline impl with a false postcondition must be refuted, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+}
+
+/// A one-line impl body must not leave the `impl` open over the rest of the file.
+///
+/// The header's brace opens and closes within its own line, so a pop keyed on the
+/// final depth would never fire and every later function would be read as a
+/// method of that `impl` -- keyed by location, and so never matched.
+#[test]
+fn a_one_line_impl_body_does_not_leak_its_scope() {
+    let src = "pub struct Foo;\nimpl Foo { pub fn m(&self) -> u8 { 1 } }\n\
+               /// ensures: ret == 9\npub fn g() -> u8 { 1 }\n";
+    let o = verify_src("g", src).expect("g must be present");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("g has a false postcondition and must be refuted, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+}
+
+// ---------------------------------------------------------------------------
+// The `const` scope scan (the const-generic leak)
+// ---------------------------------------------------------------------------
+
+/// A `const` generic parameter must not make a function-local `const` of the same
+/// name look crate-level.
+///
+/// A const-generic's *uses* print as a bare `const N`, the same spelling a
+/// crate-level item's use site gets, so the whole-crate bare-use test kept a
+/// function-local `const N` under a bare program-wide key. A contract on an
+/// unrelated function could then name `N` and resolve it to that local's value --
+/// a false proof (or a spurious vacuous-precondition failure). The name is not an
+/// item at all, so it must be ignored.
+#[test]
+fn a_const_generic_does_not_leak_a_local_const() {
+    let src = "pub fn cg<const N: usize>() -> u8 { N as u8 }\n\
+               pub fn owner() -> u8 { const N: u8 = 3; N }\n\
+               /// requires: N == 3\n/// ensures: ret == N\npub fn reads() -> u8 { 3 }\n";
+    let o = verify_src("reads", src).expect("reads must be present");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "a contract naming the leaked local `N` must be refused, not decided, got: {o}"
+    );
+}
+
+/// The same leak with the parameter list split across lines.
+#[test]
+fn a_split_const_generic_does_not_leak_a_local_const() {
+    let src = "pub fn cg<\n    const N: usize,\n>() -> u8 { N as u8 }\n\
+               pub fn owner() -> u8 { const N: u8 = 3; N }\n\
+               /// requires: N == 3\n/// ensures: ret == N\npub fn reads() -> u8 { 3 }\n";
+    let o = verify_src("reads", src).expect("reads must be present");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "a contract naming the leaked local `N` must be refused, not decided, got: {o}"
+    );
+}
+
+/// The scan must still read a genuine crate-level `const` that shares a name with
+/// a const-generic parameter elsewhere, so the fix is a narrowing, not a blanket
+/// refusal of the name.
+#[test]
+fn a_crate_level_const_is_still_read_beside_a_const_generic() {
+    let src = "pub const N: u8 = 5;\npub fn cg<const N: usize>() -> usize { N }\n\
+               /// ensures: ret == N\npub fn reads() -> u8 { 5 }\n";
+    let specs = spec::extract(src);
+    assert!(specs.crate_consts.contains("N"), "the crate-level `N` must still be read");
+    assert!(specs.const_generics.contains("N"), "the const-generic `N` must be recognized");
+    let o = verify_src("reads", src).expect("reads must be present");
+    assert!(o.is_verified(), "`ret == N` with crate `N == 5` must verify, got: {o}");
+}

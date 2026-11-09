@@ -176,6 +176,15 @@ pub struct Specs {
     /// module-scoped and its bare definition must be kept. See
     /// [`crate_level_consts`] and `parse::parse_program_scoped`.
     pub crate_consts: BTreeSet<String>,
+    /// The names of `const` generic parameters declared anywhere in the source.
+    ///
+    /// A `const` generic parameter's *uses* print as a bare `const N`, the same
+    /// spelling a crate-level item's use site gets, so the whole-crate bare-use
+    /// heuristic would keep a function-local `const N` under a bare program-wide
+    /// key and let an unrelated contract resolve `N` to that local's value -- a
+    /// false proof. This set is what the parser subtracts from the bare uses. See
+    /// [`const_generic_params`].
+    pub const_generics: BTreeSet<String>,
     /// The owner type of each `impl` block, keyed by the 1-based `(line, column)`
     /// of its `impl` keyword -- the same location rustc prints in a method's
     /// definition name `<impl at FILE:L:C: L:C>::m`.
@@ -184,7 +193,7 @@ pub struct Specs {
     /// type; without this map there is no way to tell `A::value` from `B::value`
     /// (a lost proof: each is checked against the other's contract) or a local
     /// `impl Foo::from` from an external `u16::from` (a false proof: a call to the
-    /// external function is answered by the local body). See `enclosing_impls`.
+    /// external function is answered by the local body). See `line_scopes`.
     pub impl_owners: BTreeMap<(usize, usize), String>,
     /// Contracts on methods, keyed by `(impl line, impl column, method name)`.
     ///
@@ -283,19 +292,28 @@ impl Specs {
 
     /// The contract for a function whose MIR definition name is `name`.
     ///
-    /// The name is rustc's: a free function's bare name, or a method's
+    /// The name is rustc's: a free function's path-qualified name (`f`, `a::f`,
+    /// `f::g`), a trait default's `T::value`, or a method's
     /// `<impl at FILE:L:C: L:C>::m`. A method's contract is found by that
     /// `(line, column)` and the method's tail -- never by the tail alone, because
     /// two `impl` blocks may each declare `m` and a tail match would then hand one
     /// method the other's contract (a lost proof: a true postcondition refuted, or
     /// worse, a false one proved).
     ///
-    /// The dump names an inherent method `<impl at FILE:L:C: L:C>::f`, while the
-    /// source's contract for a free function is keyed by the bare `f`. Matching
-    /// only the exact name left every method's contract unresolved, and an
-    /// unresolved contract is not a refusal: `verify_function` builds its
+    /// A non-method contract is keyed by its *full source path* (see
+    /// [`Specs::by_fn`]). rustc prints a definition by the shortest crate-unique
+    /// path suffix, so the printed name is either the full path or a `::`-aligned
+    /// tail of it: `f` when the name is unique crate-wide, `a::f` when two modules
+    /// each declare `f`, `T::value` for a trait default. The match is exact first
+    /// (so `a::f` and `b::a::f` stay apart -- rustc prints both in full once they
+    /// collide), then a unique suffix. An ambiguous suffix is *refused*, not
+    /// guessed: a wrong pairing is a lost or false proof, whereas a refusal makes
+    /// the caller report the contract `missing`, which is visible.
+    ///
+    /// Matching only the exact name left every nested item's contract unresolved,
+    /// and an unresolved contract is not a refusal: `verify_function` builds its
     /// precondition and postcondition from `contract`, so a missing one means
-    /// `requires: true` and *no* `ensures` -- a method with a false postcondition
+    /// `requires: true` and *no* `ensures` -- a function with a false postcondition
     /// was reported verified with zero obligations, the body never checked at all.
     pub fn resolve(&self, name: &str) -> Option<&FnContract> {
         if let Some(c) = self.by_fn.get(name) {
@@ -305,7 +323,22 @@ impl Specs {
             let tail = name.rsplit("::").next()?;
             return self.by_method.get(&(loc.0, loc.1, tail.to_string()));
         }
-        None
+        // A path-qualified non-method name (`a::f`, `T::value`): the contract may
+        // be keyed by that exact path, or by a longer path it is a suffix of.
+        // Collect every suffix match and take it only when it is unique.
+        let mut hit: Option<&FnContract> = None;
+        let mut count = 0usize;
+        for (key, c) in &self.by_fn {
+            if is_path_suffix(key, name) {
+                hit = Some(c);
+                count += 1;
+            }
+        }
+        if count == 1 {
+            hit
+        } else {
+            None
+        }
     }
 }
 
@@ -315,7 +348,7 @@ impl Specs {
 /// holds *two* locations: the first is the `impl` keyword itself, the second is
 /// the end of the `impl` header (`impl A` spans columns 1..7, so `impl A {` prints
 /// `4:1: 4:7`). The owner type is the thing at the keyword, so the first pair is
-/// the one that matters -- and it is what `enclosing_impls` records.
+/// the one that matters -- and it is what `line_scopes` records.
 ///
 /// The file part is split off at the `: ` that separates the two locations, so a
 /// path containing a colon (a Windows drive) does not confuse the parse.
@@ -330,6 +363,77 @@ pub(crate) fn impl_location(name: &str) -> Option<(usize, usize)> {
     let col = parts.next()?;
     let line = parts.next()?;
     Some((line.trim().parse().ok()?, col.trim().parse().ok()?))
+}
+
+/// The names of `const` generic parameters declared anywhere in the source.
+///
+/// A `const` generic parameter (`fn f<const N: usize>()`) is erased from the MIR
+/// dump's function header, but its *uses* print as a bare `const N` -- the same
+/// spelling a crate-level `const N` item's use site gets. That collides with the
+/// whole-crate heuristic [`crate_level_consts`] and `parse::bare_const_uses` use to
+/// tell a crate-level item from a function-local one: a const-generic `N` makes
+/// `N` look "used bare", so a function-local `const N` in some *other* function
+/// keeps a bare program-wide key, and an unrelated contract naming `N` resolves to
+/// that local's value -- a false proof (or a spurious vacuous-precondition
+/// failure). The names are read here so both passes can ignore them.
+///
+/// The tell is positional: a `const` generic parameter is always written
+/// `const NAME:` immediately after a `<` (first parameter) or a `,` (a later one),
+/// whereas a `const` *item* is never preceded by either. So a `const NAME:` whose
+/// preceding non-space character is `<` or `,` is a parameter.
+pub fn const_generic_params(source: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Skip comments and string/char literals so a `const N:` in text is not read.
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'"' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                if bytes[i] == b'\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if bytes[i..].starts_with(b"const ") {
+            // The preceding non-space character decides: `<`/`,` means a generic
+            // parameter, anything else (or the start of the file) an item.
+            let before = source[..i].trim_end().as_bytes().last().copied();
+            if matches!(before, Some(b'<') | Some(b',')) {
+                let after = &source[i + "const ".len()..];
+                let name: String = after
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                let plain =
+                    name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+                if plain && after[name.len()..].trim_start().starts_with(':') {
+                    out.insert(name);
+                }
+            }
+            i += "const ".len();
+            continue;
+        }
+        i += 1;
+    }
+    out
 }
 
 /// The names of `const` items declared at module scope -- outside any brace.
@@ -352,6 +456,10 @@ pub fn crate_level_consts(source: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let mut depth: i32 = 0;
     let mut in_block_comment = false;
+    // The last non-whitespace byte of the preceding lines, so a `const NAME:`
+    // that starts a line can still be told a generic parameter (the `<` or `,`
+    // sits on an earlier line) from an item. See [`const_generic_params`].
+    let mut prev_last: Option<u8> = None;
     for raw in source.lines() {
         let mut line = raw;
         // Block comments can span lines; a brace inside one is not code.
@@ -373,18 +481,27 @@ pub fn crate_level_consts(source: &str) -> BTreeSet<String> {
         }
         // A `const NAME: …` at depth zero is a crate-level item. The name is read
         // before the braces on the line are counted, so `const L: u8 = 3;` is
-        // caught while a `const` inside a `fn` body (depth > 0) is not.
+        // caught while a `const` inside a `fn` body (depth > 0) is not. A
+        // `const` generic parameter is not an item, and is told apart by what
+        // precedes it: a parameter follows a `<` or `,`, an item never does. The
+        // `<`/`,` may sit on an earlier line (a multi-line parameter list), which
+        // is what `prev_last` carries. See [`const_generic_params`].
         if depth == 0 {
             let t = line.trim_start();
             let t = t.strip_prefix("pub(crate) ").or_else(|| t.strip_prefix("pub ")).unwrap_or(t);
             if let Some(after) = t.strip_prefix("const ") {
+                let preceded = line[..line.len() - t.len()].trim_end().as_bytes().last().copied();
+                let before = preceded.or(prev_last);
                 let name: String = after
                     .chars()
                     .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
                     .collect();
                 let plain =
                     name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
-                if plain && after[name.len()..].trim_start().starts_with(':') {
+                if plain
+                    && !matches!(before, Some(b'<') | Some(b','))
+                    && after[name.len()..].trim_start().starts_with(':')
+                {
                     out.insert(name);
                 }
             }
@@ -419,28 +536,72 @@ pub fn crate_level_consts(source: &str) -> BTreeSet<String> {
             }
             i += 1;
         }
+        if let Some(c) = line.trim_end().as_bytes().last() {
+            prev_last = Some(*c);
+        }
     }
     out
 }
 
-/// The `impl` block each source line sits inside, as `(line, column)` of the
-/// `impl` keyword, or `None` for a line outside every `impl`.
+/// One source line's scope, from [`line_scopes`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LineScope {
+    /// The innermost `impl` the line sits inside, as the `(line, column)` of its
+    /// `impl` keyword, or `None`. See [`Specs::impl_owners`].
+    pub impl_loc: Option<(usize, usize)>,
+    /// The enclosing `mod`/`trait`/`fn` item names, outermost first. A method's
+    /// `impl` is *not* an element (it is named by location, not by a path); a
+    /// `fn`'s own name is not an element of the scope of the line that declares
+    /// it, because the scope is read before that line's items open. A nested `fn`
+    /// therefore sees its outer `fn` in `path`, which is exactly how rustc composes
+    /// `f::g`.
+    pub path: Vec<String>,
+}
+
+/// The kind of item a source line opens, for [`line_scopes`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ItemKind {
+    Impl,
+    Mod,
+    Trait,
+    Fn,
+}
+
+/// One open item on the [`line_scopes`] stack.
+struct ScopeFrame {
+    kind: ItemKind,
+    name: String,
+    impl_loc: Option<(usize, usize)>,
+    open_depth: i32,
+    opened: bool,
+}
+
+/// The scope of every source line: the innermost `impl` (its keyword location)
+/// and the enclosing `mod`/`trait`/`fn` path.
 ///
-/// rustc names an inherent method's *definition* `<impl at FILE:L:C: L:C>::m`,
-/// which identifies the `impl` block by the location of its `impl` keyword but
-/// names no type at all. The owner type -- the thing that tells `Foo::from` from
-/// `u16::from`, or `A::value` from `B::value` -- is only in the source, on the
-/// very line that location points at. This pass is what recovers it: it walks the
+/// rustc names a function's *definition* by its shortest crate-unique path
+/// suffix, so a free function inside a `mod` is printed `a::f` (or bare `f` when
+/// that is already unique crate-wide), a trait's default method is printed
+/// `T::value`, and a function nested in a function is printed `f::g`. The source
+/// is the only place the full path exists, so this pass recovers it: it walks the
 /// file counting brace depth (outside strings, chars and comments) and, for each
-/// line, records the innermost `impl` it is inside.
+/// line, records the `impl` it is inside and the `mod`/`trait`/`fn` names around
+/// it. [`Specs::resolve`] then matches a MIR name to a contract by that path, so a
+/// nested item's contract is found rather than silently dropped (a false proof).
 ///
 /// The map is indexed by 0-based line number, so a contract's `fn` at 1-based
 /// line `L` looks up `L - 1`.
-pub(crate) fn enclosing_impls(source: &str) -> Vec<Option<(usize, usize)>> {
+pub(crate) fn line_scopes(source: &str) -> Vec<LineScope> {
     let lines: Vec<&str> = source.lines().collect();
-    let mut out: Vec<Option<(usize, usize)>> = vec![None; lines.len()];
-    // Innermost-last: the location of each open `impl` and the depth it opened at.
-    let mut stack: Vec<((usize, usize), i32)> = Vec::new();
+    let mut out: Vec<LineScope> = vec![LineScope::default(); lines.len()];
+    // Innermost-last. The `opened` flag is what a brace-on-the-next-line header
+    // needs: Rust accepts `impl Foo` (or `mod a`, `fn f()`) with the `{` on a
+    // later line, and such a header raises no depth on its own line -- so a pop
+    // keyed on "depth has not increased" would drop it *before* its items, and
+    // every nested contract would be keyed as if the item were absent (a false
+    // proof). The flag keeps the header alive until a brace opens under it and the
+    // depth finally returns.
+    let mut stack: Vec<ScopeFrame> = Vec::new();
     let mut depth: i32 = 0;
     let mut in_block_comment = false;
     for (idx, raw) in lines.iter().enumerate() {
@@ -462,13 +623,40 @@ pub(crate) fn enclosing_impls(source: &str) -> Vec<Option<(usize, usize)>> {
                 break;
             }
         }
-        // The innermost `impl` open *before* this line's own braces are counted.
-        out[idx] = stack.last().map(|(loc, _)| *loc);
+        // The scope of this line is read *before* its own items open, so a `fn`
+        // that declares a contract is not inside itself.
+        let impl_loc =
+            stack.iter().rev().find(|f| f.kind == ItemKind::Impl).and_then(|f| f.impl_loc);
+        let path: Vec<String> = stack
+            .iter()
+            .filter(|f| matches!(f.kind, ItemKind::Mod | ItemKind::Trait | ItemKind::Fn))
+            .map(|f| f.name.clone())
+            .collect();
+        out[idx] = LineScope { impl_loc, path };
         if let Some(col) = impl_keyword_col(raw) {
-            stack.push(((idx + 1, col), depth));
+            stack.push(ScopeFrame {
+                kind: ItemKind::Impl,
+                name: String::new(),
+                impl_loc: Some((idx + 1, col)),
+                open_depth: depth,
+                opened: false,
+            });
+        } else if let Some((kind, name)) = item_head(raw) {
+            stack.push(ScopeFrame {
+                kind,
+                name,
+                impl_loc: None,
+                open_depth: depth,
+                opened: false,
+            });
         }
-        // Count braces outside strings, chars and line comments.
+        // Count braces outside strings, chars and line comments. The maximum
+        // depth reached on this line is what tells a header whether its own body
+        // opened: a one-line body (`fn f() -> u8 { 1 }`) raises and returns the
+        // depth within the line, so comparing the *final* depth would miss it and
+        // leave the frame on the stack, qualifying every later line.
         let bytes = line.as_bytes();
+        let mut line_max_depth = depth;
         let mut i = 0;
         while i < bytes.len() {
             match bytes[i] {
@@ -491,16 +679,35 @@ pub(crate) fn enclosing_impls(source: &str) -> Vec<Option<(usize, usize)>> {
                         i += 1;
                     }
                 }
-                b'{' => depth += 1,
+                b'{' => {
+                    depth += 1;
+                    line_max_depth = line_max_depth.max(depth);
+                }
                 b'}' => depth -= 1,
                 _ => {}
             }
             i += 1;
         }
-        // An `impl` whose block has closed by the end of this line is no longer
-        // enclosing anything: pop it once the depth returns to where it opened.
-        while let Some((_, open_depth)) = stack.last() {
-            if depth <= *open_depth {
+        // Mark a pending header as opened once a brace has opened under it, so its
+        // pop waits for the matching close instead of firing on the header line.
+        if let Some(last) = stack.last_mut() {
+            if line_max_depth > last.open_depth {
+                last.opened = true;
+            }
+        }
+        // A header with no brace that ends in `;` declares an item without a body
+        // (`mod a;`, a trait's `fn f();`): it never opens, so it must not linger on
+        // the stack and qualify every later line.
+        if let Some(last) = stack.last() {
+            if !last.opened && line.trim_end().ends_with(';') {
+                stack.pop();
+            }
+        }
+        // An item whose block has closed by the end of this line is no longer
+        // enclosing anything: pop it once its brace has opened and the depth
+        // returns to where it opened. A header that has not opened yet is kept.
+        while let Some(f) = stack.last() {
+            if f.opened && depth <= f.open_depth {
                 stack.pop();
             } else {
                 break;
@@ -508,6 +715,80 @@ pub(crate) fn enclosing_impls(source: &str) -> Vec<Option<(usize, usize)>> {
         }
     }
     out
+}
+
+/// The `mod`/`trait`/`fn` item a source line opens, if it opens one.
+///
+/// Only a line whose first token (after visibility and modifiers) is `mod`,
+/// `trait` or `fn` counts, so a mention inside a comment or a call like
+/// `fn_call()` is not an item. The name is the leading identifier, which is all
+/// rustc's own path uses -- generics (`fn f<T>`) and arguments are dropped.
+fn item_head(raw: &str) -> Option<(ItemKind, String)> {
+    let mut rest = raw.trim_start();
+    loop {
+        let t = rest.trim_start();
+        let mut advanced = false;
+        for p in [
+            "pub(crate)",
+            "pub(self)",
+            "pub(super)",
+            "pub",
+            "unsafe",
+            "async",
+            "const",
+            "default",
+            "extern",
+        ] {
+            if let Some(r) = t.strip_prefix(p) {
+                if r.starts_with(|c: char| c.is_whitespace()) {
+                    rest = r;
+                    advanced = true;
+                    break;
+                }
+            }
+        }
+        if !advanced {
+            rest = t;
+            break;
+        }
+    }
+    // An `extern "C"` ABI string sits between the keyword and `fn`.
+    if let Some(after) = rest.strip_prefix('"') {
+        if let Some(end) = after.find('"') {
+            rest = after[end + 1..].trim_start();
+        }
+    }
+    let (kw, kind) = if let Some(r) = rest.strip_prefix("mod ") {
+        (r, ItemKind::Mod)
+    } else if let Some(r) = rest.strip_prefix("trait ") {
+        (r, ItemKind::Trait)
+    } else if rest.starts_with("fn ") {
+        return Some((ItemKind::Fn, fn_name(raw)?));
+    } else {
+        return None;
+    };
+    let name: String = kw.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+    if name.is_empty() {
+        None
+    } else {
+        Some((kind, name))
+    }
+}
+
+/// Whether `suffix` is a `::`-aligned tail of `path` (`f` and `b::f` are tails of
+/// `a::b::f`; `b::f` is not a tail of `a::bf`).
+///
+/// This is the inverse of how rustc shortens a definition name: it prints the
+/// shortest path suffix that is unique crate-wide, so the printed name is always a
+/// `::`-aligned tail of the item's full path.
+pub(crate) fn is_path_suffix(path: &str, suffix: &str) -> bool {
+    if suffix.is_empty() || path.len() <= suffix.len() {
+        return false;
+    }
+    if !path.ends_with(suffix) {
+        return false;
+    }
+    path.as_bytes()[path.len() - suffix.len() - 1] == b':'
 }
 
 /// The 1-based column of an `impl` keyword on this line, if it has one.
@@ -604,13 +885,20 @@ pub fn extract(source: &str) -> Specs {
     // otherwise lose its definition and go unreadable. See
     // [`Specs::crate_consts`].
     specs.crate_consts = crate_level_consts(source);
+    // Which names are `const` generic parameters, so the parser can ignore their
+    // bare uses when telling a crate-level `const` from a function-local one. See
+    // [`const_generic_params`].
+    specs.const_generics = const_generic_params(source);
 
     // Which `impl` block each line is inside, and the owner type of each. rustc
     // names a method's definition by the location of the `impl` keyword, so the
     // owner type -- the only thing that distinguishes `A::value` from `B::value`
     // -- has to be read here, from the same source the contract text comes from.
     // See [`Specs::impl_owners`].
-    let enclosing = enclosing_impls(source);
+    let scopes = line_scopes(source);
+    let enclosing: Vec<Option<(usize, usize)>> =
+        scopes.iter().map(|s| s.impl_loc).collect();
+    let scope_path: Vec<Vec<String>> = scopes.iter().map(|s| s.path.clone()).collect();
     for (idx, raw) in source.lines().enumerate() {
         if let Some(col) = impl_keyword_col(raw) {
             if let Some(owner) = impl_owner(raw) {
@@ -775,14 +1063,26 @@ pub fn extract(source: &str) -> Specs {
                 pending.line = lineno + 1;
                 // A method's contract is keyed by its `impl`'s location, so two
                 // `impl` blocks that each declare `value` keep separate entries
-                // instead of one overwriting the other. A free function (no
-                // enclosing `impl`) keeps its bare name.
+                // instead of one overwriting the other.
+                //
+                // Anything else is keyed by its *full source path* -- the enclosing
+                // `mod`/`trait`/`fn` names and its own. rustc names a definition by
+                // the shortest crate-unique path suffix (`T::value` for a trait
+                // default, `a::f` for a free function in `a`, `f::g` for a function
+                // nested in `f`), and a bare key would (a) collide for two `mod`s
+                // that each declare `f`, one silently overwriting the other (a lost
+                // proof), and (b) never match a MIR name that carries the path, so
+                // the contract would be dropped and the body checked against no
+                // postcondition (a false proof). [`Specs::resolve`] matches the
+                // full path, then a unique suffix of it.
                 match enclosing.get(lineno).copied().flatten() {
                     Some(loc) => {
                         specs.by_method.insert((loc.0, loc.1, name), std::mem::take(&mut pending));
                     }
                     None => {
-                        specs.by_fn.insert(name, std::mem::take(&mut pending));
+                        let mut path = scope_path.get(lineno).cloned().unwrap_or_default();
+                        path.push(name);
+                        specs.by_fn.insert(path.join("::"), std::mem::take(&mut pending));
                     }
                 }
             }
@@ -7060,6 +7360,12 @@ impl Foo {
 }
 
 fn g<const N: usize>() -> usize { N }
+
+fn h<
+    const SPLIT: usize,
+>() -> usize {
+    SPLIT
+}
 "#;
         let names = crate_level_consts(src);
         assert!(names.contains("LIMIT"), "a crate-level const is read: {names:?}");
@@ -7070,5 +7376,40 @@ fn g<const N: usize>() -> usize { N }
         assert!(!names.contains("LOCAL"), "a function-local const is not read: {names:?}");
         assert!(!names.contains("IN_STRING"), "a const inside a string is not read: {names:?}");
         assert!(!names.contains("ASSOC"), "an associated const is not read: {names:?}");
+        assert!(
+            !names.contains("N"),
+            "a `const` generic parameter is not a module-scope item: {names:?}"
+        );
+        // The parameter list split across lines is the shape the scan actually
+        // meets: the `const` opens a line, so only the *preceding* line's last
+        // character (`<`) says it is a parameter rather than an item.
+        assert!(
+            !names.contains("SPLIT"),
+            "a `const` generic parameter on its own line is not an item: {names:?}"
+        );
+    }
+
+    /// `const_generic_params` reads parameters and only parameters.
+    ///
+    /// A parameter is written `const NAME:` after a `<` or `,`; an item never is.
+    /// The tell has to survive the parameter list being split across lines, and it
+    /// must not fire on a `const` item, an associated constant, or a `const` in a
+    /// comment or string.
+    #[test]
+    fn const_generic_params_reads_only_parameters() {
+        let names = const_generic_params(
+            "fn f<const N: usize>() -> usize { N }\n\
+             fn g<\n    const M: usize,\n>(x: usize) -> usize { x + M }\n\
+             const ITEM: u8 = 1;\n\
+             struct S<const K: usize>([u8; K]);\n\
+             // const COMMENT: u8 = 2;\n\
+             fn h() { let s = \"const STR: u8 = 3\"; let _ = s; }\n",
+        );
+        assert!(names.contains("N"), "an inline parameter is read: {names:?}");
+        assert!(names.contains("M"), "a parameter after a line break is read: {names:?}");
+        assert!(names.contains("K"), "a parameter in a type's list is read: {names:?}");
+        assert!(!names.contains("ITEM"), "a `const` item is not a parameter: {names:?}");
+        assert!(!names.contains("COMMENT"), "a commented-out parameter is not read: {names:?}");
+        assert!(!names.contains("STR"), "a parameter inside a string is not read: {names:?}");
     }
 }
