@@ -614,30 +614,14 @@ pub fn verify_file_with(
         .map_err(|e| format!("could not read {}: {e}", source.display()))?;
     let specs = spec::extract(&text);
     let mir = emit_mir_with(rustc, source)?;
-    let prog = parse::parse_program_scoped(&mir, &enum_layouts(&specs), &specs.crate_consts);
+    let prog =
+        parse::parse_program_scoped(&mir, &enum_layouts(&specs), &specs.crate_consts, &specs.impl_owners);
 
-    let mut report = FileReport { source: source.to_path_buf(), ..Default::default() };
-
-    // Every contracted function must exist in the dump; a contract naming a
-    // function that is not there is a coverage hole, not a silent pass.
-    for name in specs.by_fn.keys() {
-        if prog.get(name).is_none() {
-            report.missing.push(name.clone());
-        }
-    }
-
-    let wanted: Vec<String> = if only.is_empty() {
-        specs.by_fn.keys().cloned().collect()
-    } else {
-        only.to_vec()
-    };
-
-    for name in wanted {
-        let Some(f) = prog.get(&name) else {
-            continue;
-        };
+    let (targets, missing) = resolve_targets(&prog, &specs);
+    let mut report = FileReport { source: source.to_path_buf(), missing, ..Default::default() };
+    for (key, f) in select(&prog, &targets, only) {
         let outcome = smt::with_fresh(|| verify_function(&prog, f, &specs));
-        report.outcomes.push((name, outcome));
+        report.outcomes.push((key, outcome));
     }
     Ok(report)
 }
@@ -661,28 +645,109 @@ fn enum_layouts(specs: &Specs) -> BTreeMap<String, parse::EnumLayout> {
         .collect()
 }
 
+/// The `(report key, function)` pairs for every function the source declared a
+/// contract for, plus the contracted names the dump did not contain.
+///
+/// A free function's contract is keyed by its bare name, which is unique in a
+/// file. A method's is keyed by the `(line, column)` of its `impl`, so it is
+/// matched to the dump function carrying that same location -- never by the
+/// method's bare name alone, which two `impl` blocks can share. A method the dump
+/// does not contain is reported missing, exactly like a free function, so a
+/// contract cannot be silently dropped.
+///
+/// The report key is the bare method name when no other contracted method shares
+/// it, and `Owner::method` when one does: two methods named `value` would
+/// otherwise collapse into one `outcomes` entry and only one of them would be
+/// visible. The bare name is preferred because it is what a reader looks for, and
+/// it is exactly what the MIR dump itself uses as the method's tail.
+fn resolve_targets<'a>(
+    prog: &'a MirProgram,
+    specs: &Specs,
+) -> (Vec<(String, &'a MirFn)>, Vec<String>) {
+    // How many contracted methods share each tail, so a colliding one can be
+    // spelled `Owner::method` and stay distinguishable.
+    let mut tail_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for (_, _, method) in specs.by_method.keys() {
+        *tail_counts.entry(method.as_str()).or_default() += 1;
+    }
+
+    let mut targets: Vec<(String, &MirFn)> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+
+    for name in specs.by_fn.keys() {
+        match prog.get(name) {
+            Some(f) => targets.push((name.clone(), f)),
+            None => missing.push(name.clone()),
+        }
+    }
+    for (line, col, method) in specs.by_method.keys() {
+        match prog.fns.iter().find(|f| f.impl_loc == Some((*line, *col))
+            && f.name.rsplit("::").next() == Some(method.as_str()))
+        {
+            Some(f) => {
+                let ambiguous = tail_counts.get(method.as_str()).copied().unwrap_or(0) > 1
+                    || specs.by_fn.contains_key(method.as_str());
+                let key = if ambiguous {
+                    match prog.impl_owners.get(&(*line, *col)) {
+                        Some(owner) => format!("{owner}::{method}"),
+                        None => f.name.clone(),
+                    }
+                } else {
+                    method.clone()
+                };
+                targets.push((key, f));
+            }
+            None => missing.push(method.clone()),
+        }
+    }
+    (targets, missing)
+}
+
+/// The targets to check: all of them when `only` is empty, otherwise those whose
+/// report key or bare tail is named in `only`.
+///
+/// A name in `only` that matches no contracted target is still looked up in the
+/// dump, so naming a function that carries no contract keeps checking it for panic
+/// freedom rather than silently reporting nothing.
+fn select<'a>(
+    prog: &'a MirProgram,
+    targets: &[(String, &'a MirFn)],
+    only: &[String],
+) -> Vec<(String, &'a MirFn)> {
+    if only.is_empty() {
+        return targets.to_vec();
+    }
+    let mut out: Vec<(String, &'a MirFn)> = Vec::new();
+    for want in only {
+        let mut found = false;
+        for (key, f) in targets {
+            if want == key || f.name == *want || f.name.rsplit("::").next() == Some(want.as_str()) {
+                out.push((key.clone(), *f));
+                found = true;
+            }
+        }
+        if !found {
+            if let Some(f) = prog.get(want) {
+                out.push((want.clone(), f));
+            }
+        }
+    }
+    out
+}
+
 /// Verify a whole MIR dump, using contracts from a companion source file.
 pub fn verify_mir_text(
     mir: &str,
     specs: &Specs,
     only: &[String],
 ) -> Result<FileReport, String> {
-    let prog = parse::parse_program_scoped(mir, &enum_layouts(specs), &specs.crate_consts);
-    let mut report = FileReport::default();
-    for name in specs.by_fn.keys() {
-        if prog.get(name).is_none() {
-            report.missing.push(name.clone());
-        }
-    }
-    let wanted: Vec<String> = if only.is_empty() {
-        specs.by_fn.keys().cloned().collect()
-    } else {
-        only.to_vec()
-    };
-    for name in wanted {
-        let Some(f) = prog.get(&name) else { continue };
+    let prog =
+        parse::parse_program_scoped(mir, &enum_layouts(specs), &specs.crate_consts, &specs.impl_owners);
+    let (targets, missing) = resolve_targets(&prog, specs);
+    let mut report = FileReport { missing, ..Default::default() };
+    for (key, f) in select(&prog, &targets, only) {
         let outcome = smt::with_fresh(|| verify_function(&prog, f, specs));
-        report.outcomes.push((name, outcome));
+        report.outcomes.push((key, outcome));
     }
     Ok(report)
 }

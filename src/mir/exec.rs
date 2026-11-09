@@ -2306,7 +2306,7 @@ fn call_type(name: &str) -> Option<String> {
 /// a receiver would let a call to an *external* `Vec2::m` resolve to `Foo::m` --
 /// answering a call from the wrong body, which is a false proof. A free function
 /// has no `self` either and is also `None`, so callers distinguish the two by the
-/// definition name (see [`is_impl_method`]).
+/// definition name (see [`impl_self_loc`]).
 fn method_self_type(f: &MirFn) -> Option<String> {
     let self_local = f
         .debug_bindings
@@ -2323,10 +2323,31 @@ fn method_self_type(f: &MirFn) -> Option<String> {
     }
 }
 
-/// Whether the definition name is rustc's printed form for a method in an `impl`
-/// block (`<impl at FILE:L:C: L:C>::m`), as opposed to a free function's bare name.
-fn is_impl_method(f: &MirFn) -> bool {
-    f.name.contains("<impl at")
+/// The `(line, column)` of the `impl` block a method belongs to, from its
+/// definition name `<impl at FILE:L:C: L:C>::m`, or `None` for a free function.
+///
+/// This is the identity rustc gives a method that is *not* its `self` type: a
+/// static associated function's receiver is absent, so the only thing tying it to
+/// a type is the `impl` block it was written in, and that block is named by
+/// location. See [`method_owner_type`].
+fn impl_self_loc(f: &MirFn) -> Option<(usize, usize)> {
+    if !f.name.contains("<impl at") {
+        return None;
+    }
+    f.impl_loc
+}
+
+/// The owner type of a method's `impl`, read from the source via the location in
+/// its definition name, or `None` when that cannot be established.
+///
+/// An instance method's `self` type already names the type it is implemented for,
+/// but a *static* associated function has no `self` to read, so its owner is only
+/// known from the `impl` block's own source line. `None` here means the call
+/// cannot be matched to this method by type, so the safe direction is to refuse
+/// the call rather than answer it from a body that may not be the one named.
+fn method_owner_type(prog: &MirProgram, f: &MirFn) -> Option<String> {
+    let loc = impl_self_loc(f)?;
+    prog.impl_owners.get(&loc).cloned()
 }
 
 /// Resolve a call name to the function in the dump it names.
@@ -2339,16 +2360,20 @@ fn is_impl_method(f: &MirFn) -> bool {
 /// The tail alone is not enough. `Vec2::push` and `Vec::<u8>::push`, or a free
 /// `wrapping_add` and `core::num::<impl u8>::wrapping_add`, share a tail while
 /// naming different functions, and answering such a call from the wrong body is a
-/// false proof. Two guards keep that from happening:
+/// false proof. Three guards keep that from happening:
 ///
 /// * A call name that still carries an `impl` projection (`…::<impl u8>::…`) is a
 ///   `core`/`std` callee. rustc prints a *local* method call with its concrete
 ///   type (`Vec2::push`, `<S as T>::m`), never with `<impl`, so such a name is
 ///   never a same-dump call and is refused outright.
 /// * A surviving candidate must be the method for the same type: an instance
-///   method's `self` type must equal the call's type, and a static associated
-///   function (whose `self` type cannot be read) is accepted on the unique tail
-///   only. A free function never matches a qualified call, because rustc prints a
+///   method's `self` type must equal the call's type, and a *static* associated
+///   function -- which has no `self` to read -- must have an `impl` whose owner
+///   type equals the call's type. The owner is read from the source; when it
+///   cannot be established the candidate is refused, because a static method's
+///   tail is otherwise shared by any type (`<u16 as From<u8>>::from` would answer
+///   a local `impl Foo { fn from }`, a false proof).
+/// * A free function never matches a qualified call, because rustc prints a
 ///   same-crate free function's call bare -- the exact-match case above.
 ///
 /// `None` means the call is not modelled, which the caller reports rather than
@@ -2368,7 +2393,10 @@ fn resolve_callee(prog: &MirProgram, name: &str) -> Option<usize> {
         }
         match method_self_type(g) {
             Some(self_ty) => self_ty == want_ty,
-            None => is_impl_method(g),
+            None => match method_owner_type(prog, g) {
+                Some(owner_ty) => owner_ty == want_ty,
+                None => false,
+            },
         }
     });
     match (hits.next(), hits.next()) {

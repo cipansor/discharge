@@ -176,6 +176,25 @@ pub struct Specs {
     /// module-scoped and its bare definition must be kept. See
     /// [`crate_level_consts`] and `parse::parse_program_scoped`.
     pub crate_consts: BTreeSet<String>,
+    /// The owner type of each `impl` block, keyed by the 1-based `(line, column)`
+    /// of its `impl` keyword -- the same location rustc prints in a method's
+    /// definition name `<impl at FILE:L:C: L:C>::m`.
+    ///
+    /// The dump's method name identifies the `impl` by location and names no
+    /// type; without this map there is no way to tell `A::value` from `B::value`
+    /// (a lost proof: each is checked against the other's contract) or a local
+    /// `impl Foo::from` from an external `u16::from` (a false proof: a call to the
+    /// external function is answered by the local body). See `enclosing_impls`.
+    pub impl_owners: BTreeMap<(usize, usize), String>,
+    /// Contracts on methods, keyed by `(impl line, impl column, method name)`.
+    ///
+    /// A method's contract cannot live in [`Self::by_fn`] under its bare name: two
+    /// `impl` blocks may each declare a `value`, and one entry would silently
+    /// overwrite the other, so one method's body would be checked against the
+    /// other's claim. The location disambiguates them, exactly as it does in the
+    /// dump. [`Self::by_fn`] keeps free functions (whose bare name is unique
+    /// within a file); a method is recorded here instead.
+    pub by_method: BTreeMap<(usize, usize, String), FnContract>,
 }
 
 /// An enum's variants, in declaration order.
@@ -254,32 +273,63 @@ impl StructDef {
 
 impl Specs {
     /// The contract attached to `name`, if the source declared one.
+    ///
+    /// Only free functions are looked up: a method's contract is keyed by its
+    /// `impl`'s location, so [`Self::resolve`] is the entry point that takes the
+    /// MIR name. This stays for callers that already know they hold a bare name.
     pub fn get(&self, name: &str) -> Option<&FnContract> {
         self.by_fn.get(name)
     }
 
-    /// The contract for a function whose MIR name is `name`, resolved the way the
-    /// frontend resolves the *body*: an exact match first, then a unique match on
-    /// the last `::` segment.
+    /// The contract for a function whose MIR definition name is `name`.
+    ///
+    /// The name is rustc's: a free function's bare name, or a method's
+    /// `<impl at FILE:L:C: L:C>::m`. A method's contract is found by that
+    /// `(line, column)` and the method's tail -- never by the tail alone, because
+    /// two `impl` blocks may each declare `m` and a tail match would then hand one
+    /// method the other's contract (a lost proof: a true postcondition refuted, or
+    /// worse, a false one proved).
     ///
     /// The dump names an inherent method `<impl at FILE:L:C: L:C>::f`, while the
-    /// source's contract is keyed by the bare `f` (the scanner records the
-    /// identifier after `fn`, and a key is therefore never itself qualified).
-    /// Matching only the exact name left every method's contract unresolved, and an
+    /// source's contract for a free function is keyed by the bare `f`. Matching
+    /// only the exact name left every method's contract unresolved, and an
     /// unresolved contract is not a refusal: `verify_function` builds its
     /// precondition and postcondition from `contract`, so a missing one means
     /// `requires: true` and *no* `ensures` -- a method with a false postcondition
     /// was reported verified with zero obligations, the body never checked at all.
-    ///
-    /// A tail that no key matches stays `None`; because keys are bare, a tail
-    /// match is unique by construction.
     pub fn resolve(&self, name: &str) -> Option<&FnContract> {
         if let Some(c) = self.by_fn.get(name) {
             return Some(c);
         }
-        let tail = name.rsplit("::").next()?;
-        self.by_fn.get(tail)
+        if let Some(loc) = impl_location(name) {
+            let tail = name.rsplit("::").next()?;
+            return self.by_method.get(&(loc.0, loc.1, tail.to_string()));
+        }
+        None
     }
+}
+
+/// The `(line, column)` an `<impl at FILE:L:C: L:C>` name carries, if it is one.
+///
+/// rustc prints a method's definition as `<impl at FILE:L:C: L:C>::m`. The name
+/// holds *two* locations: the first is the `impl` keyword itself, the second is
+/// the end of the `impl` header (`impl A` spans columns 1..7, so `impl A {` prints
+/// `4:1: 4:7`). The owner type is the thing at the keyword, so the first pair is
+/// the one that matters -- and it is what `enclosing_impls` records.
+///
+/// The file part is split off at the `: ` that separates the two locations, so a
+/// path containing a colon (a Windows drive) does not confuse the parse.
+pub(crate) fn impl_location(name: &str) -> Option<(usize, usize)> {
+    // A method may be module-qualified (`inner::<impl at …>::d`), so the marker
+    // is searched for rather than required at the front.
+    let start = name.find("<impl at ")? + "<impl at ".len();
+    let inner = name[start..].split('>').next()?;
+    // `FILE:L:C: L:C` -- the head is the keyword's own `L:C`.
+    let (head, _end) = inner.rsplit_once(": ")?;
+    let mut parts = head.rsplit(':');
+    let col = parts.next()?;
+    let line = parts.next()?;
+    Some((line.trim().parse().ok()?, col.trim().parse().ok()?))
 }
 
 /// The names of `const` items declared at module scope -- outside any brace.
@@ -373,6 +423,166 @@ pub fn crate_level_consts(source: &str) -> BTreeSet<String> {
     out
 }
 
+/// The `impl` block each source line sits inside, as `(line, column)` of the
+/// `impl` keyword, or `None` for a line outside every `impl`.
+///
+/// rustc names an inherent method's *definition* `<impl at FILE:L:C: L:C>::m`,
+/// which identifies the `impl` block by the location of its `impl` keyword but
+/// names no type at all. The owner type -- the thing that tells `Foo::from` from
+/// `u16::from`, or `A::value` from `B::value` -- is only in the source, on the
+/// very line that location points at. This pass is what recovers it: it walks the
+/// file counting brace depth (outside strings, chars and comments) and, for each
+/// line, records the innermost `impl` it is inside.
+///
+/// The map is indexed by 0-based line number, so a contract's `fn` at 1-based
+/// line `L` looks up `L - 1`.
+pub(crate) fn enclosing_impls(source: &str) -> Vec<Option<(usize, usize)>> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut out: Vec<Option<(usize, usize)>> = vec![None; lines.len()];
+    // Innermost-last: the location of each open `impl` and the depth it opened at.
+    let mut stack: Vec<((usize, usize), i32)> = Vec::new();
+    let mut depth: i32 = 0;
+    let mut in_block_comment = false;
+    for (idx, raw) in lines.iter().enumerate() {
+        let mut line = *raw;
+        // A brace inside a block comment is not code.
+        loop {
+            if in_block_comment {
+                match line.find("*/") {
+                    Some(i) => {
+                        in_block_comment = false;
+                        line = &line[i + 2..];
+                    }
+                    None => line = "",
+                }
+            } else if let Some(i) = line.find("/*") {
+                in_block_comment = true;
+                line = &line[i + 2..];
+            } else {
+                break;
+            }
+        }
+        // The innermost `impl` open *before* this line's own braces are counted.
+        out[idx] = stack.last().map(|(loc, _)| *loc);
+        if let Some(col) = impl_keyword_col(raw) {
+            stack.push(((idx + 1, col), depth));
+        }
+        // Count braces outside strings, chars and line comments.
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'/' if bytes.get(i + 1) == Some(&b'/') => break,
+                b'"' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        if bytes[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                b'\'' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'\'' {
+                        if bytes[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        // An `impl` whose block has closed by the end of this line is no longer
+        // enclosing anything: pop it once the depth returns to where it opened.
+        while let Some((_, open_depth)) = stack.last() {
+            if depth <= *open_depth {
+                stack.pop();
+            } else {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// The 1-based column of an `impl` keyword on this line, if it has one.
+///
+/// The column is what rustc prints in `<impl at FILE:L:C: …>`, so it must match
+/// rustc's own count: 1-based, counting characters from the start of the line.
+/// Only a line whose first non-space token is `impl` (optionally after `unsafe`)
+/// counts, so a nested `impl` inside a body is found but a mention of `impl` in a
+/// comment or identifier is not.
+fn impl_keyword_col(raw: &str) -> Option<usize> {
+    let trimmed = raw.trim_start();
+    let offset = raw.len() - trimmed.len();
+    let (rest, col0) = match trimmed.strip_prefix("unsafe ") {
+        Some(r) => (r, offset + "unsafe ".len()),
+        None => (trimmed, offset),
+    };
+    let rest = rest.strip_prefix("impl")?;
+    // `impl` must be a whole word: `impl_thing` is an identifier.
+    if rest.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some(raw[..col0].chars().count() + 1)
+}
+
+/// The owner type of an `impl` header, as the base type name rustc prints in a
+/// call (`Foo` in `Foo::m`, `Slot` in `<Slot as Stow>::stash`).
+///
+/// `impl Foo` -> `Foo`; `impl Stow for Slot` -> `Slot` (the type after `for`);
+/// `impl<T> Gen<T>` -> `Gen`; `impl From<u8> for Bar` -> `Bar`. A generic
+/// parameter list is skipped before the first type name, and the base name is
+/// taken so a call's `base_type` (which strips generics) compares equal.
+pub(crate) fn impl_owner(header: &str) -> Option<String> {
+    let after = header.trim_start().strip_prefix("unsafe ").unwrap_or(header.trim_start());
+    let rest = after.strip_prefix("impl")?;
+    // Skip an `impl<T, U>` parameter list.
+    let rest = rest.trim_start();
+    let rest = if let Some(r) = rest.strip_prefix('<') {
+        let mut depth = 1usize;
+        let mut end = 0usize;
+        for (i, c) in r.char_indices() {
+            match c {
+                '<' => depth += 1,
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        &r[end..]
+    } else {
+        rest
+    };
+    // `for` selects the implementing type; otherwise the first type is the owner.
+    let (before, after_for) = match rest.split_once(" for ") {
+        Some((b, a)) => (b, Some(a)),
+        None => (rest, None),
+    };
+    let source = after_for.unwrap_or(before);
+    let name: String = source
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+
 /// Extract contracts from Rust source text.
 ///
 /// The scanner is line-oriented and deliberately shallow: it collects
@@ -394,6 +604,20 @@ pub fn extract(source: &str) -> Specs {
     // otherwise lose its definition and go unreadable. See
     // [`Specs::crate_consts`].
     specs.crate_consts = crate_level_consts(source);
+
+    // Which `impl` block each line is inside, and the owner type of each. rustc
+    // names a method's definition by the location of the `impl` keyword, so the
+    // owner type -- the only thing that distinguishes `A::value` from `B::value`
+    // -- has to be read here, from the same source the contract text comes from.
+    // See [`Specs::impl_owners`].
+    let enclosing = enclosing_impls(source);
+    for (idx, raw) in source.lines().enumerate() {
+        if let Some(col) = impl_keyword_col(raw) {
+            if let Some(owner) = impl_owner(raw) {
+                specs.impl_owners.insert((idx + 1, col), owner);
+            }
+        }
+    }
 
     // Struct layouts, read in the same pass. The MIR dump names a struct
     // (`_1: &Config`) but never prints its fields, so a contract like
@@ -549,7 +773,18 @@ pub fn extract(source: &str) -> Specs {
                 || !pending.decreases.is_empty()
             {
                 pending.line = lineno + 1;
-                specs.by_fn.insert(name, std::mem::take(&mut pending));
+                // A method's contract is keyed by its `impl`'s location, so two
+                // `impl` blocks that each declare `value` keep separate entries
+                // instead of one overwriting the other. A free function (no
+                // enclosing `impl`) keeps its bare name.
+                match enclosing.get(lineno).copied().flatten() {
+                    Some(loc) => {
+                        specs.by_method.insert((loc.0, loc.1, name), std::mem::take(&mut pending));
+                    }
+                    None => {
+                        specs.by_fn.insert(name, std::mem::take(&mut pending));
+                    }
+                }
             }
             pending = FnContract::default();
             continue;

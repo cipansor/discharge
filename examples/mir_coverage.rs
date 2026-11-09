@@ -66,20 +66,25 @@ fn main() {
     };
     let specs = spec::extract(&source);
 
-    // Order by name so the output is diffable between runs.
-    let mut names: Vec<&String> = specs.by_fn.keys().collect();
+    // Order by name so the output is diffable between runs. Methods are listed by
+    // their bare tail, like free functions, because that is what a reader looks
+    // for; two `impl` blocks that share a tail are reported under `Owner::method`
+    // by the driver, so they still appear once each.
+    let mut names: Vec<String> = specs.by_fn.keys().cloned().collect();
+    names.extend(specs.by_method.keys().map(|(_, _, m)| m.clone()));
     names.sort();
+    names.dedup();
 
     println!("{:<22} {:<12} {:>9}  detail", "function", "outcome", "elapsed");
     let mut decided = 0usize;
     for name in &names {
         if let Some(want) = &only {
-            if *name != want {
+            if name != want {
                 continue;
             }
         }
         let started = Instant::now();
-        let Ok(report) = verify::verify_mir_text(&mir, &specs, std::slice::from_ref(*name)) else {
+        let Ok(report) = verify::verify_mir_text(&mir, &specs, std::slice::from_ref(name)) else {
             println!("{name:<22} {:<12} {:>9}  driver error", "error", "-");
             continue;
         };
@@ -96,7 +101,11 @@ fn main() {
         }
     }
     if only.is_none() {
-        println!("\ndecided {decided} of {}", names.len());
+        // Every free function and every method is one outcome, so the
+        // denominator is their sum -- a shared method tail is deduplicated for
+        // display but is still two outcomes.
+        let total = specs.by_fn.len() + specs.by_method.len();
+        println!("\ndecided {decided} of {total}");
     }
 }
 

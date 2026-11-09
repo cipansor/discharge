@@ -7106,3 +7106,101 @@ pub fn a_recursive_contract_naming_a_const_is_resolved(n: u8) -> u8 {
         a_recursive_contract_naming_a_const_is_resolved(n - 1)
     }
 }
+
+// ---------------------------------------------------------------------------
+// F3: a static associated function's owner is not in the dump
+//
+// A *static* associated function has no `self`, so its definition name
+// `<impl at FILE:L:C: L:C>::m` carries no type the way an instance method's
+// receiver does. The call site does name a type (`Foo::m`, `<u16 as From<u8>>::from`),
+// but the old resolver accepted a static candidate on the tail alone, so a call
+// to an *external* function was answered by a local method that merely shared its
+// tail -- a false proof. The owner type now comes from the `impl` block's own
+// source line, and a candidate whose owner cannot be established is refused.
+
+/// A local static method named `from`, which is *not* `u16::from`.
+pub struct StaticOwner;
+
+impl StaticOwner {
+    /// The body returns 99, but the call below never reaches it.
+    /// requires: true
+    /// ensures: ret == 99
+    pub fn from(x: u8) -> u16 {
+        let _ = x;
+        99
+    }
+
+    /// A local static method the call below *does* reach.
+    /// requires: true
+    /// ensures: ret == 7
+    pub fn seed() -> u8 {
+        7
+    }
+}
+
+/// The false direction: `<u16 as From<u8>>::from(x)` is `core`'s conversion,
+/// which returns `x`, so `ret == 99` is false for every `x != 99`. Before the
+/// owner-type check this call matched `StaticOwner::from` on the shared tail and
+/// the contract came back verified -- a false proof.
+/// requires: true
+/// ensures: ret == 99
+pub fn a_static_call_resolves_to_its_own_impl_cannot_prove_this(x: u8) -> u16 {
+    <u16 as From<u8>>::from(x)
+}
+
+/// The true direction: a call to a *local* static method resolves to that method,
+/// so its postcondition is checked and holds.
+/// requires: true
+/// ensures: ret == 7
+pub fn a_local_static_call_resolves_to_its_impl() -> u8 {
+    StaticOwner::seed()
+}
+
+// ---------------------------------------------------------------------------
+// F4: two `impl` blocks that share a method tail must not share a contract
+//
+// A method's contract was keyed by its bare name, so two `impl` blocks that each
+// declared `tag` produced one entry and the later overwrote the earlier. Both
+// methods then resolved to the survivor's contract: a lost proof for one, and --
+// with the claims the other way round -- a false proof for the other. The key is
+// now the `impl`'s location, which is exactly what the dump names.
+
+/// The left `impl`: its `tag` returns 1 and claims 1.
+pub struct TaggedLeft;
+
+/// The right `impl`: its `tag` returns 2 and claims 2.
+pub struct TaggedRight;
+
+impl TaggedLeft {
+    /// requires: true
+    /// ensures: ret == 1
+    pub fn tag() -> u8 {
+        1
+    }
+
+    /// The false direction: the body returns 1 but the claim demands 2. If this
+    /// resolved to [`TaggedRight::tag`]'s contract (`ret == 2`) it would look
+    /// proved -- a false proof the location key closes.
+    /// requires: true
+    /// ensures: ret == 2
+    pub fn tag_cannot_prove_this() -> u8 {
+        1
+    }
+}
+
+impl TaggedRight {
+    /// requires: true
+    /// ensures: ret == 2
+    pub fn tag() -> u8 {
+        2
+    }
+
+    /// The mirror of [`TaggedLeft::tag_cannot_prove_this`]: the body returns 2
+    /// but the claim demands 1, so a conflation onto the left contract would
+    /// "prove" it.
+    /// requires: true
+    /// ensures: ret == 1
+    pub fn tag_cannot_prove_this() -> u8 {
+        2
+    }
+}

@@ -433,6 +433,11 @@ pub struct MirFn {
     /// and the subscript stays a refusal. That loses a proof on a shape like
     /// `mut i` reassigned before the alias; it cannot produce a wrong one.
     pub written: std::collections::BTreeSet<LocalIdx>,
+    /// The `(line, column)` of the `impl` keyword when this function is a method,
+    /// read from its definition name `<impl at FILE:L:C: L:C>::m`. `None` for a
+    /// free function. The owner type is not in the dump; it is looked up from
+    /// [`MirProgram::impl_owners`] by this location.
+    pub impl_loc: Option<(usize, usize)>,
 }
 
 impl MirFn {
@@ -572,6 +577,12 @@ pub struct MirProgram {
     /// constant built by an expression has its own body with its own locals, and
     /// re-deriving that value is the interpreter's job, not a table lookup.
     pub consts: BTreeMap<String, Const>,
+    /// The owner type of each `impl` block, keyed by the 1-based `(line, column)`
+    /// of its `impl` keyword -- the same location a method's definition name
+    /// `<impl at FILE:L:C: L:C>::m` carries. Empty when the caller had no source
+    /// (the MIR-only entry points), in which case a method call whose name is not
+    /// an exact match is refused rather than answered from a guessed owner.
+    pub impl_owners: BTreeMap<(usize, usize), String>,
 }
 
 /// A variant's name and discriminant, for resolving a downcast.
@@ -1646,8 +1657,9 @@ pub fn parse_program_scoped(
     text: &str,
     enums: &BTreeMap<String, EnumLayout>,
     crate_consts: &std::collections::BTreeSet<String>,
+    impl_owners: &BTreeMap<(usize, usize), String>,
 ) -> MirProgram {
-    parse_program_impl(text, enums, crate_consts)
+    parse_program_impl(text, enums, crate_consts, impl_owners)
 }
 
 /// [`parse_program`] with the enum layouts from the source.
@@ -1658,16 +1670,18 @@ pub fn parse_program_scoped(
 /// dump, so it is passed in. An empty map is the old behaviour: `Option`/`Result`
 /// resolve from their built-in numbering and every other enum refuses a downcast.
 pub fn parse_program_with(text: &str, enums: &BTreeMap<String, EnumLayout>) -> MirProgram {
-    parse_program_impl(text, enums, &std::collections::BTreeSet::new())
+    parse_program_impl(text, enums, &std::collections::BTreeSet::new(), &BTreeMap::new())
 }
 
 fn parse_program_impl(
     text: &str,
     enums: &BTreeMap<String, EnumLayout>,
     crate_consts: &std::collections::BTreeSet<String>,
+    impl_owners: &BTreeMap<(usize, usize), String>,
 ) -> MirProgram {
     let lines: Vec<&str> = text.lines().collect();
-    let mut prog = MirProgram { enums: enums.clone(), ..MirProgram::default() };
+    let mut prog =
+        MirProgram { enums: enums.clone(), impl_owners: impl_owners.clone(), ..MirProgram::default() };
     // Which bare names are ever used as a `const` at a use site, so a definition
     // can be told a crate-level item from a function-local one. See
     // [`bare_const_uses`].
@@ -1746,6 +1760,7 @@ fn parse_program_impl(
             }
         }
         if let Some((name, args, ret_ty)) = parse_fn_header(line) {
+            let impl_loc = crate::mir::spec::impl_location(&name);
             let mut f = MirFn {
                 name,
                 arg_locals: args.iter().map(|(l, _)| *l).collect(),
@@ -1755,6 +1770,7 @@ fn parse_program_impl(
                 debug_bindings: Vec::new(),
                 blocks: Vec::new(),
                 written: std::collections::BTreeSet::new(),
+                impl_loc,
             };
             // Local `_0` is the return place, so it carries the return type.
             f.locals.insert(0, ret_ty);
@@ -2292,14 +2308,14 @@ fn add(_1: u32, _2: u32) -> u32 {
         // With it, the definition is kept so a contract can name it.
         let mut scoped = std::collections::BTreeSet::new();
         scoped.insert("ONLY".to_string());
-        let prog = parse_program_scoped(dump, &BTreeMap::new(), &scoped);
+        let prog = parse_program_scoped(dump, &BTreeMap::new(), &scoped, &BTreeMap::new());
         assert_eq!(prog.consts.get("ONLY"), Some(&Const::UInt(7, Some(Ty::U8))));
         // The tell must not resurrect a name the source did *not* declare: a
         // function-local `L` (used qualified) stays out of the table.
         let dump2 = "fn f() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
                      _0 = const f::L;\n        return;\n    }\n}\n\
                      const L: u8 = const 3_u8;\n";
-        let prog2 = parse_program_scoped(dump2, &BTreeMap::new(), &scoped);
+        let prog2 = parse_program_scoped(dump2, &BTreeMap::new(), &scoped, &BTreeMap::new());
         assert!(!prog2.consts.contains_key("L"), "a name not in the source's set stays out");
     }
 

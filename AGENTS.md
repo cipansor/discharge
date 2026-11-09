@@ -6917,8 +6917,9 @@ reading it as a receiver would let an external `Vec2::m` call resolve to a local
 name that still carries an `<impl` projection is a `core`/`std` callee and is refused
 outright (rustc never prints a *local* method call with `<impl`), and a candidate must
 agree on the type -- an instance method's `self` type must equal the call's, and a
-static associated function (no `self`) is accepted on the unique tail only. The false
-proof now reports `Failed { kind: "postcondition" }`.
+static associated function (no `self`) must have its *owner* type agree, which is read
+from the `impl` block's own source line (see the section on a method contract keyed by
+its bare name below). The false proof now reports `Failed { kind: "postcondition" }`.
 
 This also *improved* the old ambiguous-tail behaviour rather than only refusing it:
 `Widget::twist` and a free `twist` share the tail, and the call `w.twist(5)` names its
@@ -6968,3 +6969,57 @@ companions -- a free `wrapping_add_still_recurses` and a static `Recursing::wrap
 the fix *over*-refusing a real self-call, and pass either way. The static companion uses
 `wrapping_sub`, not `wrapping_add`, because the free `wrapping_add` above already owns
 that report name (a method's outcome key is its bare tail).
+
+## A method's contract was keyed by its bare name -- a false proof and a lost proof
+
+The MIR frontend attaches a contract to a function by name: `Specs::get` looked a
+function's bare name up in the contract table. rustc prints a *method*'s definition as
+`<impl at FILE:L:C: L:C>::bump`, whose tail is `bump`, so a contract written on an
+inherent `impl` method was keyed under `bump` while the dump's body was looked up under
+the tail `bump` -- which happens to match, so a *single* method looked fine. The defect
+was two-fold and only the second half is obvious:
+
+* **Two `impl` blocks that share a method tail collide.** `TaggedLeft::tag` and
+  `TaggedRight::tag` both key `tag`, so the later `insert` overwrote the earlier and both
+  methods resolved to the *survivor's* contract. Whichever direction the claims are
+  written, one method is checked against a contract its own source never wrote: a lost
+  proof for the one whose contract was dropped, and -- once the claims are the false way
+  round -- a **false proof** for the other. That is the severe half.
+
+* **A static associated function's owner is not in its name.** An instance method's
+  receiver is recoverable (the first local whose `debug` binding is `self`), but a
+  *static* method has no `self`, so `<impl at …>::from` names no type at all. A call to
+  `u16::from` -- `core`'s conversion, which returns its argument -- then matched a local
+  `from` on the shared tail, and a contract claiming `ret == 99` came back **verified**
+  while the real callee returns `x`. The old resolver accepted a static candidate on the
+  unique tail alone, which is exactly this hole.
+
+The `impl`'s own *location* is the one key both halves share, and it is printed verbatim
+in the dump. `enclosing_impls` scans the source for `impl` keywords and records the
+`(line, column)` of each with its owner type; `impl_location` parses the same `L:C` back
+out of an `<impl at …>` name. The name carries *two* locations -- `4:1: 4:7` is the
+`impl` keyword and the end of the `impl A` header -- and the **first** is the keyword's,
+which is the one `enclosing_impls` records; reading the second (the natural "take the
+last `L:C`" move) silently matches nothing, which is how the first cut of this fix
+dropped every method to `missing`. Contracts are now keyed by `(line, col, name)`,
+`MirFn` carries its `impl_loc`, and both the contract lookup and the call resolver go
+through it.
+
+The fix *improves* the static-call direction rather than only refusing it: a call to a
+*local* static method (`StaticOwner::seed()`) now resolves to its own body and verifies,
+where before the owner was unknown. The external call is refused -- `Incomplete`, naming
+the unmodelled function -- which is the honest answer, not a proof.
+
+**Evidence.** The pre-existing corpus is unchanged at `decided 318 of 599` (no
+regression); the eight new fixtures move it to `decided 323 of 607`; `scripts/test-count.sh`
+**714 -> 718** passed, 0 failed; `scripts/gate.sh` **ALL GATES GREEN**; clippy (both
+halves) and rustdoc clean; zero dependencies and `no_std` untouched.
+
+Each new test is pinned to a verdict *and* a kind: the two `tag_cannot_prove_this`
+methods must fail with `kind == "postcondition"`, so an unrelated refusal cannot satisfy
+them, and `TaggedLeft::tag` / `TaggedRight::tag` must both be `Verified`, which pins that
+resolution found *a* contract rather than dropping the method (a missing contract means
+`requires: true` and no `ensures`, which also reads as verified -- so the F4 test alone
+would not catch a drop). The `mir_coverage` example now lists methods alongside free
+functions and reports the `Owner::method` key when a tail is ambiguous, so a shared tail
+appears once per method instead of vanishing from the scoreboard.

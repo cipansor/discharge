@@ -6106,3 +6106,81 @@ fn a_string_literal_does_not_leak_a_local_const() {
         "a string literal must not leak a function-local const into a contract; got: {o}"
     );
 }
+
+/// F3: a call to an *external* static associated function must not be answered by
+/// a local method that merely shares its tail.
+///
+/// A static associated function has no `self`, so its definition name
+/// `<impl at FILE:L:C: L:C>::m` names no type the way an instance method's
+/// receiver does. The old resolver accepted such a candidate on the unique tail
+/// alone, so `<u16 as From<u8>>::from(x)` -- `core`'s conversion, which returns
+/// `x` -- matched `StaticOwner::from`, whose body returns 99. The contract
+/// `ret == 99` then came back verified, a genuine false proof.
+///
+/// The owner type now comes from the `impl` block's own source line, keyed by the
+/// location the dump prints, so the external call no longer matches the local
+/// method. The verdict must not be `Verified`; it is `Incomplete` here, which is
+/// the honest answer for a call the frontend does not model.
+#[test]
+fn an_external_static_call_is_not_answered_by_a_local_method() {
+    let Some(report) = verify_realistic(&["a_static_call_resolves_to_its_own_impl_cannot_prove_this"])
+    else {
+        return;
+    };
+    let o = outcome(&report, "a_static_call_resolves_to_its_own_impl_cannot_prove_this");
+    assert!(
+        !o.is_verified(),
+        "a call to `u16::from` must not be answered by a local `from`; got: {o}"
+    );
+}
+
+/// F3 companion: the owner-type check must not refuse a call to a *local* static
+/// method, which does resolve to its own body.
+#[test]
+fn a_local_static_call_resolves_to_its_impl() {
+    let Some(report) = verify_realistic(&["a_local_static_call_resolves_to_its_impl"]) else {
+        return;
+    };
+    let o = outcome(&report, "a_local_static_call_resolves_to_its_impl");
+    assert!(o.is_verified(), "a local static method call must resolve and verify; got: {o}");
+}
+
+/// F4: two `impl` blocks that each declare a method with the same tail must not
+/// share a contract.
+///
+/// A method's contract was keyed by its bare name, so `TaggedLeft::tag` and
+/// `TaggedRight::tag` produced one entry and the later overwrote the earlier. Both
+/// methods then resolved to the survivor's claim: a lost proof for the one whose
+/// contract was dropped, and -- once the claims are the false directions -- a
+/// false proof for the other. The key is now the `impl`'s location.
+///
+/// Both methods are true here and must verify, which pins that the resolution
+/// found *a* contract rather than dropping the method (a missing contract is not a
+/// refusal: it means `requires: true` and no `ensures`).
+#[test]
+fn two_impls_with_a_shared_method_tail_keep_separate_contracts() {
+    let Some(report) = verify_realistic(&["tag"]) else { return };
+    for key in ["TaggedLeft::tag", "TaggedRight::tag"] {
+        let o = outcome(&report, key);
+        assert!(o.is_verified(), "{key} must be checked against its own contract; got: {o}");
+    }
+}
+
+/// F4 companion: with the claims the false way round, each method must be
+/// refuted by *its own* postcondition -- never "proved" by the other impl's.
+///
+/// The two `tag_cannot_prove_this` methods are the mirrors of each other: the left
+/// body returns 1 and claims 2, the right returns 2 and claims 1. If the two
+/// contracts were conflated, one of them would look true. Each must fail on the
+/// postcondition.
+#[test]
+fn two_impls_with_a_shared_method_tail_do_not_conflate_contracts() {
+    let Some(report) = verify_realistic(&["tag_cannot_prove_this"]) else { return };
+    for key in ["TaggedLeft::tag_cannot_prove_this", "TaggedRight::tag_cannot_prove_this"] {
+        let o = outcome(&report, key);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("{key} must be refuted by its own postcondition, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "{key}: the failure must be the postcondition, got `{kind}`");
+    }
+}
