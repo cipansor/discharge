@@ -5923,3 +5923,46 @@ fn a_recursive_call_must_satisfy_its_own_precondition() {
         "a recursive call that violates its own precondition must not be assumed, got: {o}"
     );
 }
+
+/// A contract on an *inherent method* is resolved, and its postcondition is
+/// actually checked.
+///
+/// The MIR dump names a method's body `<impl at FILE:L:C: L:C>::bump`, but the
+/// source scanner keys the contract by the bare `bump`. Resolving only the exact
+/// dump name matched nothing, and a missing contract is not a refusal:
+/// `verify_function` derives `requires` and `ensures` from it, so the method was
+/// checked against `true` and *no* postcondition and came back `verified` with
+/// **zero obligations**. The obligation count is the load-bearing part of this
+/// assertion -- a fix that merely matched the name but skipped the body would
+/// still report `Verified`, and only the count catches that.
+#[test]
+fn a_contract_on_an_inherent_method_is_resolved_and_checked() {
+    let Some(report) = verify_realistic(&["bump"]) else { return };
+    let o = outcome(&report, "bump");
+    let FnOutcome::Verified { obligations, .. } = o else {
+        panic!("a method whose contract holds must verify, got: {o}");
+    };
+    assert!(
+        *obligations > 0,
+        "the method's postcondition must be checked, not silently dropped; got {obligations} \
+         obligation(s)"
+    );
+}
+
+/// The false direction: a method whose postcondition the body does not establish
+/// must be refuted, never `verified`.
+///
+/// `bump_cannot_prove_this` has `bump`'s body but demands `ret == self.n + 2`, so
+/// the claim is false on every input. Before the tail resolution this was
+/// `Verified { obligations: 0 }` -- a false proof, because the contract never
+/// reached the checker. The failure kind is pinned to the postcondition so a fix
+/// that refused the method for an unrelated reason cannot pass this.
+#[test]
+fn a_contract_on_an_inherent_method_that_is_false_is_refuted() {
+    let Some(report) = verify_realistic(&["bump_cannot_prove_this"]) else { return };
+    let o = outcome(&report, "bump_cannot_prove_this");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("a method whose postcondition is false must fail, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+}

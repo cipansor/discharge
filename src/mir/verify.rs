@@ -187,7 +187,11 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
             ),
         };
     }
-    let contract = specs.get(&f.name);
+    // Resolved by tail as well as exactly: the dump names an inherent method
+    // `<impl at …>::f` while the contract is keyed by the source's `f`. An
+    // unresolved contract is not "no contract" here -- it is the false-proof
+    // case, where the body would be checked against `true` and no `ensures`.
+    let contract = specs.resolve(&f.name);
     let arg_vars = spec::arg_vars(f);
     let signed = spec::signed_args(f);
     // Fields of struct-typed arguments, bound to their own symbolic inputs. The

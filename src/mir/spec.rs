@@ -244,6 +244,29 @@ impl Specs {
     pub fn get(&self, name: &str) -> Option<&FnContract> {
         self.by_fn.get(name)
     }
+
+    /// The contract for a function whose MIR name is `name`, resolved the way the
+    /// frontend resolves the *body*: an exact match first, then a unique match on
+    /// the last `::` segment.
+    ///
+    /// The dump names an inherent method `<impl at FILE:L:C: L:C>::f`, while the
+    /// source's contract is keyed by the bare `f` (the scanner records the
+    /// identifier after `fn`, and a key is therefore never itself qualified).
+    /// Matching only the exact name left every method's contract unresolved, and an
+    /// unresolved contract is not a refusal: `verify_function` builds its
+    /// precondition and postcondition from `contract`, so a missing one means
+    /// `requires: true` and *no* `ensures` -- a method with a false postcondition
+    /// was reported verified with zero obligations, the body never checked at all.
+    ///
+    /// A tail that no key matches stays `None`; because keys are bare, a tail
+    /// match is unique by construction.
+    pub fn resolve(&self, name: &str) -> Option<&FnContract> {
+        if let Some(c) = self.by_fn.get(name) {
+            return Some(c);
+        }
+        let tail = name.rsplit("::").next()?;
+        self.by_fn.get(tail)
+    }
 }
 
 /// Extract contracts from Rust source text.

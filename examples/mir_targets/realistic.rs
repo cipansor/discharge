@@ -6903,3 +6903,36 @@ pub fn a_misspelled_const_is_refused(x: u8) -> u8 {
     let _ = x;
     LIMIT
 }
+
+/// A struct whose methods carry contracts, so a contract attached to an
+/// *inherent method* is exercised at all.
+pub struct MethodCounter {
+    pub n: u8,
+}
+
+impl MethodCounter {
+    /// A method's contract is keyed by the source name `bump`, but the MIR dump
+    /// names the body `<impl at …>::bump`. Resolving the contract by the *dump*
+    /// name matched nothing, and a missing contract is not a refusal:
+    /// `verify_function` builds `requires` and `ensures` from it, so the method
+    /// was checked against `true` and *no* postcondition -- reported verified with
+    /// zero obligations, the body never looked at. The true direction must verify
+    /// *with* its postcondition checked, which is why the obligation count is
+    /// asserted rather than only the verdict.
+    /// requires: self.n <= 250
+    /// ensures: ret == self.n + 1
+    pub fn bump(&self) -> u8 {
+        self.n + 1
+    }
+
+    /// The false direction of [`MethodCounter::bump`]: the postcondition demands
+    /// one more than the body returns, so it is false on every input. Before the
+    /// tail resolution this came back `verified` with zero obligations -- the exact
+    /// false proof the resolution closes. The corpus-wide naming invariant holds
+    /// it as well.
+    /// requires: self.n <= 250
+    /// ensures: ret == self.n + 2
+    pub fn bump_cannot_prove_this(&self) -> u8 {
+        self.n + 1
+    }
+}

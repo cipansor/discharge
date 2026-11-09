@@ -6856,3 +6856,34 @@ contract could name `f::L` -- a path no function's source can write, but whose *
 correct, so this is a looser path resolution, not a wrong value. It is recorded here rather
 than papered over: closing it needs the same use-site test to cover qualified definitions,
 which no current fixture exercises.
+
+## A contract on an inherent method was silently dropped -- a false proof
+
+`verify_file_with` asks `prog.get(name)` for a function, and `MirProgram::get` matches on
+the *last* `::` segment so a call written `crate::m::f` resolves. A method's dump name is
+`<impl at FILE:L:C: L:C>::f`, so the tail match found it -- and then `verify_function` looked
+its contract up with `specs.get(&f.name)`, the *full dump name*. The contract is keyed by the
+bare `f`, the scanner records the identifier after `fn`, so the lookup matched nothing.
+
+A missing contract is not a refusal here: `verify_function` builds `pre` and `ensures` from
+`contract`, so `None` means `requires: true` and no postcondition at all. Every method with a
+contract was therefore reported `Verified { obligations: 0 }` -- the body never checked. A
+method whose `ensures` was false on every input came back `verified`. That is the worst
+direction: a false proof, not a lost one. The free-function control in the same run correctly
+`FAILED`, which is what showed the difference was the *name*, not the contract.
+
+The fix is `Specs::resolve`, which matches exactly first and then on the last `::` segment --
+the same rule the body resolution uses, so a contract is found for exactly the functions the
+frontend can name. Because `by_fn` is keyed by bare identifiers, the tail match is unique by
+construction and no ambiguity branch is needed.
+
+**Evidence.** Corpus `decided 312 of 588` -> **`313 of 590`** (the two new method fixtures:
+the true direction is now decided *with* its postcondition checked, the false direction is a
+definite refutation); `scripts/test-count.sh` **702 -> 704** passed, 0 failed; `cargo test
+--features std` green; clippy (both halves) and docs clean; bare-metal builds green.
+
+The regression test asserts the obligation *count* is non-zero, not merely `Verified` -- a
+future fix that matched the name but still skipped the body would pass a verdict-only
+assertion. The false twin is pinned to `Failed { kind: "postcondition" }` so an unrelated
+refusal cannot satisfy it, and the corpus-wide `no_cannot_prove_entry_is_ever_verified`
+sweep holds it as well.
