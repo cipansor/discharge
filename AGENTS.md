@@ -6794,3 +6794,65 @@ what is really a missing or empty `--emit=mir` output file -- a message that sen
 to install a compiler that would not have helped. They now name the actual condition, and
 its doc comment and the README's source table and example no longer tell the reader to point
 `DISCHARGE_RUSTC` at a nightly.
+
+## A function-local `const` was in scope in every function -- a false proof
+
+Three holes, found together, all of the same family: a name or a place resolved to
+something the function's own source could not have written. Each was reproduced from
+real `rustc` output and each is now pinned by a test that fails if the fix is undone.
+
+**Bug 1: a function-local `const` leaked into another function's contract.** The parser
+recorded every literal `const NAME: TYPE = ...;` definition under its bare name, and the
+contract reader resolves a bare name against that table. A function-local item's *definition*
+is printed bare (`const L: u8 = const 3_u8;`) -- byte-identical to a crate-level item's --
+so `const L: u8 = 3;` inside `first` handed `second` a bare `L` to write in its contract.
+`requires: L == 3` then resolved and the function was **proved** from a foreign body: a
+wrong proof, not a lost one. The *use* site is the only tell -- a crate item is used bare
+(`const LIMIT`), a local one qualified (`const first::L`) -- so `bare_const_uses` collects
+the bare use sites once, and a bare definition is kept only when the name is used bare
+somewhere. A qualified definition still keeps its qualified key, which is what a contract
+that spells the path resolves. The false twin is now `Skipped` (unreadable `requires`),
+never `Verified`.
+
+The old fixture comment claimed the bare key was "safe" because rustc qualifies a local
+definition when another item shares its last segment. That reasoning was about *shadowing
+between constants*, not *scope*, and it was wrong: `first`'s `L` still became `second`'s.
+
+**Bug 2: a returned reference to a symbolic element was aimed at a caller local that
+merely shared its number.** `x.nth_mut(i)` returns `&mut x.a[i]`, and inside `nth_mut` the
+index is `_2`. Translating that returned reference back to the caller carried `IndexVar(2)`
+across the call boundary, where `_2` is a *different* local -- with a parameter before `i`,
+`_2` is that parameter, not `i`. The write `*x.nth_mut(i) = 9` landed on `x.a[zero]`, and
+the contract fixed `zero == 0`, so it landed on the *seed* element and the false `ret == 5`
+was **proved**.
+
+The index cannot be pinned (the contract admits any `i < 4`), so the fix refuses the write
+-- but dropping it alone is not enough. A later `x.a[0]` then falls back to its seed, which
+turns the false proof around rather than removing it: `ret == 5` becomes provable. The
+array's elements are *poisoned* instead (`poison_array_under`), so every read is unknown:
+the write is lost, never mis-aimed, and no stale seed survives it. Both directions are
+pinned as refusals -- the false `ret == 5` and the true `ret == 9` -- because a fix that
+only drops the write proves the second.
+
+**Bug 3: a closed true goal bypassed a stale premise.** `prove_implies` decides a goal that
+is closed and true without building `!pre || post`, which is what lets a tiny postcondition
+decide even when the premise is a large diagram. But the premise is half the claim, and the
+shortcut never read it. A `pre` saved from an earlier arena names a different term in the
+current one, and the shortcut returned `Valid` for it -- certifying `pre implies true` for a
+`pre` that is not the one passed. The ordinary route catches this because `un_bool(pre)`
+funnels through the stale check; the shortcut now asks `is_current_term` itself and returns
+`Unknown`.
+
+**Evidence.** Corpus `decided 305 of 572` -> **`312 of 588`** (the new fixtures add decided
+entries and two honest refusals); `scripts/test-count.sh` **688 -> 702** passed, 0 failed;
+`cargo test --features std` green on the whole workspace; `cargo clippy --workspace --features
+std --all-targets -- -D warnings` clean; bare-metal (`cargo build`, no `std`) green. Gate
+green; zero dependencies and `no_std` untouched.
+
+**A boundary left documented, not hidden.** When another item shares a function-local
+`const`'s last segment, rustc prints the local's *definition* qualified too
+(`const f::L: u8 = const 3_u8;`). That qualified definition still enters the table, so a
+contract could name `f::L` -- a path no function's source can write, but whose *value* is
+correct, so this is a looser path resolution, not a wrong value. It is recorded here rather
+than papered over: closing it needs the same use-site test to cover qualified definitions,
+which no current fixture exercises.

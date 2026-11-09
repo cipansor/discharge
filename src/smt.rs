@@ -3296,6 +3296,18 @@ fn goal_is_closed_true(ctx: &mut Ctx, p: Term) -> bool {
 pub fn prove_implies(pre: Pred, post: Pred) -> Verdict {
     with_ctx(|c| {
         if goal_is_closed_true(c, post.0) {
+            // A closed true goal is decided from the goal alone, but the premise
+            // is still half of the claim, and the shortcut never reads it. A
+            // `pre` saved from an earlier arena names a different term now --
+            // `is_current_term` reports that and sets `stale` -- so returning
+            // `Valid` here would certify `pre implies true` for a `pre` that is
+            // not the one the caller passed. The ordinary route catches this
+            // because `un_bool(pre)` funnels through the stale check; this route
+            // has to ask. `c.stale` afterwards also covers a goal that was itself
+            // stale, which `goal_is_closed_true` does not check.
+            if !c.is_current_term(pre.0) || c.stale {
+                return Verdict::Unknown;
+            }
             return Verdict::Valid;
         }
         let np = c.un_bool(Op::Not, pre.0);

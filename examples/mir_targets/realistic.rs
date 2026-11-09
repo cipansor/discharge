@@ -6344,6 +6344,34 @@ pub fn returned_ref_to_an_unpinned_symbolic_element_cannot_prove_this(mut x: Box
     x.a[0]
 }
 
+/// A returned reference to an element under a symbolic index, with the caller's
+/// numbering *shifted* by an extra parameter so the callee's index local number
+/// names a different caller local.
+///
+/// Inside `nth_mut` the index is `_2`, but `_2` in this caller is `zero`, not `i`.
+/// Carried across the call boundary, the write `*x.nth_mut(i) = 9` landed on
+/// `x.a[zero]` -- and the contract fixes `zero == 0`, so it landed on the *seed*
+/// element `x.a[0]` and the false `ret == 5` was **proved**. The index cannot be
+/// pinned (the contract admits any `i < 4`), so the write may hit any element and
+/// must be refused, never aimed at a caller local that happens to share its number.
+/// requires: x.a[0] == 5 && zero == 0 && i < 4
+/// ensures: ret == 5
+pub fn a_shifted_symbolic_element_cannot_prove_this(mut x: Boxed, zero: usize, i: usize) -> u8 {
+    *x.nth_mut(i) = 9;
+    x.a[0]
+}
+
+/// The true direction of [`a_shifted_symbolic_element_cannot_prove_this`]: the
+/// write may land on any element, so `ret == 9` is a refusal, not a proof. A fix
+/// that dropped the write and left the seed readable would turn the false
+/// direction above around and prove *this* one instead, so both are pinned.
+/// requires: x.a[0] == 5 && zero == 0 && i < 4
+/// ensures: ret == 9
+pub fn a_shifted_symbolic_element_is_not_proved(mut x: Boxed, zero: usize, i: usize) -> u8 {
+    *x.nth_mut(i) = 9;
+    x.a[0]
+}
+
 /// `&mut self.a[i]` -- a method whose returned reference names an element under a symbolic
 /// index.
 impl Boxed {
@@ -6730,18 +6758,47 @@ pub fn nested_module_const_is_read_cannot_prove_this() -> u8 {
 /// A `const` declared *inside* a function body is not inlined, because the two
 /// spellings do not meet: the *use* is printed with the enclosing function's path
 /// (`const a_function_local_const_is_not_inlined::L`) while the *definition* is
-/// printed bare (`const L: u8 = const 3_u8;`), rustc emitting the qualifier only
-/// where it is needed to disambiguate -- and here `L` is the crate's only one. It
-/// stays an unreadable path constant, a coverage boundary rather than a wrong
-/// proof, since no value is read at all. This is also why the bare key is safe:
-/// rustc qualifies a function-local item's definition precisely when another item
-/// shares its last segment, so a bare `const L` is recorded only when there is no
-/// other `L` for it to shadow.
+/// printed bare (`const L: u8 = const 3_u8;`). It stays an unreadable path
+/// constant, a coverage boundary rather than a wrong proof, since no value is read
+/// at all.
+///
+/// The bare definition is *also* why a function-local item must not become a
+/// program-wide key: a crate-level `const` gets the same bare definition, so the
+/// definition alone cannot tell the two apart. Only the use site can -- a crate
+/// item is used bare (`const L`), a local one qualified (`const f::L`) -- which is
+/// what [`bare_const_uses`] reads. See
+/// [`a_local_const_is_not_in_scope_in_another_function`] for the false proof a bare
+/// key would reopen.
 /// requires: true
 /// ensures: ret == 3
 pub fn a_function_local_const_is_not_inlined() -> u8 {
     const L: u8 = 3;
     L
+}
+
+/// The function that owns the local `const` the contract below must not see.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_local_const_owner() -> u8 {
+    const L: u8 = 3;
+    L
+}
+
+/// A function-local `const` is not in scope in another function, and its
+/// definition must not become a program-wide key.
+///
+/// The owner's dump prints `const L: u8 = const 3_u8;` bare, while its *use* is
+/// qualified (`const a_local_const_owner::L`) -- exactly the spelling a crate-level
+/// `const` gets for its definition. The two are indistinguishable from the
+/// definition alone, so a bare key recorded for the local let this contract's
+/// `requires: L == 3` resolve to a name this function's own source could not
+/// write, and the function was *proved* from another function's body. That is not
+/// a lost proof but a wrong one: the name must resolve to nothing here, leaving
+/// this `Skipped` (unreadable `requires`), never `Verified`.
+/// requires: L == 3
+/// ensures: ret == 3
+pub fn a_local_const_is_not_in_scope_in_another_function() -> u8 {
+    3
 }
 
 // ---------------------------------------------------------------------------

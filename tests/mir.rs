@@ -1843,6 +1843,8 @@ fn a_returned_reference_to_an_element_reaches_the_caller() {
         "returned_ref_to_a_guarded_symbolic_element",
         "returned_ref_to_a_guarded_symbolic_element_cannot_prove_this",
         "returned_ref_to_an_unpinned_symbolic_element_cannot_prove_this",
+        "a_shifted_symbolic_element_cannot_prove_this",
+        "a_shifted_symbolic_element_is_not_proved",
     ]) else {
         return;
     };
@@ -1874,6 +1876,22 @@ fn a_returned_reference_to_an_element_reaches_the_caller() {
             !o.is_verified(),
             "`{name}` is a false direction -- a write aimed at the wrong element would \
              prove it; got: {o}"
+        );
+    }
+    // The shifted-numbering pair is a *refusal* in both directions: the write may
+    // land on any element, so neither `ret == 9` nor `ret == 5` decides. The false
+    // direction must not be proved (the write must not be aimed at a caller local
+    // that shares the callee index's number), and the true direction must not be
+    // proved either (dropping the write must not leave the seed readable).
+    for name in [
+        "a_shifted_symbolic_element_cannot_prove_this",
+        "a_shifted_symbolic_element_is_not_proved",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            !o.is_verified(),
+            "`{name}` must be a refusal -- a symbolic returned index names no single \
+             element, so neither direction decides; got: {o}"
         );
     }
 }
@@ -2716,6 +2734,38 @@ fn a_contract_may_name_a_const_item() {
             "an unresolvable const name must be refused, not guessed; got: {o}"
         );
     }
+}
+
+/// A function-local `const` is not in scope in another function.
+///
+/// `a_local_const_owner` declares `const L: u8 = 3;` in its body; the dump prints
+/// that definition bare (`const L: u8 = const 3_u8;`) -- the same spelling a
+/// crate-level `const` gets -- while its *use* is qualified (`const
+/// a_local_const_owner::L`). A bare program-wide key for the definition let the
+/// other function's `requires: L == 3` resolve to a name its own source could not
+/// write, so the function was *proved* from a foreign body: a wrong proof, not a
+/// lost one. The name must resolve to nothing here, leaving the function `Skipped`
+/// (unreadable `requires`), never `Verified`.
+///
+/// The crate-level constant path stays covered by
+/// [`a_contract_may_name_a_const_item`], so this pins that the scope rule did not
+/// also drop the in-scope names.
+#[test]
+fn a_local_const_is_not_in_scope_in_another_function() {
+    let Some(report) = verify_realistic(&[
+        "a_local_const_owner",
+        "a_local_const_is_not_in_scope_in_another_function",
+    ]) else {
+        return;
+    };
+    let owner = outcome(&report, "a_local_const_owner");
+    assert!(owner.is_verified(), "the owner reads its own local const; got: {owner}");
+    let other = outcome(&report, "a_local_const_is_not_in_scope_in_another_function");
+    assert!(
+        !other.is_verified(),
+        "a contract must not resolve another function's local const -- that is a \
+         wrong proof; got: {other}"
+    );
 }
 
 /// The whole-corpus direction invariant: a function whose *name* says it must not be

@@ -979,6 +979,44 @@ fn push_projs(
     Some(place)
 }
 
+/// The bare names that appear at a `const` *use* site, such as the `LIMIT` in
+/// `_0 = const LIMIT;`.
+///
+/// rustc prints a crate-level `const`'s use site by its bare name (`const
+/// LIMIT`) and a function-local item's by a qualified path (`const f::L`), but it
+/// prints both *definitions* the same way (`const LIMIT: u8 = const 10_u8;`), so
+/// the definition alone cannot say whether the item is in scope in any given
+/// function. The use sites can: a name never written bare anywhere is never in
+/// scope bare anywhere, so a bare definition for it is a function-local item (or
+/// an unused one) and must not become a program-wide key. Without this a
+/// function-local `const L` handed every *other* function a bare `L` to name, and
+/// a contract `requires: L == 3` was proved against a name the function could not
+/// have written -- the name resolved to another function's local.
+///
+/// A definition is `const NAME: TYPE`; every other occurrence (`const NAME;`,
+/// `const NAME,`, `const NAME)`) is a use.
+fn bare_const_uses(text: &str) -> std::collections::BTreeSet<String> {
+    const KW: &str = "const ";
+    let mut out = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        let mut rest = line;
+        while let Some(i) = rest.find(KW) {
+            let after = &rest[i + KW.len()..];
+            let name: String =
+                after.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            let plain = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+            if plain && !after[name.len()..].trim_start().starts_with(':') {
+                out.insert(name);
+            }
+            rest = after;
+        }
+    }
+    out
+}
+
 /// Parse a constant like `0_u32`, `true`, `255_u32`, `()`.
 fn parse_const(s: &str) -> Const {
     let t = s.trim();
@@ -1558,6 +1596,10 @@ pub fn parse_program(text: &str) -> MirProgram {
 pub fn parse_program_with(text: &str, enums: &BTreeMap<String, EnumLayout>) -> MirProgram {
     let lines: Vec<&str> = text.lines().collect();
     let mut prog = MirProgram { enums: enums.clone(), ..MirProgram::default() };
+    // Which bare names are ever used as a `const` at a use site, so a definition
+    // can be told a crate-level item from a function-local one. See
+    // [`bare_const_uses`].
+    let bare_uses = bare_const_uses(text);
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
@@ -1588,7 +1630,17 @@ pub fn parse_program_with(text: &str, enums: &BTreeMap<String, EnumLayout>) -> M
                     if plain {
                         let body = body.trim().trim_end_matches(';');
                         if let Some(c) = body.strip_prefix("const ") {
-                            prog.consts.insert(name.to_string(), parse_const(c));
+                            // A bare key is recorded only when the name is used
+                            // bare somewhere, i.e. only for a crate-level item. A
+                            // function-local item's definition prints the same way
+                            // but its uses are qualified (`const f::L`), so a bare
+                            // key for it would let an unrelated function's contract
+                            // resolve a name its own source could not. A qualified
+                            // definition keeps its qualified key, which is what a
+                            // contract that spells the path resolves.
+                            if name.contains("::") || bare_uses.contains(name) {
+                                prog.consts.insert(name.to_string(), parse_const(c));
+                            }
                         }
                     }
                 }
@@ -2061,20 +2113,52 @@ fn add(_1: u32, _2: u32) -> u32 {
     /// expression, or a qualified associated constant, must *not* enter the table:
     /// the first has no literal to read, and the second is never referred to by
     /// the plain name.
+    ///
+    /// A bare definition is kept only when the name is *used* bare somewhere. The
+    /// dump prints a crate-level item's use site by its bare name and a
+    /// function-local item's by a qualified path, but both definitions look alike,
+    /// so a bare definition with no bare use site is a function-local item (or an
+    /// unused one) and must not become a program-wide key -- see
+    /// [`bare_const_uses`] and [`a_local_const_does_not_leak_to_another_function`].
     #[test]
     fn named_const_items_are_collected_only_when_literal() {
         let dump = "const K: u8 = const 5_u8;\n\
                     const NEG: i8 = const -1_i8;\n\
                     const B: bool = const true;\n\
+                    const UNUSED: u8 = const 9_u8;\n\
                     const EXPR: u8 = {\n    let mut _0: u8;\n\n    bb0: {\n        \
                     _0 = const 1_u8;\n        return;\n    }\n}\n\
-                    const ARR::{constant#0}: usize = const 3_usize;\n";
+                    const ARR::{constant#0}: usize = const 3_usize;\n\
+                    fn uses() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                    _0 = const K;\n        _0 = const NEG;\n        _0 = const B;\n        \
+                    return;\n    }\n}\n";
         let prog = parse_program(dump);
         assert_eq!(prog.consts.get("K"), Some(&Const::UInt(5, Some(Ty::U8))));
         assert_eq!(prog.consts.get("NEG"), Some(&Const::UInt(0xff, Some(Ty::I8))));
         assert_eq!(prog.consts.get("B"), Some(&Const::Bool(true)));
+        assert!(!prog.consts.contains_key("UNUSED"), "a bare definition with no bare use is not kept");
         assert!(!prog.consts.contains_key("EXPR"), "an expression body is not a literal");
         assert!(!prog.consts.contains_key("ARR"), "a qualified name is not collected");
+    }
+
+    /// A function-local `const`'s definition must not become a bare program-wide
+    /// key, or another function's contract could name it.
+    ///
+    /// `const L: u8 = const 3_u8;` is printed the same way for a crate-level item
+    /// and a function-local one; the use site is the only tell -- a crate item is
+    /// used bare (`const L`), a local one qualified (`const f::L`). Here `L` is
+    /// used only qualified, so it is a local of `f` and must not enter the table
+    /// under the bare key. With the bare key present, `g`'s contract could write
+    /// `requires: L == 3` and be *proved* against a name `g` cannot see.
+    #[test]
+    fn a_local_const_does_not_leak_to_another_function() {
+        let dump = "fn f() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                    _0 = const f::L;\n        return;\n    }\n}\n\
+                    const L: u8 = const 3_u8;\n\
+                    fn g() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                    _0 = const 3_u8;\n        return;\n    }\n}\n";
+        let prog = parse_program(dump);
+        assert!(!prog.consts.contains_key("L"), "a local const must not get a bare key");
     }
 
     /// The front end is total: no input, however mangled, may panic.

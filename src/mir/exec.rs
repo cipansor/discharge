@@ -1409,6 +1409,23 @@ impl Env {
         }
     }
 
+    /// Mark every element of the array at `chain` under `local` unknown.
+    ///
+    /// A write through a returned reference whose index the run cannot pin may land
+    /// on *any* element, so none of them can be trusted afterwards. Which store
+    /// holds them depends on the shape: an array reached through a field path
+    /// (`x.a[0]`, the field chain *before* the index) is in `elems_path`, a
+    /// whole-local literal array is in `elems`, and a whole-local array *argument*
+    /// is in `indexed`. All three are cleared under the path, and a whole-local
+    /// array keeps its length.
+    fn poison_array_under(&mut self, local: u32, chain: &[u32]) {
+        if chain.is_empty() {
+            self.poison_elems(local);
+        } else {
+            self.elems_path.retain(|(l, c, _), _| *l != local || !c.starts_with(chain));
+        }
+    }
+
     /// Record an element of an array reached through a field path, `o.a[k] = v`.
     ///
     /// The whole path is the key, so `o.a[0]` and `o.b[0]` cannot collide. Any
@@ -3197,11 +3214,42 @@ where
                                     o.proj.remove(0);
                                 }
                                 let o = st.env.pin_index_vars(&o);
-                                let mut proj = src.proj.clone();
-                                proj.extend_from_slice(&o.proj);
-                                let place = Place { local: src.local, proj };
-                                env.addressed.insert(dest.local, place.clone());
-                                env.ref_origin.insert(dest.local, place);
+                                // An `IndexVar` that is *not* pinned -- a symbolic index
+                                // the contract does not fix -- names a callee local that
+                                // means nothing in the caller. Carried across, the caller
+                                // reads it as *its own* local of that number, which is a
+                                // different argument, and the write lands on whatever
+                                // element that happens to hold: `*x.nth_mut(i) = 9` with a
+                                // parameter before `i` aimed the write at `x.a[zero]` --
+                                // the seed element -- so the false `ret == 5` was
+                                // *proved*.
+                                //
+                                // Dropping the reference alone is not enough: the write
+                                // may hit *any* element, so a later read of `x.a[0]` must
+                                // not fall back to its seed (that turned the false proof
+                                // around rather than removing it -- `ret == 5` became
+                                // provable). The array's elements are poisoned instead, so
+                                // every read is unknown: the write is lost, never
+                                // mis-aimed, and no stale seed survives it.
+                                if o.proj.iter().any(|s| matches!(s, Proj::IndexVar(_))) {
+                                    // The array's field chain is the `Field` steps that
+                                    // lead up to the index; the index step and anything
+                                    // past it are not part of the path.
+                                    let mut chain = field_steps(&src.proj).unwrap_or_default();
+                                    for step in &o.proj {
+                                        match step {
+                                            Proj::Field(f) => chain.push(*f),
+                                            _ => break,
+                                        }
+                                    }
+                                    env.poison_array_under(src.local, &chain);
+                                } else {
+                                    let mut proj = src.proj.clone();
+                                    proj.extend_from_slice(&o.proj);
+                                    let place = Place { local: src.local, proj };
+                                    env.addressed.insert(dest.local, place.clone());
+                                    env.ref_origin.insert(dest.local, place);
+                                }
                             }
                         }
                         env.set(dest, ret);
