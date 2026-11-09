@@ -2017,9 +2017,11 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   └── mir_targets/
 │       └── actuator.rs    the Rust under verification; imports no `discharge`
 ├── tools/
-│   └── mir-oracle/     the `rustc_public` oracle: checks the text-MIR frontend
-│                       against rustc's own typed MIR. Nightly + `rustc-dev`,
-│                       its own workspace, and never a dependency of `discharge`.
+│   ├── mir-oracle/     the `rustc_public` oracle: checks the text-MIR frontend
+│   │                   against rustc's own typed MIR. Nightly + `rustc-dev`,
+│   │                   its own workspace, and never a dependency of `discharge`.
+│   └── build-verify/   gate 17: the Kani/Verus shape -- verify from `build.rs`
+│                       and prove the artifact carries no prover (scratch crate)
 └── scripts/
     ├── gate.sh            every gate in one command, failing loudly
     └── test-count.sh      the exact passing-test count, only when all pass
@@ -2053,14 +2055,16 @@ run the Kani, Verus, Lean and Coq differential oracles and the `rustc_public` MI
 tools are present and *skip them loudly* when they are not, because all three are large
 downloads (Kani: a pinned nightly plus CBMC; Verus: a self-contained bundle with its own z3;
 the MIR oracle: a nightly with the `rustc-dev` and `llvm-tools-preview` components) that a normal local run should not
-pay for; CI installs them and runs them as hard gates. The last three gates hold the *tree*
+pay for; CI installs them and runs them as hard gates. The last four gates hold the *tree*
 rather than the logic: rustdoc must build both crates with `-D warnings` (the crate is
 `#![deny(missing_docs)]`, but that says nothing about whether a doc link still *resolves*),
 no compiled output may be tracked (`git ls-files` must not list a `.rlib` or a `target/`
 path — a `git add -A` re-committed six stray `.rlib`s once, and a `.gitignore` does not
-untrack a file that is already in the index), and the `unsafe` surface must stay at the two
+untrack a file that is already in the index), the `unsafe` surface must stay at the two
 blocks `SECURITY.md` names, each with a `// SAFETY:` justification (a count in prose is a
-claim like any other, and this one is security-relevant).
+claim like any other, and this one is security-relevant), and the build-time path must
+verify at compile time while leaving the prover out of the artifact (see
+[Verification at build time](#verification-at-build-time-the-kaniverus-shape) below).
 
 ### The third oracle: rustc's own MIR, against the parser
 
@@ -2342,6 +2346,62 @@ no test harness, so its verdict tests run on the host instead, under
 `cargo test --workspace --features std`.
 
 [Ferrocene]: https://ferrocene.dev/
+
+### Verification at build time: the Kani/Verus shape
+
+The claim above — the prover is *in* the artifact — is one of two shapes this crate can
+take, and the other one is worth stating plainly because it is what Kani and Verus
+actually do, and what a size-constrained safety build usually wants: **verify while the
+crate is built, and ship none of the verifier.**
+
+It costs nothing to reach, because the `mir` frontend is already `std`-only host tooling.
+Put `discharge` in `[build-dependencies]`, call the frontend from `build.rs`, and fail the
+build when an outcome is not `Verified`:
+
+```rust,ignore
+// build.rs
+fn main() {
+    println!("cargo:rerun-if-changed=src/lib.rs");
+    let report = discharge::mir::verify::verify_file_with("rustc", "src/lib.rs".as_ref(), &[])
+        .expect("the MIR frontend could not read the source");
+    for (name, outcome) in &report.outcomes {
+        println!("cargo:warning=discharge {name}: {outcome}");
+        assert!(outcome.is_verified(), "discharge: {name} is not verified: {outcome}");
+    }
+}
+```
+
+A build script is a *separate compilation unit*: cargo compiles it for the host, runs it,
+and throws it away. So the decision procedure — the whole BDD blasting and CDCL fallback —
+is never linked into the crate's own artifact. That is not an optimisation, it is a
+consequence of the build model, and it is what makes the two properties below both true at
+once:
+
+* **The verification happens at compile time.** A false contract is a build error naming
+  the broken obligation and its witness, exactly as it is under Kani or Verus. Nothing is
+  checked at runtime, so nothing can be skipped in a release build.
+* **The artifact is zero-cost.** Measured on this repository, `release`, `x86_64`:
+  a baseline binary is 447 728 bytes; with `discharge` as a build dependency the crate's own
+  rlib is ~5 KB and carries **zero** `discharge` symbols; with the prover *called* from the
+  crate's own code the same program is 5 746 640 bytes and carries 26 `discharge::smt`
+  symbols. The difference is whether the obligation was discharged before or after the code
+  shipped.
+
+Both shapes are real, and the choice is a trade-off rather than a verdict. Build-time
+verification buys the zero-cost artifact and pays with a host-side `rustc` (the frontend
+shells out to `--emit=mir`, so it needs a toolchain at build time and is not `no_std`).
+The embedded engine buys a proof that can run *where Z3 cannot* — `examples/bare_metal.rs`
+compiles the decision procedure for `thumbv7em-none-eabihf` — and pays with binary size.
+Neither is a substitute for the other; a flight build might use the first to keep the
+artifact small and the second for an on-target re-check of a critical invariant.
+
+This is gate 17 of `scripts/gate.sh`, run by `tools/build-verify/run.sh` on a scratch crate
+it creates and removes. It is a gate rather than a paragraph because "zero cost" and
+"verified at compile time" are both checkable claims, and both rot silently if only
+asserted: the script requires a good contract to build *and* the verifier to report
+`verified` (a build script that silently did nothing would otherwise pass), a broken
+contract to fail the build on its named obligation, and the resulting rlib to carry no
+prover symbols.
 
 ## License
 

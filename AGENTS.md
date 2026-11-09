@@ -6503,7 +6503,7 @@ without the fix by reverting the two loops: the test then reports the true direc
 whole-replacement true directions now decide, plus six named-`const` true directions; all their
 `_cannot_prove_this` twins stay `Failed`, and two coverage-boundary entries stay `incomplete`);
 `cargo test --workspace --features std` **684 -> 688** passed, 0 failed; `cargo
-clippy --workspace --features std --all-targets -- -D warnings` clean; `scripts/gate.sh` 16/16
+clippy --workspace --features std --all-targets -- -D warnings` clean; `scripts/gate.sh` 17/17
 green (bare-metal build, zero-dependency and `no_std` gates included), z3 `agree=845
 mismatch=0`, kani `agree=57 mismatch=0`, verus `0 differ`, rustc_public oracle `realistic.rs 634
 functions typed, 638 text, 633 agree, 0 differ`. Zero dependencies and `no_std` untouched.
@@ -6668,3 +6668,56 @@ call site, and the measure must be evaluated there rather than at entry.
 (a dangling `+`, an unknown name, and an empty measure are errors rather than an
 absent measure). The end-to-end half is `tests/mir.rs`'s four recursion tests, which
 need a `rustc`.
+
+## Two shapes for the prover: in the artifact, or in the build
+
+The README's headline claim is that `discharge` is a prover that compiles *into* the
+artifact, so a proof can run where Z3 cannot (`examples/bare_metal.rs` is the evidence: the
+decision procedure built for `thumbv7em-none-eabihf`). That is one shape. The other is the
+Kani/Verus shape -- verify while the crate is built, ship none of the verifier -- and it is
+reachable here for free, because the `mir` frontend is already `std`-only *host* tooling.
+
+Put `discharge` in `[build-dependencies]` and call `mir::verify::verify_file_with` from
+`build.rs`, failing the build on any outcome that is not `Verified`. A build script is a
+separate compilation unit, so cargo compiles it for the host, runs it, and discards it: the
+BDD blasting and the CDCL fallback never reach the crate's own rlib. That is a consequence
+of the build model rather than an optimisation, which is why it holds without any code
+change to the crate.
+
+**The measurements, so the "zero cost" claim is a number and not an adjective.** `release`,
+`x86_64`, this repository:
+
+| configuration | artifact | `discharge` symbols |
+|---|---|---|
+| baseline, no discharge | 447 728 B (binary) | 0 |
+| `discharge` as a dependency, never called | 447 696 B (binary) | 0 |
+| `discharge` in `[build-dependencies]`, called from `build.rs` | 4 860 B (rlib) | **0** |
+| `discharge::smt::prove` called from the crate's own code | 5 746 640 B (binary) | 26 |
+
+So "zero cost" is true of the build-time shape and false of the embedded one -- the two
+claims must not be conflated. The embedded engine's cost is the point of its existence
+(a proof on the target); the build-time shape's cost is a host-side `rustc`, which the
+frontend needs anyway because it shells out to `--emit=mir`.
+
+**Pinned by gate 17, not by prose.** `tools/build-verify/run.sh` builds a *scratch* crate
+under `mktemp -d` (a fixture in the tree would put a second `Cargo.toml` and a `target/`
+in the repository, which gate 15 exists to prevent) and requires three things:
+
+1. a provable contract builds **and** the verifier reports `verified` -- a `build.rs` that
+   silently did nothing would otherwise pass, so the positive direction alone is not enough;
+2. a false contract **fails the build**, and the failure names the broken obligation
+   (`postcondition`, with the witness). The scratch contract is the recursion one whose
+   *base case* is wrong, which is exactly the mistake a circular induction would wave
+   through, so this doubles as an end-to-end check of the `decreases:` work; and
+3. the resulting rlib carries **zero** `discharge` symbols (`nm -C | grep -ci discharge`).
+
+Exit 2 when there is no `cargo` is reported and skipped, the same convention
+`tools/ferrocene/run.sh` and `tools/mir-oracle/run.sh` use: a skipped gate is not evidence.
+
+**A shell gotcha worth recording.** The scratch `Cargo.toml` is written with an *unquoted*
+heredoc so `$ROOT` expands, and the first draft put a backtick-quoted `` `discharge` `` in
+a comment inside that heredoc. The backticks were command substitution, so the script tried
+to *run* `discharge` and printed `discharge: not found` before continuing. It still passed
+every assertion -- the failure was cosmetic -- but a gate that prints a stray error while
+going green trains a reader to ignore its output. Backticks (and `$(...)`) inside an
+unquoted heredoc are code, not prose.
