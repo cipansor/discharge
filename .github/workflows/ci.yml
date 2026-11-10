@@ -203,10 +203,23 @@ jobs:
       # rustc toolchain of its own). We take the latest release rather than pinning a tag,
       # because the point of this job is "does the engine agree with an *independent*
       # verifier", and the interesting failures are Verus changing its mind, not ours.
+      #
+      # The release lookup is *authenticated*. An unauthenticated call to api.github.com is
+      # limited to 60 requests an hour *per IP*, and GitHub's runner IPs are shared, so the
+      # call intermittently returns 403 before anything is built -- a red job that says
+      # nothing about the crate (it happened here: the job failed at this `curl` with
+      # `curl: (22) ... 403`, and a re-run on the same commit passed). `github.token` raises
+      # the limit to 5000 an hour and is already available to the workflow, so the download
+      # is a check of Verus rather than a lottery on the runner's IP. Only the API call is
+      # authenticated; the asset itself is fetched from the redirect target, which does not
+      # take the header.
       - name: Download the Verus release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          url=$(curl -fsSL https://api.github.com/repos/verus-lang/verus/releases/latest \
+          url=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                https://api.github.com/repos/verus-lang/verus/releases/latest \
                 | python3 -c "import sys,json; print([a['browser_download_url'] for a in json.load(sys.stdin)['assets'] if a['name'].endswith('x86-linux.zip')][0])")
           curl -fsSL -o verus.zip "$url"
           python3 -c "import zipfile; zipfile.ZipFile('verus.zip').extractall('.')"
