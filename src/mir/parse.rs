@@ -1027,6 +1027,35 @@ struct ConstMentions {
     qualified_defs: std::collections::BTreeSet<String>,
     /// Qualified paths a `const` is *used* under (`const owner::K;`).
     qualified_uses: std::collections::BTreeSet<String>,
+    /// The last `::` segment of every function's name (`owner`, `inner`,
+    /// `local_in_method`, `{closure#0}`). A qualified `const` use whose path
+    /// prefix is one of these names a function-local item; any other prefix
+    /// names a module or an associated item. See [`claimed_bare_const_uses`].
+    fn_names: std::collections::BTreeSet<String>,
+}
+
+/// The bare names a qualified `const` use claims for a function-local item.
+///
+/// A function-local `const`'s definition can print *bare* (`const K: u8 = const
+/// 3_u8;`) while its use stays qualified (`const owner::K`), which is how a
+/// local whose crate-level twin the compiler removed (a `#[cfg]`-disabled item)
+/// would take the crate key. But a *qualified* use is not proof of a local: an
+/// associated constant uses `Foo::K` while defining `<impl at …>::K`, and a
+/// module constant uses `a::K`. Only a use whose path *prefix* is a function --
+/// `owner::K`, `Foo::local_in_method::L`, `outer::inner::M` -- names a
+/// function-local item. So a qualified use with no qualified definition of the
+/// same path claims its bare tail only when that prefix is a function name.
+fn claimed_bare_const_uses(mentions: &ConstMentions) -> std::collections::BTreeSet<String> {
+    mentions
+        .qualified_uses
+        .difference(&mentions.qualified_defs)
+        .filter(|path| {
+            let prefix = path.rsplit_once("::").map_or("", |(p, _)| p);
+            let owner = prefix.rsplit("::").next().unwrap_or("");
+            mentions.fn_names.contains(owner)
+        })
+        .filter_map(|p| p.rsplit("::").next().map(str::to_string))
+        .collect()
 }
 
 fn const_mentions(text: &str) -> ConstMentions {
@@ -1059,6 +1088,20 @@ fn const_mentions(text: &str) -> ConstMentions {
         // use sits in an operand (`_0 = const K;`). Only the role of a qualified
         // mention depends on this; the bare-use set reads uses only.
         let is_def = line.trim_start().starts_with(KW);
+        // Every function prints its header at the left margin: `fn owner(…)`,
+        // `fn <impl at …>::method(…)`, `fn outer::inner(…)`,
+        // `fn local_in_closure::{closure#0}(…)`. The last `::` segment is the
+        // item's own name, which is the prefix a function-local `const` use
+        // carries. The header of a non-function item never begins `fn `, and an
+        // operand never sits at the left margin, so this reads only headers.
+        if let Some(rest) = line.strip_prefix("fn ") {
+            if let Some(head) = rest.split_once('(').map(|(h, _)| h) {
+                let name = head.rsplit("::").next().unwrap_or("").trim();
+                if !name.is_empty() {
+                    out.fn_names.insert(name.to_string());
+                }
+            }
+        }
         // Drop string literals before scanning, so a `const` inside one is not
         // read as a use. A `"` toggles in/out of a literal; a `\` escapes the next
         // character, so `\"` does not close it.
@@ -1742,14 +1785,12 @@ fn parse_program_impl(
     // qualified definition of that path to match. The source set still names `K`
     // (the scanner reads the `#[cfg]`-disabled item), so without this the bare
     // definition would take the crate key and a contract on another function could
-    // name it -- a false proof. Only a qualified use with *no* qualified definition
-    // is such a local; a module constant (`const a::K`, defined and used
-    // qualified) is unaffected.
-    let claimed_bare: std::collections::BTreeSet<String> = mentions
-        .qualified_uses
-        .difference(&mentions.qualified_defs)
-        .filter_map(|p| p.rsplit("::").next().map(str::to_string))
-        .collect();
+    // name it -- a false proof. Only a qualified use whose path names a *function*
+    // is such a local; an associated constant (`Foo::K`, defined `<impl at …>::K`)
+    // and a module constant (`a::K`, defined and used qualified) are not, so a
+    // compiled crate constant those paths name keeps its bare key. See
+    // [`claimed_bare_const_uses`].
+    let claimed_bare = claimed_bare_const_uses(&mentions);
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
@@ -2419,6 +2460,80 @@ fn add(_1: u32, _2: u32) -> u32 {
                       const a::K: u8 = const 5_u8;\n";
         let prog = parse_program(module);
         assert_eq!(prog.consts.get("a::K"), Some(&Const::UInt(5, Some(Ty::U8))));
+    }
+
+    /// An *associated* constant's use must not claim a bare definition, or a
+    /// compiled crate constant of the same name is discarded.
+    ///
+    /// rustc uses an associated constant as `const Foo::K` but defines it as
+    /// `const <impl at …>::K`, so the use path has no matching definition -- the
+    /// same shape a function-local whose crate twin was `#[cfg]`-disabled has. The
+    /// tell that separates them is the prefix: `owner::K` names a *function*, so
+    /// the bare `K` is that local; `Foo::K` names an associated item, so the bare
+    /// `K` is the compiled crate constant and must be kept.
+    #[test]
+    fn an_associated_use_does_not_claim_a_crate_const() {
+        let dump = "const K: u8 = const 7_u8;\n\
+                    const <impl at file.rs:3:1: 3:9>::K: u8 = const 3_u8;\n\
+                    fn uses_assoc() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                    _0 = const Foo::K;\n        return;\n    }\n}\n";
+        let mut scoped = std::collections::BTreeSet::new();
+        scoped.insert("K".to_string());
+        let prog = parse_program_scoped(
+            dump,
+            &BTreeMap::new(),
+            &scoped,
+            &std::collections::BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            prog.consts.get("K"),
+            Some(&Const::UInt(7, Some(Ty::U8))),
+            "the compiled crate `K` must survive an associated `Foo::K`: {:?}",
+            prog.consts
+        );
+    }
+
+    /// A function-local `const` inside a *method* or a *nested* function must still
+    /// be refused, even though its use path has more than one `::`.
+    ///
+    /// `Foo::method::L` and `outer::inner::M` are locals, and the owning function is
+    /// the path's last `::` segment -- not the whole prefix. Reading the whole
+    /// prefix would let both leak back in as program-wide names.
+    #[test]
+    fn a_method_or_nested_local_use_still_claims_its_bare_definition() {
+        // A `#[cfg]`-disabled crate `L`/`M` is gone from the dump, so each local's
+        // definition prints *bare* while its use stays qualified -- exactly the
+        // shape that would otherwise take the crate key.
+        let dump = "fn <impl at file.rs:2:1: 2:9>::method(_1: &Foo) -> u8 {\n    \
+                    let mut _0: u8;\n\n    bb0: {\n        _0 = const Foo::method::L;\n        \
+                    return;\n    }\n}\n\
+                    const L: u8 = const 4_u8;\n\
+                    fn outer() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                    _0 = const 0_u8;\n        return;\n    }\n}\n\
+                    fn inner() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                    _0 = const outer::inner::M;\n        return;\n    }\n}\n\
+                    const M: u8 = const 1_u8;\n";
+        let mut scoped = std::collections::BTreeSet::new();
+        scoped.insert("L".to_string());
+        scoped.insert("M".to_string());
+        let prog = parse_program_scoped(
+            dump,
+            &BTreeMap::new(),
+            &scoped,
+            &std::collections::BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        assert!(
+            !prog.consts.contains_key("L"),
+            "a method-local `L` must not get a bare key: {:?}",
+            prog.consts
+        );
+        assert!(
+            !prog.consts.contains_key("M"),
+            "a nested-fn-local `M` must not get a bare key: {:?}",
+            prog.consts
+        );
     }
 
     /// The front end is total: no input, however mangled, may panic.

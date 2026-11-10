@@ -7120,3 +7120,44 @@ reverting its guard: without the path keying the trait-default and module tests
 report `Verified { obligations: 0 }`; without the `bare_uses.remove` loop
 `a_const_generic_does_not_leak_a_local_const` fails; without `prev_last` the split
 `crate_level_consts` case fails.
+
+## An associated `const` hid a compiled crate `const` -- a lost proof, and an unclosed comment panicked
+
+The previous commit stopped a `#[cfg]`-disabled crate `const` from letting a
+function-local item of the same name take the program-wide key. It did so by treating
+*any* qualified `const` use with no matching qualified definition as a function-local
+item. That test is too wide: it also matches a use of an **associated** constant.
+rustc uses one as `const Foo::K` but defines it as `const <impl at …>::K`, so the use
+path has no definition of its own spelling -- and the blanket rule claimed the bare
+tail `K`, then discarded the compiled crate `const K` (whose bare definition it thought
+that use explained). A contract naming `K` was left unreadable: a lost proof, not a
+false one, but a proof dropped by a rule that cannot tell the two shapes apart.
+
+**The fix reads the path's *owning* `::` segment.** `const_mentions` now also collects
+every function's own name -- the last `::` segment of a `fn …` header (`owner`, `inner`,
+`{closure#0}`, and the tail of `<impl at …>::method`). `claimed_bare_const_uses` keeps a
+qualified use's bare tail only when the path's prefix ends in one of those names. So
+`owner::K`, `Foo::local_in_method::L` and `outer::inner::M` name a function-local item
+and claim it; `Foo::K` (an associated constant) and `a::K` (a module constant) do not,
+and the compiled crate constant they name keeps its bare key.
+
+**F2: `spec::const_generic_params` panicked on an unclosed block comment.** The scanner
+runs over the raw source before rustc does, so it sees malformed input. After `const` it
+skips a `/* … */` comment by scanning for `*/` and then stepping two bytes past it; an
+unterminated `/*` ran the scan to end-of-file and the `j += 2` stepped past the buffer,
+panicking on `fn f<const /*`. The skip is now clamped (`j + 1 < len` in the loop, and the
+closing `j += 2` only when `*/` was actually found), so the malformed source is left for
+rustc to reject -- a refusal, not a crash.
+
+**Evidence.** `scripts/test-count.sh` **739 -> 745** passed, 0 failed; `scripts/gate.sh`
+**ALL GATES GREEN**; clippy (`--all-targets` and the `no_std` half) clean; zero
+dependencies and `no_std` untouched. Four new integration tests in `tests/mir.rs` and two
+new unit tests pin the verdicts. Each guard was reverted to check for teeth: without the
+function-name filter `an_associated_const_does_not_hide_a_crate_const` and its unit twin
+`an_associated_use_does_not_claim_a_crate_const` fail (the crate `const K` is dropped);
+reading the whole path prefix instead of its last segment fails
+`a_nested_or_method_local_is_not_a_program_wide_name` and
+`a_method_or_nested_local_use_still_claims_its_bare_definition` (a method/nested local
+leaks back in). The unclosed-comment unit test `const_generic_params_tolerates_an_unclosed_block_comment`
+fails without the clamp. A `<Foo as Tr>::K` trait form was tried and dropped: the path
+starts with `<`, so `const_mentions` never records it and the test could not discriminate.

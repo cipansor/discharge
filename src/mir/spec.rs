@@ -444,7 +444,12 @@ pub fn const_generic_params(source: &str) -> BTreeSet<String> {
                         while j + 1 < bytes.len() && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
                             j += 1;
                         }
-                        j += 2;
+                        // An unterminated block comment runs to the end of the
+                        // source; `j` must not pass `bytes.len()`, or the slice
+                        // below panics. `verify_file_with` scans contracts before
+                        // it invokes rustc, so malformed source must not crash
+                        // verification -- it is rustc's error to report.
+                        j = (j + 2).min(bytes.len());
                         continue;
                     }
                     break;
@@ -7515,6 +7520,29 @@ fn h<
                 names.contains("N"),
                 "the parameter after the `const` keyword must be read: {source:?} -> {names:?}"
             );
+        }
+    }
+
+    /// A source that ends inside an unclosed block comment must not panic.
+    ///
+    /// The scanner runs over the raw source before rustc sees it, so malformed
+    /// input reaches it. An unterminated `/*` after a `const` generic parameter
+    /// runs the comment skip to end-of-file, and stepping two bytes past the
+    /// buffer made the following slice panic -- a crash on input whose only
+    /// correct handling is to let rustc report the syntax error.
+    #[test]
+    fn const_generic_params_tolerates_an_unclosed_block_comment() {
+        for source in [
+            "fn f<const /*",
+            "fn f<const /*x",
+            "fn f<const /* ",
+            "fn f<const /*/",
+            "fn f<const /*x*",
+            "fn f<const /*x*/",
+            "fn f<const /*\n",
+        ] {
+            // The property is "does not panic"; the call itself is the assertion.
+            let _ = const_generic_params(source);
         }
     }
 }

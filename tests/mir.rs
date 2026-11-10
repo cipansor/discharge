@@ -6547,3 +6547,82 @@ fn a_local_const_alone_is_not_a_program_wide_name() {
         "a name only a function-local `const` carries must be refused, not decided, got: {o}"
     );
 }
+
+/// An *associated* constant must not hide a compiled crate-level constant of the
+/// same name.
+///
+/// rustc uses an associated constant's path (`const Foo::K`) but defines it by
+/// its impl location (`const <impl at …>::K`), so the use path has no matching
+/// definition. Reading that mismatch as "a function-local definition" -- as the
+/// `#[cfg]`-disabled case needs -- also claims the bare tail of a perfectly good
+/// associated use, and then discards the compiled crate `const K`, leaving a
+/// contract that names it unreadable. The claim must be limited to uses whose
+/// path prefix is a *function*.
+#[test]
+fn an_associated_const_does_not_hide_a_crate_const() {
+    let src = "const K: u8 = 7;\n\
+               pub struct Foo;\n\
+               impl Foo { pub const K: u8 = 3; }\n\
+               pub fn uses_assoc() -> u8 { Foo::K }\n\
+               /// ensures: ret == K\npub fn reads() -> u8 { 7 }\n";
+    let o = verify_src("reads", src).expect("reads must be present");
+    assert!(
+        o.is_verified(),
+        "`K` is the compiled crate constant (7), so `ret == K` must be proved \
+         despite the associated `Foo::K`, got: {o}"
+    );
+}
+
+/// A function-local `const` inside a *method* or a nested function must still be
+/// refused as a program-wide name, even though its use path is longer than
+/// `owner::K` (`Foo::method::L`, `outer::inner::M`).
+///
+/// The rule must read the path's *owning* `::` segment as the function, not the
+/// whole prefix: an exact-prefix match would read `Foo::method` as the owner and
+/// drop the claim, letting the local `L` leak. A crate `const L` of the same name
+/// is present so that a leak shows up as a *false proof* (`ret == L` proved
+/// against the local's 4) rather than merely a different skip reason.
+#[test]
+fn a_nested_or_method_local_const_is_not_a_program_wide_name() {
+    let src = "pub const L: u8 = 40;\npub const M: u8 = 10;\n\
+               pub struct Foo;\n\
+               impl Foo { pub fn method(&self) -> u8 { const L: u8 = 4; L } }\n\
+               pub fn outer() -> u8 { fn inner() -> u8 { const M: u8 = 1; M } inner() }\n\
+               /// ensures: ret == L\npub fn reads_l() -> u8 { 4 }\n\
+               /// ensures: ret == M\npub fn reads_m() -> u8 { 1 }\n";
+    for (name, local) in [("reads_l", "L"), ("reads_m", "M")] {
+        let o = verify_src(name, src).expect("contracted function must be present");
+        assert!(
+            matches!(o, FnOutcome::Skipped { .. }),
+            "`{local}` in `{name}` must resolve to the crate constant, not the \
+             method/nested local, so a body of the local's value must be refused, \
+             got: {o}"
+        );
+    }
+}
+
+/// The front end must not panic on a source that ends inside an unclosed block
+/// comment.
+///
+/// `verify_file_with` scans the source for contracts *before* it runs rustc, so a
+/// malformed file reaches `const_generic_params`. A `const` generic parameter
+/// followed by an unterminated `/*` runs the comment skip to end-of-file; if the
+/// skip then steps past the buffer, the slice panics. Malformed source is rustc's
+/// error to report, not a crash here.
+#[test]
+fn an_unclosed_block_comment_after_const_is_not_a_panic() {
+    use discharge::mir::spec;
+    for src in [
+        "fn f<const /*",
+        "fn f<const /*x",
+        "fn f<const /* ",
+        "fn f<const /*/",
+        "fn f<const /*x*",
+        "fn f<const /*x*/",
+        "fn f<const /*\n",
+    ] {
+        // The property is "does not panic", so the call itself is the assertion.
+        let _ = spec::const_generic_params(src);
+    }
+}
+
