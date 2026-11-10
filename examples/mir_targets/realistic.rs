@@ -496,6 +496,38 @@ pub fn wrapped_product(a: u8) -> u8 {
     a.wrapping_mul(15)
 }
 
+/// A `u16` `saturating_mul`, which the widened product now reaches.
+///
+/// This width used to be refused outright: the model's product test widened the
+/// operands to `2w`, and past `2w == 16` that multiplier was the scaling wall, so
+/// every `u16` `saturating_mul`/`checked_mul` reported "past what the model
+/// covers" and no contract over one could be settled. The bound is 16 now, and
+/// the guard below is the shape the model's own predicate has, so the obligation
+/// settles by cancellation rather than by blasting the `2w` multiplier.
+///
+/// The guard is deliberately *tight*: `100 * 100` is `10000`, far below the
+/// `u16` `MAX`, and `a <= 100 && b <= 100` is the reason. A guard that permitted
+/// a product above `65535` would make this fail, which is what the tripwire
+/// below pins.
+/// requires: a <= 100 && b <= 100
+/// ensures: ret == a * b
+pub fn u16_product_guarded(a: u16, b: u16) -> u16 {
+    a.saturating_mul(b)
+}
+
+/// The tripwire for the fixture above: the same body under a guard that does
+/// **not** rule out overflow, so the postcondition must fail.
+///
+/// `50000 * 50000` is `2_500_000_000`, which does not fit a `u16`, and the
+/// saturating product clamps to `65535` rather than wrapping — so `ret == a * b`
+/// is false there. `tests/mir.rs` requires the failure; a frontend that verified
+/// this would be proving the wrong thing.
+/// requires: a <= 50000 && b <= 50000
+/// ensures: ret == a * b
+pub fn u16_product_unguarded_tripwire(a: u16, b: u16) -> u16 {
+    a.saturating_mul(b)
+}
+
 /// A comparison through `core::cmp::Ord` rather than the builtin operator.
 /// requires: true
 /// ensures: ret <= a

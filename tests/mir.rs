@@ -1253,6 +1253,29 @@ fn stage_two_rvalues_are_modelled_and_their_tripwires_refuted() {
     }
 }
 
+/// A `u16` product is decided end to end, which the product bound now admits.
+///
+/// The `u16` `saturating_mul` in the corpus used to report "past what the model
+/// covers": the widened product test needs a `2w`-bit multiplier, and the bound
+/// stopped the widening at `2w == 16`. The bound is 16 now, so the guarded
+/// fixture must verify and the deliberately unguarded one must still be refuted.
+/// The pair matters more than the verify: a bound raised without the refutation
+/// would be a model that proves the wrong thing, which is worse than one that
+/// declines.
+#[test]
+fn a_u16_product_is_decided_end_to_end() {
+    let Some(report) = verify_realistic(&["u16_product_guarded"]) else { return };
+    let o = outcome(&report, "u16_product_guarded");
+    assert!(o.is_verified(), "`u16_product_guarded` must verify, got: {o}");
+
+    let Some(report) = verify_realistic(&["u16_product_unguarded_tripwire"]) else { return };
+    let o = outcome(&report, "u16_product_unguarded_tripwire");
+    let FnOutcome::Failed { .. } = o else {
+        panic!("`u16_product_unguarded_tripwire` is false and must be refuted, got: {o}");
+    };
+}
+
+
 /// The bitwise complement `!x`, pinned by a true half and a tripwire.
 ///
 /// `!x` is `all_ones ^ x` at the *operand's* width. The model reads that width

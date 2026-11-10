@@ -2750,6 +2750,41 @@ themselves in the `detail` column — an unreadable `requires` (`c.lo <= c.hi`, 
 and a tuple-returning `ensures` (`ret.0 <= a`). Those are the next gaps, and they are parser
 gaps rather than engine ones, which the scoreboard says without being asked.
 
+## A product is widened to `2w == 32`, and `pow`'s fold keeps its own tighter bound
+
+The `Mul` arm of `intrinsics::failure` widens the operands to `2w` and multiplies there, because
+overflow needs the *exact* product and `2w` bits hold it. That widening was capped at
+`2w == 16`, so a `u16` `saturating_mul`/`checked_mul` was refused outright — every contract over
+one reported "past what the model covers" and none could be settled. The cap is `2w == 32` now
+(`MUL_MAX_WIDTH = 16`), and the width that was refused is decided.
+
+**The division form was tried here first and is worse.** The plain-`*` path uses
+`y != 0 && x > MAX / y` (see the section above), and it is the *right* predicate there because
+the corpus's guard is written in that shape and the boolean fold cancels the two against each
+other. The intrinsics idioms are not that shape: `saturating_mul` asks about the *value* of a
+`core` call and carries no hand-written division guard to cancel against, so the divider is
+built and blasted instead of folding away. Measured: a `u16` idiom the widened test settles
+`Valid` in ~180ms came back `Unknown` after ~3.2s under the division form, and the `pow` fold —
+which composes up to 64 `mul_failure` queries — hung past the 900s test timeout, because 64
+nested dividers are far past what the blaster holds. So the two paths share the overflow *rule*
+but not its cheapest spelling, and the shared helper stays the widened one.
+
+**`pow` gets `POW_MAX_WIDTH = 8`, below the product bound, on purpose.** Its fold is a `mul` and
+a squaring per exponent bit, so it costs a large multiple of one product rather than the product
+itself. Raising its bound to 16 bought nothing and cost seconds: a `u16` `saturating_pow` with a
+symbolic exponent was still `Unknown`, but only after ~12s of diagram work, where the same
+refusal at 8 bits is immediate. An answer that cannot be reached is not worth paying for. The
+test `pow_is_modelled_only_where_a_product_is` pins the separation so a later change cannot
+collapse the two constants quietly.
+
+The teeth are a unit test and a corpus pair. `a_u16_product_is_modelled_and_exact` sweeps the
+boundary neighbourhood of a `u16` product against `core`'s own `checked_mul`/`saturating_mul`,
+so the widened test is pinned as *exact* at the new width and not merely reachable. In the
+corpus, `u16_product_guarded` must verify and `u16_product_unguarded_tripwire` — the same body
+under a guard that does not rule out overflow — must still be refuted; a bound raised without
+the refutation would be a model that proves the wrong thing, which is worse than one that
+declines.
+
 ## An inlined call must restore the caller's loop cut, or the caller unwinds a loop it had cut
 
 Cutting a loop at its invariant is a property of a *function*: the `Cut` names the header and

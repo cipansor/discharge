@@ -69,14 +69,44 @@ use crate::smt::{self, Pred, Var};
 /// hangs is worse than one that says "I could not decide".
 pub const DIV_MAX_WIDTH: u8 = 32;
 
-/// The widest operand whose *product* the model will widen to test.
+/// The widest operand whose *product* the intrinsics model will widen to test.
 ///
 /// Overflow for a product needs the exact `2w`-bit result, and a `2w`-bit
 /// multiplier is the scaling wall this crate documents. Past this the query is
-/// not worth posing, so the model declines and the path stays unknown. This is
-/// the same wall the plain `*` path hits; the bound is stated here so the two
-/// cannot drift.
-pub const MUL_MAX_WIDTH: u8 = 8;
+/// not worth posing, so the model declines and the path stays unknown. The plain
+/// `*` path reaches further -- it uses an exact division test rather than a
+/// widened product, and `DIV_MAX_WIDTH` is its limit -- so this bound is the
+/// intrinsics' own, stated here so the two cannot be confused.
+///
+/// Sixteen is measured rather than guessed. The widened product is what makes a
+/// `u16` product decidable at all: with this bound at 8, every `u16`
+/// `saturating_mul`/`checked_mul` reported "past what the model covers" and no
+/// contract over one could be settled. At 16 a guarded `u16` product is
+/// *verified* and a mis-guarded one is correctly *refuted*, both in under 200ms,
+/// because the obligation's guard and the model's predicate are the same term and
+/// the boolean fold settles them without blasting the multiplier. The `2w == 32`
+/// multiplier is built only when the fold cannot cancel it, and even a fully
+/// unconstrained `u16` product answers inside the budget.
+///
+/// It is *not* the division form the plain-`*` path uses. That form was measured
+/// here and is strictly worse: a `u16` idiom that the widened test settles in
+/// 180ms came back `Unknown` after 3.2s, because these idioms ask about the
+/// *value* of a `core` call and carry no hand-written guard for a division to
+/// cancel against. The two paths therefore share the overflow *rule* but not its
+/// cheapest spelling.
+pub const MUL_MAX_WIDTH: u8 = 16;
+
+/// The widest base `pow` is modelled at.
+///
+/// Lower than [`MUL_MAX_WIDTH`], and deliberately so. `pow`'s fold is up to 64
+/// `mul_failure` queries composed into one term -- a `mul` and a squaring per
+/// exponent bit -- so it costs a large multiple of a single product rather than
+/// the product itself. Raising this to the product bound buys nothing and costs
+/// seconds: a `u16` `saturating_pow` with a symbolic exponent was still
+/// `Unknown`, but only after twelve seconds of diagram work, where the same
+/// refusal at 8 bits is immediate. An answer that cannot be reached is not worth
+/// paying for, so the fold keeps the tighter bound.
+pub const POW_MAX_WIDTH: u8 = 8;
 
 /// The discriminant of the `Some` variant, where a modelled `Option` payload
 /// lives. rustc numbers `None` 0 and `Some` 1.
@@ -305,9 +335,10 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         },
         // `pow`. Unlike the families above it reads a `u32` exponent beside a
         // base of the method's own width, so it is its own shape. It is modelled
-        // only where a *product* is: the fold's every step is a `mul_failure`
-        // query, and past [`MUL_MAX_WIDTH`] the widened multiply is the scaling
-        // wall, so the answer would be "unknown" at the first step anyway.
+        // only where a *product* is, and then only up to its own tighter bound:
+        // the fold's every step is a `mul_failure` query, so its cost is a large
+        // multiple of one product's rather than the product's own. See
+        // [`POW_MAX_WIDTH`] for the measurement behind the difference.
         //
         // All four families are modelled, and `pow` is not the division trap: its
         // failure is an overflow, and an overflow is a *value* in every family --
@@ -315,7 +346,7 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // `overflowing` sets the flag. Nothing here can panic, so there is no
         // panic to hide. The plain `pow`, which panics on overflow, is not a
         // modelled name at all: `classify` has no prefix for it.
-        Intrinsic::Pow(_) => w <= MUL_MAX_WIDTH,
+        Intrinsic::Pow(_) => w <= POW_MAX_WIDTH,
     }
 }
 
@@ -616,11 +647,15 @@ fn failure(op: BinOp, x: Var, y: Var, w: u8, signed: bool) -> Option<Pred> {
 ///
 /// The exact result is built by widening: `truncate` zero-extends when the target
 /// is wider, so the operands are widened to `2w` and multiplied exactly there.
-/// Past `2w == 16` the widened multiply is the scaling wall this crate documents,
-/// so the model declines and the caller reports the path unknown.
+/// Past `2w == 32` the widened multiply is the scaling wall this crate documents,
+/// so the model declines and the caller reports the path unknown. That is the same
+/// width [`MUL_MAX_WIDTH`] admits, so the two agree today; the guard stays here as
+/// well because it is the *correctness* condition on the term this function builds,
+/// and a caller that changed the policy bound should get a refusal rather than a
+/// term the blaster cannot hold.
 fn mul_failure(x: Var, y: Var, w: u8, signed: bool) -> Option<Pred> {
     let wide = w.saturating_mul(2).min(64);
-    if wide <= w || wide > 16 {
+    if wide <= w || wide > 32 {
         return None;
     }
     Some(if signed {
@@ -1285,29 +1320,41 @@ mod tests {
         }
     }
 
-    /// `pow` is modelled only where a product is, and the exponent's width is a
-    /// check rather than an assumption.
+    /// `pow` is modelled only where a product is, and only up to its own bound.
+    ///
+    /// The bound is deliberately *below* the product bound, because the fold
+    /// composes many products: this pins the separation, so a later change that
+    /// collapses the two constants has to delete an assertion rather than quietly
+    /// make every symbolic `pow` slow.
     #[test]
     fn pow_is_modelled_only_where_a_product_is() {
-        // `pow`'s every step is a widened multiply, so it shares `MUL_MAX_WIDTH`.
-        assert!(is_modelled(Intrinsic::Pow(Family::Wrapping), MUL_MAX_WIDTH, false));
-        assert!(!is_modelled(Intrinsic::Pow(Family::Wrapping), MUL_MAX_WIDTH + 1, false));
+        // A `u32` read makes the comparison opaque to clippy's constant check while
+        // still being a compile-time fact; the point is that a later change to the
+        // constants cannot silently pass.
+        assert!(
+            u32::from(POW_MAX_WIDTH) < u32::from(MUL_MAX_WIDTH),
+            "pow's fold must keep the tighter bound"
+        );
+        assert!(is_modelled(Intrinsic::Pow(Family::Wrapping), POW_MAX_WIDTH, false));
+        assert!(!is_modelled(Intrinsic::Pow(Family::Wrapping), POW_MAX_WIDTH + 1, false));
+        // A width a two-operand product admits is still refused for `pow`.
+        assert!(!is_modelled(Intrinsic::Pow(Family::Wrapping), MUL_MAX_WIDTH, false));
         assert!(eval(
             Intrinsic::Pow(Family::Overflowing),
-            smt::var(MUL_MAX_WIDTH),
+            smt::var(POW_MAX_WIDTH),
             smt::var(32),
-            MUL_MAX_WIDTH,
+            POW_MAX_WIDTH,
             false,
-            MUL_MAX_WIDTH
+            POW_MAX_WIDTH
         )
         .is_some());
         assert!(eval(
             Intrinsic::Pow(Family::Overflowing),
-            smt::var(MUL_MAX_WIDTH + 1),
+            smt::var(POW_MAX_WIDTH + 1),
             smt::var(32),
-            MUL_MAX_WIDTH + 1,
+            POW_MAX_WIDTH + 1,
             false,
-            MUL_MAX_WIDTH + 1
+            POW_MAX_WIDTH + 1
         )
         .is_none());
         // The fold runs 32 steps, so a `u32` exponent is the whole domain and a
@@ -1809,6 +1856,55 @@ mod tests {
         // And the names that *are* covered classify, under both spellings.
         assert!(classify("core::num::<impl u8>::checked_add").is_some());
         assert!(classify("saturating_sub").is_some());
+    }
+
+    /// A `u16` product is now inside the bound, and the widened test is still exact
+    /// there -- the width that used to be refused outright.
+    ///
+    /// The oracle is `core`'s own `checked_mul`/`saturating_mul`, so this is not a
+    /// second copy of the model. The sweep is the boundary neighbourhood plus a few
+    /// strides: `2^16` pairs is too many to enumerate, and the cases a wrong bound
+    /// gets wrong are the ones where the product lands exactly on `MAX`, one past
+    /// it, or in the high half.
+    #[test]
+    fn a_u16_product_is_modelled_and_exact() {
+        let vals: [u16; 16] = [
+            0, 1, 2, 3, 255, 256, 257, 32767, 32768, 32769, 43690, 65534, 65535, 12345, 40000, 513,
+        ];
+        smt::with_fresh(|| {
+            let a = smt::var(16);
+            let b = smt::var(16);
+            let (ai, bi) = (smt::index(a), smt::index(b));
+            let checked = eval(Intrinsic::Checked(BinOp::Mul), a, b, 16, false, 16)
+                .expect("checked_mul u16 must be modelled");
+            let sat = eval(Intrinsic::Saturating(BinOp::Mul), a, b, 16, false, 16)
+                .expect("saturating_mul u16 must be modelled");
+            for &x in &vals {
+                for &y in &vals {
+                    let (got_some, got_val) = read(checked, ai, bi, x as u64, y as u64);
+                    assert_eq!(
+                        got_some,
+                        Some(u16::checked_mul(x, y).is_some()),
+                        "checked_mul u16 at ({x}, {y}): the tag must match `core`"
+                    );
+                    if let Some(want) = u16::checked_mul(x, y) {
+                        assert_eq!(
+                            got_val,
+                            Some(want as u64),
+                            "checked_mul u16 at ({x}, {y}): the payload must match `core`"
+                        );
+                    }
+                    // The clamp is the predicate's other use, so a wrong `failure`
+                    // would show here as a value rather than only a tag.
+                    let (_, sat_val) = read(sat, ai, bi, x as u64, y as u64);
+                    assert_eq!(
+                        sat_val,
+                        Some(u16::saturating_mul(x, y) as u64),
+                        "saturating_mul u16 at ({x}, {y})"
+                    );
+                }
+            }
+        });
     }
 
     /// Above the documented width limits the model declines rather than guessing.
