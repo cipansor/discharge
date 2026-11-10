@@ -3667,8 +3667,9 @@ needed slice modelling, so it is left as the honest boundary.
 
 **Stage 4 — the missing intrinsics.** `wrapping_neg`, `wrapping_div`,
 `wrapping_rem`, `leading_zeros`, `trailing_zeros`, `count_ones`, `pow`,
-`is_power_of_two`. The `wrapping_*` family is the same arithmetic the `checked_*`
-arms already do, minus the overflow obligation, so it is mostly plumbing.
+`is_power_of_two`, `add_signed`/`add_unsigned`. The `wrapping_*` family is the same
+arithmetic the `checked_*` arms already do, minus the overflow obligation, so it is
+mostly plumbing.
 `count_ones` and the zero-counts are small bit-vector loops and belong in
 `discharge-arithmetic` beside the other proved primitives, not in the frontend.
 All of these are now modelled except the division families that cannot express a
@@ -3692,8 +3693,46 @@ executor builds for a `Not` rvalue, so a bit count of a written `!x` and a bit c
 of the complement cannot disagree. `is_power_of_two` is modelled too, and it is the
 one shape whose *return type* is `bool`: the model produces a `Pred` and the executor
 writes a `Val::Bool`, which is what the `if` that consumes it branches on. It is
-unsigned-only, because `core` has no such method on the signed types. Findings worth
-more than the coverage:
+unsigned-only, because `core` has no such method on the signed types. The
+mixed-signedness additions — `wrapping_add_signed`, `saturating_add_signed`,
+`checked_add_signed`, `overflowing_add_signed` and their `_unsigned` counterparts —
+are modelled too, as `Intrinsic::MixedAdd(Family)`: their two operands have
+*opposite* signedness (`u8::wrapping_add_signed` adds an `i8` to a `u8`), so they
+are their own shape rather than a `BinOp`, and the direction is read from the
+operands rather than stored in the variant. Findings worth more than the coverage:
+
+* **The mixed-add overflow flag is *not* the ordinary signed-addition rule, and a
+  model that reached for that rule would be wrong on half the domain.** The flag
+  rustc inlines is `carry XOR (addend < 0)`, where `carry` is the addition's
+  overflow read at the *method's own type* (the unsigned carry for `u8`, the signed
+  overflow for `i8`) — which is exactly the `failure(Add, …)` predicate the other
+  families already use, so the mixed shapes reuse it rather than stating a second
+  carry rule. The adjustment is load-bearing in both directions and the naive
+  reading fails both ways: for `u8::add_signed`, `250u8 + (-1i8)` is `249`, in
+  range, but the addition *carries* (`250 + 255` wraps), so the bare carry reports
+  an overflow that is not there; for `i8::add_unsigned`, `0i8 + 128u8` is `-128`,
+  which has run off the top, but the addition does *not* carry, so the bare carry
+  misses it. The addend's top bit is its sign in either reading, so one term serves
+  both. Both directions were walked over the whole `u8`/`i8` domain (65536 pairs
+  each) against `core`'s own methods; the carry alone missed 32768 of them. The
+  first cut of this model used the *self* operand's sign instead of the addend's and
+  was caught by the differential test at `i8::add_unsigned` (`0i8 + 128u8`), which is
+  why the test walks both directions rather than one.
+* **The saturating clamp differs by direction, and the two clamps are not the same
+  bound.** `u8::saturating_add_signed` clamps to the *addend's* end — `0` for a
+  negative addend, `255` for a non-negative one — while `i8::saturating_add_unsigned`
+  adds a non-negative count and can only run off the top, so it clamps to `127`. A
+  model that took the unsigned maximum for a signed self would return `255`, which
+  reads back as `-1`; the exhaustive walk caught exactly that (`0i8 + 128u8`).
+* **The value is one term in both directions.** rustc reinterprets the operand of the
+  opposite signedness and adds, so `mixed_add_result` is a plain `smt::add` and the
+  same expression serves `u8::wrapping_add_signed` and `i8::wrapping_add_unsigned`.
+  Only the failure predicate and the clamp read the direction.
+* **A `u8`/`i8` corpus pin is not enough for the `_unsigned` direction.** `0i8 +
+  128u8` is `-128` under *both* readings of the addend (`128u8` as `u8` gives `-128`;
+  `128u8` as `i8` is `-128`, and `0 + -128` also gives `-128`), so it does not
+  separate them. The separating pin is `1i8 + 128u8`: the right reading clamps to
+  `127`, the wrong one computes `1 + -128` = `-127` in range. The corpus carries both.
 
 * **`count_ones`, `leading_zeros` and `trailing_zeros` are the modelled calls whose
   result width differs from their operand's** (`u8::count_ones` returns `u32`). The
@@ -3738,10 +3777,26 @@ more than the coverage:
   panic-free*. `is_modelled` now admits only `checked_div`/`checked_rem`, and the
   corpus records why.
 
+**Evidence for the mixed-signedness additions.** `scripts/test-count.sh` **755 ->
+760** passed, 0 failed; `scripts/gate.sh` **ALL GATES GREEN**; clippy (`--all-targets`
+and the `no_std` half) and rustdoc clean; zero dependencies and `no_std` untouched.
+Five new unit tests walk both directions over the whole `u8`/`i8` domain against
+`core`'s own methods — the differential test is the oracle, not a copy of the model —
+and the corpus gains eight fixtures (six verify, two are the `overflowing` flag pinned
+in both directions). The model was wrong twice on the first cut and both were caught
+by the exhaustive walk rather than by a sample: the flag used the self operand's sign
+instead of the addend's (caught at `i8::add_unsigned`), and the saturating clamp used
+the unsigned maximum for a signed self (caught at `0i8 + 128u8`). Each corpus pin was
+checked for teeth by flipping its expected value: `overflowing_add_signed_within_range_is_not_overflow`
+is the one the bare-carry model refutes, and `saturating_add_unsigned_top_bit_tripwire`
+is the one an addend-signedness swap refutes.
+
 `wrapping_div`/`wrapping_rem`/`saturating_div`/`saturating_rem` are *not* reachable
 by design, because they panic on a zero divisor and modelling them as total would
 hide that panic; `overflowing_div`/`overflowing_rem` join them for the same reason.
-`pow` remains reachable and unmodelled. The bit-count proofs do **not** go in `discharge-arithmetic`: their oracle here is Rust's own method, checked
+`pow` and the mixed-signedness additions are now modelled, so neither is a reachable
+gap. `rotate_*`, `abs_diff` and the `next_multiple_of`/`div_*` helpers remain reachable
+and unmodelled. The bit-count proofs do **not** go in `discharge-arithmetic`: their oracle here is Rust's own method, checked
 exhaustively over the whole operand domain, which is a stronger oracle than a
 small-domain enumeration would be. A third engine with less coverage is not a proof,
 so the split the roadmap proposed is not made.

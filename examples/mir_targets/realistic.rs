@@ -37,8 +37,10 @@
 //!   in the frontend from their operands rather than by reading `core`'s MIR.
 //!   So are the unary operators — `neg` and `abs` in all four families — the
 //!   six bit counts (`count_ones`, `count_zeros`, `leading_zeros`,
-//!   `leading_ones`, `trailing_zeros` and `trailing_ones`) and the `bool`
-//!   predicate `is_power_of_two`.
+//!   `leading_ones`, `trailing_zeros` and `trailing_ones`), the `bool`
+//!   predicate `is_power_of_two`, and the mixed-signedness additions
+//!   (`wrapping_add_signed`, `saturating_add_signed`, `checked_add_signed`,
+//!   `overflowing_add_signed` and their `_unsigned` counterparts).
 //!   Division is the one narrowing: only `checked_div`/`checked_rem` are
 //!   modelled, because every other family — `overflowing_*` included — panics on
 //!   a zero divisor and hiding that panic is not something a proof may do. A
@@ -3304,6 +3306,99 @@ pub fn is_power_of_two_of_zero_tripwire(x: u8) -> bool {
 /// ensures: ret == false
 pub fn is_power_of_two_of_three(x: u8) -> bool {
     x.is_power_of_two()
+}
+
+/// `wrapping_add_signed` adds a signed addend to an unsigned self, and the result
+/// is the plain wrapped sum: `0u8 + (-1i8)` is `255`. This is the *value* pin --
+/// a model that refused the mixed shape, or read the addend as unsigned, would
+/// not produce `255`.
+/// requires: x == 0
+/// requires: r == -1
+/// ensures: ret == 255
+pub fn wrapping_add_signed_of_a_negative(x: u8, r: i8) -> u8 {
+    x.wrapping_add_signed(r)
+}
+
+/// `saturating_add_signed` clamps at the *addend's* end, not the self type's: an
+/// unsigned self with a negative addend that borrows below zero clamps to `0`,
+/// where the ordinary unsigned `saturating_add` would wrap instead. The
+/// postcondition is the clamp value, so a model that forgot the clamp -- or took
+/// the addend as unsigned -- would not produce `0`.
+/// requires: x == 0
+/// requires: r == -1
+/// ensures: ret == 0
+pub fn saturating_add_signed_clamps_to_zero(x: u8, r: i8) -> u8 {
+    x.saturating_add_signed(r)
+}
+
+/// The flag of a mixed-signedness addition, where the *mathematical* result runs
+/// off the bottom: `0u8 + (-1i8)` is `-1`, which `u8` cannot hold, so the flag is
+/// `true` and the value is the wrapped `255`. The flag is not a claim about the
+/// carry alone -- here the carry fires *and* the flag is set -- which is why the
+/// pin below, where the carry fires and the flag is *clear*, is the one that
+/// separates this model from the naive one.
+/// requires: x == 0
+/// requires: r == -1
+/// ensures: ret == true
+pub fn overflowing_add_signed_below_zero_is_overflow(x: u8, r: i8) -> bool {
+    x.overflowing_add_signed(r).1
+}
+
+/// The pin the carry alone cannot make: `250u8 + (-1i8)` is `249`, which `u8`
+/// holds, so the flag is `false` -- even though the addition *carries*, because
+/// `250 + 255` wraps to `249`. A model that took the bare top-bit carry as the
+/// flag would report `true` here and *refute* this true contract; the addend's
+/// sign is what cancels that carry.
+/// requires: x == 250
+/// requires: r == -1
+/// ensures: ret == false
+pub fn overflowing_add_signed_within_range_is_not_overflow(x: u8, r: i8) -> bool {
+    x.overflowing_add_signed(r).1
+}
+
+/// The flag from the other side: `250u8 + 10i8` is `260`, past `u8::MAX`, so the
+/// flag is `true`. Together with the pin above it fixes the flag in both
+/// directions, which is what a model that returned a constant could not do.
+/// requires: x == 250
+/// requires: r == 10
+/// ensures: ret == true
+pub fn overflowing_add_signed_past_the_top_tripwire(x: u8, r: i8) -> bool {
+    x.overflowing_add_signed(r).1
+}
+
+/// The `_unsigned` direction, where the self operand is signed: `0i8 + 128u8` is
+/// `-128`, the value `wrapping_add_unsigned` produces by reinterpreting the
+/// addend. A model that read the addend as signed (`128u8` as `i8` is `-128`)
+/// would compute `0 + -128` and agree here by accident, so the pin below is the
+/// one that separates the two readings.
+/// requires: x == 0
+/// requires: r == 128
+/// ensures: ret == -128
+pub fn wrapping_add_unsigned_of_the_top_bit(x: i8, r: u8) -> i8 {
+    x.wrapping_add_unsigned(r)
+}
+
+/// `saturating_add_unsigned` on a signed self clamps to the *signed* maximum
+/// `127`, because the addend is unsigned and can only run off the top. `0i8 +
+/// 128u8` overflows and clamps to `127`. A model that took the unsigned maximum
+/// would return `255`, which reads back as `-1`.
+/// requires: x == 0
+/// requires: r == 128
+/// ensures: ret == 127
+pub fn saturating_add_unsigned_clamps_to_signed_max(x: i8, r: u8) -> i8 {
+    x.saturating_add_unsigned(r)
+}
+
+/// The tripwire that separates the two readings of the addend: `1i8 + 128u8` is
+/// `129`, past `i8::MAX`, so it clamps to `127`. Reading the addend as signed
+/// gives `1 + (-128)` = `-127`, which is in range and would *refute* this true
+/// contract -- so a model that got the addend's signedness wrong is caught here
+/// and not by the `x == 0` pin, where both readings agree on `-128`.
+/// requires: x == 1
+/// requires: r == 128
+/// ensures: ret == 127
+pub fn saturating_add_unsigned_top_bit_tripwire(x: i8, r: u8) -> i8 {
+    x.saturating_add_unsigned(r)
 }
 
 /// `saturating_neg` of a positive value is negative: the negation is in range, so

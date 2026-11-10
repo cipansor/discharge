@@ -42,6 +42,12 @@
 //!   produces a [`Pred`] and the executor writes a `Val::Bool`, which is what the
 //!   `if` that consumes it branches on. It is unsigned-only, because `core` has no
 //!   such method on the signed types.
+//! * `add_signed`/`add_unsigned` — an addition whose two operands have *opposite*
+//!   signedness (`u8::wrapping_add_signed` adds an `i8` to a `u8`). The value is a
+//!   plain addition of the two words, so it is the same term in both directions;
+//!   the flag is the addition's own overflow *adjusted by the addend's sign*, which
+//!   is what makes it exact rather than the ordinary signed-addition rule. See
+//!   [`mixed_add_failure`] for why the adjustment is not optional.
 //!
 //! # What is not, and why refusing is the right answer
 //!
@@ -61,7 +67,7 @@
 //! * `unchecked_*` is undefined behaviour on overflow. There is no value to
 //!   model, and a proof about UB is not a proof, so it is refused.
 //! * `pow` is modelled as a fold over the exponent's bits (see [`POW_MAX_WIDTH`]).
-//!   `rotate_*`, `add_signed`, the float ops and the
+//!   `rotate_*`, `abs_diff`, the float ops and the
 //!   `next_multiple_of`/`div_*` helpers remain absent, and an unmodelled name is
 //!   refused rather than approximated. The other `is_*` predicates
 //!   (`is_ascii*`, `is_negative`, the digit predicates) are absent too: they
@@ -165,6 +171,20 @@ pub enum Intrinsic {
     /// carried for the same reason it is on `Unary`: the four disagree about the
     /// failure case, and `pow`'s failure is an *overflow*, not a zero divisor.
     Pow(Family),
+    /// A mixed-signedness addition: `wrapping_add_signed`, `saturating_add_signed`,
+    /// `checked_add_signed`, `overflowing_add_signed` and their `_unsigned`
+    /// counterparts.
+    ///
+    /// Its two operands have *opposite* signedness -- `u8::wrapping_add_signed`
+    /// adds an `i8` to a `u8` -- so it is its own shape rather than a `BinOp`,
+    /// whose operands share a type. It is one variant and not two because the
+    /// *value* is the same addition of two `w`-bit words either way: rustc
+    /// reinterprets the operand of the opposite signedness and adds, which is one
+    /// term whatever the direction. Only the failure predicate reads which side is
+    /// signed, and that is already carried by the operand's sign -- the executor
+    /// passes it as `signed` -- so the direction is not stored a second time here,
+    /// where it could drift from the sign the model actually reads.
+    MixedAdd(Family),
     /// A `bool`-valued predicate (`is_power_of_two`).
     ///
     /// Its *return type* is `bool`, not an integer, so unlike every other shape
@@ -319,6 +339,11 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     match op {
         "neg" => return Some(Intrinsic::Unary(family, UnOp::Neg)),
         "abs" => return Some(Intrinsic::Unary(family, UnOp::Abs)),
+        // The mixed-signedness additions: their two operands have opposite
+        // signedness, so they are their own shape rather than a `BinOp`. The
+        // whole suffix is matched, so `add_signed_thing` is refused rather than
+        // read as `add_signed`.
+        "add_signed" | "add_unsigned" => return Some(Intrinsic::MixedAdd(family)),
         // `pow` is a fold over the exponent's bits rather than one operator, so
         // it is its own shape too. It is matched here rather than falling into
         // the operator table below, which has no `pow` entry and would refuse it.
@@ -419,6 +444,14 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // panic to hide. The plain `pow`, which panics on overflow, is not a
         // modelled name at all: `classify` has no prefix for it.
         Intrinsic::Pow(_) => w <= POW_MAX_WIDTH,
+        // The mixed-signedness additions. The operand of the method's own type
+        // has the method's sign, and the other operand's sign is what tells the
+        // model which one it is reading; the method itself exists on *both*
+        // signednesses for the opposite operand's sign -- `u8::add_signed` takes
+        // an `i8`, `i8::add_unsigned` takes a `u8` -- so there is no membership
+        // fact to check, only the width. Nothing here can panic, so all four
+        // families are modelled.
+        Intrinsic::MixedAdd(_) => true,
     }
 }
 
@@ -553,6 +586,52 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
                     payload: value,
                 },
                 Family::Overflowing => Outcome::Tuple { value, overflowed: fails },
+            }
+        }
+        // The mixed-signedness additions. `y` is the addend, whose signedness is
+        // the *opposite* of the method's own, and `signed` is the method's own --
+        // so the direction is not carried in the shape, only read here.
+        //
+        // The value is one term in both directions, so only the failure and the
+        // clamp depend on the direction. The clamp is where the two directions
+        // genuinely differ: `u8::saturating_add_signed` clamps to the *addend's*
+        // end (`MAX` for a non-negative addend, `0` for a negative one), while
+        // `i8::saturating_add_unsigned` adds a non-negative count and can only run
+        // off the top, so it clamps to `MAX`. Both are the addend's sign read the
+        // right way round -- a non-negative addend can only take an unsigned self
+        // past `MAX`, and a negative one only below `0`.
+        Intrinsic::MixedAdd(family) => {
+            if result_w == 0 || result_w > 64 {
+                return None;
+            }
+            let plain = mixed_add_result(x, y);
+            let fails = mixed_add_failure(x, y, w, signed)?;
+            match family {
+                Family::Wrapping => Outcome::Value(smt::truncate(plain, result_w)),
+                Family::Saturating => {
+                    // The high bound is the *self type's* maximum: `127` for the
+                    // signed direction, `255` for the unsigned one. Taking the
+                    // unsigned maximum for a signed self would clamp `i8` to
+                    // `0xff`, which reads back as `-1`.
+                    let (_, hi) = bounds(w, signed)?;
+                    let bound = if signed {
+                        // The self operand is signed and the addend unsigned, so
+                        // the only way past the top is up.
+                        hi
+                    } else {
+                        // The self operand is unsigned: a non-negative addend
+                        // takes it above `MAX`, a negative one below `0`.
+                        smt::ite(smt::negative(y), smt::word(0, w), hi)
+                    };
+                    Outcome::Value(smt::truncate(smt::ite(fails, bound, plain), result_w))
+                }
+                Family::Checked => Outcome::Option {
+                    tag: smt::ite(fails, smt::word(0, w), smt::word(1, w)),
+                    payload: smt::truncate(plain, result_w),
+                },
+                Family::Overflowing => {
+                    Outcome::Tuple { value: smt::truncate(plain, result_w), overflowed: fails }
+                }
             }
         }
     })
@@ -795,6 +874,54 @@ fn mul_failure(x: Var, y: Var, w: u8, signed: bool) -> Option<Pred> {
         let limit = limit.saturating_mul(2);
         smt::uge_const(exact, limit)
     })
+}
+
+/// The wrapped value of a mixed-signedness addition.
+///
+/// The two operands have opposite signedness, but the value does not care: rustc
+/// reinterprets the operand of the opposite signedness to the method's own type
+/// and adds, which is a plain `w`-bit addition. So this is the *same term* the
+/// body would build for `x.wrapping_add(r as _)`, and one expression serves both
+/// directions.
+fn mixed_add_result(x: Var, y: Var) -> Var {
+    smt::add(x, y)
+}
+
+/// When a mixed-signedness addition has no representable result.
+///
+/// The model is the addition's top-bit carry adjusted by the *addend's* sign:
+///
+/// ```text
+/// carry = overflow of x + y read at the method's own type
+/// flag  = carry XOR sign_of_addend
+/// ```
+///
+/// The carry is read at the method's own type -- the unsigned carry when that type
+/// is unsigned, the signed overflow when it is signed -- which is exactly what
+/// [`failure`] already computes for `Add`, so the mixed shapes reuse it rather than
+/// stating a second carry rule that could drift from it. That is the `_3 = copy _2
+/// as <self type>; AddWithOverflow(_1, _3)` rustc inlines: the addend is
+/// reinterpreted to the self type and the addition's overflow is read there.
+///
+/// The adjustment is the whole subtlety, and getting it wrong is a wrong *flag*,
+/// not a weaker proof. rustc inlines `flag = carry XOR (addend < 0)`, and the
+/// addend's top bit is its sign in *either* reading, so the same term serves both
+/// directions. Taking the bare carry as the flag is wrong in both directions. For
+/// `u8::add_signed`, `250u8 + (-1i8)` is `249`, which is in range -- but the
+/// addition carries, because `250 + 255` wraps to `249`, so the carry alone would
+/// report an overflow that is not there. For `i8::add_unsigned`, `0i8 + 128u8` is
+/// `-128`, which has run off the top -- but the addition does *not* carry, so the
+/// carry alone would miss it. In each case the addend's sign is what corrects the
+/// carry: a negative addend cancels a carry that is only a legitimate borrow, and
+/// a top-bit-set unsigned addend (`128u8` read as `i8` is negative) is what makes
+/// a carry-less addition an overflow. Both directions were walked over the whole
+/// `u8`/`i8` domain (65536 pairs each) and this predicate matched `core` on every
+/// one; the carry alone missed half of them.
+fn mixed_add_failure(x: Var, y: Var, w: u8, signed: bool) -> Option<Pred> {
+    let carry = failure(BinOp::Add, x, y, w, signed)?;
+    // `y` is the addend -- the operand whose signedness is the opposite of the
+    // method's own -- and it is its top bit that the carry is adjusted by.
+    Some(smt::xor(carry, smt::negative(y)))
 }
 
 /// The wrapped value and the overflow flag of `base.pow(exp)`, by squaring.
@@ -1967,9 +2094,11 @@ mod tests {
         assert!(classify("wrapping_shl").is_none());
         assert!(classify("checked_shl").is_none());
         assert!(classify("unchecked_add").is_none());
-        // The suffix is matched whole, so `wrapping_add_signed` is not read as
-        // `wrapping_add`.
-        assert!(classify("wrapping_add_signed").is_none());
+        // The suffix is matched whole, so a near miss is not read as a modelled
+        // shape. `add_signed` *is* modelled now, but only the exact spelling: a
+        // trailing word does not classify.
+        assert!(classify("wrapping_add_signed_thing").is_none());
+        assert!(classify("add_signed").is_none());
 
         // A *known* operator that only some families can model. `saturating_div`
         // classifies as a name, and is then refused by the model: only the
@@ -2571,5 +2700,200 @@ mod tests {
         assert!(!Intrinsic::Saturating(BinOp::Sub).is_unary());
         assert!(!Intrinsic::Checked(BinOp::Mul).is_unary());
         assert!(!Intrinsic::Overflowing(BinOp::Add).is_unary());
+        // A mixed-signedness addition takes two operands, so it must *not* be
+        // reported unary: the executor would read one argument and mis-shape it.
+        assert!(!Intrinsic::MixedAdd(Family::Wrapping).is_unary());
+    }
+
+    /// The `add_signed`/`add_unsigned` names classify into the four families, and
+    /// no other spelling does.
+    #[test]
+    fn the_mixed_add_names_classify() {
+        assert_eq!(
+            classify("core::num::<impl u8>::wrapping_add_signed"),
+            Some(Intrinsic::MixedAdd(Family::Wrapping))
+        );
+        assert_eq!(
+            classify("saturating_add_signed"),
+            Some(Intrinsic::MixedAdd(Family::Saturating))
+        );
+        assert_eq!(classify("checked_add_signed"), Some(Intrinsic::MixedAdd(Family::Checked)));
+        assert_eq!(
+            classify("overflowing_add_signed"),
+            Some(Intrinsic::MixedAdd(Family::Overflowing))
+        );
+        // The `_unsigned` spelling is the same shape: the direction is read from
+        // the operands, not from the name.
+        assert_eq!(
+            classify("core::num::<impl i8>::wrapping_add_unsigned"),
+            Some(Intrinsic::MixedAdd(Family::Wrapping))
+        );
+        assert_eq!(
+            classify("overflowing_add_unsigned"),
+            Some(Intrinsic::MixedAdd(Family::Overflowing))
+        );
+        // The bare `add_signed` is not a `core` name -- every method carries a
+        // family prefix -- so it does not classify.
+        assert!(classify("add_signed").is_none());
+        assert!(classify("add_unsigned").is_none());
+    }
+
+    /// Walk every `u8`/`i8` pair of a mixed-signedness addition against `core`.
+    ///
+    /// The two operands have opposite signedness, so the generic [`check`] and
+    /// [`check_tuple`] helpers do not fit: they read both operands at the same
+    /// width *and* the same signedness. Here the first operand is read at the
+    /// method's own sign and the second at the opposite, and `core`'s own method
+    /// is the oracle in both directions.
+    ///
+    /// `self_is_unsigned` says which direction is under test, and it must agree
+    /// with the `signed` flag handed to `eval`: the flag is the sign of the
+    /// operand with the method's own type, so `u8::add_signed` passes `false` and
+    /// `i8::add_unsigned` passes `true`. Passing the other one is the bug the
+    /// whole `signed_operand` selection exists to prevent, so it is what the two
+    /// calls below vary.
+    fn check_mixed(
+        op: Intrinsic,
+        self_is_unsigned: bool,
+        rust: impl Fn(u64, u64) -> (Option<bool>, Option<u64>),
+        label: &str,
+    ) {
+        let w = 8u8;
+        smt::with_fresh(|| {
+            let a = smt::var(w);
+            let b = smt::var(w);
+            // `signed` is the *self* operand's sign, which is the opposite of the
+            // addend's.
+            let signed = !self_is_unsigned;
+            let outcome = eval(op, a, b, w, signed, w)
+                .unwrap_or_else(|| panic!("{label} at {w} bits must be modelled"));
+            let (ai, bi) = (smt::index(a), smt::index(b));
+            each_pair(w, |xb, yb| {
+                let (want_tag, want_val) = rust(xb, yb);
+                let (got_tag, got_val) = read(outcome, ai, bi, xb, yb);
+                assert_eq!(
+                    (got_tag, got_val),
+                    (want_tag, want_val),
+                    "{label} at (self={xb}, addend={yb}): the model says \
+                     ({got_tag:?}, {got_val:?}), Rust says ({want_tag:?}, {want_val:?})"
+                );
+            });
+        });
+    }
+
+    /// `u8::wrapping_add_signed` and `i8::wrapping_add_unsigned` agree with `core`.
+    #[test]
+    fn the_wrapping_mixed_adds_agree_with_rust() {
+        // `u8` self, `i8` addend: the addend's bits are its two's-complement
+        // image, and the value is the plain wrapped sum.
+        check_mixed(
+            Intrinsic::MixedAdd(Family::Wrapping),
+            true,
+            |xb, yb| {
+                let (x, r) = (xb as u8, yb as u8 as i8);
+                (None, Some(u64::from(x.wrapping_add_signed(r))))
+            },
+            "wrapping_add_signed u8",
+        );
+        // `i8` self, `u8` addend.
+        check_mixed(
+            Intrinsic::MixedAdd(Family::Wrapping),
+            false,
+            |xb, yb| {
+                let (x, r) = (xb as u8 as i8, yb as u8);
+                (None, Some(x.wrapping_add_unsigned(r) as u8 as u64))
+            },
+            "wrapping_add_unsigned i8",
+        );
+    }
+
+    /// The `overflowing` mixed additions agree with `core` on *both* the value and
+    /// the flag, over the whole `u8`/`i8` domain.
+    ///
+    /// The flag is the sharp part: it is not the ordinary signed-addition rule, so
+    /// a model that reached for that rule would agree on the value everywhere and
+    /// disagree on the flag for half the domain. The oracle is `core`'s own
+    /// `overflowing_*`, so the expectation is never a copy of the model.
+    #[test]
+    fn the_overflowing_mixed_adds_agree_with_rust() {
+        check_mixed(
+            Intrinsic::MixedAdd(Family::Overflowing),
+            true,
+            |xb, yb| {
+                let (x, r) = (xb as u8, yb as u8 as i8);
+                let (v, o) = x.overflowing_add_signed(r);
+                (Some(o), Some(u64::from(v)))
+            },
+            "overflowing_add_signed u8",
+        );
+        check_mixed(
+            Intrinsic::MixedAdd(Family::Overflowing),
+            false,
+            |xb, yb| {
+                let (x, r) = (xb as u8 as i8, yb as u8);
+                let (v, o) = x.overflowing_add_unsigned(r);
+                (Some(o), Some(v as u8 as u64))
+            },
+            "overflowing_add_unsigned i8",
+        );
+    }
+
+    /// The `checked` mixed additions agree with `core`'s `Option`, so `None` is
+    /// exactly where the operation is undefined.
+    #[test]
+    fn the_checked_mixed_adds_agree_with_rust() {
+        check_mixed(
+            Intrinsic::MixedAdd(Family::Checked),
+            true,
+            |xb, yb| {
+                let (x, r) = (xb as u8, yb as u8 as i8);
+                match x.checked_add_signed(r) {
+                    Some(v) => (Some(true), Some(u64::from(v))),
+                    None => (Some(false), Some(u64::from(x.wrapping_add_signed(r)))),
+                }
+            },
+            "checked_add_signed u8",
+        );
+        check_mixed(
+            Intrinsic::MixedAdd(Family::Checked),
+            false,
+            |xb, yb| {
+                let (x, r) = (xb as u8 as i8, yb as u8);
+                match x.checked_add_unsigned(r) {
+                    Some(v) => (Some(true), Some(v as u8 as u64)),
+                    None => (Some(false), Some(x.wrapping_add_unsigned(r) as u8 as u64)),
+                }
+            },
+            "checked_add_unsigned i8",
+        );
+    }
+
+    /// The `saturating` mixed additions agree with `core`, including the two
+    /// *different* clamps the two directions use.
+    #[test]
+    fn the_saturating_mixed_adds_agree_with_rust() {
+        // `u8` self: clamps to `0` for a negative addend and `MAX` for a
+        // non-negative one, so both ends are exercised by the sweep.
+        check_mixed(
+            Intrinsic::MixedAdd(Family::Saturating),
+            true,
+            |xb, yb| {
+                let (x, r) = (xb as u8, yb as u8 as i8);
+                (None, Some(u64::from(x.saturating_add_signed(r))))
+            },
+            "saturating_add_signed u8",
+        );
+        // `i8` self: the addend is unsigned, so it can only run off the top and
+        // the clamp is always `MAX`. A model that reused the `u8` clamp would
+        // return `0` on the wrap and disagree here.
+        check_mixed(
+            Intrinsic::MixedAdd(Family::Saturating),
+            false,
+            |xb, yb| {
+                let (x, r) = (xb as u8 as i8, yb as u8);
+                (None, Some(x.saturating_add_unsigned(r) as u8 as u64))
+            },
+            "saturating_add_unsigned i8",
+        );
     }
 }

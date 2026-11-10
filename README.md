@@ -1749,6 +1749,15 @@ refused. `src/mir/intrinsics.rs` holds the model:
   writes it as a `bool`, which is what the `if` that consumes it branches on; a
   one-bit word there would leave the local readable only as a word. It is
   unsigned-only, matching `core`.
+- `add_signed`/`add_unsigned` add a value to one of the *opposite* signedness
+  (`u8::wrapping_add_signed` adds an `i8` to a `u8`), so the two operands are read
+  at different signs. The value is the plain wrapped sum in both directions, since
+  rustc reinterprets the addend and adds. The overflow flag is the addition's own
+  overflow *adjusted by the addend's sign*, `carry XOR (addend < 0)` — not the
+  ordinary signed-addition rule, which is wrong on half the domain. `250u8 +
+  (-1i8)` carries but is in range, so the flag is `false`; `0i8 + 128u8` does not
+  carry but runs off the top, so it is `true`. The saturating clamp follows the
+  addend's end: `0` or `255` for an unsigned self, `127` for a signed one.
 
 The refusals matter as much as the model, and each has a reason. Only `checked_div`
 and `checked_rem` may model division: the `saturating_` and `wrapping_` forms *panic*
@@ -1794,7 +1803,9 @@ The frontend refuses far more than it accepts, and every refusal is reported:
   bitwise ops are computed from their operands (see below), as are the unary
   `neg`/`abs` in all four families, the six bit counts (`count_ones`,
   `count_zeros`, `leading_zeros`, `leading_ones`, `trailing_zeros`,
-  `trailing_ones`), the `bool` predicate `is_power_of_two` and the `pow`
+  `trailing_ones`), the `bool` predicate `is_power_of_two`, the mixed-signedness
+  additions (`wrapping_add_signed`, `saturating_add_signed`, `checked_add_signed`,
+  `overflowing_add_signed` and their `_unsigned` counterparts) and the `pow`
   families. Every other intrinsic, and every trait
   method, is still a call the frontend cannot model.
 - **A symbolic index into a *slice*, or a mutable reference write.** An array
