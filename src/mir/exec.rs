@@ -24,6 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::mir::intrinsics::{self, Outcome};
+use crate::mir::spec::{self, FieldEnv};
 use crate::mir::parse::{
     BinOp, Block, Callee, Const, EnumLayout, MirFn, MirProgram, Operand, Place, Proj, Rvalue, Stmt,
     Term, Ty, UnOp, USIZE_WIDTH,
@@ -173,6 +174,15 @@ pub enum ObligationKind {
     /// The declared loop invariant is left true by one iteration. This is the
     /// step of the induction.
     LoopInvariantPreserve,
+    /// A recursive call's arguments satisfy the function's own precondition. The
+    /// call is not inlined, so the contract is *assumed* -- and the precondition is
+    /// what makes that assumption an induction hypothesis rather than a
+    /// restatement of the goal.
+    RecursivePrecondition,
+    /// The `decreases:` measure is strictly smaller at a recursive call than at
+    /// entry. This is the well-founded basis the induction needs; without it the
+    /// assumption would be circular.
+    RecursiveDecreases,
 }
 
 impl std::fmt::Display for ObligationKind {
@@ -184,6 +194,12 @@ impl std::fmt::Display for ObligationKind {
             ObligationKind::VacuousPrecondition => write!(f, "vacuous precondition"),
             ObligationKind::LoopInvariantInit => write!(f, "loop invariant holds on entry"),
             ObligationKind::LoopInvariantPreserve => write!(f, "loop invariant preserved"),
+            ObligationKind::RecursivePrecondition => {
+                write!(f, "recursive call satisfies the precondition")
+            }
+            ObligationKind::RecursiveDecreases => {
+                write!(f, "recursive call decreases the measure")
+            }
         }
     }
 }
@@ -232,7 +248,9 @@ impl Obligation {
         match self.kind {
             ObligationKind::Postcondition
             | ObligationKind::LoopInvariantInit
-            | ObligationKind::LoopInvariantPreserve => self.verdict.is_proved(),
+            | ObligationKind::LoopInvariantPreserve
+            | ObligationKind::RecursivePrecondition
+            | ObligationKind::RecursiveDecreases => self.verdict.is_proved(),
             ObligationKind::Panic { .. } | ObligationKind::Unreachable => {
                 matches!(self.verdict, Verdict::Unsat)
             }
@@ -283,7 +301,9 @@ impl Obligation {
                 ObligationKind::Postcondition
                 | ObligationKind::VacuousPrecondition
                 | ObligationKind::LoopInvariantInit
-                | ObligationKind::LoopInvariantPreserve => {
+                | ObligationKind::LoopInvariantPreserve
+                | ObligationKind::RecursivePrecondition
+                | ObligationKind::RecursiveDecreases => {
                     "invalid: a `Valid` verdict is a discharge for this kind".to_string()
                 }
             },
@@ -295,8 +315,11 @@ impl Obligation {
                 }
                 // `path => I` false on every input: the invariant can never be
                 // established (or re-established), so the loop proves nothing.
-                ObligationKind::LoopInvariantInit | ObligationKind::LoopInvariantPreserve => {
-                    "the invariant holds for no input (false on every input)".to_string()
+                ObligationKind::LoopInvariantInit
+                | ObligationKind::LoopInvariantPreserve
+                | ObligationKind::RecursivePrecondition
+                | ObligationKind::RecursiveDecreases => {
+                    "the property holds for no input (false on every input)".to_string()
                 }
                 // The good answer for a reachability query, so this is a discharge.
                 ObligationKind::Panic { .. } | ObligationKind::Unreachable => {
@@ -402,6 +425,16 @@ struct Env {
     locals: BTreeMap<u32, Val>,
     /// Array elements, keyed by (local, index).
     elems: BTreeMap<(u32, u64), Val>,
+    /// An element of an array reached through a *field path*: `o.a[0]` is keyed by
+    /// `(local, [the field chain before the index], index)`.
+    ///
+    /// A separate store from [`Self::elems`] because that one is keyed by `(local, index)`
+    /// only, so `o.a[0]` and `o.b[0]` would collide on `(local, 0)` -- reading the wrong
+    /// array's element. And separate from [`Self::indexed`], which is keyed by local and holds
+    /// an *argument*'s array or slice; a field array is not the local itself. Only elements
+    /// this run explicitly wrote are served from here; a read of an element that was never
+    /// written is `Unknown`, never a seed or a literal.
+    elems_path: BTreeMap<(u32, Vec<u32>, u64), Val>,
     /// Tuple fields, keyed by (local, field).
     fields: BTreeMap<(u32, u32), Val>,
     /// A *nested* field path, keyed by (local, the projection chain from the
@@ -483,6 +516,10 @@ struct Env {
     /// would put a lifetime on `Env` for every call site of `operand` -- a table
     /// read once per constant is not worth that.
     enums: BTreeMap<String, EnumLayout>,
+    /// The program's named `const` items, so a use site (`_0 = const K`) folds to
+    /// the literal the item was defined with instead of staying unknown. See
+    /// [`crate::mir::parse::MirProgram::consts`].
+    consts: BTreeMap<String, Const>,
     /// The width of each modelled enum tag, keyed by local.
     ///
     /// A tag's width is the *discriminants'*, not the dump's `isize`. Recording
@@ -545,6 +582,7 @@ impl Env {
         Env {
             locals: BTreeMap::new(),
             elems: BTreeMap::new(),
+            elems_path: BTreeMap::new(),
             fields: BTreeMap::new(),
             nested: BTreeMap::new(),
             payloads: BTreeMap::new(),
@@ -556,13 +594,15 @@ impl Env {
             indexed: BTreeMap::new(),
             whole_writes: BTreeSet::new(),
             enums: BTreeMap::new(),
+            consts: BTreeMap::new(),
             tag_widths: BTreeMap::new(),
         }
     }
 
-    /// Same as [`Env::new`], with the program's enum layouts attached.
-    fn with_enums(enums: &BTreeMap<String, EnumLayout>) -> Env {
-        Env { enums: enums.clone(), ..Env::new() }
+    /// Same as [`Env::new`], with the program's enum layouts and `const` items
+    /// attached.
+    fn with_enums(enums: &BTreeMap<String, EnumLayout>, consts: &BTreeMap<String, Const>) -> Env {
+        Env { enums: enums.clone(), consts: consts.clone(), ..Env::new() }
     }
 
     /// The element variable for `index` of an indexed value (slice or array)
@@ -715,6 +755,170 @@ impl Env {
         }
     }
 
+    /// A place whose `IndexVar` steps are replaced by the literal they hold *in
+    /// this frame*.
+    ///
+    /// A returned reference's origin is a place in the callee's terms, and a
+    /// `&mut self.a[0]` records the *local* that held `0` -- `_2` -- not the
+    /// literal, because `_2` is the index the dump names. That local dies at the
+    /// call boundary, so a caller that translates the origin gets a place no
+    /// `elems_path` entry is ever keyed by, and a write through the returned
+    /// reference is dropped. Resolving the index here, while the callee's locals
+    /// are still live, turns it into the literal the caller's store agrees on.
+    ///
+    /// A symbolic index is left as it is: its value is not a single element the
+    /// caller could name either, so refusing to pin it is what keeps the write
+    /// from landing on an arbitrary element.
+    fn pin_index_vars(&self, p: &Place) -> Place {
+        let mut proj = p.proj.clone();
+        for step in &mut proj {
+            if let Proj::IndexVar(li) = step {
+                if let Some(Val::Sym(x, _)) = self.locals.get(li) {
+                    if let Some(k) = smt::evaluate(*x, |_| None) {
+                        *step = Proj::Index(k);
+                    }
+                }
+            }
+        }
+        Place { local: p.local, proj }
+    }
+
+    /// Move the parts stored under `src` to `dst`, re-rooting them when either place is
+    /// nested, and report whether there were any.
+    ///
+    /// This generalises [`Self::copy_parts`], which is the whole-place-to-whole-place case and
+    /// carries the element, payload, tag and index stores as well. This one is reached when a
+    /// nested place is on at least one side, and it moves the two field-shaped stores:
+    ///
+    /// - a struct literal into a nested field, `o.i = InnerBox { v: 9 }` -> `(_1.0) = move _2`
+    ///   (whole source, nested destination);
+    /// - a nested-to-nested move, `o.i = o.j` -> `_2 = move (_1.1); (_1.0) = move _2` (the
+    ///   first step is a nested source into a whole temp, the second a whole source into a
+    ///   nested destination).
+    ///
+    /// [`Self::copy_parts`] is reached only when both places are whole, so without this the
+    /// parts never land under the nested place and the later read (`(_1.0).0`, the nested
+    /// store keyed by the whole chain) finds nothing. The body's value is then unknown, and a
+    /// contract that *is* false of the body is reported unreadable instead of refuted.
+    ///
+    /// Both projections are read as field paths (`field_steps`), and both are *resolved*
+    /// first, so a write through a reference (`((*_1).0) = move _2`) reaches the target's
+    /// field path rather than stopping at the leading deref -- what makes the write and the
+    /// read meet in one store. Any other projection (an index, a downcast, a second deref)
+    /// names a store this helper does not re-root, and writing a part where no read consults
+    /// it would be a lost proof at best, so those are refused.
+    ///
+    /// A part is re-keyed relative to the source's own path: the entry at `(src.local, sp)`
+    /// (or the single-field entry whose key *is* `sp`) is the value at `src`, and it lands at
+    /// the destination's path. A whole destination replaces every part it had, so its old
+    /// parts are dropped first; a nested destination keeps its siblings, because only the
+    /// paths under it are being written. A path that re-roots to the whole local (a field of
+    /// one moved into a whole place) becomes the local's value.
+    fn rebase_parts(&mut self, src: &Place, dst: &Place) -> bool {
+        let src = self.resolve(src);
+        let dst = self.resolve(dst);
+        let Some(sp) = field_steps(&src.proj) else { return false };
+        let Some(dp) = field_steps(&dst.proj) else { return false };
+        if src.local == dst.local && sp == dp {
+            return false;
+        }
+        let s = src.local;
+        // The source's parts, keyed relative to the source's own path. The `nested` store is
+        // the chain-shaped one (length two or more) and the `fields` store the single-field
+        // one; a source path `sp` selects the entries under it, and the entry *at* it (a
+        // single-field source) is the whole moved value.
+        let mut rels: Vec<(Vec<u32>, Val)> = Vec::new();
+        for ((l, chain), v) in &self.nested {
+            if *l == s {
+                if let Some(tail) = chain.strip_prefix(sp.as_slice()) {
+                    rels.push((tail.to_vec(), *v));
+                }
+            }
+        }
+        for ((l, k), v) in &self.fields {
+            if *l != s {
+                continue;
+            }
+            if sp.is_empty() {
+                rels.push((vec![*k], *v));
+            } else if sp.as_slice() == [*k] {
+                rels.push((Vec::new(), *v));
+            }
+        }
+        // Elements of field-path arrays under the source path move with the value, re-keyed the
+        // same way. An element *at* the source path (its chain equals `sp`) is an element of the
+        // whole destination value, which the plain `elems` store answers; a deeper one keeps its
+        // tail under the destination path.
+        let mut elem_rels: Vec<(Vec<u32>, u64, Val)> = Vec::new();
+        for ((l, chain, k), v) in &self.elems_path {
+            if *l == s {
+                if let Some(tail) = chain.strip_prefix(sp.as_slice()) {
+                    elem_rels.push((tail.to_vec(), *k, *v));
+                }
+            }
+        }
+        // A whole-local array's elements live in `elems`, not `elems_path`, and they move with
+        // the value too. Without this, an array that is a struct *field* built by a literal
+        // (`ArrInner { a: [9, 1, 2, 3] }`) lost its elements at the assignment: `_2.0` held the
+        // array's value but not its parts, so `o.i.a[0]` read `Unknown` and the contract stayed
+        // `Incomplete` in both directions -- a coverage hole, not a false proof, since a missing
+        // value proves nothing. Only a *whole* source has `elems` (a nested source's elements
+        // are in `elems_path` and are handled above), so this is gated on an empty `sp`.
+        let mut whole_elem_rels: Vec<(u64, Val)> = Vec::new();
+        if sp.is_empty() {
+            for ((l, k), v) in &self.elems {
+                if *l == s {
+                    whole_elem_rels.push((*k, *v));
+                }
+            }
+        }
+        let any = !rels.is_empty() || !elem_rels.is_empty() || !whole_elem_rels.is_empty();
+        // A whole destination is replaced outright, so its previous parts must not survive; a
+        // nested destination keeps the parts outside the written path.
+        if dp.is_empty() && s != dst.local {
+            self.forget_parts(dst.local);
+        } else if !dp.is_empty() {
+            self.elems_path
+                .retain(|(l, c, _), _| *l != dst.local || !c.starts_with(dp.as_slice()));
+        }
+        for (tail, k, v) in elem_rels {
+            let mut full = dp.clone();
+            full.extend(tail);
+            if full.is_empty() {
+                self.elems.insert((dst.local, k), v);
+            } else {
+                self.elems_path.insert((dst.local, full, k), v);
+            }
+        }
+        // A whole-local element of the source lands on the destination at the same shape: a
+        // whole destination takes it as a whole-local element, and a nested destination takes
+        // it under the destination's field chain.
+        for (k, v) in whole_elem_rels {
+            if dp.is_empty() {
+                self.elems.insert((dst.local, k), v);
+            } else {
+                self.elems_path.insert((dst.local, dp.clone(), k), v);
+            }
+        }
+        for (rel, v) in rels {
+            let mut full = dp.clone();
+            full.extend(rel);
+            match full.len() {
+                // The value *at* the source path becomes the whole destination value.
+                0 => {
+                    self.locals.insert(dst.local, v);
+                }
+                1 => {
+                    self.fields.insert((dst.local, full[0]), v);
+                }
+                _ => {
+                    self.nested.insert((dst.local, full), v);
+                }
+            }
+        }
+        any
+    }
+
     /// Copy every derived part of `src`'s local onto `dst`, and report whether the
     /// source had any.
     ///
@@ -754,15 +958,28 @@ impl Env {
             .filter(|((l, _), _)| *l == s)
             .map(|((_, chain), v)| (chain.clone(), *v))
             .collect();
+        // Elements of a field-path array are parts of the local too: `c = d` has to carry
+        // `d.a[0]` to `c.a[0]`, or a later read of the destination's element finds nothing (or,
+        // worse, the destination's own pre-copy element).
+        let path_elems: Vec<(Vec<u32>, u64, Val)> = self
+            .elems_path
+            .iter()
+            .filter(|((l, _, _), _)| *l == s)
+            .map(|((_, chain, k), v)| (chain.clone(), *k, *v))
+            .collect();
         let any = !fields.is_empty()
             || !elems.is_empty()
             || !payloads.is_empty()
             || !nested.is_empty()
+            || !path_elems.is_empty()
             || disc.is_some()
             || indexed.is_some();
         self.forget_parts(dst);
         for (chain, v) in nested {
             self.nested.insert((dst, chain), v);
+        }
+        for (chain, k, v) in path_elems {
+            self.elems_path.insert((dst, chain, k), v);
         }
         for (k, v) in fields {
             self.fields.insert((dst, k), v);
@@ -857,7 +1074,25 @@ impl Env {
                         // for a caller that did not.
                         None => Val::Unknown,
                     },
-                    None => *self.elems.get(&(p.local, *k)).unwrap_or(&Val::Unknown),
+                    // An element of an array reached through a *field path*: `o.a[0]` is keyed
+                    // by `(local, the field chain before the index, index)`. The path form is
+                    // tried first; a whole-local array has an empty chain, which is the plain
+                    // `o[0]` case the `elems` map below answers. Only an element this run
+                    // explicitly wrote is served; a path no write reached is `Unknown`, never a
+                    // seed or a literal, so `o.a[0]` cannot read a value the body never stored.
+                    None => {
+                        let chain = field_steps(&p.proj[..i]).unwrap_or_default();
+                        if chain.is_empty() {
+                            // A whole-local array (an array literal): the plain `elems` map
+                            // keeps answering it, exactly as before.
+                            *self.elems.get(&(p.local, *k)).unwrap_or(&Val::Unknown)
+                        } else {
+                            *self
+                                .elems_path
+                                .get(&(p.local, chain, *k))
+                                .unwrap_or(&Val::Unknown)
+                        }
+                    }
                 },
                 // `(*_1)[_2]` — a subscript that is a local. The element is
                 // looked up by the index's *value*: a constant index names one
@@ -877,7 +1112,17 @@ impl Env {
                                 let sign = Sign::of_bool(s.elem_signed);
                                 s.elems.get(&k).map(|v| Val::Sym(*v, sign)).unwrap_or(Val::Unknown)
                             }
-                            None => *self.elems.get(&(p.local, k)).unwrap_or(&Val::Unknown),
+                            None => {
+                                let chain = field_steps(&p.proj[..i]).unwrap_or_default();
+                                if chain.is_empty() {
+                                    *self.elems.get(&(p.local, k)).unwrap_or(&Val::Unknown)
+                                } else {
+                                    *self
+                                        .elems_path
+                                        .get(&(p.local, chain, k))
+                                        .unwrap_or(&Val::Unknown)
+                                }
+                            }
                         },
                         // A symbolic subscript: `get` takes `&self`, so it cannot
                         // create the elements the chain needs. The operand path
@@ -1043,6 +1288,40 @@ impl Env {
                     self.nested.insert((p.local, chain), v);
                     return;
                 }
+                // An element of an array reached through a field path: `(_1.0)[k] = v`. The
+                // whole projection is the key, so `o.a[0]` and `o.b[0]` cannot collide. The
+                // write replaces that element and leaves the siblings; the element's *type*
+                // was not seeded, so a read of an element this run did not write stays
+                // `Unknown` rather than inventing a value.
+                if let [fields @ .., last] = rest {
+                    let index = match last {
+                        Proj::Index(k) => Some(*k),
+                        // A symbolic subscript is only writable when the run can pin its
+                        // value; otherwise the store cannot say which element changed, so the
+                        // whole path is dropped rather than left stale.
+                        Proj::IndexVar(li) => match self.locals.get(li) {
+                            Some(Val::Sym(x, _)) => smt::evaluate(*x, |_| None),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(chain) = field_steps(fields) {
+                        if !chain.is_empty() {
+                            match index {
+                                Some(k) => {
+                                    self.write_elem_at(p.local, chain, k, v);
+                                    return;
+                                }
+                                None => {
+                                    self.elems_path.retain(|(l, c, _), _| {
+                                        *l != p.local || c.as_slice() != chain.as_slice()
+                                    });
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
                 // A shape the arms above do not cover. `*a = v` (a whole-store
                 // write through a `&mut [T; N]`) would need a new store, so it is
                 // dropped. For an indexed local that leaves the store describing a
@@ -1072,12 +1351,19 @@ impl Env {
     fn forget_nested_under(&mut self, local: u32, prefix: &[u32]) {
         self.nested
             .retain(|(l, chain), _| *l != local || !chain.starts_with(prefix));
+        // The elements of an array reached through this prefix describe a value that is no
+        // longer there once the intermediate aggregate is overwritten, so they are dropped too.
+        // A stale element is a wrong value, not a missing one.
+        self.elems_path.retain(|(l, chain, _), _| *l != local || !chain.starts_with(prefix));
     }
 
     fn forget_parts(&mut self, local: u32) {
         self.fields.retain(|(l, _), _| *l != local);
         self.nested.retain(|(l, _), _| *l != local);
         self.elems.retain(|(l, _), _| *l != local);
+        // Elements of field-path arrays under a whole-value write describe a value that is no
+        // longer there; keeping them would be a stale read of the old array.
+        self.elems_path.retain(|(l, _, _), _| *l != local);
         self.payloads.retain(|(l, _), _| *l != local);
         self.discriminants.remove(&local);
         self.tag_widths.remove(&local);
@@ -1121,6 +1407,32 @@ impl Env {
             // left stale.
             None => self.elems.retain(|(l, _), _| *l != local),
         }
+    }
+
+    /// Mark every element of the array at `chain` under `local` unknown.
+    ///
+    /// A write through a returned reference whose index the run cannot pin may land
+    /// on *any* element, so none of them can be trusted afterwards. Which store
+    /// holds them depends on the shape: an array reached through a field path
+    /// (`x.a[0]`, the field chain *before* the index) is in `elems_path`, a
+    /// whole-local literal array is in `elems`, and a whole-local array *argument*
+    /// is in `indexed`. All three are cleared under the path, and a whole-local
+    /// array keeps its length.
+    fn poison_array_under(&mut self, local: u32, chain: &[u32]) {
+        if chain.is_empty() {
+            self.poison_elems(local);
+        } else {
+            self.elems_path.retain(|(l, c, _), _| *l != local || !c.starts_with(chain));
+        }
+    }
+
+    /// Record an element of an array reached through a field path, `o.a[k] = v`.
+    ///
+    /// The whole path is the key, so `o.a[0]` and `o.b[0]` cannot collide. Any
+    /// previous value at that element is replaced; siblings are untouched.
+    fn write_elem_at(&mut self, local: u32, chain: Vec<u32>, index: u64, v: Val) {
+        self.elems_path.retain(|(l, c, k), _| *l != local || *c != chain || *k != index);
+        self.elems_path.insert((local, chain, index), v);
     }
 
     /// Record the payload of a modelled `Option`, with its width.
@@ -1173,13 +1485,23 @@ impl Env {
 /// A *single* field is not a chain here: `[_1.0]` returns `None` so the
 /// single-field store keeps answering it, and the two stores stay disjoint.
 fn field_chain(proj: &[Proj]) -> Option<Vec<u32>> {
+    let chain = field_steps(proj)?;
+    if chain.len() < 2 {
+        return None;
+    }
+    Some(chain)
+}
+
+/// A projection read as a chain of field indices, stripping one leading `Deref`.
+///
+/// `None` for any step that is not a field (an index, a downcast, a second deref): those
+/// name a store the caller does not re-root. An empty chain is a whole place, which is
+/// `Some(vec![])` -- the caller decides whether that is meaningful.
+fn field_steps(proj: &[Proj]) -> Option<Vec<u32>> {
     let steps = match proj.first() {
         Some(Proj::Deref) => &proj[1..],
         _ => proj,
     };
-    if steps.len() < 2 {
-        return None;
-    }
     let mut chain = Vec::with_capacity(steps.len());
     for s in steps {
         match s {
@@ -1343,6 +1665,10 @@ pub struct Seeds {
     pub slice_steps: Vec<(u32, u64)>,
     /// `(local, index, variable, signed)` for each element a contract names.
     pub elems: Vec<(u32, u64, Var, bool)>,
+    /// `(local, field chain, index, variable, signed)` for each element of an array reached
+    /// through a field path (`o.a[0]`) that a contract names. Keyed by the whole path, so
+    /// `o.a[0]` and `o.b[0]` cannot collide.
+    pub path_elems: Vec<(u32, Vec<u32>, u64, Var, bool)>,
     /// `(local, tag variable, tag width, discriminants)` for each enum-typed
     /// argument a contract names a variant of.
     ///
@@ -1357,13 +1683,57 @@ pub struct Seeds {
     /// contract names, so `m.Data` in a contract and `((_1 as Data).0)` in the
     /// body name one variable rather than two that look alike.
     pub payload_seeds: Vec<(u32, u64, Var, u8, bool)>,
-    /// `(local, value)` for each argument the precondition pins to a constant.
+    /// `(variable index, value)` for each variable the precondition pins to a
+    /// constant.
     ///
-    /// The argument is seeded with the literal instead of a fresh symbolic input.
-    /// Sound -- every model of the precondition has the argument equal to it -- and
-    /// it is what lets a body whose only operand is pinned build its operations on a
-    /// literal, where the constant folds collapse them. See [`crate::smt::pinned_vars`].
+    /// The variable is seeded with the literal instead of a fresh symbolic input.
+    /// Sound -- every model of the precondition has it equal to that -- and it is
+    /// what lets a body whose only operand is pinned build its operations on a
+    /// literal, where the constant folds collapse them. Keyed by the variable's own
+    /// index, so a pin applies wherever that variable is seeded: an argument (whose
+    /// index is its local), a struct field, a nested path, or an element. See
+    /// [`crate::smt::pinned_vars`].
     pub pins: Vec<(u32, u64)>,
+}
+
+/// The contract of the function under verification, in *text* form, so a
+/// recursive call can be checked and assumed at the call site.
+///
+/// A self-call is not inlined: inlining it is what made a recursive function
+/// fail at the depth bound. Instead the call becomes the induction step of a
+/// well-founded recursion -- the precondition is *proved* of the call's
+/// arguments, the `decreases:` measure is *proved* to shrink, and the
+/// postcondition is then *assumed* for the result. The measure is what makes the
+/// assumption an induction hypothesis rather than a restatement of the goal, so
+/// it is required: without one the call falls back to the old inlining.
+///
+/// The text is carried rather than a pre-built predicate because only the
+/// executor knows what the arguments hold at the call site, and the same text has
+/// to be evaluated there rather than at entry.
+#[derive(Clone, Debug)]
+pub struct Recursion {
+    /// Raw `requires:` texts.
+    pub requires: Vec<String>,
+    /// Raw `ensures:` texts. At least one is needed: with no postcondition there
+    /// is nothing to assume, so the call falls back to inlining.
+    pub ensures: Vec<String>,
+    /// The `decreases:` measure.
+    pub decreases: String,
+    /// The argument names whose types are signed, for the measure's relation.
+    pub signed: BTreeSet<String>,
+    /// The program's `const` table, so a measure or contract naming a constant
+    /// resolves the way the body's use site does.
+    pub consts: BTreeMap<String, Const>,
+    /// Whether the return type is signed, for a postcondition comparison.
+    pub ret_signed: bool,
+}
+
+/// The recursion context threaded through the walk: the contract text plus the
+/// measure's value at *entry*, which the decrease test compares against.
+struct RecCtx {
+    rec: Recursion,
+    /// The measure evaluated in the entry state, with its signedness.
+    measure_entry: Option<(Var, bool)>,
 }
 
 /// Verify one function from a parsed program.
@@ -1393,6 +1763,7 @@ pub fn verify_fn<F>(
     post: Option<F>,
     invariant: Option<&str>,
     seeds: &Seeds,
+    rec: Option<Recursion>,
 ) -> MirReport
 where
     F: Fn(Option<Var>, &[(u32, Var)]) -> Result<Pred, String>,
@@ -1421,28 +1792,40 @@ where
         }
     };
 
-    let mut env = Env::with_enums(&prog.enums);
+    let mut env = Env::with_enums(&prog.enums, &prog.consts);
+    // A pinned variable takes the literal its precondition fixes it to, so the
+    // body's operations fold instead of building a circuit over an input that has
+    // only one value. The pin is keyed by *variable index*, so it applies wherever
+    // that variable is seeded -- an argument (whose index is its local) and an
+    // aggregate part (a field, a nested path, an element) alike. See
+    // [`crate::smt::pinned_vars`].
+    let pin_of = |v: Var| -> Option<u64> {
+        let idx = smt::index(v);
+        seeds.pins.iter().find(|(i, _)| *i == idx).map(|(_, k)| *k)
+    };
+    // The literal for a pinned variable, masked to the variable's own width: the
+    // value a precondition writes is signed (`-7`), and the pattern the seed needs
+    // is two's complement at that width (`249` at eight bits).
+    let lit_of = |v: Var, k: u64| -> Var {
+        let w = smt::bits(v);
+        let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        smt::word(k & mask, w)
+    };
     for &l in &f.arg_locals {
         let ty = f.ty_of(l).cloned().unwrap_or(Ty::Other("?".into()));
-        // A pinned argument takes the literal the precondition fixes it to, so the
-        // body's operations fold instead of building a circuit over an input that
-        // has only one value. See [`crate::smt::pinned_vars`].
-        let pin = seeds.pins.iter().find(|(local, _)| *local == l).map(|(_, k)| *k);
-        let v = match (ty.width(), pin) {
-            (Some(w), Some(k)) => {
-                let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                let lit = smt::word(k & mask, w);
-                if w == 1 {
-                    Val::Bool(smt::truth(k & 1 != 0))
-                } else {
-                    Val::Sym(lit, Sign::of(&ty))
+        let v = match ty.width() {
+            Some(w) => {
+                let sym = smt::var_named(l, w);
+                match pin_of(sym) {
+                    Some(k) if w == 1 => Val::Bool(smt::truth(k & 1 != 0)),
+                    Some(k) => Val::Sym(lit_of(sym, k), Sign::of(&ty)),
+                    None if w == 1 => Val::Bool(sym.eq_val(1)),
+                    // The argument's own type declares its sign, so the value
+                    // carries it rather than a later site having to look it up.
+                    None => Val::Sym(sym, Sign::of(&ty)),
                 }
             }
-            (Some(1), None) => Val::Bool(smt::var_named(l, 1).eq_val(1)),
-            // The argument's own type declares its sign, so the value carries it
-            // rather than a later site having to look it up.
-            (Some(w), None) => Val::Sym(smt::var_named(l, w), Sign::of(&ty)),
-            (None, _) => Val::Unknown,
+            None => Val::Unknown,
         };
         env.locals.insert(l, v);
         // A `&T` argument may be dereferenced: `Ty::Ref` is modelled as its
@@ -1455,13 +1838,21 @@ where
     // variable, and the body's `((*_1).0)` reads it from here, so the two are the
     // same symbolic input rather than two that merely look alike.
     for &(local, field, v, signed) in &seeds.fields {
-        env.fields.insert((local, field), Val::Sym(v, Sign::of_bool(signed)));
+        let val = match pin_of(v) {
+            Some(k) => Val::Sym(lit_of(v, k), Sign::of_bool(signed)),
+            None => Val::Sym(v, Sign::of_bool(signed)),
+        };
+        env.fields.insert((local, field), val);
     }
     // Nested field paths the contract names, keyed by the whole projection chain
     // so the body's `(((*_1).0).0)` reads the same variable the contract's `o.i.v`
     // was rewritten to.
     for &(local, ref chain, v, signed) in &seeds.nested {
-        env.nested.insert((local, chain.clone()), Val::Sym(v, Sign::of_bool(signed)));
+        let val = match pin_of(v) {
+            Some(k) => Val::Sym(lit_of(v, k), Sign::of_bool(signed)),
+            None => Val::Sym(v, Sign::of_bool(signed)),
+        };
+        env.nested.insert((local, chain.clone()), val);
     }
     // Slice lengths and elements the contract names. The contract's `xs.len()` and
     // `xs[0]` and the body's `PtrMetadata(_1)` and `(*_1)[0]` must be one value,
@@ -1492,8 +1883,22 @@ where
     }
     for &(local, index, v, _) in &seeds.elems {
         if let Some(s) = env.indexed.get_mut(&local) {
+            let v = match pin_of(v) {
+                Some(k) => lit_of(v, k),
+                None => v,
+            };
             s.elems.insert(index, v);
         }
+    }
+    // Elements of field-path arrays the contract names, keyed by the whole path. The body's
+    // `(_1.0)[k]` write lands on the same key, so a contract's `o.a[0]` and the body's write are
+    // one value. Pins apply here as elsewhere: a pinned element is a *literal*, not an input.
+    for &(local, ref chain, index, v, _signed) in &seeds.path_elems {
+        let val = match pin_of(v) {
+            Some(k) => Val::Sym(lit_of(v, k), Sign::of_bool(_signed)),
+            None => Val::Sym(v, Sign::of_bool(_signed)),
+        };
+        env.elems_path.insert((local, chain.clone(), index), val);
     }
     // Enum tags a contract names a variant of. The tag is seeded so the body's
     // `discriminant(_1)` reads the same variable the contract's `m` does, and the
@@ -1573,6 +1978,28 @@ where
         },
     };
 
+    // The recursion context: the measure evaluated in the *entry* state, which
+    // every recursive call's decrease test compares against. Evaluated here,
+    // once, because the entry state is the one the walk starts from and the walk
+    // itself only ever sees later states. `names` is the entry binding of the
+    // arguments, which is exactly the state the measure is about.
+    let rec_ctx = rec.map(|rec| {
+        let entry_names = spec::arg_vars(f);
+        let measure_entry = spec::eval_measure(&rec.decreases, &entry_names, &rec.signed, &rec.consts)
+            .ok();
+        RecCtx { rec, measure_entry }
+    });
+    // A `decreases:` clause that cannot be read at entry is a refusal, not a
+    // silently-absent measure: without it every recursive call would be reported
+    // unknown, and saying so once here is clearer than at each call.
+    if let Some(rc) = &rec_ctx {
+        if rc.measure_entry.is_none() {
+            report
+                .unknown_paths
+                .push("unreadable `decreases:` measure at entry".into());
+        }
+    }
+
     let mut work = vec![State {
         frame: Frame {
             func: root,
@@ -1605,7 +2032,7 @@ where
             break;
         }
         explored += 1;
-        run_state(prog, st, &post, &mut report, &mut work);
+        run_state(prog, st, &post, &mut report, &mut work, &seeds.pins, root, &rec_ctx);
     }
     report
 }
@@ -1750,7 +2177,451 @@ fn signed_names(f: &MirFn) -> std::collections::BTreeSet<String> {
 /// `true` would discharge both induction obligations and prove nothing.
 fn eval_invariant_here(f: &MirFn, env: &Env, text: &str) -> Result<Pred, String> {
     let names = invariant_names(f, env);
-    crate::mir::spec::eval_invariant(text, &names, &signed_names(f)).map_err(|e| e.to_string())
+    crate::mir::spec::eval_invariant(text, &names, &signed_names(f), &env.consts)
+        .map_err(|e| e.to_string())
+}
+
+/// The `(variable, literal)` bindings for the pins, masked to each variable's width.
+///
+/// A pin records a *bit pattern*, not a signed number: `-7` at eight bits is `249`. The
+/// width comes from the variable's own declaration ([`smt::var_width`]), so the literal is
+/// the same term the seeding uses. A pin whose variable is not declared in this context is
+/// skipped: there is no width to mask to, and a wrong width would substitute a term of the
+/// wrong size.
+fn pin_bindings(pins: &[(u32, u64)]) -> Vec<(Var, Var)> {
+    pins.iter()
+        .filter_map(|&(idx, k)| {
+            let w = smt::var_width(idx);
+            if w == 0 {
+                return None;
+            }
+            let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+            Some((smt::var_named(idx, w), smt::word(k & mask, w)))
+        })
+        .collect()
+}
+
+/// Apply the precondition's pins to a path and the goal built over it, at one obligation.
+///
+/// A pin is a *forced* value: the precondition entails `v == k`, so rewriting `v` to `k`
+/// throughout `(P => Q)` gives `(P[v:=k] => Q[v:=k])`, which has the same truth value --
+/// a model of `!P` restricts, and a model of `!P[v:=k]` extends by `v := k`. The rewrite is
+/// therefore an equivalence: it can turn a refusal into a proof or a refutation, and it can
+/// never manufacture a verdict.
+///
+/// It is applied to the *whole path* and not to the precondition alone, and that is the
+/// load-bearing part. The executor's path is not just the precondition: a `match` on an enum
+/// tag, an `assert`, a branch each conjoin their own constraint. Rewriting only the
+/// precondition would drop the relation between the tag and the value the pin gives it --
+/// `m == Mode::Run` pins the tag to `2`, and a path that then splits on `tag == 0` is
+/// infeasible *because* the pin says `2`. Rewriting the path keeps every split and every
+/// pin, and takes the deep term (`c == b * 2`) out of the assumption the diagram is built
+/// over. See [`crate::smt::pinned_vars`].
+fn pinned_pair(path: Pred, goal: Pred, pins: &[(u32, u64)]) -> (Pred, Pred) {
+    if pins.is_empty() {
+        return (path, goal);
+    }
+    let bindings = pin_bindings(pins);
+    if bindings.is_empty() {
+        return (path, goal);
+    }
+    (smt::substitute(path, &bindings), smt::substitute(goal, &bindings))
+}
+
+/// Decide `path => goal`, retrying with the pins rewritten in only if the engine refuses.
+///
+/// The unrewritten query is tried first and its answer is kept whenever it is decided. That
+/// ordering is what preserves the *witness*: the rewrite removes the pinned variables, so a
+/// counterexample found under it cannot name the input, and the counterexample is the more
+/// useful answer. The fallback exists for the one case the rewrite is for -- an `Unknown`
+/// the pins can lift -- and [`pinned_pair`] is an equivalence, so a decided answer from the
+/// retry is the same answer the first attempt would have given had it been able to decide.
+fn prove_obligation(path: Pred, goal: Pred, pins: &[(u32, u64)]) -> Verdict {
+    let v = smt::prove_implies(path, goal);
+    if !matches!(v, Verdict::Unknown) || pins.is_empty() {
+        return v;
+    }
+    let (path, goal) = pinned_pair(path, goal, pins);
+    let v2 = smt::prove_implies(path, goal);
+    if matches!(v2, Verdict::Unknown) {
+        v
+    } else {
+        v2
+    }
+}
+
+/// [`smt::find_model`] with the same pins fallback as [`prove_obligation`].
+fn find_obligation(path: Pred, pins: &[(u32, u64)]) -> Verdict {
+    let v = smt::find_model(path);
+    if !matches!(v, Verdict::Unknown) || pins.is_empty() {
+        return v;
+    }
+    let (path, _) = pinned_pair(path, smt::truth(true), pins);
+    let v2 = smt::find_model(path);
+    if matches!(v2, Verdict::Unknown) {
+        v
+    } else {
+        v2
+    }
+}
+
+/// The base type name of a path segment, with generic arguments and an
+/// `impl`-projection wrapper stripped: `Vec2` → `Vec2`, `G::<T>` → `G`,
+/// `<S2 as T2>` → `S2`, `core::num::<impl u8>` → `u8`.
+///
+/// rustc prints a method's *definition* with the type it is implemented for
+/// wrapped in `<impl …>` and a *call* with that type bare, so the two have to be
+/// cut to the same shape before they can be compared.
+fn base_type(s: &str) -> String {
+    let s = s.trim();
+    if let Some(rest) = s.split("<impl ").nth(1) {
+        return rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+    }
+    let s = match s.strip_prefix('<') {
+        Some(rest) => rest.split(" as ").next().unwrap_or(rest),
+        None => s,
+    };
+    let s = s.split("::<").next().unwrap_or(s);
+    let s = s.split('<').next().unwrap_or(s);
+    s.rsplit("::").next().unwrap_or(s).trim().to_string()
+}
+
+/// The type a method call is made on: `Vec2` in `Vec2::push`, `G` in
+/// `G::<T>::walk`, `S2` in `<S2 as T2>::go`.
+fn call_type(name: &str) -> Option<String> {
+    Some(base_type(name.rsplit_once("::")?.0))
+}
+
+/// The `self` type of an *instance* method, read from its receiver's declared
+/// type.
+///
+/// rustc prints a method's *definition* as `<impl at FILE:L:C: L:C>::m`, which
+/// names no type, but an instance method's receiver is the first argument and its
+/// `debug` binding is literally `self`, so that local's declared type names the
+/// type the method is implemented for (`&Vec2` gives `Vec2`).
+///
+/// A *static* associated function has no `self`, so it has no `debug self`
+/// binding and this returns `None`. The distinction matters: a static
+/// `Foo::m(x: Vec2)`'s first parameter is an ordinary argument, and reading it as
+/// a receiver would let a call to an *external* `Vec2::m` resolve to `Foo::m` --
+/// answering a call from the wrong body, which is a false proof. A free function
+/// has no `self` either and is also `None`, so callers distinguish the two by the
+/// definition name (see [`impl_self_loc`]).
+fn method_self_type(f: &MirFn) -> Option<String> {
+    let self_local = f
+        .debug_bindings
+        .iter()
+        .find_map(|(n, l)| (n == "self").then_some(*l).flatten())?;
+    let ty = f.locals.get(&self_local)?;
+    let inner = match ty {
+        Ty::Ref(inner) => inner.as_ref(),
+        other => other,
+    };
+    match inner {
+        Ty::Other(s) => Some(base_type(s)),
+        _ => None,
+    }
+}
+
+/// The `(line, column)` of the `impl` block a method belongs to, from its
+/// definition name `<impl at FILE:L:C: L:C>::m`, or `None` for a free function.
+///
+/// This is the identity rustc gives a method that is *not* its `self` type: a
+/// static associated function's receiver is absent, so the only thing tying it to
+/// a type is the `impl` block it was written in, and that block is named by
+/// location. See [`method_owner_type`].
+fn impl_self_loc(f: &MirFn) -> Option<(usize, usize)> {
+    if !f.name.contains("<impl at") {
+        return None;
+    }
+    f.impl_loc
+}
+
+/// The owner type of a method's `impl`, read from the source via the location in
+/// its definition name, or `None` when that cannot be established.
+///
+/// An instance method's `self` type already names the type it is implemented for,
+/// but a *static* associated function has no `self` to read, so its owner is only
+/// known from the `impl` block's own source line. `None` here means the call
+/// cannot be matched to this method by type, so the safe direction is to refuse
+/// the call rather than answer it from a body that may not be the one named.
+fn method_owner_type(prog: &MirProgram, f: &MirFn) -> Option<String> {
+    let loc = impl_self_loc(f)?;
+    prog.impl_owners.get(&loc).cloned()
+}
+
+/// Resolve a call name to the function in the dump it names.
+///
+/// An exact match is the free-function case: rustc prints a same-crate free
+/// function's call and its definition by the same bare name. Otherwise the name
+/// is a qualified call (`Type::m`) whose *definition* rustc prints as
+/// `<impl at …>::m`, so only the tail is shared.
+///
+/// The tail alone is not enough. `Vec2::push` and `Vec::<u8>::push`, or a free
+/// `wrapping_add` and `core::num::<impl u8>::wrapping_add`, share a tail while
+/// naming different functions, and answering such a call from the wrong body is a
+/// false proof. Three guards keep that from happening:
+///
+/// * A call name that still carries an `impl` projection (`…::<impl u8>::…`) is a
+///   `core`/`std` callee. rustc prints a *local* method call with its concrete
+///   type (`Vec2::push`, `<S as T>::m`), never with `<impl`, so such a name is
+///   never a same-dump call and is refused outright.
+/// * A surviving candidate must be the method for the same type: an instance
+///   method's `self` type must equal the call's type, and a *static* associated
+///   function -- which has no `self` to read -- must have an `impl` whose owner
+///   type equals the call's type. The owner is read from the source; when it
+///   cannot be established the candidate is refused, because a static method's
+///   tail is otherwise shared by any type (`<u16 as From<u8>>::from` would answer
+///   a local `impl Foo { fn from }`, a false proof).
+/// * A free function never matches a qualified call, because rustc prints a
+///   same-crate free function's call bare -- the exact-match case above.
+///
+/// `None` means the call is not modelled, which the caller reports rather than
+/// guesses at.
+fn resolve_callee(prog: &MirProgram, name: &str) -> Option<usize> {
+    if let Some(i) = prog.fns.iter().position(|g| g.name == name) {
+        return Some(i);
+    }
+    if name.contains("<impl") {
+        return None;
+    }
+    let tail = name.rsplit("::").next()?;
+    let want_ty = call_type(name)?;
+    let mut hits = prog.fns.iter().enumerate().filter(|(_, g)| {
+        if g.name.rsplit("::").next() != Some(tail) {
+            return false;
+        }
+        match method_self_type(g) {
+            Some(self_ty) => self_ty == want_ty,
+            None => match method_owner_type(prog, g) {
+                Some(owner_ty) => owner_ty == want_ty,
+                None => false,
+            },
+        }
+    });
+    match (hits.next(), hits.next()) {
+        (Some((i, _)), None) => Some(i),
+        _ => None,
+    }
+}
+
+/// Answer a self-recursive call by its contract instead of inlining it.
+///
+/// Returns `Some(())` when the call was handled (the caller must then continue at
+/// its own `target`, or stop when the obligation failed), `None` when it was not a
+/// recursive call or recursion is not licensed, so the caller falls through to the
+/// inliner.
+///
+/// # Why this is sound
+///
+/// A self-call inlined once is the *first* unrolling, and `DEFAULT_INLINE_DEPTH`
+/// stops the second. The contract route replaces the unrolling with an induction:
+///
+/// * the callee's precondition is *proved* of the call's arguments (`Pre`), so the
+///   assumption only applies to calls the function itself admits;
+/// * the `decreases:` measure is *proved* to be non-negative at entry and strictly
+///   smaller at the call (`Dec`), which is the well-founded basis; and
+/// * the postcondition is *assumed* of the result.
+///
+/// The measure is what makes this an induction rather than a circular argument: a
+/// strictly decreasing sequence in a well-founded order is finite, so there is a
+/// base case, and at the base case the body must establish the postcondition on
+/// its own. Nothing here *assumes* the postcondition at the base case -- the
+/// `return` obligations still have to be discharged by the body -- so a body that
+/// does not establish it is still a failure.
+///
+/// Every check is an obligation, so a wrong measure or a precondition the
+/// arguments do not meet is a *finding*, not a silent fallback.
+#[allow(clippy::too_many_arguments)]
+fn try_recursive_call(
+    prog: &MirProgram,
+    st: &mut State,
+    root: usize,
+    name: &str,
+    args: &[Operand],
+    dest: &Place,
+    target: usize,
+    rec: &Option<RecCtx>,
+    report: &mut MirReport,
+    work: &mut Vec<State>,
+    pins: &[(u32, u64)],
+) -> Option<()> {
+    // Only a self-call, and only the function under verification: an inlined
+    // callee's frame has a different `func`, and its own recursion is not this
+    // function's induction.
+    //
+    // The name is resolved with the same rule the inliner uses (exact match, else
+    // a unique tail match that also agrees on the method's `self` type), and the
+    // result has to be the root itself. A name that resolves to nothing, or
+    // ambiguously, is not this function calling itself.
+    //
+    // This must run *before* the intrinsic dispatch below, but it must not
+    // swallow an intrinsic call. A function named `wrapping_add` that calls
+    // `u8::wrapping_add` is calling the *intrinsic*, not itself; treating the
+    // call as recursive would assume the function's own postcondition in place of
+    // evaluating the intrinsic, which is a false proof. `resolve_callee` refuses
+    // that name because the intrinsic's `self` type (`u8`) is not the local
+    // function's, so the check falls through to the intrinsic model.
+    if st.frame.func != root || resolve_callee(prog, name) != Some(root) {
+        return None;
+    }
+    // The root frame has no caller, so a self-call is recursion by construction.
+    // A frame with a caller is an inlined callee, and reaching the root's name
+    // from there is not the root calling itself.
+    if st.frame.caller.is_some() {
+        return None;
+    }
+    let Some(rc) = rec else { return None };
+    // No postcondition means nothing to assume, so the call has no contract route
+    // and falls back to inlining (which will report the depth cutoff).
+    if rc.rec.ensures.is_empty() {
+        return None;
+    }
+    let f = &prog.fns[root];
+    // The contract is evaluated over the call's arguments, so the field bindings
+    // are the call site's and are rebuilt below. The `const` table is not: a
+    // constant has the same value at the call as at entry, and the entry state
+    // already carries it in `rc.rec.consts`. Handing the reader an empty table
+    // here made a contract that names a constant -- `requires: n <= LIMIT` --
+    // unreadable at the self-call, which turned a decidable proof into a refusal.
+    let fields = FieldEnv::with_consts(rc.rec.consts.clone());
+
+    // The argument bindings at the call site: name -> the value the caller holds.
+    // A name that has no value there (an unmodelled operand) makes the whole call
+    // unmodelled, which is the same refusal the inliner would give.
+    let mut names: BTreeMap<String, Var> = BTreeMap::new();
+    for (i, a) in args.iter().enumerate() {
+        let Some(&l) = f.arg_locals.get(i) else { continue };
+        match operand(&mut st.env, a) {
+            Val::Sym(v, _) => {
+                names.insert(f.name_of(l), v);
+            }
+            Val::Bool(p) => {
+                names.insert(f.name_of(l), smt::ite(p, smt::word(1, 1), smt::word(0, 1)));
+            }
+            _ => {
+                report
+                    .unknown_paths
+                    .push(format!("unmodelled argument to a recursive call to `{name}`"));
+                return Some(());
+            }
+        }
+    }
+
+    // `Pre`: the callee's precondition, proved of the call's arguments. This is a
+    // proof obligation, so an unreadable precondition is a refusal rather than a
+    // silently skipped check -- assuming a postcondition without the matching
+    // precondition would be assuming the conclusion.
+    let mut pre_ok = true;
+    let mut pre: Option<Pred> = None;
+    for r in &rc.rec.requires {
+        match spec::eval_requires(r, &names, &rc.rec.signed, &fields) {
+            Ok(p) => pre = Some(match pre {
+                None => p,
+                Some(prev) => smt::and(prev, p),
+            }),
+            Err(e) => {
+                report
+                    .unknown_paths
+                    .push(format!("unreadable `requires` at a recursive call: {e}"));
+                pre_ok = false;
+                break;
+            }
+        }
+    }
+    if !pre_ok {
+        return Some(());
+    }
+    if let Some(p) = pre {
+        report.obligations.push(Obligation {
+            kind: ObligationKind::RecursivePrecondition,
+            verdict: prove_obligation(st.path, p, pins),
+        });
+    }
+
+    // `Dec`: the measure at the call is non-negative and strictly below its value
+    // at entry. Both halves are needed. Non-negativity is what makes the order
+    // well-founded (a signed measure that goes negative would otherwise
+    // "decrease" forever); strictness is the progress.
+    if let Some((m_entry, signed)) = rc.measure_entry {
+        match spec::eval_measure(&rc.rec.decreases, &names, &rc.rec.signed, &rc.rec.consts) {
+            Ok((m_call, call_signed)) => {
+                if call_signed != signed || smt::bits(m_call) != smt::bits(m_entry) {
+                    report.unknown_paths.push(
+                        "the measure at a recursive call has a different type than at entry"
+                            .into(),
+                    );
+                    return Some(());
+                }
+                let zero = smt::word(0, smt::bits(m_entry));
+                let nonneg = if signed { smt::sge(m_entry, zero) } else { smt::truth(true) };
+                let decreases = if signed {
+                    smt::slt(m_call, m_entry)
+                } else {
+                    smt::ult(m_call, m_entry)
+                };
+                report.obligations.push(Obligation {
+                    kind: ObligationKind::RecursiveDecreases,
+                    verdict: prove_obligation(st.path, smt::and(nonneg, decreases), pins),
+                });
+            }
+            Err(e) => {
+                report.unknown_paths.push(format!("unreadable `decreases`: {e}"));
+                return Some(());
+            }
+        }
+    } else {
+        report.unknown_paths.push(
+            "a recursive call has no `decreases:` measure at entry to compare against".into(),
+        );
+        return Some(());
+    }
+
+    // Assume the postcondition for the result: a fresh variable for `ret`, the
+    // conjuncts of every `ensures`, then write it to the call's destination. The
+    // postcondition is *assumed*, never proved, here -- proving it is the `return`
+    // obligations' job.
+    let Some(w) = f.ret_ty.width() else {
+        report
+            .unknown_paths
+            .push("a recursive call returns an aggregate, which is not modelled".into());
+        return Some(());
+    };
+    let ret_v = smt::var(w);
+    let ret_signed = rc.rec.ret_signed;
+    let mut post_assumed: Option<Pred> = None;
+    for e in &rc.rec.ensures {
+        match spec::eval_ensures(
+            e,
+            &names,
+            Some(ret_v),
+            spec::RET_IS_UNKNOWN,
+            &rc.rec.signed,
+            ret_signed,
+            &fields,
+        ) {
+            Ok(p) => post_assumed = Some(match post_assumed {
+                None => p,
+                Some(prev) => smt::and(prev, p),
+            }),
+            Err(e) => {
+                report
+                    .unknown_paths
+                    .push(format!("unreadable `ensures` at a recursive call: {e}"));
+                return Some(());
+            }
+        }
+    }
+    let assumed = post_assumed.unwrap_or_else(|| smt::truth(true));
+    st.path = smt::and(st.path, assumed);
+    let ret_val = if w == 1 {
+        Val::Bool(ret_v.eq_val(1))
+    } else {
+        Val::Sym(ret_v, Sign::of_bool(ret_signed))
+    };
+    st.env.set(dest, ret_val);
+    advance(prog, st.clone(), target, report, work, pins);
+    Some(())
 }
 
 /// Push the successor states of an edge to `target`, applying the loop cut when
@@ -1765,6 +2636,7 @@ fn advance(
     target: usize,
     report: &mut MirReport,
     work: &mut Vec<State>,
+    pins: &[(u32, u64)],
 ) {
     let cut = match st.cut.clone() {
         Some(c) if c.func == st.frame.func && c.header == target => c,
@@ -1789,7 +2661,7 @@ fn advance(
     };
     report.obligations.push(Obligation {
         kind,
-        verdict: smt::prove_implies(st.path, inv),
+        verdict: prove_obligation(st.path, inv, pins),
     });
     // The cut closes here. A back edge is not followed: the assertion above is
     // the induction step, and re-entering the header would be the unwinding this
@@ -2017,7 +2889,17 @@ fn operand_width(f: &MirFn, o: &Operand) -> Option<u8> {
     }
 }
 
-fn run_state<F>(prog: &MirProgram, mut st: State, post: &Option<F>, report: &mut MirReport, work: &mut Vec<State>)
+#[allow(clippy::too_many_arguments)]
+fn run_state<F>(
+    prog: &MirProgram,
+    mut st: State,
+    post: &Option<F>,
+    report: &mut MirReport,
+    work: &mut Vec<State>,
+    pins: &[(u32, u64)],
+    root: usize,
+    rec: &Option<RecCtx>,
+)
 where
     F: Fn(Option<Var>, &[(u32, Var)]) -> Result<Pred, String>,
 {
@@ -2100,6 +2982,23 @@ where
                     }
                 }
                 st.env.set(dest, v);
+                // A *nested* aggregate assignment moves the source's parts under the
+                // destination's path. Two shapes need it: a struct literal into a nested field
+                // (`o.i = Inner { v: 9 }` -> `(_1.0) = move _2`), and a nested-to-nested move
+                // (`o.i = o.j` -> `_2 = move (_1.1); (_1.0) = move _2`, so a *nested source*
+                // into a whole temp, then a whole source into a nested destination).
+                //
+                // `copy_parts` in `eval_rvalue` handles only whole-to-whole, and a nested
+                // source is one it refuses, so this runs whenever *either* side is nested.
+                // It is done *after* `set` because the field arm of `set` forgets the nested
+                // paths beneath the destination -- correct, since they are stale -- and this
+                // is what puts the source's parts back. Without it the temp's `v` never lands
+                // under `_1.0`, and `(_1.0).0` reads `Unknown`.
+                if let Rvalue::Use(Operand::Copy(q) | Operand::Move(q)) = rv {
+                    if !q.proj.is_empty() || !dest.proj.is_empty() {
+                        st.env.rebase_parts(q, dest);
+                    }
+                }
             }
         }
     }
@@ -2107,7 +3006,7 @@ where
     // Terminator. Every successor goes through `advance`, which is where a loop
     // edge into the invariant's header is checked instead of followed.
     match &block.term {
-        Term::Goto(b) => advance(prog, st, *b, report, work),
+        Term::Goto(b) => advance(prog, st, *b, report, work, pins),
         Term::Return => {
             let ret = st.env.get(&Place::new(0));
             match st.frame.caller.take() {
@@ -2182,10 +3081,9 @@ where
                         };
                         match post(rv, &projs) {
                             Ok(p) => {
-                                let v = smt::prove_implies(st.path, p);
                                 report.obligations.push(Obligation {
                                     kind: ObligationKind::Postcondition,
-                                    verdict: v,
+                                    verdict: prove_obligation(st.path, p, pins),
                                 });
                             }
                             Err(e) => report
@@ -2356,12 +3254,51 @@ where
                             }
                             if rest.is_empty() {
                                 env.elems.insert((cl, *k), *v);
+                            } else if let Some(rc) = &rest_chain {
+                                // An array *argument* handed over as a whole field-path
+                                // target (`&mut x.a`): the callee's `_1` is the array, so
+                                // its element `k` is the caller's `<target>[k]`, which lives
+                                // in `elems_path` under the target's field chain. Without
+                                // this the element was dropped and the caller read its own
+                                // seed (`set_first_of(&mut x.a); x.a[0]` was `Incomplete` in
+                                // *both* directions). The chain is non-empty here -- the
+                                // empty one is the whole-local arm above -- and the entry
+                                // exists only because the argument is an array: a struct or
+                                // tuple argument's parts live in `fields`/`nested`, never
+                                // here, so this cannot re-base a scalar onto an array key.
+                                env.elems_path.insert((cl, rc.clone(), *k), *v);
                             } else {
-                                // An element under a sub-place target has no key in
-                                // this store. Leaving the caller's element would be a
-                                // stale value, so the caller's parts go instead --
-                                // precision lost, never a wrong value kept.
+                                // An element under a sub-place target that is not a field
+                                // chain (`&mut x.a[0]`) has no key in this store. Leaving the
+                                // caller's element would be a stale value, so the caller's
+                                // parts go instead -- precision lost, never a wrong value
+                                // kept.
                                 dropped = true;
+                            }
+                        }
+                        // Elements of field-path arrays (`x.a[0]`) the callee wrote.
+                        // These live in their own store, keyed by the whole chain, so
+                        // the loop above never sees them: without this one a helper's
+                        // `x.a[0] = 9` died with the frame and the caller read its own
+                        // seed, so the false `ret == 5` was **proved** against a body
+                        // returning 9. A whole-local target re-bases the callee's chain
+                        // under the caller's local unchanged; a sub-place target whose
+                        // chain is a field chain prefixes it (`&mut o.i` makes the
+                        // callee's `_1.a[0]` the caller's `o.i.a[0]`), and one that is
+                        // not (an element target, `&mut x.a[0]`) has no representable
+                        // key, so the caller's parts go rather than a stale value being
+                        // kept.
+                        for ((l, chain, k), v) in st.env.elems_path.iter() {
+                            if *l != *cal {
+                                continue;
+                            }
+                            match &rest_chain {
+                                Some(rc) => {
+                                    let mut full = rc.clone();
+                                    full.extend_from_slice(chain);
+                                    env.elems_path.insert((cl, full, *k), *v);
+                                }
+                                None => dropped = true,
                             }
                         }
                         if dropped {
@@ -2389,11 +3326,67 @@ where
                         // than aimed at a foreign place.
                         if let Some(o) = st.env.ref_origin.get(&0).cloned() {
                             if let Some(src) = st.env.arg_source.get(&o.local).cloned() {
-                                let mut proj = src.proj.clone();
-                                proj.extend_from_slice(&o.proj);
-                                let place = Place { local: src.local, proj };
-                                env.addressed.insert(dest.local, place.clone());
-                                env.ref_origin.insert(dest.local, place);
+                                // Two rewrites turn the callee's origin into a place in
+                                // the caller, and both are needed for an *element*:
+                                //
+                                // `resolve` collapses a deref of a local whose address
+                                // was recorded; then a leading deref is stripped
+                                // outright, because the head here is a reference
+                                // *argument* (`arg_source` holds only those) and `src`
+                                // already names its referent. `&mut a[0]` on a
+                                // whole-array argument is `(*_1)[_2]`, and `_1` is that
+                                // argument, so without the strip the deref lands in the
+                                // middle of the caller's place where no store is keyed
+                                // -- the write is dropped and a false contract about the
+                                // seed is *proved*.
+                                //
+                                // `pin_index_vars` then resolves the `IndexVar` the dump
+                                // prints (`_2` for the literal `0`), which dies at the
+                                // call boundary. Only the callee's own projection is
+                                // pinned: the caller's `src.proj` names *caller* locals,
+                                // so resolving it against this frame would read the
+                                // wrong local and is carried through as it is.
+                                let mut o = st.env.resolve(&o);
+                                if matches!(o.proj.first(), Some(Proj::Deref)) {
+                                    o.proj.remove(0);
+                                }
+                                let o = st.env.pin_index_vars(&o);
+                                // An `IndexVar` that is *not* pinned -- a symbolic index
+                                // the contract does not fix -- names a callee local that
+                                // means nothing in the caller. Carried across, the caller
+                                // reads it as *its own* local of that number, which is a
+                                // different argument, and the write lands on whatever
+                                // element that happens to hold: `*x.nth_mut(i) = 9` with a
+                                // parameter before `i` aimed the write at `x.a[zero]` --
+                                // the seed element -- so the false `ret == 5` was
+                                // *proved*.
+                                //
+                                // Dropping the reference alone is not enough: the write
+                                // may hit *any* element, so a later read of `x.a[0]` must
+                                // not fall back to its seed (that turned the false proof
+                                // around rather than removing it -- `ret == 5` became
+                                // provable). The array's elements are poisoned instead, so
+                                // every read is unknown: the write is lost, never
+                                // mis-aimed, and no stale seed survives it.
+                                if o.proj.iter().any(|s| matches!(s, Proj::IndexVar(_))) {
+                                    // The array's field chain is the `Field` steps that
+                                    // lead up to the index; the index step and anything
+                                    // past it are not part of the path.
+                                    let mut chain = field_steps(&src.proj).unwrap_or_default();
+                                    for step in &o.proj {
+                                        match step {
+                                            Proj::Field(f) => chain.push(*f),
+                                            _ => break,
+                                        }
+                                    }
+                                    env.poison_array_under(src.local, &chain);
+                                } else {
+                                    let mut proj = src.proj.clone();
+                                    proj.extend_from_slice(&o.proj);
+                                    let place = Place { local: src.local, proj };
+                                    env.addressed.insert(dest.local, place.clone());
+                                    env.ref_origin.insert(dest.local, place);
+                                }
                             }
                         }
                         env.set(dest, ret);
@@ -2419,6 +3412,53 @@ where
                                     proj: vec![Proj::Index(*k)],
                                 };
                                 env.set(&p, *v);
+                            }
+                            // A *struct* return keeps its fields and nested paths in the
+                            // field stores, not in `elems`: `_0 = _1` copies `_1`'s parts
+                            // through `copy_parts`, which writes `fields`/`nested`. Copying
+                            // only `elems` lost them, so `id_inner(o.i).v` -- a nested
+                            // aggregate handed to a helper by value and read back -- read
+                            // `Unknown` while the contract was true of the body. This runs
+                            // after the `elems` loop because clearing the destination's old
+                            // fields must not also clear the tuple components just written;
+                            // the nested paths are set last so the intermediate field write
+                            // (which forgets the paths beneath it) cannot drop a leaf.
+                            //
+                            // Only when the destination is a whole local, which is the shape
+                            // a call's destination has. A returned whole value replaces every
+                            // part, so the destination's old fields and nested paths are
+                            // dropped first: keeping one the callee did not write would be a
+                            // *wrong* value rather than a missing one.
+                            if dest.proj.is_empty() {
+                                env.fields.retain(|(l, _), _| *l != dest.local);
+                                env.nested.retain(|(l, _), _| *l != dest.local);
+                                env.elems_path.retain(|(l, _, _), _| *l != dest.local);
+                                for ((l, f), v) in st.env.fields.iter() {
+                                    if *l != 0 {
+                                        continue;
+                                    }
+                                    let p = Place {
+                                        local: dest.local,
+                                        proj: vec![Proj::Field(*f)],
+                                    };
+                                    env.set(&p, *v);
+                                }
+                                for ((l, chain, k), v) in st.env.elems_path.iter() {
+                                    if *l != 0 {
+                                        continue;
+                                    }
+                                    env.elems_path.insert((dest.local, chain.clone(), *k), *v);
+                                }
+                                for ((l, chain), v) in st.env.nested.iter() {
+                                    if *l != 0 {
+                                        continue;
+                                    }
+                                    let p = Place {
+                                        local: dest.local,
+                                        proj: chain.iter().map(|i| Proj::Field(*i)).collect(),
+                                    };
+                                    env.set(&p, *v);
+                                }
                             }
                         }
                     }
@@ -2446,7 +3486,7 @@ where
         Term::Unreachable => {
             report.obligations.push(Obligation {
                 kind: ObligationKind::Unreachable,
-                verdict: smt::find_model(st.path),
+                verdict: find_obligation(st.path, pins),
             });
         }
         Term::Assert { cond, negated, msg, target, .. } => {
@@ -2470,7 +3510,7 @@ where
             let bad = smt::and(st.path, smt::not(satisfied));
             report.obligations.push(Obligation {
                 kind: ObligationKind::Panic { message: msg.clone() },
-                verdict: smt::find_model(bad),
+                verdict: find_obligation(bad, pins),
             });
             // An assert that did *not* fire is an assumption, and the fall-through
             // path has to carry it. Without this the guard is discarded, which is
@@ -2483,7 +3523,7 @@ where
             // terminator, so the guard is assumed for either.
             let path = smt::and(st.path, satisfied);
             let next = State { block: *target, path, ..st };
-            advance(prog, next, *target, report, work);
+            advance(prog, next, *target, report, work, pins);
         }
         Term::SwitchInt { discr, cases, otherwise } => {
             let d = operand(&mut st.env, discr);
@@ -2515,7 +3555,7 @@ where
                     depth: st.depth,
                     cut: st.cut.clone(),
                 };
-                advance(prog, next, *target, report, work);
+                advance(prog, next, *target, report, work, pins);
             }
             let mut negs = Vec::new();
             for (k, _) in cases {
@@ -2536,13 +3576,26 @@ where
                 depth: st.depth,
                 cut: st.cut.clone(),
             };
-            advance(prog, next, *otherwise, report, work);
+            advance(prog, next, *otherwise, report, work, pins);
         }
         Term::Call { callee, args, dest, target } => {
             let Callee::Name(name) = callee else {
                 report.unknown_paths.push("indirect call not modelled".into());
                 return;
             };
+            // A self-call is answered by the function's own contract when it
+            // carries a `decreases:` measure, rather than inlined: inlining it
+            // would only unroll once and hit the depth bound. See
+            // [`try_recursive_call`]. It returns `Some` when it handled the call
+            // (including the failure case), and `None` when the call is not
+            // recursive, so the inliner below still sees every other call.
+            if try_recursive_call(
+                prog, &mut st, root, name, args, dest, *target, rec, report, work, pins,
+            )
+            .is_some()
+            {
+                return;
+            }
             // The same-dump lookup runs *first*, and on the full name. A `core::num`
             // name is only an intrinsic when the dump has no body for it: the model in
             // `intrinsics` is a definition of `core`'s function, and a user function
@@ -2570,7 +3623,7 @@ where
                             return;
                         }
                     };
-                    advance(prog, next, *target, report, work);
+                    advance(prog, next, *target, report, work, pins);
                     return;
                 }
             }
@@ -2579,34 +3632,18 @@ where
                 return;
             }
             // Only same-dump calls can be inlined. Assuming a return value for
-            // anything else would be assuming the conclusion, so it is unknown. The
-            // suffix match is the fallback for a name rustc prints with a path prefix
-            // (`module::f`); an exact match above already took the unambiguous case.
+            // anything else would be assuming the conclusion, so it is unknown.
             //
-            // Both sides are cut to their last `::` component, because the two sides
-            // are printed differently: an inherent method is *defined* as
-            // `<impl at file:line:col>::set_lo` and *called* as `Config::set_lo`, so
-            // matching the call against the whole definition name never fires. Cutting
-            // both to `set_lo` is what lets a method be inlined at all -- without it a
-            // call to any method was "unmodelled function", so a method's write
-            // through `&mut self` could not be seen by its caller.
-            //
-            // The tail match is required to be *unique*. `set_lo` on two types is
-            // two definitions with the same tail, and the call names only one of
-            // them, so picking the first would inline the wrong body -- a wrong
-            // proof, not a lost one. An ambiguous tail is refused instead.
-            let inline_idx = exact.or_else(|| {
-                let tail = name.rsplit("::").next();
-                let mut hits = prog
-                    .fns
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, g)| g.name.rsplit("::").next() == tail);
-                match (hits.next(), hits.next()) {
-                    (Some((i, _)), None) => Some(i),
-                    _ => None,
-                }
-            });
+            // An exact match is the free-function case: rustc prints a same-crate
+            // free function's call and its definition by the same bare name.
+            // Otherwise the call is a method (`Type::m`) whose definition rustc
+            // prints as `<impl at …>::m`, so only the tail is shared -- but the
+            // tail alone is not enough, because `Vec2::push` and `Vec::<u8>::push`
+            // (or a free `wrapping_add` and `core::num::<impl u8>::wrapping_add`)
+            // share one. Inlining the wrong body is a false proof, so the tail
+            // match also requires the same method `self` type and a unique
+            // candidate; see [`resolve_callee`].
+            let inline_idx = resolve_callee(prog, name);
             let Some(idx) = inline_idx else {
                 report.unknown_paths.push(format!("call to unmodelled function `{name}`"));
                 return;
@@ -2638,7 +3675,7 @@ where
                 report.unknown_paths.push(format!("callee `{name}` has no body"));
                 return;
             };
-            let mut env = Env::with_enums(&prog.enums);
+            let mut env = Env::with_enums(&prog.enums, &prog.consts);
             // Which caller locals were handed over through a reference, so the
             // return path knows whose store the callee's post-state belongs to.
             let mut by_ref: Vec<(Place, u32)> = Vec::new();
@@ -2734,6 +3771,19 @@ where
                             env.elems.insert((l, *k), *v);
                         }
                     }
+                    // Elements of field-path arrays (`o.a[0]`) are carried in for the
+                    // same reason the plain elements are: the callee's `(_1.0)[k]` is
+                    // the caller's `o.a[k]`, so a helper that *reads* one has to see
+                    // the caller's seed. Without this the callee read `Unknown`, and a
+                    // helper that wrote the element had its write die with the frame --
+                    // the caller read its own seed, so `requires: x.a[0] == 5;
+                    // ensures: ret == 5` on `set_first(x); x.a[0]` was **proved**
+                    // against a body that returns 9.
+                    for ((l0, chain, k), v) in st.env.elems_path.iter() {
+                        if *l0 == sl {
+                            env.elems_path.insert((l, chain.clone(), *k), *v);
+                        }
+                    }
                 } else if is_ref {
                     // A sub-place target whose own type is an aggregate: `&mut
                     // o.i`. The callee's `i.v` is the caller's `o.i.v`, so the
@@ -2770,6 +3820,32 @@ where
                                 _ => {
                                     env.nested.insert((l, rem.to_vec()), *v);
                                 }
+                            }
+                        }
+                        // Elements of field-path arrays under a sub-place target, the
+                        // same re-basing as the nested parts above: `&mut o.i` makes the
+                        // caller's `o.i.a[0]` the callee's `_1.a[0]`, so the chain has
+                        // the target's prefix dropped. Without this a helper that only
+                        // *reads* the element through its argument (`read_inner(&o.i)` ->
+                        // `i.a[0]`) saw `Unknown` and its contract was unreadable -- an
+                        // incompleteness where the true contract should decide.
+                        for ((l0, chain, k), v) in st.env.elems_path.iter() {
+                            if *l0 != sl || !chain.starts_with(&rc) {
+                                continue;
+                            }
+                            let rem = &chain[rc.len()..];
+                            if rem.is_empty() {
+                                // The target *is* the array (`peek_of(&x.a)`): in the
+                                // callee's terms its argument is a whole local, so the
+                                // callee's `_1[k]` read consults the *plain* element store,
+                                // not the field-path one. Without this the callee read
+                                // `Unknown` and a read-only helper's contract was
+                                // unreadable -- an incompleteness where the true contract
+                                // should decide. This is the exact inverse of the write-back
+                                // arm that re-bases a whole-array target's element.
+                                env.elems.insert((l, *k), *v);
+                            } else {
+                                env.elems_path.insert((l, rem.to_vec(), *k), *v);
                             }
                         }
                     }
@@ -2877,7 +3953,30 @@ fn operand(env: &mut Env, o: &Operand) -> Val {
             // A variant construction whose destination `eval_rvalue` could not
             // resolve (it has no enum layout) stays unknown; the well-typed path
             // is in `eval_rvalue::Use`, where the destination's width is known.
-            Const::Other(_) => Val::Unknown,
+            // A named `const` item: `_0 = const K`, where the item's own body is
+            // printed separately as `const K: u8 = const 5_u8;`. The value is
+            // inlined from the table rather than left unknown, so the use site
+            // folds. rustc const-evaluates the item, so its body is already a
+            // literal with a type suffix -- which is where the width and sign
+            // come from, exactly as for an inline literal.
+            //
+            // A path constant that is *not* a known `const` -- an enum variant
+            // construction (`Mode::Idle`), or a constant whose body is an
+            // expression rather than a literal -- stays unknown; the enum case is
+            // resolved by the caller in `eval_rvalue`, which knows the
+            // destination's width.
+            Const::Other(name) => match env.consts.get(name) {
+                Some(Const::UInt(v, ty)) => match ty.as_ref().and_then(|t| t.width()) {
+                    Some(1) => Val::Bool(smt::truth(*v == 1)),
+                    Some(w) => {
+                        let sign = ty.as_ref().map(Sign::of).unwrap_or(Sign::Unknown);
+                        Val::Sym(smt::word(*v as u64, w), sign)
+                    }
+                    None => Val::Unknown,
+                },
+                Some(Const::Bool(b)) => Val::Bool(smt::truth(*b)),
+                _ => Val::Unknown,
+            },
             Const::Unit => Val::Unknown,
         },
     }
@@ -3089,7 +4188,22 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
             // `Field(N)` projections index, so position `i` here is field `i`.
             for (i, o) in ops.iter().enumerate() {
                 let v = operand(env, o);
-                env.set(&Place { local: dest.local, proj: vec![Proj::Field(i as u32)] }, v);
+                let dst = Place { local: dest.local, proj: vec![Proj::Field(i as u32)] };
+                env.set(&dst, v);
+                // An *aggregate operand* keeps its value in its parts, so `Outer { i: x, .. }`
+                // stores the field's value but not `x`'s own `v`. A later read of the returned
+                // `mk_outer(o.i).i.v` walks the nested chain and finds nothing. The parts are
+                // re-rooted onto the field *after* the `set` above, because a field write
+                // forgets the paths beneath it; the operand's own parts are untouched, so this
+                // is a copy of what it holds rather than an assumption about it. The gate is the
+                // operand's *type*, not its value: a by-value struct argument's parts live in
+                // `fields`, so it reads `Unknown` as a whole and would be missed by a value
+                // test.
+                if let Operand::Copy(q) | Operand::Move(q) = o {
+                    if matches!(v, Val::Agg) || matches!(type_of_place(f, q), Some(Ty::Other(_))) {
+                        env.rebase_parts(q, &dst);
+                    }
+                }
             }
             Val::Agg
         }
@@ -3398,6 +4512,25 @@ fn eval_binary(op: BinOp, a: Val, b: Val, width: Option<u8>) -> Val {
                         if let Some((q, r)) = smt::const_of(y)
                             .map(|v| as_signed(v, w))
                             .and_then(|c| smt::sdivmod_pow2(x, c, w))
+                        {
+                            return Val::Sym(
+                                match op {
+                                    BinOp::Div => q,
+                                    _ => r,
+                                },
+                                sign,
+                            );
+                        }
+                    }
+                    // The unsigned twin: a logical shift and a mask, with no sign to
+                    // fix up. The general unsigned divider is not the signed one's wall,
+                    // but it is still a `2 * w`-deep term, and a *symbolic* dividend
+                    // through it is refused for the diagram's size -- `n / 4` on a `u64`
+                    // with `n <= 1000` was `incomplete` in ~0.9 s. `d == 1` is left to the
+                    // general path so the guard matches the signed branch.
+                    if signed == Some(false) {
+                        if let Some((q, r)) = smt::const_of(y)
+                            .and_then(|d| smt::udivmod_pow2(x, d, w))
                         {
                             return Val::Sym(
                                 match op {
@@ -4853,5 +5986,33 @@ fn count_via_helper(_1: u8) -> u8 {
                 }
             }
         }
+    }
+
+    /// The name-shape rules a call name is resolved by, on the shapes rustc
+    /// actually prints.
+    ///
+    /// These are pure string rules, so they are pinned here rather than only
+    /// through a `rustc` run: the resolver is what stands between a call and the
+    /// body it is answered from, and answering it from the wrong body is a false
+    /// proof, not a lost one. The shapes below are the ones measured from a real
+    /// `--emit=mir` dump.
+    #[test]
+    fn call_names_resolve_to_the_right_body() {
+        // `base_type` strips the wrapper rustc prints on a definition and the
+        // generics it prints on a call, and takes the last path segment.
+        assert_eq!(base_type("Vec2"), "Vec2");
+        assert_eq!(base_type("G::<T>"), "G");
+        assert_eq!(base_type("<S2 as T2>"), "S2");
+        assert_eq!(base_type("core::num::<impl u8>"), "u8");
+        assert_eq!(base_type("&Vec2"), "&Vec2");
+
+        // `call_type` is the type a method is called on.
+        assert_eq!(call_type("Vec2::push").as_deref(), Some("Vec2"));
+        assert_eq!(call_type("G::<T>::walk").as_deref(), Some("G"));
+        assert_eq!(call_type("<S as T>::m").as_deref(), Some("S"));
+        assert_eq!(call_type("free_fn"), None, "a bare name has no type segment");
+
+        // An intrinsic call keeps its `<impl` projection, which marks it external.
+        assert_eq!(call_type("core::num::<impl u8>::wrapping_add").as_deref(), Some("u8"));
     }
 }

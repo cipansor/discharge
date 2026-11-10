@@ -13,7 +13,7 @@
 //!
 //! Nothing here depends on `std`: it writes into any [`core::fmt::Write`], which
 //! includes a fixed buffer on bare metal. With the `std` feature there is also
-//! [`Query::to_smtlib2_string`].
+//! `Query::to_smtlib2_string`, an owned-string convenience for host tooling.
 //!
 //! ```text
 //! (set-logic QF_BV)

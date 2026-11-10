@@ -55,7 +55,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use rustc_public::mir::{AssertMessage, Body, TerminatorKind};
-use rustc_public::CrateDef;
+use rustc_public::{CrateDef, ItemKind};
 
 use discharge::mir::shape::{AssertShape, FnShape, PanicKind, Polarity};
 
@@ -125,15 +125,29 @@ fn classify(msg: &AssertMessage) -> PanicKind {
     }
 }
 
-/// The shapes of every function with a body, grouped by bare name.
+/// The shapes of every *function* with a body, grouped by bare name.
 ///
 /// Grouped, not keyed one-to-one: a bare name is not unique (`A::check` and
 /// `B::check` both reduce to `check`), and a single-slot map kept only the last,
 /// so the oracle checked one method and could not see a regression in the other.
+///
+/// Only [`ItemKind::Fn`] is kept. A `const`, `static`, or data-constructor item
+/// also has a body in typed MIR, but the text side does not see one: an item
+/// initialised from a literal is a single line (`const K: u8 = const 5_u8;`), an
+/// item initialised from an expression gets a body that is *not* introduced by an
+/// `fn` header, and a constructor's body is printed under a `// MIR FOR CTFE`
+/// marker that [`of_text_mir`](discharge::mir::shape::of_text_mir)'s parser skips
+/// so it does not count the type twice. Counting those typed bodies as functions
+/// made every one of them a spurious "function the text side dropped", which is
+/// the one report this oracle must never make falsely -- a real dropped function
+/// and a `const` body are indistinguishable once the kind is thrown away.
 fn typed_shapes(args: &[String]) -> Result<BTreeMap<String, Vec<FnShape>>, String> {
     let mut out: BTreeMap<String, Vec<FnShape>> = BTreeMap::new();
     let result = rustc_public::run!(args, || -> ControlFlow<()> {
         for item in rustc_public::all_local_items() {
+            if item.kind() != ItemKind::Fn {
+                continue;
+            }
             if let Some(body) = item.body() {
                 let name = item.name();
                 let bare = name.rsplit("::").next().unwrap_or(&name).to_string();

@@ -26,6 +26,7 @@ cargo test --features std
 
 # Lint (must stay at zero warnings)
 cargo clippy --features std --all-targets
+cargo clippy --no-default-features --lib   # the `no_std` half, which the line above never compiles
 
 # Docs (must stay at zero warnings)
 cargo doc --features std --no-deps
@@ -128,6 +129,29 @@ Three engine consequences worth remembering:
     sign-extended product equals the sign-extension of the wrapped result.
     `smt::sign_extend` exists for exactly this, because `truncate` zero-fills and
     a zero-extended `-1` has the wrong magnitude.
+
+- **A contract resolves a bare name against the arguments, then the `const`
+  table.** `verify_function` copies `MirProgram::consts` into `FieldEnv::consts`,
+  and `Parser::parse_primary` looks a name up there after the argument table and
+  after the associated-constant forms (`i8::MIN`). The table is the *same* one the
+  executor folds a body's `const LIMIT` from, so a contract's `LIMIT` and the
+  body's `LIMIT` are one value -- taken once from rustc's const-evaluated dump,
+  they cannot disagree. Four things to keep right if you touch this:
+  - The value is built at the *item's* own width and sign (`const 10_u8`,
+    `const -1_i8` prints as `0xff`), not at the operand's, because a constant has
+    a type of its own -- unlike a bare literal. It goes through `unshared_const`
+    so it does not hash-cons with a literal of the same bit pattern, whose
+    recorded envelope would otherwise be read back as the constant's.
+  - Arguments are checked *first*. Rust rejects a parameter that shadows a
+    constant (`E0005`), but reading the constant there would bind the wrong value
+    -- a false proof, not a refusal.
+  - A name whose printed body is not a literal (`const NEXT: u8 = LIMIT + 1`
+    prints as a `const NEXT: u8 = { ... }` block) is *refused*, not guessed: its
+    value lives in its own body, which the contract reader does not fold. Same for
+    a misspelled name. Both are skips, so nothing is proved either way.
+  - A module-nested item is keyed by its full path (`low::K`), which is how the
+    dump prints both the definition and the use, so it resolves only when the
+    contract spells the path -- a bare `K` does not silently pick one module.
 
 ## The unsigned multiply-overflow test is exact *division*, not a widened product
 
@@ -311,6 +335,35 @@ Two things this exposed, both worth remembering:
   it. **When a fix makes a query decidable, check what else used that query as a
   stress vehicle.**
 
+## A pin is keyed by the variable's index, not the argument's local
+
+The pin above worked for a whole argument because an argument's symbolic variable
+*is* its local (`var_named(l, w)`), so `pins` could be a list of `(local, k)` and the
+seed loop could look up by local. That is a coincidence of the argument case, not a
+property of the pin. An aggregate part's variable is allocated from a different index
+space (`spec.rs` gives a field `base + next_slot`, past `max_local + 1`), so the same
+lookup never matched: `requires: w.v == -7` with the body `w.v / 3` was extracted as a
+pin and then *discarded*, and the field stayed symbolic.
+
+The cost is not small. The field is `i64`, so `w.v / 3` builds the full 64-bit
+restoring divider -- the same ~262-deep term the symbolic-division vehicle uses -- and
+the query is refused for the size of its own diagram even though the precondition
+leaves exactly one value. Measured: `incomplete` in 1.18 s before, `verified` in 0.00 s
+after.
+
+`pins` is now `(variable index, k)` and the seed loop keys by `smt::index(v)`, so one
+pin reaches wherever that variable is seeded: an argument, a struct field, a nested
+path, an array element. `lit_of` masks to the *variable's own* width rather than the
+argument's, because the pin value is written signed (`-7`) and each part needs its own
+two's-complement pattern (`249` at eight bits, `-7` as `u64` at 64).
+
+The general lesson: **an identity that holds for one seeding site is not an identity of
+the pin.** The pin is about a *variable*; anything keyed to a local, an argument name,
+or a MIR place is keyed to the wrong thing and will silently drop the pins it does not
+recognise. The corpus is what catches it: the aggregate-part targets are the only ones
+that distinguish the two keys, and before they existed a mutation that deleted the
+field/nested/element arms passed every test.
+
 ## The imperative layer (`wp.rs`) has three traps
 
 If you touch verification-condition generation, these are the mistakes that make
@@ -406,8 +459,12 @@ and also what makes the frame check load-bearing:
    Do not add an `old` operator to the symbolic layer to "fix" this: it would give a
    name to a value the state no longer contains.
 
-Recursion is deliberately unsupported: a cyclic call graph needs an induction
-principle, which is a different feature rather than a missing branch.
+Recursion is supported for a *self-call* that names a `decreases:` measure: the
+call is answered by the function's own contract under well-founded induction
+rather than inlined. A *mutually* recursive cycle still has no measure to name
+here, so it remains unsupported. The full rule, its soundness argument, and the
+four ways it is pinned are recorded in "Recursion by contract" near the end of
+this file.
 
 ## A verifier needs a differential harness, not just unit tests
 
@@ -1504,6 +1561,76 @@ globals, distinct images. Then removing the cap makes the test fail, which is th
 proof that the teeth are real. The rule: before trusting a rejection test, run the mutation
 that removes the guard it names, and confirm it fails. If a nearer check could also reject
 the input, the test is ambiguous and you cannot tell which check fired.
+
+**Follow-up: the same rule applies to proof scripts, and it caught two more defects.** The
+comparison's negative Coq and Lean fixtures (`examples/comparison/bugs/coq/`, `bugs/lean/`)
+were false theorems about buggy definitions, and their proof *scripts* were tailored to the
+buggy shape. Correcting the definition therefore broke the *script* rather than the
+*proof*, so the non-zero exit was an artifact of the script and not evidence about the bug —
+the mutation said so, and the fixtures were rewritten so one script runs against both the
+correct and the buggy definition (correcting the definition now makes the file compile).
+Splitting the two Coq theorems into separate compilation units is what exposed a second
+defect: a failed `Qed` stops `coqc`, so with both theorems in one file the second was never
+reached and the exit code proved only that the first failed. The isolation check then found
+a third: the loop theorem was stated `forall n, n <= 8 -> ...` under `Open Scope Z_scope`,
+where `n <= 8` for `n : nat` is a *type error*, not a proof failure — it had been failing
+for the wrong reason and was reported as a caught bug. The general lesson is that a proof
+script is a test, and a test that fails while the defect is present has proved nothing until
+the defect is removed and it passes.
+
+**Follow-up: the gate that enforced the rule broke it, by reading a count.** The comparison
+gate first asserted `discharge`'s coverage summary — the `decided 0 of 1` line — for each
+injected bug. That line counts only `FnOutcome::Verified`, so `Failed`, `Incomplete` *and*
+`Skipped` all leave it at zero. A fixture whose contract had become unreadable (a typo in an
+`ensures` name) therefore still printed `decided 0 of 1` and the gate reported a caught
+defect while holding no counterexample: a lost proof read as a refutation. The summary is a
+*coverage* number and the claim was about a *verdict*, and the two only agreed while every
+fixture happened to be well-formed. The fix is `examples/comparison_check.rs`, which asserts
+the per-function `FnOutcome` and the expected obligation kind (`panic` for the swapped
+`sat_add`, `postcondition` for the wrong-arm `clamp`, `loop invariant` for the wrong-body
+`sum_to`), and treats `Skipped`, `Incomplete`, a missing function and a failure on the wrong
+obligation as failures. The general rule: assert the *outcome* you mean, never a number that
+several outcomes share, because a shared number cannot tell them apart and the difference is
+exactly what the test exists to detect. A second instance in the same file: the gate skipped
+whichever of Coq and Lean was absent and still exited 0, so "every claim held" could be
+printed having run one of the two proof suites; both are now required, and a missing prover
+is exit 2 (a reported skip), never success.
+
+**Follow-up: the same gate had three more holes, each a different flavour of "the test does
+not test what it claims".** All three were reproduced before being fixed. (1) *The positive
+fixture read its own claim from the thing it was checking.* The driver built its request list
+from `spec::extract`, so the names came from the contracts; deleting one function's contract
+deleted its name, the list shrank, the other two still passed, and the gate printed "2
+function(s) verified" and exited 0 with the deleted claim never checked. A claim list derived
+from the input shrinks with the input — pin the expected names independently. (2) *A `panic`
+prefix accepted any panic.* The swapped-add fixture asserted `kind.starts_with("panic")`, so a
+divide-by-zero planted before the addition passed a test about an overflow; the kind is now
+compared for equality against the exact rustc text. A prefix is a range, and the claim was
+about one point in it. (3) *Scratch fixtures shared a path.* `write_temp` named the degenerate
+fixtures by function only, so two concurrent gates wrote the same file and the first to finish
+removed it under the second's `rustc`; the path is now unique per call (`pid` + a process-wide
+sequence), mirroring `verify::emit_mir_with`, which had already been fixed for exactly this
+reason. A test that fails only when two of them run at once is a test that will fail in CI and
+pass on the laptop, which is the worst order. The unifying rule: every one of these let the
+test pass while checking less than it claimed, and none of them was visible from the happy
+path — each needed the failure to be *induced* (delete the contract, plant the wrong panic,
+run two at once) before it could be seen.
+
+**Follow-up: pinning the name was still not enough, because a `requires`-only contract is still
+a contract.** The check for (1) above tested that *a* contract existed, and existence is not
+content: with every `ensures:` deleted but `requires:` left in place, the name survived, the
+function shrank to panic freedom (`clamp` went from 3 obligations to 0), and it came back
+`Verified` with the claimed result never checked. The fix pins the whole contract — `requires:`,
+`ensures:` and `invariant:`, clause for clause and in order — and compares each kind exactly.
+Pinning the *text* rather than a count matters for the same reason the fixtures exist: a count
+cannot tell a whole-function contract from a weakened one. Swapping `sat_add`'s `ret == a + b`
+for `ret >= a` keeps the clause count and drops the part that says what the function computes,
+and loosening `sum_to`'s `n <= 8` to `n <= 2` proves a strictly smaller statement — and that
+second one was still passing after the `ensures` fix, because each clause kind can be weakened
+independently, so each has to be pinned independently. The general rule this pair teaches:
+when a test asserts that something *exists*, ask what the weakest thing that satisfies
+"exists" is, and pin that instead. "A contract is present" is satisfied by a contract that
+claims nothing; "the clause count is 3" is satisfied by three clauses that claim less.
 
 ## A SAFETY comment is a claim, and it needs the same treatment as any other
 
@@ -3240,6 +3367,84 @@ optional file argument, which is what made the measurement cheap.)
   (the same `Val::Agg` convention an aggregate literal uses) instead of clearing
   them. `struct_reassign_then_field_read` moved from *incomplete* to **refuted**:
   the false contract is now a counterexample, not a shrug.
+* **A *nested* aggregate assignment — DONE.** `o.i = Inner { v: 9 }` lowers to a
+  struct literal into a temp followed by `(_1.0) = move _2`, so the parts being
+  moved are keyed under the temp and the destination is the nested place `_1.0`.
+  `copy_parts` is reached only for a whole-place destination, so the temp's `v`
+  never landed under `_1.0` and the later read `(_1.0).0` -- the *nested* store,
+  keyed by the whole chain -- found nothing. The body's value was then unknown,
+  and a contract that is false of the body was reported unreadable instead of
+  refuted. `Env::rebase_parts` moves the source's parts to the destination,
+  re-rooting both when either place is nested, called *after* `set` (whose field
+  arm forgets the stale nested paths first, and the helper is what puts the
+  source's parts back). It generalises `copy_parts`, which is the
+  whole-to-whole case and carries the element/payload/tag/index stores too; the
+  re-rooting one moves the two field-shaped stores and is reached when *either*
+  side is nested -- a struct literal into a nested field (`o.i = Inner { v: 9 }`),
+  and a nested-to-nested move (`o.i = o.j` lowers to `_2 = move (_1.1); (_1.0) =
+  move _2`, so a *nested source* into a whole temp, then a whole source into a
+  nested destination). `copy_parts` refuses a nested source, which is why the
+  nested-to-nested move was `incomplete` before. A part is re-keyed *relative* to
+  the source's own path: the entry at `(src, sp)` -- or the single-field entry
+  whose key *is* `sp` -- is the value at `src`, and it lands at the destination's
+  path. A whole destination drops all its parts first; a nested destination keeps
+  its siblings, because only the paths under it are written. Only an all-field
+  path is re-keyed: a deref, index or downcast names a store the helper does not
+  re-root, and writing a part where no read consults it would be a lost proof at
+  best, so those are refused.
+  `whole_inner_write_makes_nested_seed_stale` moved from *incomplete* to
+  **refuted**, and its positive companion `whole_inner_write_is_seen_by_the_leaf`
+  verifies -- the pair rules out a blanket refusal, which is what an
+  "`!is_verified()`" assertion on the false entry alone would have let through.
+  The nested-to-nested pair `whole_inner_move_carries_the_source_leaf` (true
+  `ret == 3`, verified) and `whole_inner_move_is_not_the_stale_destination` (the
+  destination's pre-move `7` claimed to survive; refuted, witness `o.i.v = 7`)
+  pins both directions: a model that kept the stale leaf would *prove* the twin.
+  The swap pair `nested_swap_carries_the_other_side` (seeds `3`/`4`, true `ret == 4`)
+  and `nested_swap_is_not_the_stale_side` (the pre-swap `3` claimed to survive;
+  refuted) is what makes the *either-side* guard load-bearing: with the guard
+  narrowed to "destination nested" both entries go `incomplete`, which is exactly
+  the mistake the pair catches.
+  A *returned* nested aggregate is the mirror image of the argument side. `id_inner(o.i).v`
+  lowers to `_3 = move (_1.0); _2 = id_inner(move _3); _0 = copy (_2.0)`, so the argument
+  is a sub-place (whose parts the re-based copy-in already carries) and the callee's
+  `_0 = _1` return builds `_0`'s fields field-by-field. The return merge only copied
+  `elems` (the tuple components), so a struct return lost its `fields`/`nested` and the
+  caller's read was `Unknown` while the contract was true. The merge now copies the
+  callee's `_0` fields and nested paths into the destination too, clearing the
+  destination's old parts first (a returned whole value must not keep a stale field the
+  callee did not write -- that would be a *wrong* value, not a missing one). The pair
+  `nested_aggregate_argument_reaches_the_helper` (true `ret == 9`, verified) and
+  `nested_aggregate_argument_is_not_the_stale_destination` (claims `7`; refuted, witness
+  `v4 = 9`) pins it: with the new branch disabled both go `incomplete`.
+  Three holes remain next to it, all *coverage* rather than soundness (nothing false can be
+  proved: each is an unreadable contract or an `Unknown` read, never a pass). A *two-level*
+  nested return path (`mk_outer(o.i).i.v`) is now closed: `_0 = OuterBox { i: copy _1, .. }`
+  stores the field value but not the operand aggregate's own parts, so `Rvalue::Struct`
+  re-roots an aggregate operand's parts onto the field (`rebase_parts`, gated on the operand's
+  type, because a by-value struct argument reads `Unknown` as a whole). Pinned by
+  `nested_return_carries_the_field` / `nested_return_is_not_the_stale_field`. An *array literal
+  of aggregates* (`[o.i, o.j]`) is still `incomplete`, because the literal path stores under
+  `elems` by index and does not carry the element aggregates' parts. And an *array whose type is
+  a field* (`o.a[0]`) is skipped, since the `indexed` store is keyed by local only (see the note
+  below).
+  Two notes on what this did *not* need. The nested literal always reaches the
+  store through a temp, so `Rvalue::Struct`/`Aggregate` do **not** need to write
+  under `dest.proj`; and making `Aggregate` do so *drops* a nested tuple write
+  (`(_1.0) = (5, 6)` writes `(_1.0.0)`, a `Field(0) + Index(0)` chain the `set`
+  catch-all does not re-root), so the tempting "consistency" edit is a
+  regression. The minimal, evidence-backed change is the assignment hook alone.
+  Both projections are *resolved* before the path is read, and one leading
+  `Deref` is stripped as `field_steps` strips one (it now backs `field_chain`):
+  `o.i = Inner { v: 9 }` through an `&mut Outer` lowers to `((*_1).0) = move _2`,
+  and an `&mut T` argument is modelled as its referent, so `resolve` leaves the
+  lone deref in place. Without the strip the write is refused for the wrong
+  reason and the leaf reads `Unknown` --
+  `whole_inner_write_through_a_mutable_reference_is_seen` verifies after it and
+  is `incomplete` before, the tripwire for the deref case.
+  The deep `i64 / 3` wall is *not* part of this: that entry is the deliberate
+  `MAX_WALK_DEPTH` refusal vehicle (`a_symbolic_division_by_a_non_power_of_two_at_i64`,
+  whose contract is false in general), so its `incomplete` is intended, not a bug.
 * **`Rvalue::Discriminant` and `Downcast` for a real enum match — DONE.**
   A `match` on an enum lowers to `_2 = discriminant(_1); switchInt(move _2)`,
   so the tag is a symbolic input whose *domain is the set of variant
@@ -4020,8 +4225,49 @@ in CI rather than in a downstream build. It follows the Ferrocene/Kani conventio
 an absent toolchain, or a `thumbv7em-none-eabihf` target not installed *for that
 toolchain*, is reported and skipped rather than folded into a pass. CI installs
 both the 1.85 toolchain and that target for it so the gate actually runs. The gate
-numbering is now **13 steps**, not 12; the README and `ci.yml` were renumbered
-with it.
+numbering is now **16 steps**; it was 13 when this note was written, and three steps
+were appended without renumbering the earlier ones (so the "gate 3/4/9" references
+elsewhere still name the same gates).
+
+Step 13 *builds* on the floor; it also now *runs* the frontend there. `cargo check`
+only proves the crates compile on 1.85 -- it says nothing about whether the MIR
+frontend still works, and the frontend reads rustc's textual MIR, whose shape is not
+stable across toolchains. A `const` that folds to a literal prints inline on current
+stable and as a CTFE brace-block on 1.85, so a parser that knew only the inline shape
+passed every gate above and silently dropped the item on the floor. Step 13 now sets
+`DISCHARGE_RUSTC` to the floor rustc and runs the frontend's own suite
+(`cargo +$MSRV test --features std --test mir`) so a toolchain-shaped gap fails here
+rather than being discovered downstream. See "A `const` printed as a CTFE brace-block
+on 1.85" below.
+
+The three appended steps hold the *tree* rather than the logic, and each closes a
+recurrence rather than a one-off:
+
+- **Step 14: rustdoc builds both crates with `-D warnings`.** The crate is
+  `#![deny(missing_docs)]`, but that only checks that a doc comment *exists* -- it says
+  nothing about whether an intra-doc link still *resolves*, and `cargo test` and `cargo
+  clippy` never run rustdoc. Four warnings had shipped: `mir/spec.rs` linked a renamed
+  `bind`, and `smt.rs` linked three private items (`pinned_vars`, `EvalMemo`, `eval_term`)
+  from public docs. `discharge-arithmetic` had the same class (`prove.rs` linked its
+  private `forall_pair_bounded` from three public items), which is why the step checks
+  both crates and not just the parent. `discharge` is built *three* ways -- default
+  (`no_std`), `--features std`, and `--all-features` -- because the doc surface differs
+  between them: a link to a `#[cfg(feature = "std")]` item resolves in the last two and not
+  the first, which is how `smtscript` shipped an unresolved link to
+  `Query::to_smtlib2_string` that only the default build could see. docs.rs publishes the
+  default build, so `[package.metadata.docs.rs] all-features = true` makes the published
+  docs the union instead.
+- **Step 15: no compiled output is tracked.** `git ls-files` must not list a `.rlib`,
+  `.rmeta`, `.o`, `.bc`, `.d`, a `target/` path or a `__pycache__` path. This recurred:
+  a cleanup commit untracked six root `.rlib`s the oracle runs had left behind, and the
+  next `git add -A` put them straight back. A `.gitignore` cannot help -- ignore rules
+  are consulted only for *untracked* paths -- so the fix is a check, not a pattern.
+- **Step 16: the `unsafe` surface is pinned and justified.** `SECURITY.md` told a reporter
+  there were *three* `unsafe` blocks in `src/`; there are two, and the paragraph named only
+  `smt.rs` while `sat.rs` held the second. A count in prose is a claim like any other, and
+  this one is security-relevant, so it is checked: the gate fails unless there are exactly
+  two `unsafe {` blocks, each preceded by a `// SAFETY:` in its contiguous comment block
+  (not a fixed number of lines -- the justifications here run to several).
 
 ## The bit-blaster walked a DAG as a tree, and no budget noticed
 
@@ -5947,8 +6193,10 @@ reborrowed receiver (`let r = &mut o; r.i.set_leaf(5)`), a `&self` read feeding 
 write, and a leaf write that leaves the target's sibling at the caller's seed. Ten entries
 with their false twins, pinned by
 `a_method_receiver_is_a_sub_place_like_any_other_argument`. A whole-aggregate replacement
-through a sub-place target (`*i = n` for `&mut o.i`) is *sound-incomplete* rather than
-decided: a leaf write cannot spell a whole value, so the caller's leaf reads unknown.
+through a sub-place target (`*i = n` for `&mut o.i`) also decides: the moved value's leaf
+reaches the caller's `o.i.v`, the sibling `o.j.v` keeps its seed, and a value built in a
+local behaves the same -- see "A whole-aggregate replacement through a sub-place target
+decides" below.
 
 **A reference crosses a call in both directions.** A reference *returned* by a helper was
 the sharpest case, and it was a **false proof**: `let r = identity(&mut x); *r = 5` lowers
@@ -5994,10 +6242,27 @@ Seven entries with their false twins, pinned by
 straight into another (`write_one(identity(&mut c.lo))`), a reborrow of it (`let s = &mut
 *r`), two returned references to *different* fields held at once, and a returned reference
 to a *tuple component* all decide through the same `addressed` mapping. A returned place
-whose key cannot be spelled (an *array element*, `&mut a[0]`) stays sound-incomplete: the
-true contract is refused rather than the write being dropped, which is the honest failure
-mode. Eight entries with their false twins, pinned by
-`a_returned_reference_composes_with_the_next_use`.
+whose key cannot be spelled stays sound-incomplete: the true contract is refused rather
+than the write being dropped, which is the honest failure mode. (An *array element* was
+once in this class; it now decides -- see the next paragraph.) Eight entries with their
+false twins, pinned by `a_returned_reference_composes_with_the_next_use`.
+
+**A returned reference to an array *element* re-bases onto the caller's element.** The
+origin of `&mut a[0]` names the element index with a *local* (`_2` for the literal `0`),
+and the whole-array form is `(*_1)[_2]` -- a deref of the reference argument followed by
+the index. Two things then had to change at the return translation, and the failure mode
+differs between the two forms. A *method* (`&mut self.a[0]`) carried the index local
+through the call boundary, leaving a place no `elems_path` entry is keyed by: the write was
+dropped and the contract was unreadable, `Incomplete` in *both* directions. A *free
+function* handed the whole array (`elem_mut(&mut x.a)`) appended the argument's deref into
+the middle of the caller's place: the write was dropped, the caller read its own seed, and
+the false `ret == 5` was **proved** -- a false proof, not a lost one. The fix resolves the
+`IndexVar` to its literal while the callee's locals are still live (`pin_index_vars`) and
+strips the argument's leading deref (whose referent `arg_source` already names). The true
+directions now verify and every false twin is refuted; a *symbolic* index is left unpinned,
+so an unguarded `x.nth_mut(i)` stays fail-closed while `requires: i == 0` decides. Twelve
+entries -- five true directions and seven false -- pinned by
+`a_returned_reference_to_an_element_reaches_the_caller`.
 
 **Two reference targets in one call stay independent.** Two `&mut` to different
 *aggregate* fields (`&mut o.i, &mut o.j`) and two *elements* of one array through one
@@ -6006,14 +6271,44 @@ both referents so they also exercise the carry-in. The false twins read the *oth
 target and would verify if the two collapsed onto one place. Ten entries, pinned by
 `two_reference_targets_in_one_call_stay_independent`.
 
-**Not yet modelled, and *silently* so.** A *field whose type is an array* (`o.a[0]`) and
-an *array of arrays* (`m[1][0]`) cannot be named in a contract at all -- the refusal is
-`unknown field`, and an `ensures` about the value is reported as unreadable, so such a
-function is *skipped* rather than decided. This is a coverage hole rather than a
-soundness one (nothing false can be proved, since the contract cannot be written), and it
-is the next precision target: the `indexed` store is keyed by *local* only, so an array
-reached through a projection has no entry. Closing it means keying `indexed` by a place
-and re-basing element keys on the projection, the same shape as the `nested`-store work.
+**Not yet modelled, and *silently* so.** An *array of arrays* (`m[1][0]`) cannot be named
+in a contract at all -- the refusal is `unknown name`, and an `ensures` about the value is
+reported as unreadable, so such a function is *skipped* rather than decided. This is a
+coverage hole rather than a soundness one (nothing false can be proved, since the contract
+cannot be written). A *field whose type is an array* (`o.a[0]`) used to be in this hole and
+is now modelled: the element store is keyed by the whole path, so a contract's `o.a[0]` and
+the body's `(_1.0)[_2]` are one word. See "An array element reached through a field path"
+below.
+
+**An array element reached through a field path is one word.** `x.a[0] = 9; x.a[0]` lowers
+to `(_1.0)[_2] = 9` and `_0 = copy (_1.0)[_4]`: the *field chain* is part of the element's
+key, not the local and index alone. Before this the write landed in a store keyed by the
+local and index, so the read consulted a different key, returned the *seed*, and a contract
+claiming the pre-write value (`ret == 5`) was **proved** against a body returning 9 -- a
+false proof, not a lost one. The store (`Env::elems_path`) is keyed by
+`(local, field chain, index)`, so `x.a[0]` and `x.b[0]` cannot collide; a sibling array's
+element is left alone and the two are independent. The contract side records every
+array-typed field as subscriptable (`FieldEnv::path_elem_types`, both first-level `x.a` and
+nested `o.i.a`), binds `path[digits]` to a variable of the element's own width and
+signedness, and refuses an index past the array's declared length rather than binding a
+variable for an element that does not exist. The mangled name is built from the *chain*,
+never the dotted path: a `.` in a generated name would be read by the parser as a field
+access. The symbolic subscript `(_1.0)[_4]` reads and writes the same store, and an index
+the run cannot pin poisons the path rather than guessing. Four entries with their false
+twins, pinned by `a_field_array_element_is_one_word_for_contract_and_body`.
+
+**A field-array element crosses a reference argument in both directions.** A helper's write
+to `x.a[0]` through a `&mut` lands in the *callee's* element store, so the caller's store has
+to be re-based on return: unchanged for a whole-local target (`set_first_element(&mut x)`),
+and prefixed with the target's chain for a sub-place one (`set_holder_first_element(&mut
+o.i)` makes the callee's `_1.a[0]` the caller's `o.i.a[0]`). Without the re-base the write
+died with the frame, the caller read its seed, and the false `ret == 5` was **proved** against
+a body returning 9. The read direction is the same re-base run the other way, on the way
+*in*: `read_holder_first_element(&o.i)` reads the caller's `o.i.a[0]`, so its contract
+decides rather than being unreadable. A by-value argument is deliberately *not* carried back
+(its writes die with the frame), and the sibling element of another array is untouched. Three
+entries with their false twins, pinned by
+`a_field_array_element_crosses_a_reference_argument`.
 
 **A scalar field crosses a reference argument.** A helper reading `d.v` through a
 `&DuoBox` and one writing it through a `&mut DuoBox` both decide: the referent's *parts*
@@ -6061,9 +6356,11 @@ under a `_cannot_prove_this` name.
 
 **A callee contract is never assumed.** The engine inlines a callee's body rather than
 trusting its `ensures`, so a lying helper cannot hand a caller a proof, and a callee whose
-`requires` is *unsatisfiable* cannot be used to assume a false postcondition. Recursion and
-mutual recursion are the same property under the induction hypothesis and were checked
-separately. One honest incompleteness is pinned rather than left implicit: a callee's
+`requires` is *unsatisfiable* cannot be used to assume a false postcondition. The one
+contract that *is* assumed is the function's **own**, and only for a self-call that names a
+`decreases:` measure: there the assumption is the induction hypothesis, and the measure is
+what makes it well-founded rather than circular. Mutual recursion gets no such route. One
+honest incompleteness is pinned rather than left implicit: a callee's
 `requires` is **not** an obligation at the call site, so a violating call is decided from
 the inlined body -- sound because the body's own panics (a division by zero, say) still
 fail the path, but not a precondition check. That entry is named `..._is_not_checked`, not
@@ -6189,3 +6486,936 @@ parts under `_1` rather than tracking the sub-place -- precision is lost, never 
 value kept. A `&mut` target whose element the callee *did* write is still not copied back
 (a `&mut [T]` argument is the case that is); the caller's own store keeps the value it
 held, so the read is stale rather than unknown only when the caller never wrote it.
+
+**An array handed over *as* a reference target is modelled.** When the argument is the
+*array itself* rather than the whole local that holds it -- `set_first_of(&mut x.a)` or
+`peek_of(&x.a)`, a `&mut [u8; 4]` / `&[u8; 4]` whose target is the field `x.a` -- the callee's
+`(*_1)[0]` write is re-based onto the caller's field-path element store, so
+`set_first_of(&mut x.a); x.a[0]` *decides*: the true `ret == 9` verifies and the false
+`ret == 5` is refuted. This used to be a coverage hole (incomplete in *both* directions) and
+is the shape the note below pinned before it was closed.
+
+The mechanism, and why it took a second store: the callee's `&mut [u8; 4]` argument is the
+array, so its element write lands in the callee's plain element store (`elems`), keyed by the
+local. The caller's `x.a[0]` read consults `elems_path`, keyed by the *field chain* `x.a`. The
+return path already re-based the callee's `elems_path` entries and its `fields`/`nested`
+entries onto the target's chain, but the plain `elems` entries under a sub-place target were
+*dropped* -- there was no key for them, and dropping is the honest direction (a stale value
+would be worse). The fix is one mirrored arm: a sub-place target that *is* a field chain
+(`&mut x.a`, chain `[0]`) re-bases the callee's `elems[k]` onto `elems_path[(cl, chain, k)]`,
+which is exactly the key the caller's read consults. A sub-place target that is not a field
+chain (`&mut x.a[0]`, `&mut t.0` on a tuple) still drops -- the `rest_chain` `None` arm -- so
+an unrepresentable key is never invented. The guard is structural, not a value test: only an
+*array* argument ever has plain `elems` entries at the callee's local (a struct or tuple
+argument's parts live in `fields`/`nested`), so this arm cannot re-base a scalar onto an array
+key. A sibling field is untouched: `set_second(&mut x.a); x.b[1]` is refuted, so there is no
+cross-field contamination.
+
+The *read* direction is the mirror and needs the mirror of the same arm. `peek_of(&x.a)` hands
+the callee the array as a whole local, so the callee's `_1[k]` read consults its plain `elems`
+store; the carry-in re-bases the caller's `elems_path[(sl, chain, k)]` *onto* that store when
+the target chain is exactly the caller's field chain (`rem.is_empty()`), and onto `elems_path`
+with the prefix dropped otherwise (the `&o.i` case). Both directions were `Incomplete` before
+and both decide now, and the two are separate loops because one runs at the call and one at the
+return.
+
+It is *pinned*, and not only in the two directions that first exposed the hole. The corpus
+carries `a_whole_array_target_crosses_a_reference_argument` (the true direction, `ret == 9`)
+and its false twin `a_whole_array_target_cannot_prove_this`, the read-only pair
+`a_whole_array_target_read_crosses_a_reference_argument` / `..._read_cannot_prove_this`, the
+sibling-field probe `a_whole_array_target_sibling_cannot_prove_this`, and three shapes that
+put the re-basing rule where it is easy to get it *partly* right: a read-modify-write
+(`a_whole_array_target_read_modify_write`, where the carry-in and the write-back must both
+fire in one call), a target two fields deep
+(`a_nested_whole_array_target_crosses_a_reference_argument`, chain `[0, 0]` rather than
+`[0]`), and a write that crosses two frames (`a_whole_array_target_crosses_two_frames`, where
+each frame re-bases independently). Each has its `_cannot_prove_this` twin, so the corpus-wide
+`no_cannot_prove_entry_is_ever_verified` invariant holds them all.
+
+`tests/mir.rs::a_whole_array_target_decides_without_a_false_proof` asserts every one: each
+true direction is `Verified` and each twin is `Failed` (or, for the read-only twin, not
+`Verified`). The pin is what made closing the hole safe to do: the dangerous change is a
+re-basing that connects the two stores the *wrong* way, which would turn a false twin
+`Verified` before the true contract verified, and nothing else in the suite would notice. The
+twins' "must not verify" assertions are the unconditional half; if a later change makes any of
+these shapes incomplete again, the test fails and names the direction that broke.
+
+Still not modelled, and named so the boundary is honest. A *scalar* element target
+(`&mut x.a[0]`, a `&mut u8`) is modelled and decides -- the true `ret == 9` verifies and the
+false `ret == 5` is refuted -- but an *array* element target (`&mut g.rows[0]`, a
+`&mut [u8; 4]` reached through a subscript of a field whose type is an array of arrays) cannot
+be named in a contract at all: `g.rows[0][0]` is refused with `unknown field`, so such a
+function is *skipped* rather than decided. A *tuple* field target (`&mut w.t`) is refused the
+same way (`unknown field t of w`). Both are coverage holes, not soundness ones -- the contract
+cannot be written, so nothing false is proved.
+
+**An array that is a struct *field* carries its elements when the aggregate moves.** This was
+a coverage hole, not a false proof: `ArrayHolder { a: [9, 1, 2, 3] }` builds the array in a temp
+whose elements live in the whole-local `elems` store, then moves it into the field
+(`_2.0 = move _3`), and `Env::rebase_parts` -- which re-bases `elems_path` (field-path arrays)
+and `fields`/`nested` -- did not carry `elems`. So `_2.0` held the array's *value* but none of
+its elements, `x.a[0]` read `Unknown`, and the contract stayed `Incomplete` in *both*
+directions. A bare array literal (`let a = [9, 1, 2, 3]; a[0]`) always worked, because there the
+elements and the read share the whole-local store; only the field case had the hole, which is
+why it went unnoticed. A missing value proves nothing, so nothing false was ever proved -- the
+true direction was merely lost.
+
+The fix is one mirrored pair of loops in `rebase_parts`: a *whole* source's `elems` entries move
+with the value, re-keyed onto the destination -- a whole destination takes them as whole-local
+`elems`, and a nested destination (`o.i = ...`) takes them under the destination's field chain
+in `elems_path`. The gate is `field_steps(&src.proj)` being empty, not a type test: only a whole
+source has `elems` (a nested source's elements are already in `elems_path` and were handled), so
+this cannot invent an element for a sub-place move. Because `rebase_parts` runs on the
+reference-argument write-back too, the same carry makes a whole-field replacement through
+`&mut` (`set_holder(&mut o.i, ArrayHolder { a: [9, 1, 2, 3] }); o.i.a[0]`) decide as well.
+
+Pinned by `tests/mir.rs::an_array_field_of_a_moved_aggregate_carries_its_elements`, whose
+corpus entries are `a_struct_literal_array_element_is_read_back` (and its second-element
+sibling, so a carry that pinned index 0 for all elements is caught),
+`a_nested_struct_literal_array_element_is_read_back` (the longer destination chain),
+`a_whole_field_assignment_carries_its_array_elements` (the same carry across a call boundary),
+`a_whole_field_assignment_leaves_its_sibling` (no spill onto a neighbouring scalar), and
+`an_array_field_argument_is_read_by_element` -- each with its `_cannot_prove_this` twin, so the
+corpus-wide `no_cannot_prove_entry_is_ever_verified` invariant holds them too. Verified to fail
+without the fix by reverting the two loops: the test then reports the true direction as
+`incomplete`.
+
+**Evidence.** Corpus `decided 289 of 538` -> **`305 of 572`** (the six array-field and six
+whole-replacement true directions now decide, plus six named-`const` true directions; all their
+`_cannot_prove_this` twins stay `Failed`, and two coverage-boundary entries stay `incomplete`);
+`cargo test --workspace --features std` **684 -> 688** passed, 0 failed; `cargo
+clippy --workspace --features std --all-targets -- -D warnings` clean; `scripts/gate.sh` 18/18
+green (bare-metal build, zero-dependency and `no_std` gates included), z3 `agree=845
+mismatch=0`, kani `agree=57 mismatch=0`, verus `0 differ`, rustc_public oracle `realistic.rs 634
+functions typed, 638 text, 633 agree, 0 differ`. Zero dependencies and `no_std` untouched.
+
+**The rustc_public oracle counted `const` bodies as functions, and this was found by the corpus
+addition above.** Adding an expression-initialised `const` to `realistic.rs` turned gate 10 red
+with `NEXT: text (absent)` -- the oracle reported a function the text frontend had dropped. It
+had not: `all_local_items()` returns every item with a body, and a `const` or `static` item has
+one in typed MIR, but the text dump prints an item initialised from a literal as a single line
+and an item initialised from an expression with a body that is *not* introduced by an `fn`
+header, so the text side sees no function there. The oracle now keeps only `ItemKind::Fn`. This
+is the same class of bug the oracle exists to prevent, in the oracle itself: throwing the item
+kind away made a `const` body indistinguishable from a genuinely dropped function, and the
+report it produced was the one report it must never make falsely. The typed/text counts moved
+from `(spurious disagreement)` to `634 typed, 638 text, 633 agree, 0 differ` -- the four-function
+typed/text gap is the documented one (an item with no monomorphised body), not a disagreement.
+
+**A whole-aggregate replacement through a sub-place target decides.** `set_whole(&mut o.i, n)`
+with `set_whole(i: &mut InnerBox, n: InnerBox) { *i = n }` replaces the whole referent, and the
+moved value's leaf reaches the caller: `o.i.v` reads the new value, the sibling `o.j.v` keeps
+its seed, and a value built in a caller local (`let n = InnerBox { v: 9 }; set_whole(&mut o.i, n)`)
+behaves the same. The re-based write-back (`rest ++ key`) re-roots the callee's `fields` entry
+for the moved value under the target's chain, which is the same mechanism that carries a *leaf*
+write; a whole value and a leaf are both a `fields` entry in this store, so the shape was never
+actually the blocker it was once believed to be. This paragraph replaces an earlier claim that
+the shape was *sound-incomplete*: that was measured on a version whose write-back dropped the
+part keys for a sub-place target (the false proof the paragraph above fixes), and it is no
+longer true. Pinned by
+`tests/mir.rs::a_whole_aggregate_replacement_through_a_sub_place_decides`, whose corpus entries
+`whole_replacement_through_sub_place`, `whole_replacement_leaves_the_sibling` and
+`whole_replacement_from_a_local` each carry their `_cannot_prove_this` twin.
+
+**A named `const` item is inlined at its use site.** rustc const-evaluates a `const` item and
+prints its *body* separately (`const LIMIT: u8 = const 10_u8;`) while referring to it by name at
+the use site (`_0 = const LIMIT`). The executor read only the name, so a use site was an
+unreadable path constant and any contract that touched the constant was lost -- not wrongly
+proved, but never decided, which for an embedded crate whose bounds checks read named constants
+is the common case. `MirProgram::consts` now collects each item's printed literal (only a
+literal: an item whose body is an *expression* has its own body and locals and is left for a
+future interpreter pass, and an associated constant's `{constant#0}` name is dropped), and
+`operand` folds a use site against that table. The key is the full printed path (`a::K`,
+`low::K`), not the last segment, so two modules with a `const K` cannot collide -- a table keyed
+by the last segment could read the wrong value, which would be a false proof rather than a lost
+one. The item's own type suffix supplies the width and sign, exactly as for an inline literal,
+so a negative `const` stays signed and a wider one keeps its width.
+
+Pinned by `tests/mir.rs::a_named_const_item_is_inlined_at_its_use_site`, whose corpus entries
+`named_const_is_read`, `named_const_keeps_its_width`, `named_bool_const_selects`,
+`named_const_bounds_a_comparison`, `named_const_matches_an_equality`,
+`named_negative_const_is_signed` and `nested_module_const_is_read` each carry their
+`_cannot_prove_this` twin (every twin's postcondition is false on *every* input, so a regression
+that guessed a value would fail the test). One entry pins the boundary where the value is *not*
+inlined and the contract is lost rather than proved: `named_const_of_an_expression_is_not_inlined`
+(an item whose body is an expression has its own body and locals). Another pins a second
+boundary: `a_function_local_const_is_not_inlined`. The two spellings do not meet there -- the
+*use* is printed with the enclosing function's path (`const a_local::L`) while the *definition*
+is printed bare (`const L: u8 = const 3_u8;`), rustc emitting the qualifier only where it is
+needed to disambiguate. That is also what makes the bare key safe rather than a false-proof
+risk: rustc qualifies a function-local item's definition precisely when another item shares its
+last segment (`const L: u8 = 5;` at the top level forces `const a_local::L`), so a bare `const L`
+enters the table only when nothing else could be meant by `L`. Verified to fail without the fix
+by neutralising the table lookup: the test then reports the true direction as `incomplete`. The
+parser side is pinned by `mir::parse::tests::named_const_items_are_collected_only_when_literal`.
+
+## Recursion by contract: a self-call answered by the function's own contract
+
+**The feature.** A recursive function used to be verified by *inlining* its self-call
+once, which is the first unrolling and nothing more: the second level hit
+`DEFAULT_INLINE_DEPTH`, and the function came back `Incomplete`. That is the honest
+answer for an unrolling, but it is the wrong tool. A recursive function is proved by
+*induction*, and the induction hypothesis is the function's own contract. A
+`decreases:` line names the measure that makes it well-founded:
+
+```rust,ignore
+/// requires: true
+/// decreases: n
+/// ensures: ret == n
+pub fn count_down(n: u8) -> u8 {
+    if n == 0 { 0 } else { count_down(n - 1) + 1 }
+}
+```
+
+A self-call that names a measure is *not* inlined. It becomes three obligations at
+the call site (`exec::try_recursive_call`), and the result is the assumption of the
+postcondition:
+
+* **`RecursivePrecondition`** -- the callee's `requires` is *proved* of the call's
+  arguments. This is what restricts the assumption to calls the function itself
+  admits. Assuming a postcondition without its precondition would be assuming the
+  conclusion.
+* **`RecursiveDecreases`** -- the measure is proved *non-negative at entry* and
+  *strictly smaller at the call*. Both halves are load-bearing: non-negativity is
+  what makes the order well-founded (a signed measure that runs negative would
+  "decrease" forever), and strictness is the progress. The comparison is `slt`/`ult`
+  according to the measure's own sign, so an `i8` measure is not read as unsigned.
+* **assume `ensures`** -- the postcondition is assumed of a fresh `ret`, which is
+  written to the call's destination. The postcondition is *never proved* here;
+  proving it is the `return` obligations' job, and that is what keeps the base case
+  a real obligation rather than a free pass.
+
+**Why it is sound.** A strictly decreasing sequence in a well-founded order is
+finite, so the recursion has a base case. Nothing is assumed at the base case: the
+body's `return` obligations still have to establish the postcondition on their own.
+The assumption only ever replaces a *smaller* call, so the induction is on the
+measure and cannot be circular. The four ways this is pinned, each with a corpus
+entry that fails on the un-fixed code:
+
+* **Positive** -- `a_recursive_identity` (`decreases: n`, `ensures: ret == n`)
+  verifies; before the feature it was `Incomplete` at the depth bound. Also probed
+  live: a `sum_down` driver and a signed `down` (`requires: n >= 0`) both verify, and
+  a two-argument `keep_a(a, b)` counting down on `b` verifies.
+* **A wrong base case is refuted** --
+  `a_recursive_lie_cannot_prove_this` returns `1` at `n == 0` against
+  `ensures: ret == n`. If the postcondition were assumed at the base case too, this
+  would verify; it fails on the postcondition with a witness (`n == 0`).
+* **A non-shrinking measure is refused** --
+  `a_recursive_call_that_does_not_decrease_cannot_prove_this` calls itself on the
+  same `n`. Probed live: it fails with `kind: "recursive call decreases the measure"`,
+  `detail: "v1:u8 = 1"` -- the smallest `n` where the call is reached, and the
+  call site's measure is not below the entry's. (This is a definite `Failed`, not a
+  `Skipped`: the check is decidable and it decides against the function. An earlier
+  note in this file recorded it as `Skipped`, which was wrong, and the witness as
+  `v1:u8 = 128`, which was stale.)
+* **A signed measure that can start negative is refused** -- probed live with an
+  `i8` measure and no lower bound. Written as `below_zero(n - 1)` the *subtraction*
+  panics first at `i8::MIN` (`kind: "panic: attempt to compute \`{} - {}\` …"`,
+  `detail: "v1:u8 = 128"`), which masks the measure check; written with
+  `n.wrapping_sub(1)` -- no arithmetic overflow to hide behind -- the measure
+  obligation is the one that fires, `kind: "recursive call decreases the measure"`,
+  `detail: "v1:u8 = 128"` (the measure can start at `i8::MIN`, so the order is not
+  well-founded). Non-negativity at entry is exactly what supplies the basis, so this
+  is the check that keeps the order well-founded rather than a detail.
+* **A call that leaves its own precondition is refused** --
+  `a_recursive_call_out_of_range_cannot_prove_this` has `requires: n <= 3` and calls
+  itself on `n + 1`.
+
+**The boundary: no measure, no induction.** A self-call with no `decreases:` line
+has no induction principle, so the assumption would be circular. The handler returns
+`None`, the call falls back to the inliner, and the result is `Incomplete` at the
+depth bound -- an honest "I could not decide", never a guess. Pinned by
+`a_recursive_call_without_a_decreasing_measure_is_not_assumed` (corpus:
+`a_recursive_call_that_does_not_decrease_cannot_prove_this` and the no-measure case
+probed live). This is the same discipline as `Verdict::Unknown` in the engine.
+
+**Only a self-call, and only the function under verification.** The handler fires
+when `st.frame.func == root` *and* the callee's name resolves to `root` *and* the
+frame has no caller. An inlined callee's frame has a different `func`, so its own
+recursion is not this function's induction; and a frame with a caller is an inlined
+callee, so reaching the root's name from there is not the root calling itself. The
+name is resolved with the same rule the inliner uses -- exact match, else a unique
+tail match, because rustc may print the call with a path prefix -- and an ambiguous
+tail is not this function calling itself. A `mutual_lie` pair (two functions with
+false contracts calling each other) is in the corpus and still does not verify.
+
+**Several `decreases:` clauses are refused, not guessed.** Two measures would need a
+lexicographic order and there is no way to say which the recursion counts down, so
+more than one is `Skipped` with that reason rather than picking the first. A measure
+that does not parse, or a call-site measure whose type differs from the entry
+measure, is an unmodelled path -- a refusal, not a silently dropped check.
+
+**The measure is evaluated once, at entry, in the entry state.** `verify_fn` computes
+it there and carries `(Var, signed)` in `RecCtx`; the call site re-evaluates the same
+text against the *call's* arguments. Carrying the text rather than a pre-built
+predicate is deliberate: only the executor knows what the arguments hold at the
+call site, and the measure must be evaluated there rather than at entry.
+
+**Tests run without a toolchain too.** The contract reader's half is pinned in
+`mir::spec::tests`: `a_decreases_clause_is_read_and_counts_as_a_claim` (a bare
+`decreases:` is a claim, and its text is kept), `a_measure_takes_its_sign_from_its_arguments`
+(an `i8` argument gives a signed measure through `+`), and `an_unreadable_measure_is_an_error`
+(a dangling `+`, an unknown name, and an empty measure are errors rather than an
+absent measure). The end-to-end half is `tests/mir.rs`'s four recursion tests, which
+need a `rustc`.
+
+## Two shapes for the prover: in the artifact, or in the build
+
+The README's headline claim is that `discharge` is a prover that compiles *into* the
+artifact, so a proof can run where Z3 cannot (`examples/bare_metal.rs` is the evidence: the
+decision procedure built for `thumbv7em-none-eabihf`). That is one shape. The other is the
+Kani/Verus shape -- verify while the crate is built, ship none of the verifier -- and it is
+reachable here for free, because the `mir` frontend is already `std`-only *host* tooling.
+
+Put `discharge` in `[build-dependencies]` and call `mir::verify::verify_file_with` from
+`build.rs`, failing the build on any outcome that is not `Verified`. A build script is a
+separate compilation unit, so cargo compiles it for the host, runs it, and discards it: the
+BDD blasting and the CDCL fallback never reach the crate's own rlib. That is a consequence
+of the build model rather than an optimisation, which is why it holds without any code
+change to the crate.
+
+**The measurements, so the "zero cost" claim is a number and not an adjective.** `release`,
+`x86_64`, this repository:
+
+| configuration | artifact | `discharge` symbols |
+|---|---|---|
+| baseline, no discharge | 447 728 B (binary) | 0 |
+| `discharge` as a dependency, never called | 447 696 B (binary) | 0 |
+| `discharge` in `[build-dependencies]`, called from `build.rs` | 4 860 B (rlib) | **0** |
+| `discharge::smt::prove` called from the crate's own code | 5 746 640 B (binary) | 26 |
+
+So "zero cost" is true of the build-time shape and false of the embedded one -- the two
+claims must not be conflated. The embedded engine's cost is the point of its existence
+(a proof on the target); the build-time shape's cost is a host-side `rustc`, which the
+frontend needs anyway because it shells out to `--emit=mir`.
+
+**Pinned by gate 18, not by prose.** `tools/build-verify/run.sh` builds a *scratch* crate
+under `mktemp -d` (a fixture in the tree would put a second `Cargo.toml` and a `target/`
+in the repository, which gate 16 exists to prevent) and requires three things:
+
+1. a provable contract builds **and** the verifier reports `verified` -- a `build.rs` that
+   silently did nothing would otherwise pass, so the positive direction alone is not enough;
+2. a false contract **fails the build**, and the failure names the broken obligation
+   (`postcondition`, with the witness). The scratch contract is the recursion one whose
+   *base case* is wrong, which is exactly the mistake a circular induction would wave
+   through, so this doubles as an end-to-end check of the `decreases:` work; and
+3. the resulting rlib carries **zero** `discharge` symbols (`nm -C | grep -ci discharge`).
+
+Exit 2 when there is no `cargo` is reported and skipped, the same convention
+`tools/ferrocene/run.sh` and `tools/mir-oracle/run.sh` use: a skipped gate is not evidence.
+
+**A shell gotcha worth recording.** The scratch `Cargo.toml` is written with an *unquoted*
+heredoc so `$ROOT` expands, and the first draft put a backtick-quoted `` `discharge` `` in
+a comment inside that heredoc. The backticks were command substitution, so the script tried
+to *run* `discharge` and printed `discharge: not found` before continuing. It still passed
+every assertion -- the failure was cosmetic -- but a gate that prints a stray error while
+going green trains a reader to ignore its output. Backticks (and `$(...)`) inside an
+unquoted heredoc are code, not prose.
+
+## The MIR frontend: own text parser, `rustc_public` as the oracle only
+
+A recurring question is why the frontend parses rustc's *textual* `--emit=mir` dump
+instead of using `rustc_public` (formerly `stable_mir`), the compiler's own public API for
+internals, which returns *typed* MIR and is strictly richer. The answer is that
+`rustc_public` cannot be the frontend without destroying the crate's identity, and the
+repository already uses it in the one place it is safe: as an oracle.
+
+**What `rustc_public` costs, from `tools/mir-oracle/` itself.** It needs a nightly with the
+`rustc-dev` component, `#![feature(rustc_private)]`, and a link against
+`librustc_driver-*.so` plus `libLLVM-*`. Each of those breaks a promise the crate makes:
+gate 14 pins the floor at stable 1.85, gate 5 forbids external dependencies, the README
+sells "not a nightly feature", and an experimental API that moves every nightly is not a
+foundation for a safety build. The oracle's own manifest says it: "the `discharge` crate
+must build on stable with no dependencies, and `rustc_private` is neither stable nor
+dependency-free." Kani and Verus do link rustc internals -- but they are separate tools,
+and the whole point here is to *not* be that.
+
+**The parser is the cheap part, which is the fact that decides it.** `src/mir/parse.rs` is
+2 157 lines; `shape.rs` another 350. The other 15 473 lines of `src/mir/` -- `exec.rs`,
+`spec.rs`, `intrinsics.rs` -- are the verifier, and every one of them is needed regardless
+of where the MIR came from. So "write our own MIR reader" buys the 2 507-line parser for
+14% of the module, and 61% of the crate is `mir` to begin with. Swapping the frontend would
+delete a seventh of `mir` and add a nightly, a compiler-internal link, and an unstable API.
+
+**The architecture is already the right split**, and gate 10 is what makes it safe:
+
+```
+product:  rustc --emit=mir (text)  ->  parse.rs  ->  exec.rs  ->  verdict
+                                        ^ stable, zero-dep, inspectable
+oracle:   rustc_public (typed MIR) ->  shape.rs --+
+          parse.rs                 ->  shape.rs --+-> compare (gate 10)
+```
+
+A stable, dependency-free reader feeds the product; the rich, nightly API checks that
+reader's *reading* against the compiler's own IR. If rustc changes the pretty-printer and
+the parser drifts, gate 10 fails in CI, not in a user's build. Cheap and stable for the
+product, expensive and rich for the test.
+
+**When to revisit.** Two conditions, either of which flips the decision: (1) `rustc_public`
+stabilises, which would make it strictly better -- typed MIR with no parser to rot; (2) a
+real need for cross-crate or generic-monomorphised verification, where the textual
+frontend's "calls are inlined one level" gap (README gap 1) genuinely bites. Until then the
+text parser stays. A hybrid `--features rustc-public-frontend` was considered and rejected:
+a second frontend to maintain plus a nightly-only path is not worth it yet.
+
+
+The `--emit=mir`-is-stable question itself is settled earlier, in "The MIR frontend needs a
+`rustc`, not a *nightly* `rustc`", with the MSRV/stable parity table; do not re-derive it
+here. Two things in that section were still open, and both are closed now.
+
+**The claim was unpinned.** That section concludes the frontend is a stable-toolchain tool,
+but nothing *ran* it without a nightly: `tests/mir.rs` gates every `rustc`-dependent test on
+`DISCHARGE_RUSTC`, and gate 8 used to skip when it was unset. So the conclusion held only on
+machines that happened to name a compiler -- asserted in prose, checked by nothing. Gate 8
+now falls back to the `rustc` on `PATH` and skips only when there is no `rustc` at all, so
+the claim is exercised with no setup.
+
+**Pinning it surfaced a latent failure.** With gate 8 able to run without `DISCHARGE_RUSTC`,
+`env -u DISCHARGE_RUSTC scripts/test-count.sh` reported **1 test failing**, not skipping:
+`a_one_line_struct_does_not_swallow_the_functions_after_it` called `panic!` on the `None`
+that `verify_src` returns when no compiler is named. It was the only test in the file that
+read "no compiler" as "a bug" -- the other 174 return early -- so the suite's verdict
+depended on the environment. It returns early now. The general lesson: a gate that *skips*
+can hide a test that *fails*, which is the same class of mistake as a gate that never runs,
+and the reason a skip is reported rather than folded into a pass.
+
+Also corrected while here: `verify.rs`'s two error strings blamed "a nightly toolchain" for
+what is really a missing or empty `--emit=mir` output file -- a message that sends a reader
+to install a compiler that would not have helped. They now name the actual condition, and
+its doc comment and the README's source table and example no longer tell the reader to point
+`DISCHARGE_RUSTC` at a nightly.
+
+## A function-local `const` was in scope in every function -- a false proof
+
+Three holes, found together, all of the same family: a name or a place resolved to
+something the function's own source could not have written. Each was reproduced from
+real `rustc` output and each is now pinned by a test that fails if the fix is undone.
+
+**Bug 1: a function-local `const` leaked into another function's contract.** The parser
+recorded every literal `const NAME: TYPE = ...;` definition under its bare name, and the
+contract reader resolves a bare name against that table. A function-local item's *definition*
+is printed bare (`const L: u8 = const 3_u8;`) -- byte-identical to a crate-level item's --
+so `const L: u8 = 3;` inside `first` handed `second` a bare `L` to write in its contract.
+`requires: L == 3` then resolved and the function was **proved** from a foreign body: a
+wrong proof, not a lost one. The *use* site is the only tell -- a crate item is used bare
+(`const LIMIT`), a local one qualified (`const first::L`) -- so `bare_const_uses` collects
+the bare use sites once, and a bare definition is kept only when the name is used bare
+somewhere. A qualified definition still keeps its qualified key, which is what a contract
+that spells the path resolves. The false twin is now `Skipped` (unreadable `requires`),
+never `Verified`.
+
+The old fixture comment claimed the bare key was "safe" because rustc qualifies a local
+definition when another item shares its last segment. That reasoning was about *shadowing
+between constants*, not *scope*, and it was wrong: `first`'s `L` still became `second`'s.
+
+**Bug 2: a returned reference to a symbolic element was aimed at a caller local that
+merely shared its number.** `x.nth_mut(i)` returns `&mut x.a[i]`, and inside `nth_mut` the
+index is `_2`. Translating that returned reference back to the caller carried `IndexVar(2)`
+across the call boundary, where `_2` is a *different* local -- with a parameter before `i`,
+`_2` is that parameter, not `i`. The write `*x.nth_mut(i) = 9` landed on `x.a[zero]`, and
+the contract fixed `zero == 0`, so it landed on the *seed* element and the false `ret == 5`
+was **proved**.
+
+The index cannot be pinned (the contract admits any `i < 4`), so the fix refuses the write
+-- but dropping it alone is not enough. A later `x.a[0]` then falls back to its seed, which
+turns the false proof around rather than removing it: `ret == 5` becomes provable. The
+array's elements are *poisoned* instead (`poison_array_under`), so every read is unknown:
+the write is lost, never mis-aimed, and no stale seed survives it. Both directions are
+pinned as refusals -- the false `ret == 5` and the true `ret == 9` -- because a fix that
+only drops the write proves the second.
+
+**Bug 3: a closed true goal bypassed a stale premise.** `prove_implies` decides a goal that
+is closed and true without building `!pre || post`, which is what lets a tiny postcondition
+decide even when the premise is a large diagram. But the premise is half the claim, and the
+shortcut never read it. A `pre` saved from an earlier arena names a different term in the
+current one, and the shortcut returned `Valid` for it -- certifying `pre implies true` for a
+`pre` that is not the one passed. The ordinary route catches this because `un_bool(pre)`
+funnels through the stale check; the shortcut now asks `is_current_term` itself and returns
+`Unknown`.
+
+**Evidence.** Corpus `decided 305 of 572` -> **`312 of 588`** (the new fixtures add decided
+entries and two honest refusals); `scripts/test-count.sh` **688 -> 702** passed, 0 failed;
+`cargo test --features std` green on the whole workspace; `cargo clippy --workspace --features
+std --all-targets -- -D warnings` clean; bare-metal (`cargo build`, no `std`) green. Gate
+green; zero dependencies and `no_std` untouched.
+
+**A boundary left documented, not hidden.** When another item shares a function-local
+`const`'s last segment, rustc prints the local's *definition* qualified too
+(`const f::L: u8 = const 3_u8;`). That qualified definition still enters the table, so a
+contract could name `f::L` -- a path no function's source can write, but whose *value* is
+correct, so this is a looser path resolution, not a wrong value. It is recorded here rather
+than papered over: closing it needs the same use-site test to cover qualified definitions,
+which no current fixture exercises.
+
+## A contract on an inherent method was silently dropped -- a false proof
+
+`verify_file_with` asks `prog.get(name)` for a function, and `MirProgram::get` matches on
+the *last* `::` segment so a call written `crate::m::f` resolves. A method's dump name is
+`<impl at FILE:L:C: L:C>::f`, so the tail match found it -- and then `verify_function` looked
+its contract up with `specs.get(&f.name)`, the *full dump name*. The contract is keyed by the
+bare `f`, the scanner records the identifier after `fn`, so the lookup matched nothing.
+
+A missing contract is not a refusal here: `verify_function` builds `pre` and `ensures` from
+`contract`, so `None` means `requires: true` and no postcondition at all. Every method with a
+contract was therefore reported `Verified { obligations: 0 }` -- the body never checked. A
+method whose `ensures` was false on every input came back `verified`. That is the worst
+direction: a false proof, not a lost one. The free-function control in the same run correctly
+`FAILED`, which is what showed the difference was the *name*, not the contract.
+
+The fix is `Specs::resolve`, which matches exactly first and then on the last `::` segment --
+the same rule the body resolution uses, so a contract is found for exactly the functions the
+frontend can name. Because `by_fn` is keyed by bare identifiers, the tail match is unique by
+construction and no ambiguity branch is needed.
+
+> **Superseded (see "A contract on a nested item was keyed by its bare name" below).**
+> `by_fn` is now keyed by the *full source path* (`a::f`, `T::value`, `f::g`), because a
+> nested item's MIR name carries a path a bare key never had -- which dropped the contract
+> and reported the body `Verified { obligations: 0 }`. `resolve` now matches the exact path,
+> then a *unique* `::`-aligned suffix, and an ambiguous suffix is refused rather than taken.
+> The bare-identifier reasoning above held only while every key was a bare name.
+
+**Evidence.** Corpus `decided 312 of 588` -> **`313 of 590`** (the two new method fixtures:
+the true direction is now decided *with* its postcondition checked, the false direction is a
+definite refutation); `scripts/test-count.sh` **702 -> 704** passed, 0 failed; `cargo test
+--features std` green; clippy (both halves) and docs clean; bare-metal builds green.
+
+The regression test asserts the obligation *count* is non-zero, not merely `Verified` -- a
+future fix that matched the name but still skipped the body would pass a verdict-only
+assertion. The false twin is pinned to `Failed { kind: "postcondition" }` so an unrelated
+refusal cannot satisfy it, and the corpus-wide `no_cannot_prove_entry_is_ever_verified`
+sweep holds it as well.
+
+## Four frontend findings, found by probe: one false proof and three lost proofs
+
+Four defects in the MIR frontend, all in the "a name or a call resolved to something
+the function's own source could not have written" family. They were found by hand
+probes against real `rustc` output before any fix, and each is pinned by a test that
+fails if it is undone. F1 was the severe one -- a genuine false proof.
+
+**F1 (false proof): a call to an intrinsic resolved to a local function that shared its
+name.** The inliner and the recursion check matched a call name to a definition on the
+last `::` segment alone. rustc prints a call to `u8::wrapping_add` fully qualified
+(`core::num::<impl u8>::wrapping_add`) and a *free* function named `wrapping_add` by its
+bare name, so a `decreases:`-measured free function that calls the *intrinsic* on its
+non-base path had that call resolved to *itself*: `try_recursive_call` -- which runs
+before the intrinsic model -- assumed the function's own postcondition for the result.
+`ensures: ret == 0` was **proved** while the body returns `n` for `n > 0`. The name must
+be the intrinsic's *exact* tail for the collision to appear, which is why the fixture is
+a plain free `wrapping_add`.
+
+The fix is `resolve_callee`, shared by the recursion check and the inliner. After an
+exact-name match (the free-function case, which rustc prints bare on both sides), a
+qualified call is matched on the tail *and* on the method's `self` type. The receiver's
+type is read from the local whose `debug` binding is literally `self` (`&Vec2` gives
+`Vec2`), which is the one tell that separates an *instance* method from a *static*
+associated function -- a static function's first parameter is an ordinary argument, and
+reading it as a receiver would let an external `Vec2::m` call resolve to a local
+`Foo::m(x: Vec2)`. Two guards keep the tail from resolving to the wrong body: a call
+name that still carries an `<impl` projection is a `core`/`std` callee and is refused
+outright (rustc never prints a *local* method call with `<impl`), and a candidate must
+agree on the type -- an instance method's `self` type must equal the call's, and a
+static associated function (no `self`) must have its *owner* type agree, which is read
+from the `impl` block's own source line (see the section on a method contract keyed by
+its bare name below). The false proof now reports `Failed { kind: "postcondition" }`.
+
+This also *improved* the old ambiguous-tail behaviour rather than only refusing it:
+`Widget::twist` and a free `twist` share the tail, and the call `w.twist(5)` names its
+receiver's type, so it now resolves to the method and **refutes** the false contract
+where the old code refused the whole call as `Incomplete`. The corpus fixture and the
+`a_method_is_inlined_by_its_tail_and_a_shared_tail_resolves_by_type` test were updated
+from "refused" to "refuted", because resolving by type is the stronger and correct
+answer.
+
+**F2 (lost proof, and a false-proof path reopened): a string literal spelled
+`const NAME`.** `bare_const_uses` is the only in-dump tell between a crate-level `const`
+and a function-local one. It scanned raw lines, so a `debug s => const "const LEAKY";`
+binding and the `alloc` block behind the string -- both of which spell `const LEAKY` as
+*data* -- looked like a bare use. That gave the local `LEAKY` a program-wide key,
+reopening the exact false proof the local-const fix had closed. The scan now drops
+string literals (honouring `\"` escapes) and skips `alloc` blocks whole. The local's name
+must be *unique* among the file's locals for the shape to appear: rustc qualifies a
+local `const`'s definition (`const f::L`) only when another local shares its name, and
+prints it bare -- the colliding spelling -- when it does not.
+
+**F3 (lost proof): a crate-level `const` a *contract* names but no body uses.** The
+bare-use test is silent for a constant with no use site at all, so the definition was
+dropped and the contract went unreadable. The dump cannot tell a crate-level `const`
+from a function-local one, but the *source* can: a crate-level item sits at brace depth
+zero. `spec::crate_level_consts` reads exactly those, and `parse_program_scoped` keeps a
+bare definition when the name is used bare, is qualified, or is in that set. Reading too
+much would re-open the local-leak false proof, so a local item, an associated constant,
+a `const` generic parameter, and a `const` inside a string or comment are all excluded,
+and the negative cases are unit-tested as well as the positive one.
+
+**F4 (lost proof): a recursive contract that names a `const`.** `try_recursive_call`
+rebuilt the contract environment from `FieldEnv::default()`, whose `const` table is
+empty, so `requires: n <= LIMIT` was unreadable *at the self-call* and the whole
+function came back `Skipped`. A constant has the same value at the call as at entry, so
+the call site now carries the entry constants (`FieldEnv::with_consts`); only the field
+bindings are rebuilt per call site.
+
+**Evidence.** Corpus `decided 313 of 590` -> **`318 of 599`**; `scripts/test-count.sh`
+**704 -> 714** passed, 0 failed; `cargo clippy --workspace --features std --all-targets
+-- -D warnings` and `cargo clippy --no-default-features --lib -- -D warnings` both
+clean; `scripts/gate.sh` **ALL GATES GREEN**; zero dependencies and `no_std` untouched.
+
+Each of the four regression tests was confirmed to *fail* against the un-fixed source
+(stashing only `src/mir/`, keeping the fixtures), so they are not vacuous. The F1
+companions -- a free `wrapping_add_still_recurses` and a static `Recursing::wrapping_sub`
+-- verify on both the fixed and un-fixed source, which is the point: they guard against
+the fix *over*-refusing a real self-call, and pass either way. The static companion uses
+`wrapping_sub`, not `wrapping_add`, because the free `wrapping_add` above already owns
+that report name (a method's outcome key is its bare tail).
+
+## A method's contract was keyed by its bare name -- a false proof and a lost proof
+
+The MIR frontend attaches a contract to a function by name: `Specs::get` looked a
+function's bare name up in the contract table. rustc prints a *method*'s definition as
+`<impl at FILE:L:C: L:C>::bump`, whose tail is `bump`, so a contract written on an
+inherent `impl` method was keyed under `bump` while the dump's body was looked up under
+the tail `bump` -- which happens to match, so a *single* method looked fine. The defect
+was two-fold and only the second half is obvious:
+
+* **Two `impl` blocks that share a method tail collide.** `TaggedLeft::tag` and
+  `TaggedRight::tag` both key `tag`, so the later `insert` overwrote the earlier and both
+  methods resolved to the *survivor's* contract. Whichever direction the claims are
+  written, one method is checked against a contract its own source never wrote: a lost
+  proof for the one whose contract was dropped, and -- once the claims are the false way
+  round -- a **false proof** for the other. That is the severe half.
+
+* **A static associated function's owner is not in its name.** An instance method's
+  receiver is recoverable (the first local whose `debug` binding is `self`), but a
+  *static* method has no `self`, so `<impl at …>::from` names no type at all. A call to
+  `u16::from` -- `core`'s conversion, which returns its argument -- then matched a local
+  `from` on the shared tail, and a contract claiming `ret == 99` came back **verified**
+  while the real callee returns `x`. The old resolver accepted a static candidate on the
+  unique tail alone, which is exactly this hole.
+
+The `impl`'s own *location* is the one key both halves share, and it is printed verbatim
+in the dump. `enclosing_impls` scans the source for `impl` keywords and records the
+`(line, column)` of each with its owner type; `impl_location` parses the same `L:C` back
+out of an `<impl at …>` name. The name carries *two* locations -- `4:1: 4:7` is the
+`impl` keyword and the end of the `impl A` header -- and the **first** is the keyword's,
+which is the one `enclosing_impls` records; reading the second (the natural "take the
+last `L:C`" move) silently matches nothing, which is how the first cut of this fix
+dropped every method to `missing`. Contracts are now keyed by `(line, col, name)`,
+`MirFn` carries its `impl_loc`, and both the contract lookup and the call resolver go
+through it.
+
+The fix *improves* the static-call direction rather than only refusing it: a call to a
+*local* static method (`StaticOwner::seed()`) now resolves to its own body and verifies,
+where before the owner was unknown. The external call is refused -- `Incomplete`, naming
+the unmodelled function -- which is the honest answer, not a proof.
+
+**Evidence.** The pre-existing corpus is unchanged at `decided 318 of 599` (no
+regression); the eight new fixtures move it to `decided 323 of 607`; `scripts/test-count.sh`
+**714 -> 718** passed, 0 failed; `scripts/gate.sh` **ALL GATES GREEN**; clippy (both
+halves) and rustdoc clean; zero dependencies and `no_std` untouched.
+
+Each new test is pinned to a verdict *and* a kind: the two `tag_cannot_prove_this`
+methods must fail with `kind == "postcondition"`, so an unrelated refusal cannot satisfy
+them, and `TaggedLeft::tag` / `TaggedRight::tag` must both be `Verified`, which pins that
+resolution found *a* contract rather than dropping the method (a missing contract means
+`requires: true` and no `ensures`, which also reads as verified -- so the F4 test alone
+would not catch a drop). The `mir_coverage` example now lists methods alongside free
+functions and reports the `Owner::method` key when a tail is ambiguous, so a shared tail
+appears once per method instead of vanishing from the scoreboard.
+
+## A contract on a nested item was keyed by its bare name -- a dropped contract is a false proof
+
+The method fix above keyed a *method* by its `impl`'s location. A **free function**
+had no such key: `Specs::by_fn` was keyed by the bare source name, and `resolve`
+matched only the exact MIR name. But rustc names a function's *definition* by the
+shortest crate-unique path suffix, so a nested item's printed name carries a path
+the bare key never had:
+
+* a free function inside a `mod` is `a::f` (bare `f` only when that is already
+  unique crate-wide), a trait's default method is `T::value`, and a function nested
+  in a function is `f::g`.
+
+None of those matched the bare key, so the contract was **dropped**. A dropped
+contract is not a refusal: `verify_function` builds its precondition and
+postcondition from `contract`, so a missing one means `requires: true` and *no*
+`ensures` -- the body was reported `Verified { obligations: 0 }` and never checked.
+A false postcondition (`/// ensures: ret == 9` on a body returning 7) came back
+**proved**. Two sibling `mod`s that each declared `f` were worse: one bare key, the
+later `insert` overwrote the earlier, so one body was checked against the other's
+claim -- a lost proof for one, a false proof for the other.
+
+Two scan defects sat underneath the same keying:
+
+* **A brace-on-the-next-line header.** `impl Foo` with the `{` on the following
+  line raises no brace depth on its own line, so the old pop ("depth has not
+  increased") fired *before* the header's methods and every method contract was
+  keyed as a free function's -- which then never matched `<impl at …>::m`.
+* **A one-line body.** `impl Foo { pub fn m(&self) -> u8 { 1 } }` raises and
+  returns the depth *within* the line, so a pop keyed on the final depth never
+  fired and the `impl` stayed open over the rest of the file, qualifying every
+  later function as its method.
+
+**The fix.** `enclosing_impls` became `line_scopes`, which returns a `LineScope`
+per line: the innermost `impl`'s `(line, column)` **and** the enclosing
+`mod`/`trait`/`fn` names. A header frame now carries an `opened` flag set when a
+brace opens under it, so the pop waits for the matching close; a header with no
+brace that ends in `;` (`mod a;`) is dropped so it does not linger. `extract` keys
+every non-method contract by its **full source path** (`a::f`, `T::value`, `f::g`).
+`Specs::resolve` matches the exact path first (so `a::f` and `b::a::f` stay apart
+once rustc prints both in full), then a *unique* `::`-aligned suffix
+(`is_path_suffix`); an ambiguous suffix is **refused**, not guessed, and a refusal
+shows up as `missing`, which is visible. `resolve_targets` in `verify.rs` pairs the
+same path-qualified keys to MIR bodies the same way. `select` matches a request
+against the key, the MIR name, or a bare tail of *either*, so `f`, `a::f` and
+`Owner::f` all find their target.
+
+## A `const` generic parameter leaked a function-local `const` -- a false proof
+
+The const table is the second half of the bare-name story. `parse::bare_const_uses`
+scans the whole crate for a bare `const NAME` use site to tell a crate-level `const`
+from a function-local one (the definition alone cannot: the dump prints both
+identically). But a **`const` generic parameter's** *uses* print bare too --
+`fn f<const N: usize>()` is erased from the fn header while `N as u8` prints as
+`const N`, the very spelling a crate-level item's use site gets. So a const-generic
+`N` anywhere made `N` look "used bare", a function-local `const N` in some *other*
+function kept a bare program-wide key, and an unrelated contract naming `N`
+resolved to that local's value. Depending on the claim that is a **false proof**
+(`requires: N != 3` on a leaked `N == 3` is a vacuous precondition) or a spurious
+`Failed`. Both the inline (`fn f<const N: usize>`) and split
+(`fn f<\n const N: usize,\n>`) shapes leaked.
+
+**The fix is positional, in two places.** A `const` generic parameter is always
+written `const NAME:` immediately after a `<` or `,`; a `const` *item* never is.
+`const_generic_params` reads the parameter names (skipping comments and string/char
+literals), and `crate_level_consts` refuses a `const NAME:` whose preceding
+non-space character -- on the same line, or the previous line's last character for
+a split list -- is `<` or `,`. The parser then removes those names from
+`bare_const_uses`, so the const-generic's bare uses no longer mask a local item.
+The name is only *removed from the bare-use set*, not refused outright: a genuine
+crate-level `const N` beside a const-generic `N` is still read (pinned by
+`a_crate_level_const_is_still_read_beside_a_const_generic`).
+
+**Evidence.** `scripts/test-count.sh` **718 -> 728** passed, 0 failed;
+`scripts/gate.sh` **ALL GATES GREEN**; clippy (both halves) and rustdoc clean; zero
+dependencies and `no_std` untouched. Nine new integration tests in `tests/mir.rs`
+and two new unit tests pin the verdicts, and each was checked for teeth by
+reverting its guard: without the path keying the trait-default and module tests
+report `Verified { obligations: 0 }`; without the `bare_uses.remove` loop
+`a_const_generic_does_not_leak_a_local_const` fails; without `prev_last` the split
+`crate_level_consts` case fails.
+
+## An associated `const` hid a compiled crate `const` -- a lost proof, and an unclosed comment panicked
+
+The previous commit stopped a `#[cfg]`-disabled crate `const` from letting a
+function-local item of the same name take the program-wide key. It did so by treating
+*any* qualified `const` use with no matching qualified definition as a function-local
+item. That test is too wide: it also matches a use of an **associated** constant.
+rustc uses one as `const Foo::K` but defines it as `const <impl at …>::K`, so the use
+path has no definition of its own spelling -- and the blanket rule claimed the bare
+tail `K`, then discarded the compiled crate `const K` (whose bare definition it thought
+that use explained). A contract naming `K` was left unreadable: a lost proof, not a
+false one, but a proof dropped by a rule that cannot tell the two shapes apart.
+
+**The fix reads the path's *owning* `::` segment.** `const_mentions` now also collects
+every function's own name -- the last `::` segment of a `fn …` header (`owner`, `inner`,
+`{closure#0}`, and the tail of `<impl at …>::method`). `claimed_bare_const_uses` keeps a
+qualified use's bare tail only when the path's prefix ends in one of those names. So
+`owner::K`, `Foo::local_in_method::L` and `outer::inner::M` name a function-local item
+and claim it; `Foo::K` (an associated constant) and `a::K` (a module constant) do not,
+and the compiled crate constant they name keeps its bare key.
+
+**F2: `spec::const_generic_params` panicked on an unclosed block comment.** The scanner
+runs over the raw source before rustc does, so it sees malformed input. After `const` it
+skips a `/* … */` comment by scanning for `*/` and then stepping two bytes past it; an
+unterminated `/*` ran the scan to end-of-file and the `j += 2` stepped past the buffer,
+panicking on `fn f<const /*`. The skip is now clamped (`j + 1 < len` in the loop, and the
+closing `j += 2` only when `*/` was actually found), so the malformed source is left for
+rustc to reject -- a refusal, not a crash.
+
+**Evidence.** `scripts/test-count.sh` **739 -> 745** passed, 0 failed; `scripts/gate.sh`
+**ALL GATES GREEN**; clippy (`--all-targets` and the `no_std` half) clean; zero
+dependencies and `no_std` untouched. Four new integration tests in `tests/mir.rs` and two
+new unit tests pin the verdicts. Each guard was reverted to check for teeth: without the
+function-name filter `an_associated_const_does_not_hide_a_crate_const` and its unit twin
+`an_associated_use_does_not_claim_a_crate_const` fail (the crate `const K` is dropped);
+reading the whole path prefix instead of its last segment fails
+`a_nested_or_method_local_is_not_a_program_wide_name` and
+`a_method_or_nested_local_use_still_claims_its_bare_definition` (a method/nested local
+leaks back in). The unclosed-comment unit test `const_generic_params_tolerates_an_unclosed_block_comment`
+fails without the clamp. A `<Foo as Tr>::K` trait form was tried and dropped: the path
+starts with `<`, so `const_mentions` never records it and the test could not discriminate.
+
+## A `const` printed as a CTFE brace-block on 1.85 lost its value -- seven MSRV-only failures
+
+The front end reads `const` items from rustc's textual MIR, and the *shape* of a
+constant's body is not stable across toolchains. Current stable prints a constant that
+folds to a literal inline:
+
+```text
+const K: u8 = const 7_u8;
+```
+
+rustc **1.85** -- the MSRV floor -- prints the same item with its const-evaluated body
+instead, as a brace-block whose value is an assignment to the return place `_0`:
+
+```text
+const K: u8 = {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 7_u8;
+        return;
+    }
+}
+```
+
+The parser only recognised the inline form (`body.strip_prefix("const ")`), so on 1.85
+every constant folded to a literal was dropped from the table. A contract that named one
+then went unreadable and the function was skipped -- and because the same contract is
+readable on current stable, the defect was **toolchain-shaped**: the crate's own tests
+passed on 1.99 and failed on the floor it claims to support. Seven `tests/mir.rs` cases
+(the const-inlining family) failed on 1.85 and passed on 1.99 for exactly this reason.
+
+**The fix reads the block's return-place literal.** A new helper `block_const_value`
+scans a brace-block body for the `_0 = const <literal>;` assignment and returns the
+literal; the `const` reader falls back to it when the body starts with `{`. A block that
+*computes* its value (an `AddWithOverflow`, say) has no single literal to fold and the
+item is still dropped rather than given a guessed value, so the change adds coverage
+without adding unsoundness.
+
+**Evidence.** `scripts/test-count.sh` **745 -> 746** passed, 0 failed, on both the MSRV
+`1.85.1` and current stable; the whole `tests/mir.rs` suite is now **209/209 on 1.85,
+1.99.1 and the nightly** (it was 202/209 on 1.85 before this fix, the same 209 on the
+others). `scripts/gate.sh` **ALL GATES GREEN**; clippy (`--all-targets` and the `no_std`
+half) clean; zero dependencies and `no_std` untouched. The new unit test
+`a_ctfe_brace_block_const_folds_to_its_literal` was checked for teeth by reverting the
+fallback: it then fails with `a CTFE brace-block \`const\` must fold to its \`_0\`
+literal: {}` (the item is dropped).
+
+## A branching `const` folded to its first arm -- a false proof the CTFE fix introduced
+
+The CTFE fix above read the first `_0 = const …` assignment in a brace-block body. That
+is right for the straight-line body it was written for, and **wrong for a body that
+branches**. `const K: u8 = if false { 7 } else { 8 };` is `8`, and rustc prints it as a
+block with one arm per branch:
+
+```text
+bb1: { _0 = const 7_u8; goto -> bb3; }
+bb2: { _0 = const 8_u8; goto -> bb3; }
+```
+
+Reading the first arm in textual order stored `K = 7`, so a contract `ensures: ret == 7`
+on a function returning `K` was reported **verified** while the constant is `8` -- a false
+proof, and the worst kind: it certifies a claim about a value the program never produces.
+The earlier fix's tests could not see it because every constant they used was
+straight-line, and the hole is *not* MSRV-only: rustc emits a brace-block for an `if`-based
+constant on current stable too, so this was reachable on every toolchain, not just 1.85.
+
+**The fix refuses to fold anything but a single straight-line return.** `block_const_value`
+now requires: exactly one `_0` assignment in the body; that assignment a `const` literal;
+no branch anywhere in the body (`switchInt(`, `goto ->`, a `-> [` switch target, `unwind`,
+`resume`, `abort`); and the literal's block to reach `return` with only storage
+bookkeeping in between. A body that fails any of these is left unmodelled, which makes a
+contract that names the constant *unreadable* -- a skip, never a false proof. This is the
+conservative single-block check; a future change could fold a branch whose arms agree, but
+nothing needs it, so nothing does it.
+
+**Evidence.** `scripts/test-count.sh` **746 -> 747** passed, 0 failed; the `tests/mir.rs`
+suite is **210/210 on stable, 1.85, 1.99.1 and the nightly** (it was 209). `scripts/gate.sh`
+**ALL GATES GREEN**; clippy (both halves) clean; zero dependencies and `no_std` untouched.
+Two new tests pin it -- the unit test `a_ctfe_brace_block_const_folds_to_its_literal`
+gained a branching case, and `tests/mir.rs` gained
+`a_branching_const_does_not_fold_to_its_first_arm`, which asserts that `ret == 7` is *not*
+verified (the false proof) and that `ret == 8` is not verified either (a skip, not a
+proof). Both were checked for teeth by reverting to the naive first-literal reader: the
+unit test then reports `{"K": UInt(7, Some(U8))}` and the integration test fails with
+`` `K` is 8, so `ret == 7` must not be reported verified, got: verified ``.
+
+## The Verus oracle could fail on a runner's IP limit before it ran
+
+The `verus` CI job looked up the latest release with an *unauthenticated* call to
+`api.github.com`, which is capped at 60 requests an hour per IP. GitHub's runner IPs are
+shared, so the call intermittently returned `403` and the job went red at the `curl` --
+before a single line was compiled. It failed this way on `057bd20` (`curl: (22) ... 403`),
+and a re-run on the same commit passed; the oracle itself was green locally
+(`agree=97 mismatch=0 missing=0 refuted_identity=0`). A red job that says nothing about
+the crate is worse than a slow one: it trains the reader to ignore the job.
+
+**The fix authenticates the lookup.** The step now passes `github.token` as a bearer
+header on the release query, raising the limit to 5000 an hour. Only the API call is
+authenticated; the asset is fetched from the redirect target, which does not take the
+header. This is the only unauthenticated `api.github.com` call in the workflows -- the
+Ferrocene installer uses the `releases/latest/download` path, which redirects and is not
+rate-limited the same way.
+
+**The token is fed on stdin, not in `curl`'s argv.** The first cut passed it as a
+`-H "Authorization: Bearer $GH_TOKEN"` argument, which is readable from
+`/proc/<pid>/cmdline` by any process on the runner -- a secret exposure (CWE-214). The
+Ferrocene step in this same workflow already piped its secret on stdin, so the argument
+form broke a convention the file had set. `curl` reads headers from stdin with `-H @-`, so
+the call is now `printf 'Authorization: Bearer %s\n' "$GH_TOKEN" | curl -fsSL -H @- …`.
+Both forms were run side by side against a slow local server and the process list read
+while they were alive: the argument form showed `-H Authorization: Bearer <token>` in
+`cmdline`, the stdin form showed only `-H @-`. The stdin form still authenticates -- the
+API reports `limit: 5000`, not the anonymous `60`. The workflow also declares
+`permissions: contents: read`: it only reads a public release and checks out the repo, so
+the token needs no write scope.
+
+
+
+
+## The seven-way comparison, and the model-drift trap
+
+`examples/comparison/` proves the same three functions (`sat_add`, `clamp`, `sum_to`)
+with `discharge`, Kani, Verus, Prusti, SPARK, Coq and Lean, and then proves that two
+injected bugs (swapped `sat_add` branches, wrong `sum_to` loop body) are refused by
+every one of them. Its README is the write-up; this is the part that costs time to
+rediscover.
+
+**The Coq/Lean model-drift demonstration is the point, not a footnote.** The first
+`example.v` modelled the `u16` add as ordinary `Z` integers and `coqc` *proved the
+buggy `sat_add` correct*: in unbounded `Z` the sum never wraps, so the branch that
+overflows on a real `u16` cannot overflow in the model. A correct proof of a false
+statement. The committed version models the wrap explicitly
+(`Z.modulo (a + b) 65536`) and the same false theorem is unprovable. This is the
+concrete argument for why `discharge` reads MIR instead of a hand-written model: there
+is no transcription step, so there is no transcription to get wrong. Do not "simplify"
+the Coq or Lean model back to plain integers.
+
+**Tool quirks that cost the most time here:**
+
+- **Lean core has no `omega` via `split_ifs`, and no Mathlib.** `omega` *is* available
+  (`import Init.Omega` is implicit), but `split_ifs` is Mathlib-only, so write the case
+  split with `by_cases` + `rw [if_pos h]` / `rw [if_neg h]`. Those two lemmas are
+  deprecated in 4.35 in favour of `ite_eq_left`/`ite_eq_right` but still work. A
+  `unfold f MAX` that does not end in `at *` leaves `MAX` opaque in the hypotheses and
+  `omega` then reports a bogus counterexample with `c := ↑MAX`.
+- **Coq has no machine word in the standard library.** Spell the wrap as `Z.modulo _ 65536`
+  so `Z.mod_small` applies. `Z.land` has no upper-bound lemma in `ZArith` (searched: only
+  `land_diag`, `land_comm`, `land_assoc`, `land_m0/l/m1`), so a `land`-based mask needs a
+  hand proof; `modulo` does not.
+- **SPARK (`gnatprove`) needs `use type Interfaces.Unsigned_16;`** at spec scope, or
+  every comparison operator in a contract is "not directly visible" and the run dies in
+  "generation of Global contracts" before proving anything. A loop needs **both**
+  `pragma Loop_Invariant` and `pragma Loop_Variant`, or termination is left as a
+  `medium` warning and `--level=2` is not clean. Install with
+  `alr toolchain --select gnat_native && alr install gnatprove`; the compiler and
+  `gprbuild` live under `~/.alire/libexec/spark/bin`, not `~/.alire/bin`.
+- **Prusti 0.2.2 uses `body_invariant!(...)`**, not the `#[invariant]` attribute, and
+  needs its own pinned `nightly-2023-08-15`, a JDK 21 (`JAVA_HOME`), and `chmod +x` on
+  the bundled z3 or it ICEs.
+- **Verus requires `decreases` on every loop** and a `main()` function; without a
+  `decreases` the error is `loop must have a 'decreases' clause`.
+- **Kani is the one tool that needs no induction hypothesis**: `#[kani::unwind(10)]`
+  bounds `sum_to` because `n <= 8`. That is the honest difference -- it is a bounded
+  check, not a proof for all `n`.
+
+**Ferrocene is a different axis and must not be listed as a verifier.** It is the
+qualified *compiler* (TÜV SÜD; ISO 26262 ASIL D, IEC 61508 SIL 3, IEC 62304 Class C),
+so it qualifies the toolchain, not the program: it compiles the buggy `sat_add`
+cleanly and, with a release profile, returns `0` exactly as plain `rustc` does. It is
+already gate 3 (`tools/ferrocene/run.sh`, exit 2 = absent = report and skip). A
+qualified compiler is not a qualified verifier, and building with Ferrocene confers
+nothing on `discharge`'s engine.
+
+**The gate enumerates examples explicitly, so new files under `examples/` are safe**,
+but `gnatprove` writes `obj/` next to the `.gpr`; `examples/comparison/.gitignore`
+ignores it so a proof session cannot be committed.

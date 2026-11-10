@@ -26,6 +26,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# The workflow reads a public release (Verus) and checks out the repo; it needs no write
+# access at all. Declaring that turns the default token into a read-only one, so a
+# compromised step has nothing to push with -- least privilege on the same `github.token`
+# the Verus download authenticates with.
+permissions:
+  contents: read
+
 jobs:
   gate:
     name: gates (clippy, tests, no_std, zero deps, z3 oracle)
@@ -203,10 +210,28 @@ jobs:
       # rustc toolchain of its own). We take the latest release rather than pinning a tag,
       # because the point of this job is "does the engine agree with an *independent*
       # verifier", and the interesting failures are Verus changing its mind, not ours.
+      #
+      # The release lookup is *authenticated*. An unauthenticated call to api.github.com is
+      # limited to 60 requests an hour *per IP*, and GitHub's runner IPs are shared, so the
+      # call intermittently returns 403 before anything is built -- a red job that says
+      # nothing about the crate (it happened here: the job failed at this `curl` with
+      # `curl: (22) ... 403`, and a re-run on the same commit passed). `github.token` raises
+      # the limit to 5000 an hour and is already available to the workflow, so the download
+      # is a check of Verus rather than a lottery on the runner's IP. Only the API call is
+      # authenticated; the asset itself is fetched from the redirect target, which does not
+      # take the header.
+      #
+      # The token is fed to `curl` on *stdin* (`-H @-`), never as a `-H` argument: an
+      # argument is readable from `/proc/<pid>/cmdline` by any process on the runner, which
+      # is a secret leak (CWE-214). The Ferrocene step below pipes its secret the same way.
       - name: Download the Verus release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          url=$(curl -fsSL https://api.github.com/repos/verus-lang/verus/releases/latest \
+          url=$(printf 'Authorization: Bearer %s\n' "$GH_TOKEN" \
+                | curl -fsSL -H @- \
+                https://api.github.com/repos/verus-lang/verus/releases/latest \
                 | python3 -c "import sys,json; print([a['browser_download_url'] for a in json.load(sys.stdin)['assets'] if a['name'].endswith('x86-linux.zip')][0])")
           curl -fsSL -o verus.zip "$url"
           python3 -c "import zipfile; zipfile.ZipFile('verus.zip').extractall('.')"
@@ -328,3 +353,41 @@ jobs:
       # the corpus (see `SELECTED` in examples/coqdiff.rs) and is the slowest job here.
       - name: Run the Coq oracle
         run: cargo run -q --features std --example coqdiff
+
+  comparison:
+    name: comparison fixtures (contracts, teeth, degenerate check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # This job runs `tools/comparison/run.sh`, which needs all three of: a nightly
+      # `rustc` (the `discharge` half reads real MIR), `coqc`, and Lean. It is a separate
+      # job rather than a step in `gate` because `gate` installs none of Coq or Lean, so
+      # the comparison gate would *skip* there and a skipped gate is not evidence.
+      - name: Install Rust (stable + nightly)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup toolchain install nightly --profile minimal --no-self-update
+          rustup default stable
+
+      - name: Install Lean 4 (elan)
+        run: |
+          set -e
+          curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            -o elan-init.sh
+          sh elan-init.sh -y --default-toolchain leanprover/lean4:v4.35.0
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Install Coq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends coq
+
+      # Hard gate: the script exits 1 on a real failure and 2 only when a tool is absent,
+      # and the two are never conflated. All three tools are installed above, so exit 2
+      # here would itself be a failure worth seeing.
+      - name: Run the comparison gate
+        run: |
+          DISCHARGE_RUSTC="$(rustup which --toolchain nightly rustc)"
+          export DISCHARGE_RUSTC
+          sh tools/comparison/run.sh

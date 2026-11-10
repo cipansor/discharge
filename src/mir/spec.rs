@@ -56,7 +56,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::mir::parse::{split_top_level, Ty, USIZE_WIDTH};
+use crate::mir::parse::{split_top_level, Const, Ty, USIZE_WIDTH};
 use crate::smt::{self, Pred, Var};
 
 /// How long an array may be before a symbolic subscript is refused.
@@ -115,6 +115,22 @@ pub struct FnContract {
     /// lines is refused rather than guessed at, because attaching the wrong
     /// invariant to the wrong loop would be unsound.
     pub invariants: Vec<String>,
+    /// Raw text of each `decreases:` clause, in source order.
+    ///
+    /// A recursive function needs a measure that strictly decreases at each
+    /// recursive call, or the induction has no well-founded basis and assuming the
+    /// callee's contract at the recursive call would assume the conclusion. The
+    /// clause is what licenses that assumption: the call is sound only when the
+    /// measure is smaller at the call than at entry *and* stays non-negative.
+    ///
+    /// It is not inferred. A guessed measure is a guessed proof, which is the same
+    /// reason a loop invariant is supplied rather than synthesised. A function with
+    /// no `decreases` that calls itself is refused at the call rather than assumed.
+    ///
+    /// More than one is refused, like more than one `invariant:`, because two
+    /// measures could disagree and picking either would be guessing which proof the
+    /// source asked for.
+    pub decreases: Vec<String>,
     /// Line number of the `fn` item, for diagnostics.
     pub line: usize,
 }
@@ -147,6 +163,47 @@ pub struct Specs {
     /// contract naming a variant is refused rather than guessed at when it is not
     /// there.
     pub enums: BTreeMap<String, EnumDef>,
+    /// The names of `const` items declared at *module* scope (outside any `fn`
+    /// body), read from the source.
+    ///
+    /// The MIR dump prints a crate-level `const` and a function-local one
+    /// identically (`const L: u8 = const 3_u8;`), so the definition alone cannot
+    /// say which it is. A crate-level item is *used* bare (`const L`) while a
+    /// local one is used qualified (`const f::L`), and that use site is the usual
+    /// tell -- but a crate-level item a contract names and the body never uses has
+    /// no use site at all, so it would be dropped and the contract left
+    /// unreadable. This set is the second tell: a name declared here is
+    /// module-scoped and its bare definition must be kept. See
+    /// [`crate_level_consts`] and `parse::parse_program_scoped`.
+    pub crate_consts: BTreeSet<String>,
+    /// The names of `const` generic parameters declared anywhere in the source.
+    ///
+    /// A `const` generic parameter's *uses* print as a bare `const N`, the same
+    /// spelling a crate-level item's use site gets, so the whole-crate bare-use
+    /// heuristic would keep a function-local `const N` under a bare program-wide
+    /// key and let an unrelated contract resolve `N` to that local's value -- a
+    /// false proof. This set is what the parser subtracts from the bare uses. See
+    /// [`const_generic_params`].
+    pub const_generics: BTreeSet<String>,
+    /// The owner type of each `impl` block, keyed by the 1-based `(line, column)`
+    /// of its `impl` keyword -- the same location rustc prints in a method's
+    /// definition name `<impl at FILE:L:C: L:C>::m`.
+    ///
+    /// The dump's method name identifies the `impl` by location and names no
+    /// type; without this map there is no way to tell `A::value` from `B::value`
+    /// (a lost proof: each is checked against the other's contract) or a local
+    /// `impl Foo::from` from an external `u16::from` (a false proof: a call to the
+    /// external function is answered by the local body). See `line_scopes`.
+    pub impl_owners: BTreeMap<(usize, usize), String>,
+    /// Contracts on methods, keyed by `(impl line, impl column, method name)`.
+    ///
+    /// A method's contract cannot live in [`Self::by_fn`] under its bare name: two
+    /// `impl` blocks may each declare a `value`, and one entry would silently
+    /// overwrite the other, so one method's body would be checked against the
+    /// other's claim. The location disambiguates them, exactly as it does in the
+    /// dump. [`Self::by_fn`] keeps free functions (whose bare name is unique
+    /// within a file); a method is recorded here instead.
+    pub by_method: BTreeMap<(usize, usize, String), FnContract>,
 }
 
 /// An enum's variants, in declaration order.
@@ -225,10 +282,672 @@ impl StructDef {
 
 impl Specs {
     /// The contract attached to `name`, if the source declared one.
+    ///
+    /// Only free functions are looked up: a method's contract is keyed by its
+    /// `impl`'s location, so [`Self::resolve`] is the entry point that takes the
+    /// MIR name. This stays for callers that already know they hold a bare name.
     pub fn get(&self, name: &str) -> Option<&FnContract> {
         self.by_fn.get(name)
     }
+
+    /// The contract for a function whose MIR definition name is `name`.
+    ///
+    /// The name is rustc's: a free function's path-qualified name (`f`, `a::f`,
+    /// `f::g`), a trait default's `T::value`, or a method's
+    /// `<impl at FILE:L:C: L:C>::m`. A method's contract is found by that
+    /// `(line, column)` and the method's tail -- never by the tail alone, because
+    /// two `impl` blocks may each declare `m` and a tail match would then hand one
+    /// method the other's contract (a lost proof: a true postcondition refuted, or
+    /// worse, a false one proved).
+    ///
+    /// A non-method contract is keyed by its *full source path* (see
+    /// [`Specs::by_fn`]). rustc prints a definition by the shortest crate-unique
+    /// path suffix, so the printed name is either the full path or a `::`-aligned
+    /// tail of it: `f` when the name is unique crate-wide, `a::f` when two modules
+    /// each declare `f`, `T::value` for a trait default. The match is exact first
+    /// (so `a::f` and `b::a::f` stay apart -- rustc prints both in full once they
+    /// collide), then a unique suffix. An ambiguous suffix is *refused*, not
+    /// guessed: a wrong pairing is a lost or false proof, whereas a refusal makes
+    /// the caller report the contract `missing`, which is visible.
+    ///
+    /// Matching only the exact name left every nested item's contract unresolved,
+    /// and an unresolved contract is not a refusal: `verify_function` builds its
+    /// precondition and postcondition from `contract`, so a missing one means
+    /// `requires: true` and *no* `ensures` -- a function with a false postcondition
+    /// was reported verified with zero obligations, the body never checked at all.
+    pub fn resolve(&self, name: &str) -> Option<&FnContract> {
+        if let Some(c) = self.by_fn.get(name) {
+            return Some(c);
+        }
+        if let Some(loc) = impl_location(name) {
+            let tail = name.rsplit("::").next()?;
+            return self.by_method.get(&(loc.0, loc.1, tail.to_string()));
+        }
+        // A path-qualified non-method name (`a::f`, `T::value`): the contract may
+        // be keyed by that exact path, or by a longer path it is a suffix of.
+        // Collect every suffix match and take it only when it is unique.
+        let mut hit: Option<&FnContract> = None;
+        let mut count = 0usize;
+        for (key, c) in &self.by_fn {
+            if is_path_suffix(key, name) {
+                hit = Some(c);
+                count += 1;
+            }
+        }
+        if count == 1 {
+            hit
+        } else {
+            None
+        }
+    }
 }
+
+/// The `(line, column)` an `<impl at FILE:L:C: L:C>` name carries, if it is one.
+///
+/// rustc prints a method's definition as `<impl at FILE:L:C: L:C>::m`. The name
+/// holds *two* locations: the first is the `impl` keyword itself, the second is
+/// the end of the `impl` header (`impl A` spans columns 1..7, so `impl A {` prints
+/// `4:1: 4:7`). The owner type is the thing at the keyword, so the first pair is
+/// the one that matters -- and it is what `line_scopes` records.
+///
+/// The file part is split off at the `: ` that separates the two locations, so a
+/// path containing a colon (a Windows drive) does not confuse the parse.
+pub(crate) fn impl_location(name: &str) -> Option<(usize, usize)> {
+    // A method may be module-qualified (`inner::<impl at …>::d`), so the marker
+    // is searched for rather than required at the front.
+    let start = name.find("<impl at ")? + "<impl at ".len();
+    let inner = name[start..].split('>').next()?;
+    // `FILE:L:C: L:C` -- the head is the keyword's own `L:C`.
+    let (head, _end) = inner.rsplit_once(": ")?;
+    let mut parts = head.rsplit(':');
+    let col = parts.next()?;
+    let line = parts.next()?;
+    Some((line.trim().parse().ok()?, col.trim().parse().ok()?))
+}
+
+/// The names of `const` generic parameters declared anywhere in the source.
+///
+/// A `const` generic parameter (`fn f<const N: usize>()`) is erased from the MIR
+/// dump's function header, but its *uses* print as a bare `const N` -- the same
+/// spelling a crate-level `const N` item's use site gets. That collides with the
+/// whole-crate heuristic [`crate_level_consts`] and `parse::bare_const_uses` use to
+/// tell a crate-level item from a function-local one: a const-generic `N` makes
+/// `N` look "used bare", so a function-local `const N` in some *other* function
+/// keeps a bare program-wide key, and an unrelated contract naming `N` resolves to
+/// that local's value -- a false proof (or a spurious vacuous-precondition
+/// failure). The names are read here so both passes can ignore them.
+///
+/// The tell is positional: a `const` generic parameter is always written
+/// `const NAME:` after a `<` (first parameter) or a `,` (a later one), whereas a
+/// `const` *item* is never preceded by either. So a `const NAME:` whose
+/// preceding non-space character is `<` or `,` is a parameter.
+///
+/// Rust allows arbitrary whitespace and comments between the `const` keyword and
+/// the name, so `const\n    N: usize` and `const/*c*/N: usize` are the same
+/// parameter as `const N: usize`. Matching a literal `"const "` would miss both,
+/// leaving the name in `const_generics` absent and its bare uses in the parser's
+/// heuristic -- the leak this function exists to close. So the keyword is read as
+/// a token and the name is taken after any run of whitespace and comments.
+pub fn const_generic_params(source: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Skip comments and string/char literals so a `const N:` in text is not read.
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'"' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                if bytes[i] == b'\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        // The `const` keyword must be a whole word: `constant` is not one.
+        if bytes[i..].starts_with(b"const")
+            && !bytes.get(i + 5).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+        {
+            // The preceding non-space character decides: `<`/`,` means a generic
+            // parameter, anything else (or the start of the file) an item.
+            let before = source[..i].trim_end().as_bytes().last().copied();
+            if matches!(before, Some(b'<') | Some(b',')) {
+                // Skip whitespace and comments between `const` and the name.
+                let mut j = i + "const".len();
+                loop {
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if bytes.get(j) == Some(&b'/') && bytes.get(j + 1) == Some(&b'/') {
+                        while j < bytes.len() && bytes[j] != b'\n' {
+                            j += 1;
+                        }
+                        continue;
+                    }
+                    if bytes.get(j) == Some(&b'/') && bytes.get(j + 1) == Some(&b'*') {
+                        j += 2;
+                        while j + 1 < bytes.len() && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
+                            j += 1;
+                        }
+                        // An unterminated block comment runs to the end of the
+                        // source; `j` must not pass `bytes.len()`, or the slice
+                        // below panics. `verify_file_with` scans contracts before
+                        // it invokes rustc, so malformed source must not crash
+                        // verification -- it is rustc's error to report.
+                        j = (j + 2).min(bytes.len());
+                        continue;
+                    }
+                    break;
+                }
+                let after = &source[j..];
+                let name: String = after
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                let plain =
+                    name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+                if plain && after[name.len()..].trim_start().starts_with(':') {
+                    out.insert(name);
+                }
+            }
+            i += "const".len();
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The names of `const` items declared at module scope -- outside any brace.
+///
+/// The MIR dump prints a crate-level `const` and a function-local one
+/// identically, so the definition alone cannot say which it is; the use site
+/// (`const L` bare vs `const f::L` qualified) is the usual tell. A crate-level
+/// constant that a *contract* names but the body never uses has no use site at
+/// all, so that tell is silent and the definition would be dropped, leaving the
+/// contract unreadable. The source, though, says plainly whether the item is
+/// inside a `fn` body: a crate-level item sits at brace depth zero.
+///
+/// The scan tracks brace depth over the whole file, ignoring braces inside string
+/// and character literals and inside comments, and records the name of every
+/// `const NAME: …` seen at depth zero. It deliberately does not try to be a Rust
+/// parser: a `const` generic parameter or an associated constant inside an `impl`
+/// is at depth > 0 and so is not recorded, which is the safe direction (recording
+/// too much would re-open the local-leak false proof).
+pub fn crate_level_consts(source: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut depth: i32 = 0;
+    let mut in_block_comment = false;
+    // The last non-whitespace byte of the preceding lines, so a `const NAME:`
+    // that starts a line can still be told a generic parameter (the `<` or `,`
+    // sits on an earlier line) from an item. See [`const_generic_params`].
+    let mut prev_last: Option<u8> = None;
+    for raw in source.lines() {
+        let mut line = raw;
+        // Block comments can span lines; a brace inside one is not code.
+        loop {
+            if in_block_comment {
+                match line.find("*/") {
+                    Some(i) => {
+                        in_block_comment = false;
+                        line = &line[i + 2..];
+                    }
+                    None => line = "",
+                }
+            } else if let Some(i) = line.find("/*") {
+                in_block_comment = true;
+                line = &line[i + 2..];
+            } else {
+                break;
+            }
+        }
+        // A `const NAME: …` at depth zero is a crate-level item. The name is read
+        // before the braces on the line are counted, so `const L: u8 = 3;` is
+        // caught while a `const` inside a `fn` body (depth > 0) is not. A
+        // `const` generic parameter is not an item, and is told apart by what
+        // precedes it: a parameter follows a `<` or `,`, an item never does. The
+        // `<`/`,` may sit on an earlier line (a multi-line parameter list), which
+        // is what `prev_last` carries. See [`const_generic_params`].
+        if depth == 0 {
+            let t = line.trim_start();
+            let t = t.strip_prefix("pub(crate) ").or_else(|| t.strip_prefix("pub ")).unwrap_or(t);
+            if let Some(after) = t.strip_prefix("const ") {
+                let preceded = line[..line.len() - t.len()].trim_end().as_bytes().last().copied();
+                let before = preceded.or(prev_last);
+                let name: String = after
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                let plain =
+                    name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+                if plain
+                    && !matches!(before, Some(b'<') | Some(b','))
+                    && after[name.len()..].trim_start().starts_with(':')
+                {
+                    out.insert(name);
+                }
+            }
+        }
+        // Count braces outside strings, chars and line comments.
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'/' if bytes.get(i + 1) == Some(&b'/') => break,
+                b'"' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        if bytes[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                b'\'' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'\'' {
+                        if bytes[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        if let Some(c) = line.trim_end().as_bytes().last() {
+            prev_last = Some(*c);
+        }
+    }
+    out
+}
+
+/// One source line's scope, from [`line_scopes`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LineScope {
+    /// The innermost `impl` the line sits inside, as the `(line, column)` of its
+    /// `impl` keyword, or `None`. See [`Specs::impl_owners`].
+    pub impl_loc: Option<(usize, usize)>,
+    /// The enclosing `mod`/`trait`/`fn` item names, outermost first. A method's
+    /// `impl` is *not* an element (it is named by location, not by a path); a
+    /// `fn`'s own name is not an element of the scope of the line that declares
+    /// it, because the scope is read before that line's items open. A nested `fn`
+    /// therefore sees its outer `fn` in `path`, which is exactly how rustc composes
+    /// `f::g`.
+    pub path: Vec<String>,
+}
+
+/// The kind of item a source line opens, for [`line_scopes`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ItemKind {
+    Impl,
+    Mod,
+    Trait,
+    Fn,
+}
+
+/// One open item on the [`line_scopes`] stack.
+struct ScopeFrame {
+    kind: ItemKind,
+    name: String,
+    impl_loc: Option<(usize, usize)>,
+    /// The depth the item's *body* brace opened at, once seen. `None` while the
+    /// header has not opened its body yet (a brace on a later line, or a
+    /// braceless item). A brace inside a generic argument list does not count, so
+    /// `impl Foo<{ 1 }>` stays `None` until the real body brace. See
+    /// [`line_scopes`].
+    body_depth: Option<i32>,
+}
+
+/// The scope of every source line: the innermost `impl` (its keyword location)
+/// and the enclosing `mod`/`trait`/`fn` path.
+///
+/// rustc names a function's *definition* by its shortest crate-unique path
+/// suffix, so a free function inside a `mod` is printed `a::f` (or bare `f` when
+/// that is already unique crate-wide), a trait's default method is printed
+/// `T::value`, and a function nested in a function is printed `f::g`. The source
+/// is the only place the full path exists, so this pass recovers it: it walks the
+/// file counting brace depth (outside strings, chars and comments) and, for each
+/// line, records the `impl` it is inside and the `mod`/`trait`/`fn` names around
+/// it. [`Specs::resolve`] then matches a MIR name to a contract by that path, so a
+/// nested item's contract is found rather than silently dropped (a false proof).
+///
+/// The map is indexed by 0-based line number, so a contract's `fn` at 1-based
+/// line `L` looks up `L - 1`.
+pub(crate) fn line_scopes(source: &str) -> Vec<LineScope> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut out: Vec<LineScope> = vec![LineScope::default(); lines.len()];
+    // Innermost-last. A frame records the depth its *body* brace opened at, which
+    // is what a brace-on-the-next-line header needs: Rust accepts `impl Foo` (or
+    // `mod a`, `fn f()`) with the `{` on a later line, and such a header raises no
+    // depth on its own line -- so a pop keyed on "depth has not increased" would
+    // drop it *before* its items, and every nested contract would be keyed as if
+    // the item were absent (a false proof). Recording the body depth keeps the
+    // header alive until its own brace opens and the depth returns to it, and
+    // ignores a brace that belongs to the *header* (a const-expression generic
+    // argument, `impl Foo<{ 1 }>`), which would otherwise pop the frame early.
+    let mut stack: Vec<ScopeFrame> = Vec::new();
+    let mut depth: i32 = 0;
+    let mut in_block_comment = false;
+    for (idx, raw) in lines.iter().enumerate() {
+        let mut line = *raw;
+        // A brace inside a block comment is not code.
+        loop {
+            if in_block_comment {
+                match line.find("*/") {
+                    Some(i) => {
+                        in_block_comment = false;
+                        line = &line[i + 2..];
+                    }
+                    None => line = "",
+                }
+            } else if let Some(i) = line.find("/*") {
+                in_block_comment = true;
+                line = &line[i + 2..];
+            } else {
+                break;
+            }
+        }
+        // The scope of this line is read *before* its own items open, so a `fn`
+        // that declares a contract is not inside itself.
+        let impl_loc =
+            stack.iter().rev().find(|f| f.kind == ItemKind::Impl).and_then(|f| f.impl_loc);
+        let path: Vec<String> = stack
+            .iter()
+            .filter(|f| matches!(f.kind, ItemKind::Mod | ItemKind::Trait | ItemKind::Fn))
+            .map(|f| f.name.clone())
+            .collect();
+        out[idx] = LineScope { impl_loc, path };
+        if let Some(col) = impl_keyword_col(raw) {
+            stack.push(ScopeFrame {
+                kind: ItemKind::Impl,
+                name: String::new(),
+                impl_loc: Some((idx + 1, col)),
+                body_depth: None,
+            });
+        } else if let Some((kind, name)) = item_head(raw) {
+            stack.push(ScopeFrame {
+                kind,
+                name,
+                impl_loc: None,
+                body_depth: None,
+            });
+        }
+        // Count braces outside strings, chars, line comments and angle brackets.
+        //
+        // The depth at which an item's *body* opens is what tells a header
+        // whether its body has opened yet: a one-line body (`fn f() -> u8 { 1 }`)
+        // raises and returns the depth within the line, so comparing the *final*
+        // depth would miss it and leave the frame on the stack, qualifying every
+        // later line. The body-opening brace is the first `{` reached while no
+        // `<` is open -- a generic argument list can contain a brace-delimited
+        // const expression (`impl Foo<{ 1 }>`), and that brace belongs to the
+        // *header*, not the body: counting it would mark the frame opened and pop
+        // it before the real body, so every method under a brace-in-header `impl`
+        // lost its `impl` location and its contract was dropped (a false proof).
+        //
+        // `depth` is updated for *every* brace so the scope stays right even when
+        // a body line contains a `<` that is the comparison operator, not a
+        // generic bracket. Angle brackets only decide whether a brace is the body
+        // brace, and only until the body is seen.
+        let bytes = line.as_bytes();
+        let mut body_open_depth: Option<i32> = None;
+        let mut body_seen = false;
+        let mut angle = 0i32;
+        let mut angle_depth: Option<i32> = None;
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'/' if bytes.get(i + 1) == Some(&b'/') => break,
+                b'"' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        if bytes[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                b'\'' => {
+                    // `'a` is a lifetime; `'a'`, `'{'`, `'\n'` are char literals.
+                    // Skipping to the *next* quote would swallow the rest of a
+                    // `<'a>` generic list -- including its `>` -- so a lifetime
+                    // advances one byte and only a real literal is scanned.
+                    let lifetime = matches!(bytes.get(i + 1), Some(c) if c.is_ascii_alphabetic() || *c == b'_')
+                        && bytes.get(i + 2) != Some(&b'\'');
+                    if !lifetime {
+                        i += 1;
+                        while i < bytes.len() && bytes[i] != b'\'' {
+                            if bytes[i] == b'\\' {
+                                i += 1;
+                            }
+                            i += 1;
+                        }
+                    }
+                }
+                b'{' if body_seen || angle == 0 => {
+                    if !body_seen {
+                        body_seen = true;
+                        body_open_depth = Some(depth + 1);
+                    }
+                    depth += 1;
+                }
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                b'<' if !body_seen && angle == 0 => {
+                    angle = 1;
+                    angle_depth = Some(depth);
+                }
+                b'<' if !body_seen && angle_depth == Some(depth) => angle += 1,
+                b'>' if !body_seen && angle > 0 && angle_depth == Some(depth) => angle -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        // Record the depth the header's body brace opened at, once, so its pop
+        // waits for the matching close instead of firing on the header line. A
+        // frame that has already opened is left alone: a later brace inside its
+        // body belongs to that body, not to the header.
+        if let Some(last) = stack.last_mut() {
+            if last.body_depth.is_none() {
+                if let Some(d) = body_open_depth {
+                    last.body_depth = Some(d);
+                }
+            }
+        }
+        // A header with no brace that ends in `;` declares an item without a body
+        // (`mod a;`, a trait's `fn f();`): it never opens, so it must not linger on
+        // the stack and qualify every later line.
+        if let Some(last) = stack.last() {
+            if last.body_depth.is_none() && line.trim_end().ends_with(';') {
+                stack.pop();
+            }
+        }
+        // An item whose block has closed by the end of this line is no longer
+        // enclosing anything: pop it once its body brace has opened and the depth
+        // returns to the depth that brace opened at. A header that has not opened
+        // yet is kept. The comparison uses the recorded body depth rather than the
+        // pre-header depth, so an `impl` header that shares its line with the
+        // enclosing block's close still pops at the right point.
+        while let Some(f) = stack.last() {
+            if let Some(d) = f.body_depth {
+                if depth < d {
+                    stack.pop();
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// The `mod`/`trait`/`fn` item a source line opens, if it opens one.
+///
+/// Only a line whose first token (after visibility and modifiers) is `mod`,
+/// `trait` or `fn` counts, so a mention inside a comment or a call like
+/// `fn_call()` is not an item. The name is the leading identifier, which is all
+/// rustc's own path uses -- generics (`fn f<T>`) and arguments are dropped.
+fn item_head(raw: &str) -> Option<(ItemKind, String)> {
+    let mut rest = raw.trim_start();
+    loop {
+        let t = rest.trim_start();
+        let mut advanced = false;
+        for p in [
+            "pub(crate)",
+            "pub(self)",
+            "pub(super)",
+            "pub",
+            "unsafe",
+            "async",
+            "const",
+            "default",
+            "extern",
+        ] {
+            if let Some(r) = t.strip_prefix(p) {
+                if r.starts_with(|c: char| c.is_whitespace()) {
+                    rest = r;
+                    advanced = true;
+                    break;
+                }
+            }
+        }
+        if !advanced {
+            rest = t;
+            break;
+        }
+    }
+    // An `extern "C"` ABI string sits between the keyword and `fn`.
+    if let Some(after) = rest.strip_prefix('"') {
+        if let Some(end) = after.find('"') {
+            rest = after[end + 1..].trim_start();
+        }
+    }
+    let (kw, kind) = if let Some(r) = rest.strip_prefix("mod ") {
+        (r, ItemKind::Mod)
+    } else if let Some(r) = rest.strip_prefix("trait ") {
+        (r, ItemKind::Trait)
+    } else if rest.starts_with("fn ") {
+        return Some((ItemKind::Fn, fn_name(raw)?));
+    } else {
+        return None;
+    };
+    let name: String = kw.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+    if name.is_empty() {
+        None
+    } else {
+        Some((kind, name))
+    }
+}
+
+/// Whether `suffix` is a `::`-aligned tail of `path` (`f` and `b::f` are tails of
+/// `a::b::f`; `b::f` is not a tail of `a::bf`).
+///
+/// This is the inverse of how rustc shortens a definition name: it prints the
+/// shortest path suffix that is unique crate-wide, so the printed name is always a
+/// `::`-aligned tail of the item's full path.
+pub(crate) fn is_path_suffix(path: &str, suffix: &str) -> bool {
+    if suffix.is_empty() || path.len() <= suffix.len() {
+        return false;
+    }
+    if !path.ends_with(suffix) {
+        return false;
+    }
+    path.as_bytes()[path.len() - suffix.len() - 1] == b':'
+}
+
+/// The 1-based column of an `impl` keyword on this line, if it has one.
+///
+/// The column is what rustc prints in `<impl at FILE:L:C: …>`, so it must match
+/// rustc's own count: 1-based, counting characters from the start of the line.
+/// Only a line whose first non-space token is `impl` (optionally after `unsafe`)
+/// counts, so a nested `impl` inside a body is found but a mention of `impl` in a
+/// comment or identifier is not.
+fn impl_keyword_col(raw: &str) -> Option<usize> {
+    let trimmed = raw.trim_start();
+    let offset = raw.len() - trimmed.len();
+    let (rest, col0) = match trimmed.strip_prefix("unsafe ") {
+        Some(r) => (r, offset + "unsafe ".len()),
+        None => (trimmed, offset),
+    };
+    let rest = rest.strip_prefix("impl")?;
+    // `impl` must be a whole word: `impl_thing` is an identifier.
+    if rest.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some(raw[..col0].chars().count() + 1)
+}
+
+/// The owner type of an `impl` header, as the base type name rustc prints in a
+/// call (`Foo` in `Foo::m`, `Slot` in `<Slot as Stow>::stash`).
+///
+/// `impl Foo` -> `Foo`; `impl Stow for Slot` -> `Slot` (the type after `for`);
+/// `impl<T> Gen<T>` -> `Gen`; `impl From<u8> for Bar` -> `Bar`. A generic
+/// parameter list is skipped before the first type name, and the base name is
+/// taken so a call's `base_type` (which strips generics) compares equal.
+pub(crate) fn impl_owner(header: &str) -> Option<String> {
+    let after = header.trim_start().strip_prefix("unsafe ").unwrap_or(header.trim_start());
+    let rest = after.strip_prefix("impl")?;
+    // Skip an `impl<T, U>` parameter list.
+    let rest = rest.trim_start();
+    let rest = if let Some(r) = rest.strip_prefix('<') {
+        let mut depth = 1usize;
+        let mut end = 0usize;
+        for (i, c) in r.char_indices() {
+            match c {
+                '<' => depth += 1,
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        &r[end..]
+    } else {
+        rest
+    };
+    // `for` selects the implementing type; otherwise the first type is the owner.
+    let (before, after_for) = match rest.split_once(" for ") {
+        Some((b, a)) => (b, Some(a)),
+        None => (rest, None),
+    };
+    let source = after_for.unwrap_or(before);
+    let name: String = source
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 
 /// Extract contracts from Rust source text.
 ///
@@ -245,6 +964,33 @@ pub fn extract(source: &str) -> Specs {
     let mut specs = Specs::default();
     let mut pending = FnContract::default();
     let mut in_block_comment = false;
+    // Which `const` items are declared at the crate root, before any brace opens.
+    // The dump cannot tell a crate-level `const` from a function-local one, so a
+    // contract that names a crate-level constant the body never uses would
+    // otherwise lose its definition and go unreadable. See
+    // [`Specs::crate_consts`].
+    specs.crate_consts = crate_level_consts(source);
+    // Which names are `const` generic parameters, so the parser can ignore their
+    // bare uses when telling a crate-level `const` from a function-local one. See
+    // [`const_generic_params`].
+    specs.const_generics = const_generic_params(source);
+
+    // Which `impl` block each line is inside, and the owner type of each. rustc
+    // names a method's definition by the location of the `impl` keyword, so the
+    // owner type -- the only thing that distinguishes `A::value` from `B::value`
+    // -- has to be read here, from the same source the contract text comes from.
+    // See [`Specs::impl_owners`].
+    let scopes = line_scopes(source);
+    let enclosing: Vec<Option<(usize, usize)>> =
+        scopes.iter().map(|s| s.impl_loc).collect();
+    let scope_path: Vec<Vec<String>> = scopes.iter().map(|s| s.path.clone()).collect();
+    for (idx, raw) in source.lines().enumerate() {
+        if let Some(col) = impl_keyword_col(raw) {
+            if let Some(owner) = impl_owner(raw) {
+                specs.impl_owners.insert((idx + 1, col), owner);
+            }
+        }
+    }
 
     // Struct layouts, read in the same pass. The MIR dump names a struct
     // (`_1: &Config`) but never prints its fields, so a contract like
@@ -384,6 +1130,8 @@ pub fn extract(source: &str) -> Specs {
                 pending.ensures.push(r.trim().to_string());
             } else if let Some(r) = t.strip_prefix("invariant:") {
                 pending.invariants.push(r.trim().to_string());
+            } else if let Some(r) = t.strip_prefix("decreases:") {
+                pending.decreases.push(r.trim().to_string());
             }
             continue;
         }
@@ -395,9 +1143,33 @@ pub fn extract(source: &str) -> Specs {
             if !pending.requires.is_empty()
                 || !pending.ensures.is_empty()
                 || !pending.invariants.is_empty()
+                || !pending.decreases.is_empty()
             {
                 pending.line = lineno + 1;
-                specs.by_fn.insert(name, std::mem::take(&mut pending));
+                // A method's contract is keyed by its `impl`'s location, so two
+                // `impl` blocks that each declare `value` keep separate entries
+                // instead of one overwriting the other.
+                //
+                // Anything else is keyed by its *full source path* -- the enclosing
+                // `mod`/`trait`/`fn` names and its own. rustc names a definition by
+                // the shortest crate-unique path suffix (`T::value` for a trait
+                // default, `a::f` for a free function in `a`, `f::g` for a function
+                // nested in `f`), and a bare key would (a) collide for two `mod`s
+                // that each declare `f`, one silently overwriting the other (a lost
+                // proof), and (b) never match a MIR name that carries the path, so
+                // the contract would be dropped and the body checked against no
+                // postcondition (a false proof). [`Specs::resolve`] matches the
+                // full path, then a unique suffix of it.
+                match enclosing.get(lineno).copied().flatten() {
+                    Some(loc) => {
+                        specs.by_method.insert((loc.0, loc.1, name), std::mem::take(&mut pending));
+                    }
+                    None => {
+                        let mut path = scope_path.get(lineno).cloned().unwrap_or_default();
+                        path.push(name);
+                        specs.by_fn.insert(path.join("::"), std::mem::take(&mut pending));
+                    }
+                }
             }
             pending = FnContract::default();
             continue;
@@ -462,6 +1234,25 @@ impl std::fmt::Display for SpecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "cannot read contract `{}`: {}", self.text, self.reason)
     }
+}
+
+/// An array-typed field a contract may subscript: `o.a` in `o.a[0]`. The chain is the MIR
+/// projection from the argument's base local to the array, so the executor can key the
+/// element by the same path the body's write lands on.
+#[derive(Clone, Debug)]
+pub struct PathElem {
+    /// The argument name, used to build the element's mangled variable name.
+    pub arg: String,
+    /// The local the argument is bound to.
+    pub local: u32,
+    /// The field chain from the local to the array (`[0]` for the first field).
+    pub chain: Vec<u32>,
+    /// The element width in bits.
+    pub elem_w: u8,
+    /// Whether the element is signed.
+    pub elem_signed: bool,
+    /// The array's length, so an index past it is refused rather than bound.
+    pub len: u64,
 }
 
 /// The fields a contract may name, resolved to symbolic variables.
@@ -566,6 +1357,17 @@ pub struct FieldEnv {
     /// in a contract and `xs[0]` in the body are one value, not two that look
     /// alike.
     pub elem_seeds: Vec<(u32, u64, Var, bool)>,
+    /// `(local, field chain, index, variable, signed)` for each element of an array
+    /// reached through a *field path* (`o.a[0]`) that a contract names.
+    ///
+    /// Separate from [`elem_seeds`](Self::elem_seeds) because the executor keys these by the
+    /// whole path: `o.a[0]` and `o.b[0]` are different words, and a store keyed by the local
+    /// and index alone would collide them.
+    pub path_elem_seeds: Vec<(u32, Vec<u32>, u64, Var, bool)>,
+    /// `path -> array-field layout` for every array-typed field a contract may subscript
+    /// (`o.a` in `o.a[0]`): the argument name, the local, the field chain to the array, the
+    /// element width and signedness, and the array's length.
+    pub path_elem_types: BTreeMap<String, PathElem>,
     /// `(local, tag variable, tag width, discriminants)` for each enum-typed
     /// argument.
     ///
@@ -591,6 +1393,20 @@ pub struct FieldEnv {
     /// A name not in here is refused, which keeps a misspelled variant from being
     /// read as an unrelated integer.
     pub variant_consts: BTreeMap<String, (u64, u8)>,
+    /// Named `const` items, name → the value rustc printed for them.
+    ///
+    /// A contract may name a constant the way the body does (`requires: x <=
+    /// LIMIT`), and the name has to resolve to the same value the body reads at its
+    /// use site. This is the *same table* the executor folds a body's `const LIMIT`
+    /// from (`MirProgram::consts`), so the contract and the body cannot disagree:
+    /// there is one value, read once by rustc.
+    ///
+    /// A name that is *not* here is refused rather than guessed at, which keeps a
+    /// misspelled constant from being read as an argument that does not exist, or
+    /// as zero. Only a constant whose printed body is a literal is in the table, so
+    /// a constant built by an expression is refused too -- its value is in its own
+    /// body, not in a declaration the reader can fold.
+    pub consts: BTreeMap<String, Const>,
     /// `arg.Variant` → the mangled payload name, so a contract can name a payload
     /// the way the body's downcast reads it.
     pub payload_paths: BTreeMap<String, String>,
@@ -661,6 +1477,16 @@ pub struct FieldEnv {
 }
 
 impl FieldEnv {
+    /// An environment carrying only a `const` table, for evaluating a contract
+    /// that names a constant but binds no fields.
+    ///
+    /// A constant's value does not depend on the call site, so the table is the
+    /// entry state's, not a fresh one; this is the constructor for the places
+    /// (a recursive call) that need the constants without the field bindings.
+    pub fn with_consts(consts: BTreeMap<String, Const>) -> FieldEnv {
+        FieldEnv { consts, ..FieldEnv::default() }
+    }
+
     /// Whether `name` may be introduced as a generated binding.
     ///
     /// It may not when a *source* name already holds it: the generated binding is
@@ -688,7 +1514,7 @@ impl FieldEnv {
         self.declared.insert(name.to_string());
     }
 
-    /// [`bind`] by width and signedness, for callers outside the crate that
+    /// `bind` by width and signedness, for callers outside the crate that
     /// cannot name the IR's `Ty`.
     ///
     /// This is the primitive; `bind` is the typed wrapper. Keeping the IR
@@ -776,6 +1602,48 @@ impl FieldEnv {
         Some(())
     }
 
+    /// Bind an element of an array reached through a field path, `o.a[k]`.
+    ///
+    /// The key is the whole path -- the local, the field chain, the index -- so `o.a[0]` and
+    /// `o.b[0]` are different words and cannot be confused. The mangled name embeds the chain,
+    /// which is what keeps the two apart. An index past the array's declared length is refused
+    /// rather than bound: the element does not exist, and a fresh variable there would make a
+    /// meaningless precondition look real.
+    pub fn bind_path_elem(&mut self, path: &str, index: u64) -> Option<Var> {
+        let PathElem { arg, local, chain, elem_w, elem_signed, len } =
+            self.path_elem_types.get(path)?.clone();
+        if !(1..=64).contains(&elem_w) || index >= len {
+            return None;
+        }
+        // The mangled name is built from the *chain*, not the dotted path: a `.` in a
+        // generated name would be read by the parser as a field access, and the rewrite
+        // hands the name to the parser verbatim. The chain keeps `x.a[0]` and `x.b[0]`
+        // distinct even though both end in `.a`/`.b` of the same local.
+        let mangled = format!(
+            "{arg}__pe{}_e{index}",
+            chain.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("_")
+        );
+        if let Some(v) = self.vars.get(&mangled) {
+            return Some(*v);
+        }
+        if !self.name_is_free(&mangled) {
+            return None;
+        }
+        let slot = self.base + self.next_slot;
+        if slot as usize >= crate::smt::MAX_VARS {
+            return None;
+        }
+        self.next_slot += 1;
+        let v = smt::var_named(slot, elem_w);
+        self.vars.insert(mangled.clone(), v);
+        if elem_signed {
+            self.signed.insert(mangled.clone());
+        }
+        self.paths.insert(format!("{path}[{index}]"), mangled);
+        self.path_elem_seeds.push((local, chain, index, v, elem_signed));
+        Some(v)
+    }
+
     /// Bind every nested field path a contract may name on an argument.
     ///
     /// `arg` is the source name, `ty` the argument's type (already read through a
@@ -838,6 +1706,24 @@ impl FieldEnv {
             // into, so its scalar fields are reachable as deeper paths.
             if child.len() >= 2 && fty.width().is_some() {
                 self.bind_nested(w.local, w.arg, &path, &child, fty);
+            }
+            // An array at any depth is subscriptable: `o.i.a[0]`. The first-level
+            // pass only reaches `x.a`, so a nested array is recorded here with the
+            // full chain the executor keys its element store by.
+            if let Ty::Array(elem, n) = fty {
+                if let Some(ew) = elem.width() {
+                    self.path_elem_types.insert(
+                        path.clone(),
+                        PathElem {
+                            arg: w.arg.to_string(),
+                            local: w.local,
+                            chain: child.clone(),
+                            elem_w: ew,
+                            elem_signed: elem.is_signed(),
+                            len: *n,
+                        },
+                    );
+                }
             }
             if matches!(fty, Ty::Other(_) | Ty::Tuple(_)) {
                 self.walk_nested(w, &path, &child, fty);
@@ -1258,6 +2144,28 @@ impl FieldEnv {
                     i += 1;
                 }
                 let ident: String = chars[start..i].iter().collect();
+                // An array reached through a field path, `x.a[0]`. The scanner reads `x` first,
+                // so the dotted run has to be recognised from the *start* of the identifier, not
+                // from a later segment. A run that has an element type recorded and is followed by
+                // `[digits]` binds an element of that array; the whole-argument branch below only
+                // sees the bare `a[0]` spelling, so the two do not overlap.
+                if chars.get(i) == Some(&'.') {
+                    if let Some((end, path)) = longest_dotted_run(&chars, start) {
+                        if self.path_elem_types.contains_key(&path) && chars.get(end) == Some(&'[') {
+                            let mut j = end + 1;
+                            let digits: String =
+                                chars[j..].iter().take_while(|c| c.is_ascii_digit()).collect();
+                            j += digits.len();
+                            if !digits.is_empty() && chars.get(j) == Some(&']') {
+                                if let Ok(k) = digits.parse::<u64>() {
+                                    self.bind_path_elem(&path, k);
+                                }
+                                i = j + 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
                 if chars.get(i) == Some(&'[') {
                     let mut j = i + 1;
                     let digits: String = chars[j..].iter().take_while(|c| c.is_ascii_digit()).collect();
@@ -1364,6 +2272,35 @@ pub fn named_ret_components(texts: &[String]) -> BTreeSet<u32> {
         }
     }
     out
+}
+
+/// The longest dotted run starting at `start` (`ident` then `.seg` repeated), as
+/// `(index past the run, the dotted path)`.
+///
+/// Used to recognise an array reached through a field path (`x.a` in `x.a[0]`). A run that is
+/// not all identifiers ends before the offending character, so a subscript or a call is never
+/// swallowed.
+fn longest_dotted_run(chars: &[char], start: usize) -> Option<(usize, String)> {
+    let mut end = start;
+    while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
+        end += 1;
+    }
+    if end == start {
+        return None;
+    }
+    let mut last = end;
+    while chars.get(end) == Some(&'.') {
+        let mut j = end + 1;
+        while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+            j += 1;
+        }
+        if j == end + 1 {
+            break;
+        }
+        end = j;
+        last = j;
+    }
+    Some((last, chars[start..last].iter().collect()))
 }
 
 /// The longest dotted run starting at `dot` that has a nested binding, as
@@ -1528,6 +2465,29 @@ fn rewrite_fields(text: &str, fields: &FieldEnv) -> Result<String, SpecError> {
                         i = j;
                         continue;
                     }
+                    // An element of an array reached through a field path: `x.a[0]`, or a
+                    // deeper `o.i.a[0]`. The dotted run is the array's path and its element
+                    // binding is in `paths`. Tried before the nested match so the subscript
+                    // is not mistaken for the field `x.a` followed by a bracket. The run is
+                    // taken from the start of the identifier, not from the first field, so a
+                    // nested path is not cut short at `o.i`.
+                    if let Some((end, path)) = longest_dotted_run(&chars, start) {
+                        if chars.get(end) == Some(&'[') {
+                            let mut k = end + 1;
+                            let digits: String =
+                                chars[k..].iter().take_while(|c| c.is_ascii_digit()).collect();
+                            k += digits.len();
+                            if !digits.is_empty() && chars.get(k) == Some(&']') {
+                                if let Some(mangled) =
+                                    fields.paths.get(&format!("{path}[{digits}]"))
+                                {
+                                    out.push_str(mangled);
+                                    i = k + 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     // A *nested* path: `o.i.v`. The longest dotted run that has a
                     // binding wins, so `o.i.v` is preferred to a bare `o.i` when
                     // both exist, and the match ends after the segment it consumed.
@@ -1628,6 +2588,7 @@ pub fn eval_requires(
     let mut p = Parser::new(&text, &names, None, &sgn, false);
     p.variant_consts = fields.variant_consts.clone();
     p.enum_args = fields.enum_args.clone();
+    p.consts = fields.consts.clone();
     let pred = p.parse_or().map_err(|e| e.about(orig))?;
     p.expect_end().map_err(|e| e.about(orig))?;
     Ok(pred)
@@ -1666,6 +2627,7 @@ pub fn eval_ensures(
     p.ret_absent = ret_absent;
     p.variant_consts = fields.variant_consts.clone();
     p.enum_args = fields.enum_args.clone();
+    p.consts = fields.consts.clone();
     let pred = p.parse_or().map_err(|e| e.about(orig))?;
     p.expect_end().map_err(|e| e.about(orig))?;
     Ok(pred)
@@ -1685,11 +2647,39 @@ pub fn eval_invariant(
     text: &str,
     names: &BTreeMap<String, Var>,
     signed: &BTreeSet<String>,
+    consts: &BTreeMap<String, Const>,
 ) -> Result<Pred, SpecError> {
     let mut p = Parser::new(text, names, None, signed, false);
+    p.consts = consts.clone();
     let pred = p.parse_or()?;
     p.expect_end()?;
     Ok(pred)
+}
+
+/// Read a `decreases:` measure as a *value* rather than a predicate.
+///
+/// A measure is an expression, not a proposition: `decreases: n` or `decreases:
+/// len - i` names the quantity the induction counts down. So this parses at the
+/// expression level and returns the term with its signedness, rather than a
+/// `Pred`.
+///
+/// The signedness matters because the decrease test is `m < m_entry`, and the
+/// relation that means is the measure's own: a signed measure compares with
+/// `slt` and an unsigned one with `ult`. A measure that does not resolve is an
+/// error, for the same reason an invariant that does not resolve is: a typo must
+/// not become an unconstrained value that makes the decrease test vacuous and the
+/// induction unsound.
+pub fn eval_measure(
+    text: &str,
+    names: &BTreeMap<String, Var>,
+    signed: &BTreeSet<String>,
+    consts: &BTreeMap<String, Const>,
+) -> Result<(Var, bool), SpecError> {
+    let mut p = Parser::new(text, names, None, signed, false);
+    p.consts = consts.clone();
+    let (v, sgn) = p.parse_expr()?;
+    p.expect_end()?;
+    Ok((v, sgn.eval()))
 }
 
 /// The signedness of a subexpression: signed, unsigned, or *not yet known*.
@@ -1857,6 +2847,12 @@ struct Parser<'a> {
     /// `variant_consts` can be reported as a bad variant rather than an unknown
     /// constant.
     enum_args: BTreeSet<String>,
+    /// Named `const` items, name → the literal the item was defined with, so a
+    /// contract can name a constant the way the body does. Empty outside a
+    /// contract evaluation that was given the program's table, in which case a
+    /// `const` name is refused rather than guessed at -- the same answer the
+    /// reader gave before this table existed. See [`FieldEnv::consts`].
+    consts: BTreeMap<String, Const>,
     /// The `(min, max)` envelope, as `i128`, of the *literals and folded
     /// intermediate values* in the term a `Var` holds. Rust range-checks every
     /// literal and every constant `+ - *` intermediate against the type the
@@ -2077,6 +3073,7 @@ impl<'a> Parser<'a> {
             ret_signed,
             variant_consts: BTreeMap::new(),
             enum_args: BTreeSet::new(),
+            consts: BTreeMap::new(),
             range: BTreeMap::new(),
             bare_literals: BTreeSet::new(),
             amount_floor: 0,
@@ -2240,6 +3237,43 @@ impl<'a> Parser<'a> {
     /// passes it, exactly as the plain bound did before the envelope map existed.
     fn unshared_const(&self, k: u64, w: u8) -> Var {
         smt::truncate(smt::word(k, 64), w)
+    }
+
+    /// The value a named `const` item denotes, at the item's own width and sign.
+    ///
+    /// The dump prints the item's body const-evaluated and typed (`const LIMIT:
+    /// u8 = const 10_u8;`), so the width and the sign come from the type suffix
+    /// rather than from the operand the constant meets -- a constant has a type of
+    /// its own, unlike a bare literal. The term is built through
+    /// [`Self::unshared_const`] so it does not hash-cons with a literal of the same
+    /// bit pattern, whose recorded envelope would otherwise be read back as the
+    /// constant's and could refuse a valid contract.
+    ///
+    /// A name that is not a literal is refused rather than guessed at: an
+    /// expression-bodied item has its value in its own body, not in a declaration
+    /// the reader can fold, so nothing here can decide it.
+    fn const_item(&self, name: &str, c: &Const) -> Result<(Var, Sign), SpecError> {
+        match c {
+            Const::UInt(n, ty) => match ty.as_ref().and_then(|t| t.width()) {
+                Some(1) => Ok((smt::word(*n as u64 & 1, 1), Sign::Literal)),
+                Some(w) if w <= 64 => {
+                    let signed = ty.as_ref().map(Ty::is_signed).unwrap_or(false);
+                    // A signed item's printed value is two's complement at its width
+                    // (`const NEG: i8 = -1` prints `0xff`), and the sign travels with
+                    // the term so a later comparison reads it as `-1`; an unsigned
+                    // item's is its plain value.
+                    Ok((self.unshared_const(*n as u64, w), Sign::from_bool(signed)))
+                }
+                _ => Err(self.err(format!(
+                    "the constant `{name}` has no bit-vector width, so it is not modelled"
+                ))),
+            },
+            Const::Bool(b) => Ok((smt::word(u64::from(*b), 1), Sign::Literal)),
+            Const::Unit | Const::Other(_) => Err(self.err(format!(
+                "the constant `{name}` is not a literal, so its value is not known to the \
+                 contract reader"
+            ))),
+        }
     }
 
     /// Record `v`'s envelope as the union of its operands' envelopes, so a
@@ -3830,6 +4864,18 @@ impl<'a> Parser<'a> {
                             "`{ty}` has no variant `{a}` (or its layout was not readable)"
                         )));
                     }
+                    // A module-qualified `const` item: `requires: x <= low::K`. The
+                    // dump prints both the definition and the use with the same
+                    // path (`const low::K`), so the table is keyed by it and this is
+                    // an exact lookup -- the same key the executor folds the body's
+                    // `low::K` with. A module-nested item is resolved only when the
+                    // contract spells the path, which is what keeps it from
+                    // colliding with a top-level constant of the same last segment.
+                    if let Some(c) = self.consts.get(&format!("{ty}::{a}")) {
+                        let key = format!("{ty}::{a}");
+                        let c = c.clone();
+                        return self.const_item(&key, &c);
+                    }
                     if let Some((k, w)) = type_bound(&ty, &a) {
                         // The bound is built at the width of the type it *names*,
                         // not at the widest name in scope. `i8::MIN` is the bit
@@ -3851,13 +4897,33 @@ impl<'a> Parser<'a> {
                     }
                     return Err(self.err(format!("unknown constant `{ty}::{a}`")));
                 }
-                let v = self
-                    .args
-                    .get(&name)
-                    .copied()
-                    .ok_or_else(|| self.err(format!("unknown name `{name}` (not an argument)")))?;
-                let s = self.is_signed_name(&name);
-                Ok((v, Sign::from_bool(s)))
+                // An argument wins over a constant of the same name, so a contract
+                // that names an argument keeps resolving to it and the constant
+                // table only ever adds names the reader would otherwise refuse.
+                // Rust lets a parameter shadow a `const` of the same name, and
+                // reading the constant there would bind the wrong value -- a false
+                // proof, not a refusal.
+                if let Some(v) = self.args.get(&name).copied() {
+                    let s = self.is_signed_name(&name);
+                    return Ok((v, Sign::from_bool(s)));
+                }
+                // A named `const` item: `requires: x <= LIMIT`, where the body
+                // reads `_0 = const LIMIT`. Resolved from the program's own table,
+                // the same one the executor folds the use site from, so the
+                // contract and the body name one value and cannot disagree. Built
+                // at the *item's* own width and sign -- the dump prints the body
+                // const-evaluated and typed (`const 10_u8`) -- and as a term of its
+                // own, so an envelope recorded for a literal of the same bit pattern
+                // is not read back as this constant's.
+                //
+                // Checked *after* the associated-constant forms (`i8::MIN`), which
+                // are recognized above: a name like `i8::MIN` is not in the table,
+                // and a table entry is always a plain identifier.
+                if let Some(c) = self.consts.get(&name) {
+                    let c = c.clone();
+                    return self.const_item(&name, &c);
+                }
+                Err(self.err(format!("unknown name `{name}` (not an argument)")))
             }
             Some(Tok::Op(o)) if o == "(" => {
                 self.pos += 1;
@@ -4460,6 +5526,24 @@ pub fn field_env(
         let Some(def) = structs.get(name) else { continue };
         for (i, (fname, fty)) in def.fields.iter().enumerate() {
             env.bind(l, &arg, fname, i as u32, fty);
+            // An array-typed field is subscriptable: `o.a[0]`. Recorded so a contract's
+            // `o.a[0]` can bind an element variable of the right width, and the executor seeds
+            // it under the same `(local, [i], index)` key the body's write lands on.
+            if let Ty::Array(elem, n) = fty {
+                if let Some(w) = elem.width() {
+                    env.path_elem_types.insert(
+                        format!("{arg}.{fname}"),
+                        PathElem {
+                            arg: arg.clone(),
+                            local: l,
+                            chain: vec![i as u32],
+                            elem_w: w,
+                            elem_signed: elem.is_signed(),
+                            len: *n,
+                        },
+                    );
+                }
+            }
         }
         // Nested paths: `o.i.v` and, for a *named-field* struct, `o.i` too (its
         // field names are not numeric, so the single-field pass above skipped them).
@@ -6103,6 +7187,65 @@ mod tests {
         );
     }
 
+    /// A `decreases:` line is read as a contract clause, and it is enough on its
+    /// own to make a function "carry a claim".
+    ///
+    /// Both halves matter. If the extractor dropped `decreases:`, a recursive
+    /// function would silently lose its induction principle and fall back to
+    /// inlining, which reads as "incomplete" rather than as a parse bug. And if a
+    /// bare `decreases:` did not count as a claim, the function would not be in
+    /// `by_fn` at all, so it would neither be verified nor reported skipped.
+    #[test]
+    fn a_decreases_clause_is_read_and_counts_as_a_claim() {
+        let src = "/// decreases: n\n\
+                   pub fn f(n: u8) -> u8 { n }\n";
+        let specs = extract(src);
+        let c = specs.by_fn.get("f").expect("a `decreases:` alone is a claim");
+        assert_eq!(c.decreases, vec!["n".to_string()], "the measure text must be kept");
+        assert!(c.requires.is_empty() && c.ensures.is_empty());
+    }
+
+    /// The measure is evaluated against the arguments, and its signedness travels
+    /// with the value. A signed argument must give a *signed* measure, because the
+    /// decrease test is `slt` rather than `ult` for a signed one -- reading `i8`
+    /// as unsigned would prove `n - 1 < n` for a measure that actually runs
+    /// negative, which is exactly the well-foundedness the check exists to keep.
+    #[test]
+    fn a_measure_takes_its_sign_from_its_arguments() {
+        let mut args = BTreeMap::new();
+        args.insert("n".to_string(), smt::var_named(1, 8));
+        let consts = BTreeMap::new();
+
+        let unsigned = BTreeSet::new();
+        let (_, u_signed) = eval_measure("n", &args, &unsigned, &consts).expect("`n` parses");
+        assert!(!u_signed, "an unsigned argument gives an unsigned measure");
+
+        let signed: BTreeSet<String> = ["n".to_string()].into_iter().collect();
+        let (_, s_signed) = eval_measure("n", &args, &signed, &consts).expect("`n` parses");
+        assert!(s_signed, "a signed argument gives a signed measure");
+
+        // A compound measure keeps the argument's sign through the arithmetic.
+        let (_, sum_signed) =
+            eval_measure("n + 1", &args, &signed, &consts).expect("`n + 1` parses");
+        assert!(sum_signed, "the sign must survive the addition");
+    }
+
+    /// A measure that does not parse is an error, not a silently absent measure.
+    ///
+    /// This is the same rule the other clauses follow: an unreadable clause must
+    /// never become `true` (or here, `None`), because then a function would be
+    /// verified against a contract the reader never understood.
+    #[test]
+    fn an_unreadable_measure_is_an_error() {
+        let mut args = BTreeMap::new();
+        args.insert("n".to_string(), smt::var_named(1, 8));
+        let consts = BTreeMap::new();
+        let signed = BTreeSet::new();
+        assert!(eval_measure("n +", &args, &signed, &consts).is_err(), "a dangling `+`");
+        assert!(eval_measure("nope", &args, &signed, &consts).is_err(), "an unknown name");
+        assert!(eval_measure("", &args, &signed, &consts).is_err(), "an empty measure");
+    }
+
     /// A one-line *struct* body must not swallow the functions after it either.
     ///
     /// `struct_head` accepted any line containing `{` and opened a multi-line field
@@ -6211,5 +7354,195 @@ mod tests {
         let d = def(src);
         assert_eq!(d.index_of("A"), Some(0));
         assert_eq!(d.index_of("B"), Some(1));
+    }
+
+    fn field_env_with(consts: &[(&str, Const)]) -> FieldEnv {
+        let mut e = FieldEnv::default();
+        for (k, v) in consts {
+            e.consts.insert((*k).to_string(), v.clone());
+        }
+        e
+    }
+
+    /// A contract resolves a named `const` to its literal value, at the item's own
+    /// width and sign.
+    #[test]
+    fn a_contract_reads_a_const_name_as_its_value() {
+        let args = BTreeMap::new();
+        let env = field_env_with(&[
+            ("LIMIT", Const::UInt(10, Some(Ty::U8))),
+            ("NEG", Const::UInt(0xff, Some(Ty::I8))),
+            ("B", Const::Bool(true)),
+        ]);
+        // `LIMIT` is `10`; a precondition demanding `<= 9` is refutable, and one
+        // demanding `<= 10` holds. This pins the value, not just that it parsed.
+        let p = eval_requires("LIMIT <= 10", &args, &BTreeSet::new(), &env).unwrap();
+        assert_eq!(smt::prove(p), smt::Verdict::Valid);
+        let p = eval_requires("LIMIT <= 9", &args, &BTreeSet::new(), &env).unwrap();
+        assert_ne!(smt::prove(p), smt::Verdict::Valid, "LIMIT is 10, so `<= 9` must not hold");
+        // A negative constant keeps its sign: `NEG <= -1` holds, `NEG >= 0` does not.
+        let p = eval_requires("NEG <= -1", &args, &BTreeSet::new(), &env).unwrap();
+        assert_eq!(smt::prove(p), smt::Verdict::Valid);
+        let p = eval_requires("NEG >= 0", &args, &BTreeSet::new(), &env).unwrap();
+        assert_ne!(smt::prove(p), smt::Verdict::Valid, "NEG is -1, so `>= 0` must not hold");
+        // A boolean constant compared against a boolean literal.
+        let p = eval_requires("B == true", &args, &BTreeSet::new(), &env).unwrap();
+        assert_eq!(smt::prove(p), smt::Verdict::Valid);
+    }
+
+    /// An argument shadows a constant of the same name, so a contract naming an
+    /// argument keeps resolving to it. Reading the constant there would bind the
+    /// wrong value -- a false proof, not a refusal.
+    #[test]
+    fn an_argument_shadows_a_const_of_the_same_name() {
+        let mut args = BTreeMap::new();
+        args.insert("LIMIT".to_string(), smt::var_named(1, 8));
+        let env = field_env_with(&[("LIMIT", Const::UInt(10, Some(Ty::U8)))]);
+        // The argument is symbolic, so `LIMIT <= 10` cannot be proved even though
+        // the constant would make it true -- proof that the argument won.
+        let p = eval_requires("LIMIT <= 10", &args, &BTreeSet::new(), &env).unwrap();
+        assert_ne!(smt::prove(p), smt::Verdict::Valid);
+    }
+
+    /// A name that is not a literal constant is refused, not guessed at.
+    #[test]
+    fn a_non_literal_const_name_is_refused() {
+        let args = BTreeMap::new();
+        let env = field_env_with(&[("EXPR", Const::Other("_".into()))]);
+        assert!(eval_requires("EXPR <= 1", &args, &BTreeSet::new(), &env).is_err());
+        // A misspelled name is still refused as an unknown name.
+        assert!(eval_requires("LIMITT <= 1", &args, &BTreeSet::new(), &env).is_err());
+    }
+
+    /// The crate-level `const` scanner reads items at brace depth zero and only
+    /// those.
+    ///
+    /// The dump cannot tell a crate-level `const` from a function-local one, so the
+    /// source's brace depth is the second tell -- the one that catches a
+    /// crate-level constant a contract names but no body uses. Reading too much
+    /// would re-open the local-leak false proof, so the negative cases matter as
+    /// much as the positive one: a local item, an associated constant in an `impl`,
+    /// a `const` generic parameter, and a `const` inside a string or comment must
+    /// all be left out.
+    #[test]
+    fn crate_level_consts_reads_only_module_scope_items() {
+        let src = r#"
+// const COMMENTED: u8 = 1;
+const LIMIT: u8 = 10;
+pub const PUB_LIMIT: u8 = 11;
+const TYPO: u8 = 12;
+
+/// const DOC: u8 = 13;
+pub fn f() -> u8 {
+    const LOCAL: u8 = 3;
+    let s = "const IN_STRING: u8 = 4";
+    let _ = s;
+    LOCAL
+}
+
+impl Foo {
+    const ASSOC: u8 = 5;
+}
+
+fn g<const N: usize>() -> usize { N }
+
+fn h<
+    const SPLIT: usize,
+>() -> usize {
+    SPLIT
+}
+"#;
+        let names = crate_level_consts(src);
+        assert!(names.contains("LIMIT"), "a crate-level const is read: {names:?}");
+        assert!(names.contains("PUB_LIMIT"), "a `pub const` is read: {names:?}");
+        assert!(names.contains("TYPO"), "a plain crate-level const is read: {names:?}");
+        assert!(!names.contains("COMMENTED"), "a commented-out item is not read: {names:?}");
+        assert!(!names.contains("DOC"), "a doc-comment line is not read: {names:?}");
+        assert!(!names.contains("LOCAL"), "a function-local const is not read: {names:?}");
+        assert!(!names.contains("IN_STRING"), "a const inside a string is not read: {names:?}");
+        assert!(!names.contains("ASSOC"), "an associated const is not read: {names:?}");
+        assert!(
+            !names.contains("N"),
+            "a `const` generic parameter is not a module-scope item: {names:?}"
+        );
+        // The parameter list split across lines is the shape the scan actually
+        // meets: the `const` opens a line, so only the *preceding* line's last
+        // character (`<`) says it is a parameter rather than an item.
+        assert!(
+            !names.contains("SPLIT"),
+            "a `const` generic parameter on its own line is not an item: {names:?}"
+        );
+    }
+
+    /// `const_generic_params` reads parameters and only parameters.
+    ///
+    /// A parameter is written `const NAME:` after a `<` or `,`; an item never is.
+    /// The tell has to survive the parameter list being split across lines, and it
+    /// must not fire on a `const` item, an associated constant, or a `const` in a
+    /// comment or string.
+    #[test]
+    fn const_generic_params_reads_only_parameters() {
+        let names = const_generic_params(
+            "fn f<const N: usize>() -> usize { N }\n\
+             fn g<\n    const M: usize,\n>(x: usize) -> usize { x + M }\n\
+             const ITEM: u8 = 1;\n\
+             struct S<const K: usize>([u8; K]);\n\
+             // const COMMENT: u8 = 2;\n\
+             fn h() { let s = \"const STR: u8 = 3\"; let _ = s; }\n",
+        );
+        assert!(names.contains("N"), "an inline parameter is read: {names:?}");
+        assert!(names.contains("M"), "a parameter after a line break is read: {names:?}");
+        assert!(names.contains("K"), "a parameter in a type's list is read: {names:?}");
+        assert!(!names.contains("ITEM"), "a `const` item is not a parameter: {names:?}");
+        assert!(!names.contains("COMMENT"), "a commented-out parameter is not read: {names:?}");
+        assert!(!names.contains("STR"), "a parameter inside a string is not read: {names:?}");
+    }
+
+    /// Whitespace and comments between `const` and the parameter name are legal
+    /// Rust, and the name must still be read.
+    ///
+    /// The scanner once required a literal `"const "`, so `const\n    N: usize`
+    /// and `const/*c*/N: usize` slipped through. The parameter name then stayed
+    /// out of `const_generics`, and a function-local `const N` in some other
+    /// function kept a bare program-wide key -- which an unrelated contract
+    /// naming `N` resolved to, a false proof.
+    #[test]
+    fn const_generic_params_survives_whitespace_and_comments() {
+        for source in [
+            "fn f<const\n    N: usize>() -> usize { N }\n",
+            "fn f<const\tN: usize>() -> usize { N }\n",
+            "fn f<const/*c*/N: usize>() -> usize { N }\n",
+            "fn f<const // c\n    N: usize>() -> usize { N }\n",
+            "struct S<A, const\n    N: usize>([u8; N], A);\n",
+        ] {
+            let names = const_generic_params(source);
+            assert!(
+                names.contains("N"),
+                "the parameter after the `const` keyword must be read: {source:?} -> {names:?}"
+            );
+        }
+    }
+
+    /// A source that ends inside an unclosed block comment must not panic.
+    ///
+    /// The scanner runs over the raw source before rustc sees it, so malformed
+    /// input reaches it. An unterminated `/*` after a `const` generic parameter
+    /// runs the comment skip to end-of-file, and stepping two bytes past the
+    /// buffer made the following slice panic -- a crash on input whose only
+    /// correct handling is to let rustc report the syntax error.
+    #[test]
+    fn const_generic_params_tolerates_an_unclosed_block_comment() {
+        for source in [
+            "fn f<const /*",
+            "fn f<const /*x",
+            "fn f<const /* ",
+            "fn f<const /*/",
+            "fn f<const /*x*",
+            "fn f<const /*x*/",
+            "fn f<const /*\n",
+        ] {
+            // The property is "does not panic"; the call itself is the assertion.
+            let _ = const_generic_params(source);
+        }
     }
 }

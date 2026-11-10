@@ -18,8 +18,17 @@ rust-version = "1.85"
 description = "In-code formal verification for Rust: an embedded bit-blasting SMT decision procedure, a symbolic DSL, contracts and a machine-checked proof kernel. SPARK-inspired, no_std, no external dependencies."
 authors = ["Yayasan Pesantren Cipansor and contributors <halo@cipansor.or.id>"]
 license = "Apache-2.0"
+repository = "https://github.com/cipansor/discharge"
+homepage = "https://github.com/cipansor/discharge"
+documentation = "https://docs.rs/discharge"
+readme = "README.md"
 keywords = ["formal-verification", "smt", "no_std", "safety-critical", "contracts"]
 categories = ["no-std", "embedded", "development-tools::testing"]
+# `libb2.rlib`, `libt.rlib` and friends are *compiled output*: the oracle runs leave them
+# next to the source they compiled, and a `git add -A` used to sweep them in. They are
+# untracked now (and gate 15 fails if they come back), but a `cargo package` from a dirty
+# tree would still sweep them into the `.crate`, so they are excluded by name here too.
+exclude = ["*.rlib", "target/", ".sweep/"]
 
 [dependencies]
 # The only dependency, and it is a sibling in this repository, not a registry
@@ -28,7 +37,26 @@ categories = ["no-std", "embedded", "development-tools::testing"]
 # arithmetic a safety build ships links `core` and nothing else, while this crate
 # keeps the symbolic `smt` engine that cross-checks those proofs. Gate 4 of
 # `scripts/gate.sh` enforces that no *external* crate ever joins this list.
-discharge-arithmetic = { path = "discharge-arithmetic" }
+#
+# The `version` is required even though the build resolves the `path`: `cargo package`
+# strips the `path` when it writes the `.crate` and leaves the version behind, so a
+# path-only dependency makes the manifest unpackagable ("all dependencies must have a
+# version requirement specified when packaging"). It matches the sibling's `version`
+# by hand; the two move together.
+discharge-arithmetic = { path = "discharge-arithmetic", version = "0.1.0" }
+
+# docs.rs builds with default features unless told otherwise, and the default here is *no*
+# features (`no_std`). Without this, the published docs would silently omit every `std`-only
+# item -- the whole `mir` frontend, the proc-macro surface, the file-backed tools -- and a
+# reader would see a crate smaller than the one that ships. `--all-features` documents the
+# union, and the doc gate (step 14) already builds all three configurations (default,
+# `std`, all-features) with `-D warnings`.
+#
+# No `rustdoc-args`: nothing here is gated on a `docsrs` cfg (the crate is stable, uses no
+# nightly rustdoc features, and marks platform-specific items with `#[cfg(feature = "std")]`
+# rather than `#[doc(cfg)]`), so defining one would be a flag with no reader.
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 # No default features: the crate is `no_std` + zero-dependency out of the box,

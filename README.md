@@ -502,6 +502,71 @@ does not just shorten the term — it *merges* two nodes the frontend needs to t
 The corpus caught both. That is the reason `examples/mir_targets/realistic.rs` exists: a fold
 is not a neutral optimisation, and the coverage baseline is what says so.
 
+## A pin is transitive, and a closed goal is decided without its assumption
+
+A precondition that fixes a variable is what makes a query with a wide divider decidable at
+all: `requires: a == 5` seeds `a` with the literal `5`, the body's operations fold, and the
+obligation is a fact about numbers rather than a circuit. The pin extraction used to be one
+pass, so it only saw a right-hand side that was closed on its own. `a == 5 && b == a + 1`
+left `b` symbolic, because `a + 1` does not evaluate until `a`'s pin exists — and the chain
+`a == 5 && b == a + 1 && c == b * 2` lost every link past the first.
+
+The extraction now runs to a *fixpoint*: each round re-scans the conjuncts with the pins
+found so far in scope, and a round that adds nothing ends it. Every pin is still a
+consequence of the precondition by transitivity — `b == a + 1` *and* `a == 5` are both
+conjuncts — so nothing is assumed beside `p`, and a value the conjuncts do not force stays
+unpinned.
+
+That closed the pin list but not the obligation. With `a`, `b`, `c` all pinned, the body
+`c / 4` folds to the literal `3` and the goal becomes the closed fact `12 / 4 == 3`, which
+the engine decides by evaluation in microseconds. `prove_implies` nevertheless built
+`!pre || post` first, and `pre` still carried `c == b * 2` — a 64-bit multiply whose diagram
+is refused for its own size. The query came back `Unknown` with a *trivial* goal.
+
+So `prove_implies` now checks the goal on its own before it builds the implication: a closed
+term that evaluates to true is a theorem unconditionally, whatever the assumption says, and
+the check is a walk over the goal's own (small) DAG. The assumption is not weakened — the
+path condition is untouched, so the ordinary route still sees it and nothing that used to be
+decided by the diagram is lost. The corpus confirms the direction: `realistic.rs` stays at
+264 of 490, with zero function changing verdict in either direction, and the
+`a == 5 && b == a + 1 && c == b * 2` with body `c / 4` moves from `incomplete` to `verified`.
+
+## A division by a power of two is a shift, on both signs
+
+The restoring divider is exact, and exact is expensive: the term it builds is ~`2 * w` deep,
+so an obligation that reads a *symbolic* dividend through it is refused for the size of its
+own diagram rather than for anything about the property. The shapes that pay for this are
+the ordinary ones — `n / 4`, `i / 8`, `x % 16` — where the divisor is a literal power of two
+and the identity is elementary.
+
+The signed case came first, because the *signed* divider is the worse of the two: its sign
+fixup negates and selects on a 64-bit value whose bits are the divider's symbolic output,
+and that is the shape that blows the diagram up. `sdiv(x, 2)` took 9.3 seconds against 47ms
+for `udiv(x, 2)`, so `a / 2` on an `i64` was `incomplete`. Dividing by `2^k` needs no
+divider at all: on the positive side it is a shift, and on the negative side it is a shift
+after adding `2^k - 1`, which turns truncation toward zero into a floor. The bias is that
+constant masked by the sign, and the sign mask is the sign bit replicated — one arithmetic
+shift.
+
+The unsigned case looked like the cheap one and was left alone, which was wrong in a way
+the corpus could not show: the general unsigned divider is *not* the signed one's wall, but
+it is still a `2 * w`-deep term, and a symbolic dividend through it is refused all the same.
+`requires: n <= 1000; n / 4` at `u64` was `incomplete` in 0.9 s while the *signed* twin of
+the same body was already decided. The unsigned identity is the simplest of the four: `x /
+2^k` is `x >> k` and `x % 2^k` is `x & (2^k - 1)`, two operators and no fixup.
+
+Both fast paths are guarded to `d >= 2` and a divisor that fits below the width. `d == 1`
+is deliberately left to the general path — the guard then reads the same on both sides — and
+`d == 0` never reaches either, so the general divider's *defined* zero case (all-ones
+quotient, dividend remainder) is the one that still answers. Neither path can shadow it.
+
+The tests are two-level, and the second level is the one that matters. A concrete sweep
+walks every dividend at a width where the whole domain fits, against Rust's own `/` and `%`.
+Then the engine is asked to prove the shift-and-mask expression *equal to the general
+divider* with `x` free — that is the property a splice into a body depends on, and it is a
+statement about all inputs rather than about the ones the sweep happened to try. The signed
+sweep includes the negatives, since the bias and the negation exist for exactly those.
+
 ## Mixed-width operations are refused, not truncated
 
 A bit-vector operation has no natural width when its operands disagree. The engine used to
@@ -1159,8 +1224,11 @@ verifies anyway, because the caller does not read the body. Both are pinned by t
 The discipline is therefore: verify every body against its contract with
 `verify_proc`, and trust nothing else.
 
-Recursion is not supported — a call graph with a cycle would need an induction
-principle, and that is a different feature.
+Recursion is supported for a *self-call* with a `decreases:` measure: the call is
+answered by the function's own contract, the measure is proved to shrink, and the
+postcondition is assumed for the result — well-founded induction, described in
+the MIR frontend section below. A mutually recursive cycle has no such measure to
+name here, so it is still refused rather than guessed.
 
 ## Verifying real Rust: the MIR frontend
 
@@ -1176,8 +1244,7 @@ obligations it finds — the overflow, underflow and divide-by-zero `assert`s th
 re-modelled by hand, so there is nothing to keep in sync.
 
 ```console
-$ DISCHARGE_RUSTC=$(rustup which --toolchain nightly rustc) \
-    cargo run --features std --example mir_demo
+$ cargo run --features std --example mir_demo
 === examples/mir_targets/actuator.rs ===
 clamp            verified (3 obligation(s), 0 panic(s) ruled out)
 rate_limit       verified (5 obligation(s), 2 panic(s) ruled out)
@@ -1257,6 +1324,39 @@ the loop can write are replaced by fresh values before the invariant is assumed,
 so the state after the loop is *any* state satisfying the invariant and the exit
 condition, not the state of the first pass. Omitting that step would prove false
 postconditions; `AGENTS.md` records the measured case.
+
+### Recursion: a `decreases:` measure
+
+A recursive function is proved by *induction*, not by unrolling. Adding a
+`decreases:` line names a measure — an expression in the arguments — that must be
+non-negative at entry and strictly smaller at every self-call. The self-call is
+then answered by the function's own contract instead of being inlined:
+
+* the call's arguments must satisfy the `requires:`;
+* the measure must strictly decrease (and stay non-negative, for a signed
+  measure);
+* the `ensures:` is *assumed* for the call's result, which is the induction
+  hypothesis.
+
+```rust,ignore
+/// requires: true
+/// decreases: n
+/// ensures: ret == n
+pub fn count_down(n: u8) -> u8 {
+    if n == 0 { 0 } else { count_down(n - 1) + 1 }
+}
+```
+
+The measure is what makes the assumption an induction rather than a circular
+argument: a strictly decreasing sequence in a well-founded order is finite, so
+there is a base case, and nothing is assumed there — the body has to establish
+the postcondition on its own. The base case is therefore still a proof
+obligation, and a body that gets the base case wrong is refuted with a witness
+(`a_recursive_lie_cannot_prove_this` in the corpus). A measure that does not
+shrink, or a call that leaves its own precondition, is likewise a definite
+failure rather than a silent pass. Without a `decreases:` line a self-call has no
+induction principle, so it is inlined once and the result is reported
+`Incomplete` at the depth bound — an honest "I could not decide", never a guess.
 
 A contract may name a field of a struct argument, and a component of a tuple
 return, by the same syntax the Rust body uses:
@@ -1528,7 +1628,7 @@ constructor runs.
 |---|---|---|
 | the body | `rustc --emit=mir` | the real lowering, including the checks `rustc` inserts |
 | the contract | the source text | MIR carries no attributes or doc comments |
-| the compiler | `DISCHARGE_RUSTC`, else `rustc` | `--emit=mir` needs nightly; naming it separately keeps cargo's `rustc` alone |
+| the compiler | `DISCHARGE_RUSTC`, else `rustc` | `--emit=mir` is stable, so the `rustc` on `PATH` is enough; the variable exists to point the frontend at a *different* compiler without disturbing cargo's own |
 
 The five differential oracles (z3, Kani, Lean, Coq, Verus) all build their terms
 with `smt::` calls, so they start *below* the contract reader. That left the reader
@@ -1551,8 +1651,11 @@ release that stabilised the edition, the floor and the edition are the same
 decision — there is no version that takes one without the other.
 
 The floor is a *lower* bound, not a pin. Everything here builds on the current
-stable (1.99 at the time of writing) and the frontend runs a nightly, so the
-crate is exercised on recent compilers rather than held back to an old one. The
+stable (1.99 at the time of writing), and the MIR frontend runs on that same
+stable `rustc`: `--emit=mir` is a stable flag, checked here down to 1.85, so no
+part of the product needs a nightly. Only two *oracles* do — `tools/mir-oracle`
+links `rustc_public` and the `rustc-dev` component, and Kani tracks a nightly —
+and an oracle is a test tool that never enters the dependency tree. The
 toolchains the oracles pin are newer still and move independently: Verus tracks
 stable (`channel = "1.99.1"`), Kani tracks a nightly, and Ferrocene — the
 qualified compiler, which is the one whose ceiling could matter for a safety
@@ -1718,8 +1821,12 @@ says "I could not decide" is worth more than one that guesses.
 
 ### The known gaps, stated
 
-1. **Calls are inlined one level, non-recursively.** A call to a function in the
-   same file is symbolically executed; a call to anything else is `Unknown`.
+1. **Calls are inlined one level.** A call to a function in the same file is
+   symbolically executed; a call to anything else is `Unknown`. A *self-call* with
+   a `decreases:` measure is the exception: it is answered by the contract by
+   well-founded induction rather than inlined, so a recursive function with a
+   measure is decidable and one without it is reported incomplete at the depth
+   bound.
 2. **The dump is textual.** The frontend parses `--emit=mir` output rather than
    linking `rustc-dev`. That keeps the dependency count at zero and makes the
    input inspectable, but it means a rustc release that changes the pretty-printer
@@ -1846,7 +1953,8 @@ is instantaneous while a 12-bit multiplier equality is not.
 ├── SECURITY.md         how to report a vulnerability (GitHub private advisories)
 ├── .github/
 │   └── workflows/
-│       └── ci.yml      the gates, plus Kani, Verus and the MIR oracle as jobs
+│       └── ci.yml      the gates, plus Kani, Verus, Lean, Coq, the MIR oracle
+│                       and the comparison fixtures as jobs
 ├── src/
 │   ├── lib.rs          crate root: module map, prelude, the three proof routes
 │   ├── smt.rs          the decision procedure (the heart of the crate)
@@ -1909,12 +2017,20 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   ├── support/           the IR the engine harnesses share, so they check the
 │   │                      same formulas rather than two drifting corpora
 │   ├── mir_demo.rs        verifies real Rust read from MIR, end to end
+│   ├── comparison_check.rs  gate 13's driver: asserts each comparison fixture's
+│   │                      per-function outcome and obligation kind, not a count
+│   ├── comparison/        the same three functions proved seven ways, plus
+│   │                      Ferrocene as the qualified compiler (see its README)
 │   └── mir_targets/
 │       └── actuator.rs    the Rust under verification; imports no `discharge`
 ├── tools/
-│   └── mir-oracle/     the `rustc_public` oracle: checks the text-MIR frontend
-│                       against rustc's own typed MIR. Nightly + `rustc-dev`,
-│                       its own workspace, and never a dependency of `discharge`.
+│   ├── mir-oracle/     the `rustc_public` oracle: checks the text-MIR frontend
+│   │                   against rustc's own typed MIR. Nightly + `rustc-dev`,
+│   │                   its own workspace, and never a dependency of `discharge`.
+│   ├── comparison/     gate 13: re-runs the comparison fixtures -- the contracts,
+│   │                   the teeth, and the degenerate-implementation check
+│   └── build-verify/   gate 18: the Kani/Verus shape -- verify from `build.rs`
+│                       and prove the artifact carries no prover (scratch crate)
 └── scripts/
     ├── gate.sh            every gate in one command, failing loudly
     └── test-count.sh      the exact passing-test count, only when all pass
@@ -1929,12 +2045,17 @@ scripts/gate.sh
 # Host, with the thread-local arena and the full test suite
 cargo test --features std
 
+# Lint both halves -- `--features std` alone never compiles the `no_std` items
+cargo clippy --features std --all-targets
+cargo clippy --no-default-features --lib
+
 # Bare metal: no std, no allocator, no dependencies
 rustup target add thumbv7em-none-eabihf
 cargo build --no-default-features --target thumbv7em-none-eabihf
 ```
 
-`scripts/gate.sh` runs clippy (with `-D warnings`), the test suite, the bare-metal
+`scripts/gate.sh` runs clippy (with `-D warnings`, over both the `std` and the `no_std` half
+of the crate), the test suite, the bare-metal
 `no_std` build, a zero-dependency check, and the z3 differential oracle. It exists because
 the gates were previously five separate commands quoted in prose, which is how a gate
 quietly stops being run. It also refuses to report success when the z3 oracle is not
@@ -1943,7 +2064,34 @@ run the Kani, Verus, Lean and Coq differential oracles and the `rustc_public` MI
 tools are present and *skip them loudly* when they are not, because all three are large
 downloads (Kani: a pinned nightly plus CBMC; Verus: a self-contained bundle with its own z3;
 the MIR oracle: a nightly with the `rustc-dev` and `llvm-tools-preview` components) that a normal local run should not
-pay for; CI installs them and runs them as hard gates.
+pay for; CI installs them and runs them as hard gates. One more gate holds the comparison
+fixtures themselves — `tools/comparison/run.sh` re-runs `discharge` on the positive fixture
+and all three bug fixtures through `examples/comparison_check.rs`, which asserts each
+fixture's per-function `FnOutcome` and the *expected obligation kind* rather than scraping
+`mir_coverage`'s `decided N of M` line (that line counts only `Verified`, so a `Failed`,
+`Incomplete` or `Skipped` fixture all read `decided 0 of 1`, and a contract that had become
+unreadable would have been reported as a caught defect — a lost proof read as a refutation);
+the positive fixture's three names are pinned in the driver rather than read back from the
+contracts, and so is each function's whole contract (`requires:`, `ensures:`, `invariant:`)
+clause for clause — a name survives a deleted contract and a count survives a weakened one, so
+neither alone holds the claim; the
+expected obligation kind is compared for equality, not by a `panic` prefix that any panic would
+satisfy; and each scratch fixture gets a path unique per call, so two concurrent gates cannot
+delete each other's file;
+the same gate checks that the contracts refuse the degenerate implementations the bounds-only
+versions accepted, and runs Coq and Lean on the positive fixture and both teeth, including
+the mutation that shows each rejection is of the defect rather than of the script's shape.
+Coq and Lean are both *required*: an absent prover is a reported skip (exit 2), never a
+success for a proof suite that did not run. The last four gates hold the *tree*
+rather than the logic: rustdoc must build both crates with `-D warnings` (the crate is
+`#![deny(missing_docs)]`, but that says nothing about whether a doc link still *resolves*),
+no compiled output may be tracked (`git ls-files` must not list a `.rlib` or a `target/`
+path — a `git add -A` re-committed six stray `.rlib`s once, and a `.gitignore` does not
+untrack a file that is already in the index), the `unsafe` surface must stay at the two
+blocks `SECURITY.md` names, each with a `// SAFETY:` justification (a count in prose is a
+claim like any other, and this one is security-relevant), and the build-time path must
+verify at compile time while leaving the prover out of the artifact (see
+[Verification at build time](#verification-at-build-time-the-kaniverus-shape) below).
 
 ### The third oracle: rustc's own MIR, against the parser
 
@@ -2114,6 +2262,23 @@ The honest split:
 | Scope | bit-vectors, booleans, bounded quantifiers | first-order + arithmetic + more | — |
 | Maturity | a sketch | industrial | widely used |
 
+That table is an argument. [`examples/comparison/`](examples/comparison/README.md)
+is the evidence: three ordinary functions — a guarded `sat_add`, a `clamp`, and a
+counted `sum_to` — written for `discharge`, Kani, Verus, Prusti, SPARK, Coq and
+Lean, each tool asked to prove the same properties and then asked to *refuse* the
+same three injected bugs (a swapped-branch `sat_add`, a wrong-arm `clamp`, and a
+wrong-body `sum_to`). Every tool proves all three and catches all three, so the
+interesting result is not who wins but what each one is proving: Coq and Lean
+prove theorems about a hand-written **model**, and that model can silently be
+wrong (the first version of the Coq file proved the *buggy* `sat_add` correct,
+because unbounded `Z` never wraps), while `discharge` reads the MIR `rustc`
+actually emitted, so there is no transcription to drift. The contracts state the
+whole function, not a bound: `sat_add` says the result *is* the sum when it fits
+and `u16::MAX` when it does not, so the degenerate `u16::MAX` for every input is
+refused rather than accepted. The directory also puts Ferrocene beside the
+verifiers, as the qualified *compiler* that answers the other half of a safety
+case.
+
 Two things follow. First, `discharge` does compete with the big tools on the
 question that matters — *is the proof about the code or about a model of it?* —
 and the answer is the code: `src/mir/` reads the actual MIR that `rustc` lowers a
@@ -2225,6 +2390,62 @@ no test harness, so its verdict tests run on the host instead, under
 `cargo test --workspace --features std`.
 
 [Ferrocene]: https://ferrocene.dev/
+
+### Verification at build time: the Kani/Verus shape
+
+The claim above — the prover is *in* the artifact — is one of two shapes this crate can
+take, and the other one is worth stating plainly because it is what Kani and Verus
+actually do, and what a size-constrained safety build usually wants: **verify while the
+crate is built, and ship none of the verifier.**
+
+It costs nothing to reach, because the `mir` frontend is already `std`-only host tooling.
+Put `discharge` in `[build-dependencies]`, call the frontend from `build.rs`, and fail the
+build when an outcome is not `Verified`:
+
+```rust,ignore
+// build.rs
+fn main() {
+    println!("cargo:rerun-if-changed=src/lib.rs");
+    let report = discharge::mir::verify::verify_file_with("rustc", "src/lib.rs".as_ref(), &[])
+        .expect("the MIR frontend could not read the source");
+    for (name, outcome) in &report.outcomes {
+        println!("cargo:warning=discharge {name}: {outcome}");
+        assert!(outcome.is_verified(), "discharge: {name} is not verified: {outcome}");
+    }
+}
+```
+
+A build script is a *separate compilation unit*: cargo compiles it for the host, runs it,
+and throws it away. So the decision procedure — the whole BDD blasting and CDCL fallback —
+is never linked into the crate's own artifact. That is not an optimisation, it is a
+consequence of the build model, and it is what makes the two properties below both true at
+once:
+
+* **The verification happens at compile time.** A false contract is a build error naming
+  the broken obligation and its witness, exactly as it is under Kani or Verus. Nothing is
+  checked at runtime, so nothing can be skipped in a release build.
+* **The artifact is zero-cost.** Measured on this repository, `release`, `x86_64`:
+  a baseline binary is 447 728 bytes; with `discharge` as a build dependency the crate's own
+  rlib is ~5 KB and carries **zero** `discharge` symbols; with the prover *called* from the
+  crate's own code the same program is 5 746 640 bytes and carries 26 `discharge::smt`
+  symbols. The difference is whether the obligation was discharged before or after the code
+  shipped.
+
+Both shapes are real, and the choice is a trade-off rather than a verdict. Build-time
+verification buys the zero-cost artifact and pays with a host-side `rustc` (the frontend
+shells out to `--emit=mir`, so it needs a toolchain at build time and is not `no_std`).
+The embedded engine buys a proof that can run *where Z3 cannot* — `examples/bare_metal.rs`
+compiles the decision procedure for `thumbv7em-none-eabihf` — and pays with binary size.
+Neither is a substitute for the other; a flight build might use the first to keep the
+artifact small and the second for an on-target re-check of a critical invariant.
+
+This is gate 18 of `scripts/gate.sh`, run by `tools/build-verify/run.sh` on a scratch crate
+it creates and removes. It is a gate rather than a paragraph because "zero cost" and
+"verified at compile time" are both checkable claims, and both rot silently if only
+asserted: the script requires a good contract to build *and* the verifier to report
+`verified` (a build script that silently did nothing would otherwise pass), a broken
+contract to fail the build on its named obligation, and the resulting rlib to carry no
+prover symbols.
 
 ## License
 

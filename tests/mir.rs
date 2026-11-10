@@ -1488,25 +1488,109 @@ fn a_nested_field_write_through_a_mutable_reference_is_applied() {
 /// part of, and carried across by a whole-struct copy.
 ///
 /// Both are the "parts" rules one level down. `o.i = Inner { v: 9 }` makes the seed
-/// for `o.i.v` stale, so the false entry must not be *proved* against the
-/// pre-write leaf. And `c = d` must move `c.i.v` with the copy, so the true entry
-/// verifies -- it pins `c.i.v` and `d.i.v` to different values, so `verified` is
-/// the evidence the copy moved the right one rather than leaving `c`'s own seed.
+/// for `o.i.v` stale, so the false entry must be *refuted*: the body returns 9, and
+/// `ret == 3` holds for no input. Refutation and not merely "not proved" is the
+/// assertion, because a refusal also satisfies "not proved" and says nothing about
+/// whether the write landed. The body lowers to a struct literal into a temp
+/// followed by `(_1.0) = move _2`, so reaching the refutation is the evidence the
+/// temp's parts were re-rooted under the destination's nested place.
+///
+/// And `c = d` must move `c.i.v` with the copy, so the true entry verifies -- it
+/// pins `c.i.v` and `d.i.v` to different values, so `verified` is the evidence the
+/// copy moved the right one rather than leaving `c`'s own seed.
 #[test]
 fn a_nested_seed_is_invalidated_by_a_write_and_carried_by_a_copy() {
     let Some(report) = verify_realistic(&[
         "whole_inner_write_makes_nested_seed_stale",
+        "whole_inner_write_is_seen_by_the_leaf",
+        "whole_inner_write_through_a_mutable_reference_is_seen",
+        "whole_inner_move_carries_the_source_leaf",
+        "whole_inner_move_is_not_the_stale_destination",
+        "nested_swap_carries_the_other_side",
+        "nested_swap_is_not_the_stale_side",
+        "nested_aggregate_argument_reaches_the_helper",
+        "nested_aggregate_argument_is_not_the_stale_destination",
+        "nested_return_carries_the_field",
+        "nested_return_is_not_the_stale_field",
         "whole_struct_copy_carries_nested_paths",
     ]) else {
         return;
     };
     let stale = outcome(&report, "whole_inner_write_makes_nested_seed_stale");
     assert!(
-        !stale.is_verified(),
-        "a stale nested seed must not prove a false contract; got: {stale}"
+        matches!(stale, FnOutcome::Failed { .. }),
+        "a stale nested seed must let the false contract be refuted, not refused; got: {stale}"
+    );
+    // The positive direction: the same body's true contract (`ret == 9`) verifies, so
+    // the refutation above is the write landing and not a blanket refusal. Without this
+    // pair, an engine that answered `Unknown` for the whole shape would pass.
+    let landed = outcome(&report, "whole_inner_write_is_seen_by_the_leaf");
+    assert!(
+        landed.is_verified(),
+        "a nested aggregate write must land where the leaf reads it; got: {landed}"
+    );
+    // The `&mut` companion: the same write's destination carries a leading deref, so the
+    // re-rooting must resolve it or the field path never matches the read.
+    let via_ref = outcome(&report, "whole_inner_write_through_a_mutable_reference_is_seen");
+    assert!(
+        via_ref.is_verified(),
+        "a nested aggregate write through a &mut must reach the target's field path; got: {via_ref}"
     );
     let copy = outcome(&report, "whole_struct_copy_carries_nested_paths");
     assert!(copy.is_verified(), "a whole-struct copy must carry nested paths; got: {copy}");
+    // A nested-to-nested move: the *source* is a projection, which `copy_parts` refuses, so
+    // the re-rooting has to run on a nested source too. The pair pins both directions -- the
+    // source's leaf arrives (true `ret == 3`), and the destination's stale leaf is gone (the
+    // false `ret == 7` is refuted rather than proved against the seed the move replaced).
+    let carried = outcome(&report, "whole_inner_move_carries_the_source_leaf");
+    assert!(
+        carried.is_verified(),
+        "a nested-to-nested move must carry the source's leaf; got: {carried}"
+    );
+    let stale_move = outcome(&report, "whole_inner_move_is_not_the_stale_destination");
+    assert!(
+        matches!(stale_move, FnOutcome::Failed { .. }),
+        "the destination's pre-move leaf must not survive the move; got: {stale_move}"
+    );
+    // A nested swap: both sides are nested, so this is the shape that needs the guard to be
+    // "either side nested". The two seeds are distinct, so the positive verdict is the
+    // *other* side's leaf, and the twin claims the pre-swap one survived.
+    let swap = outcome(&report, "nested_swap_carries_the_other_side");
+    assert!(swap.is_verified(), "a nested swap must exchange the leaves; got: {swap}");
+    let swap_stale = outcome(&report, "nested_swap_is_not_the_stale_side");
+    assert!(
+        matches!(swap_stale, FnOutcome::Failed { .. }),
+        "a nested swap must not keep each side's own leaf; got: {swap_stale}"
+    );
+    // A nested aggregate handed to a helper by value and read back: the callee's return is a
+    // struct it built field-by-field, so the merge has to carry the *fields* (not only the
+    // tuple components). The positive verdict is the value that crossed; the twin claims a
+    // different one survived and must be refuted.
+    let through = outcome(&report, "nested_aggregate_argument_reaches_the_helper");
+    assert!(
+        through.is_verified(),
+        "a returned nested aggregate must keep its fields; got: {through}"
+    );
+    let through_stale =
+        outcome(&report, "nested_aggregate_argument_is_not_the_stale_destination");
+    assert!(
+        matches!(through_stale, FnOutcome::Failed { .. }),
+        "a returned nested aggregate must not keep a stale field; got: {through_stale}"
+    );
+    // A returned struct's *field* read back through a two-level path: the `Struct` literal
+    // stores the field value but not the operand aggregate's own parts, so the field's parts
+    // have to be re-rooted. The positive verdict is the value that crossed; the twin claims a
+    // different leaf and must be refuted.
+    let field = outcome(&report, "nested_return_carries_the_field");
+    assert!(
+        field.is_verified(),
+        "a returned struct's field must keep its parts; got: {field}"
+    );
+    let field_stale = outcome(&report, "nested_return_is_not_the_stale_field");
+    assert!(
+        matches!(field_stale, FnOutcome::Failed { .. }),
+        "a returned struct's field must not keep a stale leaf; got: {field_stale}"
+    );
 }
 
 /// A helper's write through a `&mut` argument reaches the caller, and the false
@@ -1538,6 +1622,276 @@ fn a_helpers_write_through_a_mutable_reference_reaches_the_caller() {
         assert!(
             matches!(o, FnOutcome::Failed { .. }),
             "a stale caller value must not prove this false contract; got: {o}"
+        );
+    }
+}
+
+/// An array element reached through a struct field is one word for the contract and
+/// the body, and the write does not spill onto a sibling array's element.
+///
+/// `x.a[0] = 9; x.a[0]` lowers to `(_1.0)[_2] = 9` and `_0 = copy (_1.0)[_4]`. The
+/// element store used to be keyed by the local and index alone, so the write landed
+/// under a key the read never consulted and the read returned the *seed* -- the false
+/// direction, where `ret == 5` was proved against a body returning 9. The pair below
+/// toothes both directions, and the sibling entry catches a store that collides
+/// `x.a[0]` with `x.b[0]`.
+#[test]
+fn a_field_array_element_is_one_word_for_contract_and_body() {
+    let Some(report) = verify_realistic(&[
+        "a_field_array_write_is_read_back",
+        "a_field_array_write_is_not_the_seed",
+        "a_sibling_field_array_is_untouched",
+    ]) else {
+        return;
+    };
+    let read_back = outcome(&report, "a_field_array_write_is_read_back");
+    assert!(
+        read_back.is_verified(),
+        "a write to `x.a[0]` must be seen by the read of `x.a[0]`; got: {read_back}"
+    );
+    let seed = outcome(&report, "a_field_array_write_is_not_the_seed");
+    assert!(
+        matches!(seed, FnOutcome::Failed { .. }),
+        "the pre-write seed must not prove a contract the body refutes; got: {seed}"
+    );
+    let sibling = outcome(&report, "a_sibling_field_array_is_untouched");
+    assert!(
+        sibling.is_verified(),
+        "writing `x.a[0]` must leave `x.b[0]` alone; got: {sibling}"
+    );
+}
+
+/// A *nested* array field is the same word on both sides, and the false direction is
+/// refuted rather than proved.
+///
+/// `o.i.a[0] = 9; o.i.a[0]` lowers to `(_1.0.0)[_2] = 9` and `_0 = copy (_1.0.0)[_4]`. The
+/// element's key is the whole field chain, so a store that stopped at the first field
+/// (`o.i`) would key the write and the read differently and leave the read at the seed --
+/// the false direction, where `ret == 5` was proved against a body returning 9.
+#[test]
+fn a_nested_field_array_element_is_one_word_for_contract_and_body() {
+    let Some(report) = verify_realistic(&[
+        "a_nested_field_array_write_is_read_back",
+        "a_nested_field_array_write_is_not_the_seed",
+    ]) else {
+        return;
+    };
+    let read_back = outcome(&report, "a_nested_field_array_write_is_read_back");
+    assert!(
+        read_back.is_verified(),
+        "a nested `o.i.a[0]` write must be seen by the read; got: {read_back}"
+    );
+    let seed = outcome(&report, "a_nested_field_array_write_is_not_the_seed");
+    assert!(
+        matches!(seed, FnOutcome::Failed { .. }),
+        "the nested pre-write seed must not prove a refuted contract; got: {seed}"
+    );
+}
+
+/// A helper's write to a field-array element crosses back through a `&mut`, and the read
+/// crosses *in* through a `&`; both directions are pinned, with their false twins.
+///
+/// The callee's write lands in its own element store, so the caller's store has to be
+/// re-based on return -- for a whole-local target (`set_first_element(&mut x)`) unchanged,
+/// and for a sub-place target (`set_holder_first_element(&mut o.i)`) prefixed with the
+/// target's chain. Without either the write died with the frame, the caller read its seed,
+/// and the false `ret == 5` was **proved** against a body returning 9. The read direction is
+/// the same re-basing run the other way: `read_holder_first_element(&o.i)` reads the
+/// caller's `o.i.a[0]`, so its contract decides rather than being unreadable.
+#[test]
+fn a_field_array_element_crosses_a_reference_argument() {
+    let Some(report) = verify_realistic(&[
+        "a_helper_field_array_write_is_read_back",
+        "a_helper_field_array_write_is_not_the_seed",
+        "a_helper_nested_aggregate_element_write_is_read_back",
+        "a_helper_nested_aggregate_element_write_is_not_the_seed",
+        "a_helper_nested_aggregate_element_read",
+    ]) else {
+        return;
+    };
+    for name in [
+        "a_helper_field_array_write_is_read_back",
+        "a_helper_nested_aggregate_element_write_is_read_back",
+        "a_helper_nested_aggregate_element_read",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must decide and verify; got: {o}");
+    }
+    for name in [
+        "a_helper_field_array_write_is_not_the_seed",
+        "a_helper_nested_aggregate_element_write_is_not_the_seed",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "`{name}` claims the caller's seed after the helper wrote; must be refuted, got: {o}"
+        );
+    }
+}
+
+/// An array handed over *as* a reference target (`&mut x.a`) used to be `Incomplete` in
+/// both directions. It now *decides*: the true contract is `Verified` and the false twin is
+/// refuted -- and the pair is what makes the decision trustworthy.
+///
+/// The callee's `(*_1)[0] = 9` lands in its own element store, and the return path re-bases
+/// it onto the caller's field-path store (`elems_path`, keyed by the target's *field* chain
+/// `x.a`) instead of dropping it. So the caller's `x.a[0]` read is the callee's write, and
+/// `ensures: ret == 9` is provable while `ensures: ret == 5` is refuted.
+///
+/// This test is the tripwire the *hole* was pinned with, kept in its stronger form. While
+/// the shape was unmodelled it asserted `Incomplete`; the fix that made it decide is the
+/// change the pin existed to police, because a re-basing that connected the two stores the
+/// *wrong* way would turn the false twin `Verified` first. It did not: the twin is `Failed`.
+/// If a later change makes this shape incomplete again, this test fails and the two
+/// assertions say exactly which direction broke.
+#[test]
+fn a_whole_array_target_decides_without_a_false_proof() {
+    let Some(report) = verify_realistic(&[
+        "a_whole_array_target_crosses_a_reference_argument",
+        "a_whole_array_target_cannot_prove_this",
+        "a_whole_array_target_sibling_cannot_prove_this",
+        "a_whole_array_target_read_crosses_a_reference_argument",
+        "a_whole_array_target_read_cannot_prove_this",
+        "a_whole_array_target_read_modify_write",
+        "a_whole_array_target_read_modify_write_cannot_prove_this",
+        "a_nested_whole_array_target_crosses_a_reference_argument",
+        "a_nested_whole_array_target_cannot_prove_this",
+        "a_whole_array_target_crosses_two_frames",
+        "a_whole_array_target_crosses_two_frames_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    let o = outcome(&report, "a_whole_array_target_crosses_a_reference_argument");
+    assert!(
+        o.is_verified(),
+        "a `&mut x.a` array target re-bases the callee's element onto the caller's \
+         field-path store, so the true contract `ret == 9` must verify; got: {o}"
+    );
+    let twin = outcome(&report, "a_whole_array_target_cannot_prove_this");
+    assert!(
+        matches!(twin, FnOutcome::Failed { .. }),
+        "the false twin of the whole-array target must be refuted -- a false proof is the \
+         only unacceptable outcome, and `Verified` here would be one; got: {twin}"
+    );
+    let sibling = outcome(&report, "a_whole_array_target_sibling_cannot_prove_this");
+    assert!(
+        !sibling.is_verified(),
+        "the write to `x.a` must not leak into the sibling `x.b`, so claiming `x.b[0]` \
+         changed must not verify; got: {sibling}"
+    );
+    let read = outcome(&report, "a_whole_array_target_read_crosses_a_reference_argument");
+    assert!(
+        read.is_verified(),
+        "the read-only direction (`peek_of(&x.a)`) must also decide -- the carry-in \
+         re-bases the caller's field-path element onto the callee's store, so `ret == 5` \
+         verifies; got: {read}"
+    );
+    let read_twin = outcome(&report, "a_whole_array_target_read_cannot_prove_this");
+    assert!(
+        !read_twin.is_verified(),
+        "the false read-only twin (`ret == 7` against a seed of 5) must not verify; \
+         got: {read_twin}"
+    );
+    // The three shapes below are the re-basing rule applied where it is easy to get it
+    // *partly* right: a read-modify-write (both directions in one call), a target two
+    // fields deep, and a write that crosses two frames. Each true contract must decide
+    // and each false twin must be refuted -- a fix that handled only the write, or only
+    // a single-field chain, or only one frame, would show up as a true direction stuck
+    // `Incomplete` (or, worse, a twin `Verified`).
+    for (name, want) in [
+        ("a_whole_array_target_read_modify_write", true),
+        ("a_whole_array_target_read_modify_write_cannot_prove_this", false),
+        ("a_nested_whole_array_target_crosses_a_reference_argument", true),
+        ("a_nested_whole_array_target_cannot_prove_this", false),
+        ("a_whole_array_target_crosses_two_frames", true),
+        ("a_whole_array_target_crosses_two_frames_cannot_prove_this", false),
+    ] {
+        let got = outcome(&report, name);
+        if want {
+            assert!(got.is_verified(), "`{name}` must verify; got: {got}");
+        } else {
+            assert!(
+                !got.is_verified(),
+                "`{name}` is a false direction and must not verify; got: {got}"
+            );
+        }
+    }
+}
+
+/// A method's returned reference to an *element* re-bases onto the caller's element.
+///
+/// `x.first_mut()` is `&mut x.a[0]`, and the dump names the element index with a
+/// local (`_2`), not the literal. Translating the returned reference to the caller
+/// therefore has to resolve that local *before* the callee's frame is gone; carrying
+/// it through left a place no element store is keyed by, the write `*x.first_mut() = 9`
+/// was dropped, and the contract was unreadable -- `Incomplete` in both directions.
+/// The true contract must now decide and the false twin must be refuted; the sibling
+/// element is the second tooth, because a fix that pinned every returned element to
+/// index 0 would decide the first case and read the wrong element here.
+#[test]
+fn a_returned_reference_to_an_element_reaches_the_caller() {
+    let Some(report) = verify_realistic(&[
+        "returned_ref_to_an_element_crosses_the_frame",
+        "returned_ref_to_an_element_cannot_prove_this",
+        "returned_ref_to_a_sibling_element",
+        "returned_ref_to_a_sibling_element_cannot_prove_this",
+        "returned_ref_write_is_not_the_wrong_element_cannot_prove_this",
+        "returned_ref_to_a_whole_array_element",
+        "returned_ref_to_a_whole_array_element_cannot_prove_this",
+        "returned_ref_to_a_nested_whole_array_element",
+        "returned_ref_to_a_nested_whole_array_element_cannot_prove_this",
+        "returned_ref_to_a_guarded_symbolic_element",
+        "returned_ref_to_a_guarded_symbolic_element_cannot_prove_this",
+        "returned_ref_to_an_unpinned_symbolic_element_cannot_prove_this",
+        "a_shifted_symbolic_element_cannot_prove_this",
+        "a_shifted_symbolic_element_is_not_proved",
+    ]) else {
+        return;
+    };
+    for name in [
+        "returned_ref_to_an_element_crosses_the_frame",
+        "returned_ref_to_a_sibling_element",
+        "returned_ref_to_a_whole_array_element",
+        "returned_ref_to_a_nested_whole_array_element",
+        "returned_ref_to_a_guarded_symbolic_element",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            o.is_verified(),
+            "the write through the returned element reference must reach the caller's \
+             element, so `{name}` must verify; got: {o}"
+        );
+    }
+    for name in [
+        "returned_ref_to_an_element_cannot_prove_this",
+        "returned_ref_to_a_sibling_element_cannot_prove_this",
+        "returned_ref_write_is_not_the_wrong_element_cannot_prove_this",
+        "returned_ref_to_a_whole_array_element_cannot_prove_this",
+        "returned_ref_to_a_nested_whole_array_element_cannot_prove_this",
+        "returned_ref_to_a_guarded_symbolic_element_cannot_prove_this",
+        "returned_ref_to_an_unpinned_symbolic_element_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            !o.is_verified(),
+            "`{name}` is a false direction -- a write aimed at the wrong element would \
+             prove it; got: {o}"
+        );
+    }
+    // The shifted-numbering pair is a *refusal* in both directions: the write may
+    // land on any element, so neither `ret == 9` nor `ret == 5` decides. The false
+    // direction must not be proved (the write must not be aimed at a caller local
+    // that shares the callee index's number), and the true direction must not be
+    // proved either (dropping the write must not leave the seed readable).
+    for name in [
+        "a_shifted_symbolic_element_cannot_prove_this",
+        "a_shifted_symbolic_element_is_not_proved",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            !o.is_verified(),
+            "`{name}` must be a refusal -- a symbolic returned index names no single \
+             element, so neither direction decides; got: {o}"
         );
     }
 }
@@ -1656,17 +2010,20 @@ fn an_element_target_is_written_and_a_by_value_copy_is_not() {
     }
 }
 
-/// A method is inlined by its *last* path component, because rustc defines an
-/// inherent method as `<impl at file:line:col>::set_lo` but calls it as
-/// `Config::set_lo`; and an ambiguous tail is refused rather than guessed.
+/// A method is inlined by its *last* path component plus its receiver's type,
+/// because rustc defines an inherent method as `<impl at file:line:col>::set_lo`
+/// but calls it as `Config::set_lo`; a shared tail is disambiguated by the type
+/// rather than guessed at.
 ///
 /// Before the tail match, a call to any method was "unmodelled function", so a
 /// method's write through `&mut self` was invisible to its caller. The tripwire
-/// pins the other direction: `set_lo` is both a method and a free function here, so
-/// the tail names two bodies and the call must be refused -- inlining the free
-/// function would write through the wrong shape and *prove* a false contract.
+/// pins the other direction: `twist` is both a method and a free function here, so
+/// the tail alone names two bodies. The call `w.twist(5)` names the receiver's
+/// type, so it resolves to `Widget::twist`; inlining the free function instead
+/// would write through the wrong shape and *prove* a false contract, so the
+/// resolution must pick the method and refute the claim.
 #[test]
-fn a_method_is_inlined_by_its_tail_and_an_ambiguous_tail_is_refused() {
+fn a_method_is_inlined_by_its_tail_and_a_shared_tail_resolves_by_type() {
     let Some(report) = verify_realistic(&[
         "a_method_write_reaches_the_caller",
         "a_method_write_cannot_prove_this",
@@ -1728,12 +2085,17 @@ fn a_method_is_inlined_by_its_tail_and_an_ambiguous_tail_is_refused() {
             "a stale caller value must not prove this false contract; got: {o}"
         );
     }
-    // Refused, not decided either way: the tail is ambiguous, so any verdict would
-    // come from the wrong body. It surfaces as `Incomplete`, which is not a pass.
+    // The tail `twist` is shared by `Widget::twist` and a free `twist`, but the
+    // call `w.twist(5)` names its receiver's type, so the resolver picks the
+    // method by that type rather than by the tail alone. Answering it from the
+    // free function -- which writes through a `&mut u8` -- would *prove* this
+    // false contract; the correct body sets `w.v = 5`, so the postcondition is
+    // refuted. Refuted is the evidence the right body was chosen.
     let o = outcome(&report, "an_ambiguous_method_tail_cannot_prove_this");
     assert!(
-        matches!(o, FnOutcome::Incomplete { .. }),
-        "an ambiguous method tail must be refused; got: {o}"
+        matches!(o, FnOutcome::Failed { .. }),
+        "a shared method tail must resolve to the receiver's own body and refute \
+         the false contract, not prove it; got: {o}"
     );
 }
 
@@ -2175,6 +2537,245 @@ fn a_reference_to_a_reference_crosses_a_frame_only_when_refused() {
     );
 }
 
+/// An array that is a struct *field* carries its elements when the aggregate is moved.
+///
+/// `ArrayHolder { a: [9, 1, 2, 3] }` builds the array in a temp whose elements live in the
+/// whole-local `elems` store, then moves it into the field. `rebase_parts` re-based
+/// `elems_path` (field-path arrays) but missed `elems`, so `x.a[0]` read `Unknown` and the
+/// contract stayed `Incomplete` in *both* directions -- a coverage hole, not a false proof,
+/// since a missing value proves nothing. A bare array literal always worked, so the hole
+/// was specific to the field case. The whole-field write through a reference (`*h = n`)
+/// exercises the same carry across a frame, and the sibling check keeps the re-base from
+/// spilling the elements onto a neighbouring scalar.
+#[test]
+fn an_array_field_of_a_moved_aggregate_carries_its_elements() {
+    let Some(report) = verify_realistic(&[
+        "a_struct_literal_array_element_is_read_back",
+        "a_struct_literal_array_element_is_not_the_seed_cannot_prove_this",
+        "a_struct_literal_array_second_element_is_read_back",
+        "a_struct_literal_array_second_element_is_not_the_first_cannot_prove_this",
+        "a_nested_struct_literal_array_element_is_read_back",
+        "a_nested_struct_literal_array_element_is_not_the_seed_cannot_prove_this",
+        "a_whole_field_assignment_carries_its_array_elements",
+        "a_stale_whole_field_array_element_cannot_prove_this",
+        "a_whole_field_assignment_leaves_its_sibling",
+        "a_whole_field_assignment_leaves_its_sibling_cannot_prove_this",
+        "an_array_field_argument_is_read_by_element",
+        "an_array_field_argument_is_read_by_element_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "a_struct_literal_array_element_is_read_back",
+        "a_struct_literal_array_second_element_is_read_back",
+        "a_nested_struct_literal_array_element_is_read_back",
+        "a_whole_field_assignment_carries_its_array_elements",
+        "a_whole_field_assignment_leaves_its_sibling",
+        "an_array_field_argument_is_read_by_element",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "an array field's elements must reach the read; got: {o}");
+    }
+    for name in [
+        "a_struct_literal_array_element_is_not_the_seed_cannot_prove_this",
+        "a_struct_literal_array_second_element_is_not_the_first_cannot_prove_this",
+        "a_nested_struct_literal_array_element_is_not_the_seed_cannot_prove_this",
+        "a_stale_whole_field_array_element_cannot_prove_this",
+        "a_whole_field_assignment_leaves_its_sibling_cannot_prove_this",
+        "an_array_field_argument_is_read_by_element_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a stale or misdirected array-field element must not prove this; got: {o}"
+        );
+    }
+}
+
+/// A whole-aggregate replacement through a sub-place target decides.
+///
+/// `set_whole(&mut o.i, InnerBox { v: 9 })` replaces the whole referent. This was once
+/// believed *sound-incomplete* -- a leaf write "cannot spell a whole value" -- but the
+/// re-based write-back re-roots the callee's `fields` entry for the moved value under the
+/// target's chain, and in this store a whole value and a leaf are both a `fields` entry, so
+/// the shape was never actually the blocker. The sibling check keeps the re-root from
+/// landing on the whole local, and the local-built value makes the carry come from a temp.
+#[test]
+fn a_whole_aggregate_replacement_through_a_sub_place_decides() {
+    let Some(report) = verify_realistic(&[
+        "whole_replacement_through_sub_place",
+        "whole_replacement_through_sub_place_cannot_prove_this",
+        "whole_replacement_leaves_the_sibling",
+        "whole_replacement_leaves_the_sibling_cannot_prove_this",
+        "whole_replacement_from_a_local",
+        "whole_replacement_from_a_local_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "whole_replacement_through_sub_place",
+        "whole_replacement_leaves_the_sibling",
+        "whole_replacement_from_a_local",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a whole replacement must reach the caller's leaf; got: {o}");
+    }
+    for name in [
+        "whole_replacement_through_sub_place_cannot_prove_this",
+        "whole_replacement_leaves_the_sibling_cannot_prove_this",
+        "whole_replacement_from_a_local_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a stale or misdirected whole replacement must not prove this; got: {o}"
+        );
+    }
+}
+
+/// A named `const` item's value is inlined at the use site.
+///
+/// rustc const-evaluates a `const` item and prints its *body* separately
+/// (`const LIMIT: u8 = const 10_u8;`) while referring to it by name at the use
+/// site (`_0 = const LIMIT`). Reading only the name left the use site an
+/// unreadable path constant, so a contract that mentioned the constant was lost.
+/// The true directions must decide, and each false twin -- whose postcondition is
+/// false on *every* input -- must be refuted, which is what a regression that
+/// guessed the value would fail.
+#[test]
+fn a_named_const_item_is_inlined_at_its_use_site() {
+    let Some(report) = verify_realistic(&[
+        "named_const_is_read",
+        "named_const_is_read_cannot_prove_this",
+        "named_const_keeps_its_width",
+        "named_const_keeps_its_width_cannot_prove_this",
+        "named_bool_const_selects",
+        "named_bool_const_selects_cannot_prove_this",
+        "named_const_bounds_a_comparison",
+        "named_const_bounds_a_comparison_cannot_prove_this",
+        "named_const_matches_an_equality",
+        "named_const_matches_an_equality_cannot_prove_this",
+        "named_negative_const_is_signed",
+        "named_negative_const_is_signed_cannot_prove_this",
+        "nested_module_const_is_read",
+        "nested_module_const_is_read_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "named_const_is_read",
+        "named_const_keeps_its_width",
+        "named_bool_const_selects",
+        "named_const_bounds_a_comparison",
+        "named_const_matches_an_equality",
+        "named_negative_const_is_signed",
+        "nested_module_const_is_read",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a named const must fold at its use site; got: {o}");
+    }
+    for name in [
+        "named_const_is_read_cannot_prove_this",
+        "named_const_keeps_its_width_cannot_prove_this",
+        "named_bool_const_selects_cannot_prove_this",
+        "named_const_bounds_a_comparison_cannot_prove_this",
+        "named_const_matches_an_equality_cannot_prove_this",
+        "named_negative_const_is_signed_cannot_prove_this",
+        "nested_module_const_is_read_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a wrong inlined const value must not prove this; got: {o}"
+        );
+    }
+}
+
+/// A contract may name a top-level `const` the way the body does.
+///
+/// The reader resolves a bare name against the arguments first, then against the
+/// program's own `const` table -- the *same* table the executor folds a body's
+/// `const LIMIT` from, so the two cannot disagree. The true directions must decide,
+/// and each false twin must be refuted; a name that resolved to nothing (or to a
+/// wrong value) would leave the twin unproved or, worse, prove it.
+///
+/// The two cases that are *refusals* rather than proofs are checked separately: an
+/// expression-bodied constant has no literal to fold, and a misspelled name is not
+/// an argument. Both must be `Skipped`, never `verified` and never a wrong value.
+#[test]
+fn a_contract_may_name_a_const_item() {
+    let Some(report) = verify_realistic(&[
+        "a_contract_names_a_const",
+        "a_contract_names_a_const_cannot_prove_this",
+        "a_contract_names_a_negative_const",
+        "a_contract_names_a_bool_const",
+        "a_contract_names_a_qualified_const",
+        "a_contract_names_a_qualified_const_cannot_prove_this",
+        "a_contract_names_an_expression_const",
+        "a_misspelled_const_is_refused",
+    ]) else {
+        return;
+    };
+    for name in [
+        "a_contract_names_a_const",
+        "a_contract_names_a_negative_const",
+        "a_contract_names_a_bool_const",
+        "a_contract_names_a_qualified_const",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a contract must resolve a named const; got: {o}");
+    }
+    for name in [
+        "a_contract_names_a_const_cannot_prove_this",
+        "a_contract_names_a_qualified_const_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a wrong const value must not prove this; got: {o}"
+        );
+    }
+    for name in ["a_contract_names_an_expression_const", "a_misspelled_const_is_refused"] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Skipped { .. }),
+            "an unresolvable const name must be refused, not guessed; got: {o}"
+        );
+    }
+}
+
+/// A function-local `const` is not in scope in another function.
+///
+/// `a_local_const_owner` declares `const L: u8 = 3;` in its body; the dump prints
+/// that definition bare (`const L: u8 = const 3_u8;`) -- the same spelling a
+/// crate-level `const` gets -- while its *use* is qualified (`const
+/// a_local_const_owner::L`). A bare program-wide key for the definition let the
+/// other function's `requires: L == 3` resolve to a name its own source could not
+/// write, so the function was *proved* from a foreign body: a wrong proof, not a
+/// lost one. The name must resolve to nothing here, leaving the function `Skipped`
+/// (unreadable `requires`), never `Verified`.
+///
+/// The crate-level constant path stays covered by
+/// [`a_contract_may_name_a_const_item`], so this pins that the scope rule did not
+/// also drop the in-scope names.
+#[test]
+fn a_local_const_is_not_in_scope_in_another_function() {
+    let Some(report) = verify_realistic(&[
+        "a_local_const_owner",
+        "a_local_const_is_not_in_scope_in_another_function",
+    ]) else {
+        return;
+    };
+    let owner = outcome(&report, "a_local_const_owner");
+    assert!(owner.is_verified(), "the owner reads its own local const; got: {owner}");
+    let other = outcome(&report, "a_local_const_is_not_in_scope_in_another_function");
+    assert!(
+        !other.is_verified(),
+        "a contract must not resolve another function's local const -- that is a \
+         wrong proof; got: {other}"
+    );
+}
+
 /// The whole-corpus direction invariant: a function whose *name* says it must not be
 /// provable may never come back `verified`.
 ///
@@ -2270,6 +2871,53 @@ fn a_deep_term_walk_is_refused_not_allowed_to_overflow_the_stack() {
         shallow.is_verified(),
         "the power-of-two fast path must still verify: {shallow}"
     );
+}
+
+/// A pin applies to an aggregate *part*, not only to a whole argument.
+///
+/// `requires: w.v == -7` names a struct field, `requires: o.i.v == -7` names a nested
+/// path, and `requires: xs[0] == -7` names an array element. All three are the same shape
+/// as the argument-level pin -- a closed equality in the precondition, under any nesting of
+/// `&&` -- but the variable the contract binds is a part's, not a local's. Keying the pin by
+/// the argument's *local* reached none of them, so the body's `w.v / 3` stayed symbolic and
+/// built the 64-bit restoring divider: `incomplete` in ~1.2s, decided in ~0s once the pin is
+/// keyed by the variable's own index.
+///
+/// The `cannot_prove_this` companions are the point of the test. Without them, an engine
+/// that answered `Verified` for everything would pass the positive assertions, so the
+/// negatives are what make "decided" mean "decided correctly": the fold refutes a wrong
+/// claim about the same pinned part, which is only possible if the value really is `-7`.
+#[test]
+fn a_pin_reaches_an_aggregate_part_not_only_a_whole_argument() {
+    let Some(report) = verify_realistic(&[
+        "a_field_pinned_division_at_i64",
+        "a_field_pinned_division_cannot_prove_this",
+        "a_nested_pinned_division_at_i64",
+        "a_nested_pinned_division_cannot_prove_this",
+        "an_element_pinned_division_at_i64",
+        "an_element_pinned_division_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "a_field_pinned_division_at_i64",
+        "a_nested_pinned_division_at_i64",
+        "an_element_pinned_division_at_i64",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a pinned aggregate part must be decided; `{name}` got: {o}");
+    }
+    for name in [
+        "a_field_pinned_division_cannot_prove_this",
+        "a_nested_pinned_division_cannot_prove_this",
+        "an_element_pinned_division_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            !o.is_verified(),
+            "a false claim about a pinned part must be refuted, not proved; `{name}` got: {o}"
+        );
+    }
 }
 
 /// A callee's contract is never taken on faith: its body is inlined, so a lying
@@ -2996,7 +3644,15 @@ fn assert_not_dropped(name: &str, src: &str, present: bool, missing: &[String]) 
 
 fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
     let rustc = rustc()?;
-    let dir = std::env::temp_dir().join(format!("discharge-{name}-{}", std::process::id()));
+    // A unique directory per call: two tests that both ask about a function
+    // named `reads` run in parallel and would otherwise write the same
+    // `probe.rs`, so one test could read the other's source. The counter keeps
+    // the path unique within the process; the pid keeps it unique across
+    // processes.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir()
+        .join(format!("discharge-{name}-{}-{seq}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("probe.rs");
     std::fs::write(&file, src).expect("write probe");
@@ -3178,6 +3834,15 @@ pub fn reassigned_then_field(mut c: B, d: B) -> u8 {
 /// The struct path now mirrors the enum path: a body that closes on the head line
 /// is read inline, and a cursor is opened only for a body that does not. This
 /// pins the function after the struct as still present and still decided.
+///
+/// The `None` case is a *skip*, not a failure, like every other `rustc`-dependent
+/// test in this file: `verify_src` returns `None` when no `DISCHARGE_RUSTC` is
+/// named, and there is nothing to assert about a compiler that is not there. This
+/// one used to `panic!` on `None`, which made the whole suite fail on a machine
+/// with no `DISCHARGE_RUSTC` -- the one test in the file that read "no compiler"
+/// as "a bug", so the suite's verdict depended on the environment rather than on
+/// the code. It is a skip now, and the reason is worth keeping: the property is
+/// real and worth pinning, but a missing toolchain is not evidence against it.
 #[test]
 fn a_one_line_struct_does_not_swallow_the_functions_after_it() {
     let src = r#"
@@ -3189,9 +3854,7 @@ pub fn after_inline_struct(x: u8) -> u8 {
     0
 }
 "#;
-    let Some(o) = verify_src("after_inline_struct", src) else {
-        panic!("the function after a one-line struct was dropped from the spec table");
-    };
+    let Some(o) = verify_src("after_inline_struct", src) else { return };
     assert!(o.is_verified(), "the function must still be read and decided; got: {o}");
 }
 
@@ -5126,5 +5789,871 @@ fn a_typed_constant_mask_keeps_its_type() {
     ] {
         let o = outcome(&report, name);
         assert!(o.is_verified(), "{name} is well-typed and must verify, got: {o}");
+    }
+}
+
+/// A pin is *transitive*: a right-hand side that names an earlier pinned variable is
+/// pinned too, and the body folds as if the whole chain had been written as literals.
+///
+/// `a == 5 && b == a + 1 && c == b * 2` fixes `c` at `12` by transitivity, so `c / 4` is
+/// `12 / 4` and the obligation is a fact about numbers. A single-pass extraction pinned
+/// only `a`, left `b` and `c` symbolic, and built the full divider — `incomplete` however
+/// small the contract was. The multiply is the second half of the shape: it makes the
+/// *path condition* expensive even once every operand is a literal, which is what the
+/// closed-goal check in `prove_implies` exists for.
+///
+/// The `cannot_prove_this` companion is the point: without it, an engine that answered
+/// `Verified` for everything would pass, so the negative is what makes the positive a
+/// proof rather than a vacuous `true`.
+#[test]
+fn a_transitive_pin_chain_folds_the_body() {
+    let Some(report) = verify_realistic(&[
+        "a_transitive_pin_chain_folds_the_body",
+        "a_transitive_pin_chain_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    let good = outcome(&report, "a_transitive_pin_chain_folds_the_body");
+    assert!(good.is_verified(), "a transitive pin chain must fold the body; got: {good}");
+    // The negative must be *refuted*, not merely "not verified". A refusal and a
+    // counterexample are both "not verified", and only the second is evidence the
+    // rewrite did anything: the point of rewriting the pins into the path is that the
+    // multiply leaves the assumption and the false claim becomes decidable. Asserting
+    // the weaker property would let a regression back to `incomplete` pass.
+    let bad = outcome(&report, "a_transitive_pin_chain_cannot_prove_this");
+    assert!(
+        matches!(bad, FnOutcome::Failed { .. }),
+        "a false claim about a transitively pinned chain must be refuted, not refused; got: {bad}"
+    );
+}
+
+/// An unsigned division by a power of two is a shift, and the body over a *symbolic*
+/// dividend is decided rather than refused for the divider's diagram.
+///
+/// The signed fast path existed; the unsigned side did not, so `n / 4` on a `u64` with
+/// only a bound on `n` built the full restoring divider and came back `incomplete` in
+/// ~0.9 s. The remainder is the other half of the same helper (`n & 3`), and it is here so
+/// a future edit that wires only the quotient fails.
+///
+/// The `cannot_prove_this` companion is what keeps "decided" meaning "decided correctly":
+/// without it, a fast path that returned a wrong value for every input could still pass.
+#[test]
+fn an_unsigned_power_of_two_division_is_a_shift_not_a_divider() {
+    let Some(report) = verify_realistic(&[
+        "an_unsigned_power_of_two_division_is_decided",
+        "an_unsigned_power_of_two_division_cannot_prove_this",
+        "an_unsigned_power_of_two_remainder_is_decided",
+    ]) else {
+        return;
+    };
+    for name in [
+        "an_unsigned_power_of_two_division_is_decided",
+        "an_unsigned_power_of_two_remainder_is_decided",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "an unsigned power-of-two op must be decided; `{name}` got: {o}");
+    }
+    let bad = outcome(&report, "an_unsigned_power_of_two_division_cannot_prove_this");
+    assert!(
+        !bad.is_verified(),
+        "a false claim about an unsigned division must be refuted; got: {bad}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Recursion by contract
+// ---------------------------------------------------------------------------
+
+/// A recursive function is proved by induction, not by unrolling.
+///
+/// The self-call is answered by the function's own contract: its precondition is
+/// proved of `n - 1`, the `decreases:` measure is proved to shrink, and the
+/// postcondition is assumed for the result. The base case is proved by the body,
+/// which is what makes the induction well-founded rather than circular.
+///
+/// Before `decreases:` existed, this function hit `DEFAULT_INLINE_DEPTH` and came
+/// back `Incomplete`, so a proof here is the whole point of the feature.
+#[test]
+fn a_recursive_function_is_proved_by_its_decreases_measure() {
+    let Some(report) = verify_realistic(&["a_recursive_identity"]) else { return };
+    let o = outcome(&report, "a_recursive_identity");
+    assert!(
+        o.is_verified(),
+        "a recursive function with a decreasing measure must be proved by induction, got: {o}"
+    );
+}
+
+/// The inductive assumption must not rescue a body that is simply wrong.
+///
+/// `a_recursive_lie_cannot_prove_this` has `a_recursive_identity`'s contract but a
+/// body that returns `n + 1` in the recursive case. If the postcondition were
+/// assumed at the base case too -- or if the `return` obligations were skipped --
+/// it would come back `verified`, which is a false proof. It must be a definite
+/// failure, with a counterexample.
+#[test]
+fn a_recursive_body_that_does_not_establish_its_postcondition_is_refuted() {
+    let Some(report) = verify_realistic(&["a_recursive_lie_cannot_prove_this"]) else { return };
+    let o = outcome(&report, "a_recursive_lie_cannot_prove_this");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("a recursive body that breaks its postcondition must fail, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "got: {o}");
+}
+
+/// An assumption with no decreasing measure is circular, so it must be refused.
+///
+/// `a_recursive_call_that_does_not_decrease_cannot_prove_this` calls itself on the
+/// same `n`. Its precondition and postcondition are both true of the body, so
+/// nothing but the measure check stands between it and a false proof. It must not
+/// verify.
+#[test]
+fn a_recursive_call_without_a_decreasing_measure_is_not_assumed() {
+    let Some(report) = verify_realistic(&["a_recursive_call_that_does_not_decrease_cannot_prove_this"])
+    else {
+        return;
+    };
+    let o = outcome(&report, "a_recursive_call_that_does_not_decrease_cannot_prove_this");
+    assert!(
+        !o.is_verified(),
+        "an induction without a decreasing measure must not be assumed, got: {o}"
+    );
+}
+
+/// The recursive call's *precondition* is an obligation, not a formality.
+///
+/// `a_recursive_call_out_of_range_cannot_prove_this` has `requires: n <= 3` and
+/// calls itself on `n + 1`, leaving that range. Proving the precondition at the
+/// call is what keeps the induction hypothesis applicable only where the contract
+/// holds; without it the postcondition would be assumed for an input the function
+/// never promised anything about.
+#[test]
+fn a_recursive_call_must_satisfy_its_own_precondition() {
+    let Some(report) =
+        verify_realistic(&["a_recursive_call_out_of_range_cannot_prove_this"])
+    else {
+        return;
+    };
+    let o = outcome(&report, "a_recursive_call_out_of_range_cannot_prove_this");
+    assert!(
+        !o.is_verified(),
+        "a recursive call that violates its own precondition must not be assumed, got: {o}"
+    );
+}
+
+/// A contract on an *inherent method* is resolved, and its postcondition is
+/// actually checked.
+///
+/// The MIR dump names a method's body `<impl at FILE:L:C: L:C>::bump`, but the
+/// source scanner keys the contract by the bare `bump`. Resolving only the exact
+/// dump name matched nothing, and a missing contract is not a refusal:
+/// `verify_function` derives `requires` and `ensures` from it, so the method was
+/// checked against `true` and *no* postcondition and came back `verified` with
+/// **zero obligations**. The obligation count is the load-bearing part of this
+/// assertion -- a fix that merely matched the name but skipped the body would
+/// still report `Verified`, and only the count catches that.
+#[test]
+fn a_contract_on_an_inherent_method_is_resolved_and_checked() {
+    let Some(report) = verify_realistic(&["bump"]) else { return };
+    let o = outcome(&report, "bump");
+    let FnOutcome::Verified { obligations, .. } = o else {
+        panic!("a method whose contract holds must verify, got: {o}");
+    };
+    assert!(
+        *obligations > 0,
+        "the method's postcondition must be checked, not silently dropped; got {obligations} \
+         obligation(s)"
+    );
+}
+
+/// The false direction: a method whose postcondition the body does not establish
+/// must be refuted, never `verified`.
+///
+/// `bump_cannot_prove_this` has `bump`'s body but demands `ret == self.n + 2`, so
+/// the claim is false on every input. Before the tail resolution this was
+/// `Verified { obligations: 0 }` -- a false proof, because the contract never
+/// reached the checker. The failure kind is pinned to the postcondition so a fix
+/// that refused the method for an unrelated reason cannot pass this.
+#[test]
+fn a_contract_on_an_inherent_method_that_is_false_is_refuted() {
+    let Some(report) = verify_realistic(&["bump_cannot_prove_this"]) else { return };
+    let o = outcome(&report, "bump_cannot_prove_this");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("a method whose postcondition is false must fail, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+}
+
+// ---------------------------------------------------------------------------
+// Frontend soundness regressions (F1-F4)
+//
+// Each of these four was a confirmed defect in the MIR frontend, found by probe
+// and fixed in the same change. They are pinned here so a later refactor cannot
+// quietly reopen them.
+
+/// F1: a free function named exactly like an intrinsic that calls the *intrinsic*
+/// is not calling itself.
+///
+/// `wrapping_add` calls `u8::wrapping_add` on its non-base path. The intrinsic is
+/// printed fully qualified (`core::num::<impl u8>::wrapping_add`), and the old
+/// resolver matched call names to definitions on the last `::` component alone,
+/// so the intrinsic call resolved to *this function*. `try_recursive_call` then
+/// assumed this function's own postcondition for the result -- a genuine false
+/// proof: `ret == 0` was "proved" while the body returns `n` for `n > 0`. The
+/// resolver now also requires the method's `self` type to agree, so `u8` and the
+/// free function are distinct and the intrinsic model handles the call.
+///
+/// The name must be the intrinsic's *exact* tail, and the function needs a
+/// `decreases:` measure, or the recursion route that carries the false proof never
+/// fires -- a name like `wrapping_add_cannot_prove_this` does not reproduce it.
+#[test]
+fn an_intrinsic_call_is_not_a_self_recursive_call() {
+    let Some(report) = verify_realistic(&["wrapping_add"]) else { return };
+    let o = outcome(&report, "wrapping_add");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!(
+            "a function named like an intrinsic that calls the intrinsic must be \
+             refuted, not proved from its own postcondition; got: {o}"
+        );
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+}
+
+/// F1 companion: a free function named like an intrinsic that *does* recurse must
+/// still be proved by induction.
+///
+/// The guard that fixes F1 must not refuse a real self-call just because the name
+/// matches an intrinsic. `wrapping_add_still_recurses` calls itself, printed bare
+/// (`wrapping_add_still_recurses`), which matches it by exact name.
+#[test]
+fn a_free_recursion_named_like_an_intrinsic_still_recurses() {
+    let Some(report) = verify_realistic(&["wrapping_add_still_recurses"]) else { return };
+    let o = outcome(&report, "wrapping_add_still_recurses");
+    assert!(
+        o.is_verified(),
+        "a free function named like an intrinsic that recurses must verify; got: {o}"
+    );
+}
+
+/// F1 companion: a *static associated function* named like an intrinsic that
+/// genuinely recurses must still be proved by induction.
+///
+/// The type check that fixes F1 must not refuse a real self-call just because the
+/// tail matches an intrinsic name. `Recursing::wrapping_sub` calls itself, and a
+/// `core` intrinsic's call name carries an `<impl` projection that the resolver
+/// refuses, so the real self-call still fires.
+#[test]
+fn a_method_named_like_an_intrinsic_still_recurses() {
+    let Some(report) = verify_realistic(&["wrapping_sub"]) else { return };
+    let o = outcome(&report, "wrapping_sub");
+    assert!(o.is_verified(), "a method named like an intrinsic that recurses must verify; got: {o}");
+}
+
+/// F4: a recursive call evaluates the callee's contract with the entry `const`
+/// table, so a contract naming a constant resolves at the self-call.
+///
+/// `a_recursive_contract_naming_a_const_is_resolved` names `LIMIT` in both its
+/// `requires` and its `ensures`. The recursive call rebuilt the contract
+/// environment from `FieldEnv::default()`, whose `const` table is empty, so the
+/// `requires` was unreadable *at the self-call* and the whole function came back
+/// `Skipped` -- a lost proof. The call site now carries the entry constants.
+#[test]
+fn a_recursive_contract_naming_a_const_is_resolved() {
+    let Some(report) = verify_realistic(&["a_recursive_contract_naming_a_const_is_resolved"])
+    else {
+        return;
+    };
+    let o = outcome(&report, "a_recursive_contract_naming_a_const_is_resolved");
+    assert!(
+        o.is_verified(),
+        "a recursive contract naming a crate-level const must resolve at the self-call; got: {o}"
+    );
+}
+
+/// F3: a crate-level `const` a *contract* names but no body uses is kept.
+///
+/// The dump's bare-use test is silent for a constant with no use site at all, so
+/// the definition was dropped and the contract went unreadable -- a lost proof.
+/// The source says the item is module-scoped, and `spec::crate_level_consts`
+/// carries that to the parser.
+#[test]
+fn a_contract_only_const_is_resolved() {
+    let Some(report) = verify_realistic(&["a_contract_only_const_is_resolved"]) else { return };
+    let o = outcome(&report, "a_contract_only_const_is_resolved");
+    assert!(
+        o.is_verified(),
+        "a crate-level const named only by a contract must resolve; got: {o}"
+    );
+}
+
+/// F2: a string literal that spells `const NAME` must not leak a function-local
+/// `const` into the program-wide table.
+///
+/// The bare-use scan reads `const NAME` out of the dump to tell a crate-level
+/// constant from a function-local one. A `debug s => const "const LEAKY";`
+/// binding and the `alloc` block behind the string spell those letters as *data*,
+/// so a scan of the raw line saw a use and gave the local `LEAKY` a program-wide
+/// key -- reopening the exact false proof
+/// `a_local_const_is_not_in_scope_in_another_function` guards. The scan now drops
+/// string literals and skips `alloc` blocks, so the contract's `LEAKY` resolves to
+/// nothing and the function is `Skipped`, never `Verified`.
+///
+/// The local name is *unique* among the file's locals, which is what makes rustc
+/// print its definition bare (`const LEAKY`) -- the spelling that collides with a
+/// crate-level item. A name shared by two locals is printed qualified and does not
+/// reproduce the shape.
+#[test]
+fn a_string_literal_does_not_leak_a_local_const() {
+    let Some(report) =
+        verify_realistic(&["a_string_literal_must_not_leak_a_unique_local_const"])
+    else {
+        return;
+    };
+    let o = outcome(&report, "a_string_literal_must_not_leak_a_unique_local_const");
+    assert!(
+        !o.is_verified(),
+        "a string literal must not leak a function-local const into a contract; got: {o}"
+    );
+}
+
+/// F3: a call to an *external* static associated function must not be answered by
+/// a local method that merely shares its tail.
+///
+/// A static associated function has no `self`, so its definition name
+/// `<impl at FILE:L:C: L:C>::m` names no type the way an instance method's
+/// receiver does. The old resolver accepted such a candidate on the unique tail
+/// alone, so `<u16 as From<u8>>::from(x)` -- `core`'s conversion, which returns
+/// `x` -- matched `StaticOwner::from`, whose body returns 99. The contract
+/// `ret == 99` then came back verified, a genuine false proof.
+///
+/// The owner type now comes from the `impl` block's own source line, keyed by the
+/// location the dump prints, so the external call no longer matches the local
+/// method. The verdict must not be `Verified`; it is `Incomplete` here, which is
+/// the honest answer for a call the frontend does not model.
+#[test]
+fn an_external_static_call_is_not_answered_by_a_local_method() {
+    let Some(report) = verify_realistic(&["a_static_call_resolves_to_its_own_impl_cannot_prove_this"])
+    else {
+        return;
+    };
+    let o = outcome(&report, "a_static_call_resolves_to_its_own_impl_cannot_prove_this");
+    assert!(
+        !o.is_verified(),
+        "a call to `u16::from` must not be answered by a local `from`; got: {o}"
+    );
+}
+
+/// F3 companion: the owner-type check must not refuse a call to a *local* static
+/// method, which does resolve to its own body.
+#[test]
+fn a_local_static_call_resolves_to_its_impl() {
+    let Some(report) = verify_realistic(&["a_local_static_call_resolves_to_its_impl"]) else {
+        return;
+    };
+    let o = outcome(&report, "a_local_static_call_resolves_to_its_impl");
+    assert!(o.is_verified(), "a local static method call must resolve and verify; got: {o}");
+}
+
+/// F4: two `impl` blocks that each declare a method with the same tail must not
+/// share a contract.
+///
+/// A method's contract was keyed by its bare name, so `TaggedLeft::tag` and
+/// `TaggedRight::tag` produced one entry and the later overwrote the earlier. Both
+/// methods then resolved to the survivor's claim: a lost proof for the one whose
+/// contract was dropped, and -- once the claims are the false directions -- a
+/// false proof for the other. The key is now the `impl`'s location.
+///
+/// Both methods are true here and must verify, which pins that the resolution
+/// found *a* contract rather than dropping the method (a missing contract is not a
+/// refusal: it means `requires: true` and no `ensures`).
+#[test]
+fn two_impls_with_a_shared_method_tail_keep_separate_contracts() {
+    let Some(report) = verify_realistic(&["tag"]) else { return };
+    for key in ["TaggedLeft::tag", "TaggedRight::tag"] {
+        let o = outcome(&report, key);
+        assert!(o.is_verified(), "{key} must be checked against its own contract; got: {o}");
+    }
+}
+
+/// F4 companion: with the claims the false way round, each method must be
+/// refuted by *its own* postcondition -- never "proved" by the other impl's.
+///
+/// The two `tag_cannot_prove_this` methods are the mirrors of each other: the left
+/// body returns 1 and claims 2, the right returns 2 and claims 1. If the two
+/// contracts were conflated, one of them would look true. Each must fail on the
+/// postcondition.
+#[test]
+fn two_impls_with_a_shared_method_tail_do_not_conflate_contracts() {
+    let Some(report) = verify_realistic(&["tag_cannot_prove_this"]) else { return };
+    for key in ["TaggedLeft::tag_cannot_prove_this", "TaggedRight::tag_cannot_prove_this"] {
+        let o = outcome(&report, key);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("{key} must be refuted by its own postcondition, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "{key}: the failure must be the postcondition, got `{kind}`");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Path-aware contract resolution (F1/F2/F3/F4)
+//
+// rustc names a function's *definition* by the shortest crate-unique path suffix,
+// not by its bare name: a free function inside `a` is `a::f` when two modules
+// declare `f`, a trait's default method is `T::value`, and a function nested in a
+// function is `f::g`. The contract table used to key every non-method contract by
+// the bare source name and match only the exact MIR name, so any nested item's
+// contract was *dropped* -- and a dropped contract is not a refusal: the function
+// was built with `requires: true` and no `ensures`, and a false postcondition was
+// reported `Verified { obligations: 0 }`. Each test below is a false postcondition
+// that must be *refuted*, or a pair of same-named items that must not share a
+// contract.
+// ---------------------------------------------------------------------------
+
+/// A trait's default method must be checked against its own contract.
+///
+/// The MIR prints the definition `T::value`, but the contract was keyed `value`,
+/// so it was dropped and the false postcondition verified with zero obligations.
+#[test]
+fn a_trait_default_method_is_checked_against_its_contract() {
+    let src = "pub trait T {\n    /// ensures: ret == 9\n    fn value(&self) -> u8 { 7 }\n}\n";
+    let o = verify_src("T::value", src).expect("T::value must be verified, not dropped");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("a trait default with a false postcondition must be refuted, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+}
+
+/// A free function nested in a module must be checked against its own contract.
+///
+/// The MIR prints `m::f`, but the contract was keyed `f`, so the false
+/// postcondition verified with zero obligations.
+#[test]
+fn a_module_nested_free_function_is_checked_against_its_contract() {
+    let src = "pub mod m {\n    /// ensures: ret == 9\n    pub fn f() -> u8 { 7 }\n}\n";
+    let o = verify_src("m::f", src).expect("m::f must be verified, not dropped");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("a module function with a false postcondition must be refuted, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+}
+
+/// Two sibling modules that each declare `f` must not share one contract.
+///
+/// A bare key let the second `f` overwrite the first, so one module's body was
+/// checked against the other's claim: a lost proof for one, a false proof for the
+/// other. Here the left claim is false and the right true, and each must be judged
+/// by its own.
+#[test]
+fn two_sibling_modules_do_not_share_a_contract() {
+    let src = "pub mod a {\n    /// ensures: ret == 9\n    pub fn f() -> u8 { 1 }\n}\n\
+               pub mod b {\n    /// ensures: ret == 2\n    pub fn f() -> u8 { 2 }\n}\n";
+    let left = verify_src("a::f", src).expect("a::f must be present");
+    let FnOutcome::Failed { kind, .. } = left else {
+        panic!("a::f has a false postcondition and must be refuted, got: {left}");
+    };
+    assert_eq!(kind, "postcondition", "a::f: the failure must be the postcondition, got `{kind}`");
+    let right = verify_src("b::f", src).expect("b::f must be present");
+    assert!(right.is_verified(), "b::f's own contract is true and must verify, got: {right}");
+}
+
+/// A contracted function whose body `#[cfg]` removes must not be paired with a
+/// *different* function's body and reported `Verified`.
+///
+/// The contract key comes from the source, but `b::a::f` is not compiled, so its
+/// suffix (`a::f`) lands on the compiled `a::f` in the dump. The unique-suffix
+/// fallback then checked `a::f`'s body against `b::a::f`'s contract and answered
+/// `Verified` -- a claim about a function that was never compiled, and a silent
+/// concealment of the fact that it was never checked. Ambiguity must be refused
+/// in *both* directions: a key that several bodies suffix-match, and a body that
+/// several keys suffix-match.
+#[test]
+fn a_cfg_excluded_contract_does_not_steal_a_compiled_body() {
+    let src = "pub mod a {\n    /// ensures: ret == 1\n    pub fn f() -> u8 { 1 }\n}\n\
+               pub mod b {\n    pub mod a {\n        /// ensures: ret == 1\n        #[cfg(any())]\n        pub fn f() -> u8 { 2 }\n    }\n}\n";
+    let rustc = rustc().expect("rustc");
+    let dir = std::env::temp_dir().join(format!("discharge-cfg-steal-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("probe.rs");
+    std::fs::write(&file, src).expect("write probe");
+    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        report.outcomes.is_empty(),
+        "no body may be paired with the excluded `b::a::f`'s contract, got: {:?}",
+        report.outcomes
+    );
+    for name in ["a::f", "b::a::f"] {
+        assert!(
+            report.missing.contains(&name.to_string()),
+            "`{name}` must be reported missing rather than silently verified, got: {:?}",
+            report.missing
+        );
+    }
+}
+
+/// The `cfg` case's neighbour: a genuine nested free function is still resolved
+/// by the unique-suffix rule, so the refusal above is a narrowing, not a blanket
+/// refusal of any qualified key.
+#[test]
+fn a_nested_free_function_is_still_resolved_by_its_suffix() {
+    let src = "pub mod a {\n    /// ensures: ret == 9\n    pub fn f() -> u8 { 1 }\n}\n";
+    let o = verify_src("a::f", src).expect("a::f must be present");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("a::f has a false postcondition and must be refuted, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "a::f: the failure must be the postcondition, got `{kind}`");
+}
+
+/// A trait default and a free function that share a name must keep separate
+/// contracts: `A::v` is the trait's, `v` the function's.
+#[test]
+fn a_trait_default_and_a_free_function_do_not_share_a_contract() {
+    let src = "/// ensures: ret == 9\npub fn v() -> u8 { 1 }\n\
+               pub trait A {\n    /// ensures: ret == 2\n    fn v(&self) -> u8 { 2 }\n}\n";
+    let free = verify_src("v", src).expect("v must be present");
+    let FnOutcome::Failed { kind, .. } = free else {
+        panic!("the free `v` has a false postcondition and must be refuted, got: {free}");
+    };
+    assert_eq!(kind, "postcondition", "v: the failure must be the postcondition, got `{kind}`");
+    let method = verify_src("A::v", src).expect("A::v must be present");
+    assert!(method.is_verified(), "the trait default's own contract is true, got: {method}");
+}
+
+/// A contract on a *trait implementation's* method is resolved and checked.
+///
+/// The review flagged this as a possible drop: the premise was that rustc prints
+/// the implementation as `<Type as Trait>::method`, a name the location-keyed
+/// resolver would not match. It does not reproduce on any supported toolchain --
+/// rustc prints a same-crate implementation as `<impl at FILE:L:C: L:C>::method`
+/// (and a default as `Trait::method`), and that location is exactly what the
+/// method key carries. The pin keeps both directions: the true contract verifies
+/// and the false one is refuted, so a future naming change cannot quietly turn
+/// this into a dropped contract.
+#[test]
+fn a_contract_on_a_trait_implementation_is_checked() {
+    let header = "pub trait Stow { fn value(&self) -> u8; }\npub struct Slot;\n";
+    let truth = format!(
+        "{header}impl Stow for Slot {{\n    /// ensures: ret == 7\n    fn value(&self) -> u8 {{ 7 }}\n}}\n"
+    );
+    let o = verify_src("value", &truth).expect("the trait impl's method must be present");
+    assert!(o.is_verified(), "`ret == 7` with a body of 7 must verify, got: {o}");
+    let falsehood = format!(
+        "{header}impl Stow for Slot {{\n    /// ensures: ret == 9\n    fn value(&self) -> u8 {{ 7 }}\n}}\n"
+    );
+    let o = verify_src("value", &falsehood).expect("the trait impl's method must be present");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("`ret == 9` with a body of 7 must be refuted, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+}
+
+/// F1: an `impl` header whose `{` is on the next line still owns its methods.
+///
+/// A brace-on-the-next-line header raises no depth on its own line, so a pop
+/// keyed on "depth has not increased" dropped it before its methods and each
+/// contract was keyed as a free function's -- which then never matched the
+/// `<impl at …>::m` name, and the false postcondition verified with zero
+/// obligations.
+#[test]
+fn a_multiline_impl_header_still_owns_its_methods() {
+    let src = "pub struct Foo;\nimpl Foo\n{\n    /// ensures: ret == 9\n    pub fn m(&self) -> u8 { 1 }\n}\n";
+    let o = verify_src("m", src).expect("m must be present");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("a method of a multiline impl with a false postcondition must be refuted, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+}
+
+/// A one-line impl body must not leave the `impl` open over the rest of the file.
+///
+/// The header's brace opens and closes within its own line, so a pop keyed on the
+/// final depth would never fire and every later function would be read as a
+/// method of that `impl` -- keyed by location, and so never matched.
+#[test]
+fn a_one_line_impl_body_does_not_leak_its_scope() {
+    let src = "pub struct Foo;\nimpl Foo { pub fn m(&self) -> u8 { 1 } }\n\
+               /// ensures: ret == 9\npub fn g() -> u8 { 1 }\n";
+    let o = verify_src("g", src).expect("g must be present");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("g has a false postcondition and must be refuted, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+}
+
+// ---------------------------------------------------------------------------
+// The `const` scope scan (the const-generic leak)
+// ---------------------------------------------------------------------------
+
+/// A `const` generic parameter must not make a function-local `const` of the same
+/// name look crate-level.
+///
+/// A const-generic's *uses* print as a bare `const N`, the same spelling a
+/// crate-level item's use site gets, so the whole-crate bare-use test kept a
+/// function-local `const N` under a bare program-wide key. A contract on an
+/// unrelated function could then name `N` and resolve it to that local's value --
+/// a false proof (or a spurious vacuous-precondition failure). The name is not an
+/// item at all, so it must be ignored.
+#[test]
+fn a_const_generic_does_not_leak_a_local_const() {
+    let src = "pub fn cg<const N: usize>() -> u8 { N as u8 }\n\
+               pub fn owner() -> u8 { const N: u8 = 3; N }\n\
+               /// requires: N == 3\n/// ensures: ret == N\npub fn reads() -> u8 { 3 }\n";
+    let o = verify_src("reads", src).expect("reads must be present");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "a contract naming the leaked local `N` must be refused, not decided, got: {o}"
+    );
+}
+
+/// The same leak with the parameter list split across lines.
+#[test]
+fn a_split_const_generic_does_not_leak_a_local_const() {
+    let src = "pub fn cg<\n    const N: usize,\n>() -> u8 { N as u8 }\n\
+               pub fn owner() -> u8 { const N: u8 = 3; N }\n\
+               /// requires: N == 3\n/// ensures: ret == N\npub fn reads() -> u8 { 3 }\n";
+    let o = verify_src("reads", src).expect("reads must be present");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "a contract naming the leaked local `N` must be refused, not decided, got: {o}"
+    );
+}
+
+/// The same leak when a newline, tab or comment sits between `const` and the name.
+///
+/// All three are legal Rust for the same parameter, but the scan once matched a
+/// literal `"const "`, so `const\n    N: usize` and `const/*c*/N: usize` were not
+/// recognized. The name then stayed out of `const_generics`, its bare use made a
+/// function-local `const N` look crate-level, and a contract naming `N` resolved
+/// to that local's value -- a false proof.
+#[test]
+fn a_const_generic_after_whitespace_or_a_comment_does_not_leak_a_local_const() {
+    for header in ["const\n    N: usize", "const\tN: usize", "const/*c*/N: usize"] {
+        let src = format!(
+            "pub fn cg<{header}>() -> u8 {{ N as u8 }}\n\
+             pub fn owner() -> u8 {{ const N: u8 = 3; N }}\n\
+             /// requires: N == 3\n/// ensures: ret == N\npub fn reads() -> u8 {{ 3 }}\n"
+        );
+        let o = verify_src("reads", &src).expect("reads must be present");
+        assert!(
+            matches!(o, FnOutcome::Skipped { .. }),
+            "a contract naming the leaked local `N` must be refused, not decided, got: {o}"
+        );
+    }
+}
+
+/// A `{` inside an `impl` header's generic arguments must not be taken for the
+/// body brace.
+///
+/// `impl Foo<{ 1 }>` writes a const expression in the header. Counting that brace
+/// as the body marked the `impl` opened and popped it before the real body, so the
+/// method lost its `impl` location, its contract was keyed as a free function's,
+/// and it was reported *missing* -- a contracted function dropped from the check
+/// set. The real body brace is the one reached with no `<` open.
+#[test]
+fn a_const_expression_in_an_impl_header_does_not_hide_its_method() {
+    let src = "pub struct Foo<const N: usize>;\nimpl Foo<{ 1 }>\n{\n    \
+               /// ensures: ret == 9\n    pub fn m(&self) -> u8 { 7 }\n}\n";
+    let o = verify_src("m", src).expect("m must be present");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("a method with a false postcondition must be refuted, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+}
+
+/// The scan must still read a genuine crate-level `const` that shares a name with
+/// a const-generic parameter elsewhere, so the fix is a narrowing, not a blanket
+/// refusal of the name.
+#[test]
+fn a_crate_level_const_is_still_read_beside_a_const_generic() {
+    let src = "pub const N: u8 = 5;\npub fn cg<const N: usize>() -> usize { N }\n\
+               /// ensures: ret == N\npub fn reads() -> u8 { 5 }\n";
+    let specs = spec::extract(src);
+    assert!(specs.crate_consts.contains("N"), "the crate-level `N` must still be read");
+    assert!(specs.const_generics.contains("N"), "the const-generic `N` must be recognized");
+    let o = verify_src("reads", src).expect("reads must be present");
+    assert!(o.is_verified(), "`ret == N` with crate `N == 5` must verify, got: {o}");
+}
+
+/// A function-local `const` of the same name as a crate-level one must not shadow
+/// it in a contract on a *different* function.
+///
+/// With both items compiled, rustc prints the local's definition and use site
+/// qualified (`const owner::K`), so the crate `const K` keeps its own value and
+/// `reads` returning `3` can never be *proved* against it. This is the control for
+/// [`a_cfg_disabled_crate_const_does_not_let_a_local_shadow_it`]: the same shape,
+/// but the crate item is compiled. The property asserted is the soundness one --
+/// the local's `3` must never be mistaken for the crate's `7` -- because on an
+/// older compiler a crate-level constant prints a block body the parser does not
+/// fold, leaving the name unresolved rather than decided.
+#[test]
+fn a_local_const_does_not_shadow_a_crate_const_in_another_contract() {
+    let src = "pub const K: u8 = 7;\npub fn owner() -> u8 { const K: u8 = 3; K }\n\
+               /// ensures: ret == K\npub fn reads() -> u8 { 3 }\n";
+    let o = verify_src("reads", src).expect("reads must be present");
+    assert!(
+        !o.is_verified(),
+        "`K` is the crate's 7, so `ret == K` with ret 3 must not be proved against \
+         `owner`'s local 3, got: {o}"
+    );
+    if let FnOutcome::Failed { kind, .. } = o {
+        assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+    }
+}
+
+/// A `#[cfg]`-disabled crate-level `const` must not let a function-local `const`
+/// of the same name become a program-wide name.
+///
+/// The source scanner still sees the disabled item, so it reports `K` as
+/// crate-level. The compiler removed it, so the dump has no crate `const K`; the
+/// only `K` is `owner`'s local, whose *definition* prints bare (`const K: u8 =
+/// const 3_u8;`) while its *use* stays qualified (`const owner::K`). Recording
+/// that bare definition under the crate key let an unrelated contract write
+/// `ret == K` and be *proved* against another function's local -- a false proof
+/// on a claim the function could not have written.
+#[test]
+fn a_cfg_disabled_crate_const_does_not_let_a_local_shadow_it() {
+    let src = "#[cfg(any())]\npub const K: u8 = 7;\n\
+               pub fn owner() -> u8 { const K: u8 = 3; K }\n\
+               /// ensures: ret == K\npub fn reads() -> u8 { 3 }\n";
+    let o = verify_src("reads", src).expect("reads must be present");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "`K` is not a crate-level name here, so the contract must be refused, got: {o}"
+    );
+}
+
+/// The `#[cfg]` case's neighbour: a `#[cfg]`-disabled `const` with no local twin
+/// must also be refused, because the name is still not a crate-level one.
+#[test]
+fn a_cfg_disabled_crate_const_alone_is_not_a_program_wide_name() {
+    let src = "#[cfg(any())]\npub const K: u8 = 7;\n\
+               /// ensures: ret == K\npub fn reads() -> u8 { 3 }\n";
+    let o = verify_src("reads", src).expect("reads must be present");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "a disabled item is not a name the compiled crate has, got: {o}"
+    );
+}
+
+/// A local `const` no crate-level item shares must not be readable by name: there
+/// is no program-wide `K`, so the contract is refused rather than resolved to the
+/// local's value.
+#[test]
+fn a_local_const_alone_is_not_a_program_wide_name() {
+    let src = "pub fn owner() -> u8 { const K: u8 = 3; K }\n\
+               /// ensures: ret == K\npub fn reads() -> u8 { 3 }\n";
+    let o = verify_src("reads", src).expect("reads must be present");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "a name only a function-local `const` carries must be refused, not decided, got: {o}"
+    );
+}
+
+/// An *associated* constant must not hide a compiled crate-level constant of the
+/// same name.
+///
+/// rustc uses an associated constant's path (`const Foo::K`) but defines it by
+/// its impl location (`const <impl at …>::K`), so the use path has no matching
+/// definition. Reading that mismatch as "a function-local definition" -- as the
+/// `#[cfg]`-disabled case needs -- also claims the bare tail of a perfectly good
+/// associated use, and then discards the compiled crate `const K`, leaving a
+/// contract that names it unreadable. The claim must be limited to uses whose
+/// path prefix is a *function*.
+#[test]
+fn an_associated_const_does_not_hide_a_crate_const() {
+    let src = "const K: u8 = 7;\n\
+               pub struct Foo;\n\
+               impl Foo { pub const K: u8 = 3; }\n\
+               pub fn uses_assoc() -> u8 { Foo::K }\n\
+               /// ensures: ret == K\npub fn reads() -> u8 { 7 }\n";
+    let o = verify_src("reads", src).expect("reads must be present");
+    assert!(
+        o.is_verified(),
+        "`K` is the compiled crate constant (7), so `ret == K` must be proved \
+         despite the associated `Foo::K`, got: {o}"
+    );
+}
+
+/// A function-local `const` inside a *method* or a nested function must still be
+/// refused as a program-wide name, even though its use path is longer than
+/// `owner::K` (`Foo::method::L`, `outer::inner::M`).
+///
+/// The rule must read the path's *owning* `::` segment as the function, not the
+/// whole prefix: an exact-prefix match would read `Foo::method` as the owner and
+/// drop the claim, letting the local `L` leak. A crate `const L` of the same name
+/// is present so that a leak shows up as a *false proof* (`ret == L` proved
+/// against the local's 4) rather than merely a different skip reason.
+#[test]
+fn a_nested_or_method_local_const_is_not_a_program_wide_name() {
+    let src = "pub const L: u8 = 40;\npub const M: u8 = 10;\n\
+               pub struct Foo;\n\
+               impl Foo { pub fn method(&self) -> u8 { const L: u8 = 4; L } }\n\
+               pub fn outer() -> u8 { fn inner() -> u8 { const M: u8 = 1; M } inner() }\n\
+               /// ensures: ret == L\npub fn reads_l() -> u8 { 4 }\n\
+               /// ensures: ret == M\npub fn reads_m() -> u8 { 1 }\n";
+    for (name, local) in [("reads_l", "L"), ("reads_m", "M")] {
+        let o = verify_src(name, src).expect("contracted function must be present");
+        assert!(
+            matches!(o, FnOutcome::Skipped { .. }),
+            "`{local}` in `{name}` must resolve to the crate constant, not the \
+             method/nested local, so a body of the local's value must be refused, \
+             got: {o}"
+        );
+    }
+}
+
+/// A `const` whose body branches between two literal returns must not fold to the
+/// first arm.
+///
+/// `K = if false { 7 } else { 8 }` is `8`, and rustc prints a CTFE body with one
+/// `_0` arm per branch (`bb1: _0 = const 7_u8`, `bb2: _0 = const 8_u8`). Folding
+/// the first arm stores `K = 7`, so `ensures: ret == 7` on a function that returns
+/// `K` is reported **verified** -- a false proof about a value the constant never
+/// has -- while the true claim `ret == 8` is refused. The fix refuses to fold a
+/// branching body at all, so both contracts go unreadable (a skip) rather than one
+/// being falsely proved.
+///
+/// This is the *reachable* form of the bug: rustc emits a brace-block for an
+/// `if`-based constant on **current stable** as well as on 1.85, so the hole was
+/// not confined to the MSRV the earlier fix was written for.
+#[test]
+fn a_branching_const_does_not_fold_to_its_first_arm() {
+    let src = "pub const K: u8 = if false { 7 } else { 8 };\n\
+               /// ensures: ret == 8\npub fn true_claim() -> u8 { K }\n\
+               /// ensures: ret == 7\npub fn false_claim() -> u8 { K }\n";
+    let true_claim = verify_src("true_claim", src).expect("true_claim must be present");
+    let false_claim = verify_src("false_claim", src).expect("false_claim must be present");
+    assert!(
+        !false_claim.is_verified(),
+        "`K` is 8, so `ret == 7` must not be reported verified, got: {false_claim}"
+    );
+    assert!(
+        !true_claim.is_verified(),
+        "a branching const body is not folded, so `ret == 8` is unreadable (a skip), \
+         not a proof, got: {true_claim}"
+    );
+}
+
+/// The front end must not panic on a source that ends inside an unclosed block
+/// comment.
+///
+/// `verify_file_with` scans the source for contracts *before* it runs rustc, so a
+/// malformed file reaches `const_generic_params`. A `const` generic parameter
+/// followed by an unterminated `/*` runs the comment skip to end-of-file; if the
+/// skip then steps past the buffer, the slice panics. Malformed source is rustc's
+/// error to report, not a crash here.
+#[test]
+fn an_unclosed_block_comment_after_const_is_not_a_panic() {
+    use discharge::mir::spec;
+    for src in [
+        "fn f<const /*",
+        "fn f<const /*x",
+        "fn f<const /* ",
+        "fn f<const /*/",
+        "fn f<const /*x*",
+        "fn f<const /*x*/",
+        "fn f<const /*\n",
+    ] {
+        // The property is "does not panic", so the call itself is the assertion.
+        let _ = spec::const_generic_params(src);
     }
 }

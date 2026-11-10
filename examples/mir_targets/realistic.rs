@@ -5085,6 +5085,63 @@ pub fn a_mutual_lie_b_cannot_prove_this(n: u8) -> u8 {
     if n == 0 { 0 } else { a_mutual_lie_a_cannot_prove_this(n - 1) + 1 }
 }
 
+/// A recursive function proved by induction on a `decreases:` measure.
+///
+/// The self-call is *not* inlined. It is answered by this very contract: the
+/// precondition is proved of `n - 1`, the measure `n` is proved to shrink, and
+/// the postcondition is then assumed for the result. The base case (`n == 0`)
+/// is proved by the body itself, which is what stops the assumption from being
+/// circular. Before `decreases:` existed this function hit the inline-depth
+/// bound and was reported incomplete.
+/// requires: true
+/// decreases: n
+/// ensures: ret == n
+pub fn a_recursive_identity(n: u8) -> u8 {
+    if n == 0 { 0 } else { a_recursive_identity(n - 1) + 1 }
+}
+
+/// A recursive function whose *base case* does not establish the postcondition,
+/// so the induction must not save it.
+///
+/// `a_recursive_identity`'s twin: the recursive case is right, but the base case
+/// returns `1` where the contract says `ret == n`, i.e. `ret == 0`. Nothing is
+/// assumed at the base case -- only the body is checked there -- so this is the
+/// one place a circular induction would go wrong. It must FAIL on the
+/// postcondition, with a witness (`n == 0`).
+/// requires: true
+/// decreases: n
+/// ensures: ret == n
+pub fn a_recursive_lie_cannot_prove_this(n: u8) -> u8 {
+    if n == 0 { 1 } else { a_recursive_lie_cannot_prove_this(n - 1) + 1 }
+}
+
+/// A recursive function whose measure does *not* decrease: the call is on the
+/// same `n`, so the induction has no well-founded basis.
+///
+/// The precondition and the postcondition are both true of the body, so nothing
+/// but the measure check stops this from being assumed. It must not verify: an
+/// assumption without a decreasing measure is circular.
+/// requires: true
+/// decreases: n
+/// ensures: ret == 0
+pub fn a_recursive_call_that_does_not_decrease_cannot_prove_this(n: u8) -> u8 {
+    if n == 0 { 0 } else { a_recursive_call_that_does_not_decrease_cannot_prove_this(n) }
+}
+
+/// A recursive function whose recursive call violates its own precondition.
+///
+/// The precondition `n <= 3` is what bounds the recursion, and the call is on
+/// `n + 1`, which leaves that range. Proving the precondition of the call is
+/// what makes the induction hypothesis applicable only where it holds; without
+/// that check the postcondition would be assumed for an input the contract never
+/// promised anything about.
+/// requires: n <= 3
+/// decreases: n
+/// ensures: ret == 0
+pub fn a_recursive_call_out_of_range_cannot_prove_this(n: u8) -> u8 {
+    if n == 0 { 0 } else { a_recursive_call_out_of_range_cannot_prove_this(n + 1) }
+}
+
 /// An invariant that is false where the loop is entered. Checking initiation is
 /// what stops an arbitrary induction hypothesis being taken on faith.
 /// requires: n <= 3
@@ -5310,10 +5367,12 @@ pub fn twist(v: &mut u8, x: u8) {
     *v = x;
 }
 
-/// The ambiguity tripwire: the call `w.twist(5)` must not be answered by the free
-/// function `twist`, which takes a different shape and would write through it.
-/// Inlining the wrong body here would *prove* a false contract, so the ambiguous
-/// tail is refused rather than matched to either.
+/// The ambiguity tripwire: the call `w.twist(5)` names its receiver's type, so it
+/// must resolve to `Widget::twist` and not to the free function `twist` that
+/// shares the tail. The free function takes a different shape (`&mut u8`) and
+/// would write through it, so inlining *it* would prove this false contract. The
+/// resolver picks the method by the receiver's type, so the correct body runs and
+/// the postcondition is refuted.
 /// requires: w.v == 0
 /// ensures: ret == 0
 pub fn an_ambiguous_method_tail_cannot_prove_this(mut w: Widget) -> u8 {
@@ -5437,6 +5496,157 @@ pub fn whole_struct_copy_carries_nested_paths(mut c: OuterBox, d: OuterBox) -> u
     c.i.v
 }
 
+/// A *nested* aggregate literal lands where the read looks, and the false direction of
+/// [`whole_inner_write_makes_nested_seed_stale`] is its tripwire.
+///
+/// `o.i = InnerBox { v: 9 }` lowers to a struct literal into a temp followed by
+/// `(_1.0) = move _2`, so the parts being moved are keyed under `_2` and the destination
+/// is the nested place `_1.0`. The copy that moves a *whole* local re-roots its parts; a
+/// copy whose destination is itself nested did not, so the temp's `v` never landed under
+/// `_1.0` and the later read `(_1.0).0` found nothing. The body then had no value, and
+/// this true contract was `incomplete` rather than verified. `verified` here is the
+/// positive evidence the re-rooting happened; the companion's refutation is the evidence
+/// it happened in the direction the read consults.
+/// requires: true
+/// ensures: ret == 9
+pub fn whole_inner_write_is_seen_by_the_leaf(mut o: OuterBox) -> u8 {
+    o.i = InnerBox { v: 9 };
+    o.i.v
+}
+
+/// The same nested aggregate literal, written *through a mutable reference*.
+///
+/// On an `&mut OuterBox` the assignment lowers to `((*_1).0) = move _2`, so the
+/// destination's projection carries a leading deref. The re-rooting helper must strip that
+/// deref -- as the nested *read* does, because an `&mut T` argument is modelled as its
+/// referent -- or the write is refused for the wrong reason and the leaf reads `Unknown`.
+/// `verified` here is the evidence the write reached the target's field path, and it is the
+/// `&mut` companion to `whole_inner_write_is_seen_by_the_leaf`.
+/// requires: true
+/// ensures: ret == 9
+pub fn whole_inner_write_through_a_mutable_reference_is_seen(o: &mut OuterBox) -> u8 {
+    o.i = InnerBox { v: 9 };
+    o.i.v
+}
+
+/// A nested-to-nested move, `o.i = o.j`.
+///
+/// The first step is the *nested source* `(_1.1)` moved into a whole temp, the second a whole
+/// source into the nested destination `(_1.0)`. `copy_parts` refuses a nested source, so
+/// without the re-rooting the leaf reads `Unknown`. The precondition pins `o.i.v` to `7`, which
+/// the move overwrites with the source's `3` -- so the true `ret == 3` is the evidence the
+/// *source's* leaf arrived.
+/// requires: o.i.v == 7
+/// ensures: ret == 3
+pub fn whole_inner_move_carries_the_source_leaf(mut o: OuterBox) -> u8 {
+    o.j.v = 3;
+    o.i = o.j;
+    o.i.v
+}
+
+/// The false twin of [`whole_inner_move_carries_the_source_leaf`].
+///
+/// Same body, but the contract claims the *destination's* pre-move leaf survived. A model
+/// that kept `o.i.v`'s stale `7` instead of the source's `3` would prove this; it must be
+/// refuted, and the witness is `o.i.v` at its seeded `7` (the value the move replaced).
+/// requires: o.i.v == 7
+/// ensures: ret == 7
+pub fn whole_inner_move_is_not_the_stale_destination(mut o: OuterBox) -> u8 {
+    o.j.v = 3;
+    o.i = o.j;
+    o.i.v
+}
+
+/// A nested swap through a temp, `let t = o.i; o.i = o.j; o.j = t`.
+///
+/// Two nested sources and two nested destinations, so it only works if the re-rooting runs
+/// on a nested source as well as a nested destination: the guard is "either side nested", not
+/// "destination nested". The precondition pins the two sides apart (`3` and `4`), so the
+/// returned `4` proves the *other* side arrived rather than the one that was already there.
+/// requires: o.i.v == 3
+/// requires: o.j.v == 4
+/// ensures: ret == 4
+pub fn nested_swap_carries_the_other_side(mut o: OuterBox) -> u8 {
+    let tmp = o.i;
+    o.i = o.j;
+    o.j = tmp;
+    o.i.v
+}
+
+/// The false twin of [`nested_swap_carries_the_other_side`].
+///
+/// Same body, but the contract claims the pre-swap `o.i.v == 3` survived. A model that
+/// dropped the nested-to-nested move -- keeping each side's own leaf -- would prove this; it
+/// must be refuted, and the witness is the two seeds (`3` and `4`) that the swap exchanged.
+/// requires: o.i.v == 3
+/// requires: o.j.v == 4
+/// ensures: ret == 3
+pub fn nested_swap_is_not_the_stale_side(mut o: OuterBox) -> u8 {
+    let tmp = o.i;
+    o.i = o.j;
+    o.j = tmp;
+    o.i.v
+}
+
+/// Identity, so a nested aggregate can be handed to a helper and read back.
+///
+/// The helper's return is an aggregate the callee built field-by-field, so the merge has to
+/// carry the *fields*, not only the tuple components; without that the caller's `id_inner(o.i).v`
+/// reads `Unknown` while the contract is true of the body.
+pub fn identity_inner_box(x: InnerBox) -> InnerBox {
+    x
+}
+
+/// A nested aggregate handed to a helper by value, and the helper's return read back.
+///
+/// `id_inner(o.i)` lowers to `_3 = move (_1.0); _2 = id_inner(move _3)`, so the aggregate
+/// argument is a *sub-place* whose parts have to be carried in, and the callee's `_0 = _1`
+/// return has to carry its fields back. The precondition pins the leaf so the returned `9` is
+/// the value that crossed, not a fresh variable.
+/// requires: o.i.v == 9
+/// ensures: ret == 9
+pub fn nested_aggregate_argument_reaches_the_helper(mut o: OuterBox) -> u8 {
+    identity_inner_box(o.i).v
+}
+
+/// The false twin of [`nested_aggregate_argument_reaches_the_helper`].
+///
+/// Same body, but the contract claims a different value survived. A merge that dropped the
+/// returned field would leave the read `Unknown` (a lost proof); one that kept a *stale* field
+/// would prove this. It must be refuted, with the seeded `9` as the witness.
+/// requires: o.i.v == 9
+/// ensures: ret == 7
+pub fn nested_aggregate_argument_is_not_the_stale_destination(mut o: OuterBox) -> u8 {
+    identity_inner_box(o.i).v
+}
+
+/// Build an `OuterBox` around an inner value, so a returned struct *field* can be read.
+pub fn wrap_inner_box(x: InnerBox) -> OuterBox {
+    OuterBox { i: x, j: InnerBox { v: 0 } }
+}
+
+/// A returned struct's *field* is read back through a two-level path.
+///
+/// `wrap_inner_box(o.i)` lowers to `_0 = OuterBox { i: copy _1, j: move _2 }`, so the returned
+/// field's own parts have to be re-rooted onto `_0.i` -- the `Struct` literal stores the field
+/// value but not the operand aggregate's `v`. The precondition pins the leaf so the returned
+/// `9` is the value that crossed.
+/// requires: o.i.v == 9
+/// ensures: ret == 9
+pub fn nested_return_carries_the_field(mut o: OuterBox) -> u8 {
+    wrap_inner_box(o.i).i.v
+}
+
+/// The false twin of [`nested_return_carries_the_field`].
+///
+/// Same body, but the contract claims a different leaf survived. It must be refuted, with the
+/// seeded `9` as the witness.
+/// requires: o.i.v == 9
+/// ensures: ret == 3
+pub fn nested_return_is_not_the_stale_field(mut o: OuterBox) -> u8 {
+    wrap_inner_box(o.i).i.v
+}
+
 /// The inner type of [`nested_tuple_projection_reads`].
 pub struct NestedPair { pub p: Pair }
 
@@ -5539,4 +5749,1458 @@ pub fn a_signed_division_by_a_non_power_of_two_at_i64(a: i64) -> i64 {
 /// ensures: ret == -2
 pub fn a_symbolic_division_by_a_non_power_of_two_at_i64(a: i64) -> i64 {
     a / 3
+}
+
+/// A precondition can pin a *field* to a constant, not just an argument.
+///
+/// `requires: w.v == -7` fixes the only input the body reads, so `w.v / 3` folds to a
+/// literal quotient exactly as the argument-level pin does. Before the pin was keyed by
+/// the variable's index rather than the argument's local, this field stayed symbolic: the
+/// 64-bit restoring divider was built in full and the query was refused for the size of
+/// its own diagram (1.18s, `incomplete`) even though the precondition left one value.
+/// [`a_field_pinned_division_cannot_prove_this`] is the false direction, so the entry
+/// above is a proof and not a vacuous `true`.
+pub struct WideBox {
+    pub v: i64,
+}
+
+/// requires: w.v == -7
+/// ensures: ret == -2
+pub fn a_field_pinned_division_at_i64(w: WideBox) -> i64 {
+    w.v / 3
+}
+
+/// The same field pin with a claim the fold refutes, so the entry above cannot pass by
+/// being decided to `true` for the wrong reason.
+/// requires: w.v == -7
+/// ensures: ret == 99
+pub fn a_field_pinned_division_cannot_prove_this(w: WideBox) -> i64 {
+    w.v / 3
+}
+
+/// A pin on a *nested* path (`o.i.v`) folds the body that reads it, for the same reason:
+/// the variable the contract names is the one the body's projection reads. The fields are
+/// `i64` so the general divider is the expensive shape the pin has to close.
+pub struct WideInner {
+    pub v: i64,
+}
+
+pub struct WideOuter {
+    pub i: WideInner,
+}
+
+/// requires: o.i.v == -7
+/// ensures: ret == -2
+pub fn a_nested_pinned_division_at_i64(o: WideOuter) -> i64 {
+    o.i.v / 3
+}
+
+/// The false direction of the nested pin.
+/// requires: o.i.v == -7
+/// ensures: ret == 99
+pub fn a_nested_pinned_division_cannot_prove_this(o: WideOuter) -> i64 {
+    o.i.v / 3
+}
+
+/// A pin reaches an *element* of an array, not just a field. `requires: xs[0] == -7` names
+/// an element, and the body reads the same element, so the divider folds.
+/// requires: xs[0] == -7
+/// ensures: ret == -2
+pub fn an_element_pinned_division_at_i64(xs: [i64; 2]) -> i64 {
+    xs[0] / 3
+}
+
+/// The false direction of the element pin.
+/// requires: xs[0] == -7
+/// ensures: ret == 99
+pub fn an_element_pinned_division_cannot_prove_this(xs: [i64; 2]) -> i64 {
+    xs[0] / 3
+}
+
+/// A pin whose right-hand side names an *earlier* pinned variable, so the chain has to be
+/// followed before the body folds.
+///
+/// `b == a + 1` does not evaluate until `a`'s pin exists, so a single-pass extraction
+/// pinned only `a` and left `b` symbolic -- and a symbolic operand builds the full circuit
+/// whatever the other operand is. The three links here (`a`, then `b` through an add, then
+/// `c` through a multiply) are the shape the fixpoint exists for, and the multiply is
+/// deliberate: the *pin* makes the body's dividend a literal, but the path condition still
+/// carries `c == b * 2` at 64 bits, which is the diagram the goal check has to get past.
+///
+/// [`a_transitive_pin_chain_cannot_prove_this`] is the false direction, so the entry above
+/// is a proof rather than a `true` that a broken extraction would also produce.
+/// requires: a == 5 && b == a + 1 && c == b * 2
+/// ensures: ret == 3
+pub fn a_transitive_pin_chain_folds_the_body(a: i64, b: i64, c: i64) -> i64 {
+    let _ = (a, b);
+    c / 4
+}
+
+/// The false direction of the transitive chain: the pin fixes `c` at `12`, so the claim is
+/// refuted by the fold rather than proved.
+/// requires: a == 5 && b == a + 1 && c == b * 2
+/// ensures: ret == 99
+pub fn a_transitive_pin_chain_cannot_prove_this(a: i64, b: i64, c: i64) -> i64 {
+    let _ = (a, b);
+    c / 4
+}
+
+
+/// An *unsigned* division by a power of two, with a symbolic dividend.
+///
+/// The signed twin of this shape was already a shift, but the unsigned side fell through
+/// to the general restoring divider -- a term ~`2 * w` deep -- and a symbolic dividend
+/// through it was refused for the diagram's size: `incomplete` in ~0.9 s at `u64`. The
+/// quotient of an unsigned value by `2^k` is the logical shift `n >> k`, so the body folds
+/// to a handful of terms and the bound decides it.
+///
+/// [`an_unsigned_power_of_two_division_cannot_prove_this`] is the false direction, so the
+/// entry above is a proof and not a `true` that a too-permissive fast path would also
+/// produce.
+/// requires: n >= 4 && n <= 7
+/// ensures: ret == 1
+pub fn an_unsigned_power_of_two_division_is_decided(n: u64) -> u64 {
+    n / 4
+}
+
+/// The false direction of the unsigned shift identity: `n` in `[4, 7]` makes `n / 4` one,
+/// so the claim of two is refuted.
+/// requires: n >= 4 && n <= 7
+/// ensures: ret == 2
+pub fn an_unsigned_power_of_two_division_cannot_prove_this(n: u64) -> u64 {
+    n / 4
+}
+
+/// An *unsigned* remainder by a power of two, which is a mask rather than a divider.
+///
+/// The companion to the division above, and it exercises the other half of
+/// `udivmod_pow2`: `n % 4 == n & 3`. The general divider would be built for a mask.
+/// requires: n >= 4 && n <= 7
+/// ensures: ret <= 3
+pub fn an_unsigned_power_of_two_remainder_is_decided(n: u64) -> u64 {
+    n % 4
+}
+
+
+/// An element of an array reached through a struct field, written and read back.
+///
+/// `x.a[0] = 9; x.a[0]` lowers to `(_1.0)[_2] = const 9_u8` and `_0 = copy (_1.0)[_4]`: the
+/// store is keyed by the whole path (the local, the field chain to the array, the index),
+/// so `x.a[0]` and `x.b[0]` are different words and the write is visible to the read. Before
+/// this the write was dropped and the read returned the *seed*, which is the false-proof
+/// direction: a contract claiming the pre-write value would have been proved.
+///
+/// [`a_field_array_write_is_not_the_seed`] is the false direction, so the entry above is a
+/// proof and not a `true` that a broken store would also produce.
+/// requires: x.a[0] == 5
+/// ensures: ret == 9
+pub fn a_field_array_write_is_read_back(mut x: Boxed) -> u8 {
+    x.a[0] = 9;
+    x.a[0]
+}
+
+/// The false direction of the field-array write: the body stores 9, so a claim of the seed
+/// is refuted rather than proved.
+/// requires: x.a[0] == 5
+/// ensures: ret == 5
+pub fn a_field_array_write_is_not_the_seed(mut x: Boxed) -> u8 {
+    x.a[0] = 9;
+    x.a[0]
+}
+
+/// Writing one field's array element leaves the sibling array's element alone.
+///
+/// The whole path is the key, so `x.a[0] = 9` must not disturb `x.b[0]`. A store keyed by
+/// the local and index alone would collide the two and prove `ret == 7` against the wrong
+/// element.
+/// requires: x.b[0] == 7
+/// ensures: ret == 7
+pub fn a_sibling_field_array_is_untouched(mut x: Boxed) -> u8 {
+    x.a[0] = 9;
+    x.b[0]
+}
+
+/// A struct with two arrays, so a contract can name both fields' elements.
+pub struct Boxed {
+    pub a: [u8; 4],
+    pub b: [u8; 4],
+}
+
+/// An array element reached through a *nested* field path is the same word on both sides.
+///
+/// `o.i.a[0] = 9; o.i.a[0]` lowers to `(_1.0.0)[_2] = 9` and `_0 = copy (_1.0.0)[_4]`. The
+/// element's key is the *whole* field chain, so a nested array is not mistaken for the
+/// first-level `o.i`; the store and the contract agree on the deeper path.
+///
+/// [`a_nested_field_array_write_is_not_the_seed`] is the false direction.
+/// requires: o.i.a[0] == 5
+/// ensures: ret == 9
+pub fn a_nested_field_array_write_is_read_back(mut o: NestedArrays) -> u8 {
+    o.i.a[0] = 9;
+    o.i.a[0]
+}
+
+/// The false direction of the nested field-array write: the body stores 9, so a claim of
+/// the seed is refuted rather than proved.
+/// requires: o.i.a[0] == 5
+/// ensures: ret == 5
+pub fn a_nested_field_array_write_is_not_the_seed(mut o: NestedArrays) -> u8 {
+    o.i.a[0] = 9;
+    o.i.a[0]
+}
+
+/// A struct whose array lives one aggregate down, so the contract's path is `o.i.a[0]`.
+pub struct NestedArrays {
+    pub i: ArrayHolder,
+    pub k: u8,
+}
+
+/// The inner aggregate holding the array.
+pub struct ArrayHolder {
+    pub a: [u8; 4],
+}
+
+/// A helper's write to a *field-array element* through `&mut` must cross back to the caller.
+///
+/// `set_first(x); x.a[0]` calls `set_first(&mut Boxed)` which stores `x.a[0] = 9`. The
+/// callee's write lands in `elems_path` under its own local, so the caller's store has to be
+/// re-based on return -- without that the write died with the frame and the caller read its
+/// *seed*, proving the false `ret == 5` against a body returning 9.
+///
+/// [`a_helper_field_array_write_is_not_the_seed`] is the false direction.
+/// requires: x.a[0] == 5
+/// ensures: ret == 9
+pub fn a_helper_field_array_write_is_read_back(x: &mut Boxed) -> u8 {
+    set_first_element(x);
+    x.a[0]
+}
+
+/// The false direction of the helper field-array write: the helper stores 9, so a claim of
+/// the caller's seed is refuted rather than proved.
+/// requires: x.a[0] == 5
+/// ensures: ret == 5
+pub fn a_helper_field_array_write_is_not_the_seed(x: &mut Boxed) -> u8 {
+    set_first_element(x);
+    x.a[0]
+}
+
+/// The helper that writes one field-array element through its `&mut` argument.
+fn set_first_element(x: &mut Boxed) {
+    x.a[0] = 9;
+}
+
+/// A helper handed a *nested aggregate* (`&mut o.i`) that writes an element of the array
+/// inside it: the callee's `_1.a[0]` is the caller's `o.i.a[0]`, so the write-back has to
+/// prefix the target's chain. The sibling `o.k` is left alone.
+///
+/// [`a_helper_nested_aggregate_element_write_is_not_the_seed`] is the false direction.
+/// requires: o.i.a[0] == 5
+/// ensures: ret == 9
+pub fn a_helper_nested_aggregate_element_write_is_read_back(mut o: NestedArrays) -> u8 {
+    set_holder_first_element(&mut o.i);
+    o.i.a[0]
+}
+
+/// The false direction of the nested-aggregate element write: the helper stores 9, so a
+/// claim of the seed is refuted rather than proved.
+/// requires: o.i.a[0] == 5
+/// ensures: ret == 5
+pub fn a_helper_nested_aggregate_element_write_is_not_the_seed(mut o: NestedArrays) -> u8 {
+    set_holder_first_element(&mut o.i);
+    o.i.a[0]
+}
+
+/// A helper handed a *shared* nested aggregate that only *reads* the array element: the
+/// caller's seed has to cross *into* the callee, or the callee's read is unknown and the
+/// true contract is unreadable rather than decided.
+/// requires: o.i.a[0] == 5
+/// ensures: ret == 5
+pub fn a_helper_nested_aggregate_element_read(mut o: NestedArrays) -> u8 {
+    read_holder_first_element(&o.i)
+}
+
+/// The reading helper: its argument is a `&ArrayHolder`, and `i.a[0]` is the caller's
+/// `o.i.a[0]`.
+fn read_holder_first_element(i: &ArrayHolder) -> u8 {
+    i.a[0]
+}
+
+/// The writing helper for a nested aggregate target: `i.a[0]` is the caller's `o.i.a[0]`.
+fn set_holder_first_element(i: &mut ArrayHolder) {
+    i.a[0] = 9;
+}
+
+/// The whole-array-target case: an array handed over *as* a reference target
+/// (`&mut x.a`) crosses the frame.
+///
+/// `set_first_of(&mut x.a)` passes a `&mut [u8; 4]` whose target is the *field* `x.a`,
+/// not the whole local. The callee's `(*_1)[0] = 9` lands in the callee's own element
+/// store, and the return path re-bases it onto the caller's field-path element store
+/// (`elems_path`, keyed by the field chain `x.a`) -- the key the caller's `x.a[0]` read
+/// consults. So the write crosses the frame and the contract decides: `ret == 9`
+/// verifies.
+///
+/// The false twin below is the other half, and it is what makes the decision
+/// trustworthy: a re-basing that connected the two stores the *wrong* way would turn
+/// the twin `Verified` before it turned this one verified. It does not -- the twin is
+/// refuted -- so no false proof is claimed. The whole-*local* form
+/// (`set_arr(&mut a); a[0]`) also decides, because the target has no projection and the
+/// store is keyed by the local alone.
+/// requires: x.a[0] == 5
+/// ensures: ret == 9
+pub fn a_whole_array_target_crosses_a_reference_argument(mut x: Boxed) -> u8 {
+    set_first_of(&mut x.a);
+    x.a[0]
+}
+
+/// The false direction of the whole-array target, named so the corpus-wide
+/// `no_cannot_prove_entry_is_ever_verified` invariant holds it as well: it must never
+/// become `Verified`.
+/// requires: x.a[0] == 5
+/// ensures: ret == 5
+pub fn a_whole_array_target_cannot_prove_this(mut x: Boxed) -> u8 {
+    set_first_of(&mut x.a);
+    x.a[0]
+}
+
+/// The helper handed the *array itself* (`&mut [u8; 4]`) rather than the local that
+/// holds it.
+fn set_first_of(a: &mut [u8; 4]) {
+    a[0] = 9;
+}
+
+/// The read-only half of the whole-array-target case: `&x.a` crosses the frame the same
+/// way `&mut x.a` does.
+///
+/// `peek_of(&x.a)` hands the callee the array `x.a` as a `&[u8; 4]`, so the callee's
+/// `a[0]` is the caller's `x.a[0]`. The carry-in re-bases the caller's field-path element
+/// onto the callee's whole-local element store, so the read finds the seed and the
+/// contract decides: `ret == 5` verifies. Without it the callee read `Unknown` and this
+/// was `Incomplete` -- the exact mirror of the write direction above.
+/// requires: x.a[0] == 5
+/// ensures: ret == 5
+pub fn a_whole_array_target_read_crosses_a_reference_argument(x: Boxed) -> u8 {
+    peek_of(&x.a)
+}
+
+/// The false direction of the read-only whole-array target: the seed is 5, not 7.
+/// requires: x.a[0] == 5
+/// ensures: ret == 7
+pub fn a_whole_array_target_read_cannot_prove_this(x: Boxed) -> u8 {
+    peek_of(&x.a)
+}
+
+/// The reading helper for a whole-array target: its argument is the array `x.a` itself.
+fn peek_of(a: &[u8; 4]) -> u8 {
+    a[0]
+}
+
+/// The sibling-field direction of the whole-array target: the write to `x.a` must not
+/// leak into `x.b`.
+///
+/// `set_first_of(&mut x.a)` writes `x.a[0]`, so `x.b[0]` is still the seed. Claiming
+/// `ret == 9` here is false of the body and must be refuted; a re-basing that keyed the
+/// callee's element on the local alone -- the field chain dropped -- would land the
+/// write on whichever field the caller happened to read and *prove* this. The suffix
+/// also puts it under the corpus-wide `no_cannot_prove_entry_is_ever_verified`
+/// invariant.
+/// requires: x.b[0] == 5
+/// ensures: ret == 9
+pub fn a_whole_array_target_sibling_cannot_prove_this(mut x: Boxed) -> u8 {
+    set_first_of(&mut x.a);
+    x.b[0]
+}
+
+/// A read-modify-write through a whole-array target: the callee *reads* the element it
+/// also writes.
+///
+/// `bump_first_of(&mut x.a)` computes `x.a[0] + 1`, so this exercises both directions at
+/// once -- the carry-in must hand the callee the caller's seed (else `a[0]` reads
+/// `Unknown` and the add is an unmodelled operand) and the write-back must land the
+/// result on the caller's `x.a[0]` (else the caller reads its own seed and `ret == 6`
+/// is unprovable). Both are the same re-basing arm, so a fix that did only one would
+/// fail here.
+/// requires: x.a[0] == 5
+/// ensures: ret == 6
+pub fn a_whole_array_target_read_modify_write(mut x: Boxed) -> u8 {
+    bump_first_of(&mut x.a);
+    x.a[0]
+}
+
+/// The false direction of [`a_whole_array_target_read_modify_write`]: the seed, not the
+/// incremented value. The suffix puts it under the corpus-wide
+/// `no_cannot_prove_entry_is_ever_verified` invariant.
+/// requires: x.a[0] == 5
+/// ensures: ret == 5
+pub fn a_whole_array_target_read_modify_write_cannot_prove_this(mut x: Boxed) -> u8 {
+    bump_first_of(&mut x.a);
+    x.a[0]
+}
+
+/// A whole-array target reached through a *nested* field path: `&mut o.i.a`.
+///
+/// The target's chain is two fields (`[0, 0]`), so the re-basing has to carry a chain of
+/// more than one step, not just a single field. The helper is the same `set_first_of`, so
+/// the difference from the flat case is the target's depth alone.
+/// requires: o.i.a[0] == 5
+/// ensures: ret == 9
+pub fn a_nested_whole_array_target_crosses_a_reference_argument(mut o: NestedArrays) -> u8 {
+    set_first_of(&mut o.i.a);
+    o.i.a[0]
+}
+
+/// The false direction of [`a_nested_whole_array_target_crosses_a_reference_argument`].
+/// requires: o.i.a[0] == 5
+/// ensures: ret == 5
+pub fn a_nested_whole_array_target_cannot_prove_this(mut o: NestedArrays) -> u8 {
+    set_first_of(&mut o.i.a);
+    o.i.a[0]
+}
+
+/// The write crosses *two* frames: the caller hands `&mut x.a` to a helper that hands the
+/// same reference on to [`set_first_of`].
+///
+/// `relay_first_of` only forwards its argument, so the write reaches the caller's
+/// `x.a[0]` through an inner call. Each frame re-bases independently, so this is the
+/// transitivity check on the re-basing rule rather than a new rule.
+/// requires: x.a[0] == 5
+/// ensures: ret == 9
+pub fn a_whole_array_target_crosses_two_frames(mut x: Boxed) -> u8 {
+    relay_first_of(&mut x.a);
+    x.a[0]
+}
+
+/// The false direction of [`a_whole_array_target_crosses_two_frames`].
+/// requires: x.a[0] == 5
+/// ensures: ret == 5
+pub fn a_whole_array_target_crosses_two_frames_cannot_prove_this(mut x: Boxed) -> u8 {
+    relay_first_of(&mut x.a);
+    x.a[0]
+}
+
+/// A read-modify-write helper for a whole-array target: reads and writes element 0.
+fn bump_first_of(a: &mut [u8; 4]) {
+    a[0] = a[0] + 1;
+}
+
+/// A pass-through helper: forwards its whole-array reference to [`set_first_of`], so the
+/// write crosses two frames.
+fn relay_first_of(a: &mut [u8; 4]) {
+    set_first_of(a);
+}
+
+impl Boxed {
+    /// `&mut self.a[0]` -- the returned reference names an *element*, and the index the
+    /// dump prints is a local (`_2`), not the literal.
+    fn first_mut(&mut self) -> &mut u8 {
+        &mut self.a[0]
+    }
+
+    /// `&mut self.a[1]` -- a second element, so a fix that pinned every returned element
+    /// to index 0 would decide the first case and read the wrong element here.
+    fn second_mut(&mut self) -> &mut u8 {
+        &mut self.a[1]
+    }
+}
+
+/// A method that returns `&mut` to an *element* of a field array: the write through the
+/// returned reference must land on `x.a[0]`.
+///
+/// `x.first_mut()` builds `&mut x.a[0]` from `_1.0[_2]`, where `_2` is the local that held
+/// `0`. The caller's place for the returned reference has to keep that element index, and
+/// `_2` means nothing outside the callee -- so a translation that carried the local through
+/// left a place no element store is keyed by, the write was dropped, and the contract was
+/// unreadable. Pinning the index to its literal while the callee's locals are still live is
+/// what makes `ret == 9` decide; a symbolic index is left alone, so no write lands on an
+/// element the caller never named.
+/// requires: x.a[0] == 5
+/// ensures: ret == 9
+pub fn returned_ref_to_an_element_crosses_the_frame(mut x: Boxed) -> u8 {
+    *x.first_mut() = 9;
+    x.a[0]
+}
+
+/// The false direction of [`returned_ref_to_an_element_crosses_the_frame`]: the seed, not
+/// the write. A re-basing that aimed the write at the wrong element could turn this twin
+/// `Verified` before the true case, so it is held by the corpus-wide
+/// `no_cannot_prove_entry_is_ever_verified` invariant.
+/// requires: x.a[0] == 5
+/// ensures: ret == 5
+pub fn returned_ref_to_an_element_cannot_prove_this(mut x: Boxed) -> u8 {
+    *x.first_mut() = 9;
+    x.a[0]
+}
+
+/// The second element: a fix that pinned every returned element to index 0 would decide the
+/// case above and read the wrong element here.
+/// requires: x.a[1] == 5
+/// ensures: ret == 9
+pub fn returned_ref_to_a_sibling_element(mut x: Boxed) -> u8 {
+    *x.second_mut() = 9;
+    x.a[1]
+}
+
+/// The false direction of [`returned_ref_to_a_sibling_element`].
+/// requires: x.a[1] == 5
+/// ensures: ret == 5
+pub fn returned_ref_to_a_sibling_element_cannot_prove_this(mut x: Boxed) -> u8 {
+    *x.second_mut() = 9;
+    x.a[1]
+}
+
+/// The write through the returned reference must not land on a *different* element.
+///
+/// The method writes `x.a[1]`, so `x.a[0]` is still the seed. Claiming `ret == 9` here is
+/// false of the body; an element index that was dropped or defaulted would prove it.
+/// requires: x.a[0] == 5
+/// ensures: ret == 9
+pub fn returned_ref_write_is_not_the_wrong_element_cannot_prove_this(mut x: Boxed) -> u8 {
+    *x.second_mut() = 9;
+    x.a[0]
+}
+
+/// A helper that returns `&mut` to an element of the array it was handed: the write
+/// through the returned reference must reach the caller's array.
+///
+/// `elem_mut(&mut x.a)` passes the array `x.a` *itself*; inside, `&mut a[0]` is
+/// `(*_1)[_2]` -- a deref of the reference argument followed by the element index. The
+/// translation back to the caller appended that projection to `x.a`, leaving a deref in
+/// the middle of the caller's place where no element store is keyed. The write was
+/// dropped, the caller read its own seed, and the *false* direction below was **proved**
+/// against a body returning 9 -- a false proof, not a lost one. Stripping the argument's
+/// deref (the head `arg_source` already names) and pinning the index is what makes the
+/// true contract decide and the false twin refute.
+/// requires: x.a[0] == 5
+/// ensures: ret == 9
+pub fn returned_ref_to_a_whole_array_element(mut x: Boxed) -> u8 {
+    let r = elem_mut(&mut x.a);
+    *r = 9;
+    x.a[0]
+}
+
+/// The false direction of [`returned_ref_to_a_whole_array_element`]: the seed, not the
+/// write. This is the entry the pre-fix engine *proved*, so it is the sharpest tooth here.
+/// requires: x.a[0] == 5
+/// ensures: ret == 5
+pub fn returned_ref_to_a_whole_array_element_cannot_prove_this(mut x: Boxed) -> u8 {
+    let r = elem_mut(&mut x.a);
+    *r = 9;
+    x.a[0]
+}
+
+/// The reading helper for [`returned_ref_to_a_whole_array_element`]: returns `&mut` to
+/// element 0 of the array it is handed.
+fn elem_mut(a: &mut [u8; 4]) -> &mut u8 {
+    &mut a[0]
+}
+
+/// A returned reference to an element reached through a *nested* field path: the origin is
+/// `(*_1).i.a[_2]`, so the appended projection is a chain of two fields and an index.
+/// requires: o.i.a[0] == 5
+/// ensures: ret == 9
+pub fn returned_ref_to_a_nested_whole_array_element(mut o: NestedArrays) -> u8 {
+    *deep_elem_mut(&mut o) = 9;
+    o.i.a[0]
+}
+
+/// The false direction of [`returned_ref_to_a_nested_whole_array_element`].
+/// requires: o.i.a[0] == 5
+/// ensures: ret == 5
+pub fn returned_ref_to_a_nested_whole_array_element_cannot_prove_this(mut o: NestedArrays) -> u8 {
+    *deep_elem_mut(&mut o) = 9;
+    o.i.a[0]
+}
+
+/// The nested reading helper: `&mut o.i.a[0]`.
+fn deep_elem_mut(o: &mut NestedArrays) -> &mut u8 {
+    &mut o.i.a[0]
+}
+
+/// A returned reference to a *guarded* symbolic element: `x.nth_mut(i)` is `&mut x.a[i]`
+/// and the contract admits only `i == 0`, so the write lands on `x.a[0]` and `ret == 9`
+/// decides. The guard is what makes the symbolic index a single element.
+/// requires: x.a[0] == 5 && i == 0
+/// ensures: ret == 9
+pub fn returned_ref_to_a_guarded_symbolic_element(mut x: Boxed, i: usize) -> u8 {
+    *x.nth_mut(i) = 9;
+    x.a[0]
+}
+
+/// The false direction of [`returned_ref_to_a_guarded_symbolic_element`]: same body, so
+/// claiming the seed must be refuted.
+/// requires: x.a[0] == 5 && i == 0
+/// ensures: ret == 5
+pub fn returned_ref_to_a_guarded_symbolic_element_cannot_prove_this(mut x: Boxed, i: usize) -> u8 {
+    *x.nth_mut(i) = 9;
+    x.a[0]
+}
+
+/// A returned reference to an element under a *symbolic* index the contract does not pin:
+/// `i` may be any of the four elements, so the write cannot be aimed at `x.a[0]`. The
+/// engine must not prove either direction -- the true `ret == 9` is a refusal, and the
+/// false `ret == 5` must not be a false proof.
+/// requires: x.a[0] == 5
+/// ensures: ret == 5
+pub fn returned_ref_to_an_unpinned_symbolic_element_cannot_prove_this(mut x: Boxed, i: usize) -> u8 {
+    *x.nth_mut(i) = 9;
+    x.a[0]
+}
+
+/// A returned reference to an element under a symbolic index, with the caller's
+/// numbering *shifted* by an extra parameter so the callee's index local number
+/// names a different caller local.
+///
+/// Inside `nth_mut` the index is `_2`, but `_2` in this caller is `zero`, not `i`.
+/// Carried across the call boundary, the write `*x.nth_mut(i) = 9` landed on
+/// `x.a[zero]` -- and the contract fixes `zero == 0`, so it landed on the *seed*
+/// element `x.a[0]` and the false `ret == 5` was **proved**. The index cannot be
+/// pinned (the contract admits any `i < 4`), so the write may hit any element and
+/// must be refused, never aimed at a caller local that happens to share its number.
+/// requires: x.a[0] == 5 && zero == 0 && i < 4
+/// ensures: ret == 5
+pub fn a_shifted_symbolic_element_cannot_prove_this(mut x: Boxed, zero: usize, i: usize) -> u8 {
+    *x.nth_mut(i) = 9;
+    x.a[0]
+}
+
+/// The true direction of [`a_shifted_symbolic_element_cannot_prove_this`]: the
+/// write may land on any element, so `ret == 9` is a refusal, not a proof. A fix
+/// that dropped the write and left the seed readable would turn the false
+/// direction above around and prove *this* one instead, so both are pinned.
+/// requires: x.a[0] == 5 && zero == 0 && i < 4
+/// ensures: ret == 9
+pub fn a_shifted_symbolic_element_is_not_proved(mut x: Boxed, zero: usize, i: usize) -> u8 {
+    *x.nth_mut(i) = 9;
+    x.a[0]
+}
+
+/// `&mut self.a[i]` -- a method whose returned reference names an element under a symbolic
+/// index.
+impl Boxed {
+    fn nth_mut(&mut self, i: usize) -> &mut u8 {
+        &mut self.a[i]
+    }
+}
+
+/// A struct literal's array field carries its elements.
+///
+/// `ArrayHolder { a: [9, 1, 2, 3] }` builds the array in a temp whose elements live in
+/// `elems`, then moves it into the field `_2.0`. The move carried the field's *value* but
+/// not its elements -- `rebase_parts` re-based `elems_path` (field-path arrays) and missed
+/// the whole-local `elems` store -- so `x.a[0]` read `Unknown` and the contract stayed
+/// `Incomplete` in *both* directions. That is a coverage hole, not a false proof: a
+/// missing value proves nothing, so the true `ret == 9` was merely lost. A bare array
+/// literal (`let a = [9, 1, 2, 3]; a[0]`) always worked, which is why only the field case
+/// showed the hole.
+/// requires: true
+/// ensures: ret == 9
+pub fn a_struct_literal_array_element_is_read_back() -> u8 {
+    let x = ArrayHolder { a: [9, 1, 2, 3] };
+    x.a[0]
+}
+
+/// The false direction of [`a_struct_literal_array_element_is_read_back`]: a carry that
+/// landed every element on index 0, or dropped the indices, would decide the wrong one.
+/// requires: true
+/// ensures: ret == 1
+pub fn a_struct_literal_array_element_is_not_the_seed_cannot_prove_this() -> u8 {
+    let x = ArrayHolder { a: [9, 1, 2, 3] };
+    x.a[0]
+}
+
+/// The element at a *different* index, so a fix that pinned the first element for all of
+/// them is caught.
+/// requires: true
+/// ensures: ret == 1
+pub fn a_struct_literal_array_second_element_is_read_back() -> u8 {
+    let x = ArrayHolder { a: [9, 1, 2, 3] };
+    x.a[1]
+}
+
+/// The false direction of [`a_struct_literal_array_second_element_is_read_back`].
+/// requires: true
+/// ensures: ret == 9
+pub fn a_struct_literal_array_second_element_is_not_the_first_cannot_prove_this() -> u8 {
+    let x = ArrayHolder { a: [9, 1, 2, 3] };
+    x.a[1]
+}
+
+/// A *nested* struct literal: the array field is one level deeper, so the move re-roots the
+/// elements under a longer destination chain.
+/// requires: true
+/// ensures: ret == 9
+pub fn a_nested_struct_literal_array_element_is_read_back() -> u8 {
+    let o = NestedArrays { i: ArrayHolder { a: [9, 1, 2, 3] }, k: 0 };
+    o.i.a[0]
+}
+
+/// The false direction of [`a_nested_struct_literal_array_element_is_read_back`].
+/// requires: true
+/// ensures: ret == 1
+pub fn a_nested_struct_literal_array_element_is_not_the_seed_cannot_prove_this() -> u8 {
+    let o = NestedArrays { i: ArrayHolder { a: [9, 1, 2, 3] }, k: 0 };
+    o.i.a[0]
+}
+
+/// A whole-field assignment through a reference carries the array field's elements to the
+/// caller. The callee's `*h = n` replaces the field, and the elements of the moved array
+/// have to reach the caller's store or `o.i.a[0]` reads its seed.
+/// requires: o.i.a[0] == 7
+/// ensures: ret == 9
+pub fn a_whole_field_assignment_carries_its_array_elements(mut o: NestedArrays) -> u8 {
+    set_holder(&mut o.i, ArrayHolder { a: [9, 1, 2, 3] });
+    o.i.a[0]
+}
+
+/// The false direction of [`a_whole_field_assignment_carries_its_array_elements`].
+/// requires: o.i.a[0] == 7
+/// ensures: ret == 7
+pub fn a_stale_whole_field_array_element_cannot_prove_this(mut o: NestedArrays) -> u8 {
+    set_holder(&mut o.i, ArrayHolder { a: [9, 1, 2, 3] });
+    o.i.a[0]
+}
+
+/// The whole-field replacement must not disturb a sibling scalar.
+/// requires: o.k == 5
+/// ensures: ret == 5
+pub fn a_whole_field_assignment_leaves_its_sibling(mut o: NestedArrays) -> u8 {
+    set_holder(&mut o.i, ArrayHolder { a: [9, 1, 2, 3] });
+    o.k
+}
+
+/// The false direction of [`a_whole_field_assignment_leaves_its_sibling`]: a re-base that
+/// spilled the moved elements onto the sibling would decide this.
+/// requires: o.k == 5
+/// ensures: ret == 9
+pub fn a_whole_field_assignment_leaves_its_sibling_cannot_prove_this(mut o: NestedArrays) -> u8 {
+    set_holder(&mut o.i, ArrayHolder { a: [9, 1, 2, 3] });
+    o.k
+}
+
+/// An array *field* read through a reference argument: the referent's elements are carried
+/// in, so the callee's `h.a[0]` reads the caller's element.
+/// requires: h.a[0] == 5
+/// ensures: ret == 5
+pub fn an_array_field_argument_is_read_by_element(h: ArrayHolder) -> u8 {
+    h.a[0]
+}
+
+/// The false direction of [`an_array_field_argument_is_read_by_element`].
+/// requires: h.a[0] == 5
+/// ensures: ret == 9
+pub fn an_array_field_argument_is_read_by_element_cannot_prove_this(h: ArrayHolder) -> u8 {
+    h.a[0]
+}
+
+/// A helper replacing a whole `ArrayHolder` through a reference.
+pub fn set_holder(h: &mut ArrayHolder, n: ArrayHolder) {
+    *h = n;
+}
+
+/// A whole-aggregate replacement through a sub-place target decides.
+///
+/// `set_whole(&mut o.i, InnerBox { v: 9 })` replaces the whole referent, and the moved value's
+/// leaf must reach the caller. This was once believed *sound-incomplete*; it is not -- the
+/// re-based write-back re-roots the callee's `fields` entry under the target's chain, and a
+/// whole value and a leaf write are both a `fields` entry there.
+/// requires: o.i.v == 7
+/// ensures: ret == 9
+pub fn whole_replacement_through_sub_place(mut o: OuterBox) -> u8 {
+    set_whole(&mut o.i, InnerBox { v: 9 });
+    o.i.v
+}
+
+/// The false direction of [`whole_replacement_through_sub_place`]: a dropped replacement
+/// would leave the seed, so this would verify.
+/// requires: o.i.v == 7
+/// ensures: ret == 7
+pub fn whole_replacement_through_sub_place_cannot_prove_this(mut o: OuterBox) -> u8 {
+    set_whole(&mut o.i, InnerBox { v: 9 });
+    o.i.v
+}
+
+/// The replacement must not spill onto the sibling field.
+/// requires: o.j.v == 5
+/// ensures: ret == 5
+pub fn whole_replacement_leaves_the_sibling(mut o: OuterBox) -> u8 {
+    set_whole(&mut o.i, InnerBox { v: 9 });
+    o.j.v
+}
+
+/// The false direction of [`whole_replacement_leaves_the_sibling`]: a write-back that
+/// re-rooted onto the whole local instead of the target's chain would prove this.
+/// requires: o.j.v == 5
+/// ensures: ret == 9
+pub fn whole_replacement_leaves_the_sibling_cannot_prove_this(mut o: OuterBox) -> u8 {
+    set_whole(&mut o.i, InnerBox { v: 9 });
+    o.j.v
+}
+
+/// A replacement whose value is built in a caller local, so the carry crosses the frame
+/// from a temp rather than a literal.
+/// requires: o.i.v == 7
+/// ensures: ret == 9
+pub fn whole_replacement_from_a_local(mut o: OuterBox) -> u8 {
+    let n = InnerBox { v: 9 };
+    set_whole(&mut o.i, n);
+    o.i.v
+}
+
+/// The false direction of [`whole_replacement_from_a_local`].
+/// requires: o.i.v == 7
+/// ensures: ret == 7
+pub fn whole_replacement_from_a_local_cannot_prove_this(mut o: OuterBox) -> u8 {
+    let n = InnerBox { v: 9 };
+    set_whole(&mut o.i, n);
+    o.i.v
+}
+
+/// A helper replacing a whole aggregate through a reference.
+pub fn set_whole(i: &mut InnerBox, n: InnerBox) {
+    *i = n;
+}
+
+// ---------------------------------------------------------------------------
+// Named `const` items
+//
+// rustc const-evaluates a `const` item and prints its body separately
+// (`const LIMIT: u8 = const 10_u8;`), referring to it by name at the use site
+// (`_0 = const LIMIT`). Without inlining the definition the use site is an
+// unreadable path constant and the contract is lost -- not wrongly proved, but
+// never decided. These pin the shapes that inlining must decide, each with its
+// false twin so a future regression that *guessed* a value would be caught.
+// ---------------------------------------------------------------------------
+
+/// A limit constant, the shape a bounds check reads.
+const LIMIT: u8 = 10;
+
+/// A wider constant, so the width comes from the item's own suffix.
+const WIDE_LIMIT: u16 = 1000;
+
+/// A constant whose definition is another constant; rustc prints the *evaluated*
+/// value, so `const NEXT: u8 = const 11_u8;`.
+const NEXT: u8 = LIMIT + 1;
+
+/// A negative constant, whose sign must survive inlining.
+const NEG: i8 = -1;
+
+/// A boolean constant.
+const ENABLED: bool = true;
+
+/// Reading a named constant decides.
+/// requires: true
+/// ensures: ret == 10
+pub fn named_const_is_read(x: u8) -> u8 {
+    let _ = x;
+    LIMIT
+}
+
+/// The false direction of [`named_const_is_read`]: a wrong inlined value would prove
+/// this.
+/// requires: true
+/// ensures: ret == 11
+pub fn named_const_is_read_cannot_prove_this(x: u8) -> u8 {
+    let _ = x;
+    LIMIT
+}
+
+/// A named constant used as a comparison bound decides. The precondition names the
+/// value the constant holds (`10`) as a plain literal, which is the spelling that
+/// worked before the contract reader could resolve `const` items; the constant
+/// itself is named in the `A contract that names a const` section below. A wrong
+/// inlined value would make the branch unreachable and the postcondition false.
+/// requires: x < 10
+/// ensures: ret == 1
+pub fn named_const_bounds_a_comparison(x: u8) -> u8 {
+    if x < LIMIT {
+        1
+    } else {
+        2
+    }
+}
+
+/// The false direction of [`named_const_bounds_a_comparison`].
+/// requires: x < 10
+/// ensures: ret == 2
+pub fn named_const_bounds_a_comparison_cannot_prove_this(x: u8) -> u8 {
+    if x < LIMIT {
+        1
+    } else {
+        2
+    }
+}
+
+/// A named constant used in an equality test decides.
+/// requires: x == 10
+/// ensures: ret == 1
+pub fn named_const_matches_an_equality(x: u8) -> u8 {
+    if x == LIMIT {
+        1
+    } else {
+        2
+    }
+}
+
+/// The false direction of [`named_const_matches_an_equality`].
+/// requires: x == 10
+/// ensures: ret == 2
+pub fn named_const_matches_an_equality_cannot_prove_this(x: u8) -> u8 {
+    if x == LIMIT {
+        1
+    } else {
+        2
+    }
+}
+
+/// A constant whose definition is an *expression* rather than a literal is not
+/// inlined: rustc prints it with its own body and locals (`const NEXT: u8 = {
+/// let mut _0: u8; ... }`), so the use site stays an unreadable path constant and
+/// the contract is not decided. This is a coverage boundary, not a wrong proof --
+/// the value is simply absent, so nothing is proved either way. Inlining it would
+/// mean interpreting the item's body, which the executor already knows how to do
+/// for a function; that is future work, and this entry is the pin that says the
+/// boundary is where it is.
+/// requires: true
+/// ensures: ret == 11
+pub fn named_const_of_an_expression_is_not_inlined(x: u8) -> u8 {
+    let _ = x;
+    NEXT
+}
+
+/// A constant wider than a byte keeps its own width.
+/// requires: true
+/// ensures: ret == 1000
+pub fn named_const_keeps_its_width() -> u16 {
+    WIDE_LIMIT
+}
+
+/// The false direction of [`named_const_keeps_its_width`].
+/// requires: true
+/// ensures: ret == 999
+pub fn named_const_keeps_its_width_cannot_prove_this() -> u16 {
+    WIDE_LIMIT
+}
+
+/// A boolean constant selects a branch at the use site.
+/// requires: true
+/// ensures: ret == 7
+pub fn named_bool_const_selects() -> u8 {
+    if ENABLED {
+        7
+    } else {
+        9
+    }
+}
+
+/// The false direction of [`named_bool_const_selects`].
+/// requires: true
+/// ensures: ret == 9
+pub fn named_bool_const_selects_cannot_prove_this() -> u8 {
+    if ENABLED {
+        7
+    } else {
+        9
+    }
+}
+
+/// A negative constant's sign survives inlining, so the comparison is a signed one.
+/// requires: x >= -1
+/// ensures: ret == 1
+pub fn named_negative_const_is_signed(x: i8) -> i8 {
+    if x < NEG {
+        0
+    } else {
+        1
+    }
+}
+
+/// The false direction of [`named_negative_const_is_signed`]: reading `NEG` as a
+/// positive 1 would make this hold for `x == -1` and `x == 0`, so it is not the
+/// false twin of a wrong *value* alone -- it also pins the signed reading.
+/// requires: x >= -1
+/// ensures: ret == 0
+pub fn named_negative_const_is_signed_cannot_prove_this(x: i8) -> i8 {
+    if x < NEG {
+        0
+    } else {
+        1
+    }
+}
+
+/// Two modules with a `const` of the same last name. rustc prints the definitions
+/// as `const low::K: u8 = const 5_u8;` and the uses as `const low::K`, so keying
+/// the table by the full path is what keeps them apart -- a table keyed by the
+/// last segment would collapse them and could read the wrong value.
+pub mod low {
+    /// The low limit.
+    pub const K: u8 = 5;
+}
+
+/// A second module whose `const K` has a different value.
+pub mod high {
+    /// The high limit.
+    pub const K: u8 = 7;
+}
+
+/// A module-nested constant is inlined by its full path.
+/// requires: true
+/// ensures: ret == 5
+pub fn nested_module_const_is_read() -> u8 {
+    low::K
+}
+
+/// The false direction of [`nested_module_const_is_read`]: reading the *other*
+/// module's `K` (7) would prove this, so the entry pins the path keying.
+/// requires: true
+/// ensures: ret == 7
+pub fn nested_module_const_is_read_cannot_prove_this() -> u8 {
+    low::K
+}
+
+/// A `const` declared *inside* a function body is not inlined, because the two
+/// spellings do not meet: the *use* is printed with the enclosing function's path
+/// (`const a_function_local_const_is_not_inlined::L`) while the *definition* is
+/// printed bare (`const L: u8 = const 3_u8;`). It stays an unreadable path
+/// constant, a coverage boundary rather than a wrong proof, since no value is read
+/// at all.
+///
+/// The bare definition is *also* why a function-local item must not become a
+/// program-wide key: a crate-level `const` gets the same bare definition, so the
+/// definition alone cannot tell the two apart. Only the use site can -- a crate
+/// item is used bare (`const L`), a local one qualified (`const f::L`) -- which is
+/// what [`bare_const_uses`] reads. See
+/// [`a_local_const_is_not_in_scope_in_another_function`] for the false proof a bare
+/// key would reopen.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_function_local_const_is_not_inlined() -> u8 {
+    const L: u8 = 3;
+    L
+}
+
+/// The function that owns the local `const` the contract below must not see.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_local_const_owner() -> u8 {
+    const L: u8 = 3;
+    L
+}
+
+/// A function-local `const` is not in scope in another function, and its
+/// definition must not become a program-wide key.
+///
+/// The owner's dump prints `const L: u8 = const 3_u8;` bare, while its *use* is
+/// qualified (`const a_local_const_owner::L`) -- exactly the spelling a crate-level
+/// `const` gets for its definition. The two are indistinguishable from the
+/// definition alone, so a bare key recorded for the local let this contract's
+/// `requires: L == 3` resolve to a name this function's own source could not
+/// write, and the function was *proved* from another function's body. That is not
+/// a lost proof but a wrong one: the name must resolve to nothing here, leaving
+/// this `Skipped` (unreadable `requires`), never `Verified`.
+/// requires: L == 3
+/// ensures: ret == 3
+pub fn a_local_const_is_not_in_scope_in_another_function() -> u8 {
+    3
+}
+
+// ---------------------------------------------------------------------------
+// A contract that names a `const`
+//
+// The reader resolves a bare name against the arguments, then against the
+// program's own `const` table -- the *same* table the executor folds a body's
+// `const LIMIT` from. One table means the contract and the body cannot disagree:
+// `requires: x <= LIMIT` and the body's `if x > LIMIT` read one value, because
+// there is one value, taken once from rustc's const-evaluated dump. The value is
+// built at the item's own width and sign (the dump prints `const 10_u8`), so a
+// `const NEG: i8 = -1` compares as `-1`, not `255`.
+
+/// A precondition that names a constant, and a body that names the same one. The
+/// postcondition is only reachable when the reader resolves `LIMIT` to `10` on
+/// both sides; a bare name that resolved to nothing would skip the function
+/// rather than prove it.
+/// requires: x <= LIMIT
+/// ensures: ret <= LIMIT
+pub fn a_contract_names_a_const(x: u8) -> u8 {
+    if x > LIMIT {
+        LIMIT
+    } else {
+        x
+    }
+}
+
+/// The false direction of [`a_contract_names_a_const`]: the body does *not* clamp
+/// to `LIMIT`, so the postcondition that names the constant is false. Reading the
+/// constant as an unbounded argument would leave this unproved either way, so the
+/// entry pins that the name really is a value.
+/// requires: true
+/// ensures: ret <= LIMIT
+pub fn a_contract_names_a_const_cannot_prove_this(x: u8) -> u8 {
+    x
+}
+
+/// A negative constant named in a contract keeps its sign, so the bound is the
+/// signed `-1`. Read as the unsigned `255`, the precondition would be vacuous and
+/// the postcondition false.
+/// requires: y >= NEG
+/// ensures: ret >= NEG
+pub fn a_contract_names_a_negative_const(y: i8) -> i8 {
+    if y < NEG {
+        NEG
+    } else {
+        y
+    }
+}
+
+/// A boolean constant named in a comparison in a contract.
+/// requires: b == ENABLED
+/// ensures: ret == ENABLED
+pub fn a_contract_names_a_bool_const(b: bool) -> bool {
+    let _ = b;
+    ENABLED
+}
+
+/// A module-qualified constant named in a contract, resolved by its full path so
+/// it does not collide with a top-level constant of the same last segment. The
+/// body reads `low::K`, and the contract names the same path.
+/// requires: x <= low::K
+/// ensures: ret <= low::K
+pub fn a_contract_names_a_qualified_const(x: u8) -> u8 {
+    if x > low::K {
+        low::K
+    } else {
+        x
+    }
+}
+
+/// The false direction of [`a_contract_names_a_qualified_const`]: naming the
+/// *other* module's `K` (7) is a value the body never exceeds, but the body clamps
+/// to `low::K` (5), so `ret <= high::K` is true -- this entry instead pins the two
+/// values apart by demanding the body reach `high::K`, which it cannot.
+/// requires: x <= low::K
+/// ensures: ret == high::K
+pub fn a_contract_names_a_qualified_const_cannot_prove_this(x: u8) -> u8 {
+    if x > low::K {
+        low::K
+    } else {
+        x
+    }
+}
+
+/// A constant whose definition is an *expression* is refused when a contract
+/// names it, rather than guessed at: its value lives in its own body, which the
+/// contract reader does not fold. The refusal is a skip, so nothing is proved --
+/// which is the honest answer, not a wrong proof.
+/// requires: x <= NEXT
+/// ensures: ret <= NEXT
+pub fn a_contract_names_an_expression_const(x: u8) -> u8 {
+    let _ = x;
+    NEXT
+}
+
+/// A misspelled constant is refused, not read as an argument that does not exist
+/// nor as zero. The name here differs from `LIMIT` by one letter.
+/// requires: x <= LIMITT
+/// ensures: ret <= LIMIT
+pub fn a_misspelled_const_is_refused(x: u8) -> u8 {
+    let _ = x;
+    LIMIT
+}
+
+/// A struct whose methods carry contracts, so a contract attached to an
+/// *inherent method* is exercised at all.
+pub struct MethodCounter {
+    pub n: u8,
+}
+
+impl MethodCounter {
+    /// A method's contract is keyed by the source name `bump`, but the MIR dump
+    /// names the body `<impl at …>::bump`. Resolving the contract by the *dump*
+    /// name matched nothing, and a missing contract is not a refusal:
+    /// `verify_function` builds `requires` and `ensures` from it, so the method
+    /// was checked against `true` and *no* postcondition -- reported verified with
+    /// zero obligations, the body never looked at. The true direction must verify
+    /// *with* its postcondition checked, which is why the obligation count is
+    /// asserted rather than only the verdict.
+    /// requires: self.n <= 250
+    /// ensures: ret == self.n + 1
+    pub fn bump(&self) -> u8 {
+        self.n + 1
+    }
+
+    /// The false direction of [`MethodCounter::bump`]: the postcondition demands
+    /// one more than the body returns, so it is false on every input. Before the
+    /// tail resolution this came back `verified` with zero obligations -- the exact
+    /// false proof the resolution closes. The corpus-wide naming invariant holds
+    /// it as well.
+    /// requires: self.n <= 250
+    /// ensures: ret == self.n + 2
+    pub fn bump_cannot_prove_this(&self) -> u8 {
+        self.n + 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A string literal must not leak a function-local `const`
+//
+// The bare-use scan reads use sites out of the dump to tell a crate-level
+// `const` from a function-local one. A `debug s => const "const LEAKY";` binding
+// (and the `alloc` block that backs the string) spells `const LEAKY` as *data*,
+// not as a use, but a scan that reads the raw line sees the same letters. That
+// made the local `LEAKY` look bare-used, gave it a program-wide key, and let this
+// contract resolve a name its own source could not write -- the very false proof
+// the qualified-use test exists to prevent, reopened through a string.
+//
+// The local name must be *unique* among the file's locals for the shape to
+// appear: rustc qualifies a local `const`'s definition (`const f::L`) only when
+// another local shares its name, and prints it bare (`const LEAKY`) when it does
+// not -- and the bare spelling is the one that collides with a crate-level item.
+
+/// A function whose local `const` no other local shares, so rustc prints its
+/// *definition* bare (`const LEAKY: u8 = const 3_u8;`) -- byte-identical to a
+/// crate-level item's.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_unique_local_const_owner() -> u8 {
+    const LEAKY: u8 = 3;
+    LEAKY
+}
+
+/// A string that contains the text `const LEAKY`, so the leak shape is present.
+/// requires: true
+/// ensures: ret == 0
+pub fn a_string_literal_spells_const_leaky() -> u8 {
+    let s = "const LEAKY";
+    let _ = s;
+    0
+}
+
+/// A contract that names `LEAKY` where no `const LEAKY` is in scope. The only
+/// `const LEAKY` is a local of [`a_unique_local_const_owner`], reachable here only
+/// if a string literal leaked its name into the bare-use set. It must be
+/// `Skipped`, never `Verified`.
+/// requires: LEAKY == 3
+/// ensures: ret == 3
+pub fn a_string_literal_must_not_leak_a_unique_local_const() -> u8 {
+    3
+}
+
+// ---------------------------------------------------------------------------
+// A crate-level `const` a *contract* names but no body uses
+//
+// The bare-use test is silent for a crate-level constant that only a contract
+// names: there is no use site to read. The definition alone cannot say the item
+// is module-scoped, so it was dropped and the contract went unreadable -- a lost
+// proof, not a wrong one. The source knows the item is at brace depth zero, so
+// `spec::crate_level_consts` says so and the definition is kept.
+
+/// A crate-level constant named by a contract below and by no body at all.
+const CONTRACT_ONLY: u8 = 7;
+
+/// The postcondition names [`CONTRACT_ONLY`], which the body never reads. It must
+/// resolve and the function verify; before the crate-scope tell the definition
+/// was dropped and this was `Skipped` (unreadable `ensures`).
+/// requires: true
+/// ensures: ret <= CONTRACT_ONLY
+pub fn a_contract_only_const_is_resolved() -> u8 {
+    3
+}
+
+// ---------------------------------------------------------------------------
+// Recursion and the intrinsic dispatch order
+//
+// `try_recursive_call` runs before the intrinsic model. A function named exactly
+// like an intrinsic that calls the *intrinsic* (`u8::wrapping_add`) is not calling
+// itself, but a resolver that matched on the last `::` component saw the tail
+// `wrapping_add`, took the call for a self-call, and answered it from this
+// function's own postcondition instead of evaluating the intrinsic -- a false
+// proof. The resolver now also requires the method's `self` type to agree, so
+// `u8` and the local function are distinct.
+//
+// The name must be the intrinsic's *exact* tail for the shape to appear: rustc
+// prints a call to the intrinsic as `core::num::<impl u8>::wrapping_add`, so only
+// a local item whose last segment is `wrapping_add` collides with it. A `decreases:`
+// measure is also required, because the false proof is the recursion route
+// assuming the postcondition; without a measure that route never fires.
+
+/// A free function named exactly `wrapping_add` that calls the *intrinsic* on the
+/// non-base path. Its postcondition `ret == 0` is false for `n == 1` (the body
+/// returns `0u8.wrapping_add(1) == 1`), so it must FAIL. Treating the intrinsic
+/// call as a self-call assumed `ret == 0` for the result and proved it.
+/// requires: true
+/// decreases: n
+/// ensures: ret == 0
+pub fn wrapping_add(n: u8) -> u8 {
+    if n == 0 {
+        0
+    } else {
+        0u8.wrapping_add(n)
+    }
+}
+
+/// A free function named exactly `wrapping_add` that *does* call itself. The
+/// type-aware resolver must still fire the recursion: the call `wrapping_add(n-1)`
+/// is printed bare (`wrapping_add`), matches this function by exact name, and its
+/// postcondition is assumed by the induction. This is the companion to the fixture
+/// above -- the intrinsic guard must not refuse a real self-call just because the
+/// tail matches an intrinsic name.
+/// requires: true
+/// decreases: n
+/// ensures: ret <= n
+pub fn wrapping_add_still_recurses(n: u8) -> u8 {
+    if n == 0 {
+        0
+    } else {
+        wrapping_add_still_recurses(n - 1)
+    }
+}
+
+/// A static associated function genuinely named like an intrinsic that recurses on
+/// itself. The tail matches an intrinsic's, but the call `Recursing::wrapping_sub`
+/// resolves to this function -- a `core` intrinsic's name carries an `<impl`
+/// projection and is refused -- so the induction proves the claim. The name is
+/// `wrapping_sub` rather than `wrapping_add` because the free `wrapping_add` above
+/// already owns that outcome key, and a method's report name is its bare tail.
+/// requires: true
+/// ensures: ret <= x
+pub fn a_static_method_named_like_an_intrinsic_still_recurses(x: u8) -> u8 {
+    Recursing::wrapping_sub(x)
+}
+
+/// The receiver for [`a_static_method_named_like_an_intrinsic_still_recurses`].
+pub struct Recursing;
+
+impl Recursing {
+    /// Recurses on `x`, with a measure and a postcondition the induction proves.
+    /// requires: true
+    /// decreases: x
+    /// ensures: ret <= x
+    pub fn wrapping_sub(x: u8) -> u8 {
+        if x == 0 {
+            0
+        } else {
+            Recursing::wrapping_sub(x - 1)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A recursive contract that names a `const`
+//
+// The recursive call evaluates the callee's contract with the *call site's*
+// argument bindings, but a constant is the same at the call as at entry. Handing
+// the reader an empty `const` table there made `requires: n <= LIMIT` unreadable
+// at the self-call, so a decidable proof came back a refusal.
+
+/// A recursive function whose contract names [`LIMIT`]. The constant resolves at
+/// the self-call now, so the induction goes through and this verifies; before,
+/// the self-call's `requires` was unreadable and the function was `Skipped`.
+/// requires: n <= LIMIT
+/// decreases: n
+/// ensures: ret <= LIMIT
+pub fn a_recursive_contract_naming_a_const_is_resolved(n: u8) -> u8 {
+    if n == 0 {
+        0
+    } else if n > LIMIT {
+        0
+    } else {
+        a_recursive_contract_naming_a_const_is_resolved(n - 1)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F3: a static associated function's owner is not in the dump
+//
+// A *static* associated function has no `self`, so its definition name
+// `<impl at FILE:L:C: L:C>::m` carries no type the way an instance method's
+// receiver does. The call site does name a type (`Foo::m`, `<u16 as From<u8>>::from`),
+// but the old resolver accepted a static candidate on the tail alone, so a call
+// to an *external* function was answered by a local method that merely shared its
+// tail -- a false proof. The owner type now comes from the `impl` block's own
+// source line, and a candidate whose owner cannot be established is refused.
+
+/// A local static method named `from`, which is *not* `u16::from`.
+pub struct StaticOwner;
+
+impl StaticOwner {
+    /// The body returns 99, but the call below never reaches it.
+    /// requires: true
+    /// ensures: ret == 99
+    pub fn from(x: u8) -> u16 {
+        let _ = x;
+        99
+    }
+
+    /// A local static method the call below *does* reach.
+    /// requires: true
+    /// ensures: ret == 7
+    pub fn seed() -> u8 {
+        7
+    }
+}
+
+/// The false direction: `<u16 as From<u8>>::from(x)` is `core`'s conversion,
+/// which returns `x`, so `ret == 99` is false for every `x != 99`. Before the
+/// owner-type check this call matched `StaticOwner::from` on the shared tail and
+/// the contract came back verified -- a false proof.
+/// requires: true
+/// ensures: ret == 99
+pub fn a_static_call_resolves_to_its_own_impl_cannot_prove_this(x: u8) -> u16 {
+    <u16 as From<u8>>::from(x)
+}
+
+/// The true direction: a call to a *local* static method resolves to that method,
+/// so its postcondition is checked and holds.
+/// requires: true
+/// ensures: ret == 7
+pub fn a_local_static_call_resolves_to_its_impl() -> u8 {
+    StaticOwner::seed()
+}
+
+// ---------------------------------------------------------------------------
+// F4: two `impl` blocks that share a method tail must not share a contract
+//
+// A method's contract was keyed by its bare name, so two `impl` blocks that each
+// declared `tag` produced one entry and the later overwrote the earlier. Both
+// methods then resolved to the survivor's contract: a lost proof for one, and --
+// with the claims the other way round -- a false proof for the other. The key is
+// now the `impl`'s location, which is exactly what the dump names.
+
+/// The left `impl`: its `tag` returns 1 and claims 1.
+pub struct TaggedLeft;
+
+/// The right `impl`: its `tag` returns 2 and claims 2.
+pub struct TaggedRight;
+
+impl TaggedLeft {
+    /// requires: true
+    /// ensures: ret == 1
+    pub fn tag() -> u8 {
+        1
+    }
+
+    /// The false direction: the body returns 1 but the claim demands 2. If this
+    /// resolved to [`TaggedRight::tag`]'s contract (`ret == 2`) it would look
+    /// proved -- a false proof the location key closes.
+    /// requires: true
+    /// ensures: ret == 2
+    pub fn tag_cannot_prove_this() -> u8 {
+        1
+    }
+}
+
+impl TaggedRight {
+    /// requires: true
+    /// ensures: ret == 2
+    pub fn tag() -> u8 {
+        2
+    }
+
+    /// The mirror of [`TaggedLeft::tag_cannot_prove_this`]: the body returns 2
+    /// but the claim demands 1, so a conflation onto the left contract would
+    /// "prove" it.
+    /// requires: true
+    /// ensures: ret == 1
+    pub fn tag_cannot_prove_this() -> u8 {
+        2
+    }
 }

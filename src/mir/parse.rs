@@ -433,6 +433,11 @@ pub struct MirFn {
     /// and the subscript stays a refusal. That loses a proof on a shape like
     /// `mut i` reassigned before the alias; it cannot produce a wrong one.
     pub written: std::collections::BTreeSet<LocalIdx>,
+    /// The `(line, column)` of the `impl` keyword when this function is a method,
+    /// read from its definition name `<impl at FILE:L:C: L:C>::m`. `None` for a
+    /// free function. The owner type is not in the dump; it is looked up from
+    /// [`MirProgram::impl_owners`] by this location.
+    pub impl_loc: Option<(usize, usize)>,
 }
 
 impl MirFn {
@@ -561,6 +566,23 @@ pub struct MirProgram {
     /// the caller had no source (the MIR-only entry points), in which case only
     /// the built-in `Option`/`Result` numbering resolves.
     pub enums: BTreeMap<String, EnumLayout>,
+    /// Named `const` items, name → the constant the dump printed for them.
+    ///
+    /// rustc evaluates a `const` item at compile time and prints its *body*
+    /// separately (`const K: u8 = const 5_u8;`) while referring to it by name at
+    /// the use site (`_0 = const K;`). Inlining the definition here is what lets
+    /// the use site fold to a value instead of staying an unreadable
+    /// `Const::Other`, which is the difference between a decided contract and a
+    /// lost proof. Only constants whose printed body is a *literal* are kept: a
+    /// constant built by an expression has its own body with its own locals, and
+    /// re-deriving that value is the interpreter's job, not a table lookup.
+    pub consts: BTreeMap<String, Const>,
+    /// The owner type of each `impl` block, keyed by the 1-based `(line, column)`
+    /// of its `impl` keyword -- the same location a method's definition name
+    /// `<impl at FILE:L:C: L:C>::m` carries. Empty when the caller had no source
+    /// (the MIR-only entry points), in which case a method call whose name is not
+    /// an exact match is refused rather than answered from a guessed owner.
+    pub impl_owners: BTreeMap<(usize, usize), String>,
 }
 
 /// A variant's name and discriminant, for resolving a downcast.
@@ -966,6 +988,251 @@ fn push_projs(
         }
     }
     Some(place)
+}
+
+/// The `const` names a dump mentions, split by shape and by role.
+///
+/// rustc prints a crate-level `const`'s use site by its bare name (`const
+/// LIMIT`) and a function-local item's by a qualified path (`const f::L`), but it
+/// prints both *definitions* the same way (`const LIMIT: u8 = const 10_u8;`), so
+/// the definition alone cannot say whether the item is in scope in any given
+/// function. The use sites can: a name never written bare anywhere is never in
+/// scope bare anywhere, so a bare definition for it is a function-local item (or
+/// an unused one) and must not become a program-wide key. Without this a
+/// function-local `const L` handed every *other* function a bare `L` to name, and
+/// a contract `requires: L == 3` was proved against a name the function could not
+/// have written -- the name resolved to another function's local.
+///
+/// A definition starts the line with the keyword (`const NAME: TYPE`); every other
+/// occurrence (`const NAME;`, `const NAME,`, `const NAME)`) is a use. The
+/// qualified sets answer a second question the source cannot: a function-local item
+/// whose crate-level twin the compiler removed (a `#[cfg]`-disabled `const`) prints
+/// its *definition* bare but keeps its *use* qualified (`const owner::K`), so a
+/// qualified use with no qualified definition of the same path is that local. A
+/// bare definition under such a name must not become a program-wide key, or an
+/// unrelated contract could name it and be proved against another function's local
+/// -- a false proof.
+///
+/// Only the *operand* text is scanned. A string literal or a constant-data block
+/// can contain the letters `const L` without that being a use -- a
+/// `debug s => const "const L";` binding or the `alloc` block that backs the
+/// string `"const L"` would otherwise make `L` look bare-used, which hands a
+/// function-local `L` a program-wide key and turns a contract that names it into
+/// a false proof.
+#[derive(Default)]
+struct ConstMentions {
+    /// Names used bare (`const L`), the tell of a crate-level item's definition.
+    bare_uses: std::collections::BTreeSet<String>,
+    /// Qualified paths a `const` is *defined* under (`const owner::K: …`).
+    qualified_defs: std::collections::BTreeSet<String>,
+    /// Qualified paths a `const` is *used* under (`const owner::K;`).
+    qualified_uses: std::collections::BTreeSet<String>,
+    /// The last `::` segment of every function's name (`owner`, `inner`,
+    /// `local_in_method`, `{closure#0}`). A qualified `const` use whose path
+    /// prefix is one of these names a function-local item; any other prefix
+    /// names a module or an associated item. See [`claimed_bare_const_uses`].
+    fn_names: std::collections::BTreeSet<String>,
+}
+
+/// The bare names a qualified `const` use claims for a function-local item.
+///
+/// A function-local `const`'s definition can print *bare* (`const K: u8 = const
+/// 3_u8;`) while its use stays qualified (`const owner::K`), which is how a
+/// local whose crate-level twin the compiler removed (a `#[cfg]`-disabled item)
+/// would take the crate key. But a *qualified* use is not proof of a local: an
+/// associated constant uses `Foo::K` while defining `<impl at …>::K`, and a
+/// module constant uses `a::K`. Only a use whose path *prefix* is a function --
+/// `owner::K`, `Foo::local_in_method::L`, `outer::inner::M` -- names a
+/// function-local item. So a qualified use with no qualified definition of the
+/// same path claims its bare tail only when that prefix is a function name.
+fn claimed_bare_const_uses(mentions: &ConstMentions) -> std::collections::BTreeSet<String> {
+    mentions
+        .qualified_uses
+        .difference(&mentions.qualified_defs)
+        .filter(|path| {
+            let prefix = path.rsplit_once("::").map_or("", |(p, _)| p);
+            let owner = prefix.rsplit("::").next().unwrap_or("");
+            mentions.fn_names.contains(owner)
+        })
+        .filter_map(|p| p.rsplit("::").next().map(str::to_string))
+        .collect()
+}
+
+fn const_mentions(text: &str) -> ConstMentions {
+    const KW: &str = "const ";
+    let mut out = ConstMentions::default();
+    // An `allocN (…) {` block holds the bytes of a string literal (and other
+    // constant data), printed with a gutter and a right-hand column that spells
+    // the bytes out as text. Nothing in it is a use site, and it can contain the
+    // word `const`, so it is skipped whole.
+    let mut in_alloc = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        if in_alloc {
+            if line.trim() == "}" {
+                in_alloc = false;
+            }
+            continue;
+        }
+        if line.trim_start().starts_with("alloc")
+            && line.trim_start()["alloc".len()..].starts_with(|c: char| c.is_ascii_digit())
+            && line.contains('(')
+            && line.trim_end().ends_with('{')
+        {
+            in_alloc = true;
+            continue;
+        }
+        // A definition starts the line with the keyword (`const K: u8 = …`); a
+        // use sits in an operand (`_0 = const K;`). Only the role of a qualified
+        // mention depends on this; the bare-use set reads uses only.
+        let is_def = line.trim_start().starts_with(KW);
+        // Every function prints its header at the left margin: `fn owner(…)`,
+        // `fn <impl at …>::method(…)`, `fn outer::inner(…)`,
+        // `fn local_in_closure::{closure#0}(…)`. The last `::` segment is the
+        // item's own name, which is the prefix a function-local `const` use
+        // carries. The header of a non-function item never begins `fn `, and an
+        // operand never sits at the left margin, so this reads only headers.
+        if let Some(rest) = line.strip_prefix("fn ") {
+            if let Some(head) = rest.split_once('(').map(|(h, _)| h) {
+                let name = head.rsplit("::").next().unwrap_or("").trim();
+                if !name.is_empty() {
+                    out.fn_names.insert(name.to_string());
+                }
+            }
+        }
+        // Drop string literals before scanning, so a `const` inside one is not
+        // read as a use. A `"` toggles in/out of a literal; a `\` escapes the next
+        // character, so `\"` does not close it.
+        let mut operand = String::with_capacity(line.len());
+        let mut in_str = false;
+        let mut escaped = false;
+        for c in line.chars() {
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            if c == '"' {
+                in_str = true;
+                continue;
+            }
+            operand.push(c);
+        }
+        let mut rest = operand.as_str();
+        while let Some(i) = rest.find(KW) {
+            let after = &rest[i + KW.len()..];
+            // The name is a `::`-separated path; the raw run stops at the first
+            // character that cannot be part of one. A trailing `:` is the
+            // name/type separator of a definition, not part of the name.
+            let raw: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+                .collect();
+            let name = raw.trim_end_matches(':');
+            let plain = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+            if plain {
+                if name.contains("::") {
+                    if is_def {
+                        out.qualified_defs.insert(name.to_string());
+                    } else {
+                        out.qualified_uses.insert(name.to_string());
+                    }
+                } else if raw == name {
+                    // No `:` after the name: a use, not a definition.
+                    out.bare_uses.insert(name.to_string());
+                }
+            }
+            rest = after;
+        }
+    }
+    out
+}
+
+/// Read the value of a `const` whose body rustc printed as a CTFE brace-block.
+///
+/// On rustc 1.85 (the MSRV floor) a constant that folds to a literal is printed
+/// with its const-evaluated body rather than the inline literal the current
+/// stable prints:
+///
+/// ```text
+/// const K: u8 = {
+///     let mut _0: u8;
+///
+///     bb0: {
+///         _0 = const 7_u8;
+///         return;
+///     }
+/// }
+/// ```
+///
+/// `lines` is the block's body (everything after the `const … = {` line). The
+/// value is the assignment to the return place `_0`, and it is returned only when
+/// that assignment is itself a `const` literal -- a block that computes its value
+/// (an `AddWithOverflow`, say) has no single literal to fold, and the caller
+/// drops the item exactly as before.
+///
+/// **The block must be a single straight-line basic block.** A `const` whose value
+/// is chosen by a branch is printed with one `_0` assignment per arm, and the first
+/// one in textual order is *not* the value the constant has:
+///
+/// ```text
+/// const K: u8 = if false { 7 } else { 8 };   // K is 8
+/// // bb1: { _0 = const 7_u8; goto -> bb3; }
+/// // bb2: { _0 = const 8_u8; goto -> bb3; }
+/// ```
+///
+/// Reading the first arm would store `K = 7` and certify `ensures: ret == 7` for a
+/// function that returns `8` -- a false proof. So folding is refused unless the
+/// body has exactly one `_0` assignment, that assignment is a literal, the body
+/// contains no branch (`switchInt`, `goto`, call-with-target, `unwind`, …), and the
+/// literal is followed by `return`. Anything else is left unmodelled, which makes a
+/// contract that names the constant *unreadable* -- a skip, never a false proof.
+fn block_const_value<'a>(lines: &[&'a str]) -> Option<&'a str> {
+    let mut body: Vec<&str> = Vec::new();
+    for line in lines {
+        if line.starts_with('}') {
+            break;
+        }
+        body.push(line);
+    }
+    // Exactly one assignment to the return place, and it must be a literal: a
+    // second assignment is a second arm, and the first is not the value.
+    let mut assignments = body.iter().enumerate().filter(|(_, l)| l.trim().starts_with("_0 ="));
+    let (assign_at, assign) = assignments.next()?;
+    if assignments.next().is_some() {
+        return None;
+    }
+    let literal = assign.trim().strip_prefix("_0 = const ")?;
+    // No branch anywhere in the body, or an arm other than this one could return.
+    for l in &body {
+        let t = l.trim();
+        if t.contains("switchInt(")
+            || t.contains("goto ->")
+            || t.contains("-> [")
+            || t.contains("unwind")
+            || t.contains("resume")
+            || t.contains("abort")
+        {
+            return None;
+        }
+    }
+    // The literal's block must return, so the value is the one that leaves. The
+    // only lines allowed between are storage bookkeeping.
+    let ret = body[assign_at + 1..].iter().find(|l| {
+        let t = l.trim();
+        !t.is_empty() && !t.starts_with("StorageLive(") && !t.starts_with("StorageDead(")
+    })?;
+    if ret.trim() != "return;" {
+        return None;
+    }
+    Some(literal.trim_end_matches(';'))
 }
 
 /// Parse a constant like `0_u32`, `true`, `255_u32`, `()`.
@@ -1537,6 +1804,23 @@ pub fn parse_program(text: &str) -> MirProgram {
     parse_program_with(text, &BTreeMap::new())
 }
 
+/// [`parse_program_with`] with the crate-level `const` names the source declared.
+///
+/// The dump prints a crate-level `const` and a function-local one identically, so
+/// the bare-use test in [`const_mentions`] is the only in-dump tell -- and it is
+/// silent for a crate-level constant that only a *contract* names. This variant
+/// takes the names the source says are module-scoped, so those definitions are
+/// kept as well. See [`crate::mir::spec::crate_level_consts`].
+pub fn parse_program_scoped(
+    text: &str,
+    enums: &BTreeMap<String, EnumLayout>,
+    crate_consts: &std::collections::BTreeSet<String>,
+    const_generics: &std::collections::BTreeSet<String>,
+    impl_owners: &BTreeMap<(usize, usize), String>,
+) -> MirProgram {
+    parse_program_impl(text, enums, crate_consts, const_generics, impl_owners)
+}
+
 /// [`parse_program`] with the enum layouts from the source.
 ///
 /// A `match` lowers to `(base as Variant)` downcasts whose *variant names* the
@@ -1545,11 +1829,114 @@ pub fn parse_program(text: &str) -> MirProgram {
 /// dump, so it is passed in. An empty map is the old behaviour: `Option`/`Result`
 /// resolve from their built-in numbering and every other enum refuses a downcast.
 pub fn parse_program_with(text: &str, enums: &BTreeMap<String, EnumLayout>) -> MirProgram {
+    parse_program_impl(
+        text,
+        enums,
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
+        &BTreeMap::new(),
+    )
+}
+
+fn parse_program_impl(
+    text: &str,
+    enums: &BTreeMap<String, EnumLayout>,
+    crate_consts: &std::collections::BTreeSet<String>,
+    const_generics: &std::collections::BTreeSet<String>,
+    impl_owners: &BTreeMap<(usize, usize), String>,
+) -> MirProgram {
     let lines: Vec<&str> = text.lines().collect();
-    let mut prog = MirProgram { enums: enums.clone(), ..MirProgram::default() };
+    let mut prog =
+        MirProgram { enums: enums.clone(), impl_owners: impl_owners.clone(), ..MirProgram::default() };
+    // Which bare names are ever used as a `const` at a use site, so a definition
+    // can be told a crate-level item from a function-local one. See
+    // [`const_mentions`]. A `const` generic parameter's uses print bare too but
+    // are not items at all, so its names are removed: otherwise a function-local
+    // `const N` in some other function would keep a bare program-wide key. See
+    // [`crate::mir::spec::const_generic_params`].
+    let mentions = const_mentions(text);
+    let mut bare_uses = mentions.bare_uses.clone();
+    for name in const_generics {
+        bare_uses.remove(name);
+    }
+    // A function-local `const` whose crate-level twin the compiler removed -- a
+    // `#[cfg]`-disabled item -- prints its definition bare (`const K: u8 = const
+    // 3_u8;`) but keeps its *use* qualified (`const owner::K`), and there is no
+    // qualified definition of that path to match. The source set still names `K`
+    // (the scanner reads the `#[cfg]`-disabled item), so without this the bare
+    // definition would take the crate key and a contract on another function could
+    // name it -- a false proof. Only a qualified use whose path names a *function*
+    // is such a local; an associated constant (`Foo::K`, defined `<impl at …>::K`)
+    // and a module constant (`a::K`, defined and used qualified) are not, so a
+    // compiled crate constant those paths name keeps its bare key. See
+    // [`claimed_bare_const_uses`].
+    let claimed_bare = claimed_bare_const_uses(&mentions);
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
+        // A `const` item whose body the dump prints as a single literal:
+        // `const K: u8 = const 5_u8;`. It is recorded so a use site (`_0 = const
+        // K`) can fold to the value. The associated-constant form
+        // (`const ARR::{constant#0}: usize = const 3_usize;`) has a `::`-suffixed
+        // name and is skipped: nothing refers to it by that name, and the array
+        // length it carries is already in the array's type.
+        if let Some(rest) = line.trim_end().strip_prefix("const ") {
+            if !rest.starts_with('{') {
+                if let Some((name, body)) = rest.split_once(" = ") {
+                    // The name/type split is at the `: ` separator, not any colon:
+                    // a qualified name (`ARR::{constant#0}`) contains `::`. A name
+                    // is kept only when it is a `::`-separated path of identifiers
+                    // -- the exact spelling the use site prints (`a::K`,
+                    // `local_const::L`), so the lookup is by full path and a
+                    // module-nested constant cannot collide with a top-level one of
+                    // the same last segment. An associated constant's
+                    // `{constant#0}` fails the identifier test and is dropped.
+                    let name = name.split_once(": ").map_or(name, |(n, _)| n).trim();
+                    let plain = !name.is_empty()
+                        && !name.contains('{')
+                        && name
+                            .split("::")
+                            .all(|seg| !seg.is_empty()
+                                && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+                    if plain {
+                        let body = body.trim().trim_end_matches(';');
+                        // A literal body prints inline (`const K: u8 = const
+                        // 7_u8;`) on current stable. On 1.85 -- the MSRV floor --
+                        // the same item prints as a CTFE brace-block instead
+                        // (`const K: u8 = { … _0 = const 7_u8; … }`), so the value
+                        // is read from the block's return-place assignment. Without
+                        // this the item is dropped on the floor and a contract that
+                        // names it goes unreadable.
+                        let literal = body.strip_prefix("const ").or_else(|| {
+                            if body.starts_with('{') {
+                                block_const_value(&lines[i + 1..])
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(c) = literal {
+                            // A bare key is recorded when the name is used
+                            // bare somewhere, i.e. for a crate-level item, or when
+                            // the source says the item is module-scoped (a
+                            // crate-level constant that only a contract names has
+                            // no use site to go by). A function-local item's
+                            // definition prints the same way but its uses are
+                            // qualified (`const f::L`), so a bare key for it would
+                            // let an unrelated function's contract resolve a name
+                            // its own source could not. A qualified definition
+                            // keeps its qualified key, which is what a contract
+                            // that spells the path resolves.
+                            if name.contains("::")
+                                || ((bare_uses.contains(name) || crate_consts.contains(name))
+                                    && !claimed_bare.contains(name))
+                            {
+                                prog.consts.insert(name.to_string(), parse_const(c));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // rustc prints a second, `// MIR FOR CTFE`-marked body for an item it
         // const-evaluates -- a tuple-variant constructor called in a `let`, for
         // one. It is a *copy* of an item already printed above it, and the typed
@@ -1572,6 +1959,7 @@ pub fn parse_program_with(text: &str, enums: &BTreeMap<String, EnumLayout>) -> M
             }
         }
         if let Some((name, args, ret_ty)) = parse_fn_header(line) {
+            let impl_loc = crate::mir::spec::impl_location(&name);
             let mut f = MirFn {
                 name,
                 arg_locals: args.iter().map(|(l, _)| *l).collect(),
@@ -1581,6 +1969,7 @@ pub fn parse_program_with(text: &str, enums: &BTreeMap<String, EnumLayout>) -> M
                 debug_bindings: Vec::new(),
                 blocks: Vec::new(),
                 written: std::collections::BTreeSet::new(),
+                impl_loc,
             };
             // Local `_0` is the return place, so it carries the return type.
             f.locals.insert(0, ret_ty);
@@ -2008,6 +2397,291 @@ fn add(_1: u32, _2: u32) -> u32 {
         assert!(!wide(&Ty::Array(Box::new(Ty::U64), 8)));
         assert!(!wide(&Ty::Tuple(vec![Ty::U8, Ty::I32])));
         assert!(!wide(&Ty::Other("MyStruct".into())));
+    }
+
+    /// A named `const` item's literal body is collected, and only a literal.
+    ///
+    /// The dump prints the item's body separately from its use, so the value has
+    /// to be gathered before it can be inlined. An item whose body is an
+    /// expression, or a qualified associated constant, must *not* enter the table:
+    /// the first has no literal to read, and the second is never referred to by
+    /// the plain name.
+    ///
+    /// A bare definition is kept only when the name is *used* bare somewhere. The
+    /// dump prints a crate-level item's use site by its bare name and a
+    /// function-local item's by a qualified path, but both definitions look alike,
+    /// so a bare definition with no bare use site is a function-local item (or an
+    /// unused one) and must not become a program-wide key -- see
+    /// [`const_mentions`] and [`a_local_const_does_not_leak_to_another_function`].
+    #[test]
+    fn named_const_items_are_collected_only_when_literal() {
+        let dump = "const K: u8 = const 5_u8;\n\
+                    const NEG: i8 = const -1_i8;\n\
+                    const B: bool = const true;\n\
+                    const UNUSED: u8 = const 9_u8;\n\
+                    const EXPR: u8 = {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                    _0 = const 1_u8;\n        return;\n    }\n}\n\
+                    const ARR::{constant#0}: usize = const 3_usize;\n\
+                    fn uses() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                    _0 = const K;\n        _0 = const NEG;\n        _0 = const B;\n        \
+                    return;\n    }\n}\n";
+        let prog = parse_program(dump);
+        assert_eq!(prog.consts.get("K"), Some(&Const::UInt(5, Some(Ty::U8))));
+        assert_eq!(prog.consts.get("NEG"), Some(&Const::UInt(0xff, Some(Ty::I8))));
+        assert_eq!(prog.consts.get("B"), Some(&Const::Bool(true)));
+        assert!(!prog.consts.contains_key("UNUSED"), "a bare definition with no bare use is not kept");
+        assert!(!prog.consts.contains_key("EXPR"), "an expression body is not a literal");
+        assert!(!prog.consts.contains_key("ARR"), "a qualified name is not collected");
+    }
+
+    /// A function-local `const`'s definition must not become a bare program-wide
+    /// key, or another function's contract could name it.
+    ///
+    /// `const L: u8 = const 3_u8;` is printed the same way for a crate-level item
+    /// and a function-local one; the use site is the only tell -- a crate item is
+    /// used bare (`const L`), a local one qualified (`const f::L`). Here `L` is
+    /// used only qualified, so it is a local of `f` and must not enter the table
+    /// under the bare key. With the bare key present, `g`'s contract could write
+    /// `requires: L == 3` and be *proved* against a name `g` cannot see.
+    #[test]
+    fn a_local_const_does_not_leak_to_another_function() {
+        let dump = "fn f() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                    _0 = const f::L;\n        return;\n    }\n}\n\
+                    const L: u8 = const 3_u8;\n\
+                    fn g() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                    _0 = const 3_u8;\n        return;\n    }\n}\n";
+        let prog = parse_program(dump);
+        assert!(!prog.consts.contains_key("L"), "a local const must not get a bare key");
+    }
+
+    /// A `const NAME` inside a string literal or an `alloc` block is *data*, not a
+    /// use, and must not make `NAME` look crate-level.
+    ///
+    /// The bare-use scan is the only in-dump tell between a crate-level `const`
+    /// and a function-local one, so a false positive here hands a function-local
+    /// item a program-wide key -- the false proof
+    /// [`a_local_const_does_not_leak_to_another_function`] guards, reopened through
+    /// a string. A `debug s => const "const L";` binding and the `alloc` block
+    /// behind the string both spell `const L` as text. The `alloc` data line is the
+    /// real dump shape -- a gutter and a right-hand column that spells the bytes out
+    /// -- so it is *not* a `//` comment and the comment skip does not cover it.
+    #[test]
+    fn a_string_literal_is_not_a_const_use() {
+        let uses = const_mentions(
+            "    debug s => const \"const L\";\n\
+             alloc12 (size: 7, align: 1) {\n\
+             \x20   63 6f 6e 73 74 20 4c 4b                       │ const L\n}\n\
+             \x20   _0 = const L;\n",
+        )
+        .bare_uses;
+        assert!(uses.contains("L"), "the real use site is still read: {uses:?}");
+        let only_string = const_mentions("    debug s => const \"const M\";\n").bare_uses;
+        assert!(
+            only_string.is_empty(),
+            "a `const NAME` inside a string literal is not a use: {only_string:?}"
+        );
+        let only_alloc = const_mentions(
+            "alloc4 (size: 4, align: 1) {\n\
+             \x20   1u8, 1u8, 1u8, 1u8,\n\
+             alloc7 (size: 7, align: 1) {\n\
+             \x20   63 6f 6e 73 74 20 4e 4f 4e                       │ const NON\n}\n",
+        )
+        .bare_uses;
+        assert!(
+            only_alloc.is_empty(),
+            "an `alloc` data block is not a use: {only_alloc:?}"
+        );
+    }
+
+    /// A crate-level `const` a contract names but no body uses keeps its bare key,
+    /// because the source says the item is module-scoped.
+    ///
+    /// The bare-use test is silent for a constant with no use site at all, so the
+    /// definition would be dropped and the contract left unreadable -- a lost
+    /// proof. The `crate_consts` set is the source's word on the item's scope.
+    #[test]
+    fn a_crate_level_const_with_no_use_site_is_kept() {
+        let dump = "const ONLY: u8 = const 7_u8;\n\
+                    fn g() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                    _0 = const 3_u8;\n        return;\n    }\n}\n";
+        // Without the source's word, the bare definition is dropped.
+        assert!(!parse_program(dump).consts.contains_key("ONLY"));
+        // With it, the definition is kept so a contract can name it.
+        let mut scoped = std::collections::BTreeSet::new();
+        scoped.insert("ONLY".to_string());
+        let prog = parse_program_scoped(dump, &BTreeMap::new(), &scoped, &std::collections::BTreeSet::new(), &BTreeMap::new());
+        assert_eq!(prog.consts.get("ONLY"), Some(&Const::UInt(7, Some(Ty::U8))));
+        // The tell must not resurrect a name the source did *not* declare: a
+        // function-local `L` (used qualified) stays out of the table.
+        let dump2 = "fn f() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                     _0 = const f::L;\n        return;\n    }\n}\n\
+                     const L: u8 = const 3_u8;\n";
+        let prog2 = parse_program_scoped(dump2, &BTreeMap::new(), &scoped, &std::collections::BTreeSet::new(), &BTreeMap::new());
+        assert!(!prog2.consts.contains_key("L"), "a name not in the source's set stays out");
+    }
+
+    /// A bare definition whose tail name is used only *qualified* is a
+    /// function-local item, and must not keep a bare key even when the source
+    /// calls the name crate-level.
+    ///
+    /// A `#[cfg]`-disabled `const K` is in the source set but not in the dump, so
+    /// the only `K` is a local's -- and rustc prints that local's definition bare
+    /// (`const K: u8 = const 3_u8;`) with a qualified use (`const owner::K`). The
+    /// source's word alone would then record `K = 3` as a crate constant, and a
+    /// contract on another function could name it. The qualified-use/qualified-def
+    /// mismatch is the in-dump tell that the bare definition is that local.
+    #[test]
+    fn a_qualified_only_use_keeps_its_bare_definition_out() {
+        // The local's definition is bare; its use is qualified, with no qualified
+        // definition anywhere. `crate_consts` claims `K` (the source saw a
+        // `#[cfg]`-disabled item), and that must not be enough.
+        let dump = "fn owner() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                    _0 = const owner::K;\n        return;\n    }\n}\n\
+                    const K: u8 = const 3_u8;\n";
+        let mut scoped = std::collections::BTreeSet::new();
+        scoped.insert("K".to_string());
+        let prog = parse_program_scoped(dump, &BTreeMap::new(), &scoped, &std::collections::BTreeSet::new(), &BTreeMap::new());
+        assert!(
+            !prog.consts.contains_key("K"),
+            "a qualified-only use means the bare definition is that local: {:?}",
+            prog.consts
+        );
+        // The control: a real module constant defines *and* uses its path
+        // qualified, so its bare spelling is not a local's and the module path is
+        // recorded under its own key.
+        let module = "fn g() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                      _0 = const a::K;\n        return;\n    }\n}\n\
+                      const a::K: u8 = const 5_u8;\n";
+        let prog = parse_program(module);
+        assert_eq!(prog.consts.get("a::K"), Some(&Const::UInt(5, Some(Ty::U8))));
+    }
+
+    /// An *associated* constant's use must not claim a bare definition, or a
+    /// compiled crate constant of the same name is discarded.
+    ///
+    /// rustc uses an associated constant as `const Foo::K` but defines it as
+    /// `const <impl at …>::K`, so the use path has no matching definition -- the
+    /// same shape a function-local whose crate twin was `#[cfg]`-disabled has. The
+    /// tell that separates them is the prefix: `owner::K` names a *function*, so
+    /// the bare `K` is that local; `Foo::K` names an associated item, so the bare
+    /// `K` is the compiled crate constant and must be kept.
+    #[test]
+    fn an_associated_use_does_not_claim_a_crate_const() {
+        let dump = "const K: u8 = const 7_u8;\n\
+                    const <impl at file.rs:3:1: 3:9>::K: u8 = const 3_u8;\n\
+                    fn uses_assoc() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                    _0 = const Foo::K;\n        return;\n    }\n}\n";
+        let mut scoped = std::collections::BTreeSet::new();
+        scoped.insert("K".to_string());
+        let prog = parse_program_scoped(
+            dump,
+            &BTreeMap::new(),
+            &scoped,
+            &std::collections::BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            prog.consts.get("K"),
+            Some(&Const::UInt(7, Some(Ty::U8))),
+            "the compiled crate `K` must survive an associated `Foo::K`: {:?}",
+            prog.consts
+        );
+    }
+
+    /// A function-local `const` inside a *method* or a *nested* function must still
+    /// be refused, even though its use path has more than one `::`.
+    ///
+    /// `Foo::method::L` and `outer::inner::M` are locals, and the owning function is
+    /// the path's last `::` segment -- not the whole prefix. Reading the whole
+    /// prefix would let both leak back in as program-wide names.
+    #[test]
+    fn a_method_or_nested_local_use_still_claims_its_bare_definition() {
+        // A `#[cfg]`-disabled crate `L`/`M` is gone from the dump, so each local's
+        // definition prints *bare* while its use stays qualified -- exactly the
+        // shape that would otherwise take the crate key.
+        let dump = "fn <impl at file.rs:2:1: 2:9>::method(_1: &Foo) -> u8 {\n    \
+                    let mut _0: u8;\n\n    bb0: {\n        _0 = const Foo::method::L;\n        \
+                    return;\n    }\n}\n\
+                    const L: u8 = const 4_u8;\n\
+                    fn outer() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                    _0 = const 0_u8;\n        return;\n    }\n}\n\
+                    fn inner() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                    _0 = const outer::inner::M;\n        return;\n    }\n}\n\
+                    const M: u8 = const 1_u8;\n";
+        let mut scoped = std::collections::BTreeSet::new();
+        scoped.insert("L".to_string());
+        scoped.insert("M".to_string());
+        let prog = parse_program_scoped(
+            dump,
+            &BTreeMap::new(),
+            &scoped,
+            &std::collections::BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        assert!(
+            !prog.consts.contains_key("L"),
+            "a method-local `L` must not get a bare key: {:?}",
+            prog.consts
+        );
+        assert!(
+            !prog.consts.contains_key("M"),
+            "a nested-fn-local `M` must not get a bare key: {:?}",
+            prog.consts
+        );
+    }
+
+    /// A `const` whose body rustc prints as a CTFE brace-block must still fold to
+    /// its value.
+    ///
+    /// On rustc 1.85 (the MSRV floor) a constant that folds to a literal prints as
+    /// `const K: u8 = { … _0 = const 7_u8; … }` rather than the inline
+    /// `const K: u8 = const 7_u8;` the current stable prints. The literal is the
+    /// assignment to the return place `_0`, and reading it keeps the item so a
+    /// contract that names it resolves -- otherwise the same contract is readable
+    /// on stable and unreadable on the MSRV, which is the kind of toolchain-shaped
+    /// gap this front end exists to avoid.
+    #[test]
+    fn a_ctfe_brace_block_const_folds_to_its_literal() {
+        let dump = "const K: u8 = {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                    _0 = const 7_u8;\n        return;\n    }\n}\n\
+                    fn reads() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                    _0 = const K;\n        return;\n    }\n}\n";
+        let prog = parse_program(dump);
+        assert_eq!(
+            prog.consts.get("K"),
+            Some(&Const::UInt(7, Some(Ty::U8))),
+            "a CTFE brace-block `const` must fold to its `_0` literal: {:?}",
+            prog.consts
+        );
+        // A block that *computes* its value has no single literal to fold, so the
+        // item is dropped rather than given a guessed value.
+        let computed = "const C: u8 = {\n    let mut _0: u8;\n    let mut _1: (u8, bool);\n\n    \
+                        bb0: {\n        _1 = AddWithOverflow(const 3_u8, const 4_u8);\n        \
+                        return;\n    }\n}\n\
+                        fn reads() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                        _0 = const C;\n        return;\n    }\n}\n";
+        let prog = parse_program(computed);
+        assert!(
+            !prog.consts.contains_key("C"),
+            "a computed const body has no literal to fold: {:?}",
+            prog.consts
+        );
+        // A *branching* body must be refused too: `if false { 7 } else { 8 }` is
+        // 8, but the first `_0` arm in textual order is 7. Folding the first arm
+        // would store 7 and certify a claim about a value the constant never has.
+        let branching = "const K: u8 = {\n    let mut _0: u8;\n    let mut _1: bool;\n\n    \
+                         bb0: {\n        _1 = const false;\n        switchInt(move _1) -> [0: bb2, \
+                         otherwise: bb1];\n    }\n\n    bb1: {\n        _0 = const 7_u8;\n        \
+                         goto -> bb3;\n    }\n\n    bb2: {\n        _0 = const 8_u8;\n        \
+                         goto -> bb3;\n    }\n\n    bb3: {\n        return;\n    }\n}\n\
+                         fn reads() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                         _0 = const K;\n        return;\n    }\n}\n";
+        let prog = parse_program(branching);
+        assert!(
+            !prog.consts.contains_key("K"),
+            "a branching const body has no single value to fold: {:?}",
+            prog.consts
+        );
     }
 
     /// The front end is total: no input, however mangled, may panic.

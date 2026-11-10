@@ -43,14 +43,17 @@ pub enum MirSource {
 
 /// Get MIR text for a Rust file, or explain why not.
 ///
-/// `rustc --emit=mir` requires nightly; the error is returned rather than
-/// papered over, because "the frontend could not run" and "the code is wrong"
-/// must never be reported the same way.
+/// `rustc --emit=mir` is a *stable* flag -- `-Zunpretty=mir` is the nightly-only
+/// spelling, and this frontend deliberately does not use it, so the frontend runs
+/// on the same stable compiler that builds the crate (checked down to the MSRV,
+/// 1.85). The error is returned rather than papered over, because "the frontend
+/// could not run" and "the code is wrong" must never be reported the same way.
 ///
 /// The compiler is taken from `DISCHARGE_RUSTC` when set, and otherwise from
-/// `rustc` on `PATH`. The dedicated variable exists so that pointing this tool
-/// at a nightly does not disturb the `rustc` that cargo is using to build the
-/// test suite -- setting `RUSTC` would do exactly that.
+/// `rustc` on `PATH`. The dedicated variable exists so that pointing this tool at
+/// a *different* compiler -- a nightly, or the rustc_public oracle's toolchain --
+/// does not disturb the `rustc` that cargo is using to build the test suite;
+/// setting `RUSTC` would do exactly that.
 pub fn emit_mir(file: &Path) -> Result<String, String> {
     let rustc = std::env::var("DISCHARGE_RUSTC").unwrap_or_else(|_| "rustc".into());
     emit_mir_with(&rustc, file)
@@ -58,8 +61,9 @@ pub fn emit_mir(file: &Path) -> Result<String, String> {
 
 /// [`emit_mir`] with the compiler named explicitly.
 ///
-/// This exists so a test can point at a nightly toolchain without mutating the
-/// process environment, which is a race when tests run in parallel.
+/// This exists so a test can point at a *specific* toolchain -- the MSRV, say, or
+/// a nightly -- without mutating the process environment, which is a race when
+/// tests run in parallel.
 pub fn emit_mir_with(rustc: &str, file: &Path) -> Result<String, String> {
     // `rustc` writes its intermediate artifacts next to the output path, so the
     // output goes to a temp file rather than to `/dev/stdout` -- pointing it at
@@ -92,14 +96,16 @@ pub fn emit_mir_with(rustc: &str, file: &Path) -> Result<String, String> {
     }
     let text = std::fs::read_to_string(&out_path).map_err(|e| {
         format!(
-            "rustc produced no MIR for {} ({e}); `--emit=mir` needs a nightly toolchain",
+            "rustc produced no MIR for {} ({e}); `--emit=mir` is stable, so this is a \
+             missing output file rather than a toolchain problem",
             file.display()
         )
     })?;
     let _ = std::fs::remove_file(&out_path);
     if text.trim().is_empty() {
         return Err(format!(
-            "rustc produced empty MIR for {}; `--emit=mir` needs a nightly toolchain",
+            "rustc produced empty MIR for {}; `--emit=mir` is stable, so check the \
+             file's crate type and that it defines an item with a body",
             file.display()
         ));
     }
@@ -181,13 +187,22 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
             ),
         };
     }
-    let contract = specs.get(&f.name);
+    // Resolved by tail as well as exactly: the dump names an inherent method
+    // `<impl at …>::f` while the contract is keyed by the source's `f`. An
+    // unresolved contract is not "no contract" here -- it is the false-proof
+    // case, where the body would be checked against `true` and no `ensures`.
+    let contract = specs.resolve(&f.name);
     let arg_vars = spec::arg_vars(f);
     let signed = spec::signed_args(f);
     // Fields of struct-typed arguments, bound to their own symbolic inputs. The
     // same bindings are handed to the executor as seeds, so `c.lo` in a contract
     // and `((*_1).0)` in the body name one variable.
     let mut fields = spec::field_env(f, &specs.structs, &specs.enums);
+    // Named `const` items the contract may name, from the program's own table --
+    // the same one the executor folds a body's `const LIMIT` from, so a contract's
+    // `LIMIT` and the body's `LIMIT` are one value. The executor's `Env` carries
+    // this table for the invariant path already; this is the contract path's copy.
+    fields.consts = prog.consts.clone();
     // Slice element references a contract names, bound before the rewrite runs so
     // each `xs[k]` has a binding to rewrite to. Done here, once, rather than on
     // demand, because the postcondition is evaluated inside a closure that cannot
@@ -400,6 +415,33 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     } else {
         spec::RET_IS_AGGREGATE
     };
+    // The recursion contract: when the function declares a `decreases:` measure,
+    // a self-call is answered by the contract instead of being inlined. The
+    // measure is required -- without it there is no induction principle and the
+    // assumption would be circular -- so its absence leaves `rec` as `None` and
+    // the call falls back to inlining. See `exec::Recursion`. Built here, before
+    // `signed` is moved into the `post` closure below.
+    let rec = match contract {
+        Some(c) if !c.decreases.is_empty() => {
+            if c.decreases.len() > 1 {
+                return FnOutcome::Skipped {
+                    reason: "several `decreases:` clauses, and there is no way to say which \
+                             measure the recursion counts down"
+                        .to_string(),
+                };
+            }
+            Some(exec::Recursion {
+                requires: c.requires.clone(),
+                ensures: c.ensures.clone(),
+                decreases: c.decreases[0].clone(),
+                signed: signed.clone(),
+                consts: prog.consts.clone(),
+                ret_signed,
+            })
+        }
+        _ => None,
+    };
+
     let post = if ensures.is_empty() {
         None
     } else {
@@ -467,10 +509,12 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
             array_lens: fields.array_lens.clone(),
             slice_steps: fields.slice_chain_steps(),
             elems: fields.elem_seeds.clone(),
+            path_elems: fields.path_elem_seeds.clone(),
             tags: fields.tag_seeds.clone(),
             payload_seeds: fields.payload_seeds.clone(),
             pins,
         },
+        rec,
     );
 
     // A definite failure outranks incompleteness: a counterexample is a result.
@@ -570,30 +614,14 @@ pub fn verify_file_with(
         .map_err(|e| format!("could not read {}: {e}", source.display()))?;
     let specs = spec::extract(&text);
     let mir = emit_mir_with(rustc, source)?;
-    let prog = parse::parse_program_with(&mir, &enum_layouts(&specs));
+    let prog =
+        parse::parse_program_scoped(&mir, &enum_layouts(&specs), &specs.crate_consts, &specs.const_generics, &specs.impl_owners);
 
-    let mut report = FileReport { source: source.to_path_buf(), ..Default::default() };
-
-    // Every contracted function must exist in the dump; a contract naming a
-    // function that is not there is a coverage hole, not a silent pass.
-    for name in specs.by_fn.keys() {
-        if prog.get(name).is_none() {
-            report.missing.push(name.clone());
-        }
-    }
-
-    let wanted: Vec<String> = if only.is_empty() {
-        specs.by_fn.keys().cloned().collect()
-    } else {
-        only.to_vec()
-    };
-
-    for name in wanted {
-        let Some(f) = prog.get(&name) else {
-            continue;
-        };
+    let (targets, missing) = resolve_targets(&prog, &specs);
+    let mut report = FileReport { source: source.to_path_buf(), missing, ..Default::default() };
+    for (key, f) in select(&prog, &targets, only) {
         let outcome = smt::with_fresh(|| verify_function(&prog, f, &specs));
-        report.outcomes.push((name, outcome));
+        report.outcomes.push((key, outcome));
     }
     Ok(report)
 }
@@ -617,28 +645,163 @@ fn enum_layouts(specs: &Specs) -> BTreeMap<String, parse::EnumLayout> {
         .collect()
 }
 
+/// The `(report key, function)` pairs for every function the source declared a
+/// contract for, plus the contracted names the dump did not contain.
+///
+/// A free function's contract is keyed by its bare name, which is unique in a
+/// file. A method's is keyed by the `(line, column)` of its `impl`, so it is
+/// matched to the dump function carrying that same location -- never by the
+/// method's bare name alone, which two `impl` blocks can share. A method the dump
+/// does not contain is reported missing, exactly like a free function, so a
+/// contract cannot be silently dropped.
+///
+/// The report key is the bare method name when no other contracted method shares
+/// it, and `Owner::method` when one does: two methods named `value` would
+/// otherwise collapse into one `outcomes` entry and only one of them would be
+/// visible. The bare name is preferred because it is what a reader looks for, and
+/// it is exactly what the MIR dump itself uses as the method's tail.
+fn resolve_targets<'a>(
+    prog: &'a MirProgram,
+    specs: &Specs,
+) -> (Vec<(String, &'a MirFn)>, Vec<String>) {
+    // How many contracted methods share each tail, so a colliding one can be
+    // spelled `Owner::method` and stay distinguishable.
+    let mut tail_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for (_, _, method) in specs.by_method.keys() {
+        *tail_counts.entry(method.as_str()).or_default() += 1;
+    }
+
+    let mut targets: Vec<(String, &MirFn)> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+
+    // The contract key is the full source path; the MIR definition name is the
+    // shortest crate-unique suffix of it. An exact match wins outright (so
+    // `a::f` and `b::a::f` stay apart -- rustc prints both in full once they
+    // collide); only when there is none does a unique `::`-aligned suffix count.
+    //
+    // Both directions of ambiguity are refused, not guessed at. A key that
+    // suffix-matches several dump functions is refused, and so is a dump function
+    // that several keys suffix-match: either pairing would check one body against
+    // another's contract. The second case is the one a `#[cfg]`-excluded item
+    // creates -- the key still comes from the source, but its body is not in the
+    // dump, so its suffix lands on a *different* compiled function, which would
+    // otherwise be reported `Verified` against the wrong contract and conceal
+    // that the excluded item was never checked at all.
+    let keys: Vec<&String> = specs.by_fn.keys().collect();
+    let mut chosen: Vec<Option<usize>> = vec![None; keys.len()];
+    let mut exact_owner: BTreeMap<usize, usize> = BTreeMap::new();
+    for (ki, key) in keys.iter().enumerate() {
+        if let Some(fi) = prog.fns.iter().position(|f| f.name == **key) {
+            chosen[ki] = Some(fi);
+            exact_owner.insert(fi, ki);
+        }
+    }
+    // A key with exactly one suffix candidate proposes it; a candidate a key
+    // already claimed exactly, or that more than one key proposes, is refused.
+    let mut proposed: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (ki, key) in keys.iter().enumerate() {
+        if chosen[ki].is_some() {
+            continue;
+        }
+        let mut cand: Option<usize> = None;
+        let mut count = 0usize;
+        for (fi, f) in prog.fns.iter().enumerate() {
+            if spec::is_path_suffix(key, &f.name) {
+                cand = Some(fi);
+                count += 1;
+            }
+        }
+        if count == 1 {
+            proposed.entry(cand.unwrap()).or_default().push(ki);
+        }
+    }
+    for (fi, kis) in proposed {
+        if kis.len() == 1 && !exact_owner.contains_key(&fi) {
+            chosen[kis[0]] = Some(fi);
+        }
+    }
+    for (ki, key) in keys.iter().enumerate() {
+        match chosen[ki] {
+            Some(fi) => targets.push(((*key).clone(), &prog.fns[fi])),
+            None => missing.push((*key).clone()),
+        }
+    }
+    for (line, col, method) in specs.by_method.keys() {
+        match prog.fns.iter().find(|f| f.impl_loc == Some((*line, *col))
+            && f.name.rsplit("::").next() == Some(method.as_str()))
+        {
+            Some(f) => {
+                let ambiguous = tail_counts.get(method.as_str()).copied().unwrap_or(0) > 1
+                    || specs.by_fn.contains_key(method.as_str());
+                let key = if ambiguous {
+                    match prog.impl_owners.get(&(*line, *col)) {
+                        Some(owner) => format!("{owner}::{method}"),
+                        None => f.name.clone(),
+                    }
+                } else {
+                    method.clone()
+                };
+                targets.push((key, f));
+            }
+            None => missing.push(method.clone()),
+        }
+    }
+    (targets, missing)
+}
+
+/// The targets to check: all of them when `only` is empty, otherwise those whose
+/// report key or bare tail is named in `only`.
+///
+/// A name in `only` that matches no contracted target is still looked up in the
+/// dump, so naming a function that carries no contract keeps checking it for panic
+/// freedom rather than silently reporting nothing.
+fn select<'a>(
+    prog: &'a MirProgram,
+    targets: &[(String, &'a MirFn)],
+    only: &[String],
+) -> Vec<(String, &'a MirFn)> {
+    if only.is_empty() {
+        return targets.to_vec();
+    }
+    let mut out: Vec<(String, &'a MirFn)> = Vec::new();
+    for want in only {
+        let mut found = false;
+        for (key, f) in targets {
+            // `key` is the report key (a method's `Owner::method`, or a free
+            // function's full source path). A request matches the key, the MIR
+            // name, or a bare tail of either -- so `f`, `a::f` and `Owner::f` all
+            // find their target without over-matching a different owner.
+            if want == key
+                || f.name == *want
+                || key.rsplit("::").next() == Some(want.as_str())
+                || f.name.rsplit("::").next() == Some(want.as_str())
+            {
+                out.push((key.clone(), *f));
+                found = true;
+            }
+        }
+        if !found {
+            if let Some(f) = prog.get(want) {
+                out.push((want.clone(), f));
+            }
+        }
+    }
+    out
+}
+
 /// Verify a whole MIR dump, using contracts from a companion source file.
 pub fn verify_mir_text(
     mir: &str,
     specs: &Specs,
     only: &[String],
 ) -> Result<FileReport, String> {
-    let prog = parse::parse_program_with(mir, &enum_layouts(specs));
-    let mut report = FileReport::default();
-    for name in specs.by_fn.keys() {
-        if prog.get(name).is_none() {
-            report.missing.push(name.clone());
-        }
-    }
-    let wanted: Vec<String> = if only.is_empty() {
-        specs.by_fn.keys().cloned().collect()
-    } else {
-        only.to_vec()
-    };
-    for name in wanted {
-        let Some(f) = prog.get(&name) else { continue };
+    let prog =
+        parse::parse_program_scoped(mir, &enum_layouts(specs), &specs.crate_consts, &specs.const_generics, &specs.impl_owners);
+    let (targets, missing) = resolve_targets(&prog, specs);
+    let mut report = FileReport { missing, ..Default::default() };
+    for (key, f) in select(&prog, &targets, only) {
         let outcome = smt::with_fresh(|| verify_function(&prog, f, specs));
-        report.outcomes.push((name, outcome));
+        report.outcomes.push((key, outcome));
     }
     Ok(report)
 }

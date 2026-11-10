@@ -66,20 +66,30 @@ fn main() {
     };
     let specs = spec::extract(&source);
 
-    // Order by name so the output is diffable between runs.
-    let mut names: Vec<&String> = specs.by_fn.keys().collect();
+    // Order by name so the output is diffable between runs. Methods are listed by
+    // their bare tail, like free functions, because that is what a reader looks
+    // for; two `impl` blocks that share a tail are reported under `Owner::method`
+    // by the driver, so they still appear once each.
+    let mut names: Vec<String> = specs.by_fn.keys().cloned().collect();
+    names.extend(specs.by_method.keys().map(|(_, _, m)| m.clone()));
     names.sort();
+    names.dedup();
 
     println!("{:<22} {:<12} {:>9}  detail", "function", "outcome", "elapsed");
     let mut decided = 0usize;
-    for name in &names {
-        if let Some(want) = &only {
-            if *name != want {
-                continue;
-            }
-        }
+    // With a filter, hand the *whole* requested name to the driver once. The list
+    // above holds bare tails, but a method whose tail is shared is *reported* as
+    // `Owner::method`, so a reader who copies a name out of the output must be
+    // able to paste it back. Passing it through lets `verify_mir_text` match the
+    // report key exactly (one row for one `Owner::method`) while a bare tail still
+    // matches every owner that shares it.
+    let selected: Vec<String> = match &only {
+        Some(want) => vec![want.clone()],
+        None => names.clone(),
+    };
+    for name in &selected {
         let started = Instant::now();
-        let Ok(report) = verify::verify_mir_text(&mir, &specs, std::slice::from_ref(*name)) else {
+        let Ok(report) = verify::verify_mir_text(&mir, &specs, std::slice::from_ref(name)) else {
             println!("{name:<22} {:<12} {:>9}  driver error", "error", "-");
             continue;
         };
@@ -96,7 +106,11 @@ fn main() {
         }
     }
     if only.is_none() {
-        println!("\ndecided {decided} of {}", names.len());
+        // Every free function and every method is one outcome, so the
+        // denominator is their sum -- a shared method tail is deduplicated for
+        // display but is still two outcomes.
+        let total = specs.by_fn.len() + specs.by_method.len();
+        println!("\ndecided {decided} of {total}");
     }
 }
 

@@ -150,3 +150,24 @@ fn width_and_index_report_the_underlying_variable() {
         assert_eq!(x.index(), smt::index(x));
     });
 }
+
+/// A closed true goal must not be decided from the goal alone when the premise
+/// is stale.
+///
+/// `prove_implies` has a shortcut: a goal that is closed and true is `Valid`
+/// without building `!pre || post`, which is what lets a tiny postcondition
+/// decide even when the premise is a large diagram. But the premise is still
+/// half of the claim. A `pre` saved from an earlier arena names a different term
+/// in the current one -- `is_current_term` reports that -- and returning `Valid`
+/// for it certifies `pre implies true` for a `pre` that is not the one passed.
+/// The shortcut must refuse (return `Unknown`) rather than prove.
+#[test]
+fn a_closed_goal_does_not_bypass_a_stale_premise() {
+    let pre = smt::with_fresh(|| smt::truth(true));
+    let v = smt::with_fresh(|| smt::prove_implies(pre, smt::truth(true)));
+    assert!(
+        !v.is_proved(),
+        "a stale premise must not yield a proof from a closed true goal; got: {v:?}"
+    );
+}
+
