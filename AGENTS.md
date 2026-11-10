@@ -1578,6 +1578,24 @@ for the wrong reason and was reported as a caught bug. The general lesson is tha
 script is a test, and a test that fails while the defect is present has proved nothing until
 the defect is removed and it passes.
 
+**Follow-up: the gate that enforced the rule broke it, by reading a count.** The comparison
+gate first asserted `discharge`'s coverage summary — the `decided 0 of 1` line — for each
+injected bug. That line counts only `FnOutcome::Verified`, so `Failed`, `Incomplete` *and*
+`Skipped` all leave it at zero. A fixture whose contract had become unreadable (a typo in an
+`ensures` name) therefore still printed `decided 0 of 1` and the gate reported a caught
+defect while holding no counterexample: a lost proof read as a refutation. The summary is a
+*coverage* number and the claim was about a *verdict*, and the two only agreed while every
+fixture happened to be well-formed. The fix is `examples/comparison_check.rs`, which asserts
+the per-function `FnOutcome` and the expected obligation kind (`panic` for the swapped
+`sat_add`, `postcondition` for the wrong-arm `clamp`, `loop invariant` for the wrong-body
+`sum_to`), and treats `Skipped`, `Incomplete`, a missing function and a failure on the wrong
+obligation as failures. The general rule: assert the *outcome* you mean, never a number that
+several outcomes share, because a shared number cannot tell them apart and the difference is
+exactly what the test exists to detect. A second instance in the same file: the gate skipped
+whichever of Coq and Lean was absent and still exited 0, so "every claim held" could be
+printed having run one of the two proof suites; both are now required, and a missing prover
+is exit 2 (a reported skip), never success.
+
 ## A SAFETY comment is a claim, and it needs the same treatment as any other
 
 The `no_std` `with_ctx` takes `&mut` to a `static mut`, and justified it with "the arena is

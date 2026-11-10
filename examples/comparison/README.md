@@ -345,18 +345,54 @@ sed 's/S (S (sum_to_buggy k))/S (sum_to_buggy k)/' \
     bugs/coq/teeth_sum_to.v > /tmp/mut.v && coqc -Q coq "" /tmp/mut.v    # exit 0
 ```
 
+## The gate: the fixtures are re-run, not remembered
+
+Everything above was, for a while, verified by hand exactly once, and the prose
+was the only record. That is the failure the repo names explicitly — a one-off
+verification is not a gate, and only a gate survives the next change — so
+`tools/comparison/run.sh` (gate 13 in `scripts/gate.sh`) re-runs the cheap,
+hermetic half on every gate run: `discharge` on the positive fixture and all three
+bug fixtures, the degenerate implementations, and Coq and Lean on the positive
+fixture and both teeth including the mutations. The external provers (Kani, Verus,
+Prusti, SPARK) keep their own CI jobs, where their toolchains are installed.
+
+The `discharge` half is a driver, `examples/comparison_check.rs`, and it asserts
+the per-function `FnOutcome` rather than scraping `mir_coverage`'s summary. That
+choice is the whole point. The summary line counts only `Verified`, so `Failed`,
+`Incomplete` and `Skipped` all leave it at `decided 0 of 1` — and the first version
+of the gate asserted exactly that line, which meant a fixture whose contract had
+become **unreadable** would still read `decided 0 of 1` and be reported as a caught
+defect. A lost proof is not a refutation, and a rejection test that cannot tell them
+apart is not a rejection test; this was the repo's own "isolate the guard" rule,
+violated by the gate that enforces it. The driver now requires `Failed` with the
+*expected obligation kind* per fixture — the panic for the swapped `sat_add`, the
+postcondition for the wrong-arm `clamp`, the loop invariant for the wrong-body
+`sum_to` — and rejects `Skipped`, `Incomplete`, a driver error, a missing function,
+or a failure on the wrong obligation.
+
+Both Coq **and** Lean are required. An earlier version skipped whichever was
+absent and still reported success, so a machine with only one of them would print
+"every claim held" without having checked one of the two proof suites. A missing
+prover is now exit `2` (a reported skip) and never exit `0`.
+
 ## Reproducing
 
 `discharge` needs a nightly `rustc` for the MIR frontend (the repo pins one).
 The other tools are external, and none of them is a dependency of the crate.
 
 ```console
-# discharge -- correct, then the bug files
+# The whole gate, in one command: the discharge driver, Coq and Lean, both
+# mutation-checked. Exits 2 (a reported skip) when coqc, lean or a nightly
+# rustc is absent, and never 0 for work it did not do.
+sh tools/comparison/run.sh
+
+# Or the discharge half on its own -- per-function outcome, not a count
+DISCHARGE_RUSTC=$(rustup which --toolchain nightly-2026-08-21 rustc) \
+  cargo run -q --features std --example comparison_check
+
+# The raw coverage scoreboard, for the numbers rather than the verdicts
 DISCHARGE_RUSTC=$(rustup which --toolchain nightly-2026-08-21 rustc) \
   cargo run -q --features std --example mir_coverage -- examples/comparison/target.rs
-cargo run -q --features std --example mir_coverage -- examples/comparison/bugs/target.rs
-cargo run -q --features std --example mir_coverage -- examples/comparison/bugs/clamp.rs
-cargo run -q --features std --example mir_coverage -- examples/comparison/bugs/loop.rs
 
 # Kani -- copy the harness into a crate with `kani` on the path
 cargo kani --version        # 0.68.0

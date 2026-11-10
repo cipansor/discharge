@@ -2017,6 +2017,8 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   ├── support/           the IR the engine harnesses share, so they check the
 │   │                      same formulas rather than two drifting corpora
 │   ├── mir_demo.rs        verifies real Rust read from MIR, end to end
+│   ├── comparison_check.rs  gate 13's driver: asserts each comparison fixture's
+│   │                      per-function outcome and obligation kind, not a count
 │   ├── comparison/        the same three functions proved seven ways, plus
 │   │                      Ferrocene as the qualified compiler (see its README)
 │   └── mir_targets/
@@ -2064,10 +2066,16 @@ downloads (Kani: a pinned nightly plus CBMC; Verus: a self-contained bundle with
 the MIR oracle: a nightly with the `rustc-dev` and `llvm-tools-preview` components) that a normal local run should not
 pay for; CI installs them and runs them as hard gates. One more gate holds the comparison
 fixtures themselves — `tools/comparison/run.sh` re-runs `discharge` on the positive fixture
-and all three bug fixtures, checks that the contracts refuse the degenerate implementations
-the bounds-only versions accepted, and runs Coq and Lean on the positive fixture and both
-teeth, including the mutation that shows each rejection is of the defect rather than of the
-script's shape. The last four gates hold the *tree*
+and all three bug fixtures through `examples/comparison_check.rs`, which asserts each
+fixture's per-function `FnOutcome` and the *expected obligation kind* rather than scraping
+`mir_coverage`'s `decided N of M` line (that line counts only `Verified`, so a `Failed`,
+`Incomplete` or `Skipped` fixture all read `decided 0 of 1`, and a contract that had become
+unreadable would have been reported as a caught defect — a lost proof read as a refutation);
+the same gate checks that the contracts refuse the degenerate implementations the bounds-only
+versions accepted, and runs Coq and Lean on the positive fixture and both teeth, including
+the mutation that shows each rejection is of the defect rather than of the script's shape.
+Coq and Lean are both *required*: an absent prover is a reported skip (exit 2), never a
+success for a proof suite that did not run. The last four gates hold the *tree*
 rather than the logic: rustdoc must build both crates with `-D warnings` (the crate is
 `#![deny(missing_docs)]`, but that says nothing about whether a doc link still *resolves*),
 no compiled output may be tracked (`git ls-files` must not list a `.rlib` or a `target/`
