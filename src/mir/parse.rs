@@ -1177,16 +1177,62 @@ fn const_mentions(text: &str) -> ConstMentions {
 /// that assignment is itself a `const` literal -- a block that computes its value
 /// (an `AddWithOverflow`, say) has no single literal to fold, and the caller
 /// drops the item exactly as before.
+///
+/// **The block must be a single straight-line basic block.** A `const` whose value
+/// is chosen by a branch is printed with one `_0` assignment per arm, and the first
+/// one in textual order is *not* the value the constant has:
+///
+/// ```text
+/// const K: u8 = if false { 7 } else { 8 };   // K is 8
+/// // bb1: { _0 = const 7_u8; goto -> bb3; }
+/// // bb2: { _0 = const 8_u8; goto -> bb3; }
+/// ```
+///
+/// Reading the first arm would store `K = 7` and certify `ensures: ret == 7` for a
+/// function that returns `8` -- a false proof. So folding is refused unless the
+/// body has exactly one `_0` assignment, that assignment is a literal, the body
+/// contains no branch (`switchInt`, `goto`, call-with-target, `unwind`, …), and the
+/// literal is followed by `return`. Anything else is left unmodelled, which makes a
+/// contract that names the constant *unreadable* -- a skip, never a false proof.
 fn block_const_value<'a>(lines: &[&'a str]) -> Option<&'a str> {
+    let mut body: Vec<&str> = Vec::new();
     for line in lines {
         if line.starts_with('}') {
             break;
         }
-        if let Some(rhs) = line.trim().strip_prefix("_0 = const ") {
-            return Some(rhs.trim_end_matches(';'));
+        body.push(line);
+    }
+    // Exactly one assignment to the return place, and it must be a literal: a
+    // second assignment is a second arm, and the first is not the value.
+    let mut assignments = body.iter().enumerate().filter(|(_, l)| l.trim().starts_with("_0 ="));
+    let (assign_at, assign) = assignments.next()?;
+    if assignments.next().is_some() {
+        return None;
+    }
+    let literal = assign.trim().strip_prefix("_0 = const ")?;
+    // No branch anywhere in the body, or an arm other than this one could return.
+    for l in &body {
+        let t = l.trim();
+        if t.contains("switchInt(")
+            || t.contains("goto ->")
+            || t.contains("-> [")
+            || t.contains("unwind")
+            || t.contains("resume")
+            || t.contains("abort")
+        {
+            return None;
         }
     }
-    None
+    // The literal's block must return, so the value is the one that leaves. The
+    // only lines allowed between are storage bookkeeping.
+    let ret = body[assign_at + 1..].iter().find(|l| {
+        let t = l.trim();
+        !t.is_empty() && !t.starts_with("StorageLive(") && !t.starts_with("StorageDead(")
+    })?;
+    if ret.trim() != "return;" {
+        return None;
+    }
+    Some(literal.trim_end_matches(';'))
 }
 
 /// Parse a constant like `0_u32`, `true`, `255_u32`, `()`.
@@ -2618,6 +2664,22 @@ fn add(_1: u32, _2: u32) -> u32 {
         assert!(
             !prog.consts.contains_key("C"),
             "a computed const body has no literal to fold: {:?}",
+            prog.consts
+        );
+        // A *branching* body must be refused too: `if false { 7 } else { 8 }` is
+        // 8, but the first `_0` arm in textual order is 7. Folding the first arm
+        // would store 7 and certify a claim about a value the constant never has.
+        let branching = "const K: u8 = {\n    let mut _0: u8;\n    let mut _1: bool;\n\n    \
+                         bb0: {\n        _1 = const false;\n        switchInt(move _1) -> [0: bb2, \
+                         otherwise: bb1];\n    }\n\n    bb1: {\n        _0 = const 7_u8;\n        \
+                         goto -> bb3;\n    }\n\n    bb2: {\n        _0 = const 8_u8;\n        \
+                         goto -> bb3;\n    }\n\n    bb3: {\n        return;\n    }\n}\n\
+                         fn reads() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                         _0 = const K;\n        return;\n    }\n}\n";
+        let prog = parse_program(branching);
+        assert!(
+            !prog.consts.contains_key("K"),
+            "a branching const body has no single value to fold: {:?}",
             prog.consts
         );
     }

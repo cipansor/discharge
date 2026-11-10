@@ -7220,3 +7220,43 @@ half) clean; zero dependencies and `no_std` untouched. The new unit test
 fallback: it then fails with `a CTFE brace-block \`const\` must fold to its \`_0\`
 literal: {}` (the item is dropped).
 
+## A branching `const` folded to its first arm -- a false proof the CTFE fix introduced
+
+The CTFE fix above read the first `_0 = const …` assignment in a brace-block body. That
+is right for the straight-line body it was written for, and **wrong for a body that
+branches**. `const K: u8 = if false { 7 } else { 8 };` is `8`, and rustc prints it as a
+block with one arm per branch:
+
+```text
+bb1: { _0 = const 7_u8; goto -> bb3; }
+bb2: { _0 = const 8_u8; goto -> bb3; }
+```
+
+Reading the first arm in textual order stored `K = 7`, so a contract `ensures: ret == 7`
+on a function returning `K` was reported **verified** while the constant is `8` -- a false
+proof, and the worst kind: it certifies a claim about a value the program never produces.
+The earlier fix's tests could not see it because every constant they used was
+straight-line, and the hole is *not* MSRV-only: rustc emits a brace-block for an `if`-based
+constant on current stable too, so this was reachable on every toolchain, not just 1.85.
+
+**The fix refuses to fold anything but a single straight-line return.** `block_const_value`
+now requires: exactly one `_0` assignment in the body; that assignment a `const` literal;
+no branch anywhere in the body (`switchInt(`, `goto ->`, a `-> [` switch target, `unwind`,
+`resume`, `abort`); and the literal's block to reach `return` with only storage
+bookkeeping in between. A body that fails any of these is left unmodelled, which makes a
+contract that names the constant *unreadable* -- a skip, never a false proof. This is the
+conservative single-block check; a future change could fold a branch whose arms agree, but
+nothing needs it, so nothing does it.
+
+**Evidence.** `scripts/test-count.sh` **746 -> 747** passed, 0 failed; the `tests/mir.rs`
+suite is **210/210 on stable, 1.85, 1.99.1 and the nightly** (it was 209). `scripts/gate.sh`
+**ALL GATES GREEN**; clippy (both halves) clean; zero dependencies and `no_std` untouched.
+Two new tests pin it -- the unit test `a_ctfe_brace_block_const_folds_to_its_literal`
+gained a branching case, and `tests/mir.rs` gained
+`a_branching_const_does_not_fold_to_its_first_arm`, which asserts that `ret == 7` is *not*
+verified (the false proof) and that `ret == 8` is not verified either (a skip, not a
+proof). Both were checked for teeth by reverting to the naive first-literal reader: the
+unit test then reports `{"K": UInt(7, Some(U8))}` and the integration test fails with
+`` `K` is 8, so `ret == 7` must not be reported verified, got: verified ``.
+
+

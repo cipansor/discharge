@@ -6601,6 +6601,38 @@ fn a_nested_or_method_local_const_is_not_a_program_wide_name() {
     }
 }
 
+/// A `const` whose body branches between two literal returns must not fold to the
+/// first arm.
+///
+/// `K = if false { 7 } else { 8 }` is `8`, and rustc prints a CTFE body with one
+/// `_0` arm per branch (`bb1: _0 = const 7_u8`, `bb2: _0 = const 8_u8`). Folding
+/// the first arm stores `K = 7`, so `ensures: ret == 7` on a function that returns
+/// `K` is reported **verified** -- a false proof about a value the constant never
+/// has -- while the true claim `ret == 8` is refused. The fix refuses to fold a
+/// branching body at all, so both contracts go unreadable (a skip) rather than one
+/// being falsely proved.
+///
+/// This is the *reachable* form of the bug: rustc emits a brace-block for an
+/// `if`-based constant on **current stable** as well as on 1.85, so the hole was
+/// not confined to the MSRV the earlier fix was written for.
+#[test]
+fn a_branching_const_does_not_fold_to_its_first_arm() {
+    let src = "pub const K: u8 = if false { 7 } else { 8 };\n\
+               /// ensures: ret == 8\npub fn true_claim() -> u8 { K }\n\
+               /// ensures: ret == 7\npub fn false_claim() -> u8 { K }\n";
+    let true_claim = verify_src("true_claim", src).expect("true_claim must be present");
+    let false_claim = verify_src("false_claim", src).expect("false_claim must be present");
+    assert!(
+        !false_claim.is_verified(),
+        "`K` is 8, so `ret == 7` must not be reported verified, got: {false_claim}"
+    );
+    assert!(
+        !true_claim.is_verified(),
+        "a branching const body is not folded, so `ret == 8` is unreadable (a skip), \
+         not a proof, got: {true_claim}"
+    );
+}
+
 /// The front end must not panic on a source that ends inside an unclosed block
 /// comment.
 ///
@@ -6625,4 +6657,3 @@ fn an_unclosed_block_comment_after_const_is_not_a_panic() {
         let _ = spec::const_generic_params(src);
     }
 }
-
