@@ -1276,6 +1276,42 @@ fn a_u16_product_is_decided_end_to_end() {
 }
 
 
+/// The complement bit counts `count_zeros`, `leading_ones` and `trailing_ones`,
+/// each pinned by a true half and a tripwire.
+///
+/// Each is `core`'s own definition -- the corresponding *positive* count of `!x`
+/// -- so a model that summed the wrong polarity would be wrong by the complement,
+/// which is a wrong value and not a weaker proof. `count_zeros` is pinned at a
+/// single operand where the two polarities disagree, and the two one-sided counts
+/// are pinned at the boundary of their precondition. The tripwires are the
+/// evidence the count is read at all: a constant answer would prove neither the
+/// true half nor the false one.
+#[test]
+fn the_complement_bit_counts_agree_with_rust() {
+    let verified = [
+        "count_zeros_of_zero_is_the_width",
+        "leading_ones_of_a_top_bit_value",
+        "trailing_ones_of_a_small_value",
+    ];
+    let refuted = [
+        "count_zeros_of_zero_is_the_width_tripwire",
+        "leading_ones_of_a_top_bit_value_tripwire",
+        "trailing_ones_of_a_small_value_tripwire",
+    ];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { .. } = o else {
+            panic!("`{name}` is a false contract that must be refuted, got: {o}");
+        };
+    }
+}
+
 /// The bitwise complement `!x`, pinned by a true half and a tripwire.
 ///
 /// `!x` is `all_ones ^ x` at the *operand's* width. The model reads that width

@@ -3670,8 +3670,10 @@ needed slice modelling, so it is left as the honest boundary.
 `wrapping_*` family is the same arithmetic the `checked_*` arms already do, minus
 the overflow obligation, so it is mostly plumbing. `count_ones` and the zero-counts
 are small bit-vector loops and belong in `discharge-arithmetic` beside the other
-proved primitives, not in the frontend. All of these are now modelled except `pow`
-and the division families that cannot express a zero divisor as a value (see below).
+proved primitives, not in the frontend. All of these are now modelled except the
+division families that cannot express a zero divisor as a value (see below); the
+bit-count family is complete, `count_ones`/`count_zeros`, `leading_zeros`/`leading_ones`
+and `trailing_zeros`/`trailing_ones` each being one expression applied to `x` and `!x`.
 
 **Stage 4 progress: the two-operand families and the whole unary surface are
 modelled.** `checked_*`, `saturating_*`, `wrapping_*` and `overflowing_*` are all
@@ -3681,7 +3683,12 @@ against `core` over the whole `u8`/`i8` domain. `count_ones`, `leading_zeros` an
 `trailing_zeros` are the bit counts; `neg` and `abs` are modelled in all four
 families. The `Intrinsic` enum was restructured to say so: `Bits(BitKind)` for the
 counts, `Unary(Family, UnOp)` for the operators, and `Overflowing(BinOp)` for the
-`(T, bool)` family. Findings worth more than the coverage:
+`(T, bool)` family. The three *complement* counts `count_zeros`, `leading_ones` and
+`trailing_ones` are modelled too, and are defined as `core` defines them — the
+corresponding positive count of `!x` — so there is one expression per pair rather
+than two that could drift. `!x` is `bxor(x, all_ones(w))`, the same term the
+executor builds for a `Not` rvalue, so a bit count of a written `!x` and a bit count
+of the complement cannot disagree. Findings worth more than the coverage:
 
 * **`count_ones`, `leading_zeros` and `trailing_zeros` are the modelled calls whose
   result width differs from their operand's** (`u8::count_ones` returns `u32`). The
@@ -3689,7 +3696,7 @@ counts, `Unary(Family, UnOp)` for the operators, and `Overflowing(BinOp)` for th
   destination's; the executor reads the destination's width for exactly this reason,
   and the `eval` signature takes the operand width and the result width separately.
   Every other shape passes the same value for both, so the change is inert outside
-  these three.
+  these three. The three complement counts widen the same way.
 * **`saturating_neg` and every `abs` do not exist on the unsigned types**, while
   `wrapping_neg`, `checked_neg` and `overflowing_neg` do -- where negation is modular
   and the failure case is `x != 0`. So `is_modelled` reads the sign for the unary

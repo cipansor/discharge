@@ -1736,6 +1736,14 @@ refused. `src/mir/intrinsics.rs` holds the model:
   constant, so the `switchInt` on it takes the right arm on each path. rustc emits
   the downcast payload read only inside the `Some` arm, which is what makes
   recording the payload unconditionally sound.
+- The unary `neg` and `abs` are `0 - x` and "negate if negative" in all four
+  families, and the six bit counts (`count_ones`, `count_zeros`,
+  `leading_zeros`, `leading_ones`, `trailing_zeros`, `trailing_ones`) are sums over
+  the operand's bits. The three *complement* counts are not a second summation:
+  each is `core`'s own definition, the corresponding positive count of `!x`, so
+  `count_zeros` is `count_ones(!x)` and a fix to one half cannot leave the other
+  behind. `!x` is spelled the way the executor spells it, so the model's `!x` and
+  the body's `!x` are the same term.
 
 The refusals matter as much as the model, and each has a reason. Only `checked_div`
 and `checked_rem` may model division: the `saturating_` and `wrapping_` forms *panic*
@@ -1778,8 +1786,11 @@ The frontend refuses far more than it accepts, and every refusal is reported:
   run out of budget and report `incomplete`.
 - **`core::num` operations other than the modelled families.** `checked_*`,
   `saturating_*` and `wrapping_*` for `add`/`sub`/`mul`/`div`/`rem` and the
-  bitwise ops are computed from their operands (see below). Every other
-  intrinsic, and every trait method, is still a call the frontend cannot model.
+  bitwise ops are computed from their operands (see below), as are the unary
+  `neg`/`abs` in all four families, the six bit counts (`count_ones`,
+  `count_zeros`, `leading_zeros`, `leading_ones`, `trailing_zeros`,
+  `trailing_ones`) and the `pow` families. Every other intrinsic, and every trait
+  method, is still a call the frontend cannot model.
 - **A symbolic index into a *slice*, or a mutable reference write.** An array
   subscripted by a parameter (`a[i]` on `[u8; 4]`) *is* modelled: the length is in
   the type, so `a[i]` is the exact ite chain over `0..N`, admitted only when the

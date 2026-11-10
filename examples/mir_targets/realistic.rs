@@ -36,7 +36,8 @@
 //!   `checked_*`, `saturating_*`, `wrapping_*` and `overflowing_*` are computed
 //!   in the frontend from their operands rather than by reading `core`'s MIR.
 //!   So are the unary operators — `neg` and `abs` in all four families — and the
-//!   three bit counts `count_ones`, `leading_zeros` and `trailing_zeros`.
+//!   six bit counts: `count_ones`, `count_zeros`, `leading_zeros`,
+//!   `leading_ones`, `trailing_zeros` and `trailing_ones`.
 //!   Division is the one narrowing: only `checked_div`/`checked_rem` are
 //!   modelled, because every other family — `overflowing_*` included — panics on
 //!   a zero divisor and hiding that panic is not something a proof may do. A
@@ -3220,6 +3221,59 @@ pub fn trailing_zeros_of_a_top_bit_value(x: u8) -> u32 {
 /// ensures: ret <= 6
 pub fn trailing_zeros_of_a_top_bit_value_tripwire(x: u8) -> u32 {
     x.trailing_zeros()
+}
+
+/// `count_zeros` counts the clear bits, so a `u8` of zero has all eight of them.
+/// This is the exactness pin: a model that summed the *set* bits (the polarity
+/// confusion) would answer `0` here and fail, and one that stopped at seven
+/// would fail too.
+/// requires: x == 0
+/// ensures: ret == 8
+pub fn count_zeros_of_zero_is_the_width(x: u8) -> u32 {
+    x.count_zeros()
+}
+
+/// The tripwire: `count_zeros` is not identically zero. `x == 0` has eight clear
+/// bits, so a bound of zero is false -- and a stub that returned a constant `0`
+/// would *prove* this false contract, which is what makes it the pin that the
+/// count is read rather than assumed.
+/// requires: true
+/// ensures: ret == 0
+pub fn count_zeros_of_zero_is_the_width_tripwire(x: u8) -> u32 {
+    x.count_zeros()
+}
+
+/// `leading_ones` counts the set bits above the highest clear bit, so a value
+/// with the top bit set has at least one -- and the count is on the widened
+/// `u32` result.
+/// requires: x >= 128
+/// ensures: ret >= 1
+pub fn leading_ones_of_a_top_bit_value(x: u8) -> u32 {
+    x.leading_ones()
+}
+
+/// The tripwire: `x == 0xff` has eight leading ones, so a bound of nine is false
+/// even though it looks safe for every operand with the top bit set.
+/// requires: x >= 128
+/// ensures: ret >= 9
+pub fn leading_ones_of_a_top_bit_value_tripwire(x: u8) -> u32 {
+    x.leading_ones()
+}
+
+/// `trailing_ones` counts the set bits below the lowest clear bit, so a value
+/// below `0x80` has at most seven of them.
+/// requires: x < 128
+/// ensures: ret <= 7
+pub fn trailing_ones_of_a_small_value(x: u8) -> u32 {
+    x.trailing_ones()
+}
+
+/// The tripwire: `x == 0x7f` has exactly seven trailing ones, so a bound of six
+/// is false -- and the witness is the largest operand the precondition allows.
+/// requires: x < 128
+/// ensures: ret <= 6
+pub fn trailing_ones_of_a_small_value_tripwire(x: u8) -> u32 {
+    x.trailing_ones()
 }
 
 /// `saturating_neg` of a positive value is negative: the negation is in range, so

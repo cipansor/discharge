@@ -30,10 +30,13 @@
 //!   four `abs` spellings — the unary operators. They share the `0 - x` core,
 //!   and `abs` is "negate if negative" on top of it, so there is one expression
 //!   rather than four.
-//! * `count_ones`, `leading_zeros`, `trailing_zeros` — bit counts, built at the
-//!   operand's width and zero-extended to the *return* type's. `u8::count_ones`
-//!   returns `u32`, so this is the one shape whose result is wider than its
-//!   operand; the extension is the promotion Rust performs.
+//! * `count_ones`, `count_zeros`, `leading_zeros`, `leading_ones`,
+//!   `trailing_zeros`, `trailing_ones` — bit counts, built at the operand's width
+//!   and zero-extended to the *return* type's. `u8::count_ones` returns `u32`, so
+//!   this is the one shape whose result is wider than its operand; the extension is
+//!   the promotion Rust performs. The three *complement* counts are `core`'s own
+//!   definition — the corresponding positive count of `!x` — rather than a second
+//!   summation.
 //!
 //! # What is not, and why refusing is the right answer
 //!
@@ -52,11 +55,10 @@
 //!   under one name is not something to guess at.
 //! * `unchecked_*` is undefined behaviour on overflow. There is no value to
 //!   model, and a proof about UB is not a proof, so it is refused.
-//! * `pow` is the remaining gap. `pow(x, k)` is a `k`-fold product whose exponent
-//!   is an *operand*, so its model needs the exponent's bits, and it is not
-//!   written yet. `count_zeros`, `is_*`, `rotate_*`, `add_signed`, the float ops
-//!   and the `next_multiple_of`/`div_*` helpers are likewise absent, and an
-//!   unmodelled name is refused rather than approximated.
+//! * `pow` is modelled as a fold over the exponent's bits (see [`POW_MAX_WIDTH`]).
+//!   `is_*`, `rotate_*`, `add_signed`, the float ops and the
+//!   `next_multiple_of`/`div_*` helpers remain absent, and an unmodelled name is
+//!   refused rather than approximated.
 
 use crate::mir::parse::BinOp;
 use crate::smt::{self, Pred, Var};
@@ -137,7 +139,8 @@ pub enum Intrinsic {
     /// case -- `wrapping_neg` returns the wrapped value, `checked_neg` returns
     /// `None`, `saturating_neg` clamps, `overflowing_neg` reports the flag.
     Unary(Family, UnOp),
-    /// A bit count: `count_ones`, `leading_zeros` or `trailing_zeros`.
+    /// A bit count: one of `count_ones`, `count_zeros`, `leading_zeros`,
+    /// `leading_ones`, `trailing_zeros` or `trailing_ones`.
     ///
     /// Its result is wider than its operand (`u8::count_ones` returns `u32`), so
     /// unlike every other shape it is built at the operand's width and
@@ -181,12 +184,25 @@ pub enum UnOp {
 /// A bit count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BitKind {
-    /// The number of set bits.
+    /// The number of set bits: `count_ones`.
     Ones,
-    /// The number of high zero bits, before the highest set bit.
+    /// The number of high zero bits, before the highest set bit: `leading_zeros`.
     LeadingZeros,
-    /// The number of low zero bits, before the lowest set bit.
+    /// The number of low zero bits, before the lowest set bit: `trailing_zeros`.
     TrailingZeros,
+    /// The number of clear bits: `count_zeros`.
+    ///
+    /// `core` defines it as `count_ones(!x)`, and the model computes it that way
+    /// rather than by a second summation, so the two cannot disagree.
+    CountZeros,
+    /// The number of high set bits, before the highest clear bit: `leading_ones`.
+    ///
+    /// `core` defines it as `leading_zeros(!x)`.
+    LeadingOnes,
+    /// The number of low set bits, before the lowest clear bit: `trailing_ones`.
+    ///
+    /// `core` defines it as `trailing_zeros(!x)`.
+    TrailingOnes,
 }
 
 impl Intrinsic {
@@ -228,17 +244,21 @@ pub enum Outcome {
 /// matched, not a prefix of it, so `wrapping_add_signed` and `saturating_pow`
 /// are refused rather than read as `wrapping_add` and `saturating_add`.
 ///
-/// The three bit counts are matched before the prefix split: they have no
+/// The bit counts are matched before the prefix split: they have no
 /// `wrapping_`/`saturating_`/`checked_`/`overflowing_` prefix, and reading them
-/// through the split would look for an operator named `ones`, `leading_zeros` or
-/// `trailing_zeros` in the operator table. Matching them first keeps the split
-/// honest -- it only ever sees a name it could actually have prefixed.
+/// through the split would look for an operator named `ones`, `zeros`,
+/// `leading_zeros` or `trailing_ones` in the operator table. Matching them first
+/// keeps the split honest -- it only ever sees a name it could actually have
+/// prefixed.
 pub fn classify(name: &str) -> Option<Intrinsic> {
     let short = name.rsplit("::").next().unwrap_or(name);
     match short {
         "count_ones" => return Some(Intrinsic::Bits(BitKind::Ones)),
+        "count_zeros" => return Some(Intrinsic::Bits(BitKind::CountZeros)),
         "leading_zeros" => return Some(Intrinsic::Bits(BitKind::LeadingZeros)),
+        "leading_ones" => return Some(Intrinsic::Bits(BitKind::LeadingOnes)),
         "trailing_zeros" => return Some(Intrinsic::Bits(BitKind::TrailingZeros)),
+        "trailing_ones" => return Some(Intrinsic::Bits(BitKind::TrailingOnes)),
         _ => {}
     }
     let (family, op) = if let Some(rest) = short.strip_prefix("wrapping_") {
@@ -520,8 +540,10 @@ fn unary_failure(un: UnOp, x: Var, w: u8, signed: bool) -> Option<Pred> {
 
 /// The number of bits of the requested kind, as a term of the *operand's* width.
 ///
-/// All three are built from the same primitive -- "is bit `k` set" -- so they
-/// cannot disagree about which bit is which.
+/// The three *positive* counts are built from the same primitive -- "is bit `k`
+/// set" -- so they cannot disagree about which bit is which, and the three
+/// *complement* counts are defined as the corresponding positive count of `!x`,
+/// so there is one expression per pair rather than two that could drift.
 fn bit_count(kind: BitKind, x: Var) -> Var {
     let w = smt::bits(x);
     let one = smt::word(1, w);
@@ -557,8 +579,31 @@ fn bit_count(kind: BitKind, x: Var) -> Var {
                 acc = smt::add(acc, smt::ite(smt::eq_const(low, 0), one, zero));
             }
         }
+        // The complements are *not* a second summation: each is `core`'s own
+        // definition, the count of the bitwise complement. `count_zeros` is
+        // `count_ones(!x)`, `leading_ones` is `leading_zeros(!x)` and
+        // `trailing_ones` is `trailing_zeros(!x)`. Recursing keeps one expression
+        // for each pair, so a fix to `leading_zeros` cannot leave `leading_ones`
+        // behind. The recursion is one level deep -- `!x` is not a count.
+        //
+        // `!x` is spelled the way the executor spells it (`bxor` with `all_ones`),
+        // not as a second complement primitive, so the model's `!x` is the *same
+        // term* the body's `!x` produces rather than a definition that could drift
+        // from it.
+        BitKind::CountZeros => return bit_count(BitKind::Ones, not_bits(x)),
+        BitKind::LeadingOnes => return bit_count(BitKind::LeadingZeros, not_bits(x)),
+        BitKind::TrailingOnes => return bit_count(BitKind::TrailingZeros, not_bits(x)),
     }
     acc
+}
+
+/// `!x` at `x`'s own width.
+///
+/// The same term the executor builds for a `Not` rvalue, so a bit count of a
+/// complement and a bit count of a written `!x` cannot disagree.
+fn not_bits(x: Var) -> Var {
+    let w = smt::bits(x);
+    smt::bxor(x, smt::all_ones(w))
 }
 
 /// The operation with the result taken modulo `2^w`.
@@ -2080,11 +2125,20 @@ mod tests {
         // all-zero operand counts its own width instead of running into the
         // sentinel.
         fn oracle(kind: BitKind, w: u8, b: u64) -> u64 {
-            let v = (b as u32) & ((1u32 << w) - 1);
+            let mask = (1u32 << w) - 1;
+            let v = (b as u32) & mask;
+            // `core` defines each complement as the count of `!x`, so the oracle is
+            // the same method on the complement. The complement must be taken *at
+            // the operand's width* -- `!v` on a `u32` sets the bits above `w`, and
+            // counting those would be counting bits the operand does not have.
+            let c = !v & mask;
             match kind {
                 BitKind::Ones => u64::from(v.count_ones()),
                 BitKind::LeadingZeros => u64::from(v.leading_zeros() - (32 - u32::from(w))),
                 BitKind::TrailingZeros => u64::from((v | (1u32 << w)).trailing_zeros()),
+                BitKind::CountZeros => u64::from(c.count_ones()),
+                BitKind::LeadingOnes => u64::from(c.leading_zeros() - (32 - u32::from(w))),
+                BitKind::TrailingOnes => u64::from((c | (1u32 << w)).trailing_zeros()),
             }
         }
         for w in [1u8, 4, 8] {
@@ -2092,6 +2146,9 @@ mod tests {
                 (BitKind::Ones, "count_ones"),
                 (BitKind::LeadingZeros, "leading_zeros"),
                 (BitKind::TrailingZeros, "trailing_zeros"),
+                (BitKind::CountZeros, "count_zeros"),
+                (BitKind::LeadingOnes, "leading_ones"),
+                (BitKind::TrailingOnes, "trailing_ones"),
             ] {
                 let f = move |b: u64| oracle(kind, w, b);
                 check_unary(
@@ -2272,8 +2329,11 @@ mod tests {
         // `pow` classifies now (as `Intrinsic::Pow`, its own shape), so the
         // unmodelled examples here are the names that stay unmodelled.
         assert!(classify("powf").is_none());
-        assert!(classify("count_zeros").is_none());
         assert!(classify("count_ones_signed").is_none());
+        // `count_zeros` is modelled now; the near miss that stays unmodelled is
+        // the signed spelling, which is not a real method name.
+        assert_eq!(classify("count_zeros"), Some(Intrinsic::Bits(BitKind::CountZeros)));
+        assert!(classify("count_zeros_signed").is_none());
     }
 
     /// The bit-count names classify as counts and not as anything else.
@@ -2283,9 +2343,18 @@ mod tests {
         assert_eq!(classify("count_ones"), Some(Intrinsic::Bits(BitKind::Ones)));
         assert_eq!(classify("leading_zeros"), Some(Intrinsic::Bits(BitKind::LeadingZeros)));
         assert_eq!(classify("trailing_zeros"), Some(Intrinsic::Bits(BitKind::TrailingZeros)));
-        // The near miss: `count_zeros` is a real method this crate does not model,
-        // and it must not be read as `count_ones`.
-        assert!(classify("count_zeros").is_none());
+        assert_eq!(classify("count_zeros"), Some(Intrinsic::Bits(BitKind::CountZeros)));
+        assert_eq!(classify("leading_ones"), Some(Intrinsic::Bits(BitKind::LeadingOnes)));
+        assert_eq!(classify("trailing_ones"), Some(Intrinsic::Bits(BitKind::TrailingOnes)));
+        // The six are distinct: a `count_zeros` read as `count_ones` would be the
+        // *complement* of the right answer, which is a wrong value rather than a
+        // refusal.
+        assert_ne!(classify("count_zeros"), Some(Intrinsic::Bits(BitKind::Ones)));
+        assert_ne!(classify("leading_ones"), Some(Intrinsic::Bits(BitKind::LeadingZeros)));
+        assert_ne!(classify("trailing_ones"), Some(Intrinsic::Bits(BitKind::TrailingZeros)));
+        // A near miss that is still refused: the `_signed` spellings are not
+        // `core` methods.
+        assert!(classify("leading_ones_signed").is_none());
     }
 
     /// The unary shapes are `is_unary`; the two-operand families are not.
