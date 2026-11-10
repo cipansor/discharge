@@ -7259,4 +7259,22 @@ proof). Both were checked for teeth by reverting to the naive first-literal read
 unit test then reports `{"K": UInt(7, Some(U8))}` and the integration test fails with
 `` `K` is 8, so `ret == 7` must not be reported verified, got: verified ``.
 
+## The Verus oracle could fail on a runner's IP limit before it ran
+
+The `verus` CI job looked up the latest release with an *unauthenticated* call to
+`api.github.com`, which is capped at 60 requests an hour per IP. GitHub's runner IPs are
+shared, so the call intermittently returned `403` and the job went red at the `curl` --
+before a single line was compiled. It failed this way on `057bd20` (`curl: (22) ... 403`),
+and a re-run on the same commit passed; the oracle itself was green locally
+(`agree=97 mismatch=0 missing=0 refuted_identity=0`). A red job that says nothing about
+the crate is worse than a slow one: it trains the reader to ignore the job.
+
+**The fix authenticates the lookup.** The step now passes `github.token` as a bearer
+header on the release query, raising the limit to 5000 an hour. Only the API call is
+authenticated; the asset is fetched from the redirect target, which does not take the
+header. This is the only unauthenticated `api.github.com` call in the workflows -- the
+Ferrocene installer uses the `releases/latest/download` path, which redirects and is not
+rate-limited the same way.
+
+
 
