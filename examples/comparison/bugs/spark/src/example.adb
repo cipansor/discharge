@@ -11,6 +11,18 @@ package body Example with SPARK_Mode is
       end if;
    end Sat_Add;
 
+   --  Bug 3: the below-range arm returns Hi, so the first disjunct is false.
+   function Clamp (X, Lo, Hi : Word) return Word is
+   begin
+      if X < Lo then
+         return Hi;
+      elsif X > Hi then
+         return Hi;
+      else
+         return X;
+      end if;
+   end Clamp;
+
    --  Bug 2: the body adds 2, so the invariant is not preserved.
    function Sum_To (N : Word) return Word is
       S : Word := 0;

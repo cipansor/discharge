@@ -19,7 +19,7 @@
 # point of this script is that the *first* trade-off is checked rather than asserted.
 #
 # It is a *scratch* crate under `mktemp -d`, not a fixture in the tree: a fixture would
-# put a second `Cargo.toml` and a `target/` in the repository, and gate 15 exists
+# put a second `Cargo.toml` and a `target/` in the repository, gate 16 exists
 # precisely because that tends to get committed. The crate is created, exercised, and
 # removed.
 #

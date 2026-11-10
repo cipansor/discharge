@@ -1,44 +1,34 @@
 /-
-  The same three functions as the Coq and Rust examples, so the comparison is
-  about the tools. As in Coq, the u16 wrap is modelled explicitly: without it
-  the model would be mathematical integers, not the machine's function.
-  Only Lean core is used (no Mathlib), so `split_ifs` is unavailable and the
-  case split is written by hand with `by_cases`.
+  The three functions, with the full contracts: `satAdd` says the result is the
+  sum when it fits and MAX when it does not, so `always return MAX` fails;
+  `clamp` says which arm is taken, so `always return lo` fails. Only Lean core
+  is used (no Mathlib), so each `if` is rewritten by its guard with
+  `ite_eq_left` / `ite_eq_right` rather than by a `split_ifs` tactic.
 -/
+import model
 
-def MAX : Nat := 65535
-
-def addEng (a b : Nat) : Nat := (a + b) % 65536
-
-def satAdd (a b : Nat) : Nat :=
-  if a > MAX - b then MAX else addEng a b
-
-theorem satAdd_ge (a b : Nat) (ha : a ≤ MAX) (hb : b ≤ MAX) :
-    satAdd a b ≥ a ∧ satAdd a b ≥ b := by
+-- `ha` and `hb` are the real domain (both operands fit in a `u16`). They are
+-- not needed for the proof, because Lean's `Nat` subtraction is truncated, but
+-- they state the range the machine function is defined on.
+theorem satAdd_spec (a b : Nat) (_ha : a ≤ MAX) (_hb : b ≤ MAX) :
+    (a ≤ MAX - b → satAdd a b = a + b) ∧
+    (a > MAX - b → satAdd a b = MAX) := by
   unfold satAdd addEng MAX at *
-  by_cases h : a > 65535 - b
-  · rw [if_pos h]; constructor <;> omega
-  · rw [if_neg h]
-    have hle : a + b ≤ 65535 := by omega
+  constructor <;> intro h
+  · rw [ite_eq_right (by omega)]
     rw [Nat.mod_eq_of_lt (by omega)]
-    constructor <;> omega
+  · rw [ite_eq_left h]
 
-def clamp (x lo hi : Nat) : Nat :=
-  if x < lo then lo else if x > hi then hi else x
-
-theorem clamp_range (x lo hi : Nat) (h : lo ≤ hi) :
-    lo ≤ clamp x lo hi ∧ clamp x lo hi ≤ hi := by
+theorem clamp_spec (x lo hi : Nat) (_hlo : lo ≤ hi) :
+    (x < lo → clamp x lo hi = lo) ∧
+    (lo ≤ x → x > hi → clamp x lo hi = hi) ∧
+    (lo ≤ x → x ≤ hi → clamp x lo hi = x) := by
   unfold clamp
-  by_cases h1 : x < lo
-  · rw [if_pos h1]; omega
-  · rw [if_neg h1]
-    by_cases h2 : x > hi
-    · rw [if_pos h2]; omega
-    · rw [if_neg h2]; omega
-
-def sumTo : Nat → Nat
-  | 0 => 0
-  | n + 1 => sumTo n + 1
+  constructor
+  · intro h; rw [ite_eq_left h]
+  constructor <;> intro h1 h2
+  · rw [ite_eq_right (by omega), ite_eq_left h2]
+  · rw [ite_eq_right (by omega), ite_eq_right (by omega)]
 
 theorem sumTo_id (n : Nat) : sumTo n = n := by
   induction n with

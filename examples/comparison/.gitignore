@@ -1,2 +1,12 @@
 # gnatprove writes its proof sessions here; they are outputs, not sources.
 obj/
+
+# coqc and lean leave compiled proof objects next to the sources. They are
+# build outputs, and gate 15 fails on a tracked artifact, so they are ignored
+# rather than committed.
+*.vo
+*.vok
+*.vos
+*.glob
+.*.aux
+*.olean

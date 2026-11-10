@@ -1562,6 +1562,22 @@ proof that the teeth are real. The rule: before trusting a rejection test, run t
 that removes the guard it names, and confirm it fails. If a nearer check could also reject
 the input, the test is ambiguous and you cannot tell which check fired.
 
+**Follow-up: the same rule applies to proof scripts, and it caught two more defects.** The
+comparison's negative Coq and Lean fixtures (`examples/comparison/bugs/coq/`, `bugs/lean/`)
+were false theorems about buggy definitions, and their proof *scripts* were tailored to the
+buggy shape. Correcting the definition therefore broke the *script* rather than the
+*proof*, so the non-zero exit was an artifact of the script and not evidence about the bug —
+the mutation said so, and the fixtures were rewritten so one script runs against both the
+correct and the buggy definition (correcting the definition now makes the file compile).
+Splitting the two Coq theorems into separate compilation units is what exposed a second
+defect: a failed `Qed` stops `coqc`, so with both theorems in one file the second was never
+reached and the exit code proved only that the first failed. The isolation check then found
+a third: the loop theorem was stated `forall n, n <= 8 -> ...` under `Open Scope Z_scope`,
+where `n <= 8` for `n : nat` is a *type error*, not a proof failure — it had been failing
+for the wrong reason and was reported as a caught bug. The general lesson is that a proof
+script is a test, and a test that fails while the defect is present has proved nothing until
+the defect is removed and it passes.
+
 ## A SAFETY comment is a claim, and it needs the same treatment as any other
 
 The `no_std` `with_ctx` takes `&mut` to a `static mut`, and justified it with "the arena is
@@ -6514,7 +6530,7 @@ without the fix by reverting the two loops: the test then reports the true direc
 whole-replacement true directions now decide, plus six named-`const` true directions; all their
 `_cannot_prove_this` twins stay `Failed`, and two coverage-boundary entries stay `incomplete`);
 `cargo test --workspace --features std` **684 -> 688** passed, 0 failed; `cargo
-clippy --workspace --features std --all-targets -- -D warnings` clean; `scripts/gate.sh` 17/17
+clippy --workspace --features std --all-targets -- -D warnings` clean; `scripts/gate.sh` 18/18
 green (bare-metal build, zero-dependency and `no_std` gates included), z3 `agree=845
 mismatch=0`, kani `agree=57 mismatch=0`, verus `0 differ`, rustc_public oracle `realistic.rs 634
 functions typed, 638 text, 633 agree, 0 differ`. Zero dependencies and `no_std` untouched.
@@ -6719,9 +6735,9 @@ claims must not be conflated. The embedded engine's cost is the point of its exi
 (a proof on the target); the build-time shape's cost is a host-side `rustc`, which the
 frontend needs anyway because it shells out to `--emit=mir`.
 
-**Pinned by gate 17, not by prose.** `tools/build-verify/run.sh` builds a *scratch* crate
+**Pinned by gate 18, not by prose.** `tools/build-verify/run.sh` builds a *scratch* crate
 under `mktemp -d` (a fixture in the tree would put a second `Cargo.toml` and a `target/`
-in the repository, which gate 15 exists to prevent) and requires three things:
+in the repository, which gate 16 exists to prevent) and requires three things:
 
 1. a provable contract builds **and** the verifier reports `verified` -- a `build.rs` that
    silently did nothing would otherwise pass, so the positive direction alone is not enough;
@@ -6753,7 +6769,7 @@ repository already uses it in the one place it is safe: as an oracle.
 **What `rustc_public` costs, from `tools/mir-oracle/` itself.** It needs a nightly with the
 `rustc-dev` component, `#![feature(rustc_private)]`, and a link against
 `librustc_driver-*.so` plus `libLLVM-*`. Each of those breaks a promise the crate makes:
-gate 13 pins the floor at stable 1.85, gate 5 forbids external dependencies, the README
+gate 14 pins the floor at stable 1.85, gate 5 forbids external dependencies, the README
 sells "not a nightly feature", and an experimental API that moves every nightly is not a
 foundation for a safety build. The oracle's own manifest says it: "the `discharge` crate
 must build on stable with no dependencies, and `rustc_private` is neither stable nor

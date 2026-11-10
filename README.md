@@ -1953,7 +1953,8 @@ is instantaneous while a 12-bit multiplier equality is not.
 ├── SECURITY.md         how to report a vulnerability (GitHub private advisories)
 ├── .github/
 │   └── workflows/
-│       └── ci.yml      the gates, plus Kani, Verus and the MIR oracle as jobs
+│       └── ci.yml      the gates, plus Kani, Verus, Lean, Coq, the MIR oracle
+│                       and the comparison fixtures as jobs
 ├── src/
 │   ├── lib.rs          crate root: module map, prelude, the three proof routes
 │   ├── smt.rs          the decision procedure (the heart of the crate)
@@ -2024,7 +2025,9 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   ├── mir-oracle/     the `rustc_public` oracle: checks the text-MIR frontend
 │   │                   against rustc's own typed MIR. Nightly + `rustc-dev`,
 │   │                   its own workspace, and never a dependency of `discharge`.
-│   └── build-verify/   gate 17: the Kani/Verus shape -- verify from `build.rs`
+│   ├── comparison/     gate 13: re-runs the comparison fixtures -- the contracts,
+│   │                   the teeth, and the degenerate-implementation check
+│   └── build-verify/   gate 18: the Kani/Verus shape -- verify from `build.rs`
 │                       and prove the artifact carries no prover (scratch crate)
 └── scripts/
     ├── gate.sh            every gate in one command, failing loudly
@@ -2059,7 +2062,12 @@ run the Kani, Verus, Lean and Coq differential oracles and the `rustc_public` MI
 tools are present and *skip them loudly* when they are not, because all three are large
 downloads (Kani: a pinned nightly plus CBMC; Verus: a self-contained bundle with its own z3;
 the MIR oracle: a nightly with the `rustc-dev` and `llvm-tools-preview` components) that a normal local run should not
-pay for; CI installs them and runs them as hard gates. The last four gates hold the *tree*
+pay for; CI installs them and runs them as hard gates. One more gate holds the comparison
+fixtures themselves — `tools/comparison/run.sh` re-runs `discharge` on the positive fixture
+and all three bug fixtures, checks that the contracts refuse the degenerate implementations
+the bounds-only versions accepted, and runs Coq and Lean on the positive fixture and both
+teeth, including the mutation that shows each rejection is of the defect rather than of the
+script's shape. The last four gates hold the *tree*
 rather than the logic: rustdoc must build both crates with `-D warnings` (the crate is
 `#![deny(missing_docs)]`, but that says nothing about whether a doc link still *resolves*),
 no compiled output may be tracked (`git ls-files` must not list a `.rlib` or a `target/`
@@ -2243,14 +2251,18 @@ That table is an argument. [`examples/comparison/`](examples/comparison/README.m
 is the evidence: three ordinary functions — a guarded `sat_add`, a `clamp`, and a
 counted `sum_to` — written for `discharge`, Kani, Verus, Prusti, SPARK, Coq and
 Lean, each tool asked to prove the same properties and then asked to *refuse* the
-same two injected bugs. Every tool proves all three and catches both bugs, so the
+same three injected bugs (a swapped-branch `sat_add`, a wrong-arm `clamp`, and a
+wrong-body `sum_to`). Every tool proves all three and catches all three, so the
 interesting result is not who wins but what each one is proving: Coq and Lean
 prove theorems about a hand-written **model**, and that model can silently be
 wrong (the first version of the Coq file proved the *buggy* `sat_add` correct,
 because unbounded `Z` never wraps), while `discharge` reads the MIR `rustc`
-actually emitted, so there is no transcription to drift. The directory also puts
-Ferrocene beside the verifiers, as the qualified *compiler* that answers the other
-half of a safety case.
+actually emitted, so there is no transcription to drift. The contracts state the
+whole function, not a bound: `sat_add` says the result *is* the sum when it fits
+and `u16::MAX` when it does not, so the degenerate `u16::MAX` for every input is
+refused rather than accepted. The directory also puts Ferrocene beside the
+verifiers, as the qualified *compiler* that answers the other half of a safety
+case.
 
 Two things follow. First, `discharge` does compete with the big tools on the
 question that matters — *is the proof about the code or about a model of it?* —
@@ -2412,7 +2424,7 @@ compiles the decision procedure for `thumbv7em-none-eabihf` — and pays with bi
 Neither is a substitute for the other; a flight build might use the first to keep the
 artifact small and the second for an on-target re-check of a critical invariant.
 
-This is gate 17 of `scripts/gate.sh`, run by `tools/build-verify/run.sh` on a scratch crate
+This is gate 18 of `scripts/gate.sh`, run by `tools/build-verify/run.sh` on a scratch crate
 it creates and removes. It is a gate rather than a paragraph because "zero cost" and
 "verified at compile time" are both checkable claims, and both rot silently if only
 asserted: the script requires a good contract to build *and* the verifier to report

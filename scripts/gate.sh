@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 
 fail() { echo "GATE FAILED: $1" >&2; exit 1; }
 
-echo "== 1/17 clippy (all targets, std; and the no_std lib) =="
+echo "== 1/18 clippy (all targets, std; and the no_std lib) =="
 cargo clippy --workspace --features std --all-targets -- -D warnings || fail "clippy (std)"
 # `--features std` compiles only the host half. Every `#[cfg(not(feature = "std"))]` item --
 # the bare-metal arena, the `static mut` discipline, the whole shipped engine -- is *not*
@@ -20,10 +20,10 @@ cargo clippy --workspace --features std --all-targets -- -D warnings || fail "cl
 # goes to a microcontroller, so it is the half that most deserves the lint.
 cargo clippy --no-default-features --lib -- -D warnings || fail "clippy (no_std)"
 
-echo "== 2/17 tests (std), with a count that fails on failure =="
+echo "== 2/18 tests (std), with a count that fails on failure =="
 sh scripts/test-count.sh || fail "tests"
 
-echo "== 3/17 ferrocene: the qualified compiler builds the crate (skipped if absent) =="
+echo "== 3/18 ferrocene: the qualified compiler builds the crate (skipped if absent) =="
 # Ferrocene is the *qualified* Rust toolchain (ISO 26262 ASIL D, IEC 61508 SIL 3, EN 50128,
 # IEC 62304), so it is the one compiler whose word carries weight for a safety-critical
 # claim. The crate's own README says it has no qualification evidence; building the same
@@ -49,7 +49,7 @@ else
   fail "ferrocene build (exit $code)"
 fi
 
-echo "== 4/17 no_std bare-metal build =="
+echo "== 4/18 no_std bare-metal build =="
 # Both crates must build for the target a flight computer actually is. The parent is
 # built without its `std` feature; the arithmetic crate has no features at all, so its
 # default build *is* the bare-metal one.
@@ -63,7 +63,7 @@ cargo build -q -p discharge-arithmetic --target thumbv7em-none-eabihf \
 cargo build -q --no-default-features --target thumbv7em-none-eabihf --example bare_metal \
   || fail "bare-metal build of examples/bare_metal.rs"
 
-echo "== 5/17 no external dependencies =="
+echo "== 5/18 no external dependencies =="
 # The property is not "the tree has one line" any more -- the arithmetic primitives were
 # split into a sibling crate in this repository, so `discharge` legitimately depends on
 # `discharge-arithmetic`. The property that must not change is that *nothing from outside
@@ -83,12 +83,12 @@ if cargo tree -p discharge -e normal --prefix none | tail -n +2 | grep -qE '\((h
   fail "an external (registry or git) dependency has appeared in the tree"
 fi
 
-echo "== 6/17 z3 differential oracle =="
+echo "== 6/18 z3 differential oracle =="
 # This one needs the oracle. If `z3` is absent it exits 2 and says so; that is a failure
 # here too, because "the oracle did not run" is not evidence about the exporter.
 cargo run -q --features std --example z3diff || fail "z3 differential oracle"
 
-echo "== 7/17 kani differential oracle (skipped if kani is absent) =="
+echo "== 7/18 kani differential oracle (skipped if kani is absent) =="
 # Kani is an oracle, not a dependency, and installing it is a large download plus a nightly
 # toolchain plus CBMC. Unlike z3 it is genuinely optional for a normal build, so an absent
 # Kani is *reported and skipped* here rather than failed -- the CI job that installs Kani is
@@ -99,7 +99,7 @@ else
   echo "   (kani not installed; skipped -- 'cargo install --locked kani-verifier && cargo kani setup')"
 fi
 
-echo "== 8/17 MIR frontend, on real rustc MIR =="
+echo "== 8/18 MIR frontend, on real rustc MIR =="
 # The MIR frontend shells out to `rustc --emit=mir`. That is a *stable* flag: `-Zunpretty=mir`
 # is the nightly-only spelling, and the frontend deliberately does not use it, so a stable
 # `rustc` runs the whole `tests/mir.rs` suite (verified on 1.85, the MSRV, and on current
@@ -125,7 +125,7 @@ else
   echo "   (no rustc on PATH and DISCHARGE_RUSTC unset; skipped -- the frontend needs a rustc)"
 fi
 
-echo "== 9/17 verus differential oracle (skipped if verus is absent) =="
+echo "== 9/18 verus differential oracle (skipped if verus is absent) =="
 # Same rule as Kani. Verus ships a self-contained bundle, so a run that wants this gate
 # unpacks a release and points VERUS_BIN at the driver.
 if command -v "${VERUS_BIN:-verus}" >/dev/null 2>&1; then
@@ -134,7 +134,7 @@ else
   echo "   (verus not installed; skipped -- set VERUS_BIN to the Verus release driver)"
 fi
 
-echo "== 10/17 rustc_public MIR oracle (skipped if no nightly/rustc-dev) =="
+echo "== 10/18 rustc_public MIR oracle (skipped if no nightly/rustc-dev) =="
 # The frontend reads *textual* MIR, so a rustc release that reprints the dump can
 # break the parser and nothing else would notice. This gate asks `rustc_public`
 # for the same programs' typed MIR and compares the per-function shape -- block
@@ -156,7 +156,7 @@ else
   fail "rustc_public MIR oracle (exit $code)"
 fi
 
-echo "== 11/17 lean differential oracle (skipped if lean is absent) =="
+echo "== 11/18 lean differential oracle (skipped if lean is absent) =="
 # Lean is the strongest of the four backends here: `bv_decide` bit-blasts and then replays
 # the SAT refutation as a Lean proof term the kernel checks, so agreement is with a
 # machine-checked theorem rather than with a solver's word. It is still an oracle, not a
@@ -174,7 +174,7 @@ else
   fi
 fi
 
-echo "== 12/17 coq differential oracle (skipped if coqc is absent) =="
+echo "== 12/18 coq differential oracle (skipped if coqc is absent) =="
 # Coq checks a different thing from the other three: not "does the engine decide this the
 # same way" but "does the engine's arithmetic, transcribed into `Z` with explicit masks,
 # evaluate to the same truth value on every point of the 8-bit domain". It enumerates, so it
@@ -191,7 +191,26 @@ else
   fi
 fi
 
-echo "== 13/17 minimum supported Rust version (skipped if the toolchain is absent) =="
+echo "== 13/18 comparison fixtures: contracts, teeth, and the degenerate check =="
+# `examples/comparison/` is the evidence behind the README's comparison table, and nothing
+# ran it: the fixtures were verified by hand, once, and the prose was the only record. That
+# is the failure mode this repository names explicitly -- a one-off verification is not a
+# gate, and only a gate survives the next change. This gate re-runs the cheap, hermetic
+# half: `discharge` on the positive fixture and all three bug fixtures, the degenerate
+# implementations that the bounds-only contracts used to accept, and Coq and Lean on the
+# positive fixture and both teeth. The external provers (Kani, Verus, Prusti, SPARK) have
+# their own CI jobs, where their toolchains are installed.
+code=0
+sh tools/comparison/run.sh || code=$?
+if [ "$code" -eq 0 ]; then
+  :
+elif [ "$code" -eq 2 ]; then
+  echo "   (comparison gate: coqc, lean or a nightly rustc is absent; skipped)"
+else
+  fail "comparison fixtures (exit $code)"
+fi
+
+echo "== 14/18 minimum supported Rust version (skipped if the toolchain is absent) =="
 # `rust-version` in Cargo.toml is a claim, and a claim nothing checks is a claim that rots.
 # This gate builds the crates with the *oldest* compiler the manifests promise to support,
 # so raising the floor without meaning to -- or leaning on a feature newer than it -- fails
@@ -234,7 +253,7 @@ else
   echo "   This is reported, not passed: the floor was not checked."
 fi
 
-echo "== 14/17 documentation builds with no warnings =="
+echo "== 15/18 documentation builds with no warnings =="
 # The crate `#![deny(missing_docs)]`, so every public item is documented -- but a
 # `missing_docs` deny says nothing about whether those doc comments *build*. Two kinds of
 # rot slip past it: an intra-doc link to an item that was renamed or made private (the link
@@ -268,7 +287,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc -q -p discharge --no-deps --all-features \
 RUSTDOCFLAGS="-D warnings" cargo doc -q -p discharge-arithmetic --no-deps \
   || fail "rustdoc warnings (discharge-arithmetic)"
 
-echo "== 15/17 the tree ships no build artifacts =="
+echo "== 16/18 the tree ships no build artifacts =="
 # `scripts/gate.sh` runs the oracles, and the oracles run `rustc`, which leaves
 # `lib<name>.rlib` next to the source it compiled. A `git add -A` then commits them. This
 # happened twice: a cleanup commit untracked six root `.rlib`s, and the next `git add -A`
@@ -291,7 +310,7 @@ else
   echo "   (not a git work tree, or no git; skipped -- the artifact check needs an index)"
 fi
 
-echo "== 16/17 the unsafe surface is pinned and justified =="
+echo "== 17/18 the unsafe surface is pinned and justified =="
 # `SECURITY.md` tells a reporter that "the unsafe code" is in scope and names *two*
 # blocks. That number was wrong in the other direction once -- it claimed three when there
 # were two, and it named only `smt.rs` while `sat.rs` held the second. A count in prose is
@@ -323,7 +342,7 @@ if [ -n "$unjustified" ]; then
   fail "an 'unsafe' block has no '// SAFETY:' justification in the comment block above it"
 fi
 
-echo "== 17/17 the build-time path verifies at compile time and costs nothing =="
+echo "== 18/18 the build-time path verifies at compile time and costs nothing =="
 # The crate's headline claim is a prover that compiles *into* the artifact. This gate
 # checks the other shape a safety build often wants, and the one Kani and Verus actually
 # have: the checker runs while the crate is built and the shipped binary carries none of

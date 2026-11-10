@@ -18,6 +18,14 @@ mod proofs {
         let b: u16 = kani::any();
         let r = sat_add(a, b);
         kani::assert(r >= a && r >= b, "sat_add result >= both inputs");
+        // The whole function, not only a bound: the sum when it fits, MAX when
+        // it does not. `always return u16::MAX` satisfies the bounds above and
+        // fails here.
+        if a <= u16::MAX - b {
+            kani::assert(r == a + b, "sat_add returns the sum when it fits");
+        } else {
+            kani::assert(r == u16::MAX, "sat_add saturates when it does not");
+        }
     }
     #[kani::proof]
     fn verify_clamp() {
@@ -27,6 +35,15 @@ mod proofs {
         kani::assume(lo <= hi);
         let r = clamp(x, lo, hi);
         kani::assert(lo <= r && r <= hi, "clamp in range");
+        // Which arm is taken, not only that the result is in range. `always
+        // return lo` satisfies the bounds above and fails here.
+        if x < lo {
+            kani::assert(r == lo, "below the range returns lo");
+        } else if x > hi {
+            kani::assert(r == hi, "above the range returns hi");
+        } else {
+            kani::assert(r == x, "inside the range returns x");
+        }
     }
     #[kani::proof]
     #[kani::unwind(10)]

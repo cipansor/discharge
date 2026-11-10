@@ -3,7 +3,13 @@ use vstd::prelude::*;
 verus! {
 
 pub fn sat_add(a: u16, b: u16) -> (r: u16)
-    ensures r >= a, r >= b,
+    ensures
+        r >= a, r >= b,
+        // The whole function, not only a bound: the sum when it fits, MAX when
+        // it does not. `always return u16::MAX` satisfies the bounds and fails
+        // here.
+        a <= u16::MAX - b ==> r == a + b,
+        a >  u16::MAX - b ==> r == u16::MAX,
 {
     if a > u16::MAX - b {
         u16::MAX
@@ -14,7 +20,12 @@ pub fn sat_add(a: u16, b: u16) -> (r: u16)
 
 pub fn clamp(x: u16, lo: u16, hi: u16) -> (r: u16)
     requires lo <= hi,
-    ensures lo <= r <= hi,
+    ensures
+        lo <= r <= hi,
+        // Which arm is taken, so `always return lo` fails.
+        x < lo ==> r == lo,
+        lo <= x && x > hi ==> r == hi,
+        lo <= x && x <= hi ==> r == x,
 {
     if x < lo { lo } else if x > hi { hi } else { x }
 }

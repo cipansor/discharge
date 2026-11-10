@@ -4,3 +4,7 @@ target/
 # Local scratch and rustc artifacts -- never part of the crate.
 .sweep/
 *.rlib
+
+# coqc's `lia` tactic writes a cache in the working directory; it is an
+# output of a proof run, not a source file.
+.lia.cache
