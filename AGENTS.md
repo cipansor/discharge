@@ -7276,5 +7276,18 @@ header. This is the only unauthenticated `api.github.com` call in the workflows 
 Ferrocene installer uses the `releases/latest/download` path, which redirects and is not
 rate-limited the same way.
 
+**The token is fed on stdin, not in `curl`'s argv.** The first cut passed it as a
+`-H "Authorization: Bearer $GH_TOKEN"` argument, which is readable from
+`/proc/<pid>/cmdline` by any process on the runner -- a secret exposure (CWE-214). The
+Ferrocene step in this same workflow already piped its secret on stdin, so the argument
+form broke a convention the file had set. `curl` reads headers from stdin with `-H @-`, so
+the call is now `printf 'Authorization: Bearer %s\n' "$GH_TOKEN" | curl -fsSL -H @- …`.
+Both forms were run side by side against a slow local server and the process list read
+while they were alive: the argument form showed `-H Authorization: Bearer <token>` in
+`cmdline`, the stdin form showed only `-H @-`. The stdin form still authenticates -- the
+API reports `limit: 5000`, not the anonymous `60`. The workflow also declares
+`permissions: contents: read`: it only reads a public release and checks out the repo, so
+the token needs no write scope.
+
 
 
