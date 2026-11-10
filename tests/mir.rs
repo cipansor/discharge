@@ -3644,7 +3644,15 @@ fn assert_not_dropped(name: &str, src: &str, present: bool, missing: &[String]) 
 
 fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
     let rustc = rustc()?;
-    let dir = std::env::temp_dir().join(format!("discharge-{name}-{}", std::process::id()));
+    // A unique directory per call: two tests that both ask about a function
+    // named `reads` run in parallel and would otherwise write the same
+    // `probe.rs`, so one test could read the other's source. The counter keeps
+    // the path unique within the process; the pid keeps it unique across
+    // processes.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir()
+        .join(format!("discharge-{name}-{}-{seq}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("probe.rs");
     std::fs::write(&file, src).expect("write probe");
@@ -6247,6 +6255,54 @@ fn two_sibling_modules_do_not_share_a_contract() {
     assert!(right.is_verified(), "b::f's own contract is true and must verify, got: {right}");
 }
 
+/// A contracted function whose body `#[cfg]` removes must not be paired with a
+/// *different* function's body and reported `Verified`.
+///
+/// The contract key comes from the source, but `b::a::f` is not compiled, so its
+/// suffix (`a::f`) lands on the compiled `a::f` in the dump. The unique-suffix
+/// fallback then checked `a::f`'s body against `b::a::f`'s contract and answered
+/// `Verified` -- a claim about a function that was never compiled, and a silent
+/// concealment of the fact that it was never checked. Ambiguity must be refused
+/// in *both* directions: a key that several bodies suffix-match, and a body that
+/// several keys suffix-match.
+#[test]
+fn a_cfg_excluded_contract_does_not_steal_a_compiled_body() {
+    let src = "pub mod a {\n    /// ensures: ret == 1\n    pub fn f() -> u8 { 1 }\n}\n\
+               pub mod b {\n    pub mod a {\n        /// ensures: ret == 1\n        #[cfg(any())]\n        pub fn f() -> u8 { 2 }\n    }\n}\n";
+    let rustc = rustc().expect("rustc");
+    let dir = std::env::temp_dir().join(format!("discharge-cfg-steal-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("probe.rs");
+    std::fs::write(&file, src).expect("write probe");
+    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        report.outcomes.is_empty(),
+        "no body may be paired with the excluded `b::a::f`'s contract, got: {:?}",
+        report.outcomes
+    );
+    for name in ["a::f", "b::a::f"] {
+        assert!(
+            report.missing.contains(&name.to_string()),
+            "`{name}` must be reported missing rather than silently verified, got: {:?}",
+            report.missing
+        );
+    }
+}
+
+/// The `cfg` case's neighbour: a genuine nested free function is still resolved
+/// by the unique-suffix rule, so the refusal above is a narrowing, not a blanket
+/// refusal of any qualified key.
+#[test]
+fn a_nested_free_function_is_still_resolved_by_its_suffix() {
+    let src = "pub mod a {\n    /// ensures: ret == 9\n    pub fn f() -> u8 { 1 }\n}\n";
+    let o = verify_src("a::f", src).expect("a::f must be present");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("a::f has a false postcondition and must be refuted, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "a::f: the failure must be the postcondition, got `{kind}`");
+}
+
 /// A trait default and a free function that share a name must keep separate
 /// contracts: `A::v` is the trait's, `v` the function's.
 #[test]
@@ -6260,6 +6316,34 @@ fn a_trait_default_and_a_free_function_do_not_share_a_contract() {
     assert_eq!(kind, "postcondition", "v: the failure must be the postcondition, got `{kind}`");
     let method = verify_src("A::v", src).expect("A::v must be present");
     assert!(method.is_verified(), "the trait default's own contract is true, got: {method}");
+}
+
+/// A contract on a *trait implementation's* method is resolved and checked.
+///
+/// The review flagged this as a possible drop: the premise was that rustc prints
+/// the implementation as `<Type as Trait>::method`, a name the location-keyed
+/// resolver would not match. It does not reproduce on any supported toolchain --
+/// rustc prints a same-crate implementation as `<impl at FILE:L:C: L:C>::method`
+/// (and a default as `Trait::method`), and that location is exactly what the
+/// method key carries. The pin keeps both directions: the true contract verifies
+/// and the false one is refuted, so a future naming change cannot quietly turn
+/// this into a dropped contract.
+#[test]
+fn a_contract_on_a_trait_implementation_is_checked() {
+    let header = "pub trait Stow { fn value(&self) -> u8; }\npub struct Slot;\n";
+    let truth = format!(
+        "{header}impl Stow for Slot {{\n    /// ensures: ret == 7\n    fn value(&self) -> u8 {{ 7 }}\n}}\n"
+    );
+    let o = verify_src("value", &truth).expect("the trait impl's method must be present");
+    assert!(o.is_verified(), "`ret == 7` with a body of 7 must verify, got: {o}");
+    let falsehood = format!(
+        "{header}impl Stow for Slot {{\n    /// ensures: ret == 9\n    fn value(&self) -> u8 {{ 7 }}\n}}\n"
+    );
+    let o = verify_src("value", &falsehood).expect("the trait impl's method must be present");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("`ret == 9` with a body of 7 must be refuted, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
 }
 
 /// F1: an `impl` header whose `{` is on the next line still owns its methods.
@@ -6333,6 +6417,48 @@ fn a_split_const_generic_does_not_leak_a_local_const() {
     );
 }
 
+/// The same leak when a newline, tab or comment sits between `const` and the name.
+///
+/// All three are legal Rust for the same parameter, but the scan once matched a
+/// literal `"const "`, so `const\n    N: usize` and `const/*c*/N: usize` were not
+/// recognized. The name then stayed out of `const_generics`, its bare use made a
+/// function-local `const N` look crate-level, and a contract naming `N` resolved
+/// to that local's value -- a false proof.
+#[test]
+fn a_const_generic_after_whitespace_or_a_comment_does_not_leak_a_local_const() {
+    for header in ["const\n    N: usize", "const\tN: usize", "const/*c*/N: usize"] {
+        let src = format!(
+            "pub fn cg<{header}>() -> u8 {{ N as u8 }}\n\
+             pub fn owner() -> u8 {{ const N: u8 = 3; N }}\n\
+             /// requires: N == 3\n/// ensures: ret == N\npub fn reads() -> u8 {{ 3 }}\n"
+        );
+        let o = verify_src("reads", &src).expect("reads must be present");
+        assert!(
+            matches!(o, FnOutcome::Skipped { .. }),
+            "a contract naming the leaked local `N` must be refused, not decided, got: {o}"
+        );
+    }
+}
+
+/// A `{` inside an `impl` header's generic arguments must not be taken for the
+/// body brace.
+///
+/// `impl Foo<{ 1 }>` writes a const expression in the header. Counting that brace
+/// as the body marked the `impl` opened and popped it before the real body, so the
+/// method lost its `impl` location, its contract was keyed as a free function's,
+/// and it was reported *missing* -- a contracted function dropped from the check
+/// set. The real body brace is the one reached with no `<` open.
+#[test]
+fn a_const_expression_in_an_impl_header_does_not_hide_its_method() {
+    let src = "pub struct Foo<const N: usize>;\nimpl Foo<{ 1 }>\n{\n    \
+               /// ensures: ret == 9\n    pub fn m(&self) -> u8 { 7 }\n}\n";
+    let o = verify_src("m", src).expect("m must be present");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("a method with a false postcondition must be refuted, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+}
+
 /// The scan must still read a genuine crate-level `const` that shares a name with
 /// a const-generic parameter elsewhere, so the fix is a narrowing, not a blanket
 /// refusal of the name.
@@ -6345,4 +6471,79 @@ fn a_crate_level_const_is_still_read_beside_a_const_generic() {
     assert!(specs.const_generics.contains("N"), "the const-generic `N` must be recognized");
     let o = verify_src("reads", src).expect("reads must be present");
     assert!(o.is_verified(), "`ret == N` with crate `N == 5` must verify, got: {o}");
+}
+
+/// A function-local `const` of the same name as a crate-level one must not shadow
+/// it in a contract on a *different* function.
+///
+/// With both items compiled, rustc prints the local's definition and use site
+/// qualified (`const owner::K`), so the crate `const K` keeps its own value and
+/// `reads` returning `3` can never be *proved* against it. This is the control for
+/// [`a_cfg_disabled_crate_const_does_not_let_a_local_shadow_it`]: the same shape,
+/// but the crate item is compiled. The property asserted is the soundness one --
+/// the local's `3` must never be mistaken for the crate's `7` -- because on an
+/// older compiler a crate-level constant prints a block body the parser does not
+/// fold, leaving the name unresolved rather than decided.
+#[test]
+fn a_local_const_does_not_shadow_a_crate_const_in_another_contract() {
+    let src = "pub const K: u8 = 7;\npub fn owner() -> u8 { const K: u8 = 3; K }\n\
+               /// ensures: ret == K\npub fn reads() -> u8 { 3 }\n";
+    let o = verify_src("reads", src).expect("reads must be present");
+    assert!(
+        !o.is_verified(),
+        "`K` is the crate's 7, so `ret == K` with ret 3 must not be proved against \
+         `owner`'s local 3, got: {o}"
+    );
+    if let FnOutcome::Failed { kind, .. } = o {
+        assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+    }
+}
+
+/// A `#[cfg]`-disabled crate-level `const` must not let a function-local `const`
+/// of the same name become a program-wide name.
+///
+/// The source scanner still sees the disabled item, so it reports `K` as
+/// crate-level. The compiler removed it, so the dump has no crate `const K`; the
+/// only `K` is `owner`'s local, whose *definition* prints bare (`const K: u8 =
+/// const 3_u8;`) while its *use* stays qualified (`const owner::K`). Recording
+/// that bare definition under the crate key let an unrelated contract write
+/// `ret == K` and be *proved* against another function's local -- a false proof
+/// on a claim the function could not have written.
+#[test]
+fn a_cfg_disabled_crate_const_does_not_let_a_local_shadow_it() {
+    let src = "#[cfg(any())]\npub const K: u8 = 7;\n\
+               pub fn owner() -> u8 { const K: u8 = 3; K }\n\
+               /// ensures: ret == K\npub fn reads() -> u8 { 3 }\n";
+    let o = verify_src("reads", src).expect("reads must be present");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "`K` is not a crate-level name here, so the contract must be refused, got: {o}"
+    );
+}
+
+/// The `#[cfg]` case's neighbour: a `#[cfg]`-disabled `const` with no local twin
+/// must also be refused, because the name is still not a crate-level one.
+#[test]
+fn a_cfg_disabled_crate_const_alone_is_not_a_program_wide_name() {
+    let src = "#[cfg(any())]\npub const K: u8 = 7;\n\
+               /// ensures: ret == K\npub fn reads() -> u8 { 3 }\n";
+    let o = verify_src("reads", src).expect("reads must be present");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "a disabled item is not a name the compiled crate has, got: {o}"
+    );
+}
+
+/// A local `const` no crate-level item shares must not be readable by name: there
+/// is no program-wide `K`, so the contract is refused rather than resolved to the
+/// local's value.
+#[test]
+fn a_local_const_alone_is_not_a_program_wide_name() {
+    let src = "pub fn owner() -> u8 { const K: u8 = 3; K }\n\
+               /// ensures: ret == K\npub fn reads() -> u8 { 3 }\n";
+    let o = verify_src("reads", src).expect("reads must be present");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "a name only a function-local `const` carries must be refused, not decided, got: {o}"
+    );
 }

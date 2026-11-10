@@ -674,28 +674,56 @@ fn resolve_targets<'a>(
     let mut targets: Vec<(String, &MirFn)> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
 
-    for key in specs.by_fn.keys() {
-        // The contract key is the full source path; the MIR definition name is the
-        // shortest crate-unique suffix of it. An exact match wins outright (so
-        // `a::f` and `b::a::f` stay apart -- rustc prints both in full once they
-        // collide); only when there is none does a unique `::`-aligned suffix
-        // count. Two suffix candidates is a refusal, not a guess: a wrong pairing
-        // would check one body against another's contract.
-        if let Some(f) = prog.fns.iter().find(|f| f.name == *key) {
-            targets.push((key.clone(), f));
+    // The contract key is the full source path; the MIR definition name is the
+    // shortest crate-unique suffix of it. An exact match wins outright (so
+    // `a::f` and `b::a::f` stay apart -- rustc prints both in full once they
+    // collide); only when there is none does a unique `::`-aligned suffix count.
+    //
+    // Both directions of ambiguity are refused, not guessed at. A key that
+    // suffix-matches several dump functions is refused, and so is a dump function
+    // that several keys suffix-match: either pairing would check one body against
+    // another's contract. The second case is the one a `#[cfg]`-excluded item
+    // creates -- the key still comes from the source, but its body is not in the
+    // dump, so its suffix lands on a *different* compiled function, which would
+    // otherwise be reported `Verified` against the wrong contract and conceal
+    // that the excluded item was never checked at all.
+    let keys: Vec<&String> = specs.by_fn.keys().collect();
+    let mut chosen: Vec<Option<usize>> = vec![None; keys.len()];
+    let mut exact_owner: BTreeMap<usize, usize> = BTreeMap::new();
+    for (ki, key) in keys.iter().enumerate() {
+        if let Some(fi) = prog.fns.iter().position(|f| f.name == **key) {
+            chosen[ki] = Some(fi);
+            exact_owner.insert(fi, ki);
+        }
+    }
+    // A key with exactly one suffix candidate proposes it; a candidate a key
+    // already claimed exactly, or that more than one key proposes, is refused.
+    let mut proposed: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (ki, key) in keys.iter().enumerate() {
+        if chosen[ki].is_some() {
             continue;
         }
-        let mut found: Option<&MirFn> = None;
+        let mut cand: Option<usize> = None;
         let mut count = 0usize;
-        for f in &prog.fns {
+        for (fi, f) in prog.fns.iter().enumerate() {
             if spec::is_path_suffix(key, &f.name) {
-                found = Some(f);
+                cand = Some(fi);
                 count += 1;
             }
         }
-        match (count, found) {
-            (1, Some(f)) => targets.push((key.clone(), f)),
-            _ => missing.push(key.clone()),
+        if count == 1 {
+            proposed.entry(cand.unwrap()).or_default().push(ki);
+        }
+    }
+    for (fi, kis) in proposed {
+        if kis.len() == 1 && !exact_owner.contains_key(&fi) {
+            chosen[kis[0]] = Some(fi);
+        }
+    }
+    for (ki, key) in keys.iter().enumerate() {
+        match chosen[ki] {
+            Some(fi) => targets.push(((*key).clone(), &prog.fns[fi])),
+            None => missing.push((*key).clone()),
         }
     }
     for (line, col, method) in specs.by_method.keys() {

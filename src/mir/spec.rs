@@ -378,9 +378,16 @@ pub(crate) fn impl_location(name: &str) -> Option<(usize, usize)> {
 /// failure). The names are read here so both passes can ignore them.
 ///
 /// The tell is positional: a `const` generic parameter is always written
-/// `const NAME:` immediately after a `<` (first parameter) or a `,` (a later one),
-/// whereas a `const` *item* is never preceded by either. So a `const NAME:` whose
+/// `const NAME:` after a `<` (first parameter) or a `,` (a later one), whereas a
+/// `const` *item* is never preceded by either. So a `const NAME:` whose
 /// preceding non-space character is `<` or `,` is a parameter.
+///
+/// Rust allows arbitrary whitespace and comments between the `const` keyword and
+/// the name, so `const\n    N: usize` and `const/*c*/N: usize` are the same
+/// parameter as `const N: usize`. Matching a literal `"const "` would miss both,
+/// leaving the name in `const_generics` absent and its bare uses in the parser's
+/// heuristic -- the leak this function exists to close. So the keyword is read as
+/// a token and the name is taken after any run of whitespace and comments.
 pub fn const_generic_params(source: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let bytes = source.as_bytes();
@@ -412,12 +419,37 @@ pub fn const_generic_params(source: &str) -> BTreeSet<String> {
             i += 1;
             continue;
         }
-        if bytes[i..].starts_with(b"const ") {
+        // The `const` keyword must be a whole word: `constant` is not one.
+        if bytes[i..].starts_with(b"const")
+            && !bytes.get(i + 5).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+        {
             // The preceding non-space character decides: `<`/`,` means a generic
             // parameter, anything else (or the start of the file) an item.
             let before = source[..i].trim_end().as_bytes().last().copied();
             if matches!(before, Some(b'<') | Some(b',')) {
-                let after = &source[i + "const ".len()..];
+                // Skip whitespace and comments between `const` and the name.
+                let mut j = i + "const".len();
+                loop {
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if bytes.get(j) == Some(&b'/') && bytes.get(j + 1) == Some(&b'/') {
+                        while j < bytes.len() && bytes[j] != b'\n' {
+                            j += 1;
+                        }
+                        continue;
+                    }
+                    if bytes.get(j) == Some(&b'/') && bytes.get(j + 1) == Some(&b'*') {
+                        j += 2;
+                        while j + 1 < bytes.len() && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
+                            j += 1;
+                        }
+                        j += 2;
+                        continue;
+                    }
+                    break;
+                }
+                let after = &source[j..];
                 let name: String = after
                     .chars()
                     .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
@@ -428,7 +460,7 @@ pub fn const_generic_params(source: &str) -> BTreeSet<String> {
                     out.insert(name);
                 }
             }
-            i += "const ".len();
+            i += "const".len();
             continue;
         }
         i += 1;
@@ -572,8 +604,12 @@ struct ScopeFrame {
     kind: ItemKind,
     name: String,
     impl_loc: Option<(usize, usize)>,
-    open_depth: i32,
-    opened: bool,
+    /// The depth the item's *body* brace opened at, once seen. `None` while the
+    /// header has not opened its body yet (a brace on a later line, or a
+    /// braceless item). A brace inside a generic argument list does not count, so
+    /// `impl Foo<{ 1 }>` stays `None` until the real body brace. See
+    /// [`line_scopes`].
+    body_depth: Option<i32>,
 }
 
 /// The scope of every source line: the innermost `impl` (its keyword location)
@@ -594,13 +630,15 @@ struct ScopeFrame {
 pub(crate) fn line_scopes(source: &str) -> Vec<LineScope> {
     let lines: Vec<&str> = source.lines().collect();
     let mut out: Vec<LineScope> = vec![LineScope::default(); lines.len()];
-    // Innermost-last. The `opened` flag is what a brace-on-the-next-line header
-    // needs: Rust accepts `impl Foo` (or `mod a`, `fn f()`) with the `{` on a
-    // later line, and such a header raises no depth on its own line -- so a pop
-    // keyed on "depth has not increased" would drop it *before* its items, and
-    // every nested contract would be keyed as if the item were absent (a false
-    // proof). The flag keeps the header alive until a brace opens under it and the
-    // depth finally returns.
+    // Innermost-last. A frame records the depth its *body* brace opened at, which
+    // is what a brace-on-the-next-line header needs: Rust accepts `impl Foo` (or
+    // `mod a`, `fn f()`) with the `{` on a later line, and such a header raises no
+    // depth on its own line -- so a pop keyed on "depth has not increased" would
+    // drop it *before* its items, and every nested contract would be keyed as if
+    // the item were absent (a false proof). Recording the body depth keeps the
+    // header alive until its own brace opens and the depth returns to it, and
+    // ignores a brace that belongs to the *header* (a const-expression generic
+    // argument, `impl Foo<{ 1 }>`), which would otherwise pop the frame early.
     let mut stack: Vec<ScopeFrame> = Vec::new();
     let mut depth: i32 = 0;
     let mut in_block_comment = false;
@@ -638,25 +676,38 @@ pub(crate) fn line_scopes(source: &str) -> Vec<LineScope> {
                 kind: ItemKind::Impl,
                 name: String::new(),
                 impl_loc: Some((idx + 1, col)),
-                open_depth: depth,
-                opened: false,
+                body_depth: None,
             });
         } else if let Some((kind, name)) = item_head(raw) {
             stack.push(ScopeFrame {
                 kind,
                 name,
                 impl_loc: None,
-                open_depth: depth,
-                opened: false,
+                body_depth: None,
             });
         }
-        // Count braces outside strings, chars and line comments. The maximum
-        // depth reached on this line is what tells a header whether its own body
-        // opened: a one-line body (`fn f() -> u8 { 1 }`) raises and returns the
-        // depth within the line, so comparing the *final* depth would miss it and
-        // leave the frame on the stack, qualifying every later line.
+        // Count braces outside strings, chars, line comments and angle brackets.
+        //
+        // The depth at which an item's *body* opens is what tells a header
+        // whether its body has opened yet: a one-line body (`fn f() -> u8 { 1 }`)
+        // raises and returns the depth within the line, so comparing the *final*
+        // depth would miss it and leave the frame on the stack, qualifying every
+        // later line. The body-opening brace is the first `{` reached while no
+        // `<` is open -- a generic argument list can contain a brace-delimited
+        // const expression (`impl Foo<{ 1 }>`), and that brace belongs to the
+        // *header*, not the body: counting it would mark the frame opened and pop
+        // it before the real body, so every method under a brace-in-header `impl`
+        // lost its `impl` location and its contract was dropped (a false proof).
+        //
+        // `depth` is updated for *every* brace so the scope stays right even when
+        // a body line contains a `<` that is the comparison operator, not a
+        // generic bracket. Angle brackets only decide whether a brace is the body
+        // brace, and only until the body is seen.
         let bytes = line.as_bytes();
-        let mut line_max_depth = depth;
+        let mut body_open_depth: Option<i32> = None;
+        let mut body_seen = false;
+        let mut angle = 0i32;
+        let mut angle_depth: Option<i32> = None;
         let mut i = 0;
         while i < bytes.len() {
             match bytes[i] {
@@ -671,44 +722,73 @@ pub(crate) fn line_scopes(source: &str) -> Vec<LineScope> {
                     }
                 }
                 b'\'' => {
-                    i += 1;
-                    while i < bytes.len() && bytes[i] != b'\'' {
-                        if bytes[i] == b'\\' {
+                    // `'a` is a lifetime; `'a'`, `'{'`, `'\n'` are char literals.
+                    // Skipping to the *next* quote would swallow the rest of a
+                    // `<'a>` generic list -- including its `>` -- so a lifetime
+                    // advances one byte and only a real literal is scanned.
+                    let lifetime = matches!(bytes.get(i + 1), Some(c) if c.is_ascii_alphabetic() || *c == b'_')
+                        && bytes.get(i + 2) != Some(&b'\'');
+                    if !lifetime {
+                        i += 1;
+                        while i < bytes.len() && bytes[i] != b'\'' {
+                            if bytes[i] == b'\\' {
+                                i += 1;
+                            }
                             i += 1;
                         }
-                        i += 1;
                     }
                 }
-                b'{' => {
+                b'{' if body_seen || angle == 0 => {
+                    if !body_seen {
+                        body_seen = true;
+                        body_open_depth = Some(depth + 1);
+                    }
                     depth += 1;
-                    line_max_depth = line_max_depth.max(depth);
                 }
+                b'{' => depth += 1,
                 b'}' => depth -= 1,
+                b'<' if !body_seen && angle == 0 => {
+                    angle = 1;
+                    angle_depth = Some(depth);
+                }
+                b'<' if !body_seen && angle_depth == Some(depth) => angle += 1,
+                b'>' if !body_seen && angle > 0 && angle_depth == Some(depth) => angle -= 1,
                 _ => {}
             }
             i += 1;
         }
-        // Mark a pending header as opened once a brace has opened under it, so its
-        // pop waits for the matching close instead of firing on the header line.
+        // Record the depth the header's body brace opened at, once, so its pop
+        // waits for the matching close instead of firing on the header line. A
+        // frame that has already opened is left alone: a later brace inside its
+        // body belongs to that body, not to the header.
         if let Some(last) = stack.last_mut() {
-            if line_max_depth > last.open_depth {
-                last.opened = true;
+            if last.body_depth.is_none() {
+                if let Some(d) = body_open_depth {
+                    last.body_depth = Some(d);
+                }
             }
         }
         // A header with no brace that ends in `;` declares an item without a body
         // (`mod a;`, a trait's `fn f();`): it never opens, so it must not linger on
         // the stack and qualify every later line.
         if let Some(last) = stack.last() {
-            if !last.opened && line.trim_end().ends_with(';') {
+            if last.body_depth.is_none() && line.trim_end().ends_with(';') {
                 stack.pop();
             }
         }
         // An item whose block has closed by the end of this line is no longer
-        // enclosing anything: pop it once its brace has opened and the depth
-        // returns to where it opened. A header that has not opened yet is kept.
+        // enclosing anything: pop it once its body brace has opened and the depth
+        // returns to the depth that brace opened at. A header that has not opened
+        // yet is kept. The comparison uses the recorded body depth rather than the
+        // pre-header depth, so an `impl` header that shares its line with the
+        // enclosing block's close still pops at the right point.
         while let Some(f) = stack.last() {
-            if f.opened && depth <= f.open_depth {
-                stack.pop();
+            if let Some(d) = f.body_depth {
+                if depth < d {
+                    stack.pop();
+                } else {
+                    break;
+                }
             } else {
                 break;
             }
@@ -7411,5 +7491,30 @@ fn h<
         assert!(!names.contains("ITEM"), "a `const` item is not a parameter: {names:?}");
         assert!(!names.contains("COMMENT"), "a commented-out parameter is not read: {names:?}");
         assert!(!names.contains("STR"), "a parameter inside a string is not read: {names:?}");
+    }
+
+    /// Whitespace and comments between `const` and the parameter name are legal
+    /// Rust, and the name must still be read.
+    ///
+    /// The scanner once required a literal `"const "`, so `const\n    N: usize`
+    /// and `const/*c*/N: usize` slipped through. The parameter name then stayed
+    /// out of `const_generics`, and a function-local `const N` in some other
+    /// function kept a bare program-wide key -- which an unrelated contract
+    /// naming `N` resolved to, a false proof.
+    #[test]
+    fn const_generic_params_survives_whitespace_and_comments() {
+        for source in [
+            "fn f<const\n    N: usize>() -> usize { N }\n",
+            "fn f<const\tN: usize>() -> usize { N }\n",
+            "fn f<const/*c*/N: usize>() -> usize { N }\n",
+            "fn f<const // c\n    N: usize>() -> usize { N }\n",
+            "struct S<A, const\n    N: usize>([u8; N], A);\n",
+        ] {
+            let names = const_generic_params(source);
+            assert!(
+                names.contains("N"),
+                "the parameter after the `const` keyword must be read: {source:?} -> {names:?}"
+            );
+        }
     }
 }

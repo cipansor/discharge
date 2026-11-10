@@ -990,8 +990,7 @@ fn push_projs(
     Some(place)
 }
 
-/// The bare names that appear at a `const` *use* site, such as the `LIMIT` in
-/// `_0 = const LIMIT;`.
+/// The `const` names a dump mentions, split by shape and by role.
 ///
 /// rustc prints a crate-level `const`'s use site by its bare name (`const
 /// LIMIT`) and a function-local item's by a qualified path (`const f::L`), but it
@@ -1004,8 +1003,15 @@ fn push_projs(
 /// a contract `requires: L == 3` was proved against a name the function could not
 /// have written -- the name resolved to another function's local.
 ///
-/// A definition is `const NAME: TYPE`; every other occurrence (`const NAME;`,
-/// `const NAME,`, `const NAME)`) is a use.
+/// A definition starts the line with the keyword (`const NAME: TYPE`); every other
+/// occurrence (`const NAME;`, `const NAME,`, `const NAME)`) is a use. The
+/// qualified sets answer a second question the source cannot: a function-local item
+/// whose crate-level twin the compiler removed (a `#[cfg]`-disabled `const`) prints
+/// its *definition* bare but keeps its *use* qualified (`const owner::K`), so a
+/// qualified use with no qualified definition of the same path is that local. A
+/// bare definition under such a name must not become a program-wide key, or an
+/// unrelated contract could name it and be proved against another function's local
+/// -- a false proof.
 ///
 /// Only the *operand* text is scanned. A string literal or a constant-data block
 /// can contain the letters `const L` without that being a use -- a
@@ -1013,9 +1019,19 @@ fn push_projs(
 /// string `"const L"` would otherwise make `L` look bare-used, which hands a
 /// function-local `L` a program-wide key and turns a contract that names it into
 /// a false proof.
-fn bare_const_uses(text: &str) -> std::collections::BTreeSet<String> {
+#[derive(Default)]
+struct ConstMentions {
+    /// Names used bare (`const L`), the tell of a crate-level item's definition.
+    bare_uses: std::collections::BTreeSet<String>,
+    /// Qualified paths a `const` is *defined* under (`const owner::K: …`).
+    qualified_defs: std::collections::BTreeSet<String>,
+    /// Qualified paths a `const` is *used* under (`const owner::K;`).
+    qualified_uses: std::collections::BTreeSet<String>,
+}
+
+fn const_mentions(text: &str) -> ConstMentions {
     const KW: &str = "const ";
-    let mut out = std::collections::BTreeSet::new();
+    let mut out = ConstMentions::default();
     // An `allocN (…) {` block holds the bytes of a string literal (and other
     // constant data), printed with a gutter and a right-hand column that spells
     // the bytes out as text. Nothing in it is a use site, and it can contain the
@@ -1039,6 +1055,10 @@ fn bare_const_uses(text: &str) -> std::collections::BTreeSet<String> {
             in_alloc = true;
             continue;
         }
+        // A definition starts the line with the keyword (`const K: u8 = …`); a
+        // use sits in an operand (`_0 = const K;`). Only the role of a qualified
+        // mention depends on this; the bare-use set reads uses only.
+        let is_def = line.trim_start().starts_with(KW);
         // Drop string literals before scanning, so a `const` inside one is not
         // read as a use. A `"` toggles in/out of a literal; a `\` escapes the next
         // character, so `\"` does not close it.
@@ -1065,11 +1085,26 @@ fn bare_const_uses(text: &str) -> std::collections::BTreeSet<String> {
         let mut rest = operand.as_str();
         while let Some(i) = rest.find(KW) {
             let after = &rest[i + KW.len()..];
-            let name: String =
-                after.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            // The name is a `::`-separated path; the raw run stops at the first
+            // character that cannot be part of one. A trailing `:` is the
+            // name/type separator of a definition, not part of the name.
+            let raw: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+                .collect();
+            let name = raw.trim_end_matches(':');
             let plain = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
-            if plain && !after[name.len()..].trim_start().starts_with(':') {
-                out.insert(name);
+            if plain {
+                if name.contains("::") {
+                    if is_def {
+                        out.qualified_defs.insert(name.to_string());
+                    } else {
+                        out.qualified_uses.insert(name.to_string());
+                    }
+                } else if raw == name {
+                    // No `:` after the name: a use, not a definition.
+                    out.bare_uses.insert(name.to_string());
+                }
             }
             rest = after;
         }
@@ -1649,7 +1684,7 @@ pub fn parse_program(text: &str) -> MirProgram {
 /// [`parse_program_with`] with the crate-level `const` names the source declared.
 ///
 /// The dump prints a crate-level `const` and a function-local one identically, so
-/// the bare-use test in [`bare_const_uses`] is the only in-dump tell -- and it is
+/// the bare-use test in [`const_mentions`] is the only in-dump tell -- and it is
 /// silent for a crate-level constant that only a *contract* names. This variant
 /// takes the names the source says are module-scoped, so those definitions are
 /// kept as well. See [`crate::mir::spec::crate_level_consts`].
@@ -1692,14 +1727,29 @@ fn parse_program_impl(
         MirProgram { enums: enums.clone(), impl_owners: impl_owners.clone(), ..MirProgram::default() };
     // Which bare names are ever used as a `const` at a use site, so a definition
     // can be told a crate-level item from a function-local one. See
-    // [`bare_const_uses`]. A `const` generic parameter's uses print bare too but
+    // [`const_mentions`]. A `const` generic parameter's uses print bare too but
     // are not items at all, so its names are removed: otherwise a function-local
     // `const N` in some other function would keep a bare program-wide key. See
     // [`crate::mir::spec::const_generic_params`].
-    let mut bare_uses = bare_const_uses(text);
+    let mentions = const_mentions(text);
+    let mut bare_uses = mentions.bare_uses.clone();
     for name in const_generics {
         bare_uses.remove(name);
     }
+    // A function-local `const` whose crate-level twin the compiler removed -- a
+    // `#[cfg]`-disabled item -- prints its definition bare (`const K: u8 = const
+    // 3_u8;`) but keeps its *use* qualified (`const owner::K`), and there is no
+    // qualified definition of that path to match. The source set still names `K`
+    // (the scanner reads the `#[cfg]`-disabled item), so without this the bare
+    // definition would take the crate key and a contract on another function could
+    // name it -- a false proof. Only a qualified use with *no* qualified definition
+    // is such a local; a module constant (`const a::K`, defined and used
+    // qualified) is unaffected.
+    let claimed_bare: std::collections::BTreeSet<String> = mentions
+        .qualified_uses
+        .difference(&mentions.qualified_defs)
+        .filter_map(|p| p.rsplit("::").next().map(str::to_string))
+        .collect();
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
@@ -1742,8 +1792,8 @@ fn parse_program_impl(
                             // keeps its qualified key, which is what a contract
                             // that spells the path resolves.
                             if name.contains("::")
-                                || bare_uses.contains(name)
-                                || crate_consts.contains(name)
+                                || ((bare_uses.contains(name) || crate_consts.contains(name))
+                                    && !claimed_bare.contains(name))
                             {
                                 prog.consts.insert(name.to_string(), parse_const(c));
                             }
@@ -2227,7 +2277,7 @@ fn add(_1: u32, _2: u32) -> u32 {
     /// function-local item's by a qualified path, but both definitions look alike,
     /// so a bare definition with no bare use site is a function-local item (or an
     /// unused one) and must not become a program-wide key -- see
-    /// [`bare_const_uses`] and [`a_local_const_does_not_leak_to_another_function`].
+    /// [`const_mentions`] and [`a_local_const_does_not_leak_to_another_function`].
     #[test]
     fn named_const_items_are_collected_only_when_literal() {
         let dump = "const K: u8 = const 5_u8;\n\
@@ -2282,24 +2332,26 @@ fn add(_1: u32, _2: u32) -> u32 {
     /// -- so it is *not* a `//` comment and the comment skip does not cover it.
     #[test]
     fn a_string_literal_is_not_a_const_use() {
-        let uses = bare_const_uses(
+        let uses = const_mentions(
             "    debug s => const \"const L\";\n\
              alloc12 (size: 7, align: 1) {\n\
              \x20   63 6f 6e 73 74 20 4c 4b                       │ const L\n}\n\
              \x20   _0 = const L;\n",
-        );
+        )
+        .bare_uses;
         assert!(uses.contains("L"), "the real use site is still read: {uses:?}");
-        let only_string = bare_const_uses("    debug s => const \"const M\";\n");
+        let only_string = const_mentions("    debug s => const \"const M\";\n").bare_uses;
         assert!(
             only_string.is_empty(),
             "a `const NAME` inside a string literal is not a use: {only_string:?}"
         );
-        let only_alloc = bare_const_uses(
+        let only_alloc = const_mentions(
             "alloc4 (size: 4, align: 1) {\n\
              \x20   1u8, 1u8, 1u8, 1u8,\n\
              alloc7 (size: 7, align: 1) {\n\
              \x20   63 6f 6e 73 74 20 4e 4f 4e                       │ const NON\n}\n",
-        );
+        )
+        .bare_uses;
         assert!(
             only_alloc.is_empty(),
             "an `alloc` data block is not a use: {only_alloc:?}"
@@ -2331,6 +2383,42 @@ fn add(_1: u32, _2: u32) -> u32 {
                      const L: u8 = const 3_u8;\n";
         let prog2 = parse_program_scoped(dump2, &BTreeMap::new(), &scoped, &std::collections::BTreeSet::new(), &BTreeMap::new());
         assert!(!prog2.consts.contains_key("L"), "a name not in the source's set stays out");
+    }
+
+    /// A bare definition whose tail name is used only *qualified* is a
+    /// function-local item, and must not keep a bare key even when the source
+    /// calls the name crate-level.
+    ///
+    /// A `#[cfg]`-disabled `const K` is in the source set but not in the dump, so
+    /// the only `K` is a local's -- and rustc prints that local's definition bare
+    /// (`const K: u8 = const 3_u8;`) with a qualified use (`const owner::K`). The
+    /// source's word alone would then record `K = 3` as a crate constant, and a
+    /// contract on another function could name it. The qualified-use/qualified-def
+    /// mismatch is the in-dump tell that the bare definition is that local.
+    #[test]
+    fn a_qualified_only_use_keeps_its_bare_definition_out() {
+        // The local's definition is bare; its use is qualified, with no qualified
+        // definition anywhere. `crate_consts` claims `K` (the source saw a
+        // `#[cfg]`-disabled item), and that must not be enough.
+        let dump = "fn owner() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                    _0 = const owner::K;\n        return;\n    }\n}\n\
+                    const K: u8 = const 3_u8;\n";
+        let mut scoped = std::collections::BTreeSet::new();
+        scoped.insert("K".to_string());
+        let prog = parse_program_scoped(dump, &BTreeMap::new(), &scoped, &std::collections::BTreeSet::new(), &BTreeMap::new());
+        assert!(
+            !prog.consts.contains_key("K"),
+            "a qualified-only use means the bare definition is that local: {:?}",
+            prog.consts
+        );
+        // The control: a real module constant defines *and* uses its path
+        // qualified, so its bare spelling is not a local's and the module path is
+        // recorded under its own key.
+        let module = "fn g() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                      _0 = const a::K;\n        return;\n    }\n}\n\
+                      const a::K: u8 = const 5_u8;\n";
+        let prog = parse_program(module);
+        assert_eq!(prog.consts.get("a::K"), Some(&Const::UInt(5, Some(Ty::U8))));
     }
 
     /// The front end is total: no input, however mangled, may panic.
