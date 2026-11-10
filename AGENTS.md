@@ -96,18 +96,21 @@ Three engine consequences worth remembering:
   multiplier does not. An out-of-range amount has a defined value (zero, or sign
   fill for an arithmetic right shift), matching the shift-count-masking choice the
   differential oracle already pins.
-- **Widened products past 16 bits are declined, not approximated -- for the *signed*
-  case.** A signed non-constant multiply at `w > 8` needs a `2w`-bit product, which
-  is the BDD wall, and a *weaker* overflow predicate would be worse than declining,
-  because it would make an overflowing function look panic-free. So the code returns
-  "no predicate" and the path is reported `incomplete`.
-  This was measured rather than assumed. The engine does have a SAT fallback for
-  when the arena fills, so the tempting fix is to raise the width and let the
+- **Widened products are gone from both overflow predicates.** A signed non-constant
+  multiply used to need a `2w`-bit product, which is the BDD wall, and a *weaker*
+  overflow predicate would be worse than declining, because it would make an overflowing
+  function look panic-free. So the code returned "no predicate" past 16 bits and the
+  path was reported `incomplete`.
+  The refusal rested on the belief that no division form is exact for every combination
+  of the signs. That is false, and it was replaced by the exact form
+  `y != 0 && |x| > limit / |y|`, with `limit = 2^(w-1) - 1` for same signs and
+  `2^(w-1)` for different ones. No widening, so it works at `i64`.
+  The old widening was measured rather than assumed: the engine has a SAT fallback for
+  when the arena fills, so the tempting fix was to raise the width and let the
   fallback take it. Raising the threshold from 16 to 32 does not reach the
   fallback: `mir_demo` on a widening multiply then runs past 300 s and has to be
   killed, because the cost is in *building* the 32-bit diagram, before the arena
-  ever fills. The threshold is a time guard, and 16 is where it sits. If you raise
-  it, time the demo rather than trusting the fallback's existence.
+  ever fills. That is why the fix is a division and not a bigger multiplier.
 
 - **Signedness is part of the *value*, not a display detail.** The engine's
   arithmetic is bit-vector arithmetic, so every operation has one bit-pattern
@@ -165,9 +168,9 @@ operands this is *exact*, not a sufficient condition: for `y != 0`, `x * y > MAX
 (`smt::divmod`) the engine already has, and no `2w`-bit multiplier -- so the BDD wall
 the old comment describes is never built. It also works at `w == 64`, where there is no
 width left to widen to and the old path could not produce a predicate at all. The signed
-case still widens and still refuses past 16 bits: its predicate is about the
-sign-extended product, and there is no division form that is exact for every combination
-of the three signs.
+case now uses the same idea rather than widening: `|x| > limit / |y|`, with `limit`
+`2^(w-1) - 1` for same signs and `2^(w-1)` for different ones. The claim that no such
+form is exact for every combination of the signs was wrong.
 
 The form is deliberately the one the guard in the saturation idiom is written in
 (`if b != 0 && a > MAX / b`), in the same operand order, so the two terms are
@@ -6383,15 +6386,15 @@ or it guards nothing; both are present and the symbolic one was checked against 
 unfixed code. Pinned by `a_wider_shift_amount_is_read_at_its_own_width{,_symbolically}`.
 
 **A constant multiply is decided without a wide multiplier.** `a * 2` at `u32` was
-`incomplete` -- the general overflow path widens to `2w` and refuses past 16 bits -- while
-the same expression at `u8` verified, so the gap was width-only. With one operand a
+`incomplete` -- the general overflow path used to widen to `2w` and refuse past 16 bits --
+while the same expression at `u8` verified, so the gap was width-only. With one operand a
 constant, `x * c` wraps exactly when `x > MAX / c`, which is one comparison against a
 compile-time constant; `i * 4` (an index scaled by an element size, usually `usize`) is the
-shape it is for. Unsigned only: the signed condition has one case per combination of the
-three signs, and a predicate that is too weak there is a false proof rather than a refusal,
-so the signed width gap is kept. `overflow_pred`'s exactness is checked exhaustively at
-`u8` (all 256 values against every constant) and at the `ceil(2^32 / c)` boundary for `u32`
-by `a_constant_multiply_overflow_is_exact`, which was confirmed to fail on an off-by-one
+shape it is for. Unsigned only, because the signed constant case has its own two-ended
+range in `signed_mul_wraps_at`; the general signed path no longer widens either.
+`overflow_pred`'s exactness is checked exhaustively at `u8` (all 256 values against every
+constant) and at the `ceil(2^32 / c)` boundary for `u32` by
+`a_constant_multiply_overflow_is_exact`, which was confirmed to fail on an off-by-one
 predicate.
 
 **`blast` multiplies by a constant as a sum of shifts.** With one operand a `Const`,

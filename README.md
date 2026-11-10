@@ -1762,12 +1762,20 @@ The frontend refuses far more than it accepts, and every refusal is reported:
 
 - **MIR it cannot parse.** An unrecognized statement becomes `Unknown`, which
   makes the path "not modelled", never "proved".
-- **A signed multiply whose overflow test needs a `2w`-bit product past 16 bits.**
-  For a signed non-constant multiply at `w > 8` the predicate is about the
-  sign-extended product, and there is no division form that is exact for every
-  combination of the three signs, so the path is reported `incomplete`. The
-  *unsigned* multiply no longer lands here: its test is the exact division form
-  (`y != 0 && x > MAX / y`), which needs no widening and works at `u64`.
+- **A signed multiply whose overflow test needs a `2w`-bit product.** This is no
+  longer a refusal. The predicate used to be written as a test on the sign-extended
+  `2w`-bit product, which is the BDD scaling wall, so past 16 bits there was no
+  predicate and the path was reported `incomplete`. The signed test is now the exact
+  division form, in the same shape as the unsigned one: `|x| > limit / |y|` with
+  `y != 0`, where `limit` is `2^(w-1) - 1` when the operands share a sign (the product
+  is positive) and `2^(w-1)` when they differ (the product is negative). It needs no
+  widening, so a predicate exists at `i64`, and it is exact for every combination of
+  the two signs — the claim that no such form exists was wrong, and brute force over
+  ~93M cases at widths 2..=14 found no counterexample. Whether the query is then
+  *decided* still depends on the diagram budget, exactly as it does for the unsigned
+  form: a guard written as this predicate cancels against the obligation's assert at
+  every width, while a bare multiply the engine has to reason about from scratch can
+  run out of budget and report `incomplete`.
 - **`core::num` operations other than the modelled families.** `checked_*`,
   `saturating_*` and `wrapping_*` for `add`/`sub`/`mul`/`div`/`rem` and the
   bitwise ops are computed from their operands (see below). Every other

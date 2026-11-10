@@ -4745,26 +4745,15 @@ fn overflow_pred(op: BinOp, a: Val, b: Val, w: u8) -> Option<Pred> {
         BinOp::Sub => smt::ult(x, y),
         // `x * y` wraps exactly when the exact product needs more than `w` bits.
         //
-        // The two signs need different tests, and only the signed one widens.
-        // Unsigned `x * y` wraps exactly when `y != 0 && x > MAX / y`, which is a
-        // division and needs no wide product at all -- see the arm below. The
-        // *signed* predicate is about the sign-extended product, and there is no
-        // division form that is exact for every combination of the three signs, so
-        // it is computed by widening: `smt::truncate` zero-extends when the target
-        // width is larger, so the operands are widened to `2w`, multiplied exactly
-        // there, and compared with the sign-extension of the wrapped result. Either
-        // way the test is exact rather than a sufficient condition, which matters
-        // because a too-weak predicate here would make the `assert` look
-        // dischargeable and report an overflowing function as panic-free.
-        //
-        // Widening is where signedness matters, and the direction is worth being
-        // exact about. rustc computes the *sign-extended* product and then tests
-        // whether it equals the `w`-bit result sign-extended back to `2w`. That
-        // test is about magnitudes, so it is neither "the unsigned product is
-        // below `2^w`" (which fires spuriously for `-1 * -1` at `i8`) nor the
-        // `2^(2w-1)` magnitude rule (which fires spuriously for `-128 * 1`). The
-        // sign-extended product is built here, and the equality is what is
-        // checked.
+        // Neither sign needs a wide product. Unsigned `x * y` wraps exactly when
+        // `y != 0 && x > MAX / y`; the *signed* form is `|x| > limit / |y|` with
+        // `y != 0`, where `limit` is `2^(w-1) - 1` for same signs and `2^(w-1)` for
+        // different ones. Both are divisions, and both are exact rather than
+        // sufficient, which matters because a too-weak predicate here would make
+        // the `assert` look dischargeable and report an overflowing function as
+        // panic-free. The signed form used to widen to `2w` and compare with the
+        // sign-extended wrapped result -- the BDD wall -- which is why it refused
+        // past 16 bits; see the arms below.
         BinOp::Mul => {
             // Both operands constant: the product is a literal, so the overflow
             // is a literal too. This arm is reachable only once an argument can
@@ -4845,34 +4834,54 @@ fn overflow_pred(op: BinOp, a: Val, b: Val, w: u8) -> Option<Pred> {
                 let over = smt::ult(smt::udiv(smt::word(max, w), y), x);
                 return Some(smt::and(nonzero, over));
             }
-            let wide = w.saturating_mul(2).min(64);
-            if wide <= w {
-                // Signed at the widest supported width: the sign-extended product
-                // needs `2w` bits and there is nowhere to put them, so no sound
-                // predicate is available.
-                return None;
-            }
-            // Signed, non-constant. The widened product is a BDD-hostile shape -- a
-            // `2w`-bit multiplier is the scaling wall this crate documents -- so past
-            // 16 bits the query is not worth posing. A verifier that declines is
-            // better than one that hangs, and a *weaker* predicate here would be worse
-            // than either, because it would make an overflowing function look
-            // panic-free. (An unsigned operand no longer takes this path: the exact
-            // division test above replaces the widening there.)
-            if wide > 16 {
-                return None;
-            }
-            // Sign-extend the operands, so the product is exact; the
-            // `2w`-bit product of two `w`-bit signed values always fits in
-            // `2w` signed bits, so this multiply cannot itself wrap.
-            let exact = smt::mul(smt::sign_extend(x, wide), smt::sign_extend(y, wide));
-            // The exact product is right exactly when it equals the `w`-bit
-            // wrapped result *sign-extended* back to `2w`. Sign-extending the
-            // wrapped result is what makes this rustc's test rather than a
-            // magnitude test -- comparing a zero-extended result would fire
-            // on every negative product.
-            let want = smt::sign_extend(smt::mul(x, y), wide);
-            smt::not(smt::eq(exact, want))
+            // Signed, non-constant, and no longer widened.
+            //
+            // The old path widened both operands to `2w`, multiplied there and
+            // compared with the sign-extension of the wrapped result. That is a
+            // `2w`-bit multiplier -- the BDD scaling wall this crate documents -- so
+            // it was refused past 16 bits, and every signed multiply of two
+            // non-constant values in `i32`/`i64` code came back `incomplete`. The
+            // refusal was justified by the comment that "there is no division form
+            // that is exact for every combination of the three signs". That is
+            // false, and the exact form is the one below, which is the same safe
+            // interval `signed_mul_wraps_at` computes for a constant operand:
+            // `|x|` against the largest magnitude the divisor permits.
+            //
+            // Only two signs matter, not three. Same signs multiply positive, so
+            // the bound is `mx = 2^(w-1) - 1`; different signs multiply negative, so
+            // it is `2^(w-1)`, the magnitude of `mn`. `|mn|` is one past `mx`, which
+            // is why the two ends are not one number, and it is exactly the `-1` in
+            // `MIN * -1` -- that pair is the different-signs bound reached at the
+            // extreme, so it needs no special case here (unlike the round-trip
+            // formulation, which cannot see it and has to name it).
+            //
+            // Magnitudes rather than signed operands: the division is unsigned, and
+            // negating `MIN` wraps back to `MIN`, whose bit pattern *is* `2^(w-1)`,
+            // so the plain wrapping subtract is the right magnitude for every input
+            // -- the same reasoning the signed divider above uses. No `2w`-bit
+            // product is built, so this works at `w == 64`, where the old path had
+            // no predicate at all.
+            let (_, mx) = signed_range(w);
+            let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+            let zero = smt::word(0, w);
+            let magnitude = |v: Var| smt::ite(smt::negative(v), smt::sub(zero, v), v);
+            // `y != 0`, so the division is defined. The engine gives `x / 0` a
+            // defined value rather than trapping it, so without this the zero divisor
+            // would contribute an answer of its own -- and `x * 0` never overflows.
+            let nonzero = smt::not(smt::eq(y, zero));
+            // The largest `|x|` that pairs with this `|y|` and stays in range, chosen
+            // by whether the product is positive or negative.
+            let same_sign = smt::iff(smt::negative(x), smt::negative(y));
+            let limit = smt::ite(
+                same_sign,
+                smt::word((mx as u64) & mask, w),
+                smt::word(1u64 << (w - 1), w),
+            );
+            // `|x| > floor(limit / |y|)`, unsigned. `udiv` truncates, so the
+            // comparison is strict and equality is the safe boundary -- `42 * 3` is
+            // `126` and `43 * 3` is `129`, and the test below probes either side.
+            let over = smt::ult(smt::udiv(limit, magnitude(y)), magnitude(x));
+            smt::and(nonzero, over)
         }
         _ => return None,
     })
@@ -5785,6 +5794,150 @@ fn count_via_helper(_1: u8) -> u8 {
                     wraps(64, c, v)
                 );
             }
+        }
+    }
+
+    /// The *two-symbolic-operand* signed multiply is exact, and it exists at every
+    /// width.
+    ///
+    /// This is the predicate that used to be refused outright. The old path widened
+    /// both operands to `2w` and multiplied there, which is the BDD scaling wall, so
+    /// it returned `None` past 16 bits and every signed multiply of two non-constant
+    /// values in `i32`/`i64` code came back `incomplete`. The refusal was written down
+    /// as "there is no division form that is exact for every combination of the three
+    /// signs". That is false: the form below divides, with no widening at all.
+    ///
+    /// Two things are checked, and they are separate claims:
+    ///
+    /// * the predicate *exists* at every width, which is the refusal this replaces;
+    /// * where it exists it agrees with Rust's own `checked_mul`, which is the part
+    ///   that keeps it sound.
+    ///
+    /// The oracle is `i128`, which holds the exact product of any two `i64`s, so the
+    /// comparison is against the standard library's idea of overflow rather than this
+    /// file's.
+    #[test]
+    fn a_signed_multiply_of_two_symbols_is_exact() {
+        // `Some(wraps)` when the engine's predicate says the multiply wraps, `None`
+        // when the engine produced no predicate at all.
+        let wraps = |w: u8, a: i128, b: i128| -> Option<bool> {
+            smt::with_fresh(|| {
+                let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                let x = smt::var(w);
+                let y = smt::var(w);
+                let (xi, yi) = (smt::index(x), smt::index(y));
+                let p = overflow_pred(
+                    BinOp::Mul,
+                    Val::Sym(x, Sign::Signed),
+                    Val::Sym(y, Sign::Signed),
+                    w,
+                )?;
+                // The predicate is over the two fresh variables, so a point is an
+                // answer for each index. Negative values go in as their own `w`-bit
+                // pattern, as in the tests above.
+                smt::evaluate_pred(p, |i| {
+                    if i == xi {
+                        Some((a as u64) & mask)
+                    } else if i == yi {
+                        Some((b as u64) & mask)
+                    } else {
+                        None
+                    }
+                })
+            })
+        };
+        let want = |w: u8, a: i128, b: i128| -> bool {
+            let half = 1i128 << (w - 1);
+            let (mn, mx) = (-half, half - 1);
+            a.checked_mul(b).is_none_or(|p| p < mn || p > mx)
+        };
+
+        // The refusal this test exists for: a predicate at every width, including
+        // `i64`, where the old widened path had none and returned `incomplete`.
+        for w in 2..=64u8 {
+            assert!(
+                smt::with_fresh(|| overflow_pred(
+                    BinOp::Mul,
+                    Val::Sym(smt::var(w), Sign::Signed),
+                    Val::Sym(smt::var(w), Sign::Signed),
+                    w,
+                ))
+                .is_some(),
+                "{w}-bit signed multiply of two symbols must produce a predicate"
+            );
+        }
+
+        // Exhaustive where the domain is small enough: every pair of values at both
+        // signs, against the standard library. `-2 * -1`, `MIN * -1` and `MIN * 1`
+        // are all in here, and the whole truth table is covered rather than sampled.
+        for w in [2u8, 3, 4, 5] {
+            let half = 1i128 << (w - 1);
+            let (mn, mx) = (-half, half - 1);
+            for a in mn..=mx {
+                for b in mn..=mx {
+                    assert_eq!(
+                        wraps(w, a, b),
+                        Some(want(w, a, b)),
+                        "{w}-bit {a} * {b}: predicate said {:?} but wrapping is {}",
+                        wraps(w, a, b),
+                        want(w, a, b)
+                    );
+                }
+            }
+        }
+
+        // The boundary pairs at the wide end, one width at a time. `evaluate` walks a
+        // term DAG under a fixed depth budget, and the divider's term chain for a wide
+        // width is deeper than that budget, so the widest widths answer `None` from
+        // *evaluation* even though the predicate exists. The bounds are checked by
+        // construction -- `|x|` against the divisor's own limit -- so the pairs that
+        // matter are the ones straddling that limit at each width.
+        for w in [8u8, 12, 16, 24, 32] {
+            let half = 1i128 << (w - 1);
+            let (mn, mx) = (-half, half - 1);
+            let mut probes: Vec<i128> = vec![mn, mn + 1, -2, -1, 0, 1, 2, mx - 1, mx];
+            // The largest `|x|` that pairs with `|y| = 3`, `|y| = 5` and `|y| = 2^(w/2)`,
+            // either side of the fencepost the division rounds at.
+            for d in [3i128, 5, 1 << (w / 2), mx] {
+                let lim = mx / d;
+                probes.extend([lim - 1, lim, lim + 1, -lim - 1, -lim, -lim + 1]);
+            }
+            for a in &probes {
+                for b in &probes {
+                    if let Some(got) = wraps(w, *a, *b) {
+                        assert_eq!(
+                            got,
+                            want(w, *a, *b),
+                            "{w}-bit {a} * {b}: predicate said {got} but wrapping is {}",
+                            want(w, *a, *b)
+                        );
+                    }
+                }
+            }
+        }
+
+        // The `MIN * -1` pair by name. It is the one overflow a round-trip form cannot
+        // see, because the wrapped product is `MIN` and `|MIN| / 1` is `|MIN|`; the
+        // range form used here reaches it as the different-signs bound, so this pins
+        // that it did -- and that the *evaluated* predicate says so, not just the
+        // oracle.
+        for w in [8u8, 16, 32] {
+            let half = 1i128 << (w - 1);
+            assert_eq!(
+                wraps(w, -half, -1),
+                Some(true),
+                "{w}-bit MIN * -1 must be reported as wrapping"
+            );
+            assert_eq!(
+                wraps(w, -half, 1),
+                Some(false),
+                "{w}-bit MIN * 1 is representable and must not be reported as wrapping"
+            );
+        }
+        for w in [8u8, 16, 32, 64] {
+            let half = 1i128 << (w - 1);
+            assert!(want(w, -half, -1), "{w}-bit MIN * -1 wraps");
+            assert!(!want(w, -half, 1), "{w}-bit MIN * 1 does not wrap");
         }
     }
 
