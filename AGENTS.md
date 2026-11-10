@@ -7524,3 +7524,71 @@ nothing on `discharge`'s engine.
 **The gate enumerates examples explicitly, so new files under `examples/` are safe**,
 but `gnatprove` writes `obj/` next to the `.gpr`; `examples/comparison/.gitignore`
 ignores it so a proof session cannot be committed.
+
+## Five reports against the intrinsic model: one false proof, one panic, one false claim, and two gaps
+
+A batch of five reports against the `core`-intrinsic model. Four were real; each fix is
+guarded by a test that fails without it, and the fifth was a wrong claim in the corpus prose
+rather than in the engine. `scripts/test-count.sh` **760 → 764** passed, 0 failed;
+`scripts/gate.sh` **ALL GATES GREEN**; clippy (`--all-targets` and the `no_std` half) and
+rustdoc clean.
+
+**Report 1 — a trait method sharing an intrinsic's name could get a *false proof*.**
+rustc prints a local trait impl's *definition* as `<impl at FILE:L:C: L:C>::is_power_of_two`
+but its *call* as `<u8 as Trait>::is_power_of_two`. The names never match, so the exact-name
+same-dump lookup missed; `try_intrinsic` classifies on the *suffix* (`is_power_of_two`), so it
+answered the call from `core`'s model before type-aware callee resolution ran. A
+`Trait::is_power_of_two` for `u8` that returns `false` then *proved* `ensures: ret == true` at
+`x == 1` — a false proof of a body that disagrees with `core`. The fix is two halves of one
+guard: (1) the `Call` term now consults `resolve_callee` *first* and only falls through to the
+model when no same-dump body exists; (2) `try_intrinsic` returns `None` for any name that does
+not carry the `<impl …>` projection. The invariant that makes (2) safe is that rustc prints
+*every* real `core` integer-method call with that projection (`core::num::<impl
+u8>::wrapping_add`) and no local method call ever carries it, so the guard refuses only names
+that could name a local body. The direction is a refusal, so a misjudged spelling loses a proof
+rather than inventing one. New corpus fixtures
+`trait_is_power_of_two_disagrees_with_core` (verifies) and `…_tripwire` (refutes) pin both
+directions; the tripwire fails without the fix.
+
+**Report 2 — the 64-bit bit counts panicked (or, without overflow checks, were wrong).**
+`bit_count(TrailingZeros, …)` built its low-bit mask `2^k - 1` with a *host* shift and ran `k`
+to `w`, so at `w == 64` the last step was `1u64 << 64`: a panic under overflow checks and,
+without them, an all-zero mask that makes `x & mask == 0` true for every operand, so every
+`trailing_zeros`/`trailing_ones` at 64 bits came back one too large. The last mask is now
+`smt::all_ones(w)`, the same low-bit mask without the shift. The existing exhaustive bit-count
+test only reaches 32 bits (`0..(1u64 << w)`), which is why it missed this; the new
+`the_64_bit_counts_agree_with_rust` walks chosen separating operands at 64 bits and fails on
+the old code.
+
+**Report 3 — the mixed-add fixtures were asserted nowhere, and every one was true.** The eight
+mixed-signedness fixtures added with the model had no test asserting their verdicts, and each
+was true at its pinned inputs, so a regression that *proved* a false claim about them would not
+have failed the suite. The fix adds the missing true pins (`checked_add_signed_in_range_is_the_sum`,
+`checked_add_unsigned_in_range_is_the_sum`, `overflowing_add_unsigned_within_range_is_not_overflow`,
+`overflowing_add_unsigned_past_the_top_is_overflow`) and one false tripwire per shape
+(`wrapping_add_signed_wrong_value_tripwire`, `saturating_add_signed_wrong_value_tripwire`,
+`overflowing_add_signed_wrong_flag_tripwire`, `checked_add_signed_none_tripwire`,
+`wrapping_add_unsigned_wrong_value_tripwire`, `saturating_add_unsigned_wrong_value_tripwire`,
+`overflowing_add_unsigned_wrong_flag_tripwire`, `checked_add_unsigned_wrong_value_tripwire`), all
+asserted by `the_mixed_signedness_additions_verify_and_their_tripwires_refute`. The
+`overflowing_add_signed_wrong_flag_tripwire` is the one a bare-carry flag model proves (checked
+for teeth by breaking the model to `Some(carry)` — it then verified the false claim).
+
+**Report 4 — the `bool` predicate was never exercised through a branch.** Every
+`is_power_of_two` fixture returned the predicate, so the `bool` reached the return place and the
+obligation read it there; a regression in *branching* on it would have left the tests green.
+The corpus gains `is_power_of_two_branching_takes_the_true_arm`,
+`…_takes_the_false_arm` and `…_of_zero_tripwire` (an `if` with different constants per arm),
+asserted by `is_power_of_two_branches_on_the_predicate`.
+
+**Report 5 — the corpus prose had the carry backwards.** The doc-comment on
+`overflowing_add_signed_below_zero_is_overflow` said "the carry fires *and* the flag is set",
+but for `0u8 + (-1i8)` there is no carry: the addition reads `-1i8` as `255u8` and
+`0u8 + 255u8` is `255` with no carry, so the flag comes purely from the addend's sign
+(`carry ^ (addend < 0)` is `false ^ true`). The claim was about the *model*, not the engine,
+and it was wrong; the prose is corrected. No behaviour changed.
+
+The lesson, again: a fixture that is never asserted is not a test, and a fixture that is always
+true cannot catch a prover that says "true" too often. The negative direction has to be in the
+suite, with a witness, or the standing tripwire rule is only a comment.
+

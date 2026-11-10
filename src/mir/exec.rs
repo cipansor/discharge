@@ -2721,6 +2721,21 @@ fn try_intrinsic(
     env: &mut Env,
 ) -> Option<Result<(), String>> {
     let op = intrinsics::classify(name)?;
+    // A modelled method is only ever `core`'s own, and rustc prints a `core`
+    // integer method's call with the `<impl …>` projection (`core::num::<impl
+    // u8>::wrapping_add`). A *local* method never carries it: a trait impl's call
+    // is `<u8 as Trait>::m` and its body is `<impl at …>::m`, so a name without
+    // `<impl` is a same-dump call and must be answered by its body, never by the
+    // model. Without this, a `Trait::is_power_of_two` on `u8` that returns `false`
+    // is modelled as `core`'s predicate and *proves* `ensures: ret == true` at
+    // `x == 1` -- a false proof of a body that disagrees with `core`. The caller
+    // already resolves same-dump names first (see the `Call` term), so this is the
+    // local half of the same guard: it keeps `try_intrinsic` from ever answering
+    // for a name that could name a local body. The direction is a refusal, so a
+    // spelling the guard misjudges loses a proof rather than inventing one.
+    if !name.contains("<impl") {
+        return None;
+    }
     let cur = &prog.fns[func];
     // The operand width, from the first argument's declared type. It is not the
     // destination's: `checked_add` on a `u8` writes an `Option<u8>`, and taking
@@ -3626,8 +3641,22 @@ where
             // same-dump name, so a user `wrapping_add` and `u8::wrapping_add` can
             // coexist: the first is inlined by the exact match, the second falls
             // through to the model.
-            let exact = prog.fns.iter().position(|g| g.name == *name);
-            if exact.is_none() {
+            //
+            // The same-dump lookup has to run on the *resolved* name, not only on the
+            // exact one, and the model is only a fallback once that fails. A local
+            // trait impl prints its *call* as `<u8 as Trait>::is_power_of_two` but its
+            // *definition* as `<impl at FILE:L:C: L:C>::is_power_of_two`, so the exact
+            // name never matches and the suffix classifies -- answering the call from
+            // `core`'s model instead of the user's body. A `Trait::is_power_of_two`
+            // for `u8` that returns `false` then *proves* `ensures: ret == true` at
+            // `x == 1`, a false proof of a trait implementation that disagrees with
+            // `core`. So [`resolve_callee`] is consulted first (it already refuses a
+            // name that carries `<impl`, which is every real intrinsic call, and
+            // requires the method's `self` type to agree), and the model answers only
+            // when no same-dump body was found. See [`try_intrinsic`] for the second
+            // half of the guard.
+            let same_dump = resolve_callee(prog, name);
+            if same_dump.is_none() {
                 if let Some(done) =
                     try_intrinsic(prog, st.frame.func, name, args, dest, &mut st.env)
                 {
@@ -3658,7 +3687,7 @@ where
             // share one. Inlining the wrong body is a false proof, so the tail
             // match also requires the same method `self` type and a unique
             // candidate; see [`resolve_callee`].
-            let inline_idx = resolve_callee(prog, name);
+            let inline_idx = same_dump;
             let Some(idx) = inline_idx else {
                 report.unknown_paths.push(format!("call to unmodelled function `{name}`"));
                 return;

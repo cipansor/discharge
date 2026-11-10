@@ -701,6 +701,9 @@ fn bit_count(kind: BitKind, x: Var) -> Var {
         // `w` bits clear. Starting at `k == 1` omits that term and reports `w - 1`
         // for zero -- an off-by-one at exactly one input, which the exhaustive
         // walk against `core` is what caught.
+        //
+        // `k` runs to `w - 1`, so the host shift `1u64 << k` is at most `63` even
+        // at `w == 64` and never overflows.
         BitKind::LeadingZeros => {
             for k in 0..w {
                 acc = smt::add(acc, smt::ite(smt::ult_const(x, 1u64 << k), one, zero));
@@ -709,9 +712,24 @@ fn bit_count(kind: BitKind, x: Var) -> Var {
         // The zero bits below the lowest set bit: the `k`-th term is added while
         // the low `k` bits are all clear. Written as `x & (2^k - 1) == 0`, which
         // is one `and` and one compare per bit.
+        //
+        // The mask `2^k - 1` is built with a *host* shift, and `k` runs to `w`, so
+        // at `w == 64` the last step would evaluate `1u64 << 64` -- which panics
+        // under overflow checks and, without them, masks the shift amount to `0`
+        // and yields an all-zero mask. An all-zero mask makes `x & mask == 0` true
+        // for *every* operand, so the final term adds `1` unconditionally and
+        // every `trailing_zeros`/`trailing_ones` at 64 bits is one too large --
+        // `0u64.trailing_zeros()` would read `65`, not `64`. The last mask is
+        // therefore `all_ones(w)`, which is the same low-bit mask without the
+        // shift (`x & all_ones == x`, and `x == 0` iff all `w` low bits are clear).
         BitKind::TrailingZeros => {
             for k in 1..=w {
-                let low = smt::band(x, smt::word((1u64 << k) - 1, w));
+                let mask = if k == w {
+                    smt::all_ones(w)
+                } else {
+                    smt::word((1u64 << k) - 1, w)
+                };
+                let low = smt::band(x, mask);
                 acc = smt::add(acc, smt::ite(smt::eq_const(low, 0), one, zero));
             }
         }
@@ -2383,6 +2401,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The 64-bit bit counts, checked at chosen operands rather than by walking.
+    ///
+    /// `the_bit_counts_agree_with_rust` walks the whole domain, which is only
+    /// possible up to 32 bits (`0..(1u64 << w)`). 64 bits is exactly where the
+    /// mask construction is delicate: `trailing_zeros` builds `2^k - 1` with a
+    /// *host* shift, and its last step is `k == w`, so at 64 bits that step is
+    /// `1u64 << 64` -- a panic under overflow checks and, without them, an
+    /// all-zero mask that makes `x & mask == 0` true for every operand, so every
+    /// count comes back one too large (`0u64.trailing_zeros()` would read `65`,
+    /// not `64`). The mask is now `all_ones(w)` at that step, and this pins the
+    /// shape at the one width the exhaustive walk cannot reach.
+    ///
+    /// The operands are the ones that separate the answers: `0` (every bit of the
+    /// operand is the counted kind), all ones (none is), `1` and `1 << 63` (one
+    /// bit of each kind at each end), and a mixed pattern.
+    #[test]
+    fn the_64_bit_counts_agree_with_rust() {
+        let operands = [
+            0u64,
+            u64::MAX,
+            1,
+            1u64 << 63,
+            0x8000_0000_0000_0001,
+            0x0000_ffff_ffff_0000,
+        ];
+        let check = |kind: BitKind, name: &str, oracle: fn(u64) -> u64| {
+            smt::with_fresh(|| {
+                let a = smt::var(64);
+                let ai = smt::index(a);
+                let outcome = eval(Intrinsic::Bits(kind), a, a, 64, false, 64)
+                    .unwrap_or_else(|| panic!("{name} at 64 bits must be modelled"));
+                let Outcome::Value(v) = outcome else {
+                    panic!("{name} must produce a plain value");
+                };
+                for xb in operands {
+                    let want = oracle(xb);
+                    let got = smt::evaluate(v, |i| if i == ai { Some(xb) } else { None });
+                    assert_eq!(
+                        got,
+                        Some(want),
+                        "{name} at bits {xb:#x}: the model says {got:?}, Rust says {want}"
+                    );
+                }
+            });
+        };
+        check(BitKind::Ones, "count_ones", |v| u64::from(v.count_ones()));
+        check(BitKind::CountZeros, "count_zeros", |v| u64::from(v.count_zeros()));
+        check(BitKind::LeadingZeros, "leading_zeros", |v| u64::from(v.leading_zeros()));
+        check(BitKind::LeadingOnes, "leading_ones", |v| u64::from(v.leading_ones()));
+        check(BitKind::TrailingZeros, "trailing_zeros", |v| u64::from(v.trailing_zeros()));
+        check(BitKind::TrailingOnes, "trailing_ones", |v| u64::from(v.trailing_ones()));
     }
 
     /// Walk every `w`-bit value and compare a `bool`-valued model against Rust.

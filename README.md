@@ -1749,6 +1749,12 @@ refused. `src/mir/intrinsics.rs` holds the model:
   writes it as a `bool`, which is what the `if` that consumes it branches on; a
   one-bit word there would leave the local readable only as a word. It is
   unsigned-only, matching `core`.
+- A *local* method that shares an intrinsic's name is answered by its own body,
+  never by the model. rustc prints a trait impl's call as `<u8 as Trait>::m` but
+  its definition as `<impl at …>::m`, so the names never match; the model is only
+  consulted when no same-dump body exists and the call name carries the `<impl …>`
+  projection that every real `core` method call has. Without both halves, a trait
+  that disagrees with `core` would get a *false proof* from the model.
 - `add_signed`/`add_unsigned` add a value to one of the *opposite* signedness
   (`u8::wrapping_add_signed` adds an `i8` to a `u8`), so the two operands are read
   at different signs. The value is the plain wrapped sum in both directions, since

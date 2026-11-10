@@ -3308,6 +3308,51 @@ pub fn is_power_of_two_of_three(x: u8) -> bool {
     x.is_power_of_two()
 }
 
+/// The predicate is *consumed by a branch*, not only read in a postcondition.
+///
+/// Every other `is_power_of_two` fixture returns the predicate directly, so the
+/// `bool` reaches the return place and the obligation reads it there. Here it is
+/// the `switchInt`'s discriminant, so a model that produced a `Pred` the
+/// executor could not branch on -- or a `Val::Bool` the `if` could not read --
+/// would leave the path unknown rather than take the right arm. The two arms
+/// return different constants, so the postcondition fixes which arm was taken.
+/// requires: x == 128
+/// ensures: ret == 7
+pub fn is_power_of_two_branching_takes_the_true_arm(x: u8) -> u8 {
+    if x.is_power_of_two() {
+        7
+    } else {
+        9
+    }
+}
+
+/// The other arm of the same branch: `3` is not a power of two, so the `else`
+/// runs and the postcondition is `9`. Together with the pin above it fixes both
+/// arms, which a model that took a constant arm could not do.
+/// requires: x == 3
+/// ensures: ret == 9
+pub fn is_power_of_two_branching_takes_the_false_arm(x: u8) -> u8 {
+    if x.is_power_of_two() {
+        7
+    } else {
+        9
+    }
+}
+
+/// The branching tripwire: `0` is not a power of two, so the `else` arm runs and
+/// the result is `9`. A model that dropped the `x != 0` conjunct would take the
+/// `then` arm and *prove* this false `ret == 7` -- so the branch, not just the
+/// predicate, is what this pins.
+/// requires: x == 0
+/// ensures: ret == 7
+pub fn is_power_of_two_branching_of_zero_tripwire(x: u8) -> u8 {
+    if x.is_power_of_two() {
+        7
+    } else {
+        9
+    }
+}
+
 /// `wrapping_add_signed` adds a signed addend to an unsigned self, and the result
 /// is the plain wrapped sum: `0u8 + (-1i8)` is `255`. This is the *value* pin --
 /// a model that refused the mixed shape, or read the addend as unsigned, would
@@ -3333,10 +3378,12 @@ pub fn saturating_add_signed_clamps_to_zero(x: u8, r: i8) -> u8 {
 
 /// The flag of a mixed-signedness addition, where the *mathematical* result runs
 /// off the bottom: `0u8 + (-1i8)` is `-1`, which `u8` cannot hold, so the flag is
-/// `true` and the value is the wrapped `255`. The flag is not a claim about the
-/// carry alone -- here the carry fires *and* the flag is set -- which is why the
-/// pin below, where the carry fires and the flag is *clear*, is the one that
-/// separates this model from the naive one.
+/// `true` and the value is the wrapped `255`. The flag is set by the *addend's
+/// sign* here, not by the carry: the addition reads `-1i8` as `255u8`, and
+/// `0u8 + 255u8` is `255` with no carry at all, so `carry ^ (addend < 0)` is
+/// `false ^ true`. That is what makes the pin below, where the carry *does* fire
+/// and the flag is nevertheless *clear*, the one that separates this model from
+/// the naive one.
 /// requires: x == 0
 /// requires: r == -1
 /// ensures: ret == true
@@ -3346,9 +3393,9 @@ pub fn overflowing_add_signed_below_zero_is_overflow(x: u8, r: i8) -> bool {
 
 /// The pin the carry alone cannot make: `250u8 + (-1i8)` is `249`, which `u8`
 /// holds, so the flag is `false` -- even though the addition *carries*, because
-/// `250 + 255` wraps to `249`. A model that took the bare top-bit carry as the
-/// flag would report `true` here and *refute* this true contract; the addend's
-/// sign is what cancels that carry.
+/// the addend reads as `255u8` and `250 + 255` wraps to `249`. A model that took
+/// the bare top-bit carry as the flag would report `true` here and *refute* this
+/// true contract; the addend's sign is what cancels that carry.
 /// requires: x == 250
 /// requires: r == -1
 /// ensures: ret == false
@@ -3399,6 +3446,197 @@ pub fn saturating_add_unsigned_clamps_to_signed_max(x: i8, r: u8) -> i8 {
 /// ensures: ret == 127
 pub fn saturating_add_unsigned_top_bit_tripwire(x: i8, r: u8) -> i8 {
     x.saturating_add_unsigned(r)
+}
+
+/// `checked_add_signed` in range: `250u8 + (-1i8)` is `249`, which `u8` holds, so
+/// the `Some` arm runs and the value is the plain sum. This is the `Some`-value
+/// pin the tripwires below need: without it a model that returned the `None` arm
+/// everywhere would still pass a false contract that happened to name the arm's
+/// constant.
+/// requires: x == 250
+/// requires: r == -1
+/// ensures: ret == 249
+pub fn checked_add_signed_in_range_is_the_sum(x: u8, r: i8) -> u8 {
+    match x.checked_add_signed(r) {
+        Some(v) => v,
+        None => 0,
+    }
+}
+
+/// `checked_add_unsigned` in range: `1i8 + 1u8` is `2`, so the `Some` arm runs.
+/// The `_unsigned` direction's `Some` value, which the false tripwire below is
+/// the complement of.
+/// requires: x == 1
+/// requires: r == 1
+/// ensures: ret == 2
+pub fn checked_add_unsigned_in_range_is_the_sum(x: i8, r: u8) -> i8 {
+    match x.checked_add_unsigned(r) {
+        Some(v) => v,
+        None => 1,
+    }
+}
+
+/// `overflowing_add_unsigned` in range: `1i8 + 1u8` is `2`, in range, so the flag
+/// is `false`. The `_unsigned` flag's clear direction, which the signed self's
+/// carry alone would report as `true` (the addend's non-negative sign does not
+/// cancel it).
+/// requires: x == 1
+/// requires: r == 1
+/// ensures: ret == false
+pub fn overflowing_add_unsigned_within_range_is_not_overflow(x: i8, r: u8) -> bool {
+    x.overflowing_add_unsigned(r).1
+}
+
+/// `overflowing_add_unsigned` off the top: `0i8 + 128u8` is `-128`, past `i8`, so
+/// the flag is `true`. Here the carry alone reports the overflow correctly, so
+/// this pin alone does not separate the two flag models -- the in-range pin above
+/// is the one that does.
+/// requires: x == 0
+/// requires: r == 128
+/// ensures: ret == true
+pub fn overflowing_add_unsigned_past_the_top_is_overflow(x: i8, r: u8) -> bool {
+    x.overflowing_add_unsigned(r).1
+}
+
+// The failing tripwires. Each is a *false* contract on a mixed-add shape with a
+// concrete witness, so the corpus carries the negative direction the standing
+// rule requires: a model that proves one of these cannot pass the suite. They are
+// kept beside the true pins so the two readings of every shape are pinned at once.
+
+/// The `wrapping` value tripwire: `250u8 + (-1i8)` is `249`, so `ret == 250` is
+/// false. The witness is `x == 250, r == -1`.
+/// requires: x == 250
+/// requires: r == -1
+/// ensures: ret == 250
+pub fn wrapping_add_signed_wrong_value_tripwire(x: u8, r: i8) -> u8 {
+    x.wrapping_add_signed(r)
+}
+
+/// The `saturating` clamp tripwire: `0u8 + (-1i8)` borrows below zero and clamps
+/// to `0`, so `ret == 1` is false. A model that forgot the clamp would wrap to
+/// `255` and also fail this, but a model that clamps to the wrong end would pass
+/// the true pin and fail here.
+/// requires: x == 0
+/// requires: r == -1
+/// ensures: ret == 1
+pub fn saturating_add_signed_wrong_value_tripwire(x: u8, r: i8) -> u8 {
+    x.saturating_add_signed(r)
+}
+
+/// The `overflowing` flag tripwire, in the direction the carry alone gets wrong:
+/// `250u8 + (-1i8)` is `249`, in range, so the flag is `false` and `ret == true`
+/// is false. This is the false contract the *bare-carry* model would prove, since
+/// that model reports the carry (which fires here) as the flag.
+/// requires: x == 250
+/// requires: r == -1
+/// ensures: ret == true
+pub fn overflowing_add_signed_wrong_flag_tripwire(x: u8, r: i8) -> bool {
+    x.overflowing_add_signed(r).1
+}
+
+/// The `checked` `None` tripwire: `250u8 + 10i8` is `260`, past `u8::MAX`, so the
+/// result is `None` and the match takes the `None` arm returning `0`. Claiming
+/// `ret == 255` -- the wrapped value -- is false, and it is the false contract a
+/// model that treated `checked` as `wrapping` would prove.
+/// requires: x == 250
+/// requires: r == 10
+/// ensures: ret == 255
+pub fn checked_add_signed_none_tripwire(x: u8, r: i8) -> u8 {
+    match x.checked_add_signed(r) {
+        Some(v) => v,
+        None => 0,
+    }
+}
+
+/// The `wrapping` `_unsigned` value tripwire: `0i8 + 128u8` is `-128`, so
+/// `ret == 127` is false -- it is the *saturating* answer, which pins that the
+/// two families are not the same shape.
+/// requires: x == 0
+/// requires: r == 128
+/// ensures: ret == 127
+pub fn wrapping_add_unsigned_wrong_value_tripwire(x: i8, r: u8) -> i8 {
+    x.wrapping_add_unsigned(r)
+}
+
+/// The `saturating` `_unsigned` value tripwire, the mirror of the pin above:
+/// `0i8 + 128u8` clamps to `127`, so `ret == -128` -- the *wrapping* answer -- is
+/// false. A model that clamped to the unsigned maximum (`255`, read back as `-1`)
+/// or that wrapped would fail the true pin and pass this one.
+/// requires: x == 0
+/// requires: r == 128
+/// ensures: ret == -128
+pub fn saturating_add_unsigned_wrong_value_tripwire(x: i8, r: u8) -> i8 {
+    x.saturating_add_unsigned(r)
+}
+
+/// The `overflowing` `_unsigned` flag tripwire: `1i8 + 1u8` is `2`, in range, so
+/// the flag is `false` and `ret == true` is false. This is the direction the
+/// signed carry gets wrong, because `1i8 + 1u8` read as a signed addition is
+/// `1 + 1`, no overflow -- and read at the addend's sign it is still clear -- so
+/// a model that used either the bare carry or the self sign proves this.
+/// requires: x == 1
+/// requires: r == 1
+/// ensures: ret == true
+pub fn overflowing_add_unsigned_wrong_flag_tripwire(x: i8, r: u8) -> bool {
+    x.overflowing_add_unsigned(r).1
+}
+
+/// The `checked` `_unsigned` tripwire: `1i8 + 1u8` is `2`, so the `Some` arm runs
+/// and `ret == 0` is false. Together with `checked_add_unsigned_in_range_is_the_sum`
+/// it pins both the value and the arm.
+/// requires: x == 1
+/// requires: r == 1
+/// ensures: ret == 0
+pub fn checked_add_unsigned_wrong_value_tripwire(x: i8, r: u8) -> i8 {
+    match x.checked_add_unsigned(r) {
+        Some(v) => v,
+        None => 1,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A *local* method that shares an intrinsic's name must be answered by its own
+// body, never by the `core` model.
+//
+// rustc prints a trait impl's *call* as `<u8 as Trait>::is_power_of_two` but its
+// *definition* as `<impl at FILE:L:C: L:C>::is_power_of_two`. The names never
+// match, so the intrinsic model -- which classifies on the suffix -- used to
+// answer the call before same-dump resolution could find the body. A trait that
+// disagrees with `core` then had a *false* proof: `trait_is_power_of_two_
+// disagrees_with_core` returns `false` at `x == 1` but the model answered `true`
+// and proved `ret == true`. The two fixtures below are the two directions -- the
+// true contract that must verify (the body really does return `false` there) and
+// the false one the model used to prove.
+// ---------------------------------------------------------------------------
+
+/// A trait method named like a `core` intrinsic, whose implementation *disagrees*
+/// with `core`: it is `false` even where `core`'s predicate is `true`.
+pub trait NotPowerOfTwo {
+    fn is_power_of_two(self) -> bool;
+}
+
+impl NotPowerOfTwo for u8 {
+    fn is_power_of_two(self) -> bool {
+        false
+    }
+}
+
+/// `1u8` *is* a power of two under `core`, but the trait above says otherwise, so
+/// the call must read the trait body and the result is `false`. A model that
+/// answered from `core`'s predicate would *refute* this true contract.
+/// requires: x == 1
+/// ensures: ret == false
+pub fn trait_is_power_of_two_disagrees_with_core(x: u8) -> bool {
+    NotPowerOfTwo::is_power_of_two(x)
+}
+
+/// The false direction: the same call claims `core`'s answer, which the trait body
+/// does not produce, so it must be refuted. This is exactly the contract the
+/// suffix-classification bug *proved*.
+/// requires: x == 1
+/// ensures: ret == true
+pub fn trait_is_power_of_two_disagrees_with_core_tripwire(x: u8) -> bool {
+    NotPowerOfTwo::is_power_of_two(x)
 }
 
 /// `saturating_neg` of a positive value is negative: the negation is in range, so

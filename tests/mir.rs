@@ -1340,6 +1340,132 @@ fn is_power_of_two_is_a_modelled_bool() {
     }
 }
 
+/// The `bool` is consumed by a `switchInt`, not only read in a postcondition.
+///
+/// `is_power_of_two_is_a_modelled_bool` returns the predicate, so the `bool`
+/// reaches the return place and the obligation reads it there; a regression in
+/// *branching* on it would leave those tests green. These fixtures put the
+/// predicate in an `if`, where the executor has to turn the `Pred` into a path
+/// condition and take one of two arms returning different constants. The two
+/// arms are pinned separately, so a model that took a constant arm fails one of
+/// them, and the zero tripwire pins the `x != 0` conjunct *through the branch*:
+/// a model that dropped it takes the `then` arm and proves the false `ret == 7`.
+#[test]
+fn is_power_of_two_branches_on_the_predicate() {
+    let verified = [
+        "is_power_of_two_branching_takes_the_true_arm",
+        "is_power_of_two_branching_takes_the_false_arm",
+    ];
+    let refuted = ["is_power_of_two_branching_of_zero_tripwire"];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { .. } = o else {
+            panic!("`{name}` is a false contract that must be refuted, got: {o}");
+        };
+    }
+}
+
+/// The mixed-signedness additions, each pinned in both directions.
+///
+/// Every shape gets a true contract *and* a false one with a concrete witness, so
+/// the suite carries the negative direction the standing tripwire rule requires:
+/// a model that proves a false claim about `add_signed`/`add_unsigned` fails here
+/// rather than passing because every fixture happened to be true. The false pins
+/// are chosen to separate the readings that the true pins cannot:
+///
+/// * `overflowing_add_signed_wrong_flag_tripwire` (`250u8 + (-1i8)`, in range) is
+///   the one a *bare-carry* flag model would prove, since the carry fires there.
+/// * `overflowing_add_unsigned_wrong_flag_tripwire` (`1i8 + 1u8`, in range) is
+///   the one a *signed-addition* flag model would prove.
+/// * `saturating_add_unsigned_wrong_value_tripwire` names the *wrapping* answer,
+///   which pins that the two families are not the same shape.
+///
+/// The checked family is read through a `match` rather than `ret.is_some()`,
+/// because the contract language cannot name an `Option` payload; the arm the
+/// match takes is what the `Some`/`None` verdicts pin.
+#[test]
+fn the_mixed_signedness_additions_verify_and_their_tripwires_refute() {
+    let verified = [
+        "wrapping_add_signed_of_a_negative",
+        "saturating_add_signed_clamps_to_zero",
+        "overflowing_add_signed_below_zero_is_overflow",
+        "overflowing_add_signed_within_range_is_not_overflow",
+        "overflowing_add_signed_past_the_top_tripwire",
+        "wrapping_add_unsigned_of_the_top_bit",
+        "saturating_add_unsigned_clamps_to_signed_max",
+        "saturating_add_unsigned_top_bit_tripwire",
+        "checked_add_signed_in_range_is_the_sum",
+        "checked_add_unsigned_in_range_is_the_sum",
+        "overflowing_add_unsigned_within_range_is_not_overflow",
+        "overflowing_add_unsigned_past_the_top_is_overflow",
+    ];
+    let refuted = [
+        "wrapping_add_signed_wrong_value_tripwire",
+        "saturating_add_signed_wrong_value_tripwire",
+        "overflowing_add_signed_wrong_flag_tripwire",
+        "checked_add_signed_none_tripwire",
+        "wrapping_add_unsigned_wrong_value_tripwire",
+        "saturating_add_unsigned_wrong_value_tripwire",
+        "overflowing_add_unsigned_wrong_flag_tripwire",
+        "checked_add_unsigned_wrong_value_tripwire",
+    ];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` is a false mixed-add contract that must be refuted, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
+/// A local method sharing an intrinsic's name is answered by its body, not `core`.
+///
+/// rustc prints a trait impl's call as `<u8 as Trait>::is_power_of_two` and its
+/// definition as `<impl at …>::is_power_of_two`, so the exact-name lookup missed
+/// and the intrinsic model -- classifying on the suffix -- answered first. A trait
+/// that disagrees with `core` then got a *false proof*: the body returns `false`
+/// at `x == 1`, but the model returned `core`'s `true` and proved `ret == true`.
+/// The true contract must verify (the body really is `false` there) and the false
+/// one must be refuted, which pins both that the body was read and that the model
+/// no longer shadows it.
+#[test]
+fn a_trait_method_sharing_an_intrinsic_name_is_answered_by_its_body() {
+    let verified = ["trait_is_power_of_two_disagrees_with_core"];
+    let refuted = ["trait_is_power_of_two_disagrees_with_core_tripwire"];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(
+            o.is_verified(),
+            "`{name}` must verify: the trait body returns `false` at `x == 1`, so a \
+             model that answered from `core`'s predicate would refute it; got: {o}"
+        );
+    }
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!(
+                "`{name}` must be refuted: it claims `core`'s answer, which the trait \
+                 body does not produce. A pass is the false proof this pins. got: {o}"
+            );
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
 /// The bitwise complement `!x`, pinned by a true half and a tripwire.
 ///
 /// `!x` is `all_ones ^ x` at the *operand's* width. The model reads that width
