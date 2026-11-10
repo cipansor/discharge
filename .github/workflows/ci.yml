@@ -26,6 +26,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# The workflow reads a public release (Verus) and checks out the repo; it needs no write
+# access at all. Declaring that turns the default token into a read-only one, so a
+# compromised step has nothing to push with -- least privilege on the same `github.token`
+# the Verus download authenticates with.
+permissions:
+  contents: read
+
 jobs:
   gate:
     name: gates (clippy, tests, no_std, zero deps, z3 oracle)
@@ -213,12 +220,17 @@ jobs:
       # is a check of Verus rather than a lottery on the runner's IP. Only the API call is
       # authenticated; the asset itself is fetched from the redirect target, which does not
       # take the header.
+      #
+      # The token is fed to `curl` on *stdin* (`-H @-`), never as a `-H` argument: an
+      # argument is readable from `/proc/<pid>/cmdline` by any process on the runner, which
+      # is a secret leak (CWE-214). The Ferrocene step below pipes its secret the same way.
       - name: Download the Verus release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          url=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+          url=$(printf 'Authorization: Bearer %s\n' "$GH_TOKEN" \
+                | curl -fsSL -H @- \
                 https://api.github.com/repos/verus-lang/verus/releases/latest \
                 | python3 -c "import sys,json; print([a['browser_download_url'] for a in json.load(sys.stdin)['assets'] if a['name'].endswith('x86-linux.zip')][0])")
           curl -fsSL -o verus.zip "$url"
