@@ -1,0 +1,2 @@
+# gnatprove writes its proof sessions here; they are outputs, not sources.
+obj/

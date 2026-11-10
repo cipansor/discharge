@@ -2016,6 +2016,8 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   ├── support/           the IR the engine harnesses share, so they check the
 │   │                      same formulas rather than two drifting corpora
 │   ├── mir_demo.rs        verifies real Rust read from MIR, end to end
+│   ├── comparison/        the same three functions proved seven ways, plus
+│   │                      Ferrocene as the qualified compiler (see its README)
 │   └── mir_targets/
 │       └── actuator.rs    the Rust under verification; imports no `discharge`
 ├── tools/
@@ -2236,6 +2238,19 @@ The honest split:
 | Runs on the target | yes (compiled in) | no (host-side) | yes (but unchecked) |
 | Scope | bit-vectors, booleans, bounded quantifiers | first-order + arithmetic + more | — |
 | Maturity | a sketch | industrial | widely used |
+
+That table is an argument. [`examples/comparison/`](examples/comparison/README.md)
+is the evidence: three ordinary functions — a guarded `sat_add`, a `clamp`, and a
+counted `sum_to` — written for `discharge`, Kani, Verus, Prusti, SPARK, Coq and
+Lean, each tool asked to prove the same properties and then asked to *refuse* the
+same two injected bugs. Every tool proves all three and catches both bugs, so the
+interesting result is not who wins but what each one is proving: Coq and Lean
+prove theorems about a hand-written **model**, and that model can silently be
+wrong (the first version of the Coq file proved the *buggy* `sat_add` correct,
+because unbounded `Z` never wraps), while `discharge` reads the MIR `rustc`
+actually emitted, so there is no transcription to drift. The directory also puts
+Ferrocene beside the verifiers, as the qualified *compiler* that answers the other
+half of a safety case.
 
 Two things follow. First, `discharge` does compete with the big tools on the
 question that matters — *is the proof about the code or about a model of it?* —
