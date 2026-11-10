@@ -1155,6 +1155,40 @@ fn const_mentions(text: &str) -> ConstMentions {
     out
 }
 
+/// Read the value of a `const` whose body rustc printed as a CTFE brace-block.
+///
+/// On rustc 1.85 (the MSRV floor) a constant that folds to a literal is printed
+/// with its const-evaluated body rather than the inline literal the current
+/// stable prints:
+///
+/// ```text
+/// const K: u8 = {
+///     let mut _0: u8;
+///
+///     bb0: {
+///         _0 = const 7_u8;
+///         return;
+///     }
+/// }
+/// ```
+///
+/// `lines` is the block's body (everything after the `const … = {` line). The
+/// value is the assignment to the return place `_0`, and it is returned only when
+/// that assignment is itself a `const` literal -- a block that computes its value
+/// (an `AddWithOverflow`, say) has no single literal to fold, and the caller
+/// drops the item exactly as before.
+fn block_const_value<'a>(lines: &[&'a str]) -> Option<&'a str> {
+    for line in lines {
+        if line.starts_with('}') {
+            break;
+        }
+        if let Some(rhs) = line.trim().strip_prefix("_0 = const ") {
+            return Some(rhs.trim_end_matches(';'));
+        }
+    }
+    None
+}
+
 /// Parse a constant like `0_u32`, `true`, `255_u32`, `()`.
 fn parse_const(s: &str) -> Const {
     let t = s.trim();
@@ -1820,7 +1854,21 @@ fn parse_program_impl(
                                 && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
                     if plain {
                         let body = body.trim().trim_end_matches(';');
-                        if let Some(c) = body.strip_prefix("const ") {
+                        // A literal body prints inline (`const K: u8 = const
+                        // 7_u8;`) on current stable. On 1.85 -- the MSRV floor --
+                        // the same item prints as a CTFE brace-block instead
+                        // (`const K: u8 = { … _0 = const 7_u8; … }`), so the value
+                        // is read from the block's return-place assignment. Without
+                        // this the item is dropped on the floor and a contract that
+                        // names it goes unreadable.
+                        let literal = body.strip_prefix("const ").or_else(|| {
+                            if body.starts_with('{') {
+                                block_const_value(&lines[i + 1..])
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(c) = literal {
                             // A bare key is recorded when the name is used
                             // bare somewhere, i.e. for a crate-level item, or when
                             // the source says the item is module-scoped (a
@@ -2532,6 +2580,44 @@ fn add(_1: u32, _2: u32) -> u32 {
         assert!(
             !prog.consts.contains_key("M"),
             "a nested-fn-local `M` must not get a bare key: {:?}",
+            prog.consts
+        );
+    }
+
+    /// A `const` whose body rustc prints as a CTFE brace-block must still fold to
+    /// its value.
+    ///
+    /// On rustc 1.85 (the MSRV floor) a constant that folds to a literal prints as
+    /// `const K: u8 = { … _0 = const 7_u8; … }` rather than the inline
+    /// `const K: u8 = const 7_u8;` the current stable prints. The literal is the
+    /// assignment to the return place `_0`, and reading it keeps the item so a
+    /// contract that names it resolves -- otherwise the same contract is readable
+    /// on stable and unreadable on the MSRV, which is the kind of toolchain-shaped
+    /// gap this front end exists to avoid.
+    #[test]
+    fn a_ctfe_brace_block_const_folds_to_its_literal() {
+        let dump = "const K: u8 = {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                    _0 = const 7_u8;\n        return;\n    }\n}\n\
+                    fn reads() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                    _0 = const K;\n        return;\n    }\n}\n";
+        let prog = parse_program(dump);
+        assert_eq!(
+            prog.consts.get("K"),
+            Some(&Const::UInt(7, Some(Ty::U8))),
+            "a CTFE brace-block `const` must fold to its `_0` literal: {:?}",
+            prog.consts
+        );
+        // A block that *computes* its value has no single literal to fold, so the
+        // item is dropped rather than given a guessed value.
+        let computed = "const C: u8 = {\n    let mut _0: u8;\n    let mut _1: (u8, bool);\n\n    \
+                        bb0: {\n        _1 = AddWithOverflow(const 3_u8, const 4_u8);\n        \
+                        return;\n    }\n}\n\
+                        fn reads() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                        _0 = const C;\n        return;\n    }\n}\n";
+        let prog = parse_program(computed);
+        assert!(
+            !prog.consts.contains_key("C"),
+            "a computed const body has no literal to fold: {:?}",
             prog.consts
         );
     }

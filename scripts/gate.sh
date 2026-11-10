@@ -218,6 +218,17 @@ if rustup run "$MSRV" rustc --version >/dev/null 2>&1; then
     echo "    skipped -- add it with 'rustup target add thumbv7em-none-eabihf --toolchain $MSRV')"
     echo "   This is reported, not passed: the no_std floor was not checked."
   fi
+  # `check` only proves the crates *compile* on the floor; it says nothing about whether the
+  # MIR frontend still *works* there, because the frontend reads rustc's textual MIR and that
+  # text is not stable across toolchains. A `const` that folds to a literal prints inline on
+  # current stable and as a CTFE brace-block on 1.85, so a parser that only knew the inline
+  # shape passed every gate above and dropped the item on the floor -- the tests were green on
+  # 1.99 and red on the compiler the manifest promises to support. Running the frontend's own
+  # suite against the floor rustc is what makes the floor a checked claim rather than a build.
+  if MSRV_RUSTC="$(rustup run "$MSRV" which rustc 2>/dev/null)"; then
+    DISCHARGE_RUSTC="$MSRV_RUSTC" cargo "+$MSRV" test -q --features std --test mir \
+      || fail "MIR frontend on the MSRV ($MSRV)"
+  fi
 else
   echo "   (no $MSRV toolchain; skipped -- install it with 'rustup toolchain install $MSRV')"
   echo "   This is reported, not passed: the floor was not checked."

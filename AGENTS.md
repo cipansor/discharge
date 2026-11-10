@@ -4159,6 +4159,17 @@ numbering is now **16 steps**; it was 13 when this note was written, and three s
 were appended without renumbering the earlier ones (so the "gate 3/4/9" references
 elsewhere still name the same gates).
 
+Step 13 *builds* on the floor; it also now *runs* the frontend there. `cargo check`
+only proves the crates compile on 1.85 -- it says nothing about whether the MIR
+frontend still works, and the frontend reads rustc's textual MIR, whose shape is not
+stable across toolchains. A `const` that folds to a literal prints inline on current
+stable and as a CTFE brace-block on 1.85, so a parser that knew only the inline shape
+passed every gate above and silently dropped the item on the floor. Step 13 now sets
+`DISCHARGE_RUSTC` to the floor rustc and runs the frontend's own suite
+(`cargo +$MSRV test --features std --test mir`) so a toolchain-shaped gap fails here
+rather than being discovered downstream. See "A `const` printed as a CTFE brace-block
+on 1.85" below.
+
 The three appended steps hold the *tree* rather than the logic, and each closes a
 recurrence rather than a one-off:
 
@@ -7161,3 +7172,51 @@ reading the whole path prefix instead of its last segment fails
 leaks back in). The unclosed-comment unit test `const_generic_params_tolerates_an_unclosed_block_comment`
 fails without the clamp. A `<Foo as Tr>::K` trait form was tried and dropped: the path
 starts with `<`, so `const_mentions` never records it and the test could not discriminate.
+
+## A `const` printed as a CTFE brace-block on 1.85 lost its value -- seven MSRV-only failures
+
+The front end reads `const` items from rustc's textual MIR, and the *shape* of a
+constant's body is not stable across toolchains. Current stable prints a constant that
+folds to a literal inline:
+
+```text
+const K: u8 = const 7_u8;
+```
+
+rustc **1.85** -- the MSRV floor -- prints the same item with its const-evaluated body
+instead, as a brace-block whose value is an assignment to the return place `_0`:
+
+```text
+const K: u8 = {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 7_u8;
+        return;
+    }
+}
+```
+
+The parser only recognised the inline form (`body.strip_prefix("const ")`), so on 1.85
+every constant folded to a literal was dropped from the table. A contract that named one
+then went unreadable and the function was skipped -- and because the same contract is
+readable on current stable, the defect was **toolchain-shaped**: the crate's own tests
+passed on 1.99 and failed on the floor it claims to support. Seven `tests/mir.rs` cases
+(the const-inlining family) failed on 1.85 and passed on 1.99 for exactly this reason.
+
+**The fix reads the block's return-place literal.** A new helper `block_const_value`
+scans a brace-block body for the `_0 = const <literal>;` assignment and returns the
+literal; the `const` reader falls back to it when the body starts with `{`. A block that
+*computes* its value (an `AddWithOverflow`, say) has no single literal to fold and the
+item is still dropped rather than given a guessed value, so the change adds coverage
+without adding unsoundness.
+
+**Evidence.** `scripts/test-count.sh` **745 -> 746** passed, 0 failed, on both the MSRV
+`1.85.1` and current stable; the whole `tests/mir.rs` suite is now **209/209 on 1.85,
+1.99.1 and the nightly** (it was 202/209 on 1.85 before this fix, the same 209 on the
+others). `scripts/gate.sh` **ALL GATES GREEN**; clippy (`--all-targets` and the `no_std`
+half) clean; zero dependencies and `no_std` untouched. The new unit test
+`a_ctfe_brace_block_const_folds_to_its_literal` was checked for teeth by reverting the
+fallback: it then fails with `a CTFE brace-block \`const\` must fold to its \`_0\`
+literal: {}` (the item is dropped).
+
