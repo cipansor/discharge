@@ -1616,6 +1616,22 @@ test pass while checking less than it claimed, and none of them was visible from
 path — each needed the failure to be *induced* (delete the contract, plant the wrong panic,
 run two at once) before it could be seen.
 
+**Follow-up: pinning the name was still not enough, because a `requires`-only contract is still
+a contract.** The check for (1) above tested that *a* contract existed, and existence is not
+content: with every `ensures:` deleted but `requires:` left in place, the name survived, the
+function shrank to panic freedom (`clamp` went from 3 obligations to 0), and it came back
+`Verified` with the claimed result never checked. The fix pins the whole contract — `requires:`,
+`ensures:` and `invariant:`, clause for clause and in order — and compares each kind exactly.
+Pinning the *text* rather than a count matters for the same reason the fixtures exist: a count
+cannot tell a whole-function contract from a weakened one. Swapping `sat_add`'s `ret == a + b`
+for `ret >= a` keeps the clause count and drops the part that says what the function computes,
+and loosening `sum_to`'s `n <= 8` to `n <= 2` proves a strictly smaller statement — and that
+second one was still passing after the `ensures` fix, because each clause kind can be weakened
+independently, so each has to be pinned independently. The general rule this pair teaches:
+when a test asserts that something *exists*, ask what the weakest thing that satisfies
+"exists" is, and pin that instead. "A contract is present" is satisfied by a contract that
+claims nothing; "the clause count is 3" is satisfied by three clauses that claim less.
+
 ## A SAFETY comment is a claim, and it needs the same treatment as any other
 
 The `no_std` `with_ctx` takes `&mut` to a `static mut`, and justified it with "the arena is

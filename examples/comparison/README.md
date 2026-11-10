@@ -376,9 +376,20 @@ The positive fixture's three names are pinned in the driver rather than read bac
 from `spec::extract`. Reading them back is the same hole one level up: a name
 comes from the contract, so deleting one function's contract deletes its name, the
 request list shrinks, the remaining two functions pass, and the gate reports
-success for a claim it never checked. The driver now requires each pinned name to
-carry a contract *and* to be `Verified`, and requires the outcome count to equal
-the expected count, so a shortened list is a failure rather than a smaller success.
+success for a claim it never checked.
+
+Pinning the names is not enough on its own, because a `requires`-only contract is
+still a contract: deleting every `ensures:` leaves the name, shrinks the function
+to panic freedom, and comes back `Verified` with the claimed result never checked.
+So the driver pins the whole contract — `requires:`, `ensures:` and `invariant:`,
+clause for clause and in order — and compares each kind exactly. The text is pinned
+rather than a count because a count cannot tell a whole-function contract from a
+weakened one: swapping `sat_add`'s `ret == a + b` for `ret >= a` keeps the number
+of clauses and drops the part that says what the function computes, and loosening
+`sum_to`'s `n <= 8` to `n <= 2` proves a strictly smaller statement. Each kind can
+be weakened on its own, so each is checked. This is the reason the fixtures exist
+at all — the bounds-only contracts were the first version's bug — so the gate has
+to hold the whole statement, not merely count it.
 
 Both Coq **and** Lean are required. An earlier version skipped whichever was
 absent and still reported success, so a machine with only one of them would print

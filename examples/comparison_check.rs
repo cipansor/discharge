@@ -48,12 +48,25 @@ use discharge::mir::verify::{self, FnOutcome};
 
 /// What one fixture must produce.
 enum Want {
-    /// Every one of these functions must carry a contract *and* be `Verified`.
+    /// Each named function must carry *exactly* the pinned contract, clause by
+    /// clause, and be `Verified`.
     ///
-    /// The names are pinned in the source, not read back from `spec::extract`:
-    /// names read from the contracts vanish when a contract does, which is the
-    /// hole this variant closes.
-    Verified(&'static [&'static str]),
+    /// The clauses are pinned, and none of them is read back from the fixture. A
+    /// name alone is not enough: a `requires`-only contract is still a contract,
+    /// so a fixture that lost every `ensures:` would keep its name, shrink to
+    /// panic-freedom, and come back `Verified` with the claimed result never
+    /// checked. So the *clauses* are the claim, and the claim is what is pinned.
+    ///
+    /// The text is pinned rather than a count, because a count cannot tell a
+    /// whole-function contract from a weakened one: swapping `sat_add`'s
+    /// `ret == a + b` for `ret >= a` keeps the number of clauses and drops the part
+    /// that says what the function computes. The same holds for `requires:` --
+    /// loosening `n <= 8` to `n <= 2` proves a strictly smaller statement -- so the
+    /// precondition and the loop invariant are pinned too, not just the result.
+    /// This is the reason the fixtures exist at all (the bounds-only contracts were
+    /// the first version's bug), so the gate has to hold the whole statement, not
+    /// merely count it.
+    Verified(&'static [(&'static str, Contract)]),
     /// The named function fails, and its obligation kind is *exactly* this text.
     ///
     /// Exact rather than a prefix: a `panic` prefix would accept any panic, so a
@@ -64,6 +77,18 @@ enum Want {
         /// The exact obligation kind the failure must name.
         kind: &'static str,
     },
+}
+
+/// A contract, clause for clause, as it must appear in the fixture.
+///
+/// Every clause kind the engine reads is here, because each one can be weakened
+/// independently and a weaker contract is a weaker claim: dropping an `ensures:`
+/// leaves panic freedom, and loosening a `requires:` proves a smaller statement.
+#[derive(Debug)]
+struct Contract {
+    requires: &'static [&'static str],
+    ensures: &'static [&'static str],
+    invariants: &'static [&'static str],
 }
 
 /// One fixture: its path, and the claim it is evidence for.
@@ -83,13 +108,48 @@ const ROOT: &str = "examples/comparison";
 /// general.
 const OVERFLOW_ADD: &str = "panic: attempt to compute `{} + {}`, which would overflow";
 
+/// The positive fixture's contracts, clause for clause and in source order.
+///
+/// These are the claim under test. They are copied here rather than read from
+/// `spec::extract` so that weakening the fixture -- dropping a clause, dropping the
+/// result and keeping only the bounds, or loosening a precondition -- is a
+/// *failure* here and not a quietly smaller success.
+const SAT_ADD_CONTRACT: Contract = Contract {
+    requires: &["true"],
+    ensures: &[
+        "ret >= a",
+        "ret >= b",
+        "a <= 65535u16 - b || ret == 65535u16",
+        "a > 65535u16 - b || ret == a + b",
+    ],
+    invariants: &[],
+};
+const CLAMP_CONTRACT: Contract = Contract {
+    requires: &["lo <= hi"],
+    ensures: &[
+        "!(x < lo) || ret == lo",
+        "!(lo <= x && x > hi) || ret == hi",
+        "!(lo <= x && x <= hi) || ret == x",
+    ],
+    invariants: &[],
+};
+const SUM_TO_CONTRACT: Contract = Contract {
+    requires: &["n <= 8"],
+    ensures: &["ret == n"],
+    invariants: &["i <= n && s == i"],
+};
+
 /// The fixtures, as data, so the driver and the shell script cannot disagree
 /// about which files are checked or what each one must do.
 fn fixtures() -> Vec<Fixture> {
     vec![
         Fixture {
             path: "target.rs",
-            want: Want::Verified(&["sat_add", "clamp", "sum_to"]),
+            want: Want::Verified(&[
+                ("sat_add", SAT_ADD_CONTRACT),
+                ("clamp", CLAMP_CONTRACT),
+                ("sum_to", SUM_TO_CONTRACT),
+            ]),
             why: "the positive fixture: the same three functions every tool proves",
         },
         Fixture {
@@ -181,30 +241,41 @@ fn check_one(rustc: &str, path: &Path, f: &Fixture) -> Result<String, String> {
     }
 }
 
-/// Assert that each pinned name carries a contract and is `Verified`.
-fn check_verified(rustc: &str, path: &Path, expected: &[&str]) -> Result<String, String> {
+/// Assert that each pinned name carries exactly its pinned contract and is
+/// `Verified`.
+fn check_verified(
+    rustc: &str,
+    path: &Path,
+    expected: &[(&str, Contract)],
+) -> Result<String, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let specs = spec::extract(&text);
     let mir = verify::emit_mir_with(rustc, path).map_err(|e| format!("could not get MIR: {e}"))?;
 
-    // The contract must exist for each pinned name. Without this the name would
-    // still be requested and still be found in the MIR, so it would come back
-    // `Verified` for panic freedom alone -- a `Verified` with zero obligations --
-    // and the positive claim would go unchecked. Checking the *contract* is what
-    // separates "proved the claim" from "proved nothing was left to prove".
-    let mut contracted: Vec<String> = specs.by_fn.keys().cloned().collect();
-    contracted.extend(specs.by_method.keys().map(|(_, _, m)| m.clone()));
-    for want in expected {
-        if !contracted.iter().any(|c| names_match(c, want)) {
+    // The claim is the clause text, so every clause is compared -- not the presence
+    // of a contract and not the number of clauses. A name alone passes a
+    // `requires`-only contract; a count alone passes a weakened one; and each kind
+    // can be weakened on its own, so all three are checked.
+    for (name, want) in expected {
+        let Some(found) = resolve_contract(&specs, name) else {
             return Err(format!(
-                "`{want}` carries no contract in the fixture, so the positive claim would go \
-                 unchecked (contracts found: {contracted:?})"
+                "`{name}` carries no contract in the fixture, so the positive claim would go \
+                 unchecked"
+            ));
+        };
+        if found.ensures.is_empty() {
+            return Err(format!(
+                "`{name}` carries a contract but no `ensures:`, so only panic freedom would be \
+                 checked -- the claimed result would go unchecked"
             ));
         }
+        compare_clauses(name, "requires", want.requires, &found.requires)?;
+        compare_clauses(name, "ensures", want.ensures, &found.ensures)?;
+        compare_clauses(name, "invariant", want.invariants, &found.invariants)?;
     }
 
-    let wanted: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+    let wanted: Vec<String> = expected.iter().map(|(n, _)| n.to_string()).collect();
     let report =
         verify::verify_mir_text(&mir, &specs, &wanted).map_err(|e| format!("driver error: {e}"))?;
     if !report.missing.is_empty() {
@@ -219,7 +290,7 @@ fn check_verified(rustc: &str, path: &Path, expected: &[&str]) -> Result<String,
         return Err(format!(
             "expected {} outcome(s) for {:?}, got {} ({:?})",
             expected.len(),
-            expected,
+            expected.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
             report.outcomes.len(),
             report
                 .outcomes
@@ -228,7 +299,7 @@ fn check_verified(rustc: &str, path: &Path, expected: &[&str]) -> Result<String,
                 .collect::<Vec<_>>()
         ));
     }
-    for want in expected {
+    for (want, _) in expected {
         let Some((name, outcome)) = report.outcomes.iter().find(|(n, _)| names_match(n, want))
         else {
             return Err(format!("`{want}` has no outcome in the report"));
@@ -317,6 +388,36 @@ fn check_failed(
             "{name}: VERIFIED, so the defect was not caught at all"
         )),
     }
+}
+
+/// Fail if a clause kind does not match, naming the kind and both texts.
+///
+/// The comparison is exact and ordered, so a weakened clause, a dropped clause, a
+/// reordered pair and an extra clause are each a failure rather than a smaller
+/// success.
+fn compare_clauses(name: &str, kind: &str, want: &[&str], found: &[String]) -> Result<(), String> {
+    if want == found {
+        return Ok(());
+    }
+    Err(format!(
+        "`{name}` states a different `{kind}:` than the one claimed:\n    \
+         expected: {want:?}\n    found:    {found:?}"
+    ))
+}
+
+/// The contract for `name`, by an exact key or a bare `::`-tail.
+///
+/// Mirrors the lookup `verify::select` uses, so the clause the driver pins is the
+/// clause the engine was handed.
+fn resolve_contract<'a>(specs: &'a spec::Specs, name: &str) -> Option<&'a spec::FnContract> {
+    if let Some(c) = specs.by_fn.get(name) {
+        return Some(c);
+    }
+    specs
+        .by_fn
+        .iter()
+        .find(|(k, _)| names_match(k, name))
+        .map(|(_, c)| c)
 }
 
 /// Whether a report key names `want`, by the same rules `verify::select` uses: an
