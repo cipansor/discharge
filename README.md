@@ -2071,6 +2071,11 @@ fixture's per-function `FnOutcome` and the *expected obligation kind* rather tha
 `mir_coverage`'s `decided N of M` line (that line counts only `Verified`, so a `Failed`,
 `Incomplete` or `Skipped` fixture all read `decided 0 of 1`, and a contract that had become
 unreadable would have been reported as a caught defect — a lost proof read as a refutation);
+the positive fixture's three names are pinned in the driver rather than read back from the
+contracts, so deleting a contract cannot shrink the request list into a smaller success; the
+expected obligation kind is compared for equality, not by a `panic` prefix that any panic would
+satisfy; and each scratch fixture gets a path unique per call, so two concurrent gates cannot
+delete each other's file;
 the same gate checks that the contracts refuse the degenerate implementations the bounds-only
 versions accepted, and runs Coq and Lean on the positive fixture and both teeth, including
 the mutation that shows each rejection is of the defect rather than of the script's shape.

@@ -365,10 +365,20 @@ become **unreadable** would still read `decided 0 of 1` and be reported as a cau
 defect. A lost proof is not a refutation, and a rejection test that cannot tell them
 apart is not a rejection test; this was the repo's own "isolate the guard" rule,
 violated by the gate that enforces it. The driver now requires `Failed` with the
-*expected obligation kind* per fixture — the panic for the swapped `sat_add`, the
-postcondition for the wrong-arm `clamp`, the loop invariant for the wrong-body
-`sum_to` — and rejects `Skipped`, `Incomplete`, a driver error, a missing function,
-or a failure on the wrong obligation.
+*expected obligation kind* per fixture — the `+` overflow for the swapped
+`sat_add`, the postcondition for the wrong-arm `clamp`, the loop invariant for the
+wrong-body `sum_to` — and rejects `Skipped`, `Incomplete`, a driver error, a
+missing function, or a failure on the wrong obligation. The kind is compared for
+equality and not by a `panic` prefix: a prefix accepts *any* panic, so a
+divide-by-zero before the addition would satisfy a test about an overflow.
+
+The positive fixture's three names are pinned in the driver rather than read back
+from `spec::extract`. Reading them back is the same hole one level up: a name
+comes from the contract, so deleting one function's contract deletes its name, the
+request list shrinks, the remaining two functions pass, and the gate reports
+success for a claim it never checked. The driver now requires each pinned name to
+carry a contract *and* to be `Verified`, and requires the outcome count to equal
+the expected count, so a shortened list is a failure rather than a smaller success.
 
 Both Coq **and** Lean are required. An earlier version skipped whichever was
 absent and still reported success, so a machine with only one of them would print

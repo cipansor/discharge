@@ -1596,6 +1596,26 @@ whichever of Coq and Lean was absent and still exited 0, so "every claim held" c
 printed having run one of the two proof suites; both are now required, and a missing prover
 is exit 2 (a reported skip), never success.
 
+**Follow-up: the same gate had three more holes, each a different flavour of "the test does
+not test what it claims".** All three were reproduced before being fixed. (1) *The positive
+fixture read its own claim from the thing it was checking.* The driver built its request list
+from `spec::extract`, so the names came from the contracts; deleting one function's contract
+deleted its name, the list shrank, the other two still passed, and the gate printed "2
+function(s) verified" and exited 0 with the deleted claim never checked. A claim list derived
+from the input shrinks with the input — pin the expected names independently. (2) *A `panic`
+prefix accepted any panic.* The swapped-add fixture asserted `kind.starts_with("panic")`, so a
+divide-by-zero planted before the addition passed a test about an overflow; the kind is now
+compared for equality against the exact rustc text. A prefix is a range, and the claim was
+about one point in it. (3) *Scratch fixtures shared a path.* `write_temp` named the degenerate
+fixtures by function only, so two concurrent gates wrote the same file and the first to finish
+removed it under the second's `rustc`; the path is now unique per call (`pid` + a process-wide
+sequence), mirroring `verify::emit_mir_with`, which had already been fixed for exactly this
+reason. A test that fails only when two of them run at once is a test that will fail in CI and
+pass on the laptop, which is the worst order. The unifying rule: every one of these let the
+test pass while checking less than it claimed, and none of them was visible from the happy
+path — each needed the failure to be *induced* (delete the contract, plant the wrong panic,
+run two at once) before it could be seen.
+
 ## A SAFETY comment is a claim, and it needs the same treatment as any other
 
 The `no_std` `with_ctx` takes `&mut` to a `static mut`, and justified it with "the arena is
