@@ -7291,3 +7291,61 @@ the token needs no write scope.
 
 
 
+
+## The seven-way comparison, and the model-drift trap
+
+`examples/comparison/` proves the same three functions (`sat_add`, `clamp`, `sum_to`)
+with `discharge`, Kani, Verus, Prusti, SPARK, Coq and Lean, and then proves that two
+injected bugs (swapped `sat_add` branches, wrong `sum_to` loop body) are refused by
+every one of them. Its README is the write-up; this is the part that costs time to
+rediscover.
+
+**The Coq/Lean model-drift demonstration is the point, not a footnote.** The first
+`example.v` modelled the `u16` add as ordinary `Z` integers and `coqc` *proved the
+buggy `sat_add` correct*: in unbounded `Z` the sum never wraps, so the branch that
+overflows on a real `u16` cannot overflow in the model. A correct proof of a false
+statement. The committed version models the wrap explicitly
+(`Z.modulo (a + b) 65536`) and the same false theorem is unprovable. This is the
+concrete argument for why `discharge` reads MIR instead of a hand-written model: there
+is no transcription step, so there is no transcription to get wrong. Do not "simplify"
+the Coq or Lean model back to plain integers.
+
+**Tool quirks that cost the most time here:**
+
+- **Lean core has no `omega` via `split_ifs`, and no Mathlib.** `omega` *is* available
+  (`import Init.Omega` is implicit), but `split_ifs` is Mathlib-only, so write the case
+  split with `by_cases` + `rw [if_pos h]` / `rw [if_neg h]`. Those two lemmas are
+  deprecated in 4.35 in favour of `ite_eq_left`/`ite_eq_right` but still work. A
+  `unfold f MAX` that does not end in `at *` leaves `MAX` opaque in the hypotheses and
+  `omega` then reports a bogus counterexample with `c := ↑MAX`.
+- **Coq has no machine word in the standard library.** Spell the wrap as `Z.modulo _ 65536`
+  so `Z.mod_small` applies. `Z.land` has no upper-bound lemma in `ZArith` (searched: only
+  `land_diag`, `land_comm`, `land_assoc`, `land_m0/l/m1`), so a `land`-based mask needs a
+  hand proof; `modulo` does not.
+- **SPARK (`gnatprove`) needs `use type Interfaces.Unsigned_16;`** at spec scope, or
+  every comparison operator in a contract is "not directly visible" and the run dies in
+  "generation of Global contracts" before proving anything. A loop needs **both**
+  `pragma Loop_Invariant` and `pragma Loop_Variant`, or termination is left as a
+  `medium` warning and `--level=2` is not clean. Install with
+  `alr toolchain --select gnat_native && alr install gnatprove`; the compiler and
+  `gprbuild` live under `~/.alire/libexec/spark/bin`, not `~/.alire/bin`.
+- **Prusti 0.2.2 uses `body_invariant!(...)`**, not the `#[invariant]` attribute, and
+  needs its own pinned `nightly-2023-08-15`, a JDK 21 (`JAVA_HOME`), and `chmod +x` on
+  the bundled z3 or it ICEs.
+- **Verus requires `decreases` on every loop** and a `main()` function; without a
+  `decreases` the error is `loop must have a 'decreases' clause`.
+- **Kani is the one tool that needs no induction hypothesis**: `#[kani::unwind(10)]`
+  bounds `sum_to` because `n <= 8`. That is the honest difference -- it is a bounded
+  check, not a proof for all `n`.
+
+**Ferrocene is a different axis and must not be listed as a verifier.** It is the
+qualified *compiler* (TÜV SÜD; ISO 26262 ASIL D, IEC 61508 SIL 3, IEC 62304 Class C),
+so it qualifies the toolchain, not the program: it compiles the buggy `sat_add`
+cleanly and, with a release profile, returns `0` exactly as plain `rustc` does. It is
+already gate 3 (`tools/ferrocene/run.sh`, exit 2 = absent = report and skip). A
+qualified compiler is not a qualified verifier, and building with Ferrocene confers
+nothing on `discharge`'s engine.
+
+**The gate enumerates examples explicitly, so new files under `examples/` are safe**,
+but `gnatprove` writes `obj/` next to the `.gpr`; `examples/comparison/.gitignore`
+ignores it so a proof session cannot be committed.
