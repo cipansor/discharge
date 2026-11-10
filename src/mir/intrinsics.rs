@@ -37,6 +37,11 @@
 //!   the promotion Rust performs. The three *complement* counts are `core`'s own
 //!   definition — the corresponding positive count of `!x` — rather than a second
 //!   summation.
+//! * `is_power_of_two` — a `bool`, not a number: `x != 0 && x & (x - 1) == 0`.
+//!   It is the one modelled shape whose *return type* is `bool`, so the model
+//!   produces a [`Pred`] and the executor writes a `Val::Bool`, which is what the
+//!   `if` that consumes it branches on. It is unsigned-only, because `core` has no
+//!   such method on the signed types.
 //!
 //! # What is not, and why refusing is the right answer
 //!
@@ -56,9 +61,12 @@
 //! * `unchecked_*` is undefined behaviour on overflow. There is no value to
 //!   model, and a proof about UB is not a proof, so it is refused.
 //! * `pow` is modelled as a fold over the exponent's bits (see [`POW_MAX_WIDTH`]).
-//!   `is_*`, `rotate_*`, `add_signed`, the float ops and the
+//!   `rotate_*`, `add_signed`, the float ops and the
 //!   `next_multiple_of`/`div_*` helpers remain absent, and an unmodelled name is
-//!   refused rather than approximated.
+//!   refused rather than approximated. The other `is_*` predicates
+//!   (`is_ascii*`, `is_negative`, the digit predicates) are absent too: they
+//!   answer about a *character* or a *sign*, not about the bits the engine holds,
+//!   and each would need its own definition rather than a shared one.
 
 use crate::mir::parse::BinOp;
 use crate::smt::{self, Pred, Var};
@@ -157,6 +165,12 @@ pub enum Intrinsic {
     /// carried for the same reason it is on `Unary`: the four disagree about the
     /// failure case, and `pow`'s failure is an *overflow*, not a zero divisor.
     Pow(Family),
+    /// A `bool`-valued predicate (`is_power_of_two`).
+    ///
+    /// Its *return type* is `bool`, not an integer, so unlike every other shape
+    /// it produces a [`Pred`] rather than a [`Var`]. It is one bit by
+    /// construction, so `result_w` is not read for it.
+    Bool(BoolKind),
 }
 
 /// Which family of a `core::num` method name a call belongs to.
@@ -179,6 +193,25 @@ pub enum UnOp {
     Neg,
     /// Absolute value: `|x|`.
     Abs,
+}
+
+/// A `bool`-valued predicate: a `core::num` method that answers a truth value
+/// rather than a number.
+///
+/// These are the methods whose *return type* is `bool`, so unlike every other
+/// shape the model produces a [`Pred`] rather than a [`Var`] and the executor
+/// writes it with [`Env::set`] as a `Val::Bool`. The return width is one bit by
+/// construction, which is why no `result_w` is read for them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoolKind {
+    /// `is_power_of_two`: true exactly for `1 << k`, `k < w`.
+    ///
+    /// A *total* predicate, and unsigned-only: `is_power_of_two` is not a method
+    /// on the signed types, so a dump that calls it is unsigned or is not a real
+    /// dump. `0` is not a power of two (the zero bit pattern is `0` clear bits,
+    /// not one), and the type's width is the highest exponent it can hold, so a
+    /// signed reading would be wrong in both directions -- see [`is_modelled`].
+    PowerOfTwo,
 }
 
 /// A bit count.
@@ -211,7 +244,7 @@ impl Intrinsic {
     /// `eval` and the executor both branch on this: a unary call has no second
     /// argument to read, so the two-operand path must not be entered for it.
     pub fn is_unary(self) -> bool {
-        matches!(self, Intrinsic::Unary(..) | Intrinsic::Bits(_))
+        matches!(self, Intrinsic::Unary(..) | Intrinsic::Bits(_) | Intrinsic::Bool(_))
     }
 }
 
@@ -235,6 +268,12 @@ pub enum Outcome {
     /// word: nothing compares it to a variant discriminant, so it is read by a
     /// `bool` consumer (`assert(!flag)`, or a `ret.1` in a contract).
     Tuple { value: Var, overflowed: Pred },
+    /// A `bool`: the whole result of a predicate method (`is_power_of_two`).
+    ///
+    /// The destination local's type is `bool`, so the value is a `Pred` and not a
+    /// `Var` -- writing a one-bit word into a `bool` local would leave the local
+    /// readable only as a word, and the `if` that consumes it reads a predicate.
+    Bool(Pred),
 }
 
 /// The family a `core::num` method name belongs to, if any.
@@ -260,6 +299,11 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
         "trailing_zeros" => return Some(Intrinsic::Bits(BitKind::TrailingZeros)),
         "trailing_ones" => return Some(Intrinsic::Bits(BitKind::TrailingOnes)),
         _ => {}
+    }
+    // The `bool`-valued predicates. Like the bit counts they carry no family
+    // prefix, so they are matched before the split for the same reason.
+    if short == "is_power_of_two" {
+        return Some(Intrinsic::Bool(BoolKind::PowerOfTwo));
     }
     let (family, op) = if let Some(rest) = short.strip_prefix("wrapping_") {
         (Family::Wrapping, rest)
@@ -317,6 +361,14 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // width the engine holds. Its *result* is wider than its operand, and
         // the model builds it at the operand's width and zero-extends.
         Intrinsic::Bits(_) => true,
+        // A `bool` predicate. `is_power_of_two` exists only on the *unsigned*
+        // types, so a signed operand is either a dump of something that is not
+        // this method or a reading the model must not guess at: the signed
+        // reading would accept `MIN` (its bits are a power of two but its value
+        // is negative) and the model has no way to tell the two apart once it
+        // has only the sign flag. It is total, so the only question is the width,
+        // which is already bounded above.
+        Intrinsic::Bool(_) => !signed,
         // The unary operators. Two membership facts decide whether a call can be
         // modelled at all, and both are about the *type*, not the width:
         //
@@ -399,6 +451,11 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             }
             Outcome::Value(smt::truncate(bit_count(kind, x), result_w))
         }
+        // A `bool` predicate. The result *is* the predicate, so there is no
+        // `result_w` to read: a `bool` is one bit and the destination local's
+        // type says so. The executor writes it as a `Val::Bool`, which is what
+        // the `if` that consumes it reads.
+        Intrinsic::Bool(kind) => Outcome::Bool(bool_pred(kind, x)),
         Intrinsic::Unary(family, un) => {
             if result_w == 0 || result_w > 64 {
                 return None;
@@ -604,6 +661,25 @@ fn bit_count(kind: BitKind, x: Var) -> Var {
 fn not_bits(x: Var) -> Var {
     let w = smt::bits(x);
     smt::bxor(x, smt::all_ones(w))
+}
+
+/// The truth value of a `bool`-valued predicate.
+///
+/// `is_power_of_two` is `x != 0 && x & (x - 1) == 0`, which is the standard
+/// trick: clearing the lowest set bit of a power of two leaves zero, and for
+/// every other non-zero value it does not. `x != 0` is *not* redundant --
+/// `0 & (0 - 1)` is `0 & all_ones`, which is `0`, so the mask test alone would
+/// call zero a power of two. The mask test is spelled with the engine's own
+/// `and`/`sub`/`eq_const`, so it is the same term a hand-written
+/// `x & (x - 1) == 0` produces.
+fn bool_pred(kind: BoolKind, x: Var) -> Pred {
+    match kind {
+        BoolKind::PowerOfTwo => {
+            let w = smt::bits(x);
+            let cleared = smt::band(x, smt::sub(x, smt::word(1, w)));
+            smt::and(smt::not(smt::eq_const(x, 0)), smt::eq_const(cleared, 0))
+        }
+    }
 }
 
 /// The operation with the result taken modulo `2^w`.
@@ -958,6 +1034,9 @@ mod tests {
             Outcome::Tuple { value, overflowed } => {
                 (smt::evaluate_pred(overflowed, env), smt::evaluate(value, env))
             }
+            // A `bool`: there is no value channel, so it is reported through the
+            // `Option<bool>` channel the tag uses. `check_bool` reads it that way.
+            Outcome::Bool(p) => (smt::evaluate_pred(p, env), None),
         }
     }
 
@@ -1157,6 +1236,9 @@ mod tests {
                             smt::evaluate(value, env),
                             smt::evaluate_pred(overflowed, env),
                         ),
+                        // `pow` is never a `bool`, so this arm is unreachable in
+                        // this helper; it exists only to keep the match total.
+                        Outcome::Bool(_) => unreachable!("`pow` is not a bool"),
                     };
                     let want = oracle(x, e);
                     let Some((wv, wf)) = want else {
@@ -1346,6 +1428,9 @@ mod tests {
                                     None,
                                     smt::evaluate_pred(overflowed, |i| if i == bi { Some(xb) } else { env(i) }),
                                 ),
+                                // `pow` is never a `bool`; the arm keeps the
+                                // match total.
+                                Outcome::Bool(_) => unreachable!("`pow` is not a bool"),
                             };
                             let from_const = eval(Intrinsic::Pow(family), base, constant, w, signed, w)
                                 .unwrap_or_else(|| panic!("{family:?} const must be modelled"));
@@ -2171,6 +2256,101 @@ mod tests {
         }
     }
 
+    /// Walk every `w`-bit value and compare a `bool`-valued model against Rust.
+    ///
+    /// The oracle answers with `core`'s own `bool`, so the expectation is never a
+    /// copy of the model. This is the sharpest of the three channels: a
+    /// `count_zeros` read as `count_ones` is a *wrong number*, but an
+    /// `is_power_of_two` read as its negation, or with the `x != 0` conjunct
+    /// dropped, is a wrong *branch* -- the `if` that consumes it takes the other
+    /// arm, and a proof built on it is a proof about the wrong program.
+    fn check_bool(
+        op: Intrinsic,
+        w: u8,
+        signed: bool,
+        oracle: impl Fn(u64) -> bool,
+        label: &str,
+    ) {
+        smt::with_fresh(|| {
+            let a = smt::var(w);
+            let outcome = eval(op, a, a, w, signed, w)
+                .unwrap_or_else(|| panic!("{label} at {w} bits must be modelled"));
+            let ai = smt::index(a);
+            for xb in 0..(1u64 << w) {
+                let want = oracle(xb);
+                let Outcome::Bool(p) = outcome else {
+                    panic!("{label} must produce a `bool`");
+                };
+                let got = smt::evaluate_pred(p, |i| if i == ai { Some(xb) } else { None });
+                assert_eq!(
+                    got,
+                    Some(want),
+                    "{label} at bits {xb}: the model says {got:?}, Rust says {want}"
+                );
+            }
+        });
+    }
+
+    /// `is_power_of_two` agrees with Rust over whole `u8` and `u16` domains.
+    ///
+    /// The oracle is `core`'s own method rather than the mask trick the model
+    /// uses, so a mistake in the trick is visible instead of being reproduced.
+    /// The interesting inputs are named rather than only swept: `0` is not a
+    /// power of two (the one value the bare `x & (x - 1)` test would accept),
+    /// `1` is (`1 << 0`), the top bit is, and `127` and `255` are not.
+    #[test]
+    fn is_power_of_two_agrees_with_rust() {
+        for w in [8u8, 16] {
+            let oracle = move |b: u64| match w {
+                8 => u8::try_from(b).unwrap().is_power_of_two(),
+                16 => u16::try_from(b).unwrap().is_power_of_two(),
+                _ => unreachable!("the test walks 8 and 16 bits"),
+            };
+            check_bool(Intrinsic::Bool(BoolKind::PowerOfTwo), w, false, oracle, "is_power_of_two");
+        }
+        // The named points, at 8 bits, so a failure names the value that broke
+        // rather than only the width.
+        let p = |b: u64| {
+            smt::with_fresh(|| {
+                let a = smt::var(8);
+                let Outcome::Bool(p) =
+                    eval(Intrinsic::Bool(BoolKind::PowerOfTwo), a, a, 8, false, 8)
+                        .expect("is_power_of_two at 8 bits must be modelled")
+                else {
+                    panic!("is_power_of_two must produce a `bool`");
+                };
+                let ai = smt::index(a);
+                smt::evaluate_pred(p, |i| if i == ai { Some(b) } else { None })
+            })
+        };
+        for (b, want, why) in [
+            (0u64, false, "zero is not a power of two"),
+            (1, true, "one is 1 << 0"),
+            (2, true, "two is 1 << 1"),
+            (127, false, "seven set bits"),
+            (128, true, "the top bit is 1 << 7"),
+            (255, false, "eight set bits"),
+        ] {
+            assert_eq!(p(b), Some(want), "{why} (at bits {b})");
+        }
+    }
+
+    /// `is_power_of_two` is refused on a signed operand, where `core` has no such
+    /// method.
+    ///
+    /// The refusal is the sound answer: read at the *bits*, `i8::MIN` is `1 << 7`
+    /// and would be accepted, but its value is negative, and once only the sign
+    /// flag survives there is no way to tell it from an unsigned `128`. Refusing
+    /// rather than guessing is what keeps the model from proving a signed reading
+    /// that `core` does not define.
+    #[test]
+    fn is_power_of_two_is_refused_when_signed() {
+        assert!(is_modelled(Intrinsic::Bool(BoolKind::PowerOfTwo), 8, false));
+        assert!(!is_modelled(Intrinsic::Bool(BoolKind::PowerOfTwo), 8, true));
+        assert!(eval(Intrinsic::Bool(BoolKind::PowerOfTwo), smt::var(8), smt::var(8), 8, true, 8)
+            .is_none());
+    }
+
     /// Every unary operator in every family agrees with Rust over a whole `i8`.
     ///
     /// `MIN` is the interesting point for all of them: its magnitude is not
@@ -2357,6 +2537,24 @@ mod tests {
         assert!(classify("leading_ones_signed").is_none());
     }
 
+    /// `is_power_of_two` classifies as a `bool` predicate, and only that name does.
+    #[test]
+    fn the_bool_predicate_names_classify() {
+        assert_eq!(
+            classify("core::num::<impl u32>::is_power_of_two"),
+            Some(Intrinsic::Bool(BoolKind::PowerOfTwo))
+        );
+        assert_eq!(classify("is_power_of_two"), Some(Intrinsic::Bool(BoolKind::PowerOfTwo)));
+        // Distinct from the numeric shapes: a `bool` read as a value would write
+        // a one-bit word into a `bool` local, which no `if` could read.
+        assert_ne!(classify("is_power_of_two"), Some(Intrinsic::Bits(BitKind::Ones)));
+        // Near misses that stay refused. `is_power_of_two` on the signed types is
+        // not a `core` method; the other `is_*` predicates are not modelled yet.
+        assert!(classify("is_power_of_two_signed").is_none());
+        assert!(classify("is_ascii").is_none());
+        assert!(classify("is_negative").is_none());
+    }
+
     /// The unary shapes are `is_unary`; the two-operand families are not.
     ///
     /// The executor branches on this to decide whether to read a second operand,
@@ -2366,6 +2564,7 @@ mod tests {
     #[test]
     fn only_the_unary_shapes_are_unary() {
         assert!(Intrinsic::Bits(BitKind::Ones).is_unary());
+        assert!(Intrinsic::Bool(BoolKind::PowerOfTwo).is_unary());
         assert!(Intrinsic::Unary(Family::Wrapping, UnOp::Neg).is_unary());
         assert!(Intrinsic::Unary(Family::Checked, UnOp::Abs).is_unary());
         assert!(!Intrinsic::Wrapping(BinOp::Add).is_unary());

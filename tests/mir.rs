@@ -1312,6 +1312,34 @@ fn the_complement_bit_counts_agree_with_rust() {
     }
 }
 
+/// `is_power_of_two` is modelled as a `bool` the `if` branches on.
+///
+/// This is the `bool`-channel pin, and it is a different kind of test from the
+/// bit counts: the model produces a `Pred` rather than a `Var`, and the executor
+/// writes it as a `Val::Bool`. A model that wrote a one-bit *word* into the
+/// destination would leave the local readable only as a word, and the postcondition
+/// `ret == true` would not read it -- so `is_power_of_two_of_the_top_bit` fails
+/// rather than passing by accident. The zero tripwire is the sharp one: `0` is the
+/// single value the bare `x & (x - 1) == 0` mask test would accept, so a model
+/// that dropped the `x != 0` conjunct would *prove* the false contract.
+#[test]
+fn is_power_of_two_is_a_modelled_bool() {
+    let verified = ["is_power_of_two_of_the_top_bit", "is_power_of_two_of_three"];
+    let refuted = ["is_power_of_two_of_zero_tripwire"];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { .. } = o else {
+            panic!("`{name}` is a false contract that must be refuted, got: {o}");
+        };
+    }
+}
+
 /// The bitwise complement `!x`, pinned by a true half and a tripwire.
 ///
 /// `!x` is `all_ones ^ x` at the *operand's* width. The model reads that width

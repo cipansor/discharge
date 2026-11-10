@@ -3666,12 +3666,13 @@ walking the body for slice reads and then proving `len <= 64` for functions that
 needed slice modelling, so it is left as the honest boundary.
 
 **Stage 4 — the missing intrinsics.** `wrapping_neg`, `wrapping_div`,
-`wrapping_rem`, `leading_zeros`, `trailing_zeros`, `count_ones`, `pow`. The
-`wrapping_*` family is the same arithmetic the `checked_*` arms already do, minus
-the overflow obligation, so it is mostly plumbing. `count_ones` and the zero-counts
-are small bit-vector loops and belong in `discharge-arithmetic` beside the other
-proved primitives, not in the frontend. All of these are now modelled except the
-division families that cannot express a zero divisor as a value (see below); the
+`wrapping_rem`, `leading_zeros`, `trailing_zeros`, `count_ones`, `pow`,
+`is_power_of_two`. The `wrapping_*` family is the same arithmetic the `checked_*`
+arms already do, minus the overflow obligation, so it is mostly plumbing.
+`count_ones` and the zero-counts are small bit-vector loops and belong in
+`discharge-arithmetic` beside the other proved primitives, not in the frontend.
+All of these are now modelled except the division families that cannot express a
+zero divisor as a value (see below); the
 bit-count family is complete, `count_ones`/`count_zeros`, `leading_zeros`/`leading_ones`
 and `trailing_zeros`/`trailing_ones` each being one expression applied to `x` and `!x`.
 
@@ -3688,7 +3689,11 @@ counts, `Unary(Family, UnOp)` for the operators, and `Overflowing(BinOp)` for th
 corresponding positive count of `!x` — so there is one expression per pair rather
 than two that could drift. `!x` is `bxor(x, all_ones(w))`, the same term the
 executor builds for a `Not` rvalue, so a bit count of a written `!x` and a bit count
-of the complement cannot disagree. Findings worth more than the coverage:
+of the complement cannot disagree. `is_power_of_two` is modelled too, and it is the
+one shape whose *return type* is `bool`: the model produces a `Pred` and the executor
+writes a `Val::Bool`, which is what the `if` that consumes it branches on. It is
+unsigned-only, because `core` has no such method on the signed types. Findings worth
+more than the coverage:
 
 * **`count_ones`, `leading_zeros` and `trailing_zeros` are the modelled calls whose
   result width differs from their operand's** (`u8::count_ones` returns `u32`). The

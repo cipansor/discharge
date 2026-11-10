@@ -35,9 +35,10 @@
 //! * **`core` is not modelled.** *Closed for the `num` intrinsics.*
 //!   `checked_*`, `saturating_*`, `wrapping_*` and `overflowing_*` are computed
 //!   in the frontend from their operands rather than by reading `core`'s MIR.
-//!   So are the unary operators — `neg` and `abs` in all four families — and the
-//!   six bit counts: `count_ones`, `count_zeros`, `leading_zeros`,
-//!   `leading_ones`, `trailing_zeros` and `trailing_ones`.
+//!   So are the unary operators — `neg` and `abs` in all four families — the
+//!   six bit counts (`count_ones`, `count_zeros`, `leading_zeros`,
+//!   `leading_ones`, `trailing_zeros` and `trailing_ones`) and the `bool`
+//!   predicate `is_power_of_two`.
 //!   Division is the one narrowing: only `checked_div`/`checked_rem` are
 //!   modelled, because every other family — `overflowing_*` included — panics on
 //!   a zero divisor and hiding that panic is not something a proof may do. A
@@ -3274,6 +3275,35 @@ pub fn trailing_ones_of_a_small_value(x: u8) -> u32 {
 /// ensures: ret <= 6
 pub fn trailing_ones_of_a_small_value_tripwire(x: u8) -> u32 {
     x.trailing_ones()
+}
+
+/// `is_power_of_two` is true for the top bit of a `u8`, so the postcondition
+/// holds for `x == 128`. This is the channel pin: the result is a `bool` the
+/// `if` branches on, and a model that wrote a one-bit *word* into the local
+/// would leave it unreadable as a predicate, so this would fail rather than pass.
+/// requires: x == 128
+/// ensures: ret == true
+pub fn is_power_of_two_of_the_top_bit(x: u8) -> bool {
+    x.is_power_of_two()
+}
+
+/// The tripwire: `x == 0` is the one value the bare `x & (x - 1) == 0` mask test
+/// would accept, so a model that dropped the `x != 0` conjunct would *prove* this
+/// false contract. It is false because zero is not a power of two.
+/// requires: x == 0
+/// ensures: ret == true
+pub fn is_power_of_two_of_zero_tripwire(x: u8) -> bool {
+    x.is_power_of_two()
+}
+
+/// The complement pin, and the one the zero tripwire cannot make: three has two
+/// bits set, so the mask test has to be applied at all. A model that answered
+/// "non-zero means a power of two" would *refute* this true contract, where `0`
+/// only catches the opposite mistake -- a missing mask wrongly accepting zero.
+/// requires: x == 3
+/// ensures: ret == false
+pub fn is_power_of_two_of_three(x: u8) -> bool {
+    x.is_power_of_two()
 }
 
 /// `saturating_neg` of a positive value is negative: the negation is in range, so

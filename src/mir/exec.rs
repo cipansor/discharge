@@ -2745,11 +2745,13 @@ fn try_intrinsic(
     if op.is_unary() {
         // A bit count does not read the sign at all -- the bits of a negative
         // value are just bits -- so a dump that did not print one is still
-        // modelled. A unary *operator* does read it, because `neg` and `abs`
-        // mean different things on the two types, so a missing sign is refused
-        // there rather than guessed.
+        // modelled. A unary *operator* and the `bool` predicate both read it:
+        // `neg` and `abs` mean different things on the two types, and
+        // `is_power_of_two` exists only on the unsigned ones. A missing sign is
+        // refused there rather than guessed, and a printed *signed* one makes
+        // `eval` decline, so a signed operand cannot be read as an unsigned one.
         let signed = match op {
-            intrinsics::Intrinsic::Unary(..) => sign.known()?,
+            intrinsics::Intrinsic::Unary(..) | intrinsics::Intrinsic::Bool(_) => sign.known()?,
             _ => false,
         };
         // A bit count returns a type wider than its operand (`u8` -> `u32`), so
@@ -2789,6 +2791,14 @@ fn try_intrinsic(
                 let field = |i| Place { local: dest.local, proj: vec![Proj::Field(i)] };
                 env.set(&field(0), Val::Sym(value, Sign::of_bool(signed)));
                 env.set(&field(1), Val::Bool(overflowed));
+                Ok(())
+            }
+            Outcome::Bool(p) => {
+                // `is_power_of_two` returns a `bool` and nothing else. The
+                // destination local is a `bool`, so the predicate is written as
+                // one; a one-bit *word* here would leave the local readable only
+                // as a word, and the `if` that consumes it reads a predicate.
+                env.set(dest, Val::Bool(p));
                 Ok(())
             }
         });
@@ -2839,6 +2849,9 @@ fn try_intrinsic(
                 env.set(&field(1), Val::Bool(overflowed));
                 Ok(())
             }
+            // A `bool` predicate is unary (`is_power_of_two` is the only one),
+            // so it never reaches the `pow` path.
+            Outcome::Bool(_) => unreachable!("a bool predicate is unary"),
         });
     }
     let y = match args.get(1) {
@@ -2876,6 +2889,8 @@ fn try_intrinsic(
             env.set(&field(0), Val::Sym(value, sign));
             env.set(&field(1), Val::Bool(overflowed));
         }
+        // A `bool` predicate is unary, so it never reaches the two-operand path.
+        Outcome::Bool(_) => unreachable!("a bool predicate is unary"),
     }
     Some(Ok(()))
 }

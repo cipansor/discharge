@@ -1744,6 +1744,11 @@ refused. `src/mir/intrinsics.rs` holds the model:
   `count_zeros` is `count_ones(!x)` and a fix to one half cannot leave the other
   behind. `!x` is spelled the way the executor spells it, so the model's `!x` and
   the body's `!x` are the same term.
+- `is_power_of_two` is the one modelled shape whose *return type* is `bool`, so it
+  is the one that produces a predicate rather than a bit-vector. The executor
+  writes it as a `bool`, which is what the `if` that consumes it branches on; a
+  one-bit word there would leave the local readable only as a word. It is
+  unsigned-only, matching `core`.
 
 The refusals matter as much as the model, and each has a reason. Only `checked_div`
 and `checked_rem` may model division: the `saturating_` and `wrapping_` forms *panic*
@@ -1789,7 +1794,8 @@ The frontend refuses far more than it accepts, and every refusal is reported:
   bitwise ops are computed from their operands (see below), as are the unary
   `neg`/`abs` in all four families, the six bit counts (`count_ones`,
   `count_zeros`, `leading_zeros`, `leading_ones`, `trailing_zeros`,
-  `trailing_ones`) and the `pow` families. Every other intrinsic, and every trait
+  `trailing_ones`), the `bool` predicate `is_power_of_two` and the `pow`
+  families. Every other intrinsic, and every trait
   method, is still a call the frontend cannot model.
 - **A symbolic index into a *slice*, or a mutable reference write.** An array
   subscripted by a parameter (`a[i]` on `[u8; 4]`) *is* modelled: the length is in
