@@ -1944,6 +1944,45 @@ pub fn multi_cfg_tripwire() -> u16 { <u16 as std::convert::From<m::Local>>::from
     }
 }
 
+/// A quoted delimiter in an attribute must not hide the `#[cfg]` above it.
+///
+/// `#[doc = "("]` holds an unmatched `(` inside a string. A reader that counts every
+/// character as a delimiter never finds the attribute's closing `]`, runs past it, and
+/// then reports the whole attribute run as unreadable -- so the disabled `#[cfg]`
+/// import above it is treated as live and displaces the live alias. The impl written
+/// with `Conv` is then recorded against the wrong trait and the call is lost
+/// (`converts a type the model does not hold`). The verifying entry is the evidence
+/// the live alias survives; the tripwire is the evidence the local body (returning
+/// `107`) answers, not the model.
+#[test]
+fn a_quoted_delimiter_does_not_hide_a_cfg_import() {
+    let src = r#"
+pub trait From { fn make() -> u8 { 0 } }
+pub mod m {
+    use std::convert::From as Conv;
+    pub struct Local;
+    impl Conv<Local> for u16 { fn from(_: Local) -> Self { 107 } }
+    #[cfg(any())]
+    #[doc = "("]
+    use crate::Other as Conv;
+}
+pub struct Other;
+/// requires: true
+/// ensures: ret == 107
+pub fn quoted_cfg_live() -> u16 { <u16 as std::convert::From<m::Local>>::from(m::Local) }
+/// requires: true
+/// ensures: ret == 5
+pub fn quoted_cfg_tripwire() -> u16 { <u16 as std::convert::From<m::Local>>::from(m::Local) }
+"#;
+    let Some(o) = verify_src("quoted_cfg_live", src) else { return };
+    assert!(o.is_verified(), "a quoted delimiter must not hide the cfg import, got: {o}");
+    let Some(o) = verify_src("quoted_cfg_tripwire", src) else { return };
+    match &o {
+        FnOutcome::Failed { kind, .. } => assert_eq!(kind, "postcondition", "got: {o}"),
+        _ => panic!("the live local body returns 107, so `ret == 5` must be refuted, got: {o}"),
+    }
+}
+
 /// The corpus pins both directions for the nested argument and the cfg alias.
 ///
 /// The inline tests above use a small self-contained source; these entries sit in
@@ -1956,6 +1995,7 @@ fn the_nested_argument_and_cfg_alias_fixtures_are_decided() {
         "nested_trait_arg_finds_the_body",
         "cfg_disabled_import_keeps_the_live_alias",
         "cfg_multiline_import_keeps_the_live_alias",
+        "cfg_quoted_delimiter_keeps_the_live_alias",
     ];
     let Some(report) = verify_realistic(&verified) else { return };
     for name in verified {
@@ -1966,6 +2006,7 @@ fn the_nested_argument_and_cfg_alias_fixtures_are_decided() {
         "nested_trait_arg_is_not_a_guess_tripwire",
         "cfg_disabled_import_is_not_the_wrong_alias_tripwire",
         "cfg_multiline_import_is_not_the_wrong_alias_tripwire",
+        "cfg_quoted_delimiter_is_not_the_wrong_alias_tripwire",
     ];
     let Some(report) = verify_realistic(&refuted) else { return };
     for name in refuted {

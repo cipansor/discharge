@@ -1320,7 +1320,12 @@ fn attrs_above_have_cfg(lines: &[&str], end: usize) -> bool {
 ///
 /// Each attribute is read from its `#[` through the balanced `]` that closes it, so
 /// one spanning lines (`#[cfg(all(\n    unix,\n))]`) is read whole rather than by its
-/// first line alone. See [`is_cfg_use`].
+/// first line alone. A delimiter inside quoted text is not a delimiter: `#[doc = "("]`
+/// holds an unmatched `(` in a string, and counting it would make the attribute run
+/// past its real end, exhaust the lines, and read a *disabled* `#[cfg]` as if it were
+/// live -- the lost proof this reader exists to prevent. String and character
+/// literals are therefore tracked (with backslash escapes) and their contents skipped
+/// for delimiter purposes. See [`is_cfg_use`] and [`is_char_literal_start`].
 fn read_attr_run(lines: &[&str], start: usize, end: usize) -> Option<bool> {
     let mut cfg = false;
     let mut k = start;
@@ -1328,29 +1333,49 @@ fn read_attr_run(lines: &[&str], start: usize, end: usize) -> Option<bool> {
         let head = lines[k].trim_start().strip_prefix("#[")?;
         // Find the `]` that closes this attribute, which may be on a later line.
         let mut depth = 1i32;
+        // The open quote we are inside, if any: `"` for a string, `'` for a char
+        // literal. Delimiters inside it do not count.
+        let mut quote: Option<char> = None;
+        let mut escaped = false;
         let mut j = k;
-        let mut segment = head;
-        loop {
-            let mut closed = false;
-            for c in segment.chars() {
-                match c {
-                    '[' | '(' => depth += 1,
-                    ']' | ')' => depth -= 1,
-                    _ => {}
+        let mut closed = false;
+        while j < end {
+            let segment: &str = if j == k { head } else { lines[j] };
+            for (idx, c) in segment.char_indices() {
+                if let Some(q) = quote {
+                    if escaped {
+                        escaped = false;
+                    } else if c == '\\' {
+                        escaped = true;
+                    } else if c == q {
+                        quote = None;
+                    }
+                    continue;
                 }
-                if depth == 0 {
-                    closed = true;
-                    break;
+                match c {
+                    '"' => quote = Some('"'),
+                    // A char literal (`'('`, `'\n'`, `'\''`) opens a quote; a lifetime
+                    // (`'a`) does not, and reading it as an unclosed literal would
+                    // make every later attribute look unreadable.
+                    '\'' if is_char_literal_start(segment, idx) => quote = Some('\''),
+                    '[' | '(' => depth += 1,
+                    ']' | ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            closed = true;
+                            break;
+                        }
+                    }
+                    _ => {}
                 }
             }
             if closed {
                 break;
             }
             j += 1;
-            if j >= end {
-                return None;
-            }
-            segment = lines[j];
+        }
+        if !closed {
+            return None;
         }
         if head.trim_start().starts_with("cfg") {
             cfg = true;
@@ -1358,6 +1383,24 @@ fn read_attr_run(lines: &[&str], start: usize, end: usize) -> Option<bool> {
         k = j + 1;
     }
     Some(cfg)
+}
+
+/// Whether the `'` at byte index `idx` in `segment` opens a character literal rather
+/// than a lifetime.
+///
+/// A char literal holds exactly one character (`'('`) or a backslash escape
+/// (`'\n'`, `'\''`), so it opens only when a `\` follows or a closing `'` follows the
+/// next character. A lifetime (`'a`, `'static`) has no closing quote and is left
+/// alone. See [`read_attr_run`].
+fn is_char_literal_start(segment: &str, idx: usize) -> bool {
+    let mut rest = segment[idx + 1..].chars();
+    match rest.next() {
+        // `'\…'`: an escape. Treat as a literal; the quote tracker reads to the close.
+        Some('\\') => true,
+        // `'x'`: a single character then the closing quote.
+        Some(_) => rest.next() == Some('\''),
+        None => false,
+    }
 }
 
 /// Split any leading `#[…]` attributes off `line`, returning the rest and whether a
@@ -8296,5 +8339,62 @@ fn h<
             "use a::B as C;",
         ];
         assert!(is_cfg_use(&lines, 4), "a cfg below another attribute is still this item's");
+    }
+
+    /// A delimiter inside a quoted string or char literal is not a delimiter.
+    ///
+    /// `#[doc = "("]` carries an unmatched `(` in a string. Counting it as a delimiter
+    /// makes the reader run past the attribute's real end, so a `#[cfg]` above it is
+    /// not read and a *disabled* import looks live -- the alias it displaces is the
+    /// lost proof this reader prevents. The reader must skip string and character
+    /// literal contents (honouring escapes) while matching `#[…]`.
+    #[test]
+    fn a_delimiter_inside_a_quoted_attribute_is_not_a_delimiter() {
+        // A `#[cfg]` followed by a `#[doc = "("]`: the `(` is in a string, so the
+        // attribute run still ends at the `]` and the condition is read.
+        let lines: Vec<&str> = vec![
+            "#[cfg(any())]",
+            "#[doc = \"(\"]",
+            "use a::B as C;",
+        ];
+        assert!(is_cfg_use(&lines, 2), "an unmatched `(` in a string must not hide the cfg");
+
+        // The same with the bracket characters that would otherwise close the run.
+        let lines: Vec<&str> = vec![
+            "#[cfg(any())]",
+            "#[doc = \"]\"]",
+            "use a::B as C;",
+        ];
+        assert!(is_cfg_use(&lines, 2), "a `]` in a string must not close the attribute early");
+
+        // An escaped quote does not end the string, so the `(` after it is still text.
+        let lines: Vec<&str> = vec![
+            "#[cfg(any())]",
+            "#[doc = \"\\\"(\"]",
+            "use a::B as C;",
+        ];
+        assert!(is_cfg_use(&lines, 2), "an escaped quote must not end the string");
+
+        // A char literal holding a delimiter is text too.
+        let lines: Vec<&str> = vec![
+            "#[cfg(any())]",
+            "#[doc = ')']",
+            "use a::B as C;",
+        ];
+        assert!(is_cfg_use(&lines, 2), "a `)` in a char literal must not close the attribute");
+
+        // A `cfg` whose own argument is a string containing a delimiter is still a
+        // condition, and the run still ends where the attribute does.
+        let lines: Vec<&str> = vec![
+            "#[cfg(feature = \"(\")]",
+            "#[doc = \")\"]",
+            "use a::B as C;",
+        ];
+        assert!(is_cfg_use(&lines, 2), "a quoted `(` in a cfg argument must not unbalance it");
+
+        // A lifetime in an attribute is not an unclosed char literal: it must not make
+        // the run unreadable, so the non-`cfg` case stays `false` and does not panic.
+        let lines: Vec<&str> = vec!["#[allow('a)]", "use a::B as C;"];
+        assert!(!is_cfg_use(&lines, 1), "a lifetime must not open a char literal");
     }
 }

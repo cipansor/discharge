@@ -7884,18 +7884,30 @@ whole attribute block directly above the item as complete, bracket-balanced `#[�
 is not an attribute, so a `#[cfg]` belonging to an earlier item is never read as this one's.
 Corpus: `cfg_multiline_import_keeps_the_live_alias` verifies, its tripwire is refuted.
 
+**A quoted delimiter is not a delimiter.** The same reader counted *every* character as a bracket,
+so a delimiter inside quoted text unbalanced it: `#[doc = "("]` holds an unmatched `(`, the run
+never finds its closing `]`, exhausts its lines, and `read_attr_run` returns `None` -- the disabled
+`#[cfg]` above it is then read as live and displaces the live alias (again
+`converts a type the model does not hold`). `read_attr_run` now tracks string and character
+literals (honouring backslash escapes) and skips their contents while matching `#[…]`. A `'` opens
+a char literal only when it looks like one (`'('`, `'\n'`), not when it is a lifetime (`'a`), since
+reading a lifetime as an unclosed literal would make every later attribute unreadable
+(`is_char_literal_start`). Corpus: `cfg_quoted_delimiter_keeps_the_live_alias` verifies, its
+tripwire is refuted.
+
 Regression coverage: `a_nested_trait_argument_keeps_its_balanced_spelling`,
 `a_cfg_disabled_import_does_not_displace_a_live_alias`, `a_same_line_cfg_import_is_read`,
-`a_multiline_cfg_import_does_not_displace_a_live_alias` (inline, via `verify_src`),
-`the_nested_argument_and_cfg_alias_fixtures_are_decided` (corpus, both the one-line and multi-line
-alias directions), plus five unit tests on the readers themselves
+`a_multiline_cfg_import_does_not_displace_a_live_alias`, `a_quoted_delimiter_does_not_hide_a_cfg_import`
+(inline, via `verify_src`), `the_nested_argument_and_cfg_alias_fixtures_are_decided` (corpus, the
+one-line, multi-line and quoted-alias directions), plus six unit tests on the readers themselves
 (`leading_attributes_are_peeled_and_a_cfg_is_reported`,
 `a_use_behind_a_same_line_attribute_is_still_an_import`,
 `a_cfg_import_does_not_displace_a_live_binding`,
 `a_conditional_binding_is_held_below_an_unconditional_one`,
-`a_multiline_cfg_attribute_is_seen_above_a_use`).
+`a_multiline_cfg_attribute_is_seen_above_a_use`,
+`a_delimiter_inside_a_quoted_attribute_is_not_a_delimiter`).
 
-`scripts/test-count.sh` **784 → 794** passed, 0 failed; `scripts/gate.sh` **ALL GATES GREEN**
+`scripts/test-count.sh` **784 → 796** passed, 0 failed; `scripts/gate.sh` **ALL GATES GREEN**
 (clippy std + no_std, tests, no_std bare-metal, zero deps, z3 oracle 845 agree / 0 mismatch,
 rustc_public oracle 0 differ, MSRV 1.85, artifacts, unsafe surface still 2). No new SMT primitives:
 every fix is a string read on the same two sides, and the model is unchanged.

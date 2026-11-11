@@ -1824,7 +1824,10 @@ refused. `src/mir/intrinsics.rs` holds the model:
   the call). An attribute on the `use`'s own line is peeled first, so a live
   `#[cfg(all())] use …` is read rather than skipped, and the attribute block above
   the `use` is read as whole bracket-balanced items, so a condition that *spans*
-  lines (`#[cfg(all(\n    any(),\n))]`) is found too.
+  lines (`#[cfg(all(\n    any(),\n))]`) is found too. A delimiter inside quoted
+  text is not a delimiter: `#[doc = "("]` carries an unmatched `(` in a string,
+  and counting it would run the reader past the attribute's real end, so string
+  and character literals are skipped (escapes honoured) while matching `#[…]`.
 - `add_signed`/`add_unsigned` add a value to one of the *opposite* signedness
   (`u8::wrapping_add_signed` adds an `i8` to a `u8`), so the two operands are read
   at different signs. The value is the plain wrapped sum in both directions, since

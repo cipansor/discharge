@@ -8159,3 +8159,45 @@ pub fn cfg_multiline_import_keeps_the_live_alias() -> u16 {
 pub fn cfg_multiline_import_is_not_the_wrong_alias_tripwire() -> u16 {
     <u16 as std::convert::From<CfgMultiLocal>>::from(CfgMultiLocal)
 }
+
+// --- A quoted delimiter in an attribute must not hide a `#[cfg]` import --------
+//
+// `#[doc = "("]` holds an unmatched `(` in a string. Counting every character as a
+// delimiter makes the reader run past the attribute's real end, so the disabled
+// `#[cfg]` above it is not seen and the disabled import is treated as live, displacing
+// the live alias. Skipping quoted text (with escapes) while matching `#[…]` closes it.
+
+pub struct CfgQuotedLocal;
+
+pub mod cfg_quoted_alias_shim {
+    use crate::CfgQuotedLocal;
+    use std::convert::From as Conv;
+
+    impl Conv<CfgQuotedLocal> for u16 {
+        fn from(_: CfgQuotedLocal) -> Self {
+            109
+        }
+    }
+
+    #[cfg(any())]
+    #[doc = "("]
+    use crate::CfgQuotedOther as Conv;
+}
+
+pub struct CfgQuotedOther;
+
+/// The live alias still binds `Conv` to the standard trait, so the impl's call
+/// resolves to its body (returning `109`) and verifies.
+/// requires: true
+/// ensures: ret == 109
+pub fn cfg_quoted_delimiter_keeps_the_live_alias() -> u16 {
+    <u16 as std::convert::From<CfgQuotedLocal>>::from(CfgQuotedLocal)
+}
+
+/// The false direction: the body returns `109`, so this must be refuted. Counting the
+/// quoted `(` as a delimiter hid the condition and lost the call instead.
+/// requires: true
+/// ensures: ret == 9
+pub fn cfg_quoted_delimiter_is_not_the_wrong_alias_tripwire() -> u16 {
+    <u16 as std::convert::From<CfgQuotedLocal>>::from(CfgQuotedLocal)
+}
