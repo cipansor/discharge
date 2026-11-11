@@ -7768,3 +7768,70 @@ its own inline source (via `verify_src`) so no local `From` competes with the im
 (clippy std + no_std, tests, no_std bare-metal, zero deps, rustdoc ×3, MSRV 1.85, artifacts,
 unsafe surface still 2). No new SMT primitives: both guards are name/type comparisons, and the
 model is unchanged.
+
+## Trait identity, round three: default-body overrides, generic arguments, and the import scan
+
+A second adversarial review of the same resolver surfaced four more defects -- two false proofs
+and two lost proofs -- plus one stale doc claim and a bug in the guard added by the previous
+round. All are closed here. The unifying lesson: **a trait method's identity is not its path.**
+It is the path *and* the instantiation *and*, when a default body exists, whether any impl
+overrides it.
+
+**Finding 1 (false proof): an overridden method verified against the trait's default body.**
+`trait T { fn value(&self) -> u8 { 1 } }` with `impl T for Foo { fn value(&self) -> u8 { 2 } }`
+makes `<Foo as T>::value(&foo)` return `2`, but rustc keeps the *default* `T::value` in the dump
+(printed `T::value`, no `<impl at`). `resolve_callee` looked for a default body *first* and
+inlined its `1`, so a contract `ret == 1` was **proved** for code Rust returns `2` from. The
+search for an `impl` candidate now runs first, and the default is consulted only when that search
+finds *nothing*: an impl that does not override emits no `<impl at …>::m`, so the default is the
+only body; an impl that does override contributes exactly one hit, which wins. Two or more hits
+stay ambiguous and are refused rather than resolved to the default.
+
+**Finding 2 (false proof): a local impl answered a different *instantiation* of a generic trait.**
+`impl From<Local> for u16` (body `107`) and the library's `impl From<u8> for u16` share the trait
+path (`From`), the owner (`u16`) and the method (`from`); only the trait's *argument* separates
+them. The previous round's self-type guard was supposed to catch this, but it never fired (see
+below), so `<u16 as From<u8>>::from(7u8)` was answered from the local body and `ret == 107` was
+proved. The fix reads the trait's arguments on *both* sides -- `call_trait_args` from the call's
+name, `Specs::impl_trait_args` (new, parsed by `spec::impl_trait_args`) from the impl header --
+and requires them equal. An unreadable side is refused rather than waved through, because it
+could be the impl the call did not name. `args_match` allows the one spelling gap rustc creates:
+the dump prints a type by its *shortest crate-unique* path, so `impl From<crate::Local> for u16`
+prints its call's argument as the bare `Local`; a bare dump argument therefore matches a
+module-qualified source spelling, while a *qualified* dump argument is compared exactly.
+
+**Findings 3 and 4 (lost proofs): an imported trait was qualified with its own module.**
+`mod m { use std::convert::From; impl From<…> for u16 { … } }` records the impl's trait as the
+*imported* path (`std::convert::From`), because that is what the compiler prints in the call. Two
+defects broke that. First, `module_imports` reset its running map on *every* scope change, so a
+nested `mod nested {}` inside `m` cleared `m`'s imports for the rest of `m`; the later
+`impl From<…>` was qualified `m::From` and no call matched -- a lost proof. Imports are now kept
+*per module path*, assembled from every `use` at that depth regardless of order, since Rust item
+imports are order-independent. Second, the scan read one line at a time and only stripped a bare
+`pub ` prefix, so a folded `use a::b::{\n C,\n};` and a restricted `pub(crate) use …` were both
+missed entirely -- the same lost proof. The scan now folds a `use` item through its `;` and
+`strip_visibility` handles `pub`, `pub(crate)`, `pub(super)` and `pub(in …)`.
+
+**The previous round's guard was itself broken.** `impl_self_ty` was meant to return the
+candidate's self type (the part between `impl` and `for`), but for a definition name
+`<impl at …>::from` it returned the *method* (`from`). It only appeared to work because the
+`have == want` arm of `trait_candidate_admits` matched first for the imported-trait case, so the
+self-type arm was never reached -- and Finding 2 is exactly what slipped through. `impl_self_ty`
+is removed; the argument key that replaces it is read from the *header* (via `impl_trait_args`),
+where the type is unambiguous.
+
+**Finding 5 was a stale doc claim, not a code bug.** The README and two `intrinsics.rs` comments
+said a *same-width* `From` call is refused. It is not: `<u8 as From<u8>>::from(x)` is `core`'s
+reflexive `impl<T> From<T> for T`, and `eval` accepts it (`result_w >= w`), modelling the source
+unchanged -- which the differential oracle agrees with. Only a *narrowing* is refused. The prose
+now says so, and the corpus pins the identity (`same_width_from_is_the_identity` plus a tripwire).
+
+Regression coverage: `an_override_wins_over_the_traits_default_body`,
+`a_generic_traits_arguments_separate_its_impls`, `an_imported_trait_keeps_its_imported_path`,
+`a_multiline_restricted_import_is_read` (all inline, via `verify_src`), plus corpus fixtures for
+the override and generic-argument directions and the same-width identity.
+
+`scripts/test-count.sh` **780 → 784** passed, 0 failed; `scripts/gate.sh` **ALL GATES GREEN**
+(clippy std + no_std, tests, no_std bare-metal, zero deps, z3 oracle 845 agree / 0 mismatch,
+rustdoc ×3, MSRV 1.85, artifacts, unsafe surface still 2). No new SMT primitives: every fix is a
+name, argument or scope comparison, and the model is unchanged.

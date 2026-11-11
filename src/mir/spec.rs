@@ -209,6 +209,17 @@ pub struct Specs {
     /// is not a suffix of that. See `impl_trait` and the executor's
     /// `resolve_callee`.
     pub impl_traits: BTreeMap<(usize, usize), String>,
+    /// The *trait arguments* each `impl` block instantiates, keyed as
+    /// [`Self::impl_traits`] and holding them as written (`u8` for
+    /// `impl From<u8> for u16`). Absent for an inherent `impl` or a trait with no
+    /// arguments.
+    ///
+    /// Path and owner cannot separate the library's `From<u8> for u16` from a local
+    /// `From<Local> for u16`; both have owner `u16` and both answer the method tail
+    /// `from`. The instantiation is what separates them, so a call to one is not
+    /// answered from the other's body. See `impl_trait_args` and the executor's
+    /// `resolve_callee`.
+    pub impl_trait_args: BTreeMap<(usize, usize), String>,
     /// The traits the crate itself declares, as module-qualified paths: `From` for
     /// a crate-root trait, `m::Trait` for one inside `mod m`.
     ///
@@ -972,21 +983,38 @@ pub(crate) fn impl_owner(header: &str) -> Option<String> {
     }
 }
 
-/// The *trait* an `impl` block implements, read from its header, or `None` for an
-/// inherent `impl`.
+/// The text inside the first balanced `<…>` of `s`, or `None` when there is none.
 ///
-/// `impl From<u8> for u16` yields `Some("From")`, `impl std::convert::From<u8>
-/// for u16` yields `Some("std::convert::From")` and `impl u16` yields `None`. The
-/// full path is kept, not just the last segment, because that is exactly what
-/// separates a local `impl From<u8> for u16` from the standard library's: a call
-/// the compiler resolved to the library trait prints its path
-/// (`<u16 as std::convert::From<u8>>::from`), which is *not* a suffix of the bare
-/// `From` a local impl was written with. See [`Specs::impl_traits`].
+/// Balanced rather than "up to the first `>`": a trait argument can itself be
+/// generic (`impl Trait<Option<u8>> for Foo`), and cutting at the first `>` would
+/// read `Option<u8` as the argument -- a different instantiation from the call's
+/// `Option<u8>`, so a call to the impl would be refused. See [`impl_trait_args`].
+pub(crate) fn angle_inner(s: &str) -> Option<&str> {
+    let open = s.find('<')?;
+    let mut depth = 0usize;
+    for (i, c) in s[open..].char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(s[open + 1..open + i].trim());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The text of an `impl` header's *trait clause*: everything between the skipped
+/// `impl<…>` parameter list and the ` for `, or `None` for an inherent `impl`.
 ///
-/// The `impl`'s type parameters (`impl<T> From<T> for …`) are skipped first,
-/// exactly as in [`impl_owner`], and the trait is the text *before* ` for ` when
-/// there is one, up to (not including) its own `<…>` type-argument list.
-pub(crate) fn impl_trait(header: &str) -> Option<String> {
+/// `impl<T> From<T> for Wrapper<T>` gives `From<T>`, `impl From<u8> for u16` gives
+/// `From<u8>`, and `impl u16` gives `None`. This is the shared reading of the two
+/// things an `impl` says about its trait: the path ([`impl_trait`]) and the
+/// arguments ([`impl_trait_args`]).
+fn impl_trait_clause(header: &str) -> Option<&str> {
     let after = header.trim_start().strip_prefix("unsafe ").unwrap_or(header.trim_start());
     let rest = after.strip_prefix("impl")?;
     // Skip an `impl<T, U>` parameter list, as `impl_owner` does.
@@ -1012,15 +1040,28 @@ pub(crate) fn impl_trait(header: &str) -> Option<String> {
         rest
     };
     // A trait impl has `Trait for Type`; an inherent one has only `Type`.
-    let (before, has_for) = match rest.split_once(" for ") {
-        Some((b, _)) => (b, true),
-        None => (rest, false),
-    };
-    if !has_for {
-        return None;
-    }
-    // The trait path is the leading `a::b::C` of the part before ` for `; its own
-    // `<…>` type arguments and any `where` clause are dropped.
+    let (before, _) = rest.split_once(" for ")?;
+    Some(before)
+}
+
+/// The *trait* an `impl` block implements, read from its header, or `None` for an
+/// inherent `impl`.
+///
+/// `impl From<u8> for u16` yields `Some("From")`, `impl std::convert::From<u8>
+/// for u16` yields `Some("std::convert::From")` and `impl u16` yields `None`. The
+/// full path is kept, not just the last segment, because that is exactly what
+/// separates a local `impl From<u8> for u16` from the standard library's: a call
+/// the compiler resolved to the library trait prints its path
+/// (`<u16 as std::convert::From<u8>>::from`), which is *not* a suffix of the bare
+/// `From` a local impl was written with. See [`Specs::impl_traits`].
+///
+/// The `impl`'s type parameters (`impl<T> From<T> for …`) are skipped first,
+/// exactly as in [`impl_owner`], and the trait is the text *before* ` for ` when
+/// there is one, up to (not including) its own `<…>` type-argument list.
+pub(crate) fn impl_trait(header: &str) -> Option<String> {
+    let before = impl_trait_clause(header)?;
+    // The trait path is the leading `a::b::C` of the clause; its own `<…>` type
+    // arguments and any `where` clause are dropped.
     let path: String = before
         .trim_start()
         .chars()
@@ -1032,6 +1073,20 @@ pub(crate) fn impl_trait(header: &str) -> Option<String> {
     } else {
         Some(path)
     }
+}
+
+/// The *trait arguments* an `impl` block instantiates, as written, or `None` for an
+/// inherent `impl` or one whose trait names no arguments.
+///
+/// `impl From<u8> for u16` yields `Some("u8")` and `impl From<Local> for u16` yields
+/// `Some("Local")`. These are the one thing that separates two impls of a generic
+/// trait that share a path, an owner and a method: the library's `From<u8> for u16`
+/// and a local `From<Local> for u16` differ only here, so a call to one must not be
+/// answered from the other's body. See [`Specs::impl_trait_args`].
+pub(crate) fn impl_trait_args(header: &str) -> Option<String> {
+    let before = impl_trait_clause(header)?;
+    let inner = angle_inner(before)?;
+    (!inner.is_empty()).then(|| inner.to_string())
 }
 
 /// Whether a trait path written in an `impl` header names an external crate, so
@@ -1153,22 +1208,83 @@ fn impl_header(lines: &[&str], start: usize) -> String {
 /// trait, and rustc prints the call with the library path it resolved. Without
 /// this map the scanner would qualify the impl with its own module
 /// (`m::From`) and no call would match it -- a lost proof. See [`extract`].
+///
+/// Imports are kept *per module path*, not in one running map. A Rust import is
+/// visible across its whole scope, so the map for `m` must hold what `m` imports
+/// even at a line that comes after a nested `mod nested {}`: a single map that is
+/// reset on every scope change (the old behaviour) loses `m`'s `use` for the rest
+/// of `m`, and the later `impl From<…>` in `m` is then qualified `m::From` and no
+/// call matches it -- a lost proof. Item imports are also order-independent
+/// (`use` after the impl still binds), so each module's map is assembled from
+/// every `use` at its own nesting depth before any line reads it. See
+/// [`Specs::impl_traits`].
 fn module_imports(scopes: &[LineScope], lines: &[&str]) -> Vec<BTreeMap<String, String>> {
-    let mut out: Vec<BTreeMap<String, String>> = vec![BTreeMap::new(); lines.len()];
-    let mut current: BTreeMap<String, String> = BTreeMap::new();
-    let mut last_key: Option<Vec<String>> = None;
-    for (idx, raw) in lines.iter().enumerate() {
-        let key = scopes[idx].path.clone();
-        if last_key.as_ref() != Some(&key) {
-            current = BTreeMap::new();
-            last_key = Some(key.clone());
+    // One map per module path, assembled from every `use` at that path (in any
+    // order), then handed to each line of that module.
+    let mut per_module: BTreeMap<Vec<String>, BTreeMap<String, String>> = BTreeMap::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if !is_use_start(lines[i]) {
+            i += 1;
+            continue;
         }
-        for (short, full) in parse_use(raw) {
-            current.insert(short, full);
+        // A `use` item ends at its `;`, which may be on a later line
+        // (`use a::b::{\n    C,\n};`). Reading one line at a time loses such an
+        // import, and a lost import is a wrongly qualified impl -- a lost proof.
+        // Join the item's lines, then read the whole thing. See [`parse_use`].
+        let mut item = String::new();
+        let mut j = i;
+        loop {
+            item.push_str(lines[j]);
+            item.push(' ');
+            if lines[j].contains(';') || j + 1 >= lines.len() {
+                break;
+            }
+            j += 1;
         }
-        out[idx] = current.clone();
+        let map = per_module.entry(scopes[i].path.clone()).or_default();
+        for (short, full) in parse_use(&item) {
+            map.insert(short, full);
+        }
+        i = j + 1;
     }
-    out
+    lines
+        .iter()
+        .enumerate()
+        .map(|(idx, _)| per_module.get(&scopes[idx].path).cloned().unwrap_or_default())
+        .collect()
+}
+
+/// Strip a leading visibility (`pub`, `pub(crate)`, `pub(super)`, `pub(in …)`) from
+/// an item's first line, so the `use` keyword behind it can be read.
+///
+/// A restricted visibility is not a `pub ` prefix, so the old `strip_prefix("pub ")`
+/// missed `pub(crate) use …` entirely and the import was lost. `pub` must be
+/// followed by whitespace or `(`, so a name that merely starts with it
+/// (`public_thing`) is left alone.
+fn strip_visibility(line: &str) -> &str {
+    let s = line.trim_start();
+    let Some(rest) = s.strip_prefix("pub") else {
+        return s;
+    };
+    match rest.chars().next() {
+        // `pub` alone, or `pub ` followed by the item.
+        None => rest,
+        Some(c) if c.is_whitespace() => rest.trim_start(),
+        // `pub(crate)`, `pub(super)`, `pub(in path)`.
+        Some('(') => match rest.find(')') {
+            Some(close) => rest[close + 1..].trim_start(),
+            None => rest,
+        },
+        // A name that merely starts with `pub` (`public_thing`) is not a visibility.
+        Some(_) => s,
+    }
+}
+
+/// Whether a line opens a `use` item (after any visibility).
+fn is_use_start(line: &str) -> bool {
+    strip_visibility(line).starts_with("use ")
+        || strip_visibility(line).trim_end() == "use"
 }
 
 /// The `(short name, full path)` pairs a `use` item introduces.
@@ -1178,14 +1294,22 @@ fn module_imports(scopes: &[LineScope], lines: &[&str]) -> Vec<BTreeMap<String, 
 /// is skipped: the map is a hint for qualification, and a wrong entry would be
 /// worse than a missing one.
 fn parse_use(raw: &str) -> Vec<(String, String)> {
-    let rest = raw.trim_start();
-    let rest = rest.strip_prefix("pub ").unwrap_or(rest);
-    let rest = rest.strip_prefix("use ").unwrap_or(rest);
-    if rest == raw.trim_start() {
-        return Vec::new();
-    }
-    let mut rest = rest.trim();
-    rest = rest.strip_suffix(';').unwrap_or(rest).trim();
+    let after_vis = strip_visibility(raw);
+    let rest = match after_vis.strip_prefix("use ") {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+    // A folded multi-line item or a trailing line comment can follow the path, so
+    // cut at the item's `;` (or a `//`) before reading it.
+    let rest = match rest.find(';') {
+        Some(i) => &rest[..i],
+        None => rest,
+    };
+    let rest = match rest.find("//") {
+        Some(i) => &rest[..i],
+        None => rest,
+    };
+    let rest = rest.trim();
     // A grouped import: `a::b::{C, D as E}`.
     if let Some((prefix, group)) = rest.split_once("::{") {
         let group = group.strip_suffix('}').unwrap_or(group);
@@ -1285,6 +1409,9 @@ pub fn extract(source: &str) -> Specs {
                 // written. See [`qualify_trait`].
                 let qualified = qualify_trait(&tr, &scope_path[idx], &imports[idx]);
                 specs.impl_traits.insert((idx + 1, col), qualified);
+            }
+            if let Some(args) = impl_trait_args(&header) {
+                specs.impl_trait_args.insert((idx + 1, col), args);
             }
         }
     }

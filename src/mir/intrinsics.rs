@@ -304,11 +304,12 @@ pub enum MinMaxKind {
 /// `i16::from(i8)` and `i16::from(u8)` exist, while `u16::from(i8)` and
 /// `i8::from(u8)` do not (they would not be total, so `core` has no such `impl`).
 /// So a real `<D as From<S>>::from` call with `S` and `D` both integer is
-/// *necessarily* a strict widening, and the widening is exactly a zero- or
-/// sign-extension of the source's `w` bits. A model that saw only a *narrowing*
-/// or a same-width call would have to guess at a truncation `core` never performs;
-/// [`eval`] refuses those by name, and the executor refuses a call whose types it
-/// cannot read.
+/// *necessarily* a widening or a same-width call, and both are exactly a zero- or
+/// sign-extension of the source's `w` bits to the destination's width (a same-width
+/// extension leaves the value unchanged, which is `core`'s reflexive `impl<T>
+/// From<T> for T`). A model that saw only a *narrowing* call would have to guess at
+/// a truncation `core` never performs; [`eval`] refuses those by name, and the
+/// executor refuses a call whose types it cannot read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Conversion {
     /// `From::from`: `<D as From<S>>::from(x)`.
@@ -909,14 +910,15 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             }
             Outcome::Value(smt::truncate(min_max_result(kind, x, y, signed), result_w))
         }
-        // A widening conversion. The operand *is* the source, so its width and
-        // signedness are `w` and `signed`, and the destination is `result_w`. The
-        // value is the source extended by its own signedness -- the same rule the
-        // executor's `as`-cast uses, so a conversion and a cast of one shape build
-        // one term. A destination no wider than the source is refused: a real
-        // integer `From` only widens, so a same-width or narrowing call is not the
-        // method this model knows, and truncating it would be a guess at a
-        // conversion `core` never performs.
+        // A widening (or same-width) conversion. The operand *is* the source, so
+        // its width and signedness are `w` and `signed`, and the destination is
+        // `result_w`. The value is the source extended by its own signedness -- the
+        // same rule the executor's `as`-cast uses, so a conversion and a cast of one
+        // shape build one term. A destination narrower than the source is refused: a
+        // real integer `From` never narrows, so a narrowing call is not the method
+        // this model knows, and truncating it would be a guess at a conversion
+        // `core` never performs. A same-width destination is `core`'s reflexive
+        // `impl<T> From<T> for T`, and the extension leaves the source unchanged.
         Intrinsic::Conversion(_) => {
             if result_w < w {
                 return None;
@@ -3552,13 +3554,24 @@ mod tests {
             );
         }
 
-        // A conversion that is not a widening is refused, so a malformed or
-        // same-width call is never read as one `core` does not implement.
+        // A narrowing conversion is refused, so a call `core` does not implement is
+        // never read as one it does. (A same-width call *is* `core`'s reflexive
+        // `impl<T> From<T> for T` and is modelled, so it is not refused here.)
         smt::with_fresh(|| {
             let x = smt::var(16);
             assert!(
                 eval(Intrinsic::Conversion(Conversion::From), x, x, 16, false, 8).is_none(),
                 "a narrowing conversion must be refused"
+            );
+        });
+        // A same-width call *is* `core`'s reflexive `impl<T> From<T> for T`, so it
+        // must be modelled rather than refused. (Its identity semantics are pinned
+        // end to end in the corpus; here it is enough that it is not a refusal.)
+        smt::with_fresh(|| {
+            let x = smt::var(16);
+            assert!(
+                eval(Intrinsic::Conversion(Conversion::From), x, x, 16, false, 16).is_some(),
+                "a same-width conversion is the identity `core` implements, not a refusal"
             );
         });
     }

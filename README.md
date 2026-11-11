@@ -1765,13 +1765,15 @@ refused. `src/mir/intrinsics.rs` holds the model:
   model reads both types from the call's name and extends the source by its *own*
   signedness: `i8::MIN` widens to `i8::MIN` (a sign-extension), `255u8` to
   `255u16` (a zero-fill). The source's sign decides the extension, not the
-  destination's, so `i16::from(255u8)` is `255` and not `-1`. Only a *strict
-  widening* between modelled integers is accepted, which is exactly every integer
-  `From` `core` implements, so a real call is never a guess; a narrowing, a
-  same-width call, or a source the engine does not hold (a `bool`, say) is refused
-  and the path is reported unknown. The trait path must be exactly `From`/`Into`,
-  `core::convert::…` or `std::convert::…` — none of which a user can define — so a
-  local `From` in a module is refused by name.
+  destination's, so `i16::from(255u8)` is `255` and not `-1`. A *strict widening*
+  between modelled integers is accepted, which is exactly every widening `From`
+  `core` implements, so a real call is never a guess. A *same-width* call is
+  `core`'s reflexive `impl<T> From<T> for T`, whose result is the source
+  unchanged, and is modelled as exactly that. Only a *narrowing*, or a source the
+  engine does not hold (a `bool`, say), is refused and the path is reported
+  unknown. The trait path must be exactly `From`/`Into`, `core::convert::…` or
+  `std::convert::…` — none of which a user can define — so a local `From` in a
+  module is refused by name.
 - A *local* method that shares an intrinsic's name is answered by its own body,
   never by the model. rustc prints a trait impl's call as `<u8 as Trait>::m` but
   its definition as `<impl at …>::m`, so the names never match; the model is only

@@ -7929,3 +7929,111 @@ pub fn suffix_collision_verifies_from_the_named_trait(r: &Root) -> u8 {
 pub fn suffix_collision_is_not_the_module_trait_tripwire(r: &Root) -> u8 {
     <Root as Trait>::pick(r)
 }
+
+// --- A trait's default body must not answer a call an `impl` overrides --------
+//
+// rustc keeps a trait's *default* method in the dump even when an implementation
+// overrides it, so `<Foo as T>::value(&foo)` names the override while the trait's
+// own `T::value` body (returning `1`) is still present. The resolver used to pick
+// the default first and inline it, proving `ret == 1` for code Rust returns `2`
+// from -- a false proof. The impl candidate must win, and the default is used only
+// when no impl overrides the method.
+
+/// A trait with a default `value` that returns `1`.
+pub trait Defaulted {
+    fn value(&self) -> u8 {
+        1
+    }
+}
+
+pub struct Overrider;
+
+impl Defaulted for Overrider {
+    fn value(&self) -> u8 {
+        2
+    }
+}
+
+/// `Overrider` overrides `value` to return `2`, so this verifies only if the
+/// override's body answered rather than the default's `1`.
+/// requires: true
+/// ensures: ret == 2
+pub fn override_wins_over_the_default_body(o: &Overrider) -> u8 {
+    <Overrider as Defaulted>::value(o)
+}
+
+/// The false direction: the default body returns `1`, not the override's `2`, so
+/// this must be refuted. Answering from the default *proved* it -- the false proof
+/// this pins.
+/// requires: true
+/// ensures: ret == 1
+pub fn override_is_not_the_default_body_tripwire(o: &Overrider) -> u8 {
+    <Overrider as Defaulted>::value(o)
+}
+
+pub struct Inheritor;
+
+impl Defaulted for Inheritor {}
+
+/// `Inheritor` does not override `value`, so the trait's default is the body Rust
+/// calls; this verifies only if the default is still reachable when nothing
+/// overrides it.
+/// requires: true
+/// ensures: ret == 1
+pub fn an_unoverridden_method_still_uses_the_default(i: &Inheritor) -> u8 {
+    <Inheritor as Defaulted>::value(i)
+}
+
+// --- A local `impl` of an imported trait must not answer a library call -------
+//
+// `use std::convert::From;` plus a local `impl From<Local> for u16` prints its
+// call `<u16 as From<Local>>::from`, the bare library name. The trait path, the
+// owner and the method all match the library's `impl From<u8> for u16`, so only
+// the trait's *argument* (`Local` vs `u8`) separates them. Without it the local
+// body (returning `107`) answered a real `<u16 as From<u8>>::from(7u8)` and proved
+// `ret == 107` -- a false proof.
+
+pub struct ConvLocal;
+
+impl From<ConvLocal> for u16 {
+    fn from(_: ConvLocal) -> Self {
+        107
+    }
+}
+
+/// A real library conversion, `7u8` widened to `u16`, so this verifies only if the
+/// modelled conversion answered rather than the local `From<ConvLocal>` body's
+/// `107`.
+/// requires: true
+/// ensures: ret == 7
+pub fn library_from_is_not_the_local_body() -> u16 {
+    <u16 as From<u8>>::from(7u8)
+}
+
+/// The false direction: the local body returns `107`, not the widened `7`, so this
+/// must be refuted. A match that ignored the trait argument *proved* it.
+/// requires: true
+/// ensures: ret == 107
+pub fn library_from_is_not_the_local_body_tripwire() -> u16 {
+    <u16 as From<u8>>::from(7u8)
+}
+
+// --- A same-width conversion is `core`'s reflexive identity --------------------
+//
+// `impl<T> From<T> for T` makes `<u8 as From<u8>>::from(x)` the identity, so a
+// model that refused a same-width call would report a real call unknown -- a lost
+// proof. It is modelled as the source unchanged.
+
+/// requires: x == 200
+/// ensures: ret == 200
+pub fn same_width_from_is_the_identity(x: u8) -> u8 {
+    <u8 as From<u8>>::from(x)
+}
+
+/// The false direction: the identity returns `x`, so claiming anything else must be
+/// refuted. A model that guessed a truncation or a constant would *prove* it.
+/// requires: x == 200
+/// ensures: ret == 7
+pub fn same_width_from_is_not_a_guess_tripwire(x: u8) -> u8 {
+    <u8 as From<u8>>::from(x)
+}

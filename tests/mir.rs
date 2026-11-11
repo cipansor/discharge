@@ -1685,6 +1685,129 @@ pub fn imported_from_is_not_the_model_tripwire() -> u16 {
     }
 }
 
+/// A trait's *default* body must not answer a call that an `impl` overrides.
+///
+/// rustc keeps a trait's default method in the dump even when an implementation
+/// overrides it, so `<Foo as T>::value(&foo)` names the override while the trait's
+/// own `T::value` body (returning `1`) is still present. `resolve_callee` used to
+/// prefer the default body, inlining `1` for code Rust returns `2` from -- a false
+/// proof. The impl candidate must win; the default is used only when no impl
+/// overrides the method.
+#[test]
+fn an_override_wins_over_the_traits_default_body() {
+    let src = r#"
+pub trait T { fn value(&self) -> u8 { 1 } }
+pub struct Foo(pub u8);
+impl T for Foo { fn value(&self) -> u8 { 2 } }
+pub struct Bar(pub u8);
+impl T for Bar {}
+/// requires: true
+/// ensures: ret == 2
+pub fn override_verifies(f: &Foo) -> u8 { <Foo as T>::value(f) }
+/// requires: true
+/// ensures: ret == 1
+pub fn override_is_not_the_default_tripwire(f: &Foo) -> u8 { <Foo as T>::value(f) }
+/// requires: true
+/// ensures: ret == 1
+pub fn default_still_used_when_not_overridden(b: &Bar) -> u8 { <Bar as T>::value(b) }
+"#;
+    let Some(o) = verify_src("override_verifies", src) else { return };
+    assert!(o.is_verified(), "the override's body must answer, got: {o}");
+    let Some(o) = verify_src("default_still_used_when_not_overridden", src) else { return };
+    assert!(o.is_verified(), "the default must still answer when nothing overrides it, got: {o}");
+    let Some(o) = verify_src("override_is_not_the_default_tripwire", src) else { return };
+    match &o {
+        FnOutcome::Failed { kind, .. } => assert_eq!(kind, "postcondition", "got: {o}"),
+        _ => panic!("the default body must not answer a call an impl overrides, got: {o}"),
+    }
+}
+
+/// A local `impl` of a generic trait must not answer a call to a *different*
+/// instantiation of the same trait.
+///
+/// `impl From<Local> for u16` and the library's `impl From<u8> for u16` share the
+/// trait path (`From`), the owner (`u16`) and the method (`from`); only the trait's
+/// *argument* separates them. A call `<u16 as From<u8>>::from(7u8)` must reach the
+/// modelled widening (`7`), and the local impl's own call
+/// `<u16 as From<Local>>::from(...)` must reach its body (`107`).
+#[test]
+fn a_generic_traits_arguments_separate_its_impls() {
+    let src = r#"
+pub struct Local;
+impl From<Local> for u16 { fn from(_: Local) -> Self { 107 } }
+/// requires: true
+/// ensures: ret == 7
+pub fn library_call_is_seven() -> u16 { <u16 as From<u8>>::from(7u8) }
+/// requires: true
+/// ensures: ret == 107
+pub fn library_call_is_not_the_local_body_tripwire() -> u16 { <u16 as From<u8>>::from(7u8) }
+/// requires: true
+/// ensures: ret == 107
+pub fn local_call_is_onehundredseven() -> u16 { <u16 as From<Local>>::from(Local) }
+"#;
+    let Some(o) = verify_src("library_call_is_seven", src) else { return };
+    assert!(o.is_verified(), "the modelled widening must answer a library call, got: {o}");
+    let Some(o) = verify_src("local_call_is_onehundredseven", src) else { return };
+    assert!(o.is_verified(), "the local impl's own instantiation must answer, got: {o}");
+    let Some(o) = verify_src("library_call_is_not_the_local_body_tripwire", src) else { return };
+    match &o {
+        FnOutcome::Failed { kind, .. } => assert_eq!(kind, "postcondition", "got: {o}"),
+        _ => panic!("a different instantiation's body must not answer, got: {o}"),
+    }
+}
+
+/// A trait imported into a module must be recorded as the imported path, not
+/// prefixed with the module.
+///
+/// `use std::convert::From;` makes a bare `From` inside `m` the standard trait, and
+/// rustc prints the call with the library path. The scanner used to prefix `m`
+/// unconditionally (`m::From`), which matched no call -- a lost proof. The same
+/// must hold after a nested module, whose scope used to reset the parent's imports.
+#[test]
+fn an_imported_trait_keeps_its_imported_path() {
+    let src = r#"
+pub struct Local;
+pub mod m {
+    use std::convert::From;
+    pub mod nested {}
+    impl From<crate::Local> for u16 { fn from(_: crate::Local) -> Self { 107 } }
+}
+/// requires: true
+/// ensures: ret == 107
+pub fn imported_trait_after_nested_module() -> u16 {
+    <u16 as std::convert::From<crate::Local>>::from(crate::Local)
+}
+"#;
+    let Some(o) = verify_src("imported_trait_after_nested_module", src) else { return };
+    assert!(o.is_verified(), "the impl must be reached through its imported trait, got: {o}");
+}
+
+/// A multi-line, restricted-visibility import must still be read.
+///
+/// `pub(crate) use a::b::{\n    C,\n};` is one item whose path spans lines and
+/// whose visibility is not a bare `pub `. A line-at-a-time scan with a `pub `
+/// prefix missed it, so the impl was qualified with its own module and no call
+/// matched -- a lost proof.
+#[test]
+fn a_multiline_restricted_import_is_read() {
+    let src = r#"
+pub struct Local;
+pub mod m {
+    pub(crate) use std::convert::{
+        From,
+    };
+    impl From<crate::Local> for u16 { fn from(_: crate::Local) -> Self { 107 } }
+}
+/// requires: true
+/// ensures: ret == 107
+pub fn multiline_imported_trait() -> u16 {
+    <u16 as std::convert::From<crate::Local>>::from(crate::Local)
+}
+"#;
+    let Some(o) = verify_src("multiline_imported_trait", src) else { return };
+    assert!(o.is_verified(), "a folded restricted import must still qualify the trait, got: {o}");
+}
+
 /// The bitwise complement `!x`, pinned by a true half and a tripwire.
 ///
 /// `!x` is `all_ones ^ x` at the *operand's* width. The model reads that width
