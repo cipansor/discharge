@@ -615,7 +615,7 @@ pub fn verify_file_with(
     let specs = spec::extract(&text);
     let mir = emit_mir_with(rustc, source)?;
     let prog =
-        parse::parse_program_scoped(&mir, &enum_layouts(&specs), &specs.crate_consts, &specs.const_generics, &specs.impl_owners, &specs.impl_traits);
+        parse::parse_program_scoped(&mir, &enum_layouts(&specs), &specs.crate_consts, &specs.const_generics, &specs.impl_owners, &specs.impl_traits, &specs.declared_traits);
 
     let (targets, missing) = resolve_targets(&prog, &specs);
     let mut report = FileReport { source: source.to_path_buf(), missing, ..Default::default() };
@@ -796,7 +796,7 @@ pub fn verify_mir_text(
     only: &[String],
 ) -> Result<FileReport, String> {
     let prog =
-        parse::parse_program_scoped(mir, &enum_layouts(specs), &specs.crate_consts, &specs.const_generics, &specs.impl_owners, &specs.impl_traits);
+        parse::parse_program_scoped(mir, &enum_layouts(specs), &specs.crate_consts, &specs.const_generics, &specs.impl_owners, &specs.impl_traits, &specs.declared_traits);
     let (targets, missing) = resolve_targets(&prog, specs);
     let mut report = FileReport { missing, ..Default::default() };
     for (key, f) in select(&prog, &targets, only) {

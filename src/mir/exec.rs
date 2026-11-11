@@ -2415,6 +2415,23 @@ fn impl_self_loc(f: &MirFn) -> Option<(usize, usize)> {
     f.impl_loc
 }
 
+/// The `impl` block's self type as written -- the part between `impl` and `for` --
+/// or `None` for a free function or a non-`impl` name.
+///
+/// The *owner* is the type after `for`, which is the type a call's self is; the
+/// self type is what appears *before* `for`, and it is the conversion's source. For
+/// `impl From<Local> for u16` the owner is `u16` and the self type is `From<Local>`
+/// -- the trait and its parameter. A bare call path such as `<u16 as From<Local>>`
+/// carries no trait argument in its printed form, so only the source is left to
+/// tell a local `impl From<Local> for u16` from the library's `impl From<u8> for
+/// u16`, both of which own `u16`.
+fn impl_self_ty(name: &str) -> Option<String> {
+    let after = name.split_once("<impl at ")?.1;
+    let (_, rest) = after.split_once(">::")?;
+    let head = rest.split("::").next()?;
+    (!head.is_empty()).then(|| head.to_string())
+}
+
 /// The owner type of a method's `impl`, read from the source via the location in
 /// its definition name, or `None` when that cannot be established.
 ///
@@ -2446,29 +2463,132 @@ fn call_trait_path(name: &str) -> Option<String> {
 ///
 /// `want` is the trait path the call names (`std::convert::From`); `have` is the
 /// path the candidate's own `impl` block implements, read from the source, or
-/// `None` for an inherent `impl`.
+/// `None` for an inherent `impl`. `self_ty` is the call's self type -- the part
+/// between `as` and the trait name -- and `impl_self` is the candidate's own self
+/// type, the part between `impl` and `for`.
 ///
-/// The rule is one-sided on purpose: the call's trait must be a `::`-aligned
-/// suffix of the impl's trait. That accepts the spellings that really are the same
-/// trait -- a call `<u16 as From<u8>>::from` (the compiler shortened the path once
-/// the local `From` was in scope) against an impl written `impl std::convert::From`
-/// -- and rejects the collision that is the whole reason for this guard: a call
-/// `<u16 as std::convert::From<u8>>::from` against a local `impl From<u8> for u16`,
-/// whose bare `From` is *not* a suffix of `std::convert::From`, so the local body
-/// cannot answer a call the compiler resolved to the library trait.
+/// The rule is an identity match, not a suffix match. rustc prints a trait in a
+/// call as its *shortest crate-unique* path, so a bare `Trait` in the dump names
+/// this crate's crate-root trait only when the crate declares one; when it does
+/// not, the bare name is the shortening of the crate's *only* trait of that name
+/// (or an external trait), and the candidate's module-qualified path is what
+/// tells which. A suffix match would accept the unrelated `m::Trait` for a bare
+/// `Trait` call -- a false proof -- so the two spellings are reconciled exactly:
 ///
-/// An inherent candidate (`have` is `None`) can never answer a trait call: its
-/// method is not the trait's. That is what closes the `impl MyFrom<u8> for u16`
-/// case, where the impl's *trait* differs from the call's even though the method
-/// tail (`from`) matches.
+/// * identical paths match (`std::convert::From` vs `std::convert::From`);
+/// * a bare `want` (`From`) matches the candidate when the crate declares no
+///   trait of that name at all, or declares exactly one, and `have` is it -- the
+///   compiler would have printed that trait bare, so the candidate is the one the
+///   call named;
+/// * a bare `want` with a *local* `impl` of an imported trait (`<W as From<u8>>`,
+///   from `use std::convert::From;` plus `impl From<u8> for W`) matches when the
+///   candidate's self type is the call's -- the trait argument (`u8`) is the only
+///   thing that separates the local impl from the library's same-named one, and it
+///   is what the call still carries. Without it, a bare call with a primitive
+///   owner (`u16`) would be answered by the *model* while a local `impl
+///   From<Local> for u16` owns the same type -- a false proof. An `impl_self` that
+///   is itself the bare trait name (`impl From<u8> for u16`) carries the argument
+///   in the *owner* instead, so this arm only fires when the candidate's self type
+///   is not a plain trait path.
+/// * a bare `have` (`From`) matches a qualified `want` (`std::convert::From`)
+///   only when the crate declares no local trait of that name, so the bare name
+///   can only be the library trait -- and it is a `::`-aligned tail of `want`, so
+///   the two name the same trait.
+///
+/// Everything else is refused. An inherent candidate (`have` is `None`) can never
+/// answer a trait call: its method is not the trait's. That is what closes the
+/// `impl MyFrom<u8> for u16` case, where the impl's *trait* differs from the
+/// call's even though the method tail (`from`) matches.
 ///
 /// A trait call with no candidate to compare against is the caller's business; an
 /// exact-name match is handled before this is reached.
-fn trait_candidate_admits(want: &str, have: Option<&str>) -> bool {
+fn trait_candidate_admits(
+    prog: &MirProgram,
+    want: &str,
+    have: Option<&str>,
+    self_ty: &str,
+    impl_self: Option<&str>,
+) -> bool {
     let Some(have) = have else {
         return false;
     };
-    have == want || crate::mir::spec::is_path_suffix(have, want)
+    if have == want {
+        return true;
+    }
+    if want.contains("::") {
+        // `want` is qualified, so it is not the crate-root trait. `have` may be the
+        // bare tail rustc prints for the crate's *unique* trait of that name, which
+        // is this same trait only when it is that one.
+        return crate::mir::spec::is_path_suffix(want, have)
+            && local_traits_named(prog, want).is_some_and(|only| only.len() == 1 && only[0] == have);
+    }
+    // `want` is bare. rustc prints it that way for the crate's unique trait of that
+    // name, or for the crate-root trait when several share the name, or for an
+    // external trait it could not shorten further.
+    match local_traits_named(prog, want) {
+        // No local trait of that name: the bare name is an external trait, which no
+        // local `impl` of a *different* trait can answer. The one exception is a
+        // local `impl` of that imported trait itself, which the self type separates.
+        None => impl_self.is_some_and(|s| !s.contains("::") && s == self_ty),
+        // The crate's only trait of that name -- the one rustc prints bare.
+        Some(only) if only.len() == 1 => only[0] == have,
+        // Several share the name: rustc prints the crate-root one bare, and that is
+        // the `have == want` case handled above.
+        Some(_) => false,
+    }
+}
+
+/// The local traits declared with the last segment `name`, as their
+/// module-qualified paths; `None` when the crate declares none.
+///
+/// rustc prints a trait in a call as its shortest crate-unique path, so this set
+/// is exactly what decides whether a bare call name is this crate's trait (and
+/// which one) or must be an external trait. See [`trait_candidate_admits`].
+fn local_traits_named(prog: &MirProgram, name: &str) -> Option<Vec<String>> {
+    let bare = name.rsplit("::").next().unwrap_or(name);
+    let hits: Vec<String> = prog
+        .declared_traits
+        .iter()
+        .filter(|t| t.rsplit("::").next() == Some(bare))
+        .cloned()
+        .collect();
+    (!hits.is_empty()).then_some(hits)
+}
+
+/// Whether a call's self type, method and *trait path* name a method some local
+/// trait `impl` declares.
+///
+/// rustc prints a trait call with the trait path (`<W as From<u8>>::from`), not
+/// the `impl` location, so [`resolve_callee`] cannot match it by location. The two
+/// still name the same method exactly when the call's self type is the impl's
+/// owner, the call's method tail is a method that impl declares, and the call's
+/// trait is the impl's own trait under the identity rule of
+/// [`trait_candidate_admits`] -- an unrelated same-owner trait must not match. This
+/// keeps a *local* trait method from being answered by the model even when the
+/// trait's name is not declared in this crate: `use std::convert::From;` plus a
+/// local `impl From<u8> for W` prints its call `<W as From<u8>>::from`, whose tail
+/// `from` would otherwise be modelled as `core`'s conversion -- a false proof. A
+/// local `impl conv_shim::From for u16`, by contrast, does not name the call's
+/// `std::convert::From`, so the library conversion is still modelled. See
+/// [`try_intrinsic`].
+fn local_impl_declares(prog: &MirProgram, self_ty: &str, method_tail: &str, want: &str) -> bool {
+    prog.fns.iter().any(|g| {
+        let Some(loc) = impl_self_loc(g) else {
+            return false;
+        };
+        let Some(have_trait) = prog.impl_traits.get(&loc).map(String::as_str) else {
+            return false;
+        };
+        g.name.rsplit("::").next() == Some(method_tail)
+            && method_owner_type(prog, g).is_some_and(|owner| owner == self_ty)
+            && trait_candidate_admits(
+                prog,
+                want,
+                Some(have_trait),
+                self_ty,
+                impl_self_ty(&g.name).as_deref(),
+            )
+    })
 }
 
 /// Resolve a call name to the function in the dump it names.
@@ -2520,6 +2640,29 @@ fn resolve_callee(prog: &MirProgram, name: &str) -> Option<usize> {
     // `None` for a bare `Type::m`, which rustc prints for both an inherent method
     // and a trait method in scope, so no trait check applies there.
     let want_trait = call_trait_path(name);
+    // A trait's *default* method has no `impl` block in the dump: rustc prints its
+    // definition as `Trait::m` -- the trait's path, with no `<impl at` -- so the
+    // location lookup below cannot find it and its `self` type is the trait's
+    // `Self`. Match it by the trait path the call names and the method tail, and
+    // only when the two trait paths are *equal*: a default method is the only body
+    // for its trait, so the definition and the call print the same path for it,
+    // whereas admitting a bare local trait for a qualified call
+    // (`<u8 as std::cmp::Ord>::min` against a crate-root `Ord::min`) would be a
+    // false proof. See [`trait_candidate_admits`].
+    if let Some(want) = want_trait.as_deref() {
+        let owner = |g: &MirFn| {
+            let prefix = g.name.strip_suffix(tail)?;
+            let prefix = prefix.strip_suffix("::")?;
+            (!prefix.is_empty()).then(|| prefix.to_string())
+        };
+        if let Some(i) = prog.fns.iter().position(|g| {
+            g.impl_loc.is_none()
+                && g.name.rsplit("::").next() == Some(tail)
+                && owner(g).is_some_and(|have| have == want)
+        }) {
+            return Some(i);
+        }
+    }
     let mut hits = prog.fns.iter().enumerate().filter(|(_, g)| {
         if g.name.rsplit("::").next() != Some(tail) {
             return false;
@@ -2539,7 +2682,13 @@ fn resolve_callee(prog: &MirProgram, name: &str) -> Option<usize> {
             .and_then(|loc| prog.impl_traits.get(&loc))
             .map(String::as_str);
         match want_trait.as_deref() {
-            Some(want) => trait_candidate_admits(want, have_trait),
+            Some(want) => trait_candidate_admits(
+                prog,
+                want,
+                have_trait,
+                &want_ty,
+                impl_self_ty(&g.name).as_deref(),
+            ),
             // An inherent-looking call (`MyType::from`, with no ` as ` projection).
             // rustc prints both an inherent method and a trait method in scope this
             // way, so the candidate is *not* required to be inherent -- a bare
@@ -2908,6 +3057,34 @@ fn try_intrinsic(
         is_ord_callee(name) || matches!(op, intrinsics::Intrinsic::Conversion(_));
     if !name.contains("<impl") && !trait_method {
         return None;
+    }
+    // A *bare* trait path that names a local crate-root trait must not be answered
+    // by the model. rustc prints a crate-root trait's call bare (`<u8 as Ord>::min`),
+    // so a local `trait Ord` with a *default* body the dump prints as `Ord::min`
+    // (no `<impl`, so `resolve_callee` cannot match it) would otherwise be answered
+    // by `core`'s ordering -- a false proof of a call the compiler resolved to the
+    // local trait. A qualified path (`std::cmp::Ord`, `std::convert::From`) cannot
+    // name a local item, and a bare path with no local crate-root trait of that
+    // name is the library trait rustc shortened, so both are still modelled. See
+    // [`trait_candidate_admits`] for the same identity rule on the body side.
+    if let Some(t) = call_trait_path(name) {
+        if !t.contains("::") && prog.declared_traits.contains(&t) {
+            return None;
+        }
+    }
+    // A trait call whose self type and method a *local* trait impl declares must be
+    // answered by that body, not the model -- even when the trait's name is not
+    // declared here (`use std::convert::From;`). rustc prints the call with the
+    // trait path rather than the impl location, so the location lookup above cannot
+    // see it, but the owner type and the method tail name the same method exactly.
+    // Answering `<W as From<u8>>::from` from the model would be a false proof of a
+    // conversion the compiler resolved to the local body. See [`local_impl_declares`].
+    if let Some(t) = call_trait_path(name) {
+        let self_ty = call_type(name).unwrap_or_default();
+        let tail = name.rsplit("::").next().unwrap_or(name);
+        if local_impl_declares(prog, &self_ty, tail, &t) {
+            return None;
+        }
     }
     // A conversion is the one shape whose *two operand types* differ, so it reads
     // both from the call's own name rather than from the single argument's type,

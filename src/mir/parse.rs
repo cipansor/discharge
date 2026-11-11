@@ -593,6 +593,17 @@ pub struct MirProgram {
     /// and the local impl's bare `From` is not a suffix of that. See
     /// executor's `resolve_callee`.
     pub impl_traits: BTreeMap<(usize, usize), String>,
+    /// The traits the crate itself declares, as module-qualified paths (`From` for
+    /// a crate-root trait, `m::Trait` for one inside `mod m`). Empty when the
+    /// caller had no source.
+    ///
+    /// rustc prints a trait in a call as its *shortest crate-unique* path, so a
+    /// bare `Trait` in a dump names the crate-root trait only when the crate
+    /// declares no other trait of that name. Without this set a bare call name
+    /// cannot be told apart from an unrelated same-named trait in another module,
+    /// and a suffix match would let the wrong `impl` answer -- a false proof. See
+    /// the executor's `trait_candidate_admits`.
+    pub declared_traits: std::collections::BTreeSet<String>,
 }
 
 /// A variant's name and discriminant, for resolving a downcast.
@@ -1828,8 +1839,17 @@ pub fn parse_program_scoped(
     const_generics: &std::collections::BTreeSet<String>,
     impl_owners: &BTreeMap<(usize, usize), String>,
     impl_traits: &BTreeMap<(usize, usize), String>,
+    declared_traits: &std::collections::BTreeSet<String>,
 ) -> MirProgram {
-    parse_program_impl(text, enums, crate_consts, const_generics, impl_owners, impl_traits)
+    parse_program_impl(
+        text,
+        enums,
+        crate_consts,
+        const_generics,
+        impl_owners,
+        impl_traits,
+        declared_traits,
+    )
 }
 
 /// [`parse_program`] with the enum layouts from the source.
@@ -1847,6 +1867,7 @@ pub fn parse_program_with(text: &str, enums: &BTreeMap<String, EnumLayout>) -> M
         &std::collections::BTreeSet::new(),
         &BTreeMap::new(),
         &BTreeMap::new(),
+        &std::collections::BTreeSet::new(),
     )
 }
 
@@ -1857,12 +1878,14 @@ fn parse_program_impl(
     const_generics: &std::collections::BTreeSet<String>,
     impl_owners: &BTreeMap<(usize, usize), String>,
     impl_traits: &BTreeMap<(usize, usize), String>,
+    declared_traits: &std::collections::BTreeSet<String>,
 ) -> MirProgram {
     let lines: Vec<&str> = text.lines().collect();
     let mut prog = MirProgram {
         enums: enums.clone(),
         impl_owners: impl_owners.clone(),
         impl_traits: impl_traits.clone(),
+        declared_traits: declared_traits.clone(),
         ..MirProgram::default()
     };
     // Which bare names are ever used as a `const` at a use site, so a definition
@@ -2526,14 +2549,14 @@ fn add(_1: u32, _2: u32) -> u32 {
         // With it, the definition is kept so a contract can name it.
         let mut scoped = std::collections::BTreeSet::new();
         scoped.insert("ONLY".to_string());
-        let prog = parse_program_scoped(dump, &BTreeMap::new(), &scoped, &std::collections::BTreeSet::new(), &BTreeMap::new(), &BTreeMap::new());
+        let prog = parse_program_scoped(dump, &BTreeMap::new(), &scoped, &std::collections::BTreeSet::new(), &BTreeMap::new(), &BTreeMap::new(), &std::collections::BTreeSet::new());
         assert_eq!(prog.consts.get("ONLY"), Some(&Const::UInt(7, Some(Ty::U8))));
         // The tell must not resurrect a name the source did *not* declare: a
         // function-local `L` (used qualified) stays out of the table.
         let dump2 = "fn f() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
                      _0 = const f::L;\n        return;\n    }\n}\n\
                      const L: u8 = const 3_u8;\n";
-        let prog2 = parse_program_scoped(dump2, &BTreeMap::new(), &scoped, &std::collections::BTreeSet::new(), &BTreeMap::new(), &BTreeMap::new());
+        let prog2 = parse_program_scoped(dump2, &BTreeMap::new(), &scoped, &std::collections::BTreeSet::new(), &BTreeMap::new(), &BTreeMap::new(), &std::collections::BTreeSet::new());
         assert!(!prog2.consts.contains_key("L"), "a name not in the source's set stays out");
     }
 
@@ -2557,7 +2580,7 @@ fn add(_1: u32, _2: u32) -> u32 {
                     const K: u8 = const 3_u8;\n";
         let mut scoped = std::collections::BTreeSet::new();
         scoped.insert("K".to_string());
-        let prog = parse_program_scoped(dump, &BTreeMap::new(), &scoped, &std::collections::BTreeSet::new(), &BTreeMap::new(), &BTreeMap::new());
+        let prog = parse_program_scoped(dump, &BTreeMap::new(), &scoped, &std::collections::BTreeSet::new(), &BTreeMap::new(), &BTreeMap::new(), &std::collections::BTreeSet::new());
         assert!(
             !prog.consts.contains_key("K"),
             "a qualified-only use means the bare definition is that local: {:?}",
@@ -2597,6 +2620,7 @@ fn add(_1: u32, _2: u32) -> u32 {
             &std::collections::BTreeSet::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &std::collections::BTreeSet::new(),
         );
         assert_eq!(
             prog.consts.get("K"),
@@ -2636,6 +2660,7 @@ fn add(_1: u32, _2: u32) -> u32 {
             &std::collections::BTreeSet::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &std::collections::BTreeSet::new(),
         );
         assert!(
             !prog.consts.contains_key("L"),

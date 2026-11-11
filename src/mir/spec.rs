@@ -209,6 +209,16 @@ pub struct Specs {
     /// is not a suffix of that. See `impl_trait` and the executor's
     /// `resolve_callee`.
     pub impl_traits: BTreeMap<(usize, usize), String>,
+    /// The traits the crate itself declares, as module-qualified paths: `From` for
+    /// a crate-root trait, `m::Trait` for one inside `mod m`.
+    ///
+    /// rustc prints a trait in a call as its *shortest crate-unique* path, so a
+    /// bare `Trait` in a dump names this crate's crate-root trait only when the
+    /// crate declares no other trait of that name. Without this set a bare call
+    /// name cannot be told apart from an unrelated same-named trait in another
+    /// module, and a suffix match would let the wrong `impl` answer -- a false
+    /// proof. See the executor's `trait_candidate_admits`.
+    pub declared_traits: BTreeSet<String>,
     /// Contracts on methods, keyed by `(impl line, impl column, method name)`.
     ///
     /// A method's contract cannot live in [`Self::by_fn`] under its bare name: two
@@ -1035,6 +1045,189 @@ fn is_absolute_trait_path(path: &str) -> bool {
     matches!(first, "std" | "core" | "alloc" | "crate" | "self" | "super")
 }
 
+/// The traits the crate declares, as module-qualified paths (`Trait` for a
+/// crate-root trait, `m::Trait` for one inside `mod m`).
+///
+/// rustc prints a trait in a call as its *shortest crate-unique* path, so a bare
+/// name in a dump is this crate's crate-root trait only when one exists; when it
+/// does not, a bare name is the shortening of the crate's only trait of that name
+/// (or an external trait). Recording the declared set is what lets the executor
+/// tell those apart instead of treating a same-named suffix as identity. See
+/// [`Specs::declared_traits`].
+pub(crate) fn declared_traits(scopes: &[LineScope], lines: &[&str]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for (idx, raw) in lines.iter().enumerate() {
+        // `item_head` already ignores an `impl` line and every other item kind.
+        let Some((ItemKind::Trait, name)) = item_head(raw) else {
+            continue;
+        };
+        let qualified = if scopes[idx].path.is_empty() {
+            name
+        } else {
+            format!("{}::{}", scopes[idx].path.join("::"), name)
+        };
+        out.insert(qualified);
+    }
+    out
+}
+
+/// Qualify a trait path written in an `impl` header the way rustc prints a call
+/// to it: resolve a leading name through the module's imports, then prefix the
+/// enclosing module path.
+///
+/// `use std::convert::From;` makes a bare `From` inside that module the standard
+/// trait, whose call prints as `std::convert::From`; without resolving the import
+/// the scanner would record `m::From` and no call would match -- a lost proof. A
+/// path that already names a crate (`std::…`, `core::…`) is kept as written, and a
+/// bare name with no import is prefixed with the module, which is how rustc prints
+/// a module-local trait. See [`Specs::impl_traits`].
+fn qualify_trait(
+    written: &str,
+    scope: &[String],
+    imports: &BTreeMap<String, String>,
+) -> String {
+    if is_absolute_trait_path(written) {
+        return written.to_string();
+    }
+    let first = written.split("::").next().unwrap_or(written);
+    if let Some(full) = imports.get(first) {
+        return format!("{full}{}", &written[first.len()..]);
+    }
+    if scope.is_empty() {
+        written.to_string()
+    } else {
+        format!("{}::{}", scope.join("::"), written)
+    }
+}
+
+/// The text of an `impl` header, spanning lines until its body-opening `{` (or the
+/// `;` of a bodyless item).
+///
+/// Rust permits the header to wrap, so `impl Trait\n    for Foo {` declares the
+/// same impl as a one-line spelling. Reading only the `impl` keyword's own line
+/// loses the trait there, and a lost trait is a refused projected call -- a lost
+/// proof. See [`extract`].
+fn impl_header(lines: &[&str], start: usize) -> String {
+    let mut out = String::new();
+    let mut angle = 0i32;
+    let mut seen_angle = false;
+    for raw in &lines[start..] {
+        let mut line = *raw;
+        // Drop a trailing line comment so a `{` inside it is not the body brace.
+        if let Some(i) = line.find("//") {
+            line = &line[..i];
+        }
+        let mut cut = line.len();
+        for (i, c) in line.char_indices() {
+            match c {
+                '<' if !seen_angle => {
+                    angle += 1;
+                    seen_angle = true;
+                }
+                '<' if angle > 0 => angle += 1,
+                '>' if angle > 0 => angle -= 1,
+                '{' if angle == 0 => {
+                    cut = i;
+                    break;
+                }
+                ';' if angle == 0 => {
+                    cut = i;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        out.push_str(&line[..cut]);
+        if cut < line.len() {
+            break;
+        }
+        out.push(' ');
+    }
+    out
+}
+
+/// The `use` imports visible on each line, keyed by the enclosing module path.
+///
+/// A trait's *written* name need not name a trait the crate declares: `use
+/// std::convert::From;` makes a bare `From` inside that module the standard
+/// trait, and rustc prints the call with the library path it resolved. Without
+/// this map the scanner would qualify the impl with its own module
+/// (`m::From`) and no call would match it -- a lost proof. See [`extract`].
+fn module_imports(scopes: &[LineScope], lines: &[&str]) -> Vec<BTreeMap<String, String>> {
+    let mut out: Vec<BTreeMap<String, String>> = vec![BTreeMap::new(); lines.len()];
+    let mut current: BTreeMap<String, String> = BTreeMap::new();
+    let mut last_key: Option<Vec<String>> = None;
+    for (idx, raw) in lines.iter().enumerate() {
+        let key = scopes[idx].path.clone();
+        if last_key.as_ref() != Some(&key) {
+            current = BTreeMap::new();
+            last_key = Some(key.clone());
+        }
+        for (short, full) in parse_use(raw) {
+            current.insert(short, full);
+        }
+        out[idx] = current.clone();
+    }
+    out
+}
+
+/// The `(short name, full path)` pairs a `use` item introduces.
+///
+/// Handles `use a::b::C;`, `use a::b::C as D;`, `use a::b::{C, D};` and the
+/// `crate::`/`self::`/`super::` roots. A glob or a re-export with no name to bind
+/// is skipped: the map is a hint for qualification, and a wrong entry would be
+/// worse than a missing one.
+fn parse_use(raw: &str) -> Vec<(String, String)> {
+    let rest = raw.trim_start();
+    let rest = rest.strip_prefix("pub ").unwrap_or(rest);
+    let rest = rest.strip_prefix("use ").unwrap_or(rest);
+    if rest == raw.trim_start() {
+        return Vec::new();
+    }
+    let mut rest = rest.trim();
+    rest = rest.strip_suffix(';').unwrap_or(rest).trim();
+    // A grouped import: `a::b::{C, D as E}`.
+    if let Some((prefix, group)) = rest.split_once("::{") {
+        let group = group.strip_suffix('}').unwrap_or(group);
+        let mut out = Vec::new();
+        for item in group.split(',') {
+            let item = item.trim();
+            if item.is_empty() || item.contains('*') {
+                continue;
+            }
+            let (path, alias) = match item.split_once(" as ") {
+                Some((p, a)) => (p.trim(), a.trim()),
+                None => (item, ""),
+            };
+            let full = format!("{}::{}", prefix, path);
+            let short = if alias.is_empty() {
+                path.rsplit("::").next().unwrap_or(path).to_string()
+            } else {
+                alias.to_string()
+            };
+            out.push((short, full));
+        }
+        return out;
+    }
+    if rest.contains('*') {
+        return Vec::new();
+    }
+    let (path, alias) = match rest.split_once(" as ") {
+        Some((p, a)) => (p.trim(), a.trim()),
+        None => (rest, ""),
+    };
+    let short = if alias.is_empty() {
+        path.rsplit("::").next().unwrap_or(path).to_string()
+    } else {
+        alias.to_string()
+    };
+    if short.is_empty() {
+        Vec::new()
+    } else {
+        vec![(short, path.to_string())]
+    }
+}
+
 /// Extract contracts from Rust source text.
 ///
 /// The scanner is line-oriented and deliberately shallow: it collects
@@ -1070,28 +1263,36 @@ pub fn extract(source: &str) -> Specs {
     let enclosing: Vec<Option<(usize, usize)>> =
         scopes.iter().map(|s| s.impl_loc).collect();
     let scope_path: Vec<Vec<String>> = scopes.iter().map(|s| s.path.clone()).collect();
-    for (idx, raw) in source.lines().enumerate() {
+    let lines: Vec<&str> = source.lines().collect();
+    let imports = module_imports(&scopes, &lines);
+    for (idx, raw) in lines.iter().enumerate() {
         if let Some(col) = impl_keyword_col(raw) {
-            if let Some(owner) = impl_owner(raw) {
+            // The header can wrap over several lines, so the whole header through
+            // its body-opening `{` is what names the owner and the trait. Reading
+            // only the `impl` keyword's own line loses a trait declared as
+            // `impl Trait\n    for Foo {` -- a refused projected call, a lost
+            // proof. See [`impl_header`].
+            let header = impl_header(&lines, idx);
+            if let Some(owner) = impl_owner(&header) {
                 specs.impl_owners.insert((idx + 1, col), owner);
             }
-            if let Some(tr) = impl_trait(raw) {
-                // Qualify the trait with its enclosing module path, because a call
-                // names it that way. `impl From<u8> for u16` inside `mod m` is
-                // `m::From`, which is exactly how rustc prints a call to it
-                // (`<u16 as m::From<u8>>::from`), while a bare `From` at the crate
-                // root stays `From`. A path that already names a crate
-                // (`std::convert::From`, `core::…`, `crate::…`) is kept as written,
-                // since prefixing a module would make it name nothing.
-                let qualified = if is_absolute_trait_path(&tr) || scope_path[idx].is_empty() {
-                    tr
-                } else {
-                    format!("{}::{}", scope_path[idx].join("::"), tr)
-                };
+            if let Some(tr) = impl_trait(&header) {
+                // Qualify the trait the way a call prints it: resolve a module
+                // import first (`use std::convert::From;` makes the bare `From`
+                // the library trait), then prefix the enclosing module for a
+                // module-local trait. A path that already names a crate
+                // (`std::convert::From`, `core::…`, `crate::…`) is kept as
+                // written. See [`qualify_trait`].
+                let qualified = qualify_trait(&tr, &scope_path[idx], &imports[idx]);
                 specs.impl_traits.insert((idx + 1, col), qualified);
             }
         }
     }
+    // The traits the crate declares, so the executor can tell a *bare* call name
+    // (`<u16 as Trait>::m`) that names this crate's crate-root trait from the
+    // collision where the same bare name could be an unrelated module trait that
+    // rustc shortened. See [`Specs::declared_traits`].
+    specs.declared_traits = declared_traits(&scopes, &lines);
 
     // Struct layouts, read in the same pass. The MIR dump names a struct
     // (`_1: &Config`) but never prints its fields, so a contract like

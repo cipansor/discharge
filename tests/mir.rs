@@ -1572,6 +1572,119 @@ fn a_local_trait_named_from_does_not_answer_the_std_trait() {
     }
 }
 
+/// A bare trait call must not be answered by the model when the crate declares a
+/// crate-root trait of that name with a *default* body.
+///
+/// rustc prints a crate-root trait's call bare (`<u8 as Ord>::min`), and a default
+/// method has no `impl` block in the dump -- its definition is printed as
+/// `Ord::min`. So `resolve_callee` cannot match it by location, and before the
+/// `declared_traits` guard the model answered `<u8 as Ord>::min` from `core`'s
+/// ordering. `crate_root_ord_default_*` pair pins both directions: the body returns
+/// a constant, so the verifying half proves the body was read and the refuted half
+/// proves the model was not consulted.
+#[test]
+fn a_bare_crate_root_trait_call_is_not_answered_by_the_model() {
+    let verified = ["crate_root_ord_default_verifies_from_its_body"];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify from the default body, got: {o}");
+    }
+    let refuted = ["crate_root_ord_default_is_not_the_model_tripwire"];
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!(
+                "`{name}` claims `core`'s ordering for a call the compiler resolved to \
+                 the local trait and must be refuted, got: {o}"
+            );
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
+/// An unrelated same-named trait must not answer a bare trait call.
+///
+/// `m::Trait` is a different trait from the crate-root `Trait`, but rustc prints a
+/// *bare* `Trait` call, so a suffix match let the module trait's body answer the
+/// crate-root trait's call -- a false proof. `suffix_collision_*` pin both
+/// directions: the call names the crate-root trait (whose default body returns
+/// `9`), and the module trait's body returns `7`, so the refuted half fails only if
+/// the module trait was *not* consulted.
+#[test]
+fn an_unrelated_same_named_trait_does_not_answer_a_bare_call() {
+    let verified = ["suffix_collision_verifies_from_the_named_trait"];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify from the crate-root trait, got: {o}");
+    }
+    let refuted = ["suffix_collision_is_not_the_module_trait_tripwire"];
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!(
+                "`{name}` claims the module trait's body for a call naming the crate-root \
+                 trait and must be refuted, got: {o}"
+            );
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
+/// A local trait method reached through an imported library trait path must not be
+/// answered by the model.
+///
+/// `use std::convert::From;` plus a local `impl From<Local> for u16` prints the call
+/// `<u16 as From<Local>>::from` -- the *bare* library name, because the local `From`
+/// is the only one in scope. The crate declares no trait named `From`, so the
+/// `declared_traits` guard alone would not refuse it, and the model would answer a
+/// call the compiler resolved to the local body. The owner (`u16`), the method
+/// (`from`) and the *self type* (`Local`, the conversion's source) together name
+/// the same method. This lives in its own source file rather than the shared corpus
+/// because the corpus's own `conv_shim::From` forces rustc to qualify the library
+/// trait, which hides the bare spelling.
+#[test]
+fn a_local_impl_of_an_imported_trait_does_not_answer_the_model() {
+    let src = r#"
+pub struct Local;
+impl From<Local> for u16 {
+    fn from(_x: Local) -> Self {
+        107
+    }
+}
+/// requires: true
+/// ensures: ret == 107
+pub fn imported_from_verifies_from_the_local_body() -> u16 {
+    <u16 as From<Local>>::from(Local)
+}
+/// requires: true
+/// ensures: ret == 7
+pub fn imported_from_is_not_the_model_tripwire() -> u16 {
+    <u16 as From<Local>>::from(Local)
+}
+"#;
+    let o = verify_src("imported_from_verifies_from_the_local_body", src);
+    let Some(o) = o else { return };
+    assert!(
+        o.is_verified(),
+        "`imported_from_verifies_from_the_local_body` must verify from the local body, got: {o}"
+    );
+    let o = verify_src("imported_from_is_not_the_model_tripwire", src);
+    let Some(o) = o else { return };
+    match &o {
+        FnOutcome::Failed { kind, .. } => {
+            assert_eq!(kind, "postcondition", "the tripwire got: {o}");
+        }
+        _ => panic!(
+            "`imported_from_is_not_the_model_tripwire` claims the modelled conversion for a \
+             call the compiler resolved to a local impl and must be refuted, got: {o}"
+        ),
+    }
+}
+
 /// The bitwise complement `!x`, pinned by a true half and a tripwire.
 ///
 /// `!x` is `all_ones ^ x` at the *operand's* width. The model reads that width

@@ -7694,7 +7694,7 @@ pub fn ord_min_of_min_and_one_is_min(x: i8) -> i8 {
 /// requires: y <= 100
 /// ensures: ret <= 100
 pub fn explicit_ord_min_is_modelled(x: u8, y: u8) -> u8 {
-    Ord::min(x, y)
+    std::cmp::Ord::min(x, y)
 }
 
 /// The false direction: `min(x, y) == x` holds only when `x <= y`, so with no
@@ -7839,3 +7839,93 @@ pub fn unsigned_source_widens_to_signed_destination(x: u8) -> i16 {
     i16::from(x)
 }
 
+
+// ---------------------------------------------------------------------------
+// Trait-identity soundness: a bare call name must not be answered by a
+// same-named trait's body, and a local impl of an *imported* library trait must
+// not be answered by the model. Each pair is a verifying half (the body must be
+// the one read) and a refuting half (the wrong answer must not be proved).
+// ---------------------------------------------------------------------------
+
+/// A crate-root trait with a *default* body, named like a modelled `core` trait.
+///
+/// rustc prints its call bare (`<u8 as Ord>::min`) and prints the default method's
+/// definition as `Ord::min` -- no `impl` block, so the same-dump lookup cannot
+/// match it by location. The body returns its first operand -- deliberately not
+/// `core`'s smaller operand -- so a call must read it and never `core`'s ordering.
+/// The bound is `Copy` (not `Sized`) so the unused operand needs no drop, and the
+/// impl is for `u16`, not `u8`, so the corpus's other `x.min(y)` calls on `u8`
+/// stay unambiguous.
+pub trait Ord: Copy {
+    fn min(self, _other: Self) -> Self {
+        self
+    }
+}
+
+impl Ord for u16 {}
+
+/// The default body returns its first operand (`x == 2` here), so this verifies
+/// only if the local trait's body answered. The model would return `min(x, y)`.
+/// requires: x == 2
+/// requires: y == 1
+/// ensures: ret == 2
+pub fn crate_root_ord_default_verifies_from_its_body(x: u16, y: u16) -> u16 {
+    <u16 as Ord>::min(x, y)
+}
+
+/// The false direction: `core`'s ordering returns `1` for `(2, 1)`, but the local
+/// trait's body returns `2`, so this must be refuted. A model that answered the
+/// bare call would *prove* it -- the false proof this pins.
+/// requires: x == 2
+/// requires: y == 1
+/// ensures: ret == 1
+pub fn crate_root_ord_default_is_not_the_model_tripwire(x: u16, y: u16) -> u16 {
+    <u16 as Ord>::min(x, y)
+}
+
+/// The crate-root trait the bare call names, and an unrelated module trait that
+/// shares its name.
+///
+/// rustc prints a bare `Trait` call when the crate-root `Trait` is in scope, even
+/// though a module trait of the same name exists elsewhere -- the shortest path
+/// that is unambiguous *at the call site*. A suffix match let the module trait's
+/// body answer the crate-root trait's call; its body returns `7`, distinct from the
+/// crate-root trait's `9`, so the two are separable.
+pub mod suffix_shim {
+    pub trait Trait {
+        fn pick(&self) -> u8 {
+            7
+        }
+    }
+    pub struct Other;
+    impl Trait for Other {}
+}
+
+/// The crate-root trait the bare call names.
+pub trait Trait {
+    fn pick(&self) -> u8 {
+        9
+    }
+}
+
+pub struct Root;
+
+impl Trait for Root {}
+
+/// The call names the crate-root trait (bare `Trait`, because `Root: Trait` is in
+/// scope at the call site), whose body returns `9`. It verifies only if that trait
+/// -- not `suffix_shim::Trait`'s `7` -- answered.
+/// requires: true
+/// ensures: ret == 9
+pub fn suffix_collision_verifies_from_the_named_trait(r: &Root) -> u8 {
+    <Root as Trait>::pick(r)
+}
+
+/// The false direction: the module trait's body returns `7`, not `9`, so this must
+/// be refuted. A suffix match answered the bare call from `suffix_shim::Trait` and
+/// *proved* it -- the false proof this pins.
+/// requires: true
+/// ensures: ret == 7
+pub fn suffix_collision_is_not_the_module_trait_tripwire(r: &Root) -> u8 {
+    <Root as Trait>::pick(r)
+}

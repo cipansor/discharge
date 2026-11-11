@@ -7727,3 +7727,44 @@ Corpus coverage `examples/mir_targets/realistic.rs` **353 → 354** decided over
 contracts (the two new `conv_shim` entries: one verifies from the local body, one refutes the
 library call it must not answer). No new SMT primitives: the guard is a name comparison, and the
 model is unchanged.
+
+## Trait identity: the bare-name and imported-trait spellings, and the self-type key
+
+The `impl_traits` guard above compared a call's trait path with the candidate impl's own path
+by `::`-aligned suffix. Two more false proofs hid behind the suffix reading, both surfaced by
+adversarial review and both now closed.
+
+**A bare name is the crate-root trait only when the crate declares one.** rustc prints a trait
+in a call as its *shortest crate-unique* path. `mod m { pub trait Trait { … } }` plus a
+crate-root `trait Trait { … }` makes the crate-root call print bare (`Trait::pick`) while the
+module trait prints qualified (`m::Trait::pick`). A suffix match accepted `m::Trait` for the
+bare call, so a contract written against the crate-root body verified from the module's body —
+a false proof. The fix is `Specs::declared_traits` (the crate's own traits as module-qualified
+paths, from `spec::declared_traits`) and a rewrite of `trait_candidate_admits` as an *identity*
+rule: identical paths match; a bare `want` matches only the crate's *unique* trait of that name
+(or the crate-root one when several share the name, which is the `have == want` case); a bare
+`have` matches a qualified `want` only when the crate declares no local trait of that name, so
+the bare name can only be the library trait.
+
+**A local `impl` of an *imported* trait needs the self type, not just the trait path.** A
+crate that only *imports* a library trait — `use std::convert::From;` plus a local
+`impl From<Local> for u16` — prints its call `<u16 as From<Local>>::from`: the bare library
+name, because the local `From` is the only one in scope. The crate declares no trait named
+`From`, so `declared_traits` alone does not refuse it, and the model would answer a call the
+compiler resolved to the local body. The owner (`u16`), the method (`from`) and the trait path
+(`From`) all match the model's conversion, so none of them separate it. What does is the call's
+*self type* (`Local`, the conversion's source, read by `call_trait_path`'s caller from between
+`as` and the trait name) against the candidate impl's own self type (`impl_self_ty`, the part
+between `impl` and `for`). `trait_candidate_admits` now takes both: when `want` is bare and the
+crate declares no trait of that name, an impl whose self type is not a plain trait path matches
+only if it equals the call's self type.
+
+The corpus cannot express the imported spelling: its own `conv_shim::From` forces rustc to
+qualify the library trait (`<u16 as std::convert::From<…>>::from`), which is the *other*
+branch. The regression test `a_local_impl_of_an_imported_trait_does_not_answer_the_model` uses
+its own inline source (via `verify_src`) so no local `From` competes with the import.
+
+`scripts/test-count.sh` **777 → 780** passed, 0 failed; `scripts/gate.sh` **ALL GATES GREEN**
+(clippy std + no_std, tests, no_std bare-metal, zero deps, rustdoc ×3, MSRV 1.85, artifacts,
+unsafe surface still 2). No new SMT primitives: both guards are name/type comparisons, and the
+model is unchanged.
