@@ -7745,3 +7745,51 @@ pub fn local_ord_min_is_not_the_model_tripwire(x: u8, y: u8) -> u8 {
     ord_shim::Ord::min(x, y)
 }
 
+/// A widening conversion, `u16::from(u8)`, is a *trait* method too -- the dump
+/// spells `<u16 as From<u8>>::from` -- so like `Ord::min` it is modelled as a
+/// fallback behind the same-dump lookup. The value is the source widened by its own
+/// signedness, which for an unsigned source is a zero-fill. The contract spells the
+/// comparison at the destination width (`x as u16`) because a contract's two
+/// operands must share a width; the cast is the same widening the model performs.
+/// requires: true
+/// ensures: ret == x as u16
+pub fn from_u8_is_modelled(x: u8) -> u16 {
+    u16::from(x)
+}
+
+/// The `Into` direction of the same conversion reaches one model: `x.into()` on a
+/// `u8` is `<u8 as Into<u16>>::into`, whose destination is the type parameter.
+/// requires: true
+/// ensures: ret == x as u16
+pub fn into_u8_is_modelled(x: u8) -> u16 {
+    x.into()
+}
+
+/// A *signed* source widens by sign-extension, so `x` keeps its value across the
+/// width change -- and `i8::MIN` stays `i8::MIN`, which is what separates a
+/// sign-extension from a zero-fill. The contract compares at the destination width,
+/// as above.
+/// requires: x == i8::MIN
+/// ensures: ret == x as i16
+pub fn signed_widening_keeps_negative_values(x: i8) -> i16 {
+    i16::from(x)
+}
+
+/// The false direction: `-1i8` widens to `-1i16`, whose bits are `0xffff`, not
+/// `255`. A model that zero-filled a signed source -- the `truncate` mistake -- would
+/// return `255` and *prove* this, so it is the tripwire for that reading.
+/// requires: x == -1
+/// ensures: ret == 255
+pub fn signed_widening_is_not_zero_fill_tripwire(x: i8) -> i16 {
+    i16::from(x)
+}
+
+/// A widening that also *changes signedness*: `i16::from(u8)` zero-fills (the
+/// source is unsigned), so `255u8` stays `255` and never becomes `-1`, even though
+/// the destination is signed.
+/// requires: x == 255
+/// ensures: ret == 255
+pub fn unsigned_source_widens_to_signed_destination(x: u8) -> i16 {
+    i16::from(x)
+}
+

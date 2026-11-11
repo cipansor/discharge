@@ -49,6 +49,13 @@
 //!   and `i8::MIN` -- whose bits sort the other way unsigned -- is ordered
 //!   correctly. Only the standard library's `Ord` path is accepted; see
 //!   [`names_ord_trait`].
+//! * `From::from`/`Into::into` — the two *widening conversion* trait methods,
+//!   spelled `<u16 as From<u8>>::from` and `<u8 as Into<u16>>::into`. Unlike every
+//!   other shape the two operand *types* differ, so the model reads both from the
+//!   call's name and extends the source by its *own* signedness (`i8::MIN` widens
+//!   to `i8::MIN`, `255u8` to `255u16`). Only a strict widening between modelled
+//!   integers is accepted -- which is every integer `From` `core` implements, so a
+//!   real call is never a guess; see [`Conversion`].
 //! * `add_signed`/`add_unsigned` — an addition whose two operands have *opposite*
 //!   signedness (`u8::wrapping_add_signed` adds an `i8` to a `u8`). The value is a
 //!   plain addition of the two words, so it is the same term in both directions;
@@ -81,7 +88,7 @@
 //!   answer about a *character* or a *sign*, not about the bits the engine holds,
 //!   and each would need its own definition rather than a shared one.
 
-use crate::mir::parse::BinOp;
+use crate::mir::parse::{BinOp, Ty};
 use crate::smt::{self, Pred, Var};
 
 /// The widest bit-vector the divider is asked about.
@@ -208,6 +215,16 @@ pub enum Intrinsic {
     /// modelled. It is total and reads the sign to pick the ordering, so both
     /// signednesses are modelled.
     MinMax(MinMaxKind),
+    /// A widening integer conversion: `From::from` or `Into::into`.
+    ///
+    /// Like [`Intrinsic::MinMax`] this is a *trait* method, so the dump spells a
+    /// call `<u16 as From<u8>>::from` (or `<u8 as Into<u16>>::into`) rather than a
+    /// `core::num::<impl …>` path, and the model is a fallback behind the same-dump
+    /// lookup. Unlike every other shape the two operand *types* differ -- that is
+    /// the whole content of the call -- so the source and destination signednesses
+    /// are carried explicitly. Only a strictly *widening* conversion is modelled;
+    /// see [`Conversion`].
+    Conversion(Conversion),
 }
 
 /// Which family of a `core::num` method name a call belongs to.
@@ -269,6 +286,103 @@ pub enum MinMaxKind {
     Min,
     /// The larger of the two operands: `a >= b ? a : b`.
     Max,
+}
+
+/// A widening integer conversion: `u16::from(x)` where `x: u8`, `x.into()`.
+///
+/// The two operand types differ -- that is what the call *is* -- so unlike every
+/// other shape the model reads two widths and two signednesses. The value is the
+/// source widened to the destination's width, and the *source's* signedness picks
+/// the extension: a signed source sign-extends (`-1i8` to `i16` is `-1`), an
+/// unsigned one zero-fills (`255u8` to `u16` is `255`). The destination's
+/// signedness only labels the result.
+///
+/// # Why only a *widening* conversion is modelled
+///
+/// `core` implements `From` for the integer types only where the source fits
+/// entirely in the destination, and never across signedness: `u16::from(u8)`,
+/// `i16::from(i8)` and `i16::from(u8)` exist, while `u16::from(i8)` and
+/// `i8::from(u8)` do not (they would not be total, so `core` has no such `impl`).
+/// So a real `<D as From<S>>::from` call with `S` and `D` both integer is
+/// *necessarily* a strict widening, and the widening is exactly a zero- or
+/// sign-extension of the source's `w` bits. A model that saw only a *narrowing*
+/// or a same-width call would have to guess at a truncation `core` never performs;
+/// [`eval`] refuses those by name, and the executor refuses a call whose types it
+/// cannot read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Conversion {
+    /// `From::from`: `<D as From<S>>::from(x)`.
+    From,
+    /// `Into::into`: `<S as Into<D>>::into(x)`.
+    Into,
+}
+
+/// The source and destination types of a conversion call, read from its name.
+///
+/// A conversion's two types are both in the name, and reading them there is what
+/// keeps the model independent of how the executor happens to have typed the
+/// argument: `From`'s spelling is `<DEST as From<SRC>>::from`, so the *self* type
+/// is the destination and the type parameter is the source, while `Into`'s is
+/// `<SRC as Into<DEST>>::into`, where they are the other way round. A name whose
+/// self type or parameter does not parse as an integer is refused by the caller,
+/// which reads the widths with [`int_width`] and requires the destination to be at
+/// least as wide as the source -- a real integer `From` is always a widening.
+pub fn conversion_types(name: &str, kind: Conversion) -> Option<(Ty, Ty)> {
+    let (self_part, after_as) = name.rsplit_once(" as ")?;
+    let self_ty = Ty::parse(self_part.trim_start_matches('<'));
+    let open = after_as.find('<')?;
+    let close = after_as.find(">::")?;
+    if close <= open {
+        return None;
+    }
+    // `after_as` is `TRAIT<PARAM>>::method`, so the slice up to `>::` carries the
+    // trait's own closing `>`. An integer type never contains `>`, so dropping a
+    // trailing one is exactly the type parameter and not a nested generic.
+    let param = after_as[open + 1..close].trim_end_matches('>');
+    let param_ty = Ty::parse(param);
+    Some(match kind {
+        Conversion::From => (param_ty, self_ty),
+        Conversion::Into => (self_ty, param_ty),
+    })
+}
+
+/// Whether a type is one of the integer types the model reads a width and a
+/// signedness from.
+///
+/// `u128`/`i128` are excluded: the engine is 64 bits wide, so a conversion *into*
+/// them has no term to build. `bool` and `char` are excluded too -- `u8::from(true)`
+/// and `u32::from('a')` are real `From` impls, but their source is not an integer
+/// whose bits the engine holds, so there is nothing to widen.
+pub fn is_modelled_int(ty: &Ty) -> bool {
+    matches!(
+        ty,
+        Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::Usize | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64
+            | Ty::Isize
+    )
+}
+
+/// The width of a modelled integer type, in bits.
+pub fn int_width(ty: &Ty) -> Option<u8> {
+    if !is_modelled_int(ty) {
+        return None;
+    }
+    ty.width()
+}
+
+/// The bit-vector of a conversion's argument: the source widened to `dst_w`.
+///
+/// `x` is the source term at its own width, `src_signed` its signedness. A signed
+/// source sign-extends and an unsigned one zero-fills, which is the *same* choice
+/// the executor's `as`-cast makes (see the `Rvalue::Cast` arm); a conversion and a
+/// cast of the same shape are the same term. When the destination is no wider than
+/// the source -- which a real `From` never is, but a malformed dump could spell --
+/// the value is truncated, so nothing here can build a term wider than `dst_w`.
+pub fn convert_value(x: Var, src_signed: bool, dst_w: u8) -> Var {
+    if src_signed {
+        smt::sign_extend(x, dst_w)
+    } else {
+        smt::truncate(x, dst_w)
+    }
 }
 
 /// A bit count.
@@ -378,6 +492,20 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
         let kind = if short == "min" { MinMaxKind::Min } else { MinMaxKind::Max };
         return Some(Intrinsic::MinMax(kind));
     }
+    // `From::from`/`Into::into`. These are *trait* methods with a type parameter,
+    // so the dump spells `<u16 as From<u8>>::from`: the trait path is read the same
+    // way `Ord`'s is (see `trait_path`), which is what keeps a module-qualified
+    // local trait (`m::From`) out. The two operand *types* are not in this name --
+    // they are read from the call's arguments and destination by the executor --
+    // so `classify` can only answer "this is a conversion"; whether it is one the
+    // model covers is decided there, from the types.
+    if short == "from" || short == "into" {
+        if !names_conversion_trait(name) {
+            return None;
+        }
+        let kind = if short == "from" { Conversion::From } else { Conversion::Into };
+        return Some(Intrinsic::Conversion(kind));
+    }
     let (family, op) = if let Some(rest) = short.strip_prefix("wrapping_") {
         (Family::Wrapping, rest)
     } else if let Some(rest) = short.strip_prefix("saturating_") {
@@ -442,18 +570,53 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
 /// caller's same-dump lookup is what answers the one spelling that could still
 /// collide (a crate-root `Ord`, which the prelude also names `Ord`).
 pub fn names_ord_trait(name: &str) -> bool {
-    let after_as = match name.rsplit_once(" as ") {
-        Some((_, rest)) => rest,
-        // A bare `min`/`max` has no `as`, so it is not a trait call and is not
-        // `Ord`'s: a free function named `min` is in the dump as `min`, and the
-        // same-dump lookup answers it.
-        None => return false,
-    };
-    let trait_path = match after_as.split_once(">::") {
-        Some((trait_path, _)) => trait_path,
-        None => return false,
-    };
-    matches!(trait_path, "Ord" | "core::cmp::Ord" | "std::cmp::Ord")
+    matches!(trait_path(name), Some("Ord" | "core::cmp::Ord" | "std::cmp::Ord"))
+}
+
+/// Whether a `from`/`into` name is `core`'s own `From`/`Into`, and theirs alone.
+///
+/// The dump spells the call `<u16 as From<u8>>::from` or `<u8 as Into<u16>>::into`,
+/// so the trait is named between `as` and the `<` that opens its type parameter.
+/// `core::convert::From` and `std::convert::From` are the same trait as the
+/// prelude's `From`; rustc prints the bare name, but a program with a local trait
+/// also called `From` in scope makes it print the qualified one to disambiguate
+/// (the corpus does exactly this), so all three spellings are accepted.
+///
+/// The accepted set is exactly the standard library's `From` and `Into`: those
+/// cannot name a user item, because a user cannot define items inside `core` or
+/// `std`. A local trait is qualified with its own module (`m::From`), so it is
+/// refused. The one spelling that can still collide is a *crate-root* trait named
+/// `From`, which the dump also prints as the bare `From` -- the caller's same-dump
+/// lookup is what answers that, and this predicate deliberately does not try to
+/// tell it apart by name, because it cannot. See [`Intrinsic::Conversion`].
+pub fn names_conversion_trait(name: &str) -> bool {
+    matches!(
+        trait_path(name),
+        Some(
+            "From"
+                | "core::convert::From"
+                | "std::convert::From"
+                | "Into"
+                | "core::convert::Into"
+                | "std::convert::Into"
+        )
+    )
+}
+
+/// The trait a method call names, read out of a rustc-printed path.
+///
+/// A call is `<SELF as TRAIT<…>>::method`, so the trait is between the last ` as `
+/// and the `<` that opens the trait's own type parameters. A name with no ` as `
+/// is not a trait call at all -- a free function or an inherent method -- so it
+/// names no trait here. A trait with no type parameters has no `<`, and is not one
+/// of the shapes this reads, so it yields `None` rather than a truncated guess.
+fn trait_path(name: &str) -> Option<&str> {
+    let after_as = name.rsplit_once(" as ")?.1;
+    // Cut the method off first (`From<i8>>::from` -> `From<i8>`), then drop the
+    // trait's type parameters (`From<i8>` -> `From`). Doing it the other way round
+    // would consume the `>::` that delimits the method.
+    let (trait_ty, _) = after_as.split_once(">::")?;
+    Some(trait_ty.split_once('<').map(|(t, _)| t).unwrap_or(trait_ty))
 }
 
 /// Whether the model has a definition for this operation at this width.
@@ -543,6 +706,13 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // check -- `Ord` is implemented for every integer -- only the width,
         // which is already bounded above.
         Intrinsic::MinMax(_) => true,
+        // A widening conversion. The *value* is a plain extension, so it is total
+        // and can fail only at a width the engine cannot hold -- which the guard
+        // above already refused. Whether the call is a real integer widening at
+        // all is a question about its two *types*, not this one operand width, so
+        // it is decided by the executor (see `conversion_types`), which refuses a
+        // non-integer or narrowing call rather than reaching here.
+        Intrinsic::Conversion(_) => true,
     }
 }
 
@@ -553,8 +723,9 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
 /// guessing.
 ///
 /// `w` is the operand width. `result_w` is the destination type's width, which
-/// differs from `w` only for the bit counts (`u8::count_ones` returns `u32`); for
-/// every other shape the two are equal, and the caller passes `w` for both. The
+/// differs from `w` for the bit counts (`u8::count_ones` returns `u32`) and for a
+/// widening conversion (whose destination is wider than its source); for every
+/// other shape the two are equal, and the caller passes `w` for both. The
 /// result term is built at `result_w` so that it has the width of the local it is
 /// written to -- a term narrower than its local would make the next read of that
 /// local ill-formed.
@@ -737,6 +908,20 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
                 return None;
             }
             Outcome::Value(smt::truncate(min_max_result(kind, x, y, signed), result_w))
+        }
+        // A widening conversion. The operand *is* the source, so its width and
+        // signedness are `w` and `signed`, and the destination is `result_w`. The
+        // value is the source extended by its own signedness -- the same rule the
+        // executor's `as`-cast uses, so a conversion and a cast of one shape build
+        // one term. A destination no wider than the source is refused: a real
+        // integer `From` only widens, so a same-width or narrowing call is not the
+        // method this model knows, and truncating it would be a guess at a
+        // conversion `core` never performs.
+        Intrinsic::Conversion(_) => {
+            if result_w < w {
+                return None;
+            }
+            Outcome::Value(convert_value(x, signed, result_w))
         }
     })
 }
@@ -3194,5 +3379,187 @@ mod tests {
         ] {
             assert_eq!(ord(kind, signed, xb, yb), Some(want), "{why} ({xb:#x}, {yb:#x})");
         }
+    }
+
+    /// The `from`/`into` names classify, and the neighbours that only *look* like
+    /// them do not.
+    #[test]
+    fn the_conversion_names_classify_and_their_neighbours_do_not() {
+        // Both spellings of both directions, bare and fully qualified.
+        for name in [
+            "<u16 as From<u8>>::from",
+            "<u16 as core::convert::From<u8>>::from",
+            "<u16 as std::convert::From<u8>>::from",
+            "<i8 as Into<i32>>::into",
+            "<i8 as core::convert::Into<i32>>::into",
+            "<i8 as std::convert::Into<i32>>::into",
+        ] {
+            assert!(classify(name).is_some(), "`{name}` must classify as a conversion");
+        }
+        assert_eq!(
+            classify("<u16 as From<u8>>::from"),
+            Some(Intrinsic::Conversion(Conversion::From))
+        );
+        assert_eq!(
+            classify("<u8 as Into<u16>>::into"),
+            Some(Intrinsic::Conversion(Conversion::Into))
+        );
+        // A module-qualified local trait is a different path, and is refused: the
+        // same-dump lookup answers it, and the model must not.
+        assert_eq!(classify("<MyT as m::From<u8>>::from"), None);
+        assert_eq!(classify("<MyT as m::Into<u16>>::into"), None);
+        assert_eq!(classify("<MyT as MyFrom<u8>>::from"), None);
+        // An inherent method of the same name is not a trait call, so it names no
+        // `From`/`Into` and is not modelled.
+        assert_eq!(classify("core::num::<impl u8>::from"), None);
+        assert_eq!(classify("from"), None);
+        assert_eq!(classify("into"), None);
+        // The `From`-like names that are not `From`.
+        assert_eq!(classify("<u8 as TryFrom<u16>>::try_from"), None);
+        assert_eq!(classify("<u16 as FromIterator<u8>>::from_iter"), None);
+    }
+
+    /// The two types a conversion reads out of its own name.
+    #[test]
+    fn a_conversion_reads_its_source_and_destination_from_the_name() {
+        // `From`: the self type is the destination, the parameter the source.
+        assert_eq!(
+            conversion_types("<u16 as From<u8>>::from", Conversion::From),
+            Some((Ty::U8, Ty::U16))
+        );
+        // `Into`: they are the other way round.
+        assert_eq!(
+            conversion_types("<u8 as Into<u16>>::into", Conversion::Into),
+            Some((Ty::U8, Ty::U16))
+        );
+        assert_eq!(
+            conversion_types("<i8 as Into<i64>>::into", Conversion::Into),
+            Some((Ty::I8, Ty::I64))
+        );
+        // A signedness change is a widening too: `i16::from(u8)`.
+        assert_eq!(
+            conversion_types("<i16 as From<u8>>::from", Conversion::From),
+            Some((Ty::U8, Ty::I16))
+        );
+        // A non-integer operand (the `bool`/`char` `From` impls) parses, but
+        // `int_width` refuses it, so the caller reports the path unknown rather
+        // than guessing a width.
+        let (src, dst) = conversion_types("<u8 as From<bool>>::from", Conversion::From).unwrap();
+        assert_eq!(src, Ty::Bool);
+        assert_eq!(int_width(&src), None);
+        assert_eq!(int_width(&dst), Some(8));
+    }
+
+    /// A widening conversion agrees with Rust's own `From`/`Into`, over every
+    /// input of the source type.
+    #[test]
+    fn the_conversion_agrees_with_rust() {
+        // `rust` is the language's own conversion, taken as a pair of functions
+        // over the *bit pattern*: `bits` at the source width in, `bits` at the
+        // destination width out. The oracle is the real `From` impl, so it cannot
+        // drift from the model the way a second hand-written rule could.
+        let check = |src_w: u8,
+                     dst_w: u8,
+                     src_signed: bool,
+                     src_ty: Ty,
+                     dst_ty: Ty,
+                     rust: &dyn Fn(u64) -> u64,
+                     label: &str| {
+            smt::with_fresh(|| {
+                let x = smt::var(src_w);
+                let xi = smt::index(x);
+                let Outcome::Value(v) = eval(
+                    Intrinsic::Conversion(Conversion::From),
+                    x,
+                    x,
+                    src_w,
+                    src_signed,
+                    dst_w,
+                )
+                .unwrap_or_else(|| panic!("{label}: must be modelled")) else {
+                    panic!("{label}: a conversion produces a plain value");
+                };
+                for bits in 0..(1u64 << src_w) {
+                    let got = smt::evaluate(v, |i| if i == xi { Some(bits) } else { None });
+                    let want = rust(bits);
+                    assert_eq!(
+                        got,
+                        Some(want),
+                        "{label} at {bits:#x}: the model says {got:?}, Rust says {want:#x}"
+                    );
+                }
+                // The name reads the same two types the case claims.
+                assert_eq!(src_ty.is_signed(), src_signed, "{label}: source signedness");
+                assert_eq!(int_width(&src_ty), Some(src_w), "{label}: source width");
+                assert_eq!(int_width(&dst_ty), Some(dst_w), "{label}: destination width");
+            });
+        };
+
+        let u8_to_u16 = |bits: u64| u64::from(u16::from(bits as u8));
+        check(8, 16, false, Ty::U8, Ty::U16, &u8_to_u16, "u16::from(u8)");
+
+        let i8_to_i16 = |bits: u64| u64::from(i16::from(i8::from_ne_bytes([bits as u8])) as u16);
+        check(8, 16, true, Ty::I8, Ty::I16, &i8_to_i16, "i16::from(i8)");
+
+        // A signedness *change* on a widening: `u8` -> `i16` zero-fills, so `255`
+        // stays `255` and never becomes `-1`.
+        let u8_to_i16 = |bits: u64| u64::from(i16::from(bits as u8) as u16);
+        check(8, 16, false, Ty::U8, Ty::I16, &u8_to_i16, "i16::from(u8)");
+
+        let i8_to_i64 = |bits: u64| i64::from(i8::from_ne_bytes([bits as u8])) as u64;
+        check(8, 64, true, Ty::I8, Ty::I64, &i8_to_i64, "i64::from(i8)");
+
+        let u8_to_u32 = |bits: u64| u64::from(u32::from(bits as u8));
+        check(8, 32, false, Ty::U8, Ty::U32, &u8_to_u32, "u32::from(u8)");
+
+        let i16_to_i32 =
+            |bits: u64| u64::from(i32::from(i16::from_ne_bytes((bits as u16).to_ne_bytes())) as u32);
+        check(16, 32, true, Ty::I16, Ty::I32, &i16_to_i32, "i32::from(i16)");
+
+        // The named points, so a failure names the value that broke. `-1` is the
+        // one that separates sign-extension from zero-filling, and `0xff`/`0x80`
+        // are the extremes of the source type.
+        let widen = |src_w: u8, dst_w: u8, src_signed: bool, bits: u64| {
+            smt::with_fresh(|| {
+                let x = smt::var(src_w);
+                let xi = smt::index(x);
+                let Outcome::Value(v) = eval(
+                    Intrinsic::Conversion(Conversion::From),
+                    x,
+                    x,
+                    src_w,
+                    src_signed,
+                    dst_w,
+                )
+                .expect("a widening conversion is modelled") else {
+                    panic!("a conversion produces a plain value");
+                };
+                smt::evaluate(v, |i| if i == xi { Some(bits) } else { None })
+            })
+        };
+        for (src_w, dst_w, signed, bits, want, why) in [
+            (8u8, 16u8, false, 0xff, 0xffu64, "unsigned widens by zero-fill"),
+            (8, 16, true, 0xff, 0xffff, "-1i8 widens to -1i16, not 255"),
+            (8, 16, true, 0x80, 0xff80, "i8::MIN widens to i16::MIN"),
+            (8, 64, true, 0x80, 0xffff_ffff_ffff_ff80, "i8::MIN widens to i64::MIN"),
+            (8, 16, false, 0x80, 0x80, "u8::128 stays 128 in a wider unsigned"),
+            (16, 32, true, 0x8000, 0xffff_8000, "i16::MIN widens to i32::MIN"),
+        ] {
+            assert_eq!(
+                widen(src_w, dst_w, signed, bits),
+                Some(want),
+                "{why} ({bits:#x})"
+            );
+        }
+
+        // A conversion that is not a widening is refused, so a malformed or
+        // same-width call is never read as one `core` does not implement.
+        smt::with_fresh(|| {
+            let x = smt::var(16);
+            assert!(
+                eval(Intrinsic::Conversion(Conversion::From), x, x, 16, false, 8).is_none(),
+                "a narrowing conversion must be refused"
+            );
+        });
     }
 }

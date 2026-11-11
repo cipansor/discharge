@@ -1502,6 +1502,45 @@ fn ord_min_and_max_are_modelled_and_a_local_trait_still_wins() {
     }
 }
 
+/// A widening conversion (`From::from`/`Into::into`) is modelled, by the source's
+/// signedness.
+///
+/// The three verifying entries pin the three cases that separate a correct model
+/// from a wrong one: `from_u8_is_modelled` and `into_u8_is_modelled` are the two
+/// trait spellings reaching one value, and
+/// `unsigned_source_widens_to_signed_destination` is the *signedness change* that
+/// must zero-fill (the source is unsigned) even though the destination is signed.
+/// `signed_widening_keeps_negative_values` is the sign-extension half: `i8::MIN`
+/// stays `i8::MIN` in an `i16`.
+///
+/// The tripwire is the evidence the source's signedness is read at all:
+/// `-1i8` widens to `-1i16` (`0xffff`), so a model that zero-filled a signed source
+/// would return `255` and *prove* `ret == 255`. Refuting it is what shows the
+/// extension is chosen by the source's sign and not by `truncate`.
+#[test]
+fn widening_conversions_are_modelled_by_the_sources_signedness() {
+    let verified = [
+        "from_u8_is_modelled",
+        "into_u8_is_modelled",
+        "signed_widening_keeps_negative_values",
+        "unsigned_source_widens_to_signed_destination",
+    ];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let refuted = ["signed_widening_is_not_zero_fill_tripwire"];
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` is a false contract that must be refuted, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
 /// The bitwise complement `!x`, pinned by a true half and a tripwire.
 ///
 /// `!x` is `all_ones ^ x` at the *operand's* width. The model reads that width
@@ -6364,6 +6403,93 @@ fn a_string_literal_does_not_leak_a_local_const() {
     );
 }
 
+/// A local trait whose `from` shares `From`'s name must be answered by its own
+/// body, never by the conversion model.
+///
+/// The model refuses a module-qualified trait path (`conv_shim::From`) by name, so
+/// a call to it reaches the same-dump lookup. This is the false-proof direction:
+/// the body returns `7`, so `ret == x` is false at `x == 0`. If the model answered
+/// the call it would return `x` and *prove* the claim -- exactly the mistake the
+/// trait-path check exists to prevent. A module is used (not a crate-root trait)
+/// because a local `impl From<u8> for u16` at the crate root has a *separate*,
+/// pre-existing hazard in `resolve_callee`'s owner-type match.
+#[test]
+fn a_local_trait_from_is_answered_by_its_body() {
+    let src = r#"
+pub mod conv_shim {
+    pub trait From<T> {
+        fn from(t: T) -> Self;
+    }
+    impl From<u8> for u16 {
+        fn from(_t: u8) -> u16 {
+            7
+        }
+    }
+}
+/// requires: x == 0
+/// ensures: ret == x as u16
+pub fn local_from_is_not_the_model(x: u8) -> u16 {
+    conv_shim::From::from(x)
+}
+"#;
+    let Some(o) = verify_src("local_from_is_not_the_model", src) else { return };
+    let FnOutcome::Failed { ref kind, .. } = o else {
+        panic!("the local trait's body must refute the claim, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "got: {o}");
+}
+
+/// A widening conversion agrees with a plain `as` cast of the same shape.
+///
+/// `u16::from(x)` and `x as u16` are the same widening, so their results must be
+/// one term. The model builds the conversion through the same extension the cast
+/// arm uses; if the two ever disagreed, `ret == x as u16` would be refuted here.
+#[test]
+fn a_conversion_agrees_with_a_cast_of_the_same_shape() {
+    let src = r#"
+/// requires: true
+/// ensures: ret == x as u16
+pub fn from_matches_cast(x: u8) -> u16 {
+    u16::from(x)
+}
+/// requires: true
+/// ensures: ret == x as i32
+pub fn into_signed_matches_cast(x: i8) -> i32 {
+    x.into()
+}
+"#;
+    let Some(o) = verify_src("from_matches_cast", src) else { return };
+    assert!(o.is_verified(), "`u16::from(x)` must agree with `x as u16`; got: {o}");
+    let Some(o) = verify_src("into_signed_matches_cast", src) else { return };
+    assert!(o.is_verified(), "`x.into()` must agree with `x as i32`; got: {o}");
+}
+
+/// A call to an *unmodelled* conversion is reported unknown, not guessed.
+///
+/// `u8::from(true)` is a real `From` impl, but the source is a `bool`, which has no
+/// bit-vector the engine widens -- `u8` is one bit's worth of a value, but a `bool`
+/// local is a predicate, not a word. The model refuses it (rather than guessing a
+/// width from the destination alone), and the path is reported unknown. This pins
+/// that the refusal is a *reported* gap rather than a silent approximation.
+#[test]
+fn an_unmodelled_conversion_is_reported_unknown_not_guessed() {
+    let src = r#"
+/// requires: true
+/// ensures: ret == 1
+pub fn from_bool_is_unmodelled(flag: bool) -> u8 {
+    u8::from(flag)
+}
+"#;
+    let Some(o) = verify_src("from_bool_is_unmodelled", src) else { return };
+    assert!(
+        !o.is_verified(),
+        "a conversion the model does not hold must not verify; got: {o}"
+    );
+    let FnOutcome::Incomplete { .. } = o else {
+        panic!("an unmodelled conversion must be `Incomplete`, got: {o}");
+    };
+}
+
 /// F3: a call to an *external* static associated function must not be answered by
 /// a local method that merely shares its tail.
 ///
@@ -6376,8 +6502,11 @@ fn a_string_literal_does_not_leak_a_local_const() {
 ///
 /// The owner type now comes from the `impl` block's own source line, keyed by the
 /// location the dump prints, so the external call no longer matches the local
-/// method. The verdict must not be `Verified`; it is `Incomplete` here, which is
-/// the honest answer for a call the frontend does not model.
+/// method. The verdict is no longer `Verified`, and it is no longer merely
+/// `Incomplete` either: the intrinsic model now *answers* the conversion, so the
+/// fixture is refuted with a witness (`x == 0`, where `u16::from(x)` is `0`, not
+/// `99`). That is the stronger evidence -- the call is answered by `core`'s own
+/// conversion, and the local `from` is not consulted at all.
 #[test]
 fn an_external_static_call_is_not_answered_by_a_local_method() {
     let Some(report) = verify_realistic(&["a_static_call_resolves_to_its_own_impl_cannot_prove_this"])
@@ -6389,6 +6518,10 @@ fn an_external_static_call_is_not_answered_by_a_local_method() {
         !o.is_verified(),
         "a call to `u16::from` must not be answered by a local `from`; got: {o}"
     );
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("the modelled conversion must refute the fixture, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "got: {o}");
 }
 
 /// F3 companion: the owner-type check must not refuse a call to a *local* static

@@ -2294,10 +2294,11 @@ fn call_type(name: &str) -> Option<String> {
 
 /// Whether a name is `core`'s own `Ord::min`/`Ord::max` for a primitive type.
 ///
-/// These are the only modelled shapes whose dump spelling carries no `<impl` --
-/// a trait method names the trait, `<u8 as Ord>::min` -- so the executor's guard
-/// has to admit them by name. It admits only a *primitive* self type: a user type
-/// cannot be `Ord`'s receiver here, so `<MyType as Ord>::min` is refused even
+/// These are one of the two modelled shapes whose dump spelling carries no `<impl`
+/// -- a trait method names the trait, `<u8 as Ord>::min` -- so the executor's guard
+/// has to admit them by name. (The other is a conversion; see [`convert`], which
+/// checks its own name and types.) It admits only a *primitive* self type: a user
+/// type cannot be `Ord`'s receiver here, so `<MyType as Ord>::min` is refused even
 /// though `core` really does implement `Ord` for it. That is deliberate and it is
 /// the conservative direction -- the model has no definition for a user type's
 /// `min` anyway, and refusing it means a name that *could* be a local trait's is
@@ -2311,6 +2312,62 @@ fn is_ord_callee(name: &str) -> bool {
     let self_ty = call_type(name).unwrap_or_default();
     matches!(self_ty.as_str(), "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16"
         | "i32" | "i64" | "i128" | "isize")
+}
+
+/// Answer a widening conversion (`From::from`/`Into::into`), or report why not.
+///
+/// The two types come from the call's *name* (`<u16 as From<u8>>::from`), because
+/// the model's whole content is that they differ; the single argument's declared
+/// type would give the source twice. Both must be modelled integers, and the
+/// destination must be at least as wide as the source: a real integer `From` only
+/// widens, so anything else is not the method this model knows. A destination the
+/// engine cannot hold is refused by `int_width` (`u128`/`i128`), which is the
+/// honest answer rather than a truncated one.
+///
+/// The source's *signedness* comes from the name's source type, and is what the
+/// model extends by; the argument's own `Val` sign is deliberately not consulted,
+/// so the value and the extension cannot be read from different places and
+/// disagree. The result carries the destination's sign, since the local it is
+/// written to has the destination's type.
+fn convert(
+    name: &str,
+    kind: intrinsics::Conversion,
+    args: &[Operand],
+    dest: &Place,
+    env: &mut Env,
+) -> Result<(), String> {
+    let Some((src_ty, dst_ty)) = intrinsics::conversion_types(name, kind) else {
+        return Err(format!("unmodelled conversion `{name}`"));
+    };
+    let (Some(src_w), Some(dst_w)) =
+        (intrinsics::int_width(&src_ty), intrinsics::int_width(&dst_ty))
+    else {
+        return Err(format!("`{name}` converts a type the model does not hold"));
+    };
+    if dst_w < src_w {
+        return Err(format!("`{name}` is not a widening conversion"));
+    }
+    let Some(arg) = args.first() else {
+        return Err(format!("unmodelled arity for `{name}`"));
+    };
+    let Val::Sym(x, _) = operand(env, arg) else {
+        return Err(format!("unmodelled argument to `{name}`"));
+    };
+    // `w` and `signed` are the source's, `result_w` the destination's, so `eval`
+    // extends by the source sign to the destination width -- the one place the two
+    // types are both read.
+    let Some(intrinsics::Outcome::Value(v)) = intrinsics::eval(
+        intrinsics::Intrinsic::Conversion(kind),
+        x,
+        x,
+        src_w,
+        src_ty.is_signed(),
+        dst_w,
+    ) else {
+        return Err(format!("`{name}` past what the model covers"));
+    };
+    env.set(dest, Val::Sym(v, Sign::of(&dst_ty)));
+    Ok(())
 }
 
 /// The `self` type of an *instance* method, read from its receiver's declared
@@ -2766,8 +2823,25 @@ fn try_intrinsic(
     // crate-root trait named `Ord` is the one spelling that could name a local
     // body, and it is in the dump, so `resolve_callee` finds it first and the model
     // is never consulted for it.
-    if !name.contains("<impl") && !is_ord_callee(name) {
+    //
+    // `From`/`Into` are the same shape of exception for the same reason: a
+    // conversion is a trait method, spelled `<u16 as From<u8>>::from`, with no
+    // `<impl`. The extra care they need is that the two operand types differ, so
+    // the model reads both from the name and refuses anything that is not a
+    // widening between modelled integers (see the branch below). The crate-root
+    // collision -- a user `From` that prints as the bare `From` -- is again closed
+    // by the same-dump lookup, not by the name.
+    let trait_method =
+        is_ord_callee(name) || matches!(op, intrinsics::Intrinsic::Conversion(_));
+    if !name.contains("<impl") && !trait_method {
         return None;
+    }
+    // A conversion is the one shape whose *two operand types* differ, so it reads
+    // both from the call's own name rather than from the single argument's type,
+    // and it is answered before the generic operand read below (which assumes one
+    // width for every operand).
+    if let intrinsics::Intrinsic::Conversion(kind) = op {
+        return Some(convert(name, kind, args, dest, env));
     }
     let cur = &prog.fns[func];
     // The operand width, from the first argument's declared type. It is not the
