@@ -7030,6 +7030,9 @@ const WIDE_LIMIT: u16 = 1000;
 /// value, so `const NEXT: u8 = const 11_u8;`.
 const NEXT: u8 = LIMIT + 1;
 
+/// A constant expression at a wider type, whose folded value must keep that width.
+const BIG: u16 = 200 + 100;
+
 /// A negative constant, whose sign must survive inlining.
 const NEG: i8 = -1;
 
@@ -7101,19 +7104,41 @@ pub fn named_const_matches_an_equality_cannot_prove_this(x: u8) -> u8 {
     }
 }
 
-/// A constant whose definition is an *expression* rather than a literal is not
-/// inlined: rustc prints it with its own body and locals (`const NEXT: u8 = {
-/// let mut _0: u8; ... }`), so the use site stays an unreadable path constant and
-/// the contract is not decided. This is a coverage boundary, not a wrong proof --
-/// the value is simply absent, so nothing is proved either way. Inlining it would
-/// mean interpreting the item's body, which the executor already knows how to do
-/// for a function; that is future work, and this entry is the pin that says the
-/// boundary is where it is.
+/// A constant whose definition is an *expression* rather than a literal is
+/// inlined by interpreting its body: rustc prints it with its own locals and
+/// basic blocks (`const NEXT: u8 = { let mut _0: u8; ... }`), and the folder walks
+/// those blocks concretely -- every operand is a literal, so the checked add
+/// folds and the body's own `assert(!overflow)` is checked. The use site
+/// (`_0 = const NEXT`) then folds to the value, and the contract decides.
+///
+/// This was the crate's own named future-work item: before the folder the item
+/// stayed an unreadable path constant and this was `Incomplete` (a coverage
+/// boundary, never a wrong proof).
 /// requires: true
 /// ensures: ret == 11
-pub fn named_const_of_an_expression_is_not_inlined(x: u8) -> u8 {
+pub fn named_const_of_an_expression_is_inlined(x: u8) -> u8 {
     let _ = x;
     NEXT
+}
+
+/// The false direction of [`named_const_of_an_expression_is_inlined`]: a *guessed*
+/// or mis-folded value would prove this. `NEXT` is `LIMIT + 1 == 11`, so `10` is
+/// the wrong value and the contract must refute rather than pass.
+/// requires: true
+/// ensures: ret == 10
+pub fn named_const_of_an_expression_is_inlined_cannot_prove_this(x: u8) -> u8 {
+    let _ = x;
+    NEXT
+}
+
+/// A folded expression keeps the item's own width. `BIG` is `200 + 100 == 300` at
+/// `u16`; a folder that dropped to a byte would truncate it to `44` and the
+/// contract would not decide. Same tell as [`named_const_keeps_its_width`], but
+/// through the folder rather than a printed literal.
+/// requires: true
+/// ensures: ret == 300
+pub fn an_expression_const_keeps_its_width() -> u16 {
+    BIG
 }
 
 /// A constant wider than a byte keeps its own width.
@@ -7206,23 +7231,24 @@ pub fn nested_module_const_is_read_cannot_prove_this() -> u8 {
     low::K
 }
 
-/// A `const` declared *inside* a function body is not inlined, because the two
-/// spellings do not meet: the *use* is printed with the enclosing function's path
-/// (`const a_function_local_const_is_not_inlined::L`) while the *definition* is
-/// printed bare (`const L: u8 = const 3_u8;`). It stays an unreadable path
-/// constant, a coverage boundary rather than a wrong proof, since no value is read
-/// at all.
+/// A `const` declared *inside* a function body is now inlined for its owner: the
+/// *use* is printed with the enclosing function's path (`const
+/// a_function_local_const_is_inlined::L`) while the *definition* is printed bare
+/// (`const L: u8 = const 3_u8;`), and the two spellings now meet -- the definition
+/// is recorded under the qualified path the use names. The contract then reads the
+/// value and decides; before, it stayed an unreadable path constant (a coverage
+/// boundary, never a wrong proof).
 ///
 /// The bare definition is *also* why a function-local item must not become a
 /// program-wide key: a crate-level `const` gets the same bare definition, so the
 /// definition alone cannot tell the two apart. Only the use site can -- a crate
 /// item is used bare (`const L`), a local one qualified (`const f::L`) -- which is
-/// what [`bare_const_uses`] reads. See
-/// [`a_local_const_is_not_in_scope_in_another_function`] for the false proof a bare
-/// key would reopen.
+/// what [`bare_const_uses`] reads. So the value is keyed by the *qualified* path,
+/// and [`a_local_const_is_not_in_scope_in_another_function`] still holds the bare
+/// key out.
 /// requires: true
 /// ensures: ret == 3
-pub fn a_function_local_const_is_not_inlined() -> u8 {
+pub fn a_function_local_const_is_inlined() -> u8 {
     const L: u8 = 3;
     L
 }
@@ -7335,10 +7361,10 @@ pub fn a_contract_names_a_qualified_const_cannot_prove_this(x: u8) -> u8 {
     }
 }
 
-/// A constant whose definition is an *expression* is refused when a contract
-/// names it, rather than guessed at: its value lives in its own body, which the
-/// contract reader does not fold. The refusal is a skip, so nothing is proved --
-/// which is the honest answer, not a wrong proof.
+/// A constant whose definition is an *expression* now resolves in a *contract*
+/// too: the item is folded once, into the program's const table, and both the
+/// body's use site and the contract reader resolve the same value. The
+/// postcondition is `ret <= NEXT`, and the body returns exactly `NEXT`.
 /// requires: x <= NEXT
 /// ensures: ret <= NEXT
 pub fn a_contract_names_an_expression_const(x: u8) -> u8 {

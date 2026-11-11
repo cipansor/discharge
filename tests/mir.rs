@@ -3464,9 +3464,10 @@ fn a_named_const_item_is_inlined_at_its_use_site() {
 /// and each false twin must be refuted; a name that resolved to nothing (or to a
 /// wrong value) would leave the twin unproved or, worse, prove it.
 ///
-/// The two cases that are *refusals* rather than proofs are checked separately: an
-/// expression-bodied constant has no literal to fold, and a misspelled name is not
-/// an argument. Both must be `Skipped`, never `verified` and never a wrong value.
+/// The case that is a *refusal* rather than a proof is checked separately: a
+/// misspelled name is not an argument and must be `Skipped`, never `verified`.
+/// (An expression-bodied constant used to be the other refusal; it is folded now,
+/// and its resolution is asserted in the body of this test.)
 #[test]
 fn a_contract_may_name_a_const_item() {
     let Some(report) = verify_realistic(&[
@@ -3500,13 +3501,59 @@ fn a_contract_may_name_a_const_item() {
             "a wrong const value must not prove this; got: {o}"
         );
     }
-    for name in ["a_contract_names_an_expression_const", "a_misspelled_const_is_refused"] {
-        let o = outcome(&report, name);
-        assert!(
-            matches!(o, FnOutcome::Skipped { .. }),
-            "an unresolvable const name must be refused, not guessed; got: {o}"
-        );
-    }
+    // An *expression* const now resolves: the item is folded once, into the
+    // program's const table, so a contract naming it reads the same value the
+    // body's use site does.
+    let expr = outcome(&report, "a_contract_names_an_expression_const");
+    assert!(
+        expr.is_verified(),
+        "a contract must resolve an expression const now that it is folded; got: {expr}"
+    );
+    // A *misspelled* name is still refused, not guessed: folding must not turn an
+    // unknown name into a value.
+    let misspelled = outcome(&report, "a_misspelled_const_is_refused");
+    assert!(
+        matches!(misspelled, FnOutcome::Skipped { .. }),
+        "an unresolvable const name must be refused, not guessed; got: {misspelled}"
+    );
+}
+
+/// A `const` whose body is an *expression* is inlined, in both directions.
+///
+/// rustc prints such an item with its own locals and blocks (`const NEXT: u8 = {
+/// let mut _0: u8; ... _1 = AddWithOverflow(const LIMIT, const 1_u8); ... }`)
+/// rather than as a single literal, so the value lives in the body. The folder
+/// interprets that body concretely -- every operand is a literal, so the checked
+/// add folds and the body's own `assert(!overflow)` is checked -- and records the
+/// result in the program's const table. Both the body's use site and a contract
+/// that names the item then read the same value.
+///
+/// The false twin is the pin that matters: a *guessed* or mis-folded value would
+/// prove `ret == 10`, which is wrong. It must be refuted.
+#[test]
+fn an_expression_const_is_inlined_in_both_directions() {
+    let Some(report) = verify_realistic(&[
+        "named_const_of_an_expression_is_inlined",
+        "named_const_of_an_expression_is_inlined_cannot_prove_this",
+        "an_expression_const_keeps_its_width",
+    ]) else {
+        return;
+    };
+    let true_direction = outcome(&report, "named_const_of_an_expression_is_inlined");
+    assert!(
+        true_direction.is_verified(),
+        "an expression const must fold to its value; got: {true_direction}"
+    );
+    let false_direction =
+        outcome(&report, "named_const_of_an_expression_is_inlined_cannot_prove_this");
+    assert!(
+        matches!(false_direction, FnOutcome::Failed { .. }),
+        "`NEXT` is 11, so `ret == 10` must be refuted, not proved; got: {false_direction}"
+    );
+    // The folded value must keep the item's own width: a folder that dropped to
+    // `u8` would truncate `BIG == 300` and the contract would not decide.
+    let width = outcome(&report, "an_expression_const_keeps_its_width");
+    assert!(width.is_verified(), "an expression const keeps its width; got: {width}");
 }
 
 /// A function-local `const` is not in scope in another function.
@@ -7467,9 +7514,11 @@ fn a_nested_or_method_local_const_is_not_a_program_wide_name() {
 /// `_0` arm per branch (`bb1: _0 = const 7_u8`, `bb2: _0 = const 8_u8`). Folding
 /// the first arm stores `K = 7`, so `ensures: ret == 7` on a function that returns
 /// `K` is reported **verified** -- a false proof about a value the constant never
-/// has -- while the true claim `ret == 8` is refused. The fix refuses to fold a
-/// branching body at all, so both contracts go unreadable (a skip) rather than one
-/// being falsely proved.
+/// has -- while the true claim `ret == 8` is refused. The folder instead follows
+/// the `switchInt` on the discriminant's actual value, so it takes `bb2` and
+/// stores `K = 8`: the true claim decides and the false one is refuted. (An
+/// earlier fix refused a branching body outright; resolving the branch by value is
+/// strictly more coverage with the same soundness.)
 ///
 /// This is the *reachable* form of the bug: rustc emits a brace-block for an
 /// `if`-based constant on **current stable** as well as on 1.85, so the hole was
@@ -7486,9 +7535,9 @@ fn a_branching_const_does_not_fold_to_its_first_arm() {
         "`K` is 8, so `ret == 7` must not be reported verified, got: {false_claim}"
     );
     assert!(
-        !true_claim.is_verified(),
-        "a branching const body is not folded, so `ret == 8` is unreadable (a skip), \
-         not a proof, got: {true_claim}"
+        true_claim.is_verified(),
+        "a branching const body folds to the *taken* arm, so `ret == 8` decides; \
+         got: {true_claim}"
     );
 }
 

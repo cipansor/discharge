@@ -1077,16 +1077,35 @@ struct ConstMentions {
 /// function-local item. So a qualified use with no qualified definition of the
 /// same path claims its bare tail only when that prefix is a function name.
 fn claimed_bare_const_uses(mentions: &ConstMentions) -> std::collections::BTreeSet<String> {
-    mentions
-        .qualified_uses
-        .difference(&mentions.qualified_defs)
-        .filter(|path| {
-            let prefix = path.rsplit_once("::").map_or("", |(p, _)| p);
-            let owner = prefix.rsplit("::").next().unwrap_or("");
-            mentions.fn_names.contains(owner)
-        })
-        .filter_map(|p| p.rsplit("::").next().map(str::to_string))
-        .collect()
+    claimed_bare_paths(mentions).into_keys().collect()
+}
+
+/// The same as [`claimed_bare_const_uses`], but keeping the full qualified path
+/// each bare tail was claimed by.
+///
+/// A bare definition claimed this way is a function-local item whose definition
+/// rustc printed *bare* only because no other local shares its name. Its use site
+/// prints the qualified path (`const owner::K`), so the definition is recorded
+/// under that path rather than dropped: a contract on the owning function then
+/// reads the value, and no *other* function can name it (the bare key is still
+/// withheld). Dropping it instead is what left such a contract undecided.
+///
+/// Two different owners cannot share a tail here: the claim requires a qualified
+/// use with no qualified definition, and a local's use is always qualified while
+/// a crate-level item's is bare, so the tail names one local.
+fn claimed_bare_paths(mentions: &ConstMentions) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for path in mentions.qualified_uses.difference(&mentions.qualified_defs) {
+        let prefix = path.rsplit_once("::").map_or("", |(p, _)| p);
+        let owner = prefix.rsplit("::").next().unwrap_or("");
+        if !mentions.fn_names.contains(owner) {
+            continue;
+        }
+        if let Some(tail) = path.rsplit("::").next() {
+            out.insert(tail.to_string(), path.clone());
+        }
+    }
+    out
 }
 
 fn const_mentions(text: &str) -> ConstMentions {
@@ -1264,6 +1283,478 @@ fn block_const_value<'a>(lines: &[&'a str]) -> Option<&'a str> {
         return None;
     }
     Some(literal.trim_end_matches(';'))
+}
+
+/// A concrete value read by [`fold_const_block`].
+///
+/// Deliberately *not* the symbolic `Val`: a `const` item's body is const-evaluated
+/// by rustc, so every operand is a literal and the whole block is a concrete
+/// computation. Folding it with the symbolic engine would be circular -- the
+/// symbolic engine's `const` table is what this feeds -- so it is a small,
+/// separate interpreter over the parsed blocks. A width and a signedness travel
+/// with a word because a cast and a comparison both need them, and a value that
+/// forgot its sign would read `-1i8` as `255`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CVal {
+    /// A bit-vector: the value, its width, and whether its type is signed.
+    Word(u64, u8, bool),
+    Bool(bool),
+}
+
+impl CVal {
+    fn width(self) -> u8 {
+        match self {
+            CVal::Word(_, w, _) => w,
+            CVal::Bool(_) => 1,
+        }
+    }
+
+    fn word(self) -> Option<u64> {
+        match self {
+            CVal::Word(v, _, _) => Some(v),
+            CVal::Bool(b) => Some(b as u64),
+        }
+    }
+
+    fn signed(self) -> bool {
+        matches!(self, CVal::Word(_, _, true))
+    }
+
+    /// A condition's truth: a `bool` is itself, a bit-vector is non-zero -- the
+    /// same reading the executor gives an assert condition.
+    fn as_bool(self) -> Option<bool> {
+        match self {
+            CVal::Bool(b) => Some(b),
+            CVal::Word(v, _, _) => Some(v != 0),
+        }
+    }
+}
+
+/// The all-ones mask for a width.
+fn c_mask(w: u8) -> u64 {
+    if w >= 64 { u64::MAX } else { (1u64 << w) - 1 }
+}
+
+/// The signed reading of a `w`-bit pattern, sign-extended to `i128`.
+fn c_signed(v: u64, w: u8) -> i128 {
+    if w >= 64 {
+        v as i64 as i128
+    } else {
+        let sh = 64 - w;
+        (((v << sh) as i64) >> sh) as i128
+    }
+}
+
+/// The value of a `Const` at a known width, when it is a literal or a path to an
+/// item already folded.
+///
+/// A const body refers to another item by path (`const LIMIT` in `LIMIT + 1`),
+/// and that item is printed *before* this one, so it is already in `consts`. A
+/// path that is not there -- a `const` this pass has not folded, an associated
+/// constant, an enum variant construction -- is refused, which leaves the item
+/// unmodelled.
+fn cval_of_const(c: &Const, want: Option<u8>, consts: &BTreeMap<String, Const>) -> Option<CVal> {
+    match c {
+        Const::Bool(b) => Some(CVal::Bool(*b)),
+        Const::UInt(v, ty) => {
+            let w = ty.as_ref().and_then(|t| t.width()).or(want)?;
+            let signed = ty.as_ref().is_some_and(|t| t.is_signed());
+            if w == 1 {
+                return Some(CVal::Bool(*v != 0));
+            }
+            Some(CVal::Word((*v as u64) & c_mask(w), w, signed))
+        }
+        Const::Other(name) => cval_of_const(consts.get(name)?, want, consts),
+        // `()` is not a literal this folder can take.
+        Const::Unit => None,
+    }
+}
+
+/// The field-index chain of a place, when every projection is a tuple/struct
+/// field. A deref, a subscript or a downcast has no key in the folder's store, so
+/// it is refused rather than read from the wrong slot.
+fn c_field_chain(proj: &[Proj]) -> Option<Vec<u32>> {
+    let mut out = Vec::with_capacity(proj.len());
+    for p in proj {
+        match p {
+            Proj::Field(k) => out.push(*k),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// A tuple component's type, for the `(T, bool)` a checked op yields.
+fn c_component_ty(ty: &Ty, field: u32) -> Option<Ty> {
+    match ty {
+        Ty::Tuple(ts) => ts.get(field as usize).cloned(),
+        _ => None,
+    }
+}
+
+/// The type of a place, walking its projections from the local's declared type.
+fn c_place_ty(f: &MirFn, p: &Place) -> Option<Ty> {
+    let mut ty = f.ty_of(p.local)?.clone();
+    for pr in &p.proj {
+        ty = match pr {
+            Proj::Field(k) => c_component_ty(&ty, *k)?,
+            Proj::Index(_) => match &ty {
+                Ty::Array(e, _) => (**e).clone(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+    }
+    Some(ty)
+}
+
+/// Read an operand from the folder's store.
+fn c_operand(
+    env: &BTreeMap<(u32, Vec<u32>), CVal>,
+    consts: &BTreeMap<String, Const>,
+    o: &Operand,
+    want: Option<u8>,
+) -> Option<CVal> {
+    match o {
+        Operand::Const(c) => cval_of_const(c, want, consts),
+        Operand::Copy(p) | Operand::Move(p) => {
+            let chain = c_field_chain(&p.proj)?;
+            env.get(&(p.local, chain)).copied()
+        }
+    }
+}
+
+/// A binary op on two concrete values, at `w` bits with the given signedness.
+fn c_binop(op: BinOp, a: CVal, b: CVal, w: u8, signed: bool) -> Option<CVal> {
+    use core::cmp::Ordering;
+    let m = c_mask(w);
+    match op {
+        BinOp::Eq => Some(CVal::Bool(a.word()? == b.word()?)),
+        BinOp::Ne => Some(CVal::Bool(a.word()? != b.word()?)),
+        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+            let (x, y) = (a.word()?, b.word()?);
+            let ord = if signed { c_signed(x, w).cmp(&c_signed(y, w)) } else { x.cmp(&y) };
+            Some(CVal::Bool(match op {
+                BinOp::Lt => ord == Ordering::Less,
+                BinOp::Le => ord != Ordering::Greater,
+                BinOp::Gt => ord == Ordering::Greater,
+                BinOp::Ge => ord != Ordering::Less,
+                _ => return None,
+            }))
+        }
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+            let (x, y) = (a.word()?, b.word()?);
+            let r = match op {
+                BinOp::Add => x.wrapping_add(y),
+                BinOp::Sub => x.wrapping_sub(y),
+                BinOp::Mul => x.wrapping_mul(y),
+                BinOp::BitAnd => x & y,
+                BinOp::BitOr => x | y,
+                BinOp::BitXor => x ^ y,
+                _ => return None,
+            };
+            Some(CVal::Word(r & m, w, signed))
+        }
+        BinOp::Div | BinOp::Rem => {
+            let (x, y) = (a.word()?, b.word()?);
+            // A zero divisor would have panicked; rustc would not have emitted a
+            // const that divides by zero, so refusing is the safe direction.
+            if y == 0 {
+                return None;
+            }
+            let r = if signed {
+                let (sx, sy) = (c_signed(x, w), c_signed(y, w));
+                // `MIN / -1` overflows; refuse rather than wrap into a value the
+                // const never had.
+                if sx == -(1i128 << (w - 1)) && sy == -1 {
+                    return None;
+                }
+                if op == BinOp::Div { sx / sy } else { sx % sy }
+            } else if op == BinOp::Div {
+                (x / y) as i128
+            } else {
+                (x % y) as i128
+            };
+            Some(CVal::Word((r as u64) & m, w, signed))
+        }
+        BinOp::Shl | BinOp::Shr => {
+            let (x, y) = (a.word()?, b.word()?);
+            // A shift at or past the width would have panicked; refuse.
+            if y >= w as u64 {
+                return None;
+            }
+            let r = if op == BinOp::Shl {
+                (x << y) & m
+            } else if signed {
+                (c_signed(x, w) >> y) as u64 & m
+            } else {
+                x >> y
+            };
+            Some(CVal::Word(r & m, w, signed))
+        }
+    }
+}
+
+/// A unary op on a concrete value.
+fn c_unop(op: UnOp, x: CVal, w: u8, signed: bool) -> Option<CVal> {
+    match op {
+        UnOp::Not => match x {
+            CVal::Bool(b) => Some(CVal::Bool(!b)),
+            CVal::Word(v, _, s) => Some(CVal::Word(!v & c_mask(w), w, s)),
+        },
+        UnOp::Neg => {
+            let v = x.word()?;
+            Some(CVal::Word(v.wrapping_neg() & c_mask(w), w, signed))
+        }
+    }
+}
+
+/// A checked binary op: the wrapped value *and* whether it overflowed.
+///
+/// The overflow flag is computed exactly, in a wider integer, rather than from a
+/// bit test: the const body's own `assert(!flag)` is what decides whether the
+/// constant is valid, and a wrong flag would either refuse a good constant or
+/// fold a value the const never had.
+fn c_checked(op: BinOp, a: CVal, b: CVal, w: u8, signed: bool) -> Option<(u64, bool)> {
+    let (x, y) = (a.word()?, b.word()?);
+    let m = c_mask(w);
+    match op {
+        BinOp::Add | BinOp::Sub | BinOp::Mul => {
+            if signed {
+                let (sx, sy) = (c_signed(x, w), c_signed(y, w));
+                let full = match op {
+                    BinOp::Add => sx + sy,
+                    BinOp::Sub => sx - sy,
+                    BinOp::Mul => sx * sy,
+                    _ => return None,
+                };
+                let lo = -(1i128 << (w - 1));
+                let hi = (1i128 << (w - 1)) - 1;
+                Some(((full as u64) & m, full < lo || full > hi))
+            } else {
+                let (ux, uy) = (x as u128, y as u128);
+                let full = match op {
+                    BinOp::Add => ux + uy,
+                    // `wrapping_sub` in `u128` is huge when `x < y`, which is
+                    // exactly the underflow the `> m` test must catch.
+                    BinOp::Sub => ux.wrapping_sub(uy),
+                    BinOp::Mul => ux * uy,
+                    _ => return None,
+                };
+                Some(((full as u64) & m, full > m as u128))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// A cast to a concrete type at `dw` bits.
+fn c_cast(x: CVal, ty: &Ty, dw: u8) -> Option<CVal> {
+    let v = x.word()?;
+    let sw = x.width();
+    let m = c_mask(dw);
+    let r = if dw > sw && x.signed() {
+        // A widening of a signed value sign-extends, so `-1i8 as i16` is `-1`.
+        (c_signed(v, sw) as u64) & m
+    } else {
+        v & m
+    };
+    Some(CVal::Word(r & m, dw, ty.is_signed()))
+}
+
+/// Execute one assignment into the folder's store.
+fn c_assign(
+    f: &MirFn,
+    env: &mut BTreeMap<(u32, Vec<u32>), CVal>,
+    consts: &BTreeMap<String, Const>,
+    dest: &Place,
+    rv: &Rvalue,
+) -> Option<()> {
+    let dty = c_place_ty(f, dest)?;
+    let chain = c_field_chain(&dest.proj)?;
+    // A scalar destination's width, read per arm: a `CheckedBinary` writes a
+    // *tuple*, whose width is not a single number, so forcing it up front would
+    // refuse every checked op -- the shape every arithmetic const body has.
+    let dw = dty.width();
+    // Narrow a computed value to the destination's width, then store it. Reading
+    // the operands happens first so the immutable and mutable borrows of `env`
+    // never overlap.
+    let narrow = |v: CVal| match (v, dw) {
+        (CVal::Word(x, _, s), Some(w)) => CVal::Word(x & c_mask(w), w, s),
+        (v, _) => v,
+    };
+    match rv {
+        Rvalue::Use(o) => {
+            let v = c_operand(env, consts, o, dw)?;
+            env.insert((dest.local, chain), narrow(v));
+        }
+        Rvalue::Binary(op, a, b) => {
+            let w = dw?;
+            let x = c_operand(env, consts, a, Some(w))?;
+            let y = c_operand(env, consts, b, Some(w))?;
+            let v = c_binop(*op, x, y, w, dty.is_signed())?;
+            env.insert((dest.local, chain), narrow(v));
+        }
+        Rvalue::Unary(op, a) => {
+            let w = dw?;
+            let x = c_operand(env, consts, a, Some(w))?;
+            let v = c_unop(*op, x, w, dty.is_signed())?;
+            env.insert((dest.local, chain), narrow(v));
+        }
+        Rvalue::CheckedBinary(op, a, b) => {
+            let rty = c_component_ty(&dty, 0)?;
+            let rw = rty.width()?;
+            let x = c_operand(env, consts, a, Some(rw))?;
+            let y = c_operand(env, consts, b, Some(rw))?;
+            let (val, ovf) = c_checked(*op, x, y, rw, rty.is_signed())?;
+            let mut c0 = chain.clone();
+            c0.push(0);
+            env.insert((dest.local, c0), CVal::Word(val, rw, rty.is_signed()));
+            let mut c1 = chain;
+            c1.push(1);
+            env.insert((dest.local, c1), CVal::Bool(ovf));
+        }
+        Rvalue::Cast(o, ty) => {
+            let w = dw?;
+            let x = c_operand(env, consts, o, None)?;
+            let v = c_cast(x, ty, w)?;
+            env.insert((dest.local, chain), narrow(v));
+        }
+        // An aggregate, a reference, a length, a discriminant: nothing a
+        // literal-folded `const` needs, and each refused rather than guessed.
+        _ => return None,
+    }
+    Some(())
+}
+
+/// Fold a `const` item whose body is an expression, by interpreting it.
+///
+/// rustc prints a `const` that folds to a literal inline (`const K: u8 = const
+/// 7_u8;`) but prints one built by an expression as its const-evaluated *body*,
+/// with its own locals and basic blocks:
+///
+/// ```text
+/// const NEXT: u8 = {
+///     let mut _0: u8;
+///     let mut _1: (u8, bool);
+///     bb0: { _1 = AddWithOverflow(const 7_u8, const 4_u8); assert(!(_1.1), …); }
+///     bb1: { _0 = move (_1.0); return; }
+/// }
+/// ```
+///
+/// The use site is still `_0 = const NEXT`, so without reading the body the item
+/// stays an unreadable `Const::Other` and a contract that names it is skipped --
+/// a lost proof. The body is parsed with [`parse_fn_body`], the same reader a
+/// function uses, and then walked as a concrete computation: every operand is a
+/// literal, so a branch is resolved by its actual value and an `assert` is
+/// *checked* rather than assumed.
+///
+/// **It refuses more than it accepts, and each refusal is the safe direction.**
+/// A call, a loop, an operand that is not a literal, a failed `assert`, a shift or
+/// divide that would panic, a place with a non-field projection: each returns
+/// `None`, which leaves the item unmodelled and the contract that named it
+/// *unreadable* -- a skip, never a false proof. The walk is bounded by the block
+/// count so a cyclic body cannot spin.
+///
+/// `start` is the line after the `const … = {` header, and `ret_ty` is the
+/// declared type, which is the width and signedness the folded literal must carry
+/// so the use site folds the way an inline literal would.
+fn fold_const_block(
+    lines: &[&str],
+    start: usize,
+    ret_ty: Ty,
+    enums: &BTreeMap<String, EnumLayout>,
+    consts: &BTreeMap<String, Const>,
+) -> Option<Const> {
+    let mut f = MirFn {
+        name: String::new(),
+        arg_locals: Vec::new(),
+        ret_ty: ret_ty.clone(),
+        locals: BTreeMap::new(),
+        local_names: BTreeMap::new(),
+        debug_bindings: Vec::new(),
+        blocks: Vec::new(),
+        written: std::collections::BTreeSet::new(),
+        impl_loc: None,
+    };
+    f.locals.insert(0, ret_ty.clone());
+    parse_fn_body(lines, start, &mut f, enums);
+
+    let mut env: BTreeMap<(u32, Vec<u32>), CVal> = BTreeMap::new();
+    let mut block = f.blocks.first()?.id;
+    // A `const` body cannot loop (const eval requires termination), but the walk
+    // is bounded anyway so a malformed body cannot spin the front end.
+    let mut steps = 0usize;
+    let limit = f.blocks.len() + 4;
+    loop {
+        steps += 1;
+        if steps > limit {
+            return None;
+        }
+        let b = f.blocks.iter().find(|b| b.id == block)?.clone();
+        for s in &b.stmts {
+            match s {
+                Stmt::Nop => {}
+                Stmt::Unknown(_) => return None,
+                Stmt::Assign(dest, rv) => c_assign(&f, &mut env, consts, dest, rv)?,
+            }
+        }
+        match &b.term {
+            Term::Goto(t) => block = *t,
+            Term::Return => {
+                let v = env.get(&(0, Vec::new()))?;
+                return c_const_of(*v, &ret_ty);
+            }
+            Term::Assert { cond, negated, target, .. } => {
+                // The const body's own overflow and shift checks. rustc would not
+                // have emitted a const whose check fails, so a failure here means
+                // the body is not the shape this folder understands: refuse rather
+                // than fold a value the const never had.
+                let c = c_operand(&env, consts, cond, None)?.as_bool()?;
+                let ok = if *negated { !c } else { c };
+                if !ok {
+                    return None;
+                }
+                block = *target;
+            }
+            Term::SwitchInt { discr, cases, otherwise } => {
+                // A branch is resolved by its *value*, which is what makes the
+                // "read the first arm" hazard the literal folder warns about
+                // impossible here: only the taken edge is followed.
+                let d = c_operand(&env, consts, discr, None)?.word()?;
+                let mut next = *otherwise;
+                for (k, t) in cases {
+                    if *k as u64 == d {
+                        next = *t;
+                        break;
+                    }
+                }
+                if next == usize::MAX {
+                    return None;
+                }
+                block = next;
+            }
+            // A call, an `unreachable`, or an unmodelled terminator.
+            _ => return None,
+        }
+    }
+}
+
+/// Turn a folded concrete value into the `Const` a use site folds.
+///
+/// The value carries `ret_ty` so the literal has the width and signedness the
+/// item was declared with -- exactly the type suffix an inline literal prints --
+/// which is what the use site reads the width and sign from.
+fn c_const_of(v: CVal, ret_ty: &Ty) -> Option<Const> {
+    match v {
+        CVal::Bool(b) => Some(Const::Bool(b)),
+        CVal::Word(x, w, _) => {
+            if w == 1 {
+                return Some(Const::Bool(x != 0));
+            }
+            Some(Const::UInt(x as u128, Some(ret_ty.clone())))
+        }
+    }
 }
 
 /// Parse a constant like `0_u32`, `true`, `255_u32`, `()`.
@@ -1928,6 +2419,7 @@ fn parse_program_impl(
     // compiled crate constant those paths name keeps its bare key. See
     // [`claimed_bare_const_uses`].
     let claimed_bare = claimed_bare_const_uses(&mentions);
+    let claimed_paths = claimed_bare_paths(&mentions);
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
@@ -1948,7 +2440,11 @@ fn parse_program_impl(
                     // module-nested constant cannot collide with a top-level one of
                     // the same last segment. An associated constant's
                     // `{constant#0}` fails the identifier test and is dropped.
-                    let name = name.split_once(": ").map_or(name, |(n, _)| n).trim();
+                    let (name, ty_text) = match name.split_once(": ") {
+                        Some((n, t)) => (n, Some(t)),
+                        None => (name, None),
+                    };
+                    let name = name.trim();
                     let plain = !name.is_empty()
                         && !name.contains('{')
                         && name
@@ -1957,20 +2453,34 @@ fn parse_program_impl(
                                 && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
                     if plain {
                         let body = body.trim().trim_end_matches(';');
-                        // A literal body prints inline (`const K: u8 = const
-                        // 7_u8;`) on current stable. On 1.85 -- the MSRV floor --
-                        // the same item prints as a CTFE brace-block instead
-                        // (`const K: u8 = { … _0 = const 7_u8; … }`), so the value
-                        // is read from the block's return-place assignment. Without
-                        // this the item is dropped on the floor and a contract that
-                        // names it goes unreadable.
-                        let literal = body.strip_prefix("const ").or_else(|| {
-                            if body.starts_with('{') {
-                                block_const_value(&lines[i + 1..])
-                            } else {
-                                None
+                        // Three shapes, in order of directness:
+                        //
+                        // 1. An inline literal (`const K: u8 = const 7_u8;`).
+                        // 2. A CTFE brace-block whose body folds to a single
+                        //    literal. On 1.85 -- the MSRV floor -- an item that
+                        //    folds to a literal prints this way
+                        //    (`const K: u8 = { … _0 = const 7_u8; … }`), so the
+                        //    value is read from the block's return-place
+                        //    assignment.
+                        // 3. A brace-block whose body is an *expression*
+                        //    (`const NEXT: u8 = { … AddWithOverflow(7, 4) … }`).
+                        //    It is interpreted concretely by `fold_const_block`.
+                        //
+                        // Without 2 and 3 the item is dropped on the floor and a
+                        // contract that names it goes unreadable -- a lost proof.
+                        let ret_ty = ty_text.map(|t| Ty::parse(t.trim()));
+                        let literal = if let Some(rest) = body.strip_prefix("const ") {
+                            Some(parse_const(rest))
+                        } else if body.starts_with('{') {
+                            match block_const_value(&lines[i + 1..]) {
+                                Some(lit) => Some(parse_const(lit)),
+                                None => ret_ty.clone().and_then(|rt| {
+                                    fold_const_block(&lines, i + 1, rt, enums, &prog.consts)
+                                }),
                             }
-                        });
+                        } else {
+                            None
+                        };
                         if let Some(c) = literal {
                             // A bare key is recorded when the name is used
                             // bare somewhere, i.e. for a crate-level item, or when
@@ -1983,11 +2493,20 @@ fn parse_program_impl(
                             // its own source could not. A qualified definition
                             // keeps its qualified key, which is what a contract
                             // that spells the path resolves.
-                            if name.contains("::")
-                                || ((bare_uses.contains(name) || crate_consts.contains(name))
-                                    && !claimed_bare.contains(name))
-                            {
-                                prog.consts.insert(name.to_string(), parse_const(c));
+                            if name.contains("::") {
+                                prog.consts.insert(name.to_string(), c);
+                            } else if claimed_bare.contains(name) {
+                                // A bare definition whose use is qualified: a
+                                // function-local item printed bare because no
+                                // other local shares its name. Record it under
+                                // the qualified path the use site spells, so the
+                                // owning function's contract reads the value while
+                                // no other function can name the bare key.
+                                if let Some(path) = claimed_paths.get(name) {
+                                    prog.consts.insert(path.clone(), c);
+                                }
+                            } else if bare_uses.contains(name) || crate_consts.contains(name) {
+                                prog.consts.insert(name.to_string(), c);
                             }
                         }
                     }
@@ -2033,118 +2552,7 @@ fn parse_program_impl(
             for (l, t) in &args {
                 f.locals.insert(*l, t.clone());
             }
-            // Body runs until the closing brace in column 0.
-            let mut j = i + 1;
-            let mut cur_block: Option<Block> = None;
-            while j < lines.len() {
-                let l = lines[j];
-                if l.starts_with('}') {
-                    if let Some(b) = cur_block.take() {
-                        f.blocks.push(b);
-                    }
-                    break;
-                }
-                let t = l.trim();
-                // Locals and debug names, wherever they appear (scope blocks too).
-                if let Some(rest) = t.strip_prefix("let ") {
-                    let rest = rest.trim_start_matches("mut ").trim();
-                    if let Some(c) = find_top_level_colon(rest) {
-                        if let Some(idx) = parse_local(&rest[..c]) {
-                            f.locals.insert(idx, Ty::parse(rest[c + 1..].trim().trim_end_matches(';')));
-                        }
-                    }
-                    j += 1;
-                    continue;
-                }
-                if let Some(rest) = t.strip_prefix("debug ") {
-                    if let Some((n, p)) = rest.split_once("=>") {
-                        let name = n.trim().to_string();
-                        let target = p.trim().trim_end_matches(';');
-                        // Recorded before the local check, so a binding to a
-                        // constant is visible as a shadowing. `let k = i; let k =
-                        // 0;` prints `debug k => _2;` then `debug k => const
-                        // 0_usize;`, and dropping the second (as keeping only
-                        // local targets would) leaves the stale `_2` looking like
-                        // the only binding, so a contract's `k` would be checked
-                        // against `i` while the body used the constant.
-                        f.debug_bindings.push((name.clone(), parse_local(target)));
-                        if let Some(idx) = parse_local(target) {
-                            // First binding wins, and it must. A `debug` line at
-                            // function level names the *parameter*; a later one
-                            // inside a `scope` block names whatever value has
-                            // since moved into that local (`let s = a;` prints
-                            // `debug s => _1;` inside `scope 1`). Overwriting
-                            // with the scoped alias renames the parameter, so a
-                            // contract that says `requires: a <= 127` would look
-                            // up `a`, find only `s`, and be skipped as unreadable
-                            // -- the function would go unverified because a
-                            // local borrowed the parameter's slot.
-                            f.local_names.entry(idx).or_insert_with(|| name.clone());
-                        }
-                    }
-                    j += 1;
-                    continue;
-                }
-                if t.starts_with("scope ") || t == "{" {
-                    j += 1;
-                    continue;
-                }
-                // A block header: `bbN: {`
-                if let Some(rest) = t.strip_prefix("bb") {
-                    if let Some(colon) = rest.find(':') {
-                        if let Ok(id) = rest[..colon].trim().parse::<usize>() {
-                            if let Some(b) = cur_block.take() {
-                                f.blocks.push(b);
-                            }
-                            cur_block = Some(Block { id, stmts: Vec::new(), term: Term::Unknown("missing".into()) });
-                            j += 1;
-                            continue;
-                        }
-                    }
-                }
-                if t == "}" {
-                    if let Some(b) = cur_block.take() {
-                        f.blocks.push(b);
-                    }
-                    j += 1;
-                    continue;
-                }
-                if t.is_empty() || t.starts_with("//") {
-                    j += 1;
-                    continue;
-                }
-                // A statement or terminator.
-                if let Some(b) = cur_block.as_mut() {
-                    match parse_stmt_or_term(t, enums) {
-                        Ok(s) => b.stmts.push(s),
-                        Err(term) => {
-                            b.term = term;
-                            let done = b.clone();
-                            f.blocks.push(done);
-                            cur_block = None;
-                        }
-                    }
-                }
-                j += 1;
-            }
-            // Keep the locals map from losing the return slot's real type.
-            //
-            // Every local the body assigns is recorded, so `alias_locals` can
-            // refuse to alias an argument that is reassigned. A `let mut i = …`
-            // argument that the body writes is exactly the case where a scoped
-            // `debug k => _2;` stops being an alias, so this is collected from the
-            // parsed blocks rather than from the text: the parser is the only
-            // thing that knows which lines were statements.
-            for b in &f.blocks {
-                for s in &b.stmts {
-                    if let Stmt::Assign(p, _) = s {
-                        f.written.insert(p.local);
-                    }
-                }
-                if let Term::Call { dest, .. } = &b.term {
-                    f.written.insert(dest.local);
-                }
-            }
+            let j = parse_fn_body(&lines, i + 1, &mut f, enums);
             prog.fns.push(f);
             i = j + 1;
             continue;
@@ -2152,6 +2560,134 @@ fn parse_program_impl(
         i += 1;
     }
     prog
+}
+
+/// Parse a body of basic blocks into `f`, from the line after a header.
+///
+/// `lines` is the whole dump and `start` is the first body line; the returned
+/// index is the line that closes the body, so the caller resumes after it. A
+/// function body and a `const` item's const-evaluated body print in the same
+/// shape, so both go through here rather than through two copies of the reader.
+/// See [`fold_const_block`].
+fn parse_fn_body(
+    lines: &[&str],
+    start: usize,
+    f: &mut MirFn,
+    enums: &BTreeMap<String, EnumLayout>,
+) -> usize {
+    // Body runs until the closing brace in column 0.
+    let mut j = start;
+    let mut cur_block: Option<Block> = None;
+    while j < lines.len() {
+        let l = lines[j];
+        if l.starts_with('}') {
+            if let Some(b) = cur_block.take() {
+                f.blocks.push(b);
+            }
+            break;
+        }
+        let t = l.trim();
+        // Locals and debug names, wherever they appear (scope blocks too).
+        if let Some(rest) = t.strip_prefix("let ") {
+            let rest = rest.trim_start_matches("mut ").trim();
+            if let Some(c) = find_top_level_colon(rest) {
+                if let Some(idx) = parse_local(&rest[..c]) {
+                    f.locals.insert(idx, Ty::parse(rest[c + 1..].trim().trim_end_matches(';')));
+                }
+            }
+            j += 1;
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("debug ") {
+            if let Some((n, p)) = rest.split_once("=>") {
+                let name = n.trim().to_string();
+                let target = p.trim().trim_end_matches(';');
+                // Recorded before the local check, so a binding to a
+                // constant is visible as a shadowing. `let k = i; let k =
+                // 0;` prints `debug k => _2;` then `debug k => const
+                // 0_usize;`, and dropping the second (as keeping only
+                // local targets would) leaves the stale `_2` looking like
+                // the only binding, so a contract's `k` would be checked
+                // against `i` while the body used the constant.
+                f.debug_bindings.push((name.clone(), parse_local(target)));
+                if let Some(idx) = parse_local(target) {
+                    // First binding wins, and it must. A `debug` line at
+                    // function level names the *parameter*; a later one
+                    // inside a `scope` block names whatever value has
+                    // since moved into that local (`let s = a;` prints
+                    // `debug s => _1;` inside `scope 1`). Overwriting
+                    // with the scoped alias renames the parameter, so a
+                    // contract that says `requires: a <= 127` would look
+                    // up `a`, find only `s`, and be skipped as unreadable
+                    // -- the function would go unverified because a
+                    // local borrowed the parameter's slot.
+                    f.local_names.entry(idx).or_insert_with(|| name.clone());
+                }
+            }
+            j += 1;
+            continue;
+        }
+        if t.starts_with("scope ") || t == "{" {
+            j += 1;
+            continue;
+        }
+        // A block header: `bbN: {`
+        if let Some(rest) = t.strip_prefix("bb") {
+            if let Some(colon) = rest.find(':') {
+                if let Ok(id) = rest[..colon].trim().parse::<usize>() {
+                    if let Some(b) = cur_block.take() {
+                        f.blocks.push(b);
+                    }
+                    cur_block = Some(Block { id, stmts: Vec::new(), term: Term::Unknown("missing".into()) });
+                    j += 1;
+                    continue;
+                }
+            }
+        }
+        if t == "}" {
+            if let Some(b) = cur_block.take() {
+                f.blocks.push(b);
+            }
+            j += 1;
+            continue;
+        }
+        if t.is_empty() || t.starts_with("//") {
+            j += 1;
+            continue;
+        }
+        // A statement or terminator.
+        if let Some(b) = cur_block.as_mut() {
+            match parse_stmt_or_term(t, enums) {
+                Ok(s) => b.stmts.push(s),
+                Err(term) => {
+                    b.term = term;
+                    let done = b.clone();
+                    f.blocks.push(done);
+                    cur_block = None;
+                }
+            }
+        }
+        j += 1;
+    }
+    // Keep the locals map from losing the return slot's real type.
+    //
+    // Every local the body assigns is recorded, so `alias_locals` can
+    // refuse to alias an argument that is reassigned. A `let mut i = …`
+    // argument that the body writes is exactly the case where a scoped
+    // `debug k => _2;` stops being an alias, so this is collected from the
+    // parsed blocks rather than from the text: the parser is the only
+    // thing that knows which lines were statements.
+    for b in &f.blocks {
+        for s in &b.stmts {
+            if let Stmt::Assign(p, _) = s {
+                f.written.insert(p.local);
+            }
+        }
+        if let Term::Call { dest, .. } = &b.term {
+            f.written.insert(dest.local);
+        }
+    }
+    j
 }
 
 #[cfg(test)]
@@ -2716,22 +3252,29 @@ fn add(_1: u32, _2: u32) -> u32 {
             "a CTFE brace-block `const` must fold to its `_0` literal: {:?}",
             prog.consts
         );
-        // A block that *computes* its value has no single literal to fold, so the
-        // item is dropped rather than given a guessed value.
+        // A block that *computes* its value is now interpreted concretely: the
+        // checked add folds to `3 + 4`, and the item is recorded rather than
+        // dropped, so a contract that names it decides. The value is the folded
+        // result, not a guess -- the body's own `assert(!overflow)` is checked.
         let computed = "const C: u8 = {\n    let mut _0: u8;\n    let mut _1: (u8, bool);\n\n    \
                         bb0: {\n        _1 = AddWithOverflow(const 3_u8, const 4_u8);\n        \
-                        return;\n    }\n}\n\
+                        assert(!move (_1.1: bool), \"x\", const 3_u8, const 4_u8) -> \
+                        [success: bb1, unwind continue];\n    }\n\n    bb1: {\n        \
+                        _0 = move (_1.0: u8);\n        return;\n    }\n}\n\
                         fn reads() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
                         _0 = const C;\n        return;\n    }\n}\n";
         let prog = parse_program(computed);
-        assert!(
-            !prog.consts.contains_key("C"),
-            "a computed const body has no literal to fold: {:?}",
+        assert_eq!(
+            prog.consts.get("C"),
+            Some(&Const::UInt(7, Some(Ty::U8))),
+            "a computed const body folds to its value: {:?}",
             prog.consts
         );
-        // A *branching* body must be refused too: `if false { 7 } else { 8 }` is
-        // 8, but the first `_0` arm in textual order is 7. Folding the first arm
-        // would store 7 and certify a claim about a value the constant never has.
+        // A *branching* body must fold to the **taken** arm, not the first arm in
+        // textual order. `if false { 7 } else { 8 }` is 8, and bb1 (which holds 7)
+        // prints first: folding the first arm would store 7 and certify a claim
+        // about a value the constant never has. Following the `switchInt` on the
+        // discriminant's actual value is what keeps this honest.
         let branching = "const K: u8 = {\n    let mut _0: u8;\n    let mut _1: bool;\n\n    \
                          bb0: {\n        _1 = const false;\n        switchInt(move _1) -> [0: bb2, \
                          otherwise: bb1];\n    }\n\n    bb1: {\n        _0 = const 7_u8;\n        \
@@ -2740,10 +3283,84 @@ fn add(_1: u32, _2: u32) -> u32 {
                          fn reads() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
                          _0 = const K;\n        return;\n    }\n}\n";
         let prog = parse_program(branching);
-        assert!(
-            !prog.consts.contains_key("K"),
-            "a branching const body has no single value to fold: {:?}",
+        assert_eq!(
+            prog.consts.get("K"),
+            Some(&Const::UInt(8, Some(Ty::U8))),
+            "a branching const body folds to the taken arm: {:?}",
             prog.consts
+        );
+    }
+
+    /// The folder refuses every shape it cannot interpret exactly, and each
+    /// refusal leaves the item out of the table (an unreadable name at a use
+    /// site), never a guessed value.
+    ///
+    /// This is the soundness half of [`a_ctfe_brace_block_const_folds_to_its_literal`]:
+    /// the folder *does* fold expressions, so what it must not do is fold one it
+    /// did not fully understand. A call, a non-literal operand, a place with a
+    /// subscript, and a failed `assert` are the four ways a `const` body can leave
+    /// the modelled subset, and each is asserted here.
+    #[test]
+    fn a_const_body_outside_the_modelled_subset_is_refused_not_guessed() {
+        let reads = "fn reads() -> u8 {\n    let mut _0: u8;\n\n    bb0: {\n        \
+                     _0 = const C;\n        return;\n    }\n}\n";
+        // A call in the body: the callee's value is not a literal here, so the
+        // item cannot be folded.
+        let call = format!(
+            "const C: u8 = {{\n    let mut _0: u8;\n\n    bb0: {{\n        \
+             _0 = helper(const 1_u8) -> [return: bb1, unwind continue];\n    }}\n\n    \
+             bb1: {{\n        return;\n    }}\n}}\n{reads}"
+        );
+        assert!(!parse_program(&call).consts.contains_key("C"), "a call body is refused");
+
+        // A path the folder has not resolved, used as an operand of an operation:
+        // the operand is not a literal, so the item is refused. (A bare
+        // `_0 = const OTHER` is read by the older literal path, not the folder, so
+        // the path is put inside an operation to reach the folder.)
+        let unknown = format!(
+            "const C: u8 = {{\n    let mut _0: u8;\n\n    bb0: {{\n        \
+             _0 = Add(const OTHER, const 1_u8);\n        return;\n    }}\n}}\n{reads}"
+        );
+        assert!(
+            !parse_program(&unknown).consts.contains_key("C"),
+            "an unresolved path operand is refused"
+        );
+
+        // A place with a *subscript* has no key in the folder's store, so the read
+        // is refused rather than taken from the wrong slot.
+        let subscript = format!(
+            "const C: u8 = {{\n    let mut _0: u8;\n    let mut _1: [u8; 2];\n\n    bb0: {{\n        \
+             _0 = _1[0];\n        return;\n    }}\n}}\n{reads}"
+        );
+        assert!(
+            !parse_program(&subscript).consts.contains_key("C"),
+            "a subscripted read is refused"
+        );
+
+        // A failed `assert`: rustc would not emit a const whose check fails, so a
+        // failure means the body is not the shape the folder understands. Folding
+        // past it would store a value the constant never had.
+        let failing_assert = format!(
+            "const C: u8 = {{\n    let mut _0: u8;\n\n    bb0: {{\n        \
+             _0 = const 3_u8;\n        assert(const false, \"x\") -> [success: bb1, unwind continue];\n    }}\n\n    \
+             bb1: {{\n        return;\n    }}\n}}\n{reads}"
+        );
+        assert!(
+            !parse_program(&failing_assert).consts.contains_key("C"),
+            "a failed assert is refused"
+        );
+
+        // The control: the same shape with a *satisfied* assert folds, so the
+        // refusals above are about the shapes and not about the harness.
+        let ok = format!(
+            "const C: u8 = {{\n    let mut _0: u8;\n\n    bb0: {{\n        \
+             _0 = const 3_u8;\n        assert(const true, \"x\") -> [success: bb1, unwind continue];\n    }}\n\n    \
+             bb1: {{\n        return;\n    }}\n}}\n{reads}"
+        );
+        assert_eq!(
+            parse_program(&ok).consts.get("C"),
+            Some(&Const::UInt(3, Some(Ty::U8))),
+            "a satisfied assert folds"
         );
     }
 

@@ -6727,10 +6727,17 @@ prints its *body* separately (`const LIMIT: u8 = const 10_u8;`) while referring 
 the use site (`_0 = const LIMIT`). The executor read only the name, so a use site was an
 unreadable path constant and any contract that touched the constant was lost -- not wrongly
 proved, but never decided, which for an embedded crate whose bounds checks read named constants
-is the common case. `MirProgram::consts` now collects each item's printed literal (only a
-literal: an item whose body is an *expression* has its own body and locals and is left for a
-future interpreter pass, and an associated constant's `{constant#0}` name is dropped), and
-`operand` folds a use site against that table. The key is the full printed path (`a::K`,
+is the common case. `MirProgram::consts` now collects each item's value -- its printed
+literal, or, when the body is an *expression* (`const NEXT: u8 = LIMIT + 1`), the value that a
+concrete folder derives by interpreting that body (`fold_const_block`, in `src/mir/parse.rs`).
+The folder walks the item's own basic blocks with every operand a literal, checks the body's
+own `assert(!overflow)` / shift checks, resolves a branch by the discriminant's *value* (so it
+follows the taken arm, never the first arm in textual order), and refuses -- leaving the item
+unmodelled -- on any shape outside that subset (a call, an unresolved path, a subscript, a
+failed assert, a zero divisor). It is a separate interpreter over the parsed blocks rather than
+the symbolic executor, because the symbolic engine's `const` table is what the folder feeds.
+An associated constant's `{constant#0}` name is still dropped. `operand` folds a use site
+against that table. The key is the full printed path (`a::K`,
 `low::K`), not the last segment, so two modules with a `const K` cannot collide -- a table keyed
 by the last segment could read the wrong value, which would be a false proof rather than a lost
 one. The item's own type suffix supplies the width and sign, exactly as for an inline literal,
@@ -6741,18 +6748,20 @@ Pinned by `tests/mir.rs::a_named_const_item_is_inlined_at_its_use_site`, whose c
 `named_const_bounds_a_comparison`, `named_const_matches_an_equality`,
 `named_negative_const_is_signed` and `nested_module_const_is_read` each carry their
 `_cannot_prove_this` twin (every twin's postcondition is false on *every* input, so a regression
-that guessed a value would fail the test). One entry pins the boundary where the value is *not*
-inlined and the contract is lost rather than proved: `named_const_of_an_expression_is_not_inlined`
-(an item whose body is an expression has its own body and locals). Another pins a second
-boundary: `a_function_local_const_is_not_inlined`. The two spellings do not meet there -- the
-*use* is printed with the enclosing function's path (`const a_local::L`) while the *definition*
-is printed bare (`const L: u8 = const 3_u8;`), rustc emitting the qualifier only where it is
-needed to disambiguate. That is also what makes the bare key safe rather than a false-proof
-risk: rustc qualifies a function-local item's definition precisely when another item shares its
-last segment (`const L: u8 = 5;` at the top level forces `const a_local::L`), so a bare `const L`
-enters the table only when nothing else could be meant by `L`. Verified to fail without the fix
-by neutralising the table lookup: the test then reports the true direction as `incomplete`. The
-parser side is pinned by `mir::parse::tests::named_const_items_are_collected_only_when_literal`.
+that guessed a value would fail the test). The expression-bodied item that used to be a boundary is now folded:
+`named_const_of_an_expression_is_inlined` (its `NEXT` is `LIMIT + 1 == 11`) verifies, its
+`_cannot_prove_this` twin (claiming `10`) is refuted, and `an_expression_const_keeps_its_width`
+holds the folded value's width. The refusals are pinned by
+`mir::parse::tests::a_const_body_outside_the_modelled_subset_is_refused_not_guessed`. A
+function-local `const` is inlined for its *owner* now too: `a_function_local_const_is_inlined`.
+Its *use* is printed with the enclosing function's path (`const a_local::L`) while the
+*definition* is printed bare (`const L: u8 = const 3_u8;`) -- rustc emitting the qualifier only
+where it is needed to disambiguate -- so the definition is recorded under the *qualified* path
+the use names, and no bare key is created. The bare key is what would be a false-proof risk:
+`a_local_const_is_not_in_scope_in_another_function` still holds that the bare name resolves to
+nothing elsewhere. Verified to fail without the fix by neutralising the table lookup: the test
+then reports the true direction as `incomplete`. The parser side is pinned by
+`mir::parse::tests::named_const_items_are_collected_only_when_literal`.
 
 ## Recursion by contract: a self-call answered by the function's own contract
 
