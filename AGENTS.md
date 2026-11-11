@@ -7690,19 +7690,40 @@ Corpus coverage `examples/mir_targets/realistic.rs` **349 → 353** verified ove
 local `from` is not consulted at all. No new SMT primitives were needed: `sign_extend` and
 `truncate` already existed.
 
-### A separate, pre-existing hazard this work surfaced (not fixed here)
+### The owner-type gap this work surfaced, and how it was closed
 
-While checking the local-trait case, a probe found a **false proof that predates this
-increment** (confirmed on the unmodified tree): a crate-root `impl From<u8> for u16` whose body
-returns `7` is *wrongly* consulted for a real `<u16 as std::convert::From<u8>>::from(x)` call,
-so a contract `ret == 7` verifies. The mechanism is `resolve_callee`'s owner-type match: the
+While checking the local-trait case, a probe found a **false proof that predated this
+increment** (confirmed on the unmodified tree): a local `impl From<u8> for u16` whose body
+returns `7` was *wrongly* consulted for a real `<u16 as std::convert::From<u8>>::from(x)` call,
+so a contract `ret == 7` verified. The mechanism was `resolve_callee`'s owner-type match: the
 local impl's *definition* name `<impl at …>::from` shares the tail `from` with the call
-`<u16 as std::convert::From<u8>>::from`, and `method_owner_type` reads the owner as `u16`, which
-equals the call's self type — so the local body wins the same-dump lookup for a `core` call.
-This is orthogonal to the conversion *model* (which is only a fallback and is never reached when
-the lookup matches); it is a gap in the same-dump resolver for *any* local impl on a primitive
-whose owner type matches an external trait call's self type. It is deliberately left to its own
-increment rather than folded in here, and the corpus fixtures added here avoid the collision (the
-local-trait pair lives in a module, `conv_shim::From`, where the trait path differs and the model
-refuses it by name). The scratch probes were `/tmp/gap/shimproof.rs` (the false proof) and
-`/tmp/gap/localtrait.rs` (the module-qualified local trait behaving correctly).
+`<u16 as std::convert::From<u8>>::from`, and `method_owner_type` read the owner as `u16`, which
+equals the call's self type — so the local body won the same-dump lookup for a `core` call. The
+gap was in the same-dump resolver, not in the conversion *model* (a fallback that is never
+reached when the lookup matches), and it applied to *any* local impl on a primitive whose owner
+type matched an external trait call's self type.
+
+It is now closed by making the resolver **trait-aware**. `Specs` gains an `impl_traits` map —
+the trait each `impl` block implements, keyed by the same `(line, column)` as `impl_owners`,
+read by the new `spec::impl_trait` parser and qualified with its enclosing module (so
+`impl From<u8> for u16` inside `mod m` records `m::From`, the path rustc prints in a call). A
+*trait* call (`<T as Trait<…>>::m`) is admitted only when the call's trait path is a `::`-aligned
+suffix of the candidate impl's own trait path (`trait_candidate_admits`): a bare `conv_shim::From`
+is not a suffix of `std::convert::From`, so the local body can no longer answer the library call,
+while the local trait's *own* call (`conv_shim::From::from(x)`) still reaches its body. A bare
+`Type::m` call carries no ` as ` projection — rustc prints both an inherent method and an in-scope
+trait method that way — so it keeps the owner-type match alone, as before.
+
+The corpus pins both directions with a `conv_shim` fixture mirroring `ord_shim`:
+`local_from_does_not_answer_the_std_trait` (the false proof, must refute) and
+`local_from_is_answered_by_its_own_body` (the local trait, must verify). The integration test
+`a_local_trait_named_from_does_not_answer_the_std_trait` **fails** on the pre-fix tree — it
+reports the false proof `verified (1 obligation(s), 0 panic(s) ruled out)` — so the guard is
+load-bearing, not decorative. Unit tests pin the parser (`impl_trait`) and the map's keying and
+module-qualification.
+
+`scripts/test-count.sh` **774 → 777** passed, 0 failed; `scripts/gate.sh` **ALL GATES GREEN**.
+Corpus coverage `examples/mir_targets/realistic.rs` **353 → 354** decided over 655 → 657
+contracts (the two new `conv_shim` entries: one verifies from the local body, one refutes the
+library call it must not answer). No new SMT primitives: the guard is a name comparison, and the
+model is unchanged.

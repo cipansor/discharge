@@ -195,6 +195,20 @@ pub struct Specs {
     /// `impl Foo::from` from an external `u16::from` (a false proof: a call to the
     /// external function is answered by the local body). See `line_scopes`.
     pub impl_owners: BTreeMap<(usize, usize), String>,
+    /// The *trait* each `impl` block implements, keyed by the same location as
+    /// [`Self::impl_owners`]. Absent for an inherent `impl`, which is the common
+    /// case. The value is the trait's *path* as written (`From`,
+    /// `std::convert::From`), not just its last segment.
+    ///
+    /// This is the second half of telling a local `impl From<u8> for u16` from the
+    /// standard library's: both print a call as `<u16 as From<u8>>::from` when the
+    /// local `From` is in scope, and both have owner `u16`, so the *owner alone
+    /// cannot separate them*. The trait path can, because the compiler qualifies
+    /// the library trait in the call it resolved there
+    /// (`<u16 as std::convert::From<u8>>::from`) and the local impl's bare `From`
+    /// is not a suffix of that. See `impl_trait` and the executor's
+    /// `resolve_callee`.
+    pub impl_traits: BTreeMap<(usize, usize), String>,
     /// Contracts on methods, keyed by `(impl line, impl column, method name)`.
     ///
     /// A method's contract cannot live in [`Self::by_fn`] under its bare name: two
@@ -948,6 +962,78 @@ pub(crate) fn impl_owner(header: &str) -> Option<String> {
     }
 }
 
+/// The *trait* an `impl` block implements, read from its header, or `None` for an
+/// inherent `impl`.
+///
+/// `impl From<u8> for u16` yields `Some("From")`, `impl std::convert::From<u8>
+/// for u16` yields `Some("std::convert::From")` and `impl u16` yields `None`. The
+/// full path is kept, not just the last segment, because that is exactly what
+/// separates a local `impl From<u8> for u16` from the standard library's: a call
+/// the compiler resolved to the library trait prints its path
+/// (`<u16 as std::convert::From<u8>>::from`), which is *not* a suffix of the bare
+/// `From` a local impl was written with. See [`Specs::impl_traits`].
+///
+/// The `impl`'s type parameters (`impl<T> From<T> for …`) are skipped first,
+/// exactly as in [`impl_owner`], and the trait is the text *before* ` for ` when
+/// there is one, up to (not including) its own `<…>` type-argument list.
+pub(crate) fn impl_trait(header: &str) -> Option<String> {
+    let after = header.trim_start().strip_prefix("unsafe ").unwrap_or(header.trim_start());
+    let rest = after.strip_prefix("impl")?;
+    // Skip an `impl<T, U>` parameter list, as `impl_owner` does.
+    let rest = rest.trim_start();
+    let rest = if let Some(r) = rest.strip_prefix('<') {
+        let mut depth = 1usize;
+        let mut end = 0usize;
+        for (i, c) in r.char_indices() {
+            match c {
+                '<' => depth += 1,
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        &r[end..]
+    } else {
+        rest
+    };
+    // A trait impl has `Trait for Type`; an inherent one has only `Type`.
+    let (before, has_for) = match rest.split_once(" for ") {
+        Some((b, _)) => (b, true),
+        None => (rest, false),
+    };
+    if !has_for {
+        return None;
+    }
+    // The trait path is the leading `a::b::C` of the part before ` for `; its own
+    // `<…>` type arguments and any `where` clause are dropped.
+    let path: String = before
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+        .collect();
+    let path = path.trim_end_matches(':').to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+/// Whether a trait path written in an `impl` header names an external crate, so
+/// that prefixing the enclosing module would be wrong.
+///
+/// `std::convert::From`, `core::cmp::Ord`, `alloc::…` and a `crate::`/`self::`
+/// path are already rooted; a bare `From` or a `super::m::From` is relative to the
+/// module the `impl` sits in. See [`extract`]'s use of [`Specs::impl_traits`].
+fn is_absolute_trait_path(path: &str) -> bool {
+    let first = path.split("::").next().unwrap_or(path);
+    matches!(first, "std" | "core" | "alloc" | "crate" | "self" | "super")
+}
 
 /// Extract contracts from Rust source text.
 ///
@@ -988,6 +1074,21 @@ pub fn extract(source: &str) -> Specs {
         if let Some(col) = impl_keyword_col(raw) {
             if let Some(owner) = impl_owner(raw) {
                 specs.impl_owners.insert((idx + 1, col), owner);
+            }
+            if let Some(tr) = impl_trait(raw) {
+                // Qualify the trait with its enclosing module path, because a call
+                // names it that way. `impl From<u8> for u16` inside `mod m` is
+                // `m::From`, which is exactly how rustc prints a call to it
+                // (`<u16 as m::From<u8>>::from`), while a bare `From` at the crate
+                // root stays `From`. A path that already names a crate
+                // (`std::convert::From`, `core::…`, `crate::…`) is kept as written,
+                // since prefixing a module would make it name nothing.
+                let qualified = if is_absolute_trait_path(&tr) || scope_path[idx].is_empty() {
+                    tr
+                } else {
+                    format!("{}::{}", scope_path[idx].join("::"), tr)
+                };
+                specs.impl_traits.insert((idx + 1, col), qualified);
             }
         }
     }
@@ -7544,5 +7645,56 @@ fn h<
             // The property is "does not panic"; the call itself is the assertion.
             let _ = const_generic_params(source);
         }
+    }
+
+    /// The trait an `impl` block implements is read from its header, and an
+    /// inherent `impl` has none.
+    ///
+    /// This is what separates a local `impl From<u8> for u16` from the standard
+    /// library's when both own `u16` and both spell their method `from`. The path
+    /// is kept whole (`std::convert::From`), because a bare `From` is *not* a
+    /// suffix of the qualified path a call prints for the library trait, and that
+    /// non-match is the guard. See [`Specs::impl_traits`].
+    #[test]
+    fn impl_trait_reads_the_trait_and_refuses_an_inherent_impl() {
+        assert_eq!(impl_trait("impl From<u8> for u16 {"), Some("From".to_string()));
+        assert_eq!(
+            impl_trait("impl std::convert::From<u8> for u16 {"),
+            Some("std::convert::From".to_string())
+        );
+        assert_eq!(impl_trait("impl core::cmp::Ord for Foo {"), Some("core::cmp::Ord".to_string()));
+        // An `impl<T>` parameter list is skipped, as for the owner.
+        assert_eq!(impl_trait("impl<T> From<T> for Wrapper<T> {"), Some("From".to_string()));
+        // `unsafe impl` still names its trait.
+        assert_eq!(impl_trait("unsafe impl Send for Foo {}"), Some("Send".to_string()));
+        // An inherent impl has no trait.
+        assert_eq!(impl_trait("impl u16 {"), None);
+        assert_eq!(impl_trait("impl<T> Wrapper<T> {"), None);
+        // A nested type argument does not end the path early.
+        assert_eq!(
+            impl_trait("impl Convert<Option<u8>> for Foo {"),
+            Some("Convert".to_string())
+        );
+    }
+
+    /// The `impl_traits` map is keyed by the `impl` keyword's location -- the same
+    /// key as `impl_owners` -- and qualifies the trait with its enclosing module.
+    ///
+    /// A call prints a module-local trait with its module (`<u16 as m::From<u8>>::from`),
+    /// so the recorded path must carry that module too, or the guard would refuse a
+    /// legitimate local impl. A crate-root impl keeps its bare path.
+    #[test]
+    fn impl_traits_are_keyed_by_location_and_module_qualified() {
+        let src = "mod m {\n    pub trait From<T> { fn from(t: T) -> Self; }\n    \
+                   impl From<u8> for u16 { fn from(_t: u8) -> u16 { 7 } }\n}\n\
+                   struct Wrapper(u8);\n\
+                   impl Wrapper { fn make() -> Wrapper { Wrapper(0) } }\n";
+        let specs = extract(src);
+        // `impl From` is on line 3; the module `m` prefixes it.
+        assert_eq!(specs.impl_traits.get(&(3, 5)), Some(&"m::From".to_string()));
+        assert_eq!(specs.impl_owners.get(&(3, 5)), Some(&"u16".to_string()));
+        // The inherent `impl Wrapper` on line 6 has an owner but no trait.
+        assert_eq!(specs.impl_owners.get(&(6, 1)), Some(&"Wrapper".to_string()));
+        assert_eq!(specs.impl_traits.get(&(6, 1)), None);
     }
 }

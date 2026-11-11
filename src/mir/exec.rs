@@ -2428,6 +2428,49 @@ fn method_owner_type(prog: &MirProgram, f: &MirFn) -> Option<String> {
     prog.impl_owners.get(&loc).cloned()
 }
 
+/// The trait a *call* names, as the path between `as` and `>`, or `None` when the
+/// call is not a trait call.
+///
+/// `Some("std::convert::From")` for `<u16 as std::convert::From<u8>>::from`,
+/// `Some("From")` for `<u16 as From<u8>>::from`, and `None` for an inherent call
+/// like `Vec2::push` or `<impl at …>::m`. The ` as `-delimited projection is what
+/// rustc prints for a trait method call, so the trait path is read there and
+/// nowhere else -- a bare `Type::m` has no trait to compare.
+fn call_trait_path(name: &str) -> Option<String> {
+    let after = name.rsplit_once(" as ")?.1;
+    let (trait_ty, _) = after.split_once(">::")?;
+    Some(trait_ty.split_once('<').map(|(t, _)| t).unwrap_or(trait_ty).trim().to_string())
+}
+
+/// Whether a local method candidate may answer a *trait* call.
+///
+/// `want` is the trait path the call names (`std::convert::From`); `have` is the
+/// path the candidate's own `impl` block implements, read from the source, or
+/// `None` for an inherent `impl`.
+///
+/// The rule is one-sided on purpose: the call's trait must be a `::`-aligned
+/// suffix of the impl's trait. That accepts the spellings that really are the same
+/// trait -- a call `<u16 as From<u8>>::from` (the compiler shortened the path once
+/// the local `From` was in scope) against an impl written `impl std::convert::From`
+/// -- and rejects the collision that is the whole reason for this guard: a call
+/// `<u16 as std::convert::From<u8>>::from` against a local `impl From<u8> for u16`,
+/// whose bare `From` is *not* a suffix of `std::convert::From`, so the local body
+/// cannot answer a call the compiler resolved to the library trait.
+///
+/// An inherent candidate (`have` is `None`) can never answer a trait call: its
+/// method is not the trait's. That is what closes the `impl MyFrom<u8> for u16`
+/// case, where the impl's *trait* differs from the call's even though the method
+/// tail (`from`) matches.
+///
+/// A trait call with no candidate to compare against is the caller's business; an
+/// exact-name match is handled before this is reached.
+fn trait_candidate_admits(want: &str, have: Option<&str>) -> bool {
+    let Some(have) = have else {
+        return false;
+    };
+    have == want || crate::mir::spec::is_path_suffix(have, want)
+}
+
 /// Resolve a call name to the function in the dump it names.
 ///
 /// An exact match is the free-function case: rustc prints a same-crate free
@@ -2451,6 +2494,14 @@ fn method_owner_type(prog: &MirProgram, f: &MirFn) -> Option<String> {
 ///   cannot be established the candidate is refused, because a static method's
 ///   tail is otherwise shared by any type (`<u16 as From<u8>>::from` would answer
 ///   a local `impl Foo { fn from }`, a false proof).
+/// * A *trait* call must agree on the trait. The owner type is not enough: a local
+///   `impl From<u8> for u16` and the standard library's `impl From<u8> for u16`
+///   share both the tail `from` and the owner `u16`, so owner-matching alone let
+///   the local body answer `<u16 as std::convert::From<u8>>::from`, a false proof
+///   of a call the compiler resolved to the library. The call's trait path must be
+///   a suffix of the candidate `impl`'s own trait path (see
+///   [`trait_candidate_admits`]), which the source records. An *inherent*
+///   candidate never answers a trait call.
 /// * A free function never matches a qualified call, because rustc prints a
 ///   same-crate free function's call bare -- the exact-match case above.
 ///
@@ -2465,16 +2516,38 @@ fn resolve_callee(prog: &MirProgram, name: &str) -> Option<usize> {
     }
     let tail = name.rsplit("::").next()?;
     let want_ty = call_type(name)?;
+    // The trait the call names, when it is a trait call (`<T as Trait<..>>::m`).
+    // `None` for a bare `Type::m`, which rustc prints for both an inherent method
+    // and a trait method in scope, so no trait check applies there.
+    let want_trait = call_trait_path(name);
     let mut hits = prog.fns.iter().enumerate().filter(|(_, g)| {
         if g.name.rsplit("::").next() != Some(tail) {
             return false;
         }
-        match method_self_type(g) {
+        let self_matches = match method_self_type(g) {
             Some(self_ty) => self_ty == want_ty,
             None => match method_owner_type(prog, g) {
                 Some(owner_ty) => owner_ty == want_ty,
                 None => false,
             },
+        };
+        if !self_matches {
+            return false;
+        }
+        // The candidate's own trait, from its `impl` block's location.
+        let have_trait = impl_self_loc(g)
+            .and_then(|loc| prog.impl_traits.get(&loc))
+            .map(String::as_str);
+        match want_trait.as_deref() {
+            Some(want) => trait_candidate_admits(want, have_trait),
+            // An inherent-looking call (`MyType::from`, with no ` as ` projection).
+            // rustc prints both an inherent method and a trait method in scope this
+            // way, so the candidate is *not* required to be inherent -- a bare
+            // `MyType::from` that resolves to a trait impl is legitimate. The owner
+            // match alone is as strong as it was before the trait check existed, and
+            // the ambiguity that would make it unsafe (two `from`s in scope, so
+            // rustc could not pick one) does not compile.
+            None => true,
         }
     });
     match (hits.next(), hits.next()) {

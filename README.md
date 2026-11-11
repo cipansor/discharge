@@ -1782,8 +1782,21 @@ refused. `src/mir/intrinsics.rs` holds the model:
   exceptions to the projection rule — a trait call has no `<impl …>` — and each is
   admitted only under the standard library's trait path (and, for `Ord`, only for a
   *primitive* self type). A crate-root trait named `Ord` or `From` is the one
-  spelling that could still collide; its body is in the dump, so the same-dump
-  lookup finds it first and the model is never consulted for it.
+  spelling that prints its own call with a bare trait path too, so the same
+  trait-path check separates it from the library trait — the local `From` is not a
+  suffix of `std::convert::From`, and the model answers only the library spelling.
+- The same-dump lookup is *trait-aware*, so a local impl on a primitive cannot
+  answer a call the compiler resolved to a library trait. The hazard is concrete:
+  a local `impl From<u8> for u16` returning `7` shares the method tail (`from`)
+  *and* the owner (`u16`) with `core`'s `impl From<u8> for u16`, so matching on the
+  owner alone answered `<u16 as std::convert::From<u8>>::from` from the local body
+  — a false proof of a library call. A *trait* call (`<T as Trait<…>>::m`) is now
+  admitted only when the call's trait path is a `::`-aligned suffix of the candidate
+  impl's own trait path, which the source records (`impl_traits`): the local impl's
+  bare `conv_shim::From` is not a suffix of `std::convert::From`, so it is refused,
+  while the local trait's own call still reaches its body. A bare `Type::m` call
+  carries no ` as ` projection — rustc prints an inherent method and an in-scope
+  trait method that way — so it keeps the owner-type match alone, as before.
 - `add_signed`/`add_unsigned` add a value to one of the *opposite* signedness
   (`u8::wrapping_add_signed` adds an `i8` to a `u8`), so the two operands are read
   at different signs. The value is the plain wrapped sum in both directions, since

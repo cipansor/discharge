@@ -1541,6 +1541,37 @@ fn widening_conversions_are_modelled_by_the_sources_signedness() {
     }
 }
 
+/// A local trait whose name and owner type collide with a modelled conversion's
+/// must not answer a call the compiler resolved to the *library* trait.
+///
+/// The `conv_shim` module implements its own `From<u8> for u16` returning `7`,
+/// while `core`'s `From<u8> for u16` widens `x`. Both share the method tail
+/// (`from`) and the owner (`u16`), so before the trait check
+/// `resolve_callee` answered `<u16 as std::convert::From<u8>>::from` from the
+/// local body and *proved* `ret == 7` -- a false proof of a library call. This
+/// test is the tripwire: `local_from_does_not_answer_the_std_trait` must be
+/// refuted, and the local trait's own call
+/// (`local_from_is_answered_by_its_own_body`) must still verify, so the guard
+/// separates the two traits rather than refusing the local one outright.
+#[test]
+fn a_local_trait_named_from_does_not_answer_the_std_trait() {
+    let verified = ["local_from_is_answered_by_its_own_body"];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify from the local body, got: {o}");
+    }
+    let refuted = ["local_from_does_not_answer_the_std_trait"];
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` claims the local body's answer for a library call and must be refuted, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
 /// The bitwise complement `!x`, pinned by a true half and a tripwire.
 ///
 /// `!x` is `all_ones ^ x` at the *operand's* width. The model reads that width

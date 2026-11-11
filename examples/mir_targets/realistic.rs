@@ -7745,6 +7745,52 @@ pub fn local_ord_min_is_not_the_model_tripwire(x: u8, y: u8) -> u8 {
     ord_shim::Ord::min(x, y)
 }
 
+/// A local trait whose *name* collides with a modelled conversion's, and whose
+/// owner type does too.
+///
+/// This is the collision the trait check in `resolve_callee` exists for, and it is
+/// sharper than `ord_shim`'s: `ord_shim::Ord` is refused by `classify` because the
+/// dump spells its call `<u8 as ord_shim::Ord>::min`, a trait segment the model
+/// does not know. Here the local trait is written `From` and lives in a module, so
+/// its own call is `<u16 as conv_shim::From>::from` -- still refused by the model.
+/// The hazard is the *other* direction: the standard library's `From<u8> for u16`
+/// shares the tail (`from`) *and* the owner (`u16`), so owner-matching alone let
+/// this body answer `<u16 as std::convert::From<u8>>::from`, a false proof of a
+/// call the compiler resolved to the library. The trait check separates them: the
+/// library call's path is not a suffix of this impl's bare `conv_shim::From`.
+pub mod conv_shim {
+    pub trait From<T> {
+        fn from(t: T) -> Self;
+    }
+    impl From<u8> for u16 {
+        fn from(_t: u8) -> u16 {
+            7
+        }
+    }
+}
+
+/// The false direction, and the tripwire for the collision above: the call is
+/// spelled with the *standard library's* trait path, so the compiler resolved it
+/// to `core`'s widening, which returns `x` -- not this module's `7`. The contract
+/// claims the local body's answer, so it must be refuted. Owner-matching alone
+/// answered the call from the local body, returned `7`, and *proved* it.
+/// requires: true
+/// ensures: ret == 7
+pub fn local_from_does_not_answer_the_std_trait(x: u8) -> u16 {
+    <u16 as std::convert::From<u8>>::from(x)
+}
+
+/// The local trait's *own* call, answered by its own body.
+///
+/// The positive counterpart: this is what must keep working once the trait check
+/// is in place. `conv_shim::From::from(x)` names the local trait, whose body
+/// returns `7`, so the claim verifies only from the body.
+/// requires: true
+/// ensures: ret == 7
+pub fn local_from_is_answered_by_its_own_body(x: u8) -> u16 {
+    conv_shim::From::from(x)
+}
+
 /// A widening conversion, `u16::from(u8)`, is a *trait* method too -- the dump
 /// spells `<u16 as From<u8>>::from` -- so like `Ord::min` it is modelled as a
 /// fallback behind the same-dump lookup. The value is the source widened by its own
