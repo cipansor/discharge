@@ -1808,6 +1808,134 @@ pub fn multiline_imported_trait() -> u16 {
     assert!(o.is_verified(), "a folded restricted import must still qualify the trait, got: {o}");
 }
 
+/// A nested trait argument keeps its balanced spelling on both sides of the match.
+///
+/// `call_trait_args` reads the argument off the *call* (`<W as Wrap<Option<u8>>>::get`)
+/// and `impl_trait_args` reads it off the impl header (`impl Wrap<Option<u8>> for W`).
+/// A "strip trailing `>`" reading on the call side cuts *every* closing bracket, so
+/// the call would say `Option<u8` while the impl says `Option<u8>`, the two would not
+/// match, and the local body would be lost -- the call reported as unmodelled. The
+/// verifying entry is the evidence the body answers; the tripwire is the evidence it
+/// is the *body* (returning `9`) and not a guess, since a model that constant-folded
+/// or refused would not refute it.
+#[test]
+fn a_nested_trait_argument_keeps_its_balanced_spelling() {
+    let src = r#"
+pub trait Wrap<T> { fn get(&self) -> u8; }
+pub struct W;
+impl Wrap<Option<u8>> for W { fn get(&self) -> u8 { 9 } }
+/// requires: true
+/// ensures: ret == 9
+pub fn nested_arg(w: &W) -> u8 { <W as Wrap<Option<u8>>>::get(w) }
+/// requires: true
+/// ensures: ret == 4
+pub fn nested_arg_tripwire(w: &W) -> u8 { <W as Wrap<Option<u8>>>::get(w) }
+"#;
+    let Some(o) = verify_src("nested_arg", src) else { return };
+    assert!(o.is_verified(), "a nested trait argument must still find the local body, got: {o}");
+    let Some(o) = verify_src("nested_arg_tripwire", src) else { return };
+    match &o {
+        FnOutcome::Failed { kind, .. } => assert_eq!(kind, "postcondition", "got: {o}"),
+        _ => panic!("the local body returns 9, so `ret == 4` must be refuted, got: {o}"),
+    }
+}
+
+/// A `#[cfg]`-disabled later `use` must not displace a live alias.
+///
+/// The import scan reads raw source, but rustc emits MIR only for enabled items. A
+/// live `use std::convert::From as Conv;` binds `Conv`; a later
+/// `#[cfg(any())] use crate::Other as Conv;` binds nothing, yet a naive map lets it
+/// overwrite the live binding, so the impl written with `Conv` is recorded with the
+/// wrong trait and its call is lost. The verifying entry is the evidence the live
+/// binding still resolves; the tripwire is the evidence the *local body* (returning
+/// `107`) answers, not the model. The same-line attribute form is covered too, since
+/// the attribute hides the `use` keyword from the scanner there.
+#[test]
+fn a_cfg_disabled_import_does_not_displace_a_live_alias() {
+    let src = r#"
+pub trait From { fn make() -> u8 { 0 } }
+pub mod m {
+    use std::convert::From as Conv;
+    pub struct Local;
+    impl Conv<Local> for u16 { fn from(_: Local) -> Self { 107 } }
+    #[cfg(any())]
+    use crate::Other as Conv;
+}
+pub struct Other;
+/// requires: true
+/// ensures: ret == 107
+pub fn cfg_live() -> u16 { <u16 as std::convert::From<m::Local>>::from(m::Local) }
+/// requires: true
+/// ensures: ret == 5
+pub fn cfg_tripwire() -> u16 { <u16 as std::convert::From<m::Local>>::from(m::Local) }
+"#;
+    let Some(o) = verify_src("cfg_live", src) else { return };
+    assert!(o.is_verified(), "a live alias must survive a later cfg-disabled import, got: {o}");
+    let Some(o) = verify_src("cfg_tripwire", src) else { return };
+    match &o {
+        FnOutcome::Failed { kind, .. } => assert_eq!(kind, "postcondition", "got: {o}"),
+        _ => panic!("the live local body returns 107, so `ret == 5` must be refuted, got: {o}"),
+    }
+}
+
+/// A same-line `#[cfg] use …` is read, not skipped.
+///
+/// An attribute on the item's own line (`#[cfg(all())] use std::convert::From as
+/// Conv;`) hides the `use` keyword from [`is_use_start`] unless the attribute is
+/// split off first. When it is skipped, the binding is lost entirely, so an impl
+/// written with `Conv` is qualified with its own module (`m::Conv`) and the call the
+/// compiler resolved to the imported trait matches nothing -- a lost proof. The
+/// condition here is *enabled*, so the binding is the live one and the call must
+/// still reach the impl's body.
+#[test]
+fn a_same_line_cfg_import_is_read() {
+    let src = r#"
+pub mod m {
+    #[cfg(all())] use std::convert::From as Conv;
+    pub struct Local;
+    impl Conv<Local> for u16 { fn from(_: Local) -> Self { 107 } }
+}
+/// requires: true
+/// ensures: ret == 107
+pub fn same_line_live_import() -> u16 {
+    <u16 as std::convert::From<m::Local>>::from(m::Local)
+}
+"#;
+    let Some(o) = verify_src("same_line_live_import", src) else { return };
+    assert!(o.is_verified(), "a same-line cfg import must still bind, got: {o}");
+}
+
+/// The corpus pins both directions for the nested argument and the cfg alias.
+///
+/// The inline tests above use a small self-contained source; these entries sit in
+/// `examples/mir_targets/realistic.rs` beside the other trait-identity fixtures, so
+/// the two new spellings are exercised against the full corpus (where `conv_shim`
+/// already forces rustc to qualify the standard path) and not only in isolation.
+#[test]
+fn the_nested_argument_and_cfg_alias_fixtures_are_decided() {
+    let verified = [
+        "nested_trait_arg_finds_the_body",
+        "cfg_disabled_import_keeps_the_live_alias",
+    ];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify from its local body, got: {o}");
+    }
+    let refuted = [
+        "nested_trait_arg_is_not_a_guess_tripwire",
+        "cfg_disabled_import_is_not_the_wrong_alias_tripwire",
+    ];
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` is a false contract that must be refuted, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
 /// The bitwise complement `!x`, pinned by a true half and a tripwire.
 ///
 /// `!x` is `all_ones ^ x` at the *operand's* width. The model reads that width

@@ -1218,16 +1218,27 @@ fn impl_header(lines: &[&str], start: usize) -> String {
 /// (`use` after the impl still binds), so each module's map is assembled from
 /// every `use` at its own nesting depth before any line reads it. See
 /// [`Specs::impl_traits`].
+///
+/// A `#[cfg]`-conditional import is the one that is *not* order-independent: it
+/// binds only when its condition holds, and rustc then binds nothing at all. The
+/// source cannot evaluate an arbitrary condition, so a conditional binding is
+/// held below an unconditional one and never displaces it: a live
+/// `use std::convert::From as Conv;` followed by a disabled
+/// `#[cfg(any())] use crate::Other as Conv;` must keep `Conv` bound to the
+/// standard trait, or the impl written with `Conv` is recorded with the wrong
+/// trait and its call is lost. See [`is_cfg_use`].
 fn module_imports(scopes: &[LineScope], lines: &[&str]) -> Vec<BTreeMap<String, String>> {
-    // One map per module path, assembled from every `use` at that path (in any
-    // order), then handed to each line of that module.
-    let mut per_module: BTreeMap<Vec<String>, BTreeMap<String, String>> = BTreeMap::new();
+    // One map per module path, assembled from every `use` at that path, then handed
+    // to each line of that module. Each entry carries whether the binding came from
+    // an unconditional `use`, which is what decides precedence.
+    let mut per_module: BTreeMap<Vec<String>, BTreeMap<String, (String, bool)>> = BTreeMap::new();
     let mut i = 0;
     while i < lines.len() {
         if !is_use_start(lines[i]) {
             i += 1;
             continue;
         }
+        let conditional = is_cfg_use(lines, i);
         // A `use` item ends at its `;`, which may be on a later line
         // (`use a::b::{\n    C,\n};`). Reading one line at a time loses such an
         // import, and a lost import is a wrongly qualified impl -- a lost proof.
@@ -1244,15 +1255,101 @@ fn module_imports(scopes: &[LineScope], lines: &[&str]) -> Vec<BTreeMap<String, 
         }
         let map = per_module.entry(scopes[i].path.clone()).or_default();
         for (short, full) in parse_use(&item) {
-            map.insert(short, full);
+            // An unconditional binding is definitely live, so a conditional one must
+            // not overwrite it (the conditional may be `#[cfg]`-disabled, in which
+            // case rustc binds nothing and the earlier binding is the live one).
+            let live_unconditional = map.get(&short).is_some_and(|(_, unconditional)| *unconditional);
+            if conditional && live_unconditional {
+                continue;
+            }
+            map.insert(short, (full, !conditional));
         }
         i = j + 1;
     }
     lines
         .iter()
         .enumerate()
-        .map(|(idx, _)| per_module.get(&scopes[idx].path).cloned().unwrap_or_default())
+        .map(|(idx, _)| {
+            per_module
+                .get(&scopes[idx].path)
+                .map(|m| m.iter().map(|(k, (v, _))| (k.clone(), v.clone())).collect())
+                .unwrap_or_default()
+        })
         .collect()
+}
+
+/// Whether the `use` item starting at `lines[i]` carries a `#[cfg]` attribute.
+///
+/// The attribute sits on the line (or contiguous attribute lines) directly above
+/// the item, or on the item's own line. A conditional import may be `#[cfg]`-disabled,
+/// and rustc then binds nothing for it; treating it as live can rewrite an alias a
+/// *live* import already bound, and a wrongly qualified impl is a lost proof. Only
+/// the presence of a condition is read, never its value -- the source cannot
+/// evaluate an arbitrary `cfg`, and a conservative "this may be off" is what
+/// [`module_imports`] needs. See [`module_imports`].
+fn is_cfg_use(lines: &[&str], i: usize) -> bool {
+    // An attribute on the item's own line (`#[cfg(any())] use a::B;`).
+    if split_leading_attrs(lines[i]).1 {
+        return true;
+    }
+    let mut k = i;
+    while k > 0 {
+        k -= 1;
+        let t = lines[k].trim();
+        // A blank line ends the attribute block: an attribute must be contiguous
+        // with the item it applies to.
+        if t.is_empty() {
+            break;
+        }
+        if t.starts_with("#[cfg") {
+            return true;
+        }
+        // Another attribute (`#[allow(…)]`) still belongs to the item, so keep
+        // looking upward past it. A doc comment or any other text ends the block.
+        if t.starts_with("#[") {
+            continue;
+        }
+        break;
+    }
+    false
+}
+
+/// Split any leading `#[…]` attributes off `line`, returning the rest and whether a
+/// `#[cfg…]` attribute was among them.
+///
+/// An attribute on the item's own line (`#[cfg(any())] use a::B;`) would otherwise
+/// hide the `use` from [`is_use_start`], and the item would be missed entirely -- a
+/// lost import. The body's `(…)`/`[…]` nest, so brackets are matched by depth and the
+/// attribute ends at the first `]` that closes its own `[`.
+fn split_leading_attrs(line: &str) -> (&str, bool) {
+    let mut rest = line.trim_start();
+    let mut cfg = false;
+    while let Some(after) = rest.strip_prefix("#[") {
+        if after.starts_with("cfg") {
+            cfg = true;
+        }
+        let mut depth = 1usize;
+        let mut end = None;
+        for (i, c) in after.char_indices() {
+            match c {
+                '[' | '(' => depth += 1,
+                ']' | ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match end {
+            Some(i) => rest = after[i + 1..].trim_start(),
+            // An unbalanced attribute is not one this reads; leave the line alone.
+            None => break,
+        }
+    }
+    (rest, cfg)
 }
 
 /// Strip a leading visibility (`pub`, `pub(crate)`, `pub(super)`, `pub(in …)`) from
@@ -1263,7 +1360,7 @@ fn module_imports(scopes: &[LineScope], lines: &[&str]) -> Vec<BTreeMap<String, 
 /// followed by whitespace or `(`, so a name that merely starts with it
 /// (`public_thing`) is left alone.
 fn strip_visibility(line: &str) -> &str {
-    let s = line.trim_start();
+    let s = split_leading_attrs(line).0;
     let Some(rest) = s.strip_prefix("pub") else {
         return s;
     };
@@ -8024,5 +8121,91 @@ fn h<
         // The inherent `impl Wrapper` on line 6 has an owner but no trait.
         assert_eq!(specs.impl_owners.get(&(6, 1)), Some(&"Wrapper".to_string()));
         assert_eq!(specs.impl_traits.get(&(6, 1)), None);
+    }
+
+    /// `split_leading_attrs` peels every leading attribute and reports a `#[cfg]`
+    /// among them, so a same-line attribute cannot hide the item behind it.
+    #[test]
+    fn leading_attributes_are_peeled_and_a_cfg_is_reported() {
+        // No attribute: the line is returned unchanged and no `cfg` is seen.
+        assert_eq!(split_leading_attrs("use a::B;"), ("use a::B;", false));
+        // A bare attribute on its own line is peeled.
+        assert_eq!(split_leading_attrs("#[cfg(any())] use a::B;"), ("use a::B;", true));
+        // Two attributes: the `cfg` is reported even when it is not the first.
+        assert_eq!(
+            split_leading_attrs("#[allow(unused)] #[cfg(test)] use a::B;"),
+            ("use a::B;", true)
+        );
+        // A non-`cfg` attribute is peeled but not reported.
+        assert_eq!(split_leading_attrs("#[allow(dead_code)] use a::B;"), ("use a::B;", false));
+        // The body's own brackets nest, so the attribute ends at its own `]`.
+        assert_eq!(
+            split_leading_attrs("#[cfg(all(unix, target_os = \"linux\"))] use a::B;"),
+            ("use a::B;", true)
+        );
+        // `cfg_attr` is a `cfg`-family attribute, so it is reported too.
+        assert_eq!(split_leading_attrs("#[cfg_attr(x, allow(y))] use a::B;"), ("use a::B;", true));
+    }
+
+    /// `is_use_start` sees a `use` behind a same-line attribute, and `strip_visibility`
+    /// reads the visibility that follows one.
+    #[test]
+    fn a_use_behind_a_same_line_attribute_is_still_an_import() {
+        assert!(is_use_start("#[cfg(all())] use std::convert::From;"));
+        assert!(is_use_start("#[allow(unused)] pub(crate) use a::B;"));
+        assert!(!is_use_start("#[allow(unused)] let x = 1;"));
+        // A visibility behind a same-line attribute is stripped as before.
+        assert_eq!(strip_visibility("#[allow(x)] pub(crate) use a::B;"), "use a::B;");
+    }
+
+    /// A `#[cfg]`-conditional import never displaces an unconditional binding, but a
+    /// later unconditional one still wins over an earlier conditional.
+    #[test]
+    fn a_cfg_import_does_not_displace_a_live_binding() {
+        // Two modules at the same depth: line 1 `m`, and the crate root for the rest.
+        let lines: Vec<&str> = vec![
+            "mod m {",
+            "    use std::convert::From as Conv;",
+            "    #[cfg(any())]",
+            "    use crate::Other as Conv;",
+            "}",
+            "struct Other;",
+            "use crate::Other as Root;",
+        ];
+        let scopes = line_scopes(&lines.join("\n"));
+        let imports = module_imports(&scopes, &lines);
+        // The module `m` keeps `Conv` bound to the standard trait: the disabled
+        // conditional did not overwrite the live unconditional binding.
+        let m = &imports[1];
+        assert_eq!(m.get("Conv"), Some(&"std::convert::From".to_string()));
+        // The crate-root `Root` import is read as usual.
+        assert_eq!(imports[6].get("Root"), Some(&"crate::Other".to_string()));
+    }
+
+    /// A conditional binding that is the *only* one still binds, and a later
+    /// unconditional binding replaces an earlier conditional one.
+    #[test]
+    fn a_conditional_binding_is_held_below_an_unconditional_one() {
+        let lines: Vec<&str> = vec![
+            "mod m {",
+            "    #[cfg(all())] use std::convert::From as Conv;",
+            "    pub struct Local;",
+            "}",
+        ];
+        let scopes = line_scopes(&lines.join("\n"));
+        let imports = module_imports(&scopes, &lines);
+        // Only a conditional binding: it is applied, so the impl it names resolves.
+        assert_eq!(imports[1].get("Conv"), Some(&"std::convert::From".to_string()));
+
+        let lines: Vec<&str> = vec![
+            "mod m {",
+            "    #[cfg(any())] use crate::Other as Conv;",
+            "    use std::convert::From as Conv;",
+            "}",
+        ];
+        let scopes = line_scopes(&lines.join("\n"));
+        let imports = module_imports(&scopes, &lines);
+        // The unconditional binding comes later and replaces the conditional one.
+        assert_eq!(imports[1].get("Conv"), Some(&"std::convert::From".to_string()));
     }
 }

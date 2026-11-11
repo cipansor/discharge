@@ -1799,6 +1799,30 @@ refused. `src/mir/intrinsics.rs` holds the model:
   while the local trait's own call still reaches its body. A bare `Type::m` call
   carries no ` as ` projection — rustc prints an inherent method and an in-scope
   trait method that way — so it keeps the owner-type match alone, as before.
+- A trait call's *instantiation* is part of its identity, not just its path and
+  owner. `impl From<Local> for u16` returning `107` and `core`'s `impl From<u8> for
+  u16` share the trait path, the owner and the method, so only the trait's
+  *argument* separates them; a local `impl From<Local> for u16` once answered
+  `<u16 as From<u8>>::from(7u8)` from its own body — a false proof. The argument is
+  now read on *both* sides, with the same balanced reader
+  (`spec::angle_inner`): `call_trait_args` from the call's name,
+  `Specs::impl_trait_args` from the impl header. A nested argument
+  (`impl Wrap<Option<u8>> for W`) is the case that keeps the reader honest — a
+  "strip trailing `>`" reading on the call side cut *every* closing bracket
+  (`Option<u8`), matched no impl, and turned a call with a real body into an
+  unmodelled one — a lost proof. An unreadable side is refused, not waved through.
+- The import scan reads the source's `use` items, because rustc prints an imported
+  trait's call with the *imported* path (`use std::convert::From as Conv;` makes
+  `impl Conv<Local> for u16` print `<u16 as std::convert::From<Local>>::from`).
+  Imports are kept per module path, folded across the item's lines, and read
+  through any visibility (`pub(crate)`, `pub(in …)`), so a lost import — which
+  qualifies an impl with its own module and loses the call — is not the failure
+  mode. A `#[cfg]`-conditional `use` is the exception to order-independence: it
+  binds only when its condition holds, and rustc then binds nothing, so a
+  conditional binding never displaces an unconditional one (a disabled
+  `#[cfg(any())] use crate::Other as Conv;` once overwrote a live alias and lost
+  the call). An attribute on the `use`'s own line is peeled first, so a live
+  `#[cfg(all())] use …` is read rather than skipped.
 - `add_signed`/`add_unsigned` add a value to one of the *opposite* signedness
   (`u8::wrapping_add_signed` adds an `i8` to a `u8`), so the two operands are read
   at different signs. The value is the plain wrapped sum in both directions, since

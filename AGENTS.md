@@ -7835,3 +7835,55 @@ the override and generic-argument directions and the same-width identity.
 (clippy std + no_std, tests, no_std bare-metal, zero deps, z3 oracle 845 agree / 0 mismatch,
 rustdoc ×3, MSRV 1.85, artifacts, unsafe surface still 2). No new SMT primitives: every fix is a
 name, argument or scope comparison, and the model is unchanged.
+
+
+## Trait identity, round four: nested trait arguments and the conditional import
+
+A third adversarial pass over the same resolver found two more defects, both *lost* proofs, in the
+two helpers the previous round added. Both are closed here. The lesson this time: **a reader added
+for one spelling must be used on *both* sides, and raw source is not the enabled crate.**
+
+**Finding 7 (lost proof): a nested trait argument lost the local body.**
+The previous round added `call_trait_args` (the call's argument) and `Specs::impl_trait_args` (the
+impl header's argument) and required them equal. But the two readers disagreed on a *nested*
+argument: `impl_trait_args` used `spec::angle_inner` (balanced), while `call_trait_args` read to
+the first `<` and then `trim_end_matches('>')`. That strips *every* closing bracket, so
+`<W as Wrap<Option<u8>>>::get` yielded `Option<u8` -- which no balanced impl reading (`Option<u8>`)
+equals. The argument comparison then refused the match, the call had no body, and it was reported
+unmodelled: a *lost* proof (`ret == 9` for a local body returning `9` was `Incomplete`). The fix
+makes `call_trait_args` read with `angle_inner` too, so both sides spell the argument the same
+balanced way. Corpus: `nested_trait_arg_finds_the_body` verifies, its tripwire is refuted.
+
+**Finding 8 (lost proof): a `#[cfg]`-disabled import displaced a live alias.**
+`module_imports` reads raw source, but rustc emits MIR only for *enabled* items. A live
+`use std::convert::From as Conv;` binds `Conv` to the standard trait; a later
+`#[cfg(any())] use crate::Other as Conv;` binds nothing. The map was built by plain insertion in
+source order, so the disabled import overwrote the live binding, the impl written with `Conv` was
+recorded against `crate::Other`, and the call the compiler resolved to the standard trait matched
+nothing -- a lost proof (reported `converts a type the model does not hold`). The fix records, per
+binding, whether it came from an *unconditional* `use`, and a conditional binding never displaces
+an unconditional one. An unconditional binding still wins wherever it appears, and a conditional
+binding is still applied when it is the only one (the source cannot evaluate an arbitrary `cfg`,
+so the conservative reading is "this may be off, so never let it override a definite binding").
+Corpus: `cfg_disabled_import_keeps_the_live_alias` verifies, its tripwire is refuted.
+
+**The same-line attribute form.** A `#[cfg] use …` whose attribute shares the line hides the `use`
+keyword from `is_use_start`, so the import was missed *entirely* -- the same lost proof for a live
+binding. `strip_visibility` now peels any leading `#[…]` attributes (with depth-matched brackets)
+before reading the visibility, so `#[cfg(all())] use std::convert::From as Conv;` is read; and
+`is_cfg_use` sees the same-line `#[cfg]` when deciding precedence. A `#[cfg]` attribute on the
+item's own line was also previously invisible to the scanner, so it could not even be identified
+as conditional.
+
+Regression coverage: `a_nested_trait_argument_keeps_its_balanced_spelling`,
+`a_cfg_disabled_import_does_not_displace_a_live_alias`, `a_same_line_cfg_import_is_read` (inline,
+via `verify_src`), `the_nested_argument_and_cfg_alias_fixtures_are_decided` (corpus), plus four
+unit tests on the readers themselves (`leading_attributes_are_peeled_and_a_cfg_is_reported`,
+`a_use_behind_a_same_line_attribute_is_still_an_import`,
+`a_cfg_import_does_not_displace_a_live_binding`,
+`a_conditional_binding_is_held_below_an_unconditional_one`).
+
+`scripts/test-count.sh` **784 → 792** passed, 0 failed; `scripts/gate.sh` **ALL GATES GREEN**
+(clippy std + no_std, tests, no_std bare-metal, zero deps, z3 oracle 845 agree / 0 mismatch,
+rustc_public oracle 0 differ, MSRV 1.85, artifacts, unsafe surface still 2). No new SMT primitives:
+both fixes are string reads on the same two sides, and the model is unchanged.

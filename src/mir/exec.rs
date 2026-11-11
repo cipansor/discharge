@@ -2443,19 +2443,28 @@ fn call_trait_path(name: &str) -> Option<String> {
 }
 
 /// The trait *arguments* a call instantiates, as written: `u8` for
-/// `<u16 as From<u8>>::from`, `None` for a call with no generic arguments
-/// (`<Foo as Trait>::m`) or one that is not a trait call.
+/// `<u16 as From<u8>>::from`, `Option<u8>` for `<W as Wrap<Option<u8>>>::get`, and
+/// `None` for a call with no generic arguments (`<Foo as Trait>::m`) or one that is
+/// not a trait call.
 ///
 /// A `From<Local>` impl and the library's `From<u8>` impl share both the trait path
 /// (`From`) and the owner (`u16`), so the *argument* is the only thing separating
 /// them, and it is what a call to the wrong one would answer from. Returning the
 /// whole list (`From<u8, u8>` gives `u8, u8`) keeps the identity exact rather than
 /// sampling the first parameter. See [`trait_candidate_admits`].
+///
+/// The argument is read with [`crate::mir::spec::angle_inner`], the same balanced
+/// reader the `impl` side uses, so the two spellings are compared as written. A
+/// "strip trailing `>`" reading would cut *every* closing bracket off a nested
+/// argument (`Wrap<Option<u8>>` -> `Option<u8`), which no impl's balanced reading
+/// equals, so a call to such a trait would be refused -- a lost proof.
 fn call_trait_args(name: &str) -> Option<String> {
     let after = name.rsplit_once(" as ")?.1;
+    // `after` is `TRAIT<…>>::method`; the first `>::` closes the trait's own
+    // argument list and the projection, so the text before it is the trait as
+    // written. See [`crate::mir::spec::angle_inner`] for the balanced read.
     let (trait_ty, _) = after.split_once(">::")?;
-    let open = trait_ty.find('<')?;
-    let inner = trait_ty[open + 1..].trim_end_matches('>').trim();
+    let inner = crate::mir::spec::angle_inner(trait_ty)?;
     (!inner.is_empty()).then(|| inner.to_string())
 }
 

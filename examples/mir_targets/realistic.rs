@@ -8037,3 +8037,82 @@ pub fn same_width_from_is_the_identity(x: u8) -> u8 {
 pub fn same_width_from_is_not_a_guess_tripwire(x: u8) -> u8 {
     <u8 as From<u8>>::from(x)
 }
+
+// --- A nested trait argument must keep its balanced spelling -------------------
+//
+// `<NestedHolder as NestedWrap<Option<u8>>>::get` carries a nested generic
+// argument. The call side and the impl side must read it the same way -- balanced,
+// `Option<u8>` -- or the two spellings disagree (`Option<u8` versus `Option<u8>`)
+// and the local body is lost, the call reported as unmodelled. A "strip trailing
+// `>`" reading on the call side cut *every* closing bracket.
+
+pub trait NestedWrap<T> {
+    fn get(&self) -> u8;
+}
+
+pub struct NestedHolder;
+
+impl NestedWrap<Option<u8>> for NestedHolder {
+    fn get(&self) -> u8 {
+        9
+    }
+}
+
+/// The local body returns `9`, so this verifies only if the balanced argument
+/// matched the impl and the body answered.
+/// requires: true
+/// ensures: ret == 9
+pub fn nested_trait_arg_finds_the_body(h: &NestedHolder) -> u8 {
+    <NestedHolder as NestedWrap<Option<u8>>>::get(h)
+}
+
+/// The false direction: the body returns `9`, so this must be refuted. A resolver
+/// that lost the body reported the call unmodelled instead (a lost proof).
+/// requires: true
+/// ensures: ret == 4
+pub fn nested_trait_arg_is_not_a_guess_tripwire(h: &NestedHolder) -> u8 {
+    <NestedHolder as NestedWrap<Option<u8>>>::get(h)
+}
+
+// --- A `#[cfg]`-disabled import must not displace a live alias -----------------
+//
+// The import scan reads raw source, but rustc emits MIR only for enabled items. A
+// live `use std::convert::From as Conv;` binds `Conv`; a later
+// `#[cfg(any())] use crate::CfgOther as Conv;` binds nothing, yet a naive map let it
+// overwrite the live binding, so the impl written with `Conv` was recorded with the
+// wrong trait and its call was lost. `conv_shim::From` above forces rustc to print
+// the standard path qualified, so the two candidate paths are visibly different.
+
+pub struct CfgLocal;
+
+pub mod cfg_alias_shim {
+    use crate::CfgLocal;
+    use std::convert::From as Conv;
+
+    impl Conv<CfgLocal> for u16 {
+        fn from(_: CfgLocal) -> Self {
+            107
+        }
+    }
+
+    #[cfg(any())]
+    use crate::CfgOther as Conv;
+}
+
+pub struct CfgOther;
+
+/// The live alias still binds `Conv` to the standard trait, so the impl's call
+/// resolves to its body (returning `107`) and verifies.
+/// requires: true
+/// ensures: ret == 107
+pub fn cfg_disabled_import_keeps_the_live_alias() -> u16 {
+    <u16 as std::convert::From<CfgLocal>>::from(CfgLocal)
+}
+
+/// The false direction: the body returns `107`, so this must be refuted. Recording
+/// the impl with the *wrong* trait (the disabled alias) lost the call instead.
+/// requires: true
+/// ensures: ret == 9
+pub fn cfg_disabled_import_is_not_the_wrong_alias_tripwire() -> u16 {
+    <u16 as std::convert::From<CfgLocal>>::from(CfgLocal)
+}
