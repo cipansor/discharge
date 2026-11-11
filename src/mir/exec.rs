@@ -2292,6 +2292,27 @@ fn call_type(name: &str) -> Option<String> {
     Some(base_type(name.rsplit_once("::")?.0))
 }
 
+/// Whether a name is `core`'s own `Ord::min`/`Ord::max` for a primitive type.
+///
+/// These are the only modelled shapes whose dump spelling carries no `<impl` --
+/// a trait method names the trait, `<u8 as Ord>::min` -- so the executor's guard
+/// has to admit them by name. It admits only a *primitive* self type: a user type
+/// cannot be `Ord`'s receiver here, so `<MyType as Ord>::min` is refused even
+/// though `core` really does implement `Ord` for it. That is deliberate and it is
+/// the conservative direction -- the model has no definition for a user type's
+/// `min` anyway, and refusing it means a name that *could* be a local trait's is
+/// never answered by the model. The trait path must be the standard library's
+/// `Ord` (see [`intrinsics::names_ord_trait`]), so `m::Ord::min` and
+/// `MyOrd::min` are both refused. See [`try_intrinsic`].
+fn is_ord_callee(name: &str) -> bool {
+    if !intrinsics::names_ord_trait(name) {
+        return false;
+    }
+    let self_ty = call_type(name).unwrap_or_default();
+    matches!(self_ty.as_str(), "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16"
+        | "i32" | "i64" | "i128" | "isize")
+}
+
 /// The `self` type of an *instance* method, read from its receiver's declared
 /// type.
 ///
@@ -2733,7 +2754,19 @@ fn try_intrinsic(
     // local half of the same guard: it keeps `try_intrinsic` from ever answering
     // for a name that could name a local body. The direction is a refusal, so a
     // spelling the guard misjudges loses a proof rather than inventing one.
-    if !name.contains("<impl") {
+    //
+    // `Ord::min`/`Ord::max` are the one exception, and only because they cannot be
+    // spelled with `<impl`: a *trait* method's call names the trait, `<u8 as
+    // Ord>::min`, never the `core::num::<impl u8>` inherent path. Refusing every
+    // such name would make them permanently unmodellable. What keeps the exception
+    // sound is the same thing that keeps the guard sound -- the caller resolving a
+    // same-dump body first -- plus `classify` accepting `min`/`max` only when the
+    // trait path is the standard library's `Ord` (a module-qualified `m::Ord` is
+    // refused) and only for a *primitive* self type (see `is_ord_callee`): a
+    // crate-root trait named `Ord` is the one spelling that could name a local
+    // body, and it is in the dump, so `resolve_callee` finds it first and the model
+    // is never consulted for it.
+    if !name.contains("<impl") && !is_ord_callee(name) {
         return None;
     }
     let cur = &prog.fns[func];

@@ -1466,6 +1466,42 @@ fn a_trait_method_sharing_an_intrinsic_name_is_answered_by_its_body() {
     }
 }
 
+/// `Ord::min`/`Ord::max` are modelled, and a local trait sharing their name is
+/// answered by its body rather than by the model.
+///
+/// The two halves pin both directions. The verifying half covers the unsigned and
+/// signed orderings and the explicit `Ord::min` spelling; `ord_min_of_min_and_one_is_min`
+/// is the one that separates them, since `i8::MIN`'s bits sort the other way
+/// unsigned. The refuting half is the tripwire on the method form, plus the
+/// local-trait pair: `local_ord_min_is_answered_by_its_body` verifies only from the
+/// body's constant, and `local_ord_min_is_not_the_model_tripwire` is refuted only
+/// if the body -- not the model -- answered, so the model cannot silently take the
+/// call over.
+#[test]
+fn ord_min_and_max_are_modelled_and_a_local_trait_still_wins() {
+    let verified = [
+        "ord_min_is_at_most_both",
+        "ord_max_is_at_least_x",
+        "ord_min_of_min_and_one_is_min",
+        "explicit_ord_min_is_modelled",
+        "local_ord_min_is_answered_by_its_body",
+    ];
+    let refuted = ["ord_min_is_x_tripwire", "local_ord_min_is_not_the_model_tripwire"];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` is a false contract that must be refuted, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
 /// The bitwise complement `!x`, pinned by a true half and a tripwire.
 ///
 /// `!x` is `all_ones ^ x` at the *operand's* width. The model reads that width

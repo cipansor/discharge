@@ -1749,12 +1749,27 @@ refused. `src/mir/intrinsics.rs` holds the model:
   writes it as a `bool`, which is what the `if` that consumes it branches on; a
   one-bit word there would leave the local readable only as a word. It is
   unsigned-only, matching `core`.
+- `Ord::min` and `Ord::max` are the two modelled *trait* methods, so a dump spells
+  a call `<u8 as Ord>::min` (or `<i8 as std::cmp::Ord>::max` with `std` in scope)
+  rather than a `core::num::<impl …>` inherent path. The model is one `ite` over
+  the two operands, and the *sign* selects the ordering — `sle`/`sge` on a signed
+  type, `ule`/`uge` on an unsigned one — so both signednesses are exact. The sign
+  matters: `i8::MIN`'s bits (`0x80`) are the largest unsigned byte, so an unsigned
+  ordering would return the wrong operand for every pair with a negative side. Only
+  the standard library's `Ord` is accepted — the trait path must be exactly `Ord`,
+  `core::cmp::Ord` or `std::cmp::Ord`, which a user cannot define — so a local
+  trait's `min` is refused by name as well as by the same-dump lookup below.
 - A *local* method that shares an intrinsic's name is answered by its own body,
   never by the model. rustc prints a trait impl's call as `<u8 as Trait>::m` but
   its definition as `<impl at …>::m`, so the names never match; the model is only
   consulted when no same-dump body exists and the call name carries the `<impl …>`
   projection that every real `core` method call has. Without both halves, a trait
   that disagrees with `core` would get a *false proof* from the model.
+  `Ord::min`/`Ord::max` are the one exception to the projection rule — a trait call
+  has no `<impl …>` — and it is admitted only for a *primitive* self type and only
+  under the standard library's `Ord` path. A crate-root trait named `Ord` is the one
+  spelling that could still collide; its body is in the dump, so the same-dump
+  lookup finds it first and the model is never consulted for it.
 - `add_signed`/`add_unsigned` add a value to one of the *opposite* signedness
   (`u8::wrapping_add_signed` adds an `i8` to a `u8`), so the two operands are read
   at different signs. The value is the plain wrapped sum in both directions, since
@@ -1809,10 +1824,11 @@ The frontend refuses far more than it accepts, and every refusal is reported:
   bitwise ops are computed from their operands (see below), as are the unary
   `neg`/`abs` in all four families, the six bit counts (`count_ones`,
   `count_zeros`, `leading_zeros`, `leading_ones`, `trailing_zeros`,
-  `trailing_ones`), the `bool` predicate `is_power_of_two`, the mixed-signedness
+  `trailing_ones`), the `bool` predicate `is_power_of_two`, the `Ord::min`/`Ord::max`
+  trait methods, the mixed-signedness
   additions (`wrapping_add_signed`, `saturating_add_signed`, `checked_add_signed`,
   `overflowing_add_signed` and their `_unsigned` counterparts) and the `pow`
-  families. Every other intrinsic, and every trait
+  families. Every other intrinsic, and every other trait
   method, is still a call the frontend cannot model.
 - **A symbolic index into a *slice*, or a mutable reference write.** An array
   subscripted by a parameter (`a[i]` on `[u8; 4]`) *is* modelled: the length is in

@@ -42,6 +42,13 @@
 //!   produces a [`Pred`] and the executor writes a `Val::Bool`, which is what the
 //!   `if` that consumes it branches on. It is unsigned-only, because `core` has no
 //!   such method on the signed types.
+//! * `Ord::min`/`Ord::max` — the two *trait* methods, so the dump spells a call
+//!   `<u8 as Ord>::min` rather than a `core::num::<impl …>` path. The model is one
+//!   `ite` whose ordering predicate the operand's sign selects (`sle`/`sge` for a
+//!   signed type, `ule`/`uge` for an unsigned one), so both signednesses are exact
+//!   and `i8::MIN` -- whose bits sort the other way unsigned -- is ordered
+//!   correctly. Only the standard library's `Ord` path is accepted; see
+//!   [`names_ord_trait`].
 //! * `add_signed`/`add_unsigned` — an addition whose two operands have *opposite*
 //!   signedness (`u8::wrapping_add_signed` adds an `i8` to a `u8`). The value is a
 //!   plain addition of the two words, so it is the same term in both directions;
@@ -191,6 +198,16 @@ pub enum Intrinsic {
     /// it produces a [`Pred`] rather than a [`Var`]. It is one bit by
     /// construction, so `result_w` is not read for it.
     Bool(BoolKind),
+    /// `Ord::min` or `Ord::max`: the smaller or larger of two operands of one
+    /// type.
+    ///
+    /// Unlike every other shape this is a *trait* method, so its dump spelling is
+    /// `<u8 as Ord>::min` rather than a `core::num::<impl …>` path. The executor
+    /// therefore lets a same-dump body win and consults this model only as a
+    /// fallback, so a local trait method of the same shape is inlined rather than
+    /// modelled. It is total and reads the sign to pick the ordering, so both
+    /// signednesses are modelled.
+    MinMax(MinMaxKind),
 }
 
 /// Which family of a `core::num` method name a call belongs to.
@@ -232,6 +249,26 @@ pub enum BoolKind {
     /// not one), and the type's width is the highest exponent it can hold, so a
     /// signed reading would be wrong in both directions -- see [`is_modelled`].
     PowerOfTwo,
+}
+
+/// `Ord::min` and `Ord::max`: the smaller or larger of two values of one type.
+///
+/// Unlike every other shape these are *trait* methods, not inherent ones, so the
+/// dump spells a call `<u8 as Ord>::min` -- the `Ord` trait itself, with no
+/// `core::num::<impl …>` path. That is why the model is a *fallback*: the executor
+/// resolves a same-dump body first and reaches the model only when none claims the
+/// name, so a local trait method of the same shape is inlined rather than
+/// modelled. The trait path must also be the standard library's `Ord`, which is
+/// what keeps a differently-qualified local trait out (see [`names_ord_trait`]).
+/// The model itself is total and reads the sign to pick the comparison: `min`/`max`
+/// are the same two-operand ite either way, only the ordering predicate differs, so
+/// both signednesses are modelled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MinMaxKind {
+    /// The smaller of the two operands: `a <= b ? a : b`.
+    Min,
+    /// The larger of the two operands: `a >= b ? a : b`.
+    Max,
 }
 
 /// A bit count.
@@ -325,6 +362,22 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     if short == "is_power_of_two" {
         return Some(Intrinsic::Bool(BoolKind::PowerOfTwo));
     }
+    // `Ord::min`/`Ord::max`. These are *trait* methods, so the name is matched on
+    // the trait path rather than a `core::num::<impl …>` path: the dump spells the
+    // call `<u8 as Ord>::min`, naming the trait itself. `min`/`max` are matched
+    // only when that path is the standard library's `Ord` (see `names_ord_trait`),
+    // so a same-named method on any other trait (or an inherent one) is not read as
+    // `Ord`'s. That is a *narrower* match than the suffix match the other shapes
+    // use, deliberately: the trait name is the only thing distinguishing this from
+    // an unrelated `min`, and widening it would answer a call the model has no
+    // definition for.
+    if short == "min" || short == "max" {
+        if !names_ord_trait(name) {
+            return None;
+        }
+        let kind = if short == "min" { MinMaxKind::Min } else { MinMaxKind::Max };
+        return Some(Intrinsic::MinMax(kind));
+    }
     let (family, op) = if let Some(rest) = short.strip_prefix("wrapping_") {
         (Family::Wrapping, rest)
     } else if let Some(rest) = short.strip_prefix("saturating_") {
@@ -369,6 +422,38 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
         Family::Checked => Intrinsic::Checked(op),
         Family::Overflowing => Intrinsic::Overflowing(op),
     })
+}
+
+/// Whether a `min`/`max` name is `Ord`'s, and `Ord`'s alone.
+///
+/// The dump spells a trait call `<u8 as Ord>::min`, naming the trait between the
+/// `as` and the `>`; a module-qualified trait spells `<u8 as m::Ord>::min`. The
+/// trait path rustc prints for the prelude's own `Ord` is not always the bare
+/// name: with `std` in scope a call is `<i8 as std::cmp::Ord>::max`, and against
+/// `core` it is `<u8 as Ord>::min`. Both spellings are accepted, and so is
+/// `core::cmp::Ord`.
+///
+/// The accepted set is exactly the standard library's `Ord` and nothing else, and
+/// that is what makes the match sound: `std::cmp::Ord` and `core::cmp::Ord` cannot
+/// name a user item, because a user cannot define items inside `std` or `core`. A
+/// local trait is always qualified with *its own* module (`m::Ord`, `ord_shim::Ord`),
+/// so it is refused. This is the narrow half of the guard in `try_intrinsic`: it
+/// keeps the model from claiming a name that could be a local trait's, and the
+/// caller's same-dump lookup is what answers the one spelling that could still
+/// collide (a crate-root `Ord`, which the prelude also names `Ord`).
+pub fn names_ord_trait(name: &str) -> bool {
+    let after_as = match name.rsplit_once(" as ") {
+        Some((_, rest)) => rest,
+        // A bare `min`/`max` has no `as`, so it is not a trait call and is not
+        // `Ord`'s: a free function named `min` is in the dump as `min`, and the
+        // same-dump lookup answers it.
+        None => return false,
+    };
+    let trait_path = match after_as.split_once(">::") {
+        Some((trait_path, _)) => trait_path,
+        None => return false,
+    };
+    matches!(trait_path, "Ord" | "core::cmp::Ord" | "std::cmp::Ord")
 }
 
 /// Whether the model has a definition for this operation at this width.
@@ -452,6 +537,12 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // fact to check, only the width. Nothing here can panic, so all four
         // families are modelled.
         Intrinsic::MixedAdd(_) => true,
+        // `Ord::min`/`Ord::max`. Total, and modelled on both signednesses: the
+        // model reads the sign to pick the ordering, so a signed operand is not a
+        // guess but the method's own meaning. There is no membership fact to
+        // check -- `Ord` is implemented for every integer -- only the width,
+        // which is already bounded above.
+        Intrinsic::MinMax(_) => true,
     }
 }
 
@@ -634,7 +725,35 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
                 }
             }
         }
+        // `Ord::min`/`Ord::max`: the smaller or larger operand, by the type's own
+        // ordering. Total, so the result is a plain value and no failure term is
+        // built. The sign selects the ordering -- `sle`/`sge` on a signed type,
+        // `ule`/`uge` on an unsigned one -- and that is the *only* thing the sign
+        // changes here: on a signed type `i8::MIN` is below `0`, so a `ule` would
+        // return the wrong operand for every negative pair, which is a wrong value
+        // rather than a weaker proof.
+        Intrinsic::MinMax(kind) => {
+            if result_w == 0 || result_w > 64 {
+                return None;
+            }
+            Outcome::Value(smt::truncate(min_max_result(kind, x, y, signed), result_w))
+        }
     })
+}
+
+/// The smaller or larger of two operands, under the type's ordering.
+///
+/// Both results are one ite over the same operands; only the comparison differs,
+/// so the two cannot drift about which operand wins a tie (`min` returns the
+/// first on `<=`, `max` the first on `>=`, and both are the value either way).
+fn min_max_result(kind: MinMaxKind, x: Var, y: Var, signed: bool) -> Var {
+    let take_x = match (kind, signed) {
+        (MinMaxKind::Min, true) => smt::sle(x, y),
+        (MinMaxKind::Min, false) => smt::ule(x, y),
+        (MinMaxKind::Max, true) => smt::sge(x, y),
+        (MinMaxKind::Max, false) => smt::ule(y, x),
+    };
+    smt::ite(take_x, x, y)
 }
 
 /// The wrapped result of a unary operator, before any family reads it.
@@ -2966,5 +3085,114 @@ mod tests {
             },
             "saturating_add_unsigned i8",
         );
+    }
+
+    /// `Ord::min`/`Ord::max` classify only under the standard library's `Ord`.
+    #[test]
+    fn the_ord_names_classify_and_their_neighbours_do_not() {
+        assert_eq!(classify("<u8 as Ord>::min"), Some(Intrinsic::MinMax(MinMaxKind::Min)));
+        assert_eq!(classify("<u8 as Ord>::max"), Some(Intrinsic::MinMax(MinMaxKind::Max)));
+        assert_eq!(classify("<i8 as Ord>::min"), Some(Intrinsic::MinMax(MinMaxKind::Min)));
+        assert_eq!(classify("<i8 as Ord>::max"), Some(Intrinsic::MinMax(MinMaxKind::Max)));
+        // `min` and `max` are distinct shapes: reading `max` as `min` returns the
+        // other operand, a wrong value rather than a refusal.
+        assert_ne!(classify("<u8 as Ord>::max"), Some(Intrinsic::MinMax(MinMaxKind::Min)));
+        // A different trait's `min` is refused. The trait path is the only thing
+        // distinguishing `Ord`'s from another trait's, and a local trait in a
+        // module spells its call `<u8 as m::Ord>::min` -- a path that is not `Ord`.
+        assert!(classify("<u8 as m::Ord>::min").is_none());
+        assert!(classify("<u8 as MyOrd>::min").is_none());
+        assert!(classify("<u8 as ord_shim::Ord>::min").is_none());
+        assert!(classify("<u8 as Ord>::clamp").is_none());
+        // The `std`/`core`-qualified spelling the prelude's own `Ord` prints with.
+        assert_eq!(
+            classify("<i8 as std::cmp::Ord>::max"),
+            Some(Intrinsic::MinMax(MinMaxKind::Max))
+        );
+        assert_eq!(
+            classify("<u8 as core::cmp::Ord>::min"),
+            Some(Intrinsic::MinMax(MinMaxKind::Min))
+        );
+        // The `_signed` near misses stay refused.
+        assert!(classify("<u8 as Ord>::min_signed").is_none());
+    }
+
+    /// `Ord::min`/`Ord::max` agree with `core` over a whole `u8` and `i8`.
+    ///
+    /// The signed walk is what pins the ordering choice: a model that used `ule`
+    /// for a signed type would return the wrong operand for every pair with a
+    /// negative side, and `i8::MIN` (`0x80`) is the one value whose bits sort the
+    /// other way. `core`'s own `min`/`max` are the oracle, so the model's `ite` is
+    /// compared against the method rather than against a second copy of itself.
+    #[test]
+    fn the_ord_min_max_agree_with_rust() {
+        check(
+            Intrinsic::MinMax(MinMaxKind::Min),
+            8,
+            false,
+            unident,
+            ident,
+            |x, y| Some(i64::from((x as u8).min(y as u8))),
+            "u8::min",
+        );
+        check(
+            Intrinsic::MinMax(MinMaxKind::Max),
+            8,
+            false,
+            unident,
+            ident,
+            |x, y| Some(i64::from((x as u8).max(y as u8))),
+            "u8::max",
+        );
+        check(
+            Intrinsic::MinMax(MinMaxKind::Min),
+            8,
+            true,
+            |b| i8::from_ne_bytes([b as u8]) as i64,
+            |v| v as u8 as u64,
+            |x, y| Some(i64::from((x as i8).min(y as i8))),
+            "i8::min",
+        );
+        check(
+            Intrinsic::MinMax(MinMaxKind::Max),
+            8,
+            true,
+            |b| i8::from_ne_bytes([b as u8]) as i64,
+            |v| v as u8 as u64,
+            |x, y| Some(i64::from((x as i8).max(y as i8))),
+            "i8::max",
+        );
+        // The named points, so a failure names the pair that broke. `i8::MIN` is
+        // the value that separates the signed and unsigned orderings.
+        let ord = |kind: MinMaxKind, signed: bool, xb: u64, yb: u64| {
+            smt::with_fresh(|| {
+                let (a, b) = (smt::var(8), smt::var(8));
+                let Outcome::Value(v) =
+                    eval(Intrinsic::MinMax(kind), a, b, 8, signed, 8).expect("min/max at 8 bits")
+                else {
+                    panic!("min/max must produce a plain value");
+                };
+                let (ai, bi) = (smt::index(a), smt::index(b));
+                smt::evaluate(v, |i| {
+                    if i == ai {
+                        Some(xb)
+                    } else if i == bi {
+                        Some(yb)
+                    } else {
+                        None
+                    }
+                })
+            })
+        };
+        for (kind, signed, xb, yb, want, why) in [
+            (MinMaxKind::Min, false, 3, 7, 3u64, "unsigned min takes the smaller"),
+            (MinMaxKind::Max, false, 3, 7, 7, "unsigned max takes the larger"),
+            (MinMaxKind::Min, true, 0x80, 1, 0x80, "i8::MIN is the smallest signed value"),
+            (MinMaxKind::Max, true, 0x80, 1, 1, "i8::MIN is not the largest"),
+            (MinMaxKind::Min, true, 0xff, 0xfe, 0xfe, "0xfe is -2, below -1"),
+            (MinMaxKind::Max, true, 0xff, 0xfe, 0xff, "0xff is -1, above -2"),
+        ] {
+            assert_eq!(ord(kind, signed, xb, yb), Some(want), "{why} ({xb:#x}, {yb:#x})");
+        }
     }
 }

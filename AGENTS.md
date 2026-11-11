@@ -7592,3 +7592,57 @@ The lesson, again: a fixture that is never asserted is not a test, and a fixture
 true cannot catch a prover that says "true" too often. The negative direction has to be in the
 suite, with a witness, or the standing tripwire rule is only a comment.
 
+## `Ord::min`/`Ord::max`: the first modelled trait methods, and the guard exception they forced
+
+The corpus's top idiom gap was `x.min(y)`/`x.max(y)`, which were `incomplete` with "call to
+unmodelled function `<u8 as Ord>::min`". Modelling them is the increment; the interesting part
+is *why they are hard*, because they are the first modelled shape whose call is a **trait**
+call rather than a `core::num::<impl …>` inherent one, and that collides with the guard that
+keeps the model from ever answering a local body.
+
+The guard (from the Report-1 work) is: `try_intrinsic` returns `None` for any name that does not
+contain `<impl`, because rustc prints every real `core` integer-method call with the
+`core::num::<impl u8>::wrapping_add` projection and no local method call carries it. But a trait
+call has no `<impl` by construction — it is `<u8 as Ord>::min` — so the guard would have made
+`Ord::min`/`max` permanently unmodellable. Removing the guard outright is *also* wrong: it was
+what allowed Report 1's false proof in the first place. The reconciliation is that the guard's
+job is really done by the caller, which consults `resolve_callee` (same-dump lookup) *before*
+the model. Two experiments pinned this: with the guard removed and the reorder in place, the
+Report-1 soundness test still passes and the whole 216-test MIR suite stays green, which shows
+the reorder — not the guard — is what carries soundness; and with the guard restored, core
+`Ord::min` is unmodelled.
+
+So the guard gains one **narrow exception**, `is_ord_callee`, admitting a name only when all of
+these hold: the method is `min`/`max`; the trait path between `as` and `>` is exactly `Ord`,
+`core::cmp::Ord`, or `std::cmp::Ord`; and the self type is a *primitive* integer. Each clause
+closes a real hole.
+
+- **The trait path must be the standard library's.** A local trait in a module prints its call
+  as `<u8 as m::Ord>::min` — trait path `m::Ord`, refused. `std::cmp::Ord` and `core::cmp::Ord`
+  cannot name a user item, because a user cannot define items inside `std`/`core`. So the
+  accepted set is exactly the prelude's `Ord`.
+- **The self type must be primitive.** A user type can be `Ord`, but the model has no definition
+  for its `min`, so admitting it would only answer a call with no meaning. Refusing keeps the
+  direction conservative.
+- **A crate-root trait named `Ord` is the one spelling that can still collide**, because it
+  prints as `<u8 as Ord>::min` — indistinguishable from the prelude's by name alone. This is
+  *not* closed by name; it is closed by the caller's same-dump lookup, which finds the local
+  body first. The corpus pins this: `ord_shim` (a module-qualified local `Ord`) verifies from
+  its body's constant, and the crate-root case was checked by probe.
+
+The model itself is total and sign-aware: `min` is `ite(sle(x,y), x, y)` signed and
+`ite(ule(x,y), x, y)` unsigned, `max` the same with `sge`/`uge`. The sign is not cosmetic —
+`i8::MIN`'s bits (`0x80`) are the largest unsigned byte, so an unsigned ordering would return
+the wrong operand for every pair with a negative side, a *wrong value* rather than a weaker
+proof. `the_ord_min_max_agree_with_rust` walks all of `u8` and all of `i8` against `core`'s own
+methods, and names the separating points (`0x80`, `0xff`/`0xfe`) so a failure names the pair.
+The integration test `ord_min_and_max_are_modelled_and_a_local_trait_still_wins` covers the
+unsigned and signed orderings, the explicit `Ord::min` spelling, a tripwire on the method form,
+and the local-trait pair — and it *fails* if the guard exception is removed (checked by
+temporary revert), so the exception is load-bearing rather than decorative.
+
+`scripts/test-count.sh` **764 → 767** passed, 0 failed; `scripts/gate.sh` **ALL GATES GREEN**.
+Corpus coverage `examples/mir_targets/realistic.rs` **344 → 349** verified over 643 → 650 lines
+(the two new tripwires refute, as they must). No new SMT primitives were needed: `sle`, `sge`,
+`ule` and `ite` already existed.
+

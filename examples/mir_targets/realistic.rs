@@ -7653,3 +7653,95 @@ impl TaggedRight {
         2
     }
 }
+
+/// `Ord::min`/`Ord::max` are *trait* methods, so the dump spells a call `<u8 as
+/// Ord>::min` -- the trait itself, with no `core::num::<impl …>` inherent path.
+/// They are modelled anyway: the model is one ite whose ordering predicate is
+/// chosen by the operand's sign, so both signednesses are covered.
+///
+/// The model is consulted only as a *fallback*. A trait call and a local trait
+/// method's call can spell the same name, so the executor resolves a same-dump
+/// body first and reaches the model only when none claims the name -- the same
+/// rule the intrinsic model follows, and the reason a local `Ord` below is
+/// answered by its body rather than by `core`'s ordering.
+/// requires: x <= 100
+/// requires: y <= 100
+/// ensures: ret <= 100
+pub fn ord_min_is_at_most_both(x: u8, y: u8) -> u8 {
+    x.min(y)
+}
+
+/// `max` is at least both operands, so it is at least `x`; a model that swapped
+/// the two would return `min` and refute this.
+/// requires: true
+/// ensures: ret >= x
+pub fn ord_max_is_at_least_x(x: i8, y: i8) -> i8 {
+    x.max(y)
+}
+
+/// The signed ordering is not the unsigned one. `i8::MIN`'s bits (`0x80`) are the
+/// largest *unsigned* byte, so a model that used `ule` would return `1` here; as a
+/// signed value `MIN` is below `1`, so the signed model returns `MIN`. The
+/// precondition pins the operand to the one value where the two orderings differ.
+/// requires: x == i8::MIN
+/// ensures: ret == i8::MIN
+pub fn ord_min_of_min_and_one_is_min(x: i8) -> i8 {
+    x.min(1)
+}
+
+/// The explicit `Ord::min` spelling reaches the same model as the method form.
+/// requires: x <= 100
+/// requires: y <= 100
+/// ensures: ret <= 100
+pub fn explicit_ord_min_is_modelled(x: u8, y: u8) -> u8 {
+    Ord::min(x, y)
+}
+
+/// The false direction: `min(x, y) == x` holds only when `x <= y`, so with no
+/// precondition it must be refuted. A model that always returned `x` -- or that
+/// treated `min` as the identity -- would prove it.
+/// requires: true
+/// ensures: ret == x
+pub fn ord_min_is_x_tripwire(x: u8, y: u8) -> u8 {
+    x.min(y)
+}
+
+/// A local trait whose method shares `Ord`'s `min` name. Its `min` returns a
+/// constant, so a call to it must be answered by *this body* and never by `core`'s
+/// ordering. The trait lives in a module, which is what rustc does for a trait
+/// outside the prelude's position -- the dump spells the call
+/// `<u8 as ord_shim::Ord>::min`, a trait segment (`ord_shim::Ord`) that is not
+/// `Ord`, so `classify` refuses it outright *and* the same-dump lookup finds the
+/// body first.
+pub mod ord_shim {
+    pub trait Ord {
+        fn min(self, other: Self) -> Self;
+    }
+    impl Ord for u8 {
+        fn min(self, _other: u8) -> u8 {
+            99
+        }
+    }
+}
+
+/// The body returns `99`, so this verifies only if the local trait's body is what
+/// answers the call. If the model answered instead it would return `min(x, y)`,
+/// which is `99` only when one operand is `99`, so the postcondition would be
+/// false.
+/// requires: true
+/// ensures: ret == 99
+pub fn local_ord_min_is_answered_by_its_body(x: u8, y: u8) -> u8 {
+    ord_shim::Ord::min(x, y)
+}
+
+/// The false direction on the same call: the *model's* answer (`min(100, 200) ==
+/// 100`) is what this claims, and the body returns `99`, so it must be refuted. A
+/// model that answered the call would return `100` and *prove* it -- this is the
+/// tripwire for that mistake.
+/// requires: x == 100
+/// requires: y == 200
+/// ensures: ret == 100
+pub fn local_ord_min_is_not_the_model_tripwire(x: u8, y: u8) -> u8 {
+    ord_shim::Ord::min(x, y)
+}
+
