@@ -7646,3 +7646,63 @@ Corpus coverage `examples/mir_targets/realistic.rs` **344 → 349** verified ove
 (the two new tripwires refute, as they must). No new SMT primitives were needed: `sle`, `sge`,
 `ule` and `ite` already existed.
 
+## `From::from`/`Into::into`: the second trait-method exception, and the two-type shape
+
+A widening conversion is the *same shape* of exception `Ord` is — a trait method whose call
+carries no `<impl` — so it is admitted the same way: `classify` accepts `from`/`into` only under
+the standard library's trait path, `try_intrinsic`'s `<impl` guard gains `Conversion` beside
+`is_ord_callee`, and the same-dump lookup still answers any local body first.
+
+Two things make conversions harder than `Ord`, and both are handled in the model rather than
+the guard:
+
+- **The two operand *types* differ, and both are in the name.** `Ord::min`'s operands share the
+  receiver's type, so one width read off the argument suffices. A conversion's whole content is
+  the *pair* of types, and rustc spells them in opposite positions for the two directions:
+  `From` is `<DEST as From<SRC>>::from` (self type = destination, parameter = source) and `Into`
+  is `<SRC as Into<DEST>>::into` (the other way round). `conversion_types` reads both out of the
+  call's own name — independent of how the executor happened to type the argument — and the
+  executor passes the *source* width/sign as `w`/`signed` and the *destination* width as
+  `result_w`. This is the one shape where those two differ by construction (the bit counts are
+  the other, and there the result is a fixed `u32`).
+- **Only a *strict widening* is a real integer `From`.** `core` implements `From` for exactly
+  the strict widenings (`u8 → u16`, `i8 → i16`, `u8 → i16`, …) and nothing else, so requiring
+  `dst_w >= src_w` between two modelled integers accepts every real call and refuses every
+  malformed or same-width spelling, which is the conservative direction. The extension is by the
+  *source's* sign — `i8::MIN` widens to `i8::MIN` (`0xff80`), `255u8` widens to `255u16` — and
+  that is deliberately the *same* rule the executor's `as`-cast arm uses, so a conversion and a
+  cast of one shape build one term (`convert_value` is the shared helper; the unit test pins the
+  agreement against the real `From` impl over all of `u8`/`i8`).
+
+The trait-path set is `From`/`Into`, `core::convert::…` and `std::convert::…`. The `std::convert`
+spelling is not hypothetical: the corpus prints `<u16 as std::convert::From<u8>>::from` once a
+local trait also named `From` is in scope, because rustc then qualifies the prelude trait to
+disambiguate. All three are the standard library's `From` and a user cannot define items inside
+`core`/`std`, so the set is exactly the prelude's; a module-qualified `m::From` is refused by
+name, and a crate-root `From` — which prints as the bare `From` too — is closed by the same-dump
+lookup, exactly as for `Ord`.
+
+`scripts/test-count.sh` **767 → 774** passed, 0 failed; `scripts/gate.sh` **ALL GATES GREEN**.
+Corpus coverage `examples/mir_targets/realistic.rs` **349 → 353** verified over 650 → 655 lines
+(the sign-extension tripwire refutes, as it must). The strengthened
+`a_static_call_resolves_to_its_own_impl_cannot_prove_this` now *refutes* with a witness
+(`x == 0`) where it used to be `Incomplete` — the modelled conversion answers the call, so the
+local `from` is not consulted at all. No new SMT primitives were needed: `sign_extend` and
+`truncate` already existed.
+
+### A separate, pre-existing hazard this work surfaced (not fixed here)
+
+While checking the local-trait case, a probe found a **false proof that predates this
+increment** (confirmed on the unmodified tree): a crate-root `impl From<u8> for u16` whose body
+returns `7` is *wrongly* consulted for a real `<u16 as std::convert::From<u8>>::from(x)` call,
+so a contract `ret == 7` verifies. The mechanism is `resolve_callee`'s owner-type match: the
+local impl's *definition* name `<impl at …>::from` shares the tail `from` with the call
+`<u16 as std::convert::From<u8>>::from`, and `method_owner_type` reads the owner as `u16`, which
+equals the call's self type — so the local body wins the same-dump lookup for a `core` call.
+This is orthogonal to the conversion *model* (which is only a fallback and is never reached when
+the lookup matches); it is a gap in the same-dump resolver for *any* local impl on a primitive
+whose owner type matches an external trait call's self type. It is deliberately left to its own
+increment rather than folded in here, and the corpus fixtures added here avoid the collision (the
+local-trait pair lives in a module, `conv_shim::From`, where the trait path differs and the model
+refuses it by name). The scratch probes were `/tmp/gap/shimproof.rs` (the false proof) and
+`/tmp/gap/localtrait.rs` (the module-qualified local trait behaving correctly).
