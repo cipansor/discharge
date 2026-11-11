@@ -7875,15 +7875,27 @@ before reading the visibility, so `#[cfg(all())] use std::convert::From as Conv;
 item's own line was also previously invisible to the scanner, so it could not even be identified
 as conditional.
 
+**The multi-line attribute form.** The same hazard for an attribute that *wraps*:
+`#[cfg(all(\n    any(),\n))]` puts the closing `)]` on the line directly above the `use`, so a
+one-line look upward sees no `#[cfg…` and treats a *disabled* import as live, displacing the live
+alias (again a lost proof, `converts a type the model does not hold`). `is_cfg_use` now reads the
+whole attribute block directly above the item as complete, bracket-balanced `#[…]` items
+(`read_attr_run`), so a condition that spans lines is found. The block ends at the first line that
+is not an attribute, so a `#[cfg]` belonging to an earlier item is never read as this one's.
+Corpus: `cfg_multiline_import_keeps_the_live_alias` verifies, its tripwire is refuted.
+
 Regression coverage: `a_nested_trait_argument_keeps_its_balanced_spelling`,
-`a_cfg_disabled_import_does_not_displace_a_live_alias`, `a_same_line_cfg_import_is_read` (inline,
-via `verify_src`), `the_nested_argument_and_cfg_alias_fixtures_are_decided` (corpus), plus four
-unit tests on the readers themselves (`leading_attributes_are_peeled_and_a_cfg_is_reported`,
+`a_cfg_disabled_import_does_not_displace_a_live_alias`, `a_same_line_cfg_import_is_read`,
+`a_multiline_cfg_import_does_not_displace_a_live_alias` (inline, via `verify_src`),
+`the_nested_argument_and_cfg_alias_fixtures_are_decided` (corpus, both the one-line and multi-line
+alias directions), plus five unit tests on the readers themselves
+(`leading_attributes_are_peeled_and_a_cfg_is_reported`,
 `a_use_behind_a_same_line_attribute_is_still_an_import`,
 `a_cfg_import_does_not_displace_a_live_binding`,
-`a_conditional_binding_is_held_below_an_unconditional_one`).
+`a_conditional_binding_is_held_below_an_unconditional_one`,
+`a_multiline_cfg_attribute_is_seen_above_a_use`).
 
-`scripts/test-count.sh` **784 → 792** passed, 0 failed; `scripts/gate.sh` **ALL GATES GREEN**
+`scripts/test-count.sh` **784 → 794** passed, 0 failed; `scripts/gate.sh` **ALL GATES GREEN**
 (clippy std + no_std, tests, no_std bare-metal, zero deps, z3 oracle 845 agree / 0 mismatch,
 rustc_public oracle 0 differ, MSRV 1.85, artifacts, unsafe surface still 2). No new SMT primitives:
-both fixes are string reads on the same two sides, and the model is unchanged.
+every fix is a string read on the same two sides, and the model is unchanged.

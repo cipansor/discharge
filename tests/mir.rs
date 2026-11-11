@@ -1905,6 +1905,45 @@ pub fn same_line_live_import() -> u16 {
     assert!(o.is_verified(), "a same-line cfg import must still bind, got: {o}");
 }
 
+/// A `#[cfg]` attribute that spans lines is read as a whole, not by its first line.
+///
+/// The same hazard as the one-line `#[cfg(any())]` case, but the attribute wraps, so
+/// the line directly above the `use` is its closing `)]` rather than its `#[cfg…`.
+/// A reader that inspects one line above the `use` sees `))]`, concludes there is no
+/// condition, treats the disabled import as live, and lets it displace the live
+/// alias -- recording the impl with the wrong trait and losing the call. The
+/// verifying entry is the evidence the live alias survives; the tripwire is the
+/// evidence the local body (returning `107`) answers, not the model.
+#[test]
+fn a_multiline_cfg_import_does_not_displace_a_live_alias() {
+    let src = r#"
+pub trait From { fn make() -> u8 { 0 } }
+pub mod m {
+    use std::convert::From as Conv;
+    pub struct Local;
+    impl Conv<Local> for u16 { fn from(_: Local) -> Self { 107 } }
+    #[cfg(all(
+        any(),
+    ))]
+    use crate::Other as Conv;
+}
+pub struct Other;
+/// requires: true
+/// ensures: ret == 107
+pub fn multi_cfg_live() -> u16 { <u16 as std::convert::From<m::Local>>::from(m::Local) }
+/// requires: true
+/// ensures: ret == 5
+pub fn multi_cfg_tripwire() -> u16 { <u16 as std::convert::From<m::Local>>::from(m::Local) }
+"#;
+    let Some(o) = verify_src("multi_cfg_live", src) else { return };
+    assert!(o.is_verified(), "a multi-line cfg import must not displace a live alias, got: {o}");
+    let Some(o) = verify_src("multi_cfg_tripwire", src) else { return };
+    match &o {
+        FnOutcome::Failed { kind, .. } => assert_eq!(kind, "postcondition", "got: {o}"),
+        _ => panic!("the live local body returns 107, so `ret == 5` must be refuted, got: {o}"),
+    }
+}
+
 /// The corpus pins both directions for the nested argument and the cfg alias.
 ///
 /// The inline tests above use a small self-contained source; these entries sit in
@@ -1916,6 +1955,7 @@ fn the_nested_argument_and_cfg_alias_fixtures_are_decided() {
     let verified = [
         "nested_trait_arg_finds_the_body",
         "cfg_disabled_import_keeps_the_live_alias",
+        "cfg_multiline_import_keeps_the_live_alias",
     ];
     let Some(report) = verify_realistic(&verified) else { return };
     for name in verified {
@@ -1925,6 +1965,7 @@ fn the_nested_argument_and_cfg_alias_fixtures_are_decided() {
     let refuted = [
         "nested_trait_arg_is_not_a_guess_tripwire",
         "cfg_disabled_import_is_not_the_wrong_alias_tripwire",
+        "cfg_multiline_import_is_not_the_wrong_alias_tripwire",
     ];
     let Some(report) = verify_realistic(&refuted) else { return };
     for name in refuted {

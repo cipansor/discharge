@@ -8116,3 +8116,46 @@ pub fn cfg_disabled_import_keeps_the_live_alias() -> u16 {
 pub fn cfg_disabled_import_is_not_the_wrong_alias_tripwire() -> u16 {
     <u16 as std::convert::From<CfgLocal>>::from(CfgLocal)
 }
+
+// --- A multi-line `#[cfg]` import must also not displace a live alias ----------
+//
+// The same hazard as above, but the attribute spans lines. The line next to the
+// `use` is then its closing `)]`, not its `#[cfg…`, so a reader that looks at one
+// line above misses the condition entirely and treats a *disabled* import as live.
+// Reading the attribute block as whole, balanced `#[…]` items closes it.
+
+pub struct CfgMultiLocal;
+
+pub mod cfg_multi_alias_shim {
+    use crate::CfgMultiLocal;
+    use std::convert::From as Conv;
+
+    impl Conv<CfgMultiLocal> for u16 {
+        fn from(_: CfgMultiLocal) -> Self {
+            108
+        }
+    }
+
+    #[cfg(all(
+        any(),
+    ))]
+    use crate::CfgMultiOther as Conv;
+}
+
+pub struct CfgMultiOther;
+
+/// The live alias still binds `Conv` to the standard trait, so the impl's call
+/// resolves to its body (returning `108`) and verifies.
+/// requires: true
+/// ensures: ret == 108
+pub fn cfg_multiline_import_keeps_the_live_alias() -> u16 {
+    <u16 as std::convert::From<CfgMultiLocal>>::from(CfgMultiLocal)
+}
+
+/// The false direction: the body returns `108`, so this must be refuted. Missing
+/// the multi-line condition recorded the impl with the wrong trait and lost the call.
+/// requires: true
+/// ensures: ret == 9
+pub fn cfg_multiline_import_is_not_the_wrong_alias_tripwire() -> u16 {
+    <u16 as std::convert::From<CfgMultiLocal>>::from(CfgMultiLocal)
+}

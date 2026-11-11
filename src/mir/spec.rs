@@ -1292,26 +1292,72 @@ fn is_cfg_use(lines: &[&str], i: usize) -> bool {
     if split_leading_attrs(lines[i]).1 {
         return true;
     }
-    let mut k = i;
-    while k > 0 {
-        k -= 1;
-        let t = lines[k].trim();
-        // A blank line ends the attribute block: an attribute must be contiguous
-        // with the item it applies to.
-        if t.is_empty() {
-            break;
-        }
-        if t.starts_with("#[cfg") {
-            return true;
-        }
-        // Another attribute (`#[allow(…)]`) still belongs to the item, so keep
-        // looking upward past it. A doc comment or any other text ends the block.
-        if t.starts_with("#[") {
-            continue;
-        }
-        break;
+    // The attribute block directly above the item. Reading one line at a time misses
+    // the head of a `#[cfg]` that spans lines -- the line next to the item is then
+    // its closing `)]`, not its `#[cfg…` -- so a disabled import would look live and
+    // displace a live alias. Read the whole block instead. See [`read_attr_run`].
+    attrs_above_have_cfg(lines, i)
+}
+
+/// Whether the contiguous attribute block directly above `end` holds a `#[cfg…]`.
+///
+/// The block is the longest suffix of the contiguous non-blank lines above `end`
+/// that parses as whole attributes; trying candidate starts from the top down finds
+/// it, because the first start whose read covers exactly `[start, end)` is the real
+/// block. A line that is not an attribute (a doc comment, or the tail of an earlier
+/// item) makes every start at or above it fail, so an attribute belonging to another
+/// item is never read as this item's. See [`read_attr_run`].
+fn attrs_above_have_cfg(lines: &[&str], end: usize) -> bool {
+    let mut top = end;
+    while top > 0 && !lines[top - 1].trim().is_empty() {
+        top -= 1;
     }
-    false
+    (top..end).any(|start| read_attr_run(lines, start, end) == Some(true))
+}
+
+/// Read the lines `[start, end)` as a run of whole `#[…]` attributes, returning
+/// whether any is a `#[cfg…]`; `None` when they are not all attributes.
+///
+/// Each attribute is read from its `#[` through the balanced `]` that closes it, so
+/// one spanning lines (`#[cfg(all(\n    unix,\n))]`) is read whole rather than by its
+/// first line alone. See [`is_cfg_use`].
+fn read_attr_run(lines: &[&str], start: usize, end: usize) -> Option<bool> {
+    let mut cfg = false;
+    let mut k = start;
+    while k < end {
+        let head = lines[k].trim_start().strip_prefix("#[")?;
+        // Find the `]` that closes this attribute, which may be on a later line.
+        let mut depth = 1i32;
+        let mut j = k;
+        let mut segment = head;
+        loop {
+            let mut closed = false;
+            for c in segment.chars() {
+                match c {
+                    '[' | '(' => depth += 1,
+                    ']' | ')' => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 {
+                    closed = true;
+                    break;
+                }
+            }
+            if closed {
+                break;
+            }
+            j += 1;
+            if j >= end {
+                return None;
+            }
+            segment = lines[j];
+        }
+        if head.trim_start().starts_with("cfg") {
+            cfg = true;
+        }
+        k = j + 1;
+    }
+    Some(cfg)
 }
 
 /// Split any leading `#[…]` attributes off `line`, returning the rest and whether a
@@ -8207,5 +8253,48 @@ fn h<
         let imports = module_imports(&scopes, &lines);
         // The unconditional binding comes later and replaces the conditional one.
         assert_eq!(imports[1].get("Conv"), Some(&"std::convert::From".to_string()));
+    }
+
+    /// `is_cfg_use` reads a `#[cfg]` that spans lines, and does not read an
+    /// attribute belonging to a different item.
+    #[test]
+    fn a_multiline_cfg_attribute_is_seen_above_a_use() {
+        // A one-line `#[cfg]` above the `use` is seen (the pre-existing case).
+        let lines: Vec<&str> = vec!["#[cfg(any())]", "use a::B as C;"];
+        assert!(is_cfg_use(&lines, 1));
+
+        // A `#[cfg]` that wraps: the line above the `use` is its closing `)]`, so a
+        // one-line look misses it. The whole attribute must be read.
+        let lines: Vec<&str> = vec![
+            "#[cfg(all(",
+            "    any(),",
+            "))]",
+            "use a::B as C;",
+        ];
+        assert!(is_cfg_use(&lines, 3), "a multi-line cfg must still be seen");
+
+        // A non-`cfg` attribute above the `use` is not a condition.
+        let lines: Vec<&str> = vec!["#[allow(unused)]", "use a::B as C;"];
+        assert!(!is_cfg_use(&lines, 1));
+
+        // A non-attribute line (an earlier item's text) ends the block: the `#[cfg]`
+        // above it belongs to that item, not to this `use`.
+        let lines: Vec<&str> = vec!["#[cfg(any())]", "struct X;", "use a::B as C;"];
+        assert!(!is_cfg_use(&lines, 2), "a non-attribute line ends the attribute block");
+
+        // A blank line also ends the block.
+        let lines: Vec<&str> = vec!["#[cfg(any())]", "", "use a::B as C;"];
+        assert!(!is_cfg_use(&lines, 2), "a blank line ends the attribute block");
+
+        // Two attributes, the `cfg` second, the first spanning a line: both belong to
+        // the `use`, so the condition is seen.
+        let lines: Vec<&str> = vec![
+            "#[allow(",
+            "    unused,",
+            ")]",
+            "#[cfg(any())]",
+            "use a::B as C;",
+        ];
+        assert!(is_cfg_use(&lines, 4), "a cfg below another attribute is still this item's");
     }
 }
