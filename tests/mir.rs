@@ -3556,6 +3556,91 @@ fn an_expression_const_is_inlined_in_both_directions() {
     assert!(width.is_verified(), "an expression const keeps its width; got: {width}");
 }
 
+/// A comparison folded in a *constant* is read at its operands' type, not at the
+/// `bool` destination's.
+///
+/// rustc prints `const LESS: bool = -1i8 < 0i8` as `_0 = Lt(const -1_i8, const
+/// 0_i8)`: the return place is `bool`, but the operands are `i8`. Taking the width
+/// and signedness from the destination made the folder compare the `-1i8` pattern,
+/// 255, as *unsigned* -- so `-1i8 < 0i8` folded to `false`, and a contract claiming
+/// `ret == false` was *proved* from a wrong value. That is a false proof, not a lost
+/// one, which is why the false twin here is the load-bearing assertion.
+#[test]
+fn a_signed_comparison_const_uses_the_operand_type() {
+    let Some(report) = verify_realistic(&[
+        "a_signed_comparison_const_is_read",
+        "a_signed_comparison_const_is_read_cannot_prove_this",
+        "an_unsigned_comparison_const_is_read",
+    ]) else {
+        return;
+    };
+    let signed = outcome(&report, "a_signed_comparison_const_is_read");
+    assert!(
+        signed.is_verified(),
+        "`-1i8 < 0i8` is true and the contract must prove it; got: {signed}"
+    );
+    let false_direction = outcome(&report, "a_signed_comparison_const_is_read_cannot_prove_this");
+    assert!(
+        matches!(false_direction, FnOutcome::Failed { .. }),
+        "`LESS` is true, so `ret == false` must be refuted -- reading the operands \
+         as unsigned proves it from a wrong value; got: {false_direction}"
+    );
+    // The unsigned control folds the same way under either reading, so it pins
+    // that the fix did not simply invert every comparison.
+    let unsigned = outcome(&report, "an_unsigned_comparison_const_is_read");
+    assert!(unsigned.is_verified(), "`200u8 > 100u8` is true; got: {unsigned}");
+}
+
+/// A constant may name one the dump prints *after* it.
+///
+/// rustc keeps source declaration order, so `FWD_NEXT`'s expression body is printed
+/// before `FWD_LIMIT`'s literal. A single in-order pass folds `FWD_NEXT` while
+/// `FWD_LIMIT` is still unresolved and leaves the item unmodelled -- its contracts
+/// undecided. The fold runs to a fixpoint, so a later constant is seen. The false
+/// twin pins that the value is real: a guess would prove `ret == 12`.
+#[test]
+fn a_forward_referenced_const_is_resolved() {
+    let Some(report) = verify_realistic(&[
+        "a_forward_referenced_const_is_read",
+        "a_forward_referenced_const_is_read_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    let resolved = outcome(&report, "a_forward_referenced_const_is_read");
+    assert!(
+        resolved.is_verified(),
+        "a constant may name a later one; the fold must reach a fixpoint; got: {resolved}"
+    );
+    let false_direction = outcome(&report, "a_forward_referenced_const_is_read_cannot_prove_this");
+    assert!(
+        matches!(false_direction, FnOutcome::Failed { .. }),
+        "`FWD_NEXT` is 11, so `ret == 12` must be refuted; got: {false_direction}"
+    );
+}
+
+/// A file that declares an *unused* 128-bit expression constant still verifies its
+/// smaller functions.
+///
+/// The parser reads every `const` definition when it loads a dump, including ones no
+/// target names. rustc prints an expression-bodied `i128` as an `AddWithOverflow` at
+/// width 128, and the folder's exact overflow test negates `1i128 << 127` --
+/// `i128::MIN` -- which panics in a debug build, taking the whole run down for an
+/// item nobody asked about. The width is refused, so the item is simply unmodelled
+/// and the verdicts still arrive.
+#[test]
+fn an_unused_i128_expression_const_does_not_abort_the_run() {
+    let Some(report) =
+        verify_realistic(&["a_file_with_an_unused_i128_const_still_verifies"])
+    else {
+        return;
+    };
+    let o = outcome(&report, "a_file_with_an_unused_i128_const_still_verifies");
+    assert!(
+        o.is_verified(),
+        "an unused i128 const must not abort the parse; got: {o}"
+    );
+}
+
 /// A function-local `const` is not in scope in another function.
 ///
 /// `a_local_const_owner` declares `const L: u8 = 3;` in its body; the dump prints

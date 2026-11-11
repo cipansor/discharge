@@ -7039,6 +7039,89 @@ const NEG: i8 = -1;
 /// A boolean constant.
 const ENABLED: bool = true;
 
+/// An *unused* 128-bit expression constant.
+///
+/// The parser walks every `const` definition when it loads a dump, including ones
+/// no selected target names, and rustc prints an expression-bodied `i128` as an
+/// `AddWithOverflow` at width 128. The folder's exact overflow test negates
+/// `1i128 << 127` -- `i128::MIN` -- which panics in a debug build, at parse time,
+/// for this item alone. The width is refused instead, so parsing this file reaches
+/// the verdicts for the functions below.
+const HUGE: i128 = 1 + 2;
+
+/// A small function in a file that also declares [`HUGE`], so the parse of the
+/// unused 128-bit item cannot take the process down before this contract decides.
+/// requires: true
+/// ensures: ret == 7
+pub fn a_file_with_an_unused_i128_const_still_verifies(x: u8) -> u8 {
+    let _ = x;
+    7
+}
+
+/// A signed comparison, whose operands keep their own type while the destination
+/// is `bool`.
+///
+/// rustc prints this as `_0 = Lt(const -1_i8, const 0_i8)`: a `bool` return place
+/// assigned from `i8` operands. Reading the width and sign off the `bool`
+/// destination compares the `-1i8` pattern, 255, as unsigned and folds the
+/// comparison to *false* -- the wrong value, which a contract claiming the false
+/// direction would then *prove*. The operands' own type decides it instead.
+const LESS: bool = -1i8 < 0i8;
+
+/// An unsigned comparison at a width of its own, the control for [`LESS`].
+const BIGGER: bool = 200u8 > 100u8;
+
+/// A signed comparison folded in a *constant* is read at its operands' type.
+/// requires: true
+/// ensures: ret == true
+pub fn a_signed_comparison_const_is_read() -> bool {
+    LESS
+}
+
+/// The false direction of [`a_signed_comparison_const_is_read`]: folding `LESS` at
+/// the `bool` destination would read the operands as unsigned and prove this. It
+/// must not verify.
+/// requires: true
+/// ensures: ret == false
+pub fn a_signed_comparison_const_is_read_cannot_prove_this() -> bool {
+    LESS
+}
+
+/// The control for [`a_signed_comparison_const_is_read`], at an unsigned type where
+/// the destination reading happens to agree.
+/// requires: true
+/// ensures: ret == true
+pub fn an_unsigned_comparison_const_is_read() -> bool {
+    BIGGER
+}
+
+/// A constant that names one the dump prints *after* it.
+///
+/// Rust keeps source declaration order in the dump, so `FWD_NEXT`'s body is printed
+/// before `FWD_LIMIT`'s literal. A single in-order pass would fold `FWD_NEXT` while
+/// `FWD_LIMIT` is still unresolved, leaving the item unmodelled and its contracts
+/// undecided; the fold runs to a fixpoint so the later literal is seen.
+const FWD_NEXT: u8 = FWD_LIMIT + 1;
+
+/// The forward-referenced limit, declared after its user.
+const FWD_LIMIT: u8 = 10;
+
+/// A forward-referenced constant resolves.
+/// requires: true
+/// ensures: ret == 11
+pub fn a_forward_referenced_const_is_read() -> u8 {
+    FWD_NEXT
+}
+
+/// The false direction of [`a_forward_referenced_const_is_read`]: leaving the
+/// forward reference unmodelled would skip rather than prove, but a *guessed* value
+/// would prove this. It must not verify.
+/// requires: true
+/// ensures: ret == 12
+pub fn a_forward_referenced_const_is_read_cannot_prove_this() -> u8 {
+    FWD_NEXT
+}
+
 /// Reading a named constant decides.
 /// requires: true
 /// ensures: ret == 10

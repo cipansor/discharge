@@ -1285,6 +1285,71 @@ fn block_const_value<'a>(lines: &[&'a str]) -> Option<&'a str> {
     Some(literal.trim_end_matches(';'))
 }
 
+/// Split a `const` item's definition line into its name, optional declared type,
+/// and body text.
+///
+/// The line is `const NAME: TYPE = BODY;` or `const NAME = BODY;`. The
+/// name/type split is at the `": "` separator, not any colon -- a qualified name
+/// (`ARR::{constant#0}`) contains `::` -- and the name/body split is at the first
+/// `" = "`. The associated-constant form is dropped: its `{constant#0}` name is
+/// not an identifier path, nothing refers to it by that name, and the array
+/// length it carries is already in the array's type. `None` is returned for a
+/// non-item line or a name that is not a plain `::`-path of identifiers.
+fn parse_const_item(line: &str) -> Option<(String, Option<Ty>, &str)> {
+    let rest = line.trim_end().strip_prefix("const ")?;
+    if rest.starts_with('{') {
+        return None;
+    }
+    let (name, body) = rest.split_once(" = ")?;
+    let (name, ty_text) = match name.split_once(": ") {
+        Some((n, t)) => (n, Some(t)),
+        None => (name, None),
+    };
+    let name = name.trim();
+    let plain = !name.is_empty()
+        && !name.contains('{')
+        && name
+            .split("::")
+            .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+    if !plain {
+        return None;
+    }
+    let ret_ty = ty_text.map(|t| Ty::parse(t.trim()));
+    Some((name.to_string(), ret_ty, body.trim().trim_end_matches(';')))
+}
+
+/// The `prog.consts` key a `const` definition is recorded under, or `None` when
+/// its names are not in scope for any contract.
+///
+/// A bare key is recorded when the name is used bare somewhere (a crate-level
+/// item), or when the source says the item is module-scoped (a crate-level
+/// constant that only a contract names has no use site to go by). A
+/// function-local item's definition prints the same way but its uses are
+/// qualified (`const f::L`), so a bare key for it would let an unrelated
+/// function's contract resolve a name its own source could not. Such a bare
+/// definition is instead recorded under the qualified path the use site spells,
+/// so the owning function's contract reads the value while no other function can
+/// name the bare key. A qualified definition keeps its qualified key, which is
+/// what a contract that spells the path resolves.
+fn const_key(
+    name: &str,
+    claimed_bare: &std::collections::BTreeSet<String>,
+    claimed_paths: &BTreeMap<String, String>,
+    bare_uses: &std::collections::BTreeSet<String>,
+    crate_consts: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    if name.contains("::") {
+        return Some(name.to_string());
+    }
+    if claimed_bare.contains(name) {
+        return claimed_paths.get(name).cloned();
+    }
+    if bare_uses.contains(name) || crate_consts.contains(name) {
+        return Some(name.to_string());
+    }
+    None
+}
+
 /// A concrete value read by [`fold_const_block`].
 ///
 /// Deliberately *not* the symbolic `Val`: a `const` item's body is const-evaluated
@@ -1335,6 +1400,18 @@ fn c_mask(w: u8) -> u64 {
     if w >= 64 { u64::MAX } else { (1u64 << w) - 1 }
 }
 
+/// Whether a width is one the folder's 64-bit `CVal` can hold.
+///
+/// A 128-bit literal (`const HUGE: i128 = 1 + 2`) reaches the folder as an
+/// `AddWithOverflow` whose width is 128, and the exact overflow test negates
+/// `1i128 << 127`, i.e. `i128::MIN` -- a panic in a debug build, at *parse* time
+/// and for an item no selected function even names. The 64-bit word cannot carry
+/// such a value, so the folder refuses it: the item stays unmodelled and a
+/// contract that named it is a skip, never a crash and never a wrong fold.
+fn c_width_ok(w: u8) -> bool {
+    w <= 64
+}
+
 /// The signed reading of a `w`-bit pattern, sign-extended to `i128`.
 fn c_signed(v: u64, w: u8) -> i128 {
     if w >= 64 {
@@ -1358,6 +1435,11 @@ fn cval_of_const(c: &Const, want: Option<u8>, consts: &BTreeMap<String, Const>) 
         Const::Bool(b) => Some(CVal::Bool(*b)),
         Const::UInt(v, ty) => {
             let w = ty.as_ref().and_then(|t| t.width()).or(want)?;
+            // A 128-bit literal is wider than the folder's word; see
+            // [`c_width_ok`].
+            if !c_width_ok(w) {
+                return None;
+            }
             let signed = ty.as_ref().is_some_and(|t| t.is_signed());
             if w == 1 {
                 return Some(CVal::Bool(*v != 0));
@@ -1427,6 +1509,9 @@ fn c_operand(
 /// A binary op on two concrete values, at `w` bits with the given signedness.
 fn c_binop(op: BinOp, a: CVal, b: CVal, w: u8, signed: bool) -> Option<CVal> {
     use core::cmp::Ordering;
+    if !c_width_ok(w) {
+        return None;
+    }
     let m = c_mask(w);
     match op {
         BinOp::Eq => Some(CVal::Bool(a.word()? == b.word()?)),
@@ -1495,8 +1580,35 @@ fn c_binop(op: BinOp, a: CVal, b: CVal, w: u8, signed: bool) -> Option<CVal> {
     }
 }
 
+/// Whether a binary op yields a `bool` whose operands keep their own type.
+///
+/// Such an op's width and signedness come from the operands, never from the
+/// `bool` destination; see [`c_assign`].
+fn is_comparison(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+    )
+}
+
+/// The width and signedness a comparison's two operands agree on.
+///
+/// A comparison compares like-typed operands, so a mismatch means they were not
+/// read at a common width; comparing them would be meaningless, so it is refused
+/// rather than guessed.
+fn c_operand_shape(x: CVal, y: CVal) -> Option<(u8, bool)> {
+    match (x, y) {
+        (CVal::Word(_, wx, sx), CVal::Word(_, wy, sy)) if wx == wy && sx == sy => Some((wx, sx)),
+        (CVal::Bool(_), CVal::Bool(_)) => Some((1, false)),
+        _ => None,
+    }
+}
+
 /// A unary op on a concrete value.
 fn c_unop(op: UnOp, x: CVal, w: u8, signed: bool) -> Option<CVal> {
+    if !c_width_ok(w) {
+        return None;
+    }
     match op {
         UnOp::Not => match x {
             CVal::Bool(b) => Some(CVal::Bool(!b)),
@@ -1516,6 +1628,9 @@ fn c_unop(op: UnOp, x: CVal, w: u8, signed: bool) -> Option<CVal> {
 /// constant is valid, and a wrong flag would either refuse a good constant or
 /// fold a value the const never had.
 fn c_checked(op: BinOp, a: CVal, b: CVal, w: u8, signed: bool) -> Option<(u64, bool)> {
+    if !c_width_ok(w) {
+        return None;
+    }
     let (x, y) = (a.word()?, b.word()?);
     let m = c_mask(w);
     match op {
@@ -1550,6 +1665,9 @@ fn c_checked(op: BinOp, a: CVal, b: CVal, w: u8, signed: bool) -> Option<(u64, b
 
 /// A cast to a concrete type at `dw` bits.
 fn c_cast(x: CVal, ty: &Ty, dw: u8) -> Option<CVal> {
+    if !c_width_ok(dw) {
+        return None;
+    }
     let v = x.word()?;
     let sw = x.width();
     let m = c_mask(dw);
@@ -1589,11 +1707,25 @@ fn c_assign(
             env.insert((dest.local, chain), narrow(v));
         }
         Rvalue::Binary(op, a, b) => {
-            let w = dw?;
-            let x = c_operand(env, consts, a, Some(w))?;
-            let y = c_operand(env, consts, b, Some(w))?;
-            let v = c_binop(*op, x, y, w, dty.is_signed())?;
-            env.insert((dest.local, chain), narrow(v));
+            if is_comparison(*op) {
+                // The destination is a `bool`, but the operands keep their own
+                // type (`_0 = Lt(const -1_i8, const 0_i8)` writes a `bool` local
+                // from `i8` operands). Reading the width and sign off the `bool`
+                // destination would compare the `-1i8` pattern, 255, as unsigned
+                // and fold `-1i8 < 0i8` to *false* -- a false proof of a contract
+                // that claims it. Take them from the operands instead.
+                let x = c_operand(env, consts, a, None)?;
+                let y = c_operand(env, consts, b, None)?;
+                let (w, signed) = c_operand_shape(x, y)?;
+                let v = c_binop(*op, x, y, w, signed)?;
+                env.insert((dest.local, chain), narrow(v));
+            } else {
+                let w = dw?;
+                let x = c_operand(env, consts, a, Some(w))?;
+                let y = c_operand(env, consts, b, Some(w))?;
+                let v = c_binop(*op, x, y, w, dty.is_signed())?;
+                env.insert((dest.local, chain), narrow(v));
+            }
         }
         Rvalue::Unary(op, a) => {
             let w = dw?;
@@ -1666,6 +1798,13 @@ fn fold_const_block(
     enums: &BTreeMap<String, EnumLayout>,
     consts: &BTreeMap<String, Const>,
 ) -> Option<Const> {
+    // A `const` declared wider than the folder's word (`i128`/`u128`) is refused
+    // before its body is interpreted: the width-taking helpers would each have to
+    // refuse it, and the exact overflow test would panic on `i128::MIN` first. See
+    // [`c_width_ok`].
+    if !ret_ty.width().is_some_and(c_width_ok) {
+        return None;
+    }
     let mut f = MirFn {
         name: String::new(),
         arg_locals: Vec::new(),
@@ -2420,99 +2559,80 @@ fn parse_program_impl(
     // [`claimed_bare_const_uses`].
     let claimed_bare = claimed_bare_const_uses(&mentions);
     let claimed_paths = claimed_bare_paths(&mentions);
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i];
-        // A `const` item whose body the dump prints as a single literal:
-        // `const K: u8 = const 5_u8;`. It is recorded so a use site (`_0 = const
-        // K`) can fold to the value. The associated-constant form
-        // (`const ARR::{constant#0}: usize = const 3_usize;`) has a `::`-suffixed
-        // name and is skipped: nothing refers to it by that name, and the array
-        // length it carries is already in the array's type.
-        if let Some(rest) = line.trim_end().strip_prefix("const ") {
-            if !rest.starts_with('{') {
-                if let Some((name, body)) = rest.split_once(" = ") {
-                    // The name/type split is at the `: ` separator, not any colon:
-                    // a qualified name (`ARR::{constant#0}`) contains `::`. A name
-                    // is kept only when it is a `::`-separated path of identifiers
-                    // -- the exact spelling the use site prints (`a::K`,
-                    // `local_const::L`), so the lookup is by full path and a
-                    // module-nested constant cannot collide with a top-level one of
-                    // the same last segment. An associated constant's
-                    // `{constant#0}` fails the identifier test and is dropped.
-                    let (name, ty_text) = match name.split_once(": ") {
-                        Some((n, t)) => (n, Some(t)),
-                        None => (name, None),
-                    };
-                    let name = name.trim();
-                    let plain = !name.is_empty()
-                        && !name.contains('{')
-                        && name
-                            .split("::")
-                            .all(|seg| !seg.is_empty()
-                                && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
-                    if plain {
-                        let body = body.trim().trim_end_matches(';');
-                        // Three shapes, in order of directness:
-                        //
-                        // 1. An inline literal (`const K: u8 = const 7_u8;`).
-                        // 2. A CTFE brace-block whose body folds to a single
-                        //    literal. On 1.85 -- the MSRV floor -- an item that
-                        //    folds to a literal prints this way
-                        //    (`const K: u8 = { … _0 = const 7_u8; … }`), so the
-                        //    value is read from the block's return-place
-                        //    assignment.
-                        // 3. A brace-block whose body is an *expression*
-                        //    (`const NEXT: u8 = { … AddWithOverflow(7, 4) … }`).
-                        //    It is interpreted concretely by `fold_const_block`.
-                        //
-                        // Without 2 and 3 the item is dropped on the floor and a
-                        // contract that names it goes unreadable -- a lost proof.
-                        let ret_ty = ty_text.map(|t| Ty::parse(t.trim()));
-                        let literal = if let Some(rest) = body.strip_prefix("const ") {
-                            Some(parse_const(rest))
-                        } else if body.starts_with('{') {
-                            match block_const_value(&lines[i + 1..]) {
-                                Some(lit) => Some(parse_const(lit)),
-                                None => ret_ty.clone().and_then(|rt| {
-                                    fold_const_block(&lines, i + 1, rt, enums, &prog.consts)
-                                }),
-                            }
-                        } else {
-                            None
-                        };
-                        if let Some(c) = literal {
-                            // A bare key is recorded when the name is used
-                            // bare somewhere, i.e. for a crate-level item, or when
-                            // the source says the item is module-scoped (a
-                            // crate-level constant that only a contract names has
-                            // no use site to go by). A function-local item's
-                            // definition prints the same way but its uses are
-                            // qualified (`const f::L`), so a bare key for it would
-                            // let an unrelated function's contract resolve a name
-                            // its own source could not. A qualified definition
-                            // keeps its qualified key, which is what a contract
-                            // that spells the path resolves.
-                            if name.contains("::") {
-                                prog.consts.insert(name.to_string(), c);
-                            } else if claimed_bare.contains(name) {
-                                // A bare definition whose use is qualified: a
-                                // function-local item printed bare because no
-                                // other local shares its name. Record it under
-                                // the qualified path the use site spells, so the
-                                // owning function's contract reads the value while
-                                // no other function can name the bare key.
-                                if let Some(path) = claimed_paths.get(name) {
-                                    prog.consts.insert(path.clone(), c);
-                                }
-                            } else if bare_uses.contains(name) || crate_consts.contains(name) {
-                                prog.consts.insert(name.to_string(), c);
+
+    // --- `const` items -----------------------------------------------------
+    // Collected *before* the function loop, and in two stages, so an expression
+    // body can name a constant the dump prints *after* it. rustc keeps source
+    // declaration order in the dump, and Rust lets a constant refer to a later
+    // one (`const NEXT: u8 = LIMIT + 1;` above `const LIMIT: u8 = 10;`), so a
+    // single in-order pass would leave `NEXT` unresolved -- an unmodelled item
+    // and a lost proof. Stage 1 reads every literal (and every CTFE block that
+    // folds to one) into the table; stage 2 folds the expression bodies to a
+    // fixpoint, each round seeing the constants the previous one resolved. A
+    // cycle resolves nothing and stops the loop, leaving those items unmodelled
+    // as before.
+    //
+    // The scan mirrors the function loop's skip of a `// MIR FOR CTFE` copy, so a
+    // duplicate body is not read a second time.
+    let mut pending: Vec<(String, usize, Ty)> = Vec::new();
+    let mut idx = 0;
+    while idx < lines.len() {
+        let line = lines[idx];
+        if line.trim() == "// MIR FOR CTFE" {
+            let mut k = idx + 1;
+            while k < lines.len() && lines[k].trim().is_empty() {
+                k += 1;
+            }
+            if k < lines.len() && parse_fn_header(lines[k]).is_some() {
+                let mut m = k + 1;
+                while m < lines.len() && !lines[m].starts_with('}') {
+                    m += 1;
+                }
+                idx = m + 1;
+                continue;
+            }
+        }
+        if let Some((name, ret_ty, body)) = parse_const_item(line) {
+            if let Some(key) = const_key(&name, &claimed_bare, &claimed_paths, &bare_uses, crate_consts)
+            {
+                if let Some(rest) = body.strip_prefix("const ") {
+                    prog.consts.insert(key, parse_const(rest));
+                } else if body.starts_with('{') {
+                    match block_const_value(&lines[idx + 1..]) {
+                        Some(lit) => {
+                            prog.consts.insert(key, parse_const(lit));
+                        }
+                        None => {
+                            if let Some(rt) = ret_ty {
+                                pending.push((key, idx + 1, rt));
                             }
                         }
                     }
                 }
             }
         }
+        idx += 1;
+    }
+    loop {
+        let mut progressed = false;
+        pending.retain(|(key, start, ty)| {
+            let folded = fold_const_block(&lines, *start, ty.clone(), enums, &prog.consts);
+            match folded {
+                Some(c) => {
+                    prog.consts.insert(key.clone(), c);
+                    progressed = true;
+                    false
+                }
+                None => true,
+            }
+        });
+        if !progressed {
+            break;
+        }
+    }
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
         // rustc prints a second, `// MIR FOR CTFE`-marked body for an item it
         // const-evaluates -- a tuple-variant constructor called in a `let`, for
         // one. It is a *copy* of an item already printed above it, and the typed

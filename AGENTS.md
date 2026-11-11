@@ -155,6 +155,36 @@ Three engine consequences worth remembering:
   - A module-nested item is keyed by its full path (`low::K`), which is how the
     dump prints both the definition and the use, so it resolves only when the
     contract spells the path -- a bare `K` does not silently pick one module.
+  - A `const` item is collected *before* the function loop, in two stages: every
+    literal (and every CTFE block that folds to one) first, then the
+    expression-bodied ones to a fixpoint. A single in-order pass folded
+    `const FWD_NEXT: u8 = FWD_LIMIT + 1` while the later `const FWD_LIMIT: u8 =
+    10` was still unresolved, because rustc prints source declaration order and
+    Rust lets a constant name a later one. The fixpoint sees each round's
+    resolved constants; a cycle resolves nothing and stops, leaving those items
+    unmodelled as before. `parse_const_item`/`const_key` are the item reader, so
+    the same keying rules apply to the prepass and the fixpoint.
+
+  - A comparison's width and sign come from its *operands*, never from its
+    destination. `const LESS: bool = -1i8 < 0i8` folds as `_0 = Lt(const -1_i8,
+    const 0_i8)`: a `bool` return place assigned from `i8` operands. Reading the
+    shape off the `bool` destination compared the `-1i8` pattern, 255, as unsigned
+    and folded the comparison to `false` -- and a contract claiming `ret == false`
+    was *proved* from a wrong value. `is_comparison` routes the comparison arms
+    through `c_operand_shape`, which takes the common operand shape and refuses a
+    mismatch rather than guessing.
+
+- **The const folder's word is 64 bits.** `CVal::Word` holds a `u64`, so a width
+  past 64 (`i128`/`u128`) is refused by `c_width_ok` rather than carried. An
+  expression-bodied `i128` (`const HUGE: i128 = 1 + 2`) reaches `c_checked` as an
+  `AddWithOverflow` at width 128, whose exact overflow test negates
+  `1i128 << 127` -- `i128::MIN` -- which panics in a debug build, at *parse* time,
+  for an item no target named. Every width-taking folder (`cval_of_const`,
+  `c_binop`, `c_unop`, `c_checked`, `c_cast`) checks it, and `fold_const_block`
+  refuses such a `ret_ty` up front; the item stays unmodelled and a contract that
+  named it is a skip. `Ty::width` still reports 128 because the *constant reader*
+  needs it to compute `u128::MAX` and a negative literal's two's-complement
+  pattern -- only the folder refuses it. See `Ty::has_unrepresentable_leaf`.
 
 ## The unsigned multiply-overflow test is exact *division*, not a widened product
 

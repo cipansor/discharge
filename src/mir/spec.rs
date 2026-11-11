@@ -1315,6 +1315,160 @@ fn attrs_above_have_cfg(lines: &[&str], end: usize) -> bool {
     (top..end).any(|start| read_attr_run(lines, start, end) == Some(true))
 }
 
+/// Whether a raw string literal opens at byte `i`, returning its `#` count and the
+/// offset just past the opening `"`.
+///
+/// A raw string is `r"…"`, `r#"…"#`, `r##"…"##`, … with an optional `b` or `c`
+/// prefix (`br#"…"#`, `cr#"…"#`). Inside one a backslash is *not* an escape, so the
+/// closing `"` plus `#`s is the only thing that ends it -- `r"\"` is the two bytes
+/// `\` and `"`, the `"` closing the string. Reading it as an ordinary string, the
+/// `\` would escape that `"`, the real end would be missed, and a following
+/// `#[cfg]` would go unread -- the lost proof this reader prevents. See
+/// [`attr_close_offset`].
+fn raw_string_start(bytes: &[u8], i: usize) -> Option<(usize, usize)> {
+    let mut j = i;
+    // An optional `b` or `c` prefix in front of the `r`.
+    if matches!(bytes.get(j), Some(b'b') | Some(b'c')) {
+        j += 1;
+    }
+    if bytes.get(j) != Some(&b'r') {
+        return None;
+    }
+    j += 1;
+    let mut hashes = 0;
+    while bytes.get(j) == Some(&b'#') {
+        hashes += 1;
+        j += 1;
+    }
+    if bytes.get(j) != Some(&b'"') {
+        return None;
+    }
+    Some((hashes, j + 1))
+}
+
+/// Whether the `'` at byte `i` opens a character literal rather than a lifetime.
+///
+/// A char literal holds one character (`'('`) or a backslash escape (`'\n'`,
+/// `'\''`), so it opens only when a `\` follows or a closing `'` follows the next
+/// character. A lifetime (`'a`, `'static`) has no closing quote and is left alone.
+/// See [`attr_close_offset`].
+fn is_char_literal_start_bytes(bytes: &[u8], i: usize) -> bool {
+    match bytes.get(i + 1) {
+        Some(b'\\') => true,
+        Some(_) => bytes.get(i + 2) == Some(&b'\''),
+        None => false,
+    }
+}
+
+/// The offset just past the closing `"` of an ordinary string opening at `i`.
+fn skip_string(bytes: &[u8], i: usize) -> usize {
+    let mut j = i + 1;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\\' => j += 2,
+            b'"' => return j + 1,
+            _ => j += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// The offset just past the closing `'` of a char literal opening at `i`.
+fn skip_char(bytes: &[u8], i: usize) -> usize {
+    let mut j = i + 1;
+    if bytes.get(j) == Some(&b'\\') {
+        j += 1;
+    }
+    j += 1;
+    if bytes.get(j) == Some(&b'\'') {
+        j + 1
+    } else {
+        j
+    }
+}
+
+/// The offset just past a raw string's closing `"` + `#`s, whose opening `"` is at
+/// `after_quote` and whose `#` count is `hashes`.
+fn skip_raw_string(bytes: &[u8], after_quote: usize, hashes: usize) -> usize {
+    let mut j = after_quote;
+    while j < bytes.len() {
+        if bytes[j] == b'"' {
+            let mut h = 0;
+            let mut k = j + 1;
+            while h < hashes && bytes.get(k) == Some(&b'#') {
+                h += 1;
+                k += 1;
+            }
+            if h == hashes {
+                return k;
+            }
+        }
+        j += 1;
+    }
+    bytes.len()
+}
+
+/// The offset just past the `]` that closes an attribute whose `[` is at `open`.
+///
+/// The attribute body's `(…)`/`[…]` nest, so brackets are matched by depth. Text
+/// that is *not* a delimiter is skipped whole: ordinary and raw string literals,
+/// char literals, and `//` / `/* … */` comments. Each of these can hold a quote or
+/// a bracket that, counted, would either end the attribute early or run it past
+/// its real end -- and a run past the end reads a *disabled* `#[cfg]` as live, the
+/// lost proof this reader exists to prevent. Comments are skipped because Rust
+/// discards them before parsing: a `"` in a comment is not a string, and a `]` in
+/// one is not the close. `None` when no `]` closes the attribute.
+fn attr_close_offset(text: &str, open: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 1i32;
+    let mut i = open + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            // A line comment runs to the end of the line; a block comment nests and
+            // may span lines.
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let mut d = 1u32;
+                i += 2;
+                while i < bytes.len() && d > 0 {
+                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                        d += 1;
+                        i += 2;
+                    } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                        d -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'"' => i = skip_string(bytes, i),
+            b'\'' if is_char_literal_start_bytes(bytes, i) => i = skip_char(bytes, i),
+            b'r' | b'b' | b'c' => match raw_string_start(bytes, i) {
+                Some((hashes, after)) => i = skip_raw_string(bytes, after, hashes),
+                None => i += 1,
+            },
+            b'[' | b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b']' | b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 /// Read the lines `[start, end)` as a run of whole `#[…]` attributes, returning
 /// whether any is a `#[cfg…]`; `None` when they are not all attributes.
 ///
@@ -1323,84 +1477,27 @@ fn attrs_above_have_cfg(lines: &[&str], end: usize) -> bool {
 /// first line alone. A delimiter inside quoted text is not a delimiter: `#[doc = "("]`
 /// holds an unmatched `(` in a string, and counting it would make the attribute run
 /// past its real end, exhaust the lines, and read a *disabled* `#[cfg]` as if it were
-/// live -- the lost proof this reader exists to prevent. String and character
-/// literals are therefore tracked (with backslash escapes) and their contents skipped
-/// for delimiter purposes. See [`is_cfg_use`] and [`is_char_literal_start`].
+/// live -- the lost proof this reader exists to prevent. String, raw-string, char
+/// literal and comment contents are therefore skipped whole. See [`is_cfg_use`] and
+/// [`attr_close_offset`].
 fn read_attr_run(lines: &[&str], start: usize, end: usize) -> Option<bool> {
     let mut cfg = false;
     let mut k = start;
     while k < end {
-        let head = lines[k].trim_start().strip_prefix("#[")?;
-        // Find the `]` that closes this attribute, which may be on a later line.
-        let mut depth = 1i32;
-        // The open quote we are inside, if any: `"` for a string, `'` for a char
-        // literal. Delimiters inside it do not count.
-        let mut quote: Option<char> = None;
-        let mut escaped = false;
-        let mut j = k;
-        let mut closed = false;
-        while j < end {
-            let segment: &str = if j == k { head } else { lines[j] };
-            for (idx, c) in segment.char_indices() {
-                if let Some(q) = quote {
-                    if escaped {
-                        escaped = false;
-                    } else if c == '\\' {
-                        escaped = true;
-                    } else if c == q {
-                        quote = None;
-                    }
-                    continue;
-                }
-                match c {
-                    '"' => quote = Some('"'),
-                    // A char literal (`'('`, `'\n'`, `'\''`) opens a quote; a lifetime
-                    // (`'a`) does not, and reading it as an unclosed literal would
-                    // make every later attribute look unreadable.
-                    '\'' if is_char_literal_start(segment, idx) => quote = Some('\''),
-                    '[' | '(' => depth += 1,
-                    ']' | ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            closed = true;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if closed {
-                break;
-            }
-            j += 1;
-        }
-        if !closed {
-            return None;
-        }
-        if head.trim_start().starts_with("cfg") {
+        let trimmed = lines[k].trim_start();
+        let head = trimmed.strip_prefix("#[")?;
+        // The `[` of `#[` sits this far into the line.
+        let lead = lines[k].len() - trimmed.len();
+        let flat = lines[k..end].join("\n");
+        let close = attr_close_offset(&flat, lead + 1)?;
+        // How many lines the attribute spans, so the next one starts after it.
+        let spanned = flat[..close].matches('\n').count();
+        if head.starts_with("cfg") {
             cfg = true;
         }
-        k = j + 1;
+        k += spanned + 1;
     }
     Some(cfg)
-}
-
-/// Whether the `'` at byte index `idx` in `segment` opens a character literal rather
-/// than a lifetime.
-///
-/// A char literal holds exactly one character (`'('`) or a backslash escape
-/// (`'\n'`, `'\''`), so it opens only when a `\` follows or a closing `'` follows the
-/// next character. A lifetime (`'a`, `'static`) has no closing quote and is left
-/// alone. See [`read_attr_run`].
-fn is_char_literal_start(segment: &str, idx: usize) -> bool {
-    let mut rest = segment[idx + 1..].chars();
-    match rest.next() {
-        // `'\…'`: an escape. Treat as a literal; the quote tracker reads to the close.
-        Some('\\') => true,
-        // `'x'`: a single character then the closing quote.
-        Some(_) => rest.next() == Some('\''),
-        None => false,
-    }
 }
 
 /// Split any leading `#[…]` attributes off `line`, returning the rest and whether a
@@ -1409,7 +1506,10 @@ fn is_char_literal_start(segment: &str, idx: usize) -> bool {
 /// An attribute on the item's own line (`#[cfg(any())] use a::B;`) would otherwise
 /// hide the `use` from [`is_use_start`], and the item would be missed entirely -- a
 /// lost import. The body's `(…)`/`[…]` nest, so brackets are matched by depth and the
-/// attribute ends at the first `]` that closes its own `[`.
+/// attribute ends at the first `]` that closes its own `[`. Text that is not a
+/// delimiter -- string, raw-string and char literal contents, and comments -- is
+/// skipped by [`attr_close_offset`], so a `(` or a quote inside one does not hide
+/// the `use` behind the attribute. See [`is_cfg_use`].
 fn split_leading_attrs(line: &str) -> (&str, bool) {
     let mut rest = line.trim_start();
     let mut cfg = false;
@@ -1417,23 +1517,12 @@ fn split_leading_attrs(line: &str) -> (&str, bool) {
         if after.starts_with("cfg") {
             cfg = true;
         }
-        let mut depth = 1usize;
-        let mut end = None;
-        for (i, c) in after.char_indices() {
-            match c {
-                '[' | '(' => depth += 1,
-                ']' | ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = Some(i);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        match end {
-            Some(i) => rest = after[i + 1..].trim_start(),
+        // `after` begins just past the `#[`, so the attribute's `[` is at index 1
+        // of it; `attr_close_offset` returns the offset just past the closing `]`.
+        match attr_close_offset(rest, 1) {
+            // `after` is `rest[2..]`, so an offset `e` into `rest` is `e - 2` into
+            // `after`.
+            Some(e) => rest = after[e - 2..].trim_start(),
             // An unbalanced attribute is not one this reads; leave the line alone.
             None => break,
         }
@@ -8396,5 +8485,88 @@ fn h<
         // the run unreadable, so the non-`cfg` case stays `false` and does not panic.
         let lines: Vec<&str> = vec!["#[allow('a)]", "use a::B as C;"];
         assert!(!is_cfg_use(&lines, 1), "a lifetime must not open a char literal");
+    }
+
+    /// A raw string's contents are opaque: a `\` does not escape, so the `"` that
+    /// follows it still closes the string.
+    ///
+    /// `r"\"` is the two bytes `\` and `"`; the `"` ends the literal. Read as an
+    /// ordinary string, the `\` would escape it, the literal would swallow the rest
+    /// of the line, and the `#[cfg]` above would go unread -- a disabled import
+    /// would then displace a live alias, the lost proof this reader prevents. The
+    /// raw-string form carries an optional `b`/`c` prefix and any number of `#`
+    /// delimiters.
+    #[test]
+    fn a_raw_string_attribute_is_read_opaque() {
+        // The reported shape: a raw string whose last character is a backslash.
+        let lines: Vec<&str> = vec!["#[cfg(any())]", "#[doc = r\"\\\"]", "use a::B as C;"];
+        assert!(is_cfg_use(&lines, 2), "a trailing backslash in a raw string must not hide the cfg");
+
+        // A `#`-delimited raw string, whose contents may hold a bare `"`.
+        let lines: Vec<&str> = vec!["#[cfg(any())]", "#[doc = r#\"a \" b\"#]", "use a::B as C;"];
+        assert!(is_cfg_use(&lines, 2), "a raw string with hashes must be read whole");
+
+        // A byte raw string, with the `b` prefix.
+        let lines: Vec<&str> = vec!["#[cfg(any())]", "#[doc = br\"(\"]", "use a::B as C;"];
+        assert!(is_cfg_use(&lines, 2), "a byte raw string must be read whole");
+
+        // A raw string holding a delimiter that would otherwise unbalance the run.
+        let lines: Vec<&str> = vec!["#[cfg(any())]", "#[doc = r\")\"]", "use a::B as C;"];
+        assert!(is_cfg_use(&lines, 2), "a `)` inside a raw string must not close the attribute");
+    }
+
+    /// A comment is not code: a quote inside one does not open a string, and a
+    /// bracket inside one does not close the attribute.
+    ///
+    /// Rust discards comments before parsing attributes, so a `"` in a comment is
+    /// not a string and a `]` in one is not the close. Counting them makes the
+    /// reader miss the attribute's real end and lose a following `#[cfg]` -- a
+    /// disabled import would displace a live alias, the lost proof this reader
+    /// prevents.
+    #[test]
+    fn a_comment_inside_an_attribute_is_not_code() {
+        // A line comment with a quote, inside a multi-line `cfg`.
+        let lines: Vec<&str> = vec!["#[cfg(any( // \" note", "))]", "use a::B as C;"];
+        assert!(is_cfg_use(&lines, 2), "a quote in a line comment must not open a string");
+
+        // A line comment with a closing bracket.
+        let lines: Vec<&str> = vec!["#[cfg(any() // ]", ")]", "use a::B as C;"];
+        assert!(is_cfg_use(&lines, 2), "a `]` in a line comment must not close the attribute");
+
+        // A block comment with a quote, on one line.
+        let lines: Vec<&str> = vec!["#[cfg(any())]", "#[doc = /* \" */ \"x\"]", "use a::B as C;"];
+        assert!(is_cfg_use(&lines, 2), "a quote in a block comment must not open a string");
+
+        // A block comment spanning lines.
+        let lines: Vec<&str> = vec!["#[cfg(any())]", "#[doc = /* \"", "*/ \"x\"]", "use a::B as C;"];
+        assert!(is_cfg_use(&lines, 3), "a multi-line block comment must be skipped whole");
+    }
+
+    /// A quoted attribute on the `use`'s own line does not hide the `use`.
+    ///
+    /// [`split_leading_attrs`] peels leading attributes to reach the `use` behind
+    /// them. A `(` inside a string in the attribute is not a delimiter, so counting
+    /// it runs the attribute past its real end and the `use` is never found -- the
+    /// import is lost. The same scanner [`read_attr_run`] uses is applied here.
+    #[test]
+    fn a_quoted_attribute_on_the_use_line_does_not_hide_it() {
+        // A same-line doc attribute with an unmatched `(` in a string.
+        assert_eq!(
+            split_leading_attrs("#[doc = \"(\"] use a::B;"),
+            ("use a::B;", false)
+        );
+        assert!(is_use_start("#[doc = \"(\"] use a::B;"));
+
+        // The same with a raw string and a trailing backslash.
+        assert_eq!(
+            split_leading_attrs("#[doc = r\"\\\"] use a::B;"),
+            ("use a::B;", false)
+        );
+
+        // A `cfg` attribute before a quoted one is still seen, and the `use` found.
+        assert_eq!(
+            split_leading_attrs("#[cfg(any())] #[doc = \")\"] use a::B;"),
+            ("use a::B;", true)
+        );
     }
 }
