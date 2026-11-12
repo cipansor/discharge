@@ -3357,6 +3357,391 @@ fn an_array_field_of_a_moved_aggregate_carries_its_elements() {
     }
 }
 
+/// An array or tuple *literal* whose elements are aggregates carries the elements' leaves.
+///
+/// `[o.i, o.j]` stores each element's own value but not the leaves under it, so
+/// `a[0].v` read `Unknown` and the contract stayed `Incomplete` in *both* directions
+/// -- a coverage hole, not a false proof, since a missing value proves nothing. The
+/// read is `_2[_5].0`: an index *then* a field, the opposite order from `o.a[0]`,
+/// which is why it needed its own key rather than `rebase_parts`. The pairs pin both
+/// directions: a read that leaked the *other* element's leaf, or kept the pre-write
+/// leaf, would decide the false entry and the pair would look green while proving
+/// something untrue.
+#[test]
+fn an_aggregate_literal_element_carries_its_own_leaves() {
+    let Some(report) = verify_realistic(&[
+        "an_array_literal_of_aggregates_is_read_back",
+        "an_array_literal_of_aggregates_is_not_the_other_element_cannot_prove_this",
+        "an_array_literal_of_aggregates_second_element_is_read_back",
+        "an_array_literal_of_aggregates_second_is_not_the_first_cannot_prove_this",
+        "an_array_literal_of_aggregate_fields_is_read_back",
+        "an_array_literal_of_aggregate_fields_is_not_the_other_cannot_prove_this",
+        "a_tuple_literal_of_aggregates_is_read_back",
+        "a_tuple_literal_of_aggregates_is_not_the_other_cannot_prove_this",
+        "an_element_write_of_an_aggregate_is_read_back",
+        "an_element_write_of_an_aggregate_is_not_the_old_leaf_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "an_array_literal_of_aggregates_is_read_back",
+        "an_array_literal_of_aggregates_second_element_is_read_back",
+        "an_array_literal_of_aggregate_fields_is_read_back",
+        "a_tuple_literal_of_aggregates_is_read_back",
+        "an_element_write_of_an_aggregate_is_read_back",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "an aggregate element's leaves must reach the read; got: {o}");
+    }
+    for name in [
+        "an_array_literal_of_aggregates_is_not_the_other_element_cannot_prove_this",
+        "an_array_literal_of_aggregates_second_is_not_the_first_cannot_prove_this",
+        "an_array_literal_of_aggregate_fields_is_not_the_other_cannot_prove_this",
+        "a_tuple_literal_of_aggregates_is_not_the_other_cannot_prove_this",
+        "an_element_write_of_an_aggregate_is_not_the_old_leaf_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a leaked or stale element leaf must not prove this; got: {o}"
+        );
+    }
+}
+
+/// A write to a leaf *inside* an element of an array or tuple of aggregates is
+/// read back, and a stale leaf cannot prove the false twin.
+///
+/// `elem_parts` is keyed index-first -- the key the read `a[0].v` consults -- so a
+/// write that reached only `elems` (the element's own value) or no store at all left
+/// the literal's old leaf in place. A stale leaf is a *wrong* value rather than a
+/// missing one, so each `..._cannot_prove_this` twin below is a false contract the
+/// old model **proved**; without them a fix that dropped the write would look green.
+/// The tuple twin exercises the mirror key, which is the only path a `t.0.v` read
+/// takes, and the second-element twin catches a fix that pinned index 0 for every
+/// leaf write.
+#[test]
+fn a_leaf_write_inside_an_element_is_read_back() {
+    let verified = [
+        "an_element_leaf_write_is_read_back",
+        "an_element_leaf_write_leaves_its_sibling",
+        "a_second_element_leaf_write_is_read_back",
+        "a_tuple_component_leaf_write_is_read_back",
+    ];
+    let refuted = [
+        "an_element_leaf_write_is_not_the_old_leaf_cannot_prove_this",
+        "an_element_leaf_write_is_not_the_sibling_cannot_prove_this",
+        "a_second_element_leaf_write_is_not_the_old_leaf_cannot_prove_this",
+        "a_tuple_component_leaf_write_is_not_the_old_leaf_cannot_prove_this",
+    ];
+    let mut names = verified.to_vec();
+    names.extend_from_slice(&refuted);
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a leaf write inside an element must reach the read; got: {o}");
+    }
+    for name in refuted {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a stale element leaf must not prove this; got: {o}"
+        );
+    }
+}
+
+/// A `variant:` measure turns partial correctness into total correctness.
+///
+/// Without a measure a loop is only proved for *partial* correctness: a divergent
+/// loop verifies, because nothing says the header is ever left. With one, the back
+/// edge also proves `I && guard => V' < V`, and on a fixed bit width a strictly
+/// decreasing sequence cannot be infinite -- so the loop must stop.
+///
+/// The negative twins are the point. `a_loop_that_cannot_terminate_fails` is the
+/// soundness check: before the measure existed the divergent loop *verified*, and
+/// the whole reason to add the feature is that this must not happen.
+#[test]
+fn a_variant_measure_proves_loop_termination() {
+    // A real countdown loop: the measure decreases every iteration, so the
+    // termination obligation is discharged. `u8`/`u16` are used because the
+    // bit-blasted query for a 32-bit measure is larger than the engine's diagram
+    // budget -- that is a refusal, not a failure, and it is the same budget that
+    // bounds every other wide query.
+    let ok = verify_src(
+        "f",
+        "/// invariant: i <= n\n/// variant: n - i\n/// ensures: ret == n\n\
+         pub fn f(n: u8) -> u8 { let mut i = 0u8; while i < n { i += 1; } i }\n",
+    );
+    let Some(o) = ok else { return };
+    assert!(o.is_verified(), "a decreasing measure must prove termination; got: {o}");
+}
+
+/// A loop whose body never advances the measure is *not* proved, and the failure
+/// names the termination obligation rather than a postcondition.
+///
+/// This is the case the feature exists for. `while i < 5 { i += 0 }` never leaves
+/// the loop, so a tool that reports it `Verified` is certifying a function that
+/// does not return. Before `variant:` the loop had no termination obligation at
+/// all and came back `Verified`; now the measure `i` is proved not to decrease and
+/// the function fails.
+#[test]
+fn a_loop_that_cannot_terminate_fails() {
+    let div = verify_src(
+        "f",
+        "/// invariant: i >= 0\n/// variant: i\n/// ensures: ret == 0\n\
+         pub fn f(n: u32) -> u32 { let _ = n; let mut i = 0u32; while i < 5 { i += 0; } i }\n",
+    );
+    let Some(o) = div else { return };
+    assert!(!o.is_verified(), "a divergent loop must not verify; got: {o}");
+    match &o {
+        FnOutcome::Failed { kind, .. } => {
+            assert!(kind.contains("variant"), "the failure names termination; got: {kind}")
+        }
+        other => panic!("expected a termination failure, got: {other}"),
+    }
+}
+
+/// A measure that moves the wrong way fails, so the obligation is a real proof
+/// and not a restatement of the invariant.
+#[test]
+fn a_measure_that_increases_fails() {
+    let wrong = verify_src(
+        "f",
+        "/// invariant: i <= n\n/// variant: i\n/// ensures: ret == n\n\
+         pub fn f(n: u8) -> u8 { let mut i = 0u8; while i < n { i += 1; } i }\n",
+    );
+    let Some(o) = wrong else { return };
+    assert!(!o.is_verified(), "an increasing measure must fail; got: {o}");
+}
+
+/// Without a measure the loop is still checked, for partial correctness: the
+/// invariant and the postcondition are proved exactly as before, and no
+/// termination claim is made. Adding the feature must not make the measure
+/// mandatory.
+#[test]
+fn a_loop_without_a_measure_is_still_verified_for_partial_correctness() {
+    let partial = verify_src(
+        "f",
+        "/// invariant: i <= n\n/// ensures: ret == n\n\
+         pub fn f(n: u8) -> u8 { let mut i = 0u8; while i < n { i += 1; } i }\n",
+    );
+    let Some(o) = partial else { return };
+    assert!(o.is_verified(), "partial correctness must still be proved; got: {o}");
+}
+
+/// A measure with no invariant has no loop to attach to, so it is refused rather
+/// than ignored -- an ignored measure would report partial correctness as if it
+/// were total.
+#[test]
+fn a_measure_without_an_invariant_is_refused() {
+    let orphan = verify_src(
+        "f",
+        "/// variant: n\n/// ensures: ret == 5\npub fn f(n: u32) -> u32 { let _ = n; 5 }\n",
+    );
+    let Some(o) = orphan else { return };
+    assert!(!o.is_verified(), "an orphan measure must not verify; got: {o}");
+    assert!(matches!(o, FnOutcome::Skipped { .. }), "expected a refusal; got: {o}");
+}
+
+/// A clause-shaped doc comment that is not a clause is refused, not dropped.
+///
+/// `/// ensuers: ret == 99` used to be discarded: the function then had no
+/// postcondition, was checked against `true`, and came back `Verified` with zero
+/// obligations -- a green report for a claim nobody read. The same held for
+/// `variant:`, where the reader wrote a termination measure and the tool ignored
+/// it. Both are now `Skipped` with the line named, which is the discipline an
+/// unreadable `requires` already follows.
+///
+/// The negative twins pin the other direction: ordinary prose that happens to
+/// contain a colon (`/// direction: ...`) is more than two edits from every
+/// keyword and must *not* be refused, or documentation would start failing
+/// builds.
+#[test]
+fn a_clause_shaped_doc_comment_that_is_not_a_clause_is_refused() {
+    let typo = verify_src(
+        "f",
+        "/// requires: x == 0\n/// ensuers: ret == 99\npub fn f(x: u32) -> u32 { 5 }\n",
+    );
+    let Some(o) = typo else { return };
+    assert!(!o.is_verified(), "a typo must not verify the function without it; got: {o}");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "a dropped clause is a refusal, not a silent pass; got: {o}"
+    );
+    assert!(o.to_string().contains("ensuers"), "the refusal names the line; got: {o}");
+    assert!(o.to_string().contains("ensures"), "and suggests the keyword; got: {o}");
+
+    // `variant:` is a *supported* clause, so it is no longer a near miss. A
+    // measure with no invariant is still refused, because the invariant is what
+    // locates the loop the measure is about.
+    let orphan = verify_src("g", "/// variant: n\n/// ensures: ret == 5\npub fn g(n: u32) -> u32 { let _ = n; 5 }\n");
+    let Some(o) = orphan else { return };
+    assert!(!o.is_verified(), "an orphan measure must not pass silently; got: {o}");
+    assert!(o.to_string().contains("variant"), "the refusal names it; got: {o}");
+
+    // Prose is left alone. `direction:` is three edits from `decreases`, so it is
+    // documentation rather than a typo, and the function verifies normally.
+    let prose = verify_src(
+        "h",
+        "/// direction: a contract claiming the pre-write value would be proved.\n\
+         /// requires: x == 0\n/// ensures: ret == 5\npub fn h(x: u32) -> u32 { 5 }\n",
+    );
+    let Some(o) = prose else { return };
+    assert!(o.is_verified(), "prose with a colon is not a clause; got: {o}");
+}
+
+/// A pinned write after a symbolic one re-establishes that element, and the value
+/// must be readable -- including through an element copy.
+///
+/// The poison is array-wide, but the leaf maps are the record of which indices have
+/// been re-established: `poison_elems` clears them and a later pinned write
+/// re-populates exactly its index. An array-wide veto on top of that hid a leaf the
+/// body genuinely knows, so `a[i].v = 7; a[0].v = 9; let x = a[0]; x.v` was
+/// `incomplete` although the copy is always `9`. The recovery also has to cross the
+/// call boundary, along with the poison it follows.
+///
+/// The negative twins pin the other half: a rewrite of one element recovers neither
+/// its sibling nor its own pre-write leaf, so the fix is per-element and not a
+/// blanket un-poisoning.
+#[test]
+fn a_pinned_rewrite_after_a_symbolic_write_is_read_back() {
+    let recovered = [
+        "a_pinned_leaf_rewrite_after_a_symbolic_write_is_read_back",
+        "a_pinned_element_rewrite_after_a_symbolic_write_is_read_back",
+        "a_pinned_leaf_rewrite_after_a_symbolic_element_write_is_read_back",
+        "a_helper_pinned_rewrite_after_a_symbolic_write_is_read_back",
+    ];
+    let Some(report) = verify_realistic(&recovered) else { return };
+    for name in recovered {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a pinned rewrite is a known leaf; got: {o}");
+    }
+    let unknown = [
+        "a_pinned_rewrite_does_not_recover_its_sibling",
+        "a_pinned_rewrite_does_not_revive_the_old_leaf",
+    ];
+    let Some(report) = verify_realistic(&unknown) else { return };
+    for name in unknown {
+        let o = outcome(&report, name);
+        assert!(!o.is_verified(), "a sibling stays unknown after a pinned rewrite; got: {o}");
+    }
+}
+
+/// An unpinned element write poisons the whole array, and a copy of an element
+/// must not revive a pre-write leaf.
+///
+/// `a[i] = E { v: 7 }` with an unpinned `i` marks every element unknown. The poison
+/// used to reach only one of the two leaf representations: `poison_elems` cleared
+/// `elem_parts` and left its `nested` mirror, so `carry_elem_leaf_onto_local`
+/// collected the mirror on the next element *copy* (`let x = a[0]`) and the copy
+/// read the value from before the write -- a **false proof** of `ret == 3`. The
+/// poison also had to cross the call boundary, which is where a helper's symbolic
+/// write lost it: the callee held no leaves, the copy-back inserted none, and the
+/// caller's own leaves survived.
+///
+/// These are asserted `!is_verified()` rather than `Failed`, because `incomplete` is
+/// the honest answer for a write the run cannot pin: the array is genuinely unknown,
+/// so neither the old leaf nor the new one may be proved. What must never happen is
+/// `verified`, which is what the false contracts below were before.
+#[test]
+fn an_unpinned_write_poisons_the_whole_array() {
+    let names = [
+        "an_element_copy_after_an_unpinned_write_is_not_the_old_leaf",
+        "an_element_copy_after_an_unpinned_write_is_not_the_sibling",
+        "an_element_copy_after_an_unpinned_write_is_not_the_new_leaf",
+        "an_element_copy_after_an_unpinned_leaf_write_is_not_the_old_leaf",
+        "a_helper_unpinned_write_is_not_the_callers_old_leaf",
+        "a_helper_unpinned_write_is_not_the_callers_sibling",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in names {
+        let o = outcome(&report, name);
+        assert!(
+            !o.is_verified(),
+            "an unpinned write leaves no element known, so this must not be proved; got: {o}"
+        );
+    }
+}
+
+/// A whole-*element* write of an aggregate crosses a call boundary too.
+///
+/// The leaf-write family above covers `a[0].v = 7`. This is the other half: the
+/// whole element is replaced, which lowers to `(*_1)[_3] = move _2` through a
+/// `&mut` argument. The element's own *value* crossed the boundary already, but its
+/// leaves did not, so the caller read the leaf its literal had before the call and a
+/// false `ret == 3` was **proved**. The gate that re-roots the leaves read
+/// `dest.proj` directly and so missed the leading `Deref` this shape carries; it
+/// goes through `elem_index_of` now, which reads past it.
+///
+/// The element-copy case (`a[0] = b[0]`) needed one more piece: reading an element
+/// hands over its leaf *scalar*, not its parts, so the leaves died at the temp the
+/// copy goes through. `carry_elem_leaf_onto_local` moves them onto that temp. That
+/// pair was `incomplete` in both directions before, not a false proof.
+#[test]
+fn a_whole_element_write_of_an_aggregate_crosses_a_call_boundary() {
+    let verified = [
+        "an_element_copy_from_another_element_is_read_back",
+        "a_helper_whole_element_write_is_read_back",
+        "a_helper_whole_element_write_leaves_its_sibling",
+        "a_helper_element_copy_is_read_back",
+    ];
+    let refuted = [
+        "an_element_copy_is_not_the_old_leaf_cannot_prove_this",
+        "a_helper_whole_element_write_is_not_the_callers_leaf_cannot_prove_this",
+        "a_helper_whole_element_write_is_not_the_sibling_cannot_prove_this",
+        "a_helper_element_copy_is_not_the_old_leaf_cannot_prove_this",
+    ];
+    let mut names = verified.to_vec();
+    names.extend_from_slice(&refuted);
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a whole-element write must reach the read; got: {o}");
+    }
+    for name in refuted {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a stale element leaf must not prove this; got: {o}"
+        );
+    }
+}
+
+/// The leaf store crosses both call boundaries: an argument and a return.
+///
+/// A helper that writes a leaf through `&mut [T; N]` had its write die with the
+/// frame, so the caller read the leaf its literal had before the call and a false
+/// `ret == 3` was **proved**. A helper that only *reads* a leaf through its argument
+/// saw `Unknown`, and a helper that *returns* an array of aggregates lost every leaf
+/// so the caller could not read one at all. Each pair pins one direction: the
+/// `..._cannot_prove_this` twins are the false contracts a dropped carry would decide.
+#[test]
+fn an_element_leaf_store_crosses_a_call_boundary() {
+    let verified = [
+        "a_helper_leaf_write_through_a_mutable_array_is_read_back",
+        "a_helper_leaf_read_through_an_array_argument_decides",
+        "a_returned_array_of_aggregates_keeps_its_leaves",
+    ];
+    let refuted = [
+        "a_helper_leaf_write_is_not_the_callers_leaf_cannot_prove_this",
+        "a_helper_leaf_read_is_not_a_made_up_value_cannot_prove_this",
+        "a_returned_array_of_aggregates_is_not_a_made_up_value_cannot_prove_this",
+    ];
+    let mut names = verified.to_vec();
+    names.extend_from_slice(&refuted);
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a leaf must cross the call boundary; got: {o}");
+    }
+    for name in refuted {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a dropped or stale leaf carry must not prove this; got: {o}"
+        );
+    }
+}
+
 /// A whole-aggregate replacement through a sub-place target decides.
 ///
 /// `set_whole(&mut o.i, InnerBox { v: 9 })` replaces the whole referent. This was once
@@ -4562,6 +4947,22 @@ fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
     let _ = std::fs::remove_dir_all(&dir);
     assert_not_dropped(name, src, o.is_some(), &report.missing);
     o
+}
+
+/// Every outcome and the `missing` list for one source, without the
+/// "must be present" guard of [`verify_src`] -- for the trait-contract tests,
+/// whose whole point is that a declaration has *no* outcome of its own.
+fn verify_all_outcomes(src: &str) -> (Vec<(String, FnOutcome)>, Vec<String>) {
+    let rustc = rustc().expect("a toolchain to dump MIR with");
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif-all-{}-{seq}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("probe.rs");
+    std::fs::write(&file, src).expect("write probe");
+    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let _ = std::fs::remove_dir_all(&dir);
+    (report.outcomes, report.missing)
 }
 
 /// A contracted function the frontend dropped is a failure, even when the report
@@ -7354,6 +7755,173 @@ fn a_multiline_impl_header_still_owns_its_methods() {
     assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
 }
 
+// ---------------------------------------------------------------------------
+// A trait declaration's contract
+//
+// A trait method declaration has no body, so rustc emits no MIR for it and it can
+// never be a target on its own. Its contract is a promise every implementation
+// inherits, and the implementation is where it is kept or broken. Before this,
+// the declaration's contract was filed under the free-function table, where its
+// `Trait::method` key suffix-matched an *unrelated* free function of the same
+// name -- so a free `fn bump() -> u8 { 9 }` was checked against the trait's
+// `ensures: ret == 9`, passed, and was reported `Bump::bump: Verified`. That reads
+// as "the trait's promise is discharged" when no implementation was ever checked.
+// ---------------------------------------------------------------------------
+
+/// An implementation that breaks the trait's declared postcondition is refuted.
+#[test]
+fn an_implementation_that_breaks_its_traits_contract_is_refuted() {
+    let src = "pub trait Bump {\n    /// ensures: ret == 9\n    fn bump(&self) -> u8;\n}\n\
+               pub struct S;\nimpl Bump for S { fn bump(&self) -> u8 { 7 } }\n";
+    let (outcomes, missing) = verify_all_outcomes(src);
+    assert!(missing.is_empty(), "the impl carries the promise, so nothing is missing: {missing:?}");
+    let o = pick(&outcomes, "bump");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("a body of 7 against `ret == 9` must be refuted, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+}
+
+/// The same implementation with the promise kept must verify, so the test above
+/// pins the refutation and not a blanket failure.
+#[test]
+fn an_implementation_that_keeps_its_traits_contract_verifies() {
+    let src = "pub trait Bump {\n    /// ensures: ret == 9\n    fn bump(&self) -> u8;\n}\n\
+               pub struct S;\nimpl Bump for S { fn bump(&self) -> u8 { 9 } }\n";
+    let (outcomes, _) = verify_all_outcomes(src);
+    let o = pick(&outcomes, "bump");
+    assert!(o.is_verified(), "a body of 9 against `ret == 9` must verify, got: {o}");
+}
+
+/// A free function that shares the trait method's name is not the trait's method
+/// and must not be judged by the trait's contract.
+///
+/// This is the false proof the separate table closes: the free `bump` returns 9,
+/// which satisfies the trait's claim, so before the fix the report said
+/// `Bump::bump: Verified` -- naming the *trait method* as verified although no
+/// implementation existed in the file at all.
+#[test]
+fn a_free_function_does_not_borrow_a_trait_declarations_contract() {
+    let src = "pub trait Bump {\n    /// ensures: ret == 9\n    fn bump(&self) -> u8;\n}\n\
+               pub fn bump() -> u8 { 9 }\n";
+    let (outcomes, missing) = verify_all_outcomes(src);
+    for (key, _) in &outcomes {
+        assert_ne!(
+            key, "Bump::bump",
+            "the trait declaration has no body, so it can never be reported as a verified \
+             function: {outcomes:?}"
+        );
+    }
+    assert!(
+        missing.iter().any(|m| m.starts_with("Bump::bump")),
+        "the trait's promise has no implementation here, which must be visible rather than \
+         silently unenforced; missing was {missing:?}"
+    );
+}
+
+/// A trait declaration with no implementation in the file is reported, not dropped.
+///
+/// It has no MIR, so it can never be a target; leaving it unmentioned would make
+/// the run clean while the claim was never checked.
+#[test]
+fn a_trait_declaration_with_no_implementation_is_reported() {
+    let src = "pub trait Bump {\n    /// ensures: ret == 9\n    fn bump(&self) -> u8;\n}\n";
+    let (outcomes, missing) = verify_all_outcomes(src);
+    assert!(outcomes.is_empty(), "there is no body to verify, got: {outcomes:?}");
+    assert!(
+        missing.iter().any(|m| m.starts_with("Bump::bump")),
+        "an unenforced trait contract must be reported, got: {missing:?}"
+    );
+}
+
+/// When the impl *and* the trait both declare a contract, the run refuses.
+///
+/// `resolve` can return only one of the two, so whichever it dropped would vanish
+/// without a word. The refusal names both sides instead.
+#[test]
+fn two_contracts_for_one_method_are_refused_not_silently_chosen() {
+    let src = "pub trait Bump {\n    /// ensures: ret == 9\n    fn bump(&self) -> u8;\n}\n\
+               pub struct S;\nimpl Bump for S {\n    /// ensures: ret == 7\n    \
+               fn bump(&self) -> u8 { 7 }\n}\n";
+    let (outcomes, _) = verify_all_outcomes(src);
+    let o = pick(&outcomes, "bump");
+    let FnOutcome::Skipped { reason } = o else {
+        panic!("two contracts for one function must be refused, got: {o}");
+    };
+    assert!(
+        reason.contains("Bump") && reason.contains("contract"),
+        "the refusal must name the trait and say what conflicts, got: `{reason}`"
+    );
+}
+
+/// Two implementations of one contracted trait are both checked, and stay
+/// distinguishable in the report.
+///
+/// Both are keyed by the bare tail before the fix, so one `outcomes` entry hid the
+/// other: one body's verdict was simply not reported.
+#[test]
+fn two_implementations_of_a_contracted_trait_are_both_checked() {
+    let src = "pub trait Bump {\n    /// ensures: ret == 9\n    fn bump(&self) -> u8;\n}\n\
+               pub struct A; pub struct B;\n\
+               impl Bump for A { fn bump(&self) -> u8 { 7 } }\n\
+               impl Bump for B { fn bump(&self) -> u8 { 9 } }\n";
+    let (outcomes, missing) = verify_all_outcomes(src);
+    assert!(missing.is_empty(), "both impls carry the promise: {missing:?}");
+    let a = pick(&outcomes, "A::bump");
+    let b = pick(&outcomes, "B::bump");
+    let FnOutcome::Failed { kind, .. } = a else {
+        panic!("`A::bump` returns 7 against `ret == 9` and must be refuted, got: {a}");
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+    assert!(b.is_verified(), "`B::bump` returns 9 and must verify, got: {b}");
+}
+
+/// A trait with no contract contributes nothing, so an impl that declares its own
+/// contract is checked by that one alone.
+#[test]
+fn an_impl_of_an_uncontracted_trait_keeps_its_own_contract() {
+    let src = "pub trait Bump { fn bump(&self) -> u8; }\n\
+               pub struct S;\nimpl Bump for S {\n    /// ensures: ret == 7\n    \
+               fn bump(&self) -> u8 { 7 }\n}\n";
+    let (outcomes, _) = verify_all_outcomes(src);
+    let o = pick(&outcomes, "bump");
+    assert!(o.is_verified(), "the impl's own `ret == 7` with a body of 7 must verify, got: {o}");
+}
+
+/// A trait default whose *signature* contains a `;` -- `[u8; 4]` -- is still a
+/// function, not a declaration.
+///
+/// The body detector stops at the first `;` outside brackets, and the `;` of an
+/// array type comes before the body brace. Reading it as the declaration's
+/// terminator filed this default as bodyless: its contract would then be inherited
+/// by implementations (there are none here) and its own false postcondition would
+/// never be checked, while the run still looked clean.
+#[test]
+fn a_trait_default_returning_an_array_is_still_checked() {
+    let src = "pub trait T {\n    /// ensures: ret == 9\n    fn v(&self, xs: [u8; 4]) -> u8 { 7 }\n}\n";
+    let (outcomes, missing) = verify_all_outcomes(src);
+    assert!(missing.is_empty(), "a default has a body, so nothing is missing: {missing:?}");
+    let o = pick(&outcomes, "T::v");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("a default whose `ret` is 7 against `ret == 9` must be refuted, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+}
+
+/// A trait *default* has a body and real MIR, so it stays an ordinary target and is
+/// not swept into the declaration table.
+#[test]
+fn a_trait_default_method_is_not_treated_as_a_declaration() {
+    let src = "pub trait T {\n    /// ensures: ret == 9\n    fn value(&self) -> u8 { 7 }\n}\n";
+    let (outcomes, missing) = verify_all_outcomes(src);
+    assert!(missing.is_empty(), "a default has a body, so nothing is missing: {missing:?}");
+    let o = pick(&outcomes, "T::value");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("a default with a false postcondition must be refuted, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+}
+
 /// A one-line impl body must not leave the `impl` open over the rest of the file.
 ///
 /// The header's brace opens and closes within its own line, so a pop keyed on the
@@ -7649,4 +8217,547 @@ fn an_unclosed_block_comment_after_const_is_not_a_panic() {
         // The property is "does not panic", so the call itself is the assertion.
         let _ = spec::const_generic_params(src);
     }
+}
+
+/// The `(name, outcome)` pairs for a source written to a temp file, for a test
+/// that needs more than one function out of the same file.
+///
+/// [`verify_src`] returns one outcome and asserts the function was not dropped,
+/// which is what a single-function test wants. The modular-call tests need to
+/// read a *caller* and confirm what happened to a *callee* in the same run, so
+/// this hands back every outcome and lets the test pick.
+fn verify_all_src(src: &str) -> Option<Vec<(String, FnOutcome)>> {
+    let rustc = rustc()?;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir()
+        .join(format!("verif-all-{}-{seq}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("probe.rs");
+    std::fs::write(&file, src).expect("write probe");
+    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let _ = std::fs::remove_dir_all(&dir);
+    Some(report.outcomes)
+}
+
+/// The outcome for `name` out of a multi-function run.
+fn pick<'a>(outcomes: &'a [(String, FnOutcome)], name: &str) -> &'a FnOutcome {
+    outcomes
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, o)| o)
+        .unwrap_or_else(|| {
+            let seen: Vec<&str> = outcomes.iter().map(|(n, _)| n.as_str()).collect();
+            panic!("`{name}` missing from {seen:?}")
+        })
+}
+
+// ---------------------------------------------------------------------------
+// Modular verification: a call answered by the callee's contract
+// ---------------------------------------------------------------------------
+
+/// A call to a function whose body is not in the dump, but whose contract is,
+/// is decided by the contract.
+///
+/// This is the gap the README used to state as "calls are inlined one level": a
+/// callee with no body had no route to a verdict at all. The contract gives one,
+/// and the two obligations it produces are visible in the count -- the
+/// precondition proved, and (with the postcondition assumed) the caller's own
+/// postcondition proved from it.
+#[test]
+fn a_callee_contract_decides_a_call_with_no_body() {
+    let src = "unsafe extern \"C\" {\n    /// requires: n <= 10\n    /// ensures: ret <= n + 1\n    \
+               fn ext_bump(n: u32) -> u32;\n}\n\n\
+               /// requires: x <= 10\n/// ensures: ret <= 11\n\
+               pub fn caller_ok(x: u32) -> u32 { unsafe { ext_bump(x) } }\n";
+    let Some(all) = verify_all_src(src) else { return };
+    let o = pick(&all, "caller_ok");
+    assert!(o.is_verified(), "the contract should decide this call, got: {o}");
+    match o {
+        FnOutcome::Verified { obligations, .. } => assert!(
+            *obligations >= 2,
+            "the precondition obligation and the caller's postcondition must both \
+             be present, got {obligations}"
+        ),
+        _ => unreachable!(),
+    }
+}
+
+/// A caller that does not establish the callee's precondition is refused.
+///
+/// The postcondition is *assumed*, so a caller that reaches the call with an
+/// argument outside the precondition would be assuming something the callee
+/// never promised. Only the precondition obligation catches this -- the
+/// postcondition `ret <= 101` follows from the assumption -- which is exactly
+/// why the precondition has to be a proof obligation rather than a comment.
+#[test]
+fn a_caller_that_does_not_establish_the_precondition_fails() {
+    let src = "unsafe extern \"C\" {\n    /// requires: n <= 10\n    /// ensures: ret <= n + 1\n    \
+               fn ext_bump(n: u32) -> u32;\n}\n\n\
+               /// requires: x <= 100\n/// ensures: ret <= 101\n\
+               pub fn caller_pre_fails(x: u32) -> u32 { unsafe { ext_bump(x) } }\n";
+    let Some(all) = verify_all_src(src) else { return };
+    let o = pick(&all, "caller_pre_fails");
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("callee's precondition"),
+            "the failure must name the precondition, got: {kind}"
+        ),
+        _ => panic!("a call outside the callee's precondition must FAIL, got: {o}"),
+    }
+}
+
+/// A callee whose postcondition is unsatisfiable never returns, and the caller
+/// must not be credited with a proof past the call.
+///
+/// `ensures false` describes a function that cannot return. Assuming it would
+/// make every claim after the call vacuously true, so a caller whose body is
+/// `diverge(x); unreachable` would "verify". This is the MIR twin of `wp`'s
+/// `Rule::DivergentCall`, and the verdict is a *refutation* of the
+/// postcondition -- `Unsat` -- so its discharge is `Unsat` rather than `Valid`.
+#[test]
+fn a_call_to_a_callee_whose_postcondition_is_unsatisfiable_fails() {
+    let src = "unsafe extern \"C\" {\n    /// requires: n <= 10\n    /// ensures: false\n    \
+               fn ext_never_returns(n: u32) -> u32;\n}\n\n\
+               /// requires: x <= 10\n/// ensures: ret == 0\n\
+               pub fn caller_of_divergent(x: u32) -> u32 { unsafe { ext_never_returns(x) } }\n";
+    let Some(all) = verify_all_src(src) else { return };
+    let o = pick(&all, "caller_of_divergent");
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("postcondition is unsatisfiable"),
+            "the failure must name the divergence, got: {kind}"
+        ),
+        _ => panic!("a divergent callee must FAIL the caller, got: {o}"),
+    }
+}
+
+/// A callee with a precondition but no postcondition promises nothing about its
+/// result, so there is nothing to assume and the call is incomplete.
+///
+/// The alternative reading -- no `ensures` means `ensures true` -- would let the
+/// caller's own postcondition be proved from nothing at all. An absent clause is
+/// the absence of a promise, not a promise of everything.
+#[test]
+fn a_callee_with_no_postcondition_is_not_assumed_to_promise_everything() {
+    let src = "unsafe extern \"C\" {\n    /// requires: n <= 10\n    fn ext_no_post(n: u32) -> u32;\n}\n\n\
+               /// requires: x <= 10\n/// ensures: ret <= 11\n\
+               pub fn caller_of_silent(x: u32) -> u32 { unsafe { ext_no_post(x) } }\n";
+    let Some(all) = verify_all_src(src) else { return };
+    let o = pick(&all, "caller_of_silent");
+    assert!(
+        !o.is_verified(),
+        "a callee with no `ensures` gives nothing to assume, got: {o}"
+    );
+    match o {
+        FnOutcome::Incomplete { reasons, .. } => assert!(
+            reasons.iter().any(|r| r.contains("no `ensures`")),
+            "the reason must say the callee has no postcondition, got: {reasons:?}"
+        ),
+        _ => panic!("expected Incomplete, got: {o}"),
+    }
+}
+
+/// A callee whose signature the scanner cannot read is refused rather than bound
+/// positionally to the wrong parameter.
+///
+/// rustc enforces a call's arity, so a *real* mismatch cannot come from valid
+/// Rust. It comes from the scanner: a parameter written as a pattern (`_: u32`)
+/// has no name for a contract to mention, so [`spec`]'s signature reader stops
+/// and reports no parameters at all. The call still has an argument, the two
+/// counts disagree, and the contract's `requires: n <= 10` has no parameter to
+/// attach to. Binding it to the first argument anyway would prove a precondition
+/// nobody stated, so the call is refused.
+#[test]
+fn a_signature_the_scanner_cannot_read_refuses_the_call() {
+    let src = "unsafe extern \"C\" {\n    /// requires: n <= 10\n    /// ensures: ret <= n + 1\n    \
+               fn ext_bump(_: u32) -> u32;\n}\n\n\
+               /// requires: x <= 10\n/// ensures: ret <= 11\n\
+               pub fn caller_unnamed(x: u32) -> u32 { unsafe { ext_bump(x) } }\n";
+    let Some(all) = verify_all_src(src) else { return };
+    let o = pick(&all, "caller_unnamed");
+    assert!(
+        !o.is_verified(),
+        "a parameter the scanner could not name must not be bound positionally, got: {o}"
+    );
+    match o {
+        FnOutcome::Incomplete { reasons, .. } => assert!(
+            reasons.iter().any(|r| r.contains("parameter(s)") || r.contains("signature")),
+            "the reason must name the arity or the unreadable signature, got: {reasons:?}"
+        ),
+        _ => panic!("expected Incomplete, got: {o}"),
+    }
+}
+
+/// A caller that passes a reference to a callee outside the dump is refused.
+///
+/// `Ty::Ref` is modelled as its referent, so a `&mut` argument handed to a callee
+/// with no body would have its write vanish: the callee's contract talks about
+/// the referent, the caller holds the value, and a postcondition about the write
+/// would be checked against a state the callee never produced. No aliasing model,
+/// no contract route.
+#[test]
+fn a_call_passing_a_reference_to_a_bodyless_callee_is_refused() {
+    let src = "unsafe extern \"C\" {\n    /// requires: *r <= 10\n    /// ensures: true\n    \
+               fn ext_take(r: &mut u32);\n}\n\n\
+               /// requires: x <= 10\n/// ensures: ret <= 10\n\
+               pub fn caller_by_ref(x: u32) -> u32 {\n    let mut y = x;\n    \
+               unsafe { ext_take(&mut y) };\n    y\n}\n";
+    let Some(all) = verify_all_src(src) else { return };
+    let o = pick(&all, "caller_by_ref");
+    assert!(
+        !o.is_verified(),
+        "a reference argument needs the aliasing model, got: {o}"
+    );
+    match o {
+        FnOutcome::Incomplete { reasons, .. } => assert!(
+            reasons.iter().any(|r| r.contains("passes a reference")),
+            "the reason must name the reference, got: {reasons:?}"
+        ),
+        _ => panic!("expected Incomplete, got: {o}"),
+    }
+}
+
+/// A callee whose body *is* in the dump is inlined, not answered from its
+/// contract.
+///
+/// Inlining is strictly more precise -- it executes the callee rather than
+/// trusting what it promised -- so the contract route must not shadow it. The
+/// discriminating test is a callee whose contract is *weaker* than its body: the
+/// caller's claim is only provable from the body, so a pass proves the body was
+/// used. A contract-only route would leave it undecided.
+#[test]
+fn a_callee_with_a_body_is_inlined_rather_than_answered_from_its_contract() {
+    let src = "/// ensures: ret <= 100\n\
+               pub fn callee(a: u32) -> u32 { a }\n\n\
+               /// requires: x <= 3\n/// ensures: ret <= 3\n\
+               pub fn caller(x: u32) -> u32 { callee(x) }\n";
+    let Some(all) = verify_all_src(src) else { return };
+    let o = pick(&all, "caller");
+    assert!(
+        o.is_verified(),
+        "the callee's body is in the dump, so inlining proves `ret <= 3`; a contract-only \
+         route would only give `ret <= 100`, got: {o}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Inherited trait contracts bind by declaration position, not by name
+// ---------------------------------------------------------------------------
+
+/// An implementation may name its parameters differently from the trait it
+/// implements, and the declaration's contract means the *declaration's* names.
+///
+/// The two signatures are the same method, so their parameters correspond by
+/// position: the declaration's first value parameter is the implementation's first
+/// value parameter, whatever either is called. Binding the contract by the
+/// implementation's own names instead attached `ret == a` to whichever argument the
+/// implementation called `a`, which is the wrong value whenever the names are
+/// swapped. That is a false proof, not a lost one: the body returned its *second*
+/// argument and the tool reported the postcondition proved.
+///
+/// Both directions are pinned. The body that returns the implementation's `a` is
+/// the trait's `b`, so it must be refuted; the body that returns the
+/// implementation's `b` is the trait's `a`, so it must verify. A tool that bound by
+/// name would get exactly these two backwards.
+#[test]
+fn an_inherited_contract_binds_parameters_by_position_not_by_name() {
+    let src = "pub trait T {\n\
+               /// ensures: ret == a\n\
+               fn f(&self, a: u8, b: u8) -> u8;\n\
+               }\n\
+               pub struct S;\n\
+               impl T for S { fn f(&self, b: u8, a: u8) -> u8 { a } }\n";
+    let (outcomes, missing) = verify_all_outcomes(src);
+    assert!(missing.is_empty(), "the impl carries the declaration's contract, so nothing is missing: {missing:?}");
+    let o = pick(&outcomes, "f");
+    assert!(
+        !o.is_verified(),
+        "the body returns the implementation's `a`, which is the trait's `b`, so \
+         `ret == a` (the trait's `a`) must be refuted, got: {o}"
+    );
+
+    let src = "pub trait T {\n\
+               /// ensures: ret == a\n\
+               fn f(&self, a: u8, b: u8) -> u8;\n\
+               }\n\
+               pub struct S;\n\
+               impl T for S { fn f(&self, b: u8, a: u8) -> u8 { b } }\n";
+    let (outcomes, _) = verify_all_outcomes(src);
+    let o = pick(&outcomes, "f");
+    assert!(
+        o.is_verified(),
+        "the body returns the implementation's `b`, which is the trait's `a`, so \
+         `ret == a` holds, got: {o}"
+    );
+}
+
+/// The same alignment holds for a field a contract names: `c.lo` means the
+/// *declaration's* parameter `c`, at whatever position the implementation puts it.
+///
+/// A struct argument's fields are bound under the argument's name, so an inherited
+/// contract that names `c.lo` has to find the fields under the declaration's `c`,
+/// not the implementation's. Binding them under the implementation's name would
+/// leave the contract unreadable -- refused rather than mis-proved, but still a
+/// lost proof.
+#[test]
+fn an_inherited_contract_binds_a_field_to_the_declarations_parameter() {
+    let src = "pub struct Config { pub lo: u8, pub hi: u8 }\n\
+               pub trait T {\n\
+               /// requires: c.lo <= c.hi\n\
+               /// ensures: ret == c.hi\n\
+               fn hi_of(&self, c: Config) -> u8;\n\
+               }\n\
+               pub struct S;\n\
+               impl T for S { fn hi_of(&self, k: Config) -> u8 { k.hi } }\n";
+    let (outcomes, missing) = verify_all_outcomes(src);
+    assert!(missing.is_empty(), "nothing is missing here: {missing:?}");
+    let o = pick(&outcomes, "hi_of");
+    assert!(
+        o.is_verified(),
+        "the contract names the declaration's `c`, which is the implementation's \
+         `k` by position, so `c.hi` is `k.hi` and the body satisfies it, got: {o}"
+    );
+}
+
+/// An inherited contract that cannot be aligned is refused, not bound by guess.
+///
+/// A declaration whose parameter list the scanner cannot read whole -- here a
+/// pattern (`_: u8`) with no name for a contract to mention -- leaves the positions
+/// unknown, so "the Nth name means the Nth local" stops being true. Binding by
+/// position anyway would attach the contract to an argument it may not mean, which
+/// is the failure the alignment exists to prevent. The implementation is *skipped*
+/// with a reason that names the unreadable signature, rather than verified against a
+/// guess or silently dropped.
+#[test]
+fn an_inherited_contract_that_cannot_be_aligned_is_refused() {
+    let src = "pub trait T {\n\
+               /// ensures: ret == 1\n\
+               fn f(&self, _: u8) -> u8;\n\
+               }\n\
+               pub struct S;\n\
+               impl T for S { fn f(&self, a: u8) -> u8 { let _ = a; 2 } }\n";
+    let (outcomes, missing) = verify_all_outcomes(src);
+    assert!(missing.is_empty(), "the impl is present, so nothing is missing: {missing:?}");
+    let o = pick(&outcomes, "f");
+    assert!(
+        !o.is_verified(),
+        "a contract whose declaration cannot be aligned must not be bound by guess, got: {o}"
+    );
+    match o {
+        FnOutcome::Skipped { reason } => assert!(
+            reason.contains("signature"),
+            "the refusal must name the unreadable declaration signature, got: {reason}"
+        ),
+        _ => panic!("expected Skipped, got: {o}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A wrapped return type is not read as unsigned
+// ---------------------------------------------------------------------------
+
+/// A return type that wraps to the next line leaves the signature unreadable, and
+/// an unreadable signature refuses the call.
+///
+/// The reader used to take everything between `->` and the end of the line, so
+/// `fn ext() ->` followed by `i8;` produced an empty type, which reads as unsigned.
+/// A caller testing `ext() < 0` then took the unsigned branch and a postcondition
+/// that does not hold was reported proved. The whole signature is refused instead,
+/// which is the same discipline the parameter list already followed.
+#[test]
+fn a_return_type_that_wraps_to_the_next_line_refuses_the_call() {
+    let src = "unsafe extern \"C\" {\n\
+               /// ensures: ret == i8::MIN\n\
+               fn ext() ->\n\
+               i8;\n\
+               }\n\
+               /// ensures: ret == 0\n\
+               pub fn caller() -> u8 { if unsafe { ext() } < 0 { 1u8 } else { 0u8 } }\n";
+    let (outcomes, _) = verify_all_outcomes(src);
+    let o = pick(&outcomes, "caller");
+    assert!(
+        !o.is_verified(),
+        "the return type was not read whole, so the call must be refused rather than \
+         checked against an unsigned reading, got: {o}"
+    );
+    match o {
+        FnOutcome::Incomplete { reasons, .. } => assert!(
+            reasons.iter().any(|r| r.contains("signature")),
+            "the reason must name the unreadable signature, got: {reasons:?}"
+        ),
+        _ => panic!("expected Incomplete, got: {o}"),
+    }
+}
+
+/// The control: the same signature on one line *is* read, and the caller's false
+/// postcondition is refuted rather than verified.
+#[test]
+fn a_return_type_on_one_line_is_read_and_refutes_the_false_claim() {
+    let src = "unsafe extern \"C\" {\n\
+               /// ensures: ret == i8::MIN\n\
+               fn ext() -> i8;\n\
+               }\n\
+               /// ensures: ret == 0\n\
+               pub fn caller() -> u8 { if unsafe { ext() } < 0 { 1u8 } else { 0u8 } }\n";
+    let (outcomes, _) = verify_all_outcomes(src);
+    let o = pick(&outcomes, "caller");
+    assert!(
+        !o.is_verified(),
+        "a signed return of i8::MIN makes `ext() < 0` true, so `ret == 0` is false \
+         for that input, got: {o}"
+    );
+    match o {
+        FnOutcome::Failed { .. } => {}
+        _ => panic!("expected a definite counterexample, got: {o}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A trait path written with a relative root names the declared trait
+// ---------------------------------------------------------------------------
+
+/// `impl crate::T for S` is an implementation of `T`, so the declaration's contract
+/// is checked on it.
+///
+/// The qualifier used to be kept as written, so the impl's trait path never matched
+/// the declaration's module-qualified key: the impl was checked against nothing and
+/// the declaration was reported as having no implementation. Both halves of that are
+/// a silently unenforced promise. `crate::` at the root and `self::` inside a module
+/// resolve to the same key as the bare name.
+#[test]
+fn a_trait_impl_written_with_a_relative_root_is_checked() {
+    for (label, path) in [("crate::T", "crate::T"), ("self::T", "self::T")] {
+        let src = format!(
+            "pub trait T {{\n\
+             /// ensures: ret == 9\n\
+             fn f(&self) -> u8;\n\
+             }}\n\
+             pub struct S;\n\
+             impl {path} for S {{ fn f(&self) -> u8 {{ 7 }} }}\n"
+        );
+        let (outcomes, missing) = verify_all_outcomes(&src);
+        assert!(
+            missing.is_empty(),
+            "`{label}` names the declared trait, so nothing is missing: {missing:?}"
+        );
+        let o = pick(&outcomes, "f");
+        assert!(
+            !o.is_verified(),
+            "the body returns 7 and the trait promises 9, so `{label}` must be \
+             refuted, got: {o}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A bodyless declaration's contract is assumed, not missing
+// ---------------------------------------------------------------------------
+
+/// A file whose only external call verified is clean.
+///
+/// An `extern` item has no MIR by construction, so its contract is assumed at each
+/// call rather than checked on a body. Reporting it `missing` made `is_clean()`
+/// false for a file with nothing wrong, which is the false alarm that trains a
+/// reader to ignore the report. The call itself must still be verified.
+#[test]
+fn a_bodyless_declaration_is_assumed_not_reported_missing() {
+    let src = "unsafe extern \"C\" {\n\
+               /// ensures: ret == 1\n\
+               fn ext() -> u8;\n\
+               }\n\
+               /// ensures: ret == 1\n\
+               pub fn caller() -> u8 { unsafe { ext() } }\n";
+    let (outcomes, missing) = verify_all_outcomes(src);
+    assert!(
+        missing.is_empty(),
+        "an `extern` declaration is assumed at its calls, not missing: {missing:?}"
+    );
+    let o = pick(&outcomes, "caller");
+    assert!(o.is_verified(), "the call is decided by the callee's contract, got: {o}");
+}
+
+/// A bodyless declaration that is *called* with an unsatisfiable postcondition is
+/// still a failure -- being assumed is not being ignored.
+#[test]
+fn an_assumed_bodyless_contract_is_still_refuted_when_unsatisfiable() {
+    let src = "unsafe extern \"C\" {\n\
+               /// ensures: ret == 1 && ret == 2\n\
+               fn ext() -> u8;\n\
+               }\n\
+               /// ensures: ret == 1\n\
+               pub fn caller() -> u8 { unsafe { ext() } }\n";
+    let (outcomes, _) = verify_all_outcomes(src);
+    let o = pick(&outcomes, "caller");
+    assert!(
+        !o.is_verified(),
+        "a postcondition no input satisfies must not verify the caller, got: {o}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// An unreachable call site proves nothing about the callee
+// ---------------------------------------------------------------------------
+
+/// A call under contradictory guards is never executed, so it is not a divergence.
+///
+/// The divergence check asks whether any input satisfies the callee's postcondition,
+/// and an unsatisfiable path condition makes that query `Unsat` for a reason that has
+/// nothing to do with the callee: the path is dead. Reporting divergence there is a
+/// false failure about a call that cannot happen. The dead path is dropped, and the
+/// function verifies on the reachable ones.
+#[test]
+fn an_unreachable_call_is_not_a_divergence() {
+    let src = "unsafe extern \"C\" {\n\
+               /// ensures: true\n\
+               fn ext() -> u8;\n\
+               }\n\
+               /// ensures: ret == 0\n\
+               pub fn caller(x: u8) -> u8 {\n\
+               if x == 0 { if x != 0 { unsafe { ext() }; } }\n\
+               0\n\
+               }\n";
+    let (outcomes, missing) = verify_all_outcomes(src);
+    assert!(missing.is_empty(), "the extern is assumed, so nothing is missing: {missing:?}");
+    let o = pick(&outcomes, "caller");
+    assert!(
+        o.is_verified(),
+        "the call sits under contradictory guards, so it cannot happen and is not a \
+         divergence, got: {o}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A helper call inside a measured loop keeps the measure
+// ---------------------------------------------------------------------------
+
+/// A measured loop whose step is a same-dump call still proves termination.
+///
+/// Entering a callee cleared the caller's `cut` *and* its measure, and only the cut
+/// was restored on return. The resumed caller was still inside its loop with a cut
+/// but no head value, so the back edge had nothing to compare and the loop was
+/// reported incomplete -- "the loop head was never entered" -- even though its
+/// measure was sufficient. A proof silently discarded, which this crate treats as a
+/// defect. The two now travel together.
+#[test]
+fn a_helper_call_in_a_measured_loop_keeps_the_termination_measure() {
+    let src = "/// requires: i < 255\n\
+               /// ensures: ret == i + 1\n\
+               pub fn step(i: u8) -> u8 { i + 1 }\n\n\
+               /// requires: n <= 200\n\
+               /// invariant: i <= n\n\
+               /// variant: n - i\n\
+               /// ensures: ret == n\n\
+               pub fn f(n: u8) -> u8 {\n\
+               let mut i = 0u8;\n\
+               while i < n { i = step(i); }\n\
+               i\n\
+               }\n";
+    let (outcomes, missing) = verify_all_outcomes(src);
+    assert!(missing.is_empty(), "both bodies are present: {missing:?}");
+    let o = pick(&outcomes, "f");
+    assert!(
+        o.is_verified(),
+        "the helper call must not erase the loop's measure, got: {o}"
+    );
 }

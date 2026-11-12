@@ -8310,3 +8310,574 @@ pub fn cfg_quoted_delimiter_keeps_the_live_alias() -> u16 {
 pub fn cfg_quoted_delimiter_is_not_the_wrong_alias_tripwire() -> u16 {
     <u16 as std::convert::From<CfgQuotedLocal>>::from(CfgQuotedLocal)
 }
+
+// ---------------------------------------------------------------------------
+// An array or tuple *literal* whose elements are aggregates.
+//
+// `[o.i, o.j]` stores each element's own value but not the leaves under it, so
+// `a[0].v` read `Unknown` and the contract stayed `incomplete` -- a coverage hole,
+// not a false proof (a missing value proves nothing). The literal path re-roots
+// the element aggregates' parts onto the element slot now, in the index-first key
+// `a[0].v` reads. The false directions below pin that the leaves do not leak
+// between elements: if element 0 answered with element 1's leaf, the "other
+// element" tripwire would *verify*.
+// ---------------------------------------------------------------------------
+
+/// The inner aggregate an element of the literal holds.
+pub struct ElemInner {
+    pub v: u8,
+}
+
+/// The outer aggregate the elements are read out of.
+pub struct ElemOuter {
+    pub i: ElemInner,
+    pub j: ElemInner,
+}
+
+/// Builds an `ElemOuter` from two values, so the elements come from a call rather
+/// than a literal in the same body.
+/// requires: true
+/// ensures: ret.i.v == x && ret.j.v == y
+pub fn elem_outer(x: u8, y: u8) -> ElemOuter {
+    ElemOuter { i: ElemInner { v: x }, j: ElemInner { v: y } }
+}
+
+/// An array literal of inline aggregate elements, read by index then field.
+/// requires: true
+/// ensures: ret == 3
+pub fn an_array_literal_of_aggregates_is_read_back() -> u8 {
+    let a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
+    a[0].v
+}
+
+/// The false direction: element 0's leaf is `3`, so a read that leaked element 1's
+/// leaf would decide this wrongly.
+/// requires: true
+/// ensures: ret == 4
+pub fn an_array_literal_of_aggregates_is_not_the_other_element_cannot_prove_this() -> u8 {
+    let a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
+    a[0].v
+}
+
+/// The *second* element, so a fix that pinned index 0 for every read is caught.
+/// requires: true
+/// ensures: ret == 4
+pub fn an_array_literal_of_aggregates_second_element_is_read_back() -> u8 {
+    let a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
+    a[1].v
+}
+
+/// The false direction of the second element.
+/// requires: true
+/// ensures: ret == 3
+pub fn an_array_literal_of_aggregates_second_is_not_the_first_cannot_prove_this() -> u8 {
+    let a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
+    a[1].v
+}
+
+/// The elements are *field reads* of another aggregate, so the parts come from a
+/// call's return rather than a literal, and the literal only stores their value.
+/// requires: true
+/// ensures: ret == 3
+pub fn an_array_literal_of_aggregate_fields_is_read_back() -> u8 {
+    let o = elem_outer(3, 4);
+    let a = [o.i, o.j];
+    a[0].v
+}
+
+/// The false direction of the field-derived literal.
+/// requires: true
+/// ensures: ret == 4
+pub fn an_array_literal_of_aggregate_fields_is_not_the_other_cannot_prove_this() -> u8 {
+    let o = elem_outer(3, 4);
+    let a = [o.i, o.j];
+    a[0].v
+}
+
+/// A *tuple* literal of aggregates: the same carry, but the read is the
+/// field-then-field spelling `t.0.v` rather than index-then-field.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_tuple_literal_of_aggregates_is_read_back() -> u8 {
+    let t = (ElemInner { v: 3 }, ElemInner { v: 4 });
+    t.0.v
+}
+
+/// The false direction of the tuple literal.
+/// requires: true
+/// ensures: ret == 4
+pub fn a_tuple_literal_of_aggregates_is_not_the_other_cannot_prove_this() -> u8 {
+    let t = (ElemInner { v: 3 }, ElemInner { v: 4 });
+    t.0.v
+}
+
+/// A whole-aggregate *element write* followed by a leaf read: the write's own
+/// leaves must land on the element, and the pre-write leaf must not survive.
+/// requires: true
+/// ensures: ret == 7
+pub fn an_element_write_of_an_aggregate_is_read_back() -> u8 {
+    let a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
+    let mut b = a;
+    b[0] = ElemInner { v: 7 };
+    b[0].v
+}
+
+/// The false direction of the element write: the pre-write leaf is `3`.
+/// requires: true
+/// ensures: ret == 3
+pub fn an_element_write_of_an_aggregate_is_not_the_old_leaf_cannot_prove_this() -> u8 {
+    let a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
+    let mut b = a;
+    b[0] = ElemInner { v: 7 };
+    b[0].v
+}
+
+// ---------------------------------------------------------------------------
+// Writes to a leaf *inside* an element of an array or tuple of aggregates, and
+// the two call boundaries that used to drop the store.
+//
+// `elem_parts` is keyed index-first, which is what the read `a[0].v` consults. A
+// write that reached only `elems` -- the element's own value -- or no store at all
+// left the literal's old leaf in place, and a stale leaf is a *wrong* value, not a
+// missing one: `a[0].v = 7; a[0].v` could **prove** `ret == 3`. The `_cannot_prove_this`
+// twins below are what pin that; without them a fix that dropped the write would
+// look green.
+// ---------------------------------------------------------------------------
+
+/// A leaf write inside an element, then the leaf read back.
+/// requires: true
+/// ensures: ret == 7
+pub fn an_element_leaf_write_is_read_back() -> u8 {
+    let mut a = [ElemInner { v: 3 }];
+    a[0].v = 7;
+    a[0].v
+}
+
+/// The false direction: the pre-write leaf is `3`, so a write that never reached
+/// the leaf store would decide this wrongly.
+/// requires: true
+/// ensures: ret == 3
+pub fn an_element_leaf_write_is_not_the_old_leaf_cannot_prove_this() -> u8 {
+    let mut a = [ElemInner { v: 3 }];
+    a[0].v = 7;
+    a[0].v
+}
+
+/// The leaf write must not touch its *sibling* element.
+/// requires: true
+/// ensures: ret == 4
+pub fn an_element_leaf_write_leaves_its_sibling() -> u8 {
+    let mut a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
+    a[0].v = 7;
+    a[1].v
+}
+
+/// The false direction of the sibling check.
+/// requires: true
+/// ensures: ret == 7
+pub fn an_element_leaf_write_is_not_the_sibling_cannot_prove_this() -> u8 {
+    let mut a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
+    a[0].v = 7;
+    a[1].v
+}
+
+/// The *second* element's leaf, so a fix that pinned index 0 for every leaf write
+/// is caught.
+/// requires: true
+/// ensures: ret == 9
+pub fn a_second_element_leaf_write_is_read_back() -> u8 {
+    let mut a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
+    a[1].v = 9;
+    a[1].v
+}
+
+/// The false direction of the second element's leaf write.
+/// requires: true
+/// ensures: ret == 4
+pub fn a_second_element_leaf_write_is_not_the_old_leaf_cannot_prove_this() -> u8 {
+    let mut a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
+    a[1].v = 9;
+    a[1].v
+}
+
+/// The tuple spelling of the same leaf write: `t.0.v = 7` reads through a field
+/// chain, so it exercises the mirror key rather than the index-first one.
+/// requires: true
+/// ensures: ret == 7
+pub fn a_tuple_component_leaf_write_is_read_back() -> u8 {
+    let mut t = (ElemInner { v: 3 }, ElemInner { v: 4 });
+    t.0.v = 7;
+    t.0.v
+}
+
+/// The false direction of the tuple component's leaf write.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_tuple_component_leaf_write_is_not_the_old_leaf_cannot_prove_this() -> u8 {
+    let mut t = (ElemInner { v: 3 }, ElemInner { v: 4 });
+    t.0.v = 7;
+    t.0.v
+}
+
+/// A helper that writes a leaf through `&mut [ElemInner; 1]`: the write has to
+/// cross back to the caller, and the caller's pre-call leaf must not survive it.
+/// requires: true
+/// ensures: ret == 7
+pub fn a_helper_leaf_write_through_a_mutable_array_is_read_back() -> u8 {
+    let mut a = [ElemInner { v: 3 }];
+    write_first_leaf(&mut a, 7);
+    a[0].v
+}
+
+/// The false direction of the helper's leaf write: the caller's own leaf is `3`,
+/// so a call boundary that dropped the write would decide this wrongly.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_helper_leaf_write_is_not_the_callers_leaf_cannot_prove_this() -> u8 {
+    let mut a = [ElemInner { v: 3 }];
+    write_first_leaf(&mut a, 7);
+    a[0].v
+}
+
+/// Writes the first element's leaf through a mutable array argument.
+/// requires: true
+/// ensures: true
+pub fn write_first_leaf(a: &mut [ElemInner; 1], v: u8) {
+    a[0].v = v;
+}
+
+/// A helper that only *reads* a leaf through its argument: the caller's leaf has
+/// to cross *into* the callee, or the helper's contract is unreadable.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_helper_leaf_read_through_an_array_argument_decides() -> u8 {
+    let a = [ElemInner { v: 3 }];
+    read_first_leaf(&a)
+}
+
+/// The false direction of the helper's leaf read.
+/// requires: true
+/// ensures: ret == 9
+pub fn a_helper_leaf_read_is_not_a_made_up_value_cannot_prove_this() -> u8 {
+    let a = [ElemInner { v: 3 }];
+    read_first_leaf(&a)
+}
+
+/// Reads the first element's leaf through an array argument.
+/// requires: true
+/// ensures: ret == a[0].v
+pub fn read_first_leaf(a: &[ElemInner; 1]) -> u8 {
+    a[0].v
+}
+
+/// A helper that *returns* an array of aggregates: the element's leaves have to
+/// cross the return boundary with it, or the caller cannot read them at all.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_returned_array_of_aggregates_keeps_its_leaves() -> u8 {
+    make_one(3)[0].v
+}
+
+/// The false direction of the returned array's leaf.
+/// requires: true
+/// ensures: ret == 9
+pub fn a_returned_array_of_aggregates_is_not_a_made_up_value_cannot_prove_this() -> u8 {
+    make_one(3)[0].v
+}
+
+/// Builds a one-element array of aggregates from a value.
+/// requires: true
+/// ensures: ret[0].v == x
+pub fn make_one(x: u8) -> [ElemInner; 1] {
+    [ElemInner { v: x }]
+}
+
+// ---------------------------------------------------------------------------
+// Whole-*element* writes of aggregates, and the element copy, across a call.
+//
+// The leaf-write family above covers `a[0].v = 7`. This is the other half: the
+// whole element is replaced (`a[0] = E { v: 7 }`, which lowers to `(*_1)[_3] =
+// move _2` through a `&mut` argument). The element's own value crossed the call
+// boundary already, but its *leaves* did not, so the caller read the leaf its
+// literal had before the call and a false `ret == 3` was **proved**. The
+// `_cannot_prove_this` twins are that false contract.
+// ---------------------------------------------------------------------------
+
+/// A copyable element, so `a[0] = b[0]` is a plain element read and write rather
+/// than a move out of a borrow.
+#[derive(Clone, Copy)]
+pub struct ElemCopy {
+    pub v: u8,
+}
+
+/// An element copied from another array's element, then its leaf read back.
+/// requires: true
+/// ensures: ret == 7
+pub fn an_element_copy_from_another_element_is_read_back() -> u8 {
+    let mut a = [ElemCopy { v: 3 }];
+    let b = [ElemCopy { v: 7 }];
+    a[0] = b[0];
+    a[0].v
+}
+
+/// The false direction: the destination's pre-copy leaf is `3`, so a copy that
+/// never reached the leaf store would decide this wrongly.
+/// requires: true
+/// ensures: ret == 3
+pub fn an_element_copy_is_not_the_old_leaf_cannot_prove_this() -> u8 {
+    let mut a = [ElemCopy { v: 3 }];
+    let b = [ElemCopy { v: 7 }];
+    a[0] = b[0];
+    a[0].v
+}
+
+/// A helper replaces a whole element through `&mut [ElemCopy; 1]`: the element's
+/// leaves have to cross back to the caller.
+/// requires: true
+/// ensures: ret == 7
+pub fn a_helper_whole_element_write_is_read_back() -> u8 {
+    let mut a = [ElemCopy { v: 3 }];
+    set_whole_element(&mut a, 7);
+    a[0].v
+}
+
+/// The false direction of the helper's whole-element write.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_helper_whole_element_write_is_not_the_callers_leaf_cannot_prove_this() -> u8 {
+    let mut a = [ElemCopy { v: 3 }];
+    set_whole_element(&mut a, 7);
+    a[0].v
+}
+
+/// Replaces the first element of a mutable array argument.
+/// requires: true
+/// ensures: true
+pub fn set_whole_element(a: &mut [ElemCopy; 1], v: u8) {
+    a[0] = ElemCopy { v };
+}
+
+/// A helper replaces *one* element of a two-element array; the sibling must keep
+/// its own leaf, which a store that dropped the whole array would lose.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_helper_whole_element_write_leaves_its_sibling() -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    set_second_element(&mut a, 9);
+    a[0].v
+}
+
+/// The false direction of the sibling check: `9` is the *other* element's new
+/// leaf, so a store that put the write on element 0 would prove this.
+/// requires: true
+/// ensures: ret == 9
+pub fn a_helper_whole_element_write_is_not_the_sibling_cannot_prove_this() -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    set_second_element(&mut a, 9);
+    a[0].v
+}
+
+/// Replaces the second element of a mutable array argument.
+/// requires: true
+/// ensures: true
+pub fn set_second_element(a: &mut [ElemCopy; 2], v: u8) {
+    a[1] = ElemCopy { v };
+}
+
+/// A helper copies one element onto another through two arguments: the source's
+/// leaves have to cross *in* and the destination's *out*.
+/// requires: true
+/// ensures: ret == 7
+pub fn a_helper_element_copy_is_read_back() -> u8 {
+    let mut a = [ElemCopy { v: 3 }];
+    let b = [ElemCopy { v: 7 }];
+    copy_first_element(&mut a, &b);
+    a[0].v
+}
+
+/// The false direction of the helper's element copy.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_helper_element_copy_is_not_the_old_leaf_cannot_prove_this() -> u8 {
+    let mut a = [ElemCopy { v: 3 }];
+    let b = [ElemCopy { v: 7 }];
+    copy_first_element(&mut a, &b);
+    a[0].v
+}
+
+/// Copies the first element of `b` onto the first element of `a`.
+/// requires: true
+/// ensures: true
+pub fn copy_first_element(a: &mut [ElemCopy; 1], b: &[ElemCopy; 1]) {
+    a[0] = b[0];
+}
+
+// ---------------------------------------------------------------------------
+// An unpinned element write poisons the whole array, and a *copy* of an element
+// must not revive a pre-write leaf.
+//
+// `a[i] = E { v: 7 }` with an unpinned `i` marks every element unknown, because
+// the write could have landed anywhere. The poison has to reach both leaf
+// representations (`elem_parts` and its `nested` mirror) *and* survive the call
+// boundary: a helper's symbolic write used to drop the callee's leaves, copy
+// nothing back, and leave the caller's own leaves in place, so `let x = a[0];
+// x.v` read the value from before the call. These are the false contracts that
+// must stay unproved -- `incomplete` is the honest answer, not `verified`.
+// ---------------------------------------------------------------------------
+
+/// An unpinned write, then an element *copy* read through the copy: the leaf must
+/// not be the pre-write `3`.
+/// requires: i < 2
+/// ensures: ret == 3
+pub fn an_element_copy_after_an_unpinned_write_is_not_the_old_leaf(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    a[i] = ElemCopy { v: 7 };
+    let x = a[0];
+    x.v
+}
+
+/// The other element's obsolete leaf, the same way.
+/// requires: i < 2
+/// ensures: ret == 4
+pub fn an_element_copy_after_an_unpinned_write_is_not_the_sibling(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    a[i] = ElemCopy { v: 7 };
+    let x = a[1];
+    x.v
+}
+
+/// The *new* leaf is not readable either: the write may have landed on element 1,
+/// so no single element is known to be `7`.
+/// requires: i < 2
+/// ensures: ret == 7
+pub fn an_element_copy_after_an_unpinned_write_is_not_the_new_leaf(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    a[i] = ElemCopy { v: 7 };
+    let x = a[0];
+    x.v
+}
+
+/// An unpinned *leaf* write, then an element copy: the same poison, reached
+/// through `a[i].v = 7` rather than a whole-element write.
+/// requires: i < 2
+/// ensures: ret == 3
+pub fn an_element_copy_after_an_unpinned_leaf_write_is_not_the_old_leaf(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    a[i].v = 7;
+    let x = a[0];
+    x.v
+}
+
+/// A helper's unpinned write, then an element copy: the poison has to cross the
+/// call boundary, which is where it was lost.
+/// requires: i < 2
+/// ensures: ret == 3
+pub fn a_helper_unpinned_write_is_not_the_callers_old_leaf(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    set_unpinned(&mut a, i);
+    let x = a[0];
+    x.v
+}
+
+/// The other element, through the same helper.
+/// requires: i < 2
+/// ensures: ret == 4
+pub fn a_helper_unpinned_write_is_not_the_callers_sibling(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    set_unpinned(&mut a, i);
+    let x = a[1];
+    x.v
+}
+
+/// Writes an element the run cannot pin, so the whole array is unknown.
+/// requires: i < 2
+/// ensures: true
+pub fn set_unpinned(a: &mut [ElemCopy; 2], i: usize) {
+    a[i] = ElemCopy { v: 7 };
+}
+
+// ---------------------------------------------------------------------------
+// A pinned rewrite after a symbolic write *re-establishes* that element.
+//
+// A symbolic write (`a[i].v = 7`) marks the whole array unknown, so no element is
+// known afterwards. A *pinned* write to one element (`a[0].v = 9`) then names a
+// value the body does know, and it must be readable -- including through an
+// element copy. The leaf maps are the record of which indices are re-established:
+// `poison_elems` clears them, and a later pinned write re-populates exactly its
+// index, so no array-wide flag may veto a leaf that is genuinely known. What must
+// *not* come back is a sibling the poison left unknown, or the pre-write leaf.
+// ---------------------------------------------------------------------------
+
+/// A pinned leaf rewrite after a symbolic one: the copy reads `9`.
+/// requires: i < 2
+/// ensures: ret == 9
+pub fn a_pinned_leaf_rewrite_after_a_symbolic_write_is_read_back(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    a[i].v = 7;
+    a[0].v = 9;
+    let x = a[0];
+    x.v
+}
+
+/// The same through a whole-element rewrite.
+/// requires: i < 2
+/// ensures: ret == 9
+pub fn a_pinned_element_rewrite_after_a_symbolic_write_is_read_back(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    a[i].v = 7;
+    a[0] = ElemCopy { v: 9 };
+    let x = a[0];
+    x.v
+}
+
+/// A pinned rewrite after a symbolic *whole-element* write, the other order.
+/// requires: i < 2
+/// ensures: ret == 9
+pub fn a_pinned_leaf_rewrite_after_a_symbolic_element_write_is_read_back(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    a[i] = ElemCopy { v: 7 };
+    a[0].v = 9;
+    let x = a[0];
+    x.v
+}
+
+/// A helper that poisons and then re-establishes: the recovery has to cross the
+/// call boundary along with the poison.
+/// requires: i < 2
+/// ensures: ret == 9
+pub fn a_helper_pinned_rewrite_after_a_symbolic_write_is_read_back(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    poison_then_rewrite(&mut a, i);
+    let x = a[0];
+    x.v
+}
+
+/// Poisons every element, then re-establishes element 0.
+/// requires: i < 2
+/// ensures: true
+pub fn poison_then_rewrite(a: &mut [ElemCopy; 2], i: usize) {
+    a[i].v = 7;
+    a[0].v = 9;
+}
+
+/// The sibling the poison left unknown is *not* recovered by a rewrite of element 0.
+/// requires: i < 2
+/// ensures: ret == 4
+pub fn a_pinned_rewrite_does_not_recover_its_sibling(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    a[i].v = 7;
+    a[0].v = 9;
+    let x = a[1];
+    x.v
+}
+
+/// Nor the pre-write leaf of the element that was rewritten.
+/// requires: i < 2
+/// ensures: ret == 3
+pub fn a_pinned_rewrite_does_not_revive_the_old_leaf(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    a[i].v = 7;
+    a[0].v = 9;
+    let x = a[0];
+    x.v
+}

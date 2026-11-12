@@ -598,6 +598,116 @@ here, so it remains unsupported. The full rule, its soundness argument, and the
 four ways it is pinned are recorded in "Recursion by contract" near the end of
 this file.
 
+### The MIR frontend's version: a callee with no body is answered from its contract
+
+The MIR executor had the same gap for a long time and it was the README's first
+stated limitation: a call to a function in the same file was symbolically
+executed, and a call to anything else was `Unknown`. Only a self-call with a
+`decreases:` measure had a verdict, by induction. `try_callee_contract` in
+`src/mir/exec.rs` closes the rest: a callee whose *body* the dump does not
+contain, but whose *contract* the source does, is answered from that contract.
+An `extern` declaration is the smallest shape that produces it, but the path is
+not special-cased -- any item the dump carries no body for goes through it.
+
+The order of the three checks is the whole soundness argument:
+
+1. **`CalleePrecondition`** proves the callee's `requires:` of the call's
+   arguments. This is what makes the assumption sound. Proving a caller's
+   postcondition from an assumed postcondition whose precondition was never
+   established is assuming the conclusion, and this obligation is what stops a
+   contract from being a free pass.
+2. **`CalleeDiverges`** refutes the postcondition *before* assuming it. `ensures
+   false` describes a callee that never returns, so every claim after the call
+   would be vacuously true, and a report that counted them would call a function
+   that does not run "verified". The query is `find_model(path && post)`, so its
+   discharge is `Unsat` rather than `Valid` -- the MIR twin of
+   `wp::Rule::DivergentCall`, and a kind whose polarity is the opposite of every
+   other `Callee*` obligation.
+3. The postcondition is **assumed** of a fresh return variable, whose width comes
+   from the *caller's* destination (the one place the return type exists without
+   the callee's MIR).
+
+Four refusals are deliberate, and each is the safe direction:
+
+* A callee with **no `ensures`** gives nothing to assume. "No postcondition" is
+  not "postcondition `true`": the first promises nothing, the second promises
+  everything. Reading the absence as `true` would let a caller's postcondition be
+  proved from nothing at all.
+* A **parameter list the source scanner cannot read** leaves the names unbound
+  and the call is refused. There is no second signal -- a bodyless callee has no
+  `debug` bindings -- so positional binding is the only tie between
+  `requires: n <= 10` and the first argument, and a list short by one would prove
+  a precondition nobody stated. `spec::fn_signature` therefore returns an *empty*
+  list on any shape it cannot read whole (a destructuring pattern, a wrapped
+  parameter list, a return type with no terminator on its line), never a partial
+  one. A *receiver* is not such a shape: it is read as a slot and dropped from the
+  call route's `params` because a call's argument list has none, which leaves a
+  method's list short by the receiver and refuses the call on the arity check
+  below. The body route needs the opposite view -- see "An inherited contract
+  binds by position".
+* A **reference argument** is refused. `Ty::Ref` is modelled as its referent, so a
+  `&mut` write would land on the caller's value and not reach the local it names;
+  there is no aliasing model to carry it back. rustc does **not** elide the
+  receiver: `s.stash(x, 2)` dumps as `Slot::stash(copy _1, copy _2, const 2_u32)`
+  and a trait call as `<T as Bump>::bump(copy _1, copy _2)`, receiver first, so the
+  argument count already includes it. The real limitation is on the *source* side:
+  `spec::fn_signature` reads `name: Type` pairs, and a receiver has no such form
+  (`self`, `&self`, `&mut self`), so a method signature comes back short by the
+  receiver and `try_callee_contract` refuses on the arity mismatch. Even a
+  receiver the scanner *did* read would then hit the reference refusal above, since
+  `&self` is a `Ty::Ref`. So a bodyless method call is refused, deliberately and by
+  two independent checks, not by a missing arity check.
+* **Inlining wins when it can.** The contract route runs *after* `resolve_callee`,
+  never before. When the body is in the dump, inlining executes the callee rather
+  than trusting what it promised, so it is strictly more precise; a contract route
+  that shadowed it would trade a proof for a promise. The test that pins this
+  deliberately gives the callee a contract *weaker* than its body, so a pass can
+  only mean the body was executed.
+
+`CalleeEnv` resolves through `Specs::resolve`, so an `impl`-keyed contract and a
+path-keyed one are both found by the rule the frontend already uses to attach a
+contract to its function, rather than by a second lookup rule that could drift.
+
+## A trait declaration's contract belongs to its implementations
+
+A trait method declaration has no body, so rustc emits no MIR for it and it can
+never be a verification target. Its contract is a promise every implementation
+inherits, and the implementation is where it is kept or broken. Filing it with the
+free functions was a **false proof**, not a cosmetic mis-filing: `by_fn` keys match
+by unique path suffix, so a key `Bump::bump` answered a lookup for a free
+`fn bump() -> u8 { 9 }`, that body was checked against the trait's
+`ensures: ret == 9`, passed, and was reported `Bump::bump: Verified` -- naming the
+trait method as verified when no implementation existed in the file at all.
+
+Four rules follow, and the first two are the ones that make it sound:
+
+* A **bodyless `fn` inside a `trait`** goes to `Specs::by_trait`, keyed
+  `Trait::method` with the trait's module-qualified path. A trait *default* has a
+  body, is real MIR, and stays in `by_fn` under the `T::value` key rustc prints for
+  it -- `spec::fn_has_body` is what tells the two apart.
+* **Each implementation is a target**, discovered by inverting the inheritance:
+  for every `impl` and every contract its trait declares, the impl's method is
+  checked against that contract. Without this the promise was inherited by
+  `resolve` (so a *call* to it was answered correctly) but never checked on any
+  body, and the declaration was not in `by_fn` to be reported missing either -- a
+  silently unenforced claim, the one outcome this frontend treats as worse than a
+  refusal.
+* A **declaration with no implementation in the file** is reported, with the
+  reason spelled out so it is not mistaken for a missing body. It can never be a
+  target, and leaving it unmentioned would make the run clean while the claim went
+  unchecked.
+* **Two contracts for one method are refused, naming both.** When the impl and its
+  trait each declare a contract, `resolve` can return only one, so whichever it
+  dropped would vanish without a word; preferring either is indefensible. The
+  refusal is what loses nothing.
+
+Tail counts are taken over *distinct functions*, not table entries: a method that
+declares its own contract and also inherits its trait's appears in both tables, and
+counting it twice would spell its report key `Owner::method` even when it is the
+only one. Two implementations of one contracted trait are genuinely ambiguous and
+do get `Owner::method`, which is what keeps one `outcomes` entry from hiding the
+other.
+
 ## A verifier needs a differential harness, not just unit tests
 
 Both soundness holes in the call rule were found by accident. `tests/modular_differential.rs`
@@ -2816,6 +2926,86 @@ The general lesson: for a loop, an invariant is not a predicate to *check at the
 it is a predicate to *assume over the whole state space it describes*. Asserting it at the
 back edge is necessary and not sufficient; the header has to forget what it cannot know.
 
+## A clause that is not a clause must be refused, not dropped
+
+The contract reader takes four clause keywords: `requires:`, `ensures:`, `invariant:`,
+`decreases:`. Anything else on a `///` line used to be ignored, and that is a **false
+proof**, not a lost one. Measured at the time of the fix:
+
+    /// requires: x == 0
+    /// ensuers: ret == 99        <- one transposition from `ensures`
+    pub fn f(x: u32) -> u32 { 5 }
+
+came back `Verified` with **zero obligations**. The typo meant the function had no
+postcondition at all, so the body was checked against `true`, and the report was green
+for a claim nobody had read. The `ensuers` case is the sharp one because it is the
+*false* direction: had the claim been true, the green report would have been earned by
+luck, and had it been false -- as here -- the tool would have certified it. `variant:`
+was the same shape from the other side: a reader who writes a loop termination measure
+reasonably expects it honoured, and the tool ignored it, so a total-correctness claim
+rested on nothing.
+
+The fix records any clause-shaped line the frontend does not take and **skips** the
+function, naming the line and the keyword it looks like. The hard part is not the
+refusal, it is *deciding what counts as clause-shaped*: a naive "any `/// word:`" rule
+would refuse ordinary documentation, and the corpus is full of it (`/// direction: ...`,
+`/// type: ...`, `/// width: ...`). The rule is a bounded edit distance of two on the
+word before the first colon, so `ensuers` (one transposition) and `requiers` (one
+transposition) are caught while `direction` (three edits from `decreases`) is left as
+prose. Measured over `examples/`, `tests/` and `src/`: the only near misses anywhere are
+inside the tests for this rule itself, so the corpus does not trip it.
+
+`variant:` gets a distinct message rather than a "did you mean" suggestion, because it is
+not a typo -- it is a feature this frontend does not have yet, and correcting the reader
+into an invariant would hide that. That message is the honest statement of the gap, and
+it is the reason this section exists in a document about *soundness* rather than one
+about ergonomics.
+
+The regression test `a_clause_shaped_doc_comment_that_is_not_a_clause_is_refused` was run
+against the pre-fix code first and fails there with
+`verified (0 obligation(s), 0 panic(s) ruled out)`.
+
+## A loop invariant alone proves only partial correctness; the measure is separate
+
+The invariant path cut a loop at its head and proved `I` on entry and across an
+iteration. That is *partial* correctness: it says the loop is safe if it stops,
+which a loop that never stops satisfies vacuously. Measured before the fix,
+`while i < 5 { i += 0 }` -- a loop that never leaves -- came back `Verified`. The
+tool certified a function that does not return.
+
+The missing piece was the measure, and the shape of the fix is where the care is.
+`variant: <expr>` is a clause of its own, not a second meaning for `invariant:`.
+The measure is evaluated **twice in different states**:
+
+* At the head, over the *havoced* state -- the same fresh locals the invariant was
+  assumed on. This is the value `V` the body's iteration starts from.
+* At the back edge, over the state the body's own symbolic execution produced.
+  This is `V'`, derived rather than restated.
+
+The obligation is then `path => V' < V`. Reading `V` from the *arriving* state
+instead of the havoced one would compare an iteration against the first pass's
+value, which proves the decrease for one iteration rather than for the loop --
+the same mistake the invariant's havoc step exists to prevent, in the measure.
+
+No lower-bound obligation is emitted, and this is deliberate. On a fixed bit width
+a strictly decreasing sequence cannot be infinite, so strictness alone is the
+well-founded basis. A `V >= 0` check would be *wrong* here: the measure is a
+machine word, so a measure that "goes negative" is just a smaller word, which is
+exactly the descent that proves termination. This is the opposite of the recursion
+case, where the measure is over the mathematical integers and non-negativity is
+load-bearing -- so the two `decreases:` checks are not the same check, even though
+both are called "decrease".
+
+The width wall shows up honestly. A `u32` measure bit-blasts to a query larger
+than the engine's diagram budget, so it comes back `Incomplete` rather than
+`Verified`; `u8`/`u16` decide. That is a refusal, not a failure, and it is the same
+budget every other wide query meets.
+
+`variant:` is only taken with an `invariant:`, because the invariant is what
+locates the loop head the measure is evaluated at. An orphan measure is refused
+rather than ignored -- ignoring it would report partial correctness as if it were
+total.
+
 ## A call to `core` made the whole path unknown, and modelling it needed a tag that is a term
 
 The MIR frontend's biggest coverage gap was not a parser shape or a width wall: it was that
@@ -3591,8 +3781,86 @@ optional file argument, which is what made the measurement cheap.)
   re-roots an aggregate operand's parts onto the field (`rebase_parts`, gated on the operand's
   type, because a by-value struct argument reads `Unknown` as a whole). Pinned by
   `nested_return_carries_the_field` / `nested_return_is_not_the_stale_field`. An *array literal
-  of aggregates* (`[o.i, o.j]`) is still `incomplete`, because the literal path stores under
-  `elems` by index and does not carry the element aggregates' parts. And an *array whose type is
+  of aggregates* (`[o.i, o.j]`) is now closed: the literal path stores the element under `elems`
+  by index, and the element's *leaves* are re-rooted onto that element in a store keyed
+  index-first (`elem_parts`, mirrored in `nested` for the tuple spelling), because the read
+  `a[0].v` lowers to `_2[_5].0` -- an index then a field, the opposite order from `o.a[0]`, so
+  `rebase_parts` (field chains only) could not carry it. The read arm consumes the trailing field
+  steps; without that the loop re-reads `Field(0)` against the local and replaces the leaf with
+  the whole element. A whole-aggregate *element write* (`b[0] = Inner { v: 7 }`) re-roots the same
+  way, and `copy_parts` carries `elem_parts` across a whole-value copy. Pinned by
+  `an_array_literal_of_aggregates_is_read_back` / `..._second_element_...` /
+  `..._aggregate_fields_...` / `a_tuple_literal_of_aggregates_...` /
+  `an_element_write_of_an_aggregate_...` and their `_cannot_prove_this` twins, asserted in
+  `an_aggregate_literal_element_carries_its_own_leaves`.
+  A *write* to a leaf inside such an element (`a[0].v = 7`, which lowers to
+  `(_1[_3].0: u8) = 7` -- an index then a field, `set`'s arms covered neither) is
+  `write_elem_part`: it drops the leaves the write replaces, writes both keys, and
+  poisons a subscript the run cannot pin. `write_elem` clears the element's old leaves
+  first, so a whole-element write whose source cannot be re-rooted (`a[0] = other[1]`,
+  which `rebase_elem_parts` now also carries) leaves them unknown rather than stale.
+  The store then crosses both call boundaries: the argument transfer and the reference
+  copy-back carry it (whole-local targets only -- a sub-place target's array is reached
+  through a field path this store has no key for, so its caller leaves are dropped, not
+  prefixed), and the return merge re-keys the callee's `_0` leaves onto the caller's
+  destination. Each of those was a *false proof*: the stale leaf decided a contract about
+  the pre-write value. Pinned by
+  `an_element_leaf_write_is_read_back` / `..._leaves_its_sibling` /
+  `a_second_element_leaf_write_...` / `a_tuple_component_leaf_write_...` and
+  `a_helper_leaf_write_through_a_mutable_array_...` / `a_helper_leaf_read_...` /
+  `a_returned_array_of_aggregates_...` with their `_cannot_prove_this` twins, asserted in
+  `a_leaf_write_inside_an_element_is_read_back` and
+  `an_element_leaf_store_crosses_a_call_boundary`.
+  A *whole-element* write of an aggregate (`a[0] = E { v: 7 }`) is the other half,
+  and through a `&mut` argument it lowers to `(*_1)[_3] = move _2` -- the leading
+  `Deref` is what the re-root gate used to miss, because it read `dest.proj`
+  directly; `elem_index_of` reads past it now (and past the `Deref` on a source
+  element too, so `rebase_elem_parts` takes the element-source arm for rustc's usual
+  `IndexVar` spelling, not only a constant `Proj::Index`). An element *copy*
+  (`a[0] = b[0]`) goes through a temp, and reading an element hands over its leaf
+  *scalar* rather than its parts, so `carry_elem_leaf_onto_local` moves them onto
+  that temp; that pair was `incomplete` in both directions, not a false proof. The
+  copy-back drops the caller's own leaves for a whole-local target *before* copying
+  the callee's in, because a callee that wrote through an index it could not pin
+  poisoned its array and holds none -- keeping the caller's would leave a stale
+  pre-call leaf readable. Pinned by
+  `an_element_copy_from_another_element_is_read_back` /
+  `a_helper_whole_element_write_is_read_back` /
+  `..._leaves_its_sibling` / `a_helper_element_copy_is_read_back` and their
+  `_cannot_prove_this` twins, asserted in
+  `a_whole_element_write_of_an_aggregate_crosses_a_call_boundary`.
+  An *unpinned* element write (`a[i] = x`) poisons the whole array, and the poison
+  has to reach *both* leaf representations: `poison_elems` cleared `elem_parts` and
+  left its `nested` mirror, so a later element *copy* (`let x = a[0]`) collected the
+  mirror and **proved** `x.v` was the pre-write leaf. The poison also has to cross
+  the call boundary, which it did not: a helper's symbolic write left the callee with
+  no leaves, the copy-back inserted none, and the caller's own leaves survived. A
+  literal array's elements live in `elems`, which has no `poisoned` flag of its own,
+  so `Env::poisoned_elems` records the local; the argument transfer carries it in,
+  and the copy-back drops the caller's `elems`/`nested`/`elem_parts` for that local
+  before copying anything. Pinned by
+  `an_element_copy_after_an_unpinned_write_is_not_the_old_leaf` /
+  `..._is_not_the_sibling` / `..._is_not_the_new_leaf` /
+  `..._after_an_unpinned_leaf_write_...` and
+  `a_helper_unpinned_write_is_not_the_callers_old_leaf` / `..._sibling`, asserted
+  `!is_verified()` in `an_unpinned_write_poisons_the_whole_array` -- `incomplete` is
+  the honest answer for a write the run cannot pin, and the one outcome that must
+  never appear is `verified`.
+  The poison is array-wide, but the leaf maps *are* the record of which indices have
+  been re-established, so an array-wide veto must not sit in front of them: a pinned
+  write after a symbolic one (`a[i].v = 7; a[0].v = 9`) re-populates exactly its
+  index, and `poisoned_elems` must not hide it -- that made
+  `let x = a[0]; x.v` `incomplete` though the copy is always `9`. The marker is for
+  the *call boundary* only, where it means "this array is not wholly known"; it is
+  no longer consulted by `carry_elem_leaf_onto_local` or by the `elem_parts` reader.
+  Pinned by `a_pinned_leaf_rewrite_after_a_symbolic_write_is_read_back` /
+  `a_pinned_element_rewrite_after_a_symbolic_write_is_read_back` /
+  `a_pinned_leaf_rewrite_after_a_symbolic_element_write_is_read_back` /
+  `a_helper_pinned_rewrite_after_a_symbolic_write_is_read_back` (verified) against
+  the twins `a_pinned_rewrite_does_not_recover_its_sibling` /
+  `a_pinned_rewrite_does_not_revive_the_old_leaf` (`!is_verified`), so the recovery
+  is per-element and never a blanket un-poisoning.
+  And an *array whose type is
   a field* (`o.a[0]`) is skipped, since the `indexed` store is keyed by local only (see the note
   below).
   Two notes on what this did *not* need. The nested literal always reaches the
@@ -8346,3 +8614,74 @@ the whole difference from the two runtime routes, and the paragraph immediately
 below now says so. The lesson is narrower than the last one: after changing an
 example to be compile-time, the sentence introducing it is still written for the
 runtime version, and prose is not type-checked.
+
+## A third review found six, two of them false proofs
+
+The trait-contract work (below) introduced a body route that binds a *declaration's*
+contract to an *implementation's* MIR. Reviewing that route and the call route
+around it turned up six defects. Two could report a false claim as proved, which is
+the direction this crate exists to prevent; the rest were a lost proof, a false
+failure, a silent pass, and a false alarm. Each was reproduced with a probe before
+anything changed, and each now has a test pinned in both directions.
+
+**An inherited contract bound parameters by *name*, not by position (false proof).**
+`Specs::resolve` handed back the declaration's contract, but the executor and the
+contract evaluator bound its identifiers to the implementation's own MIR debug
+names. An implementation is free to name its parameters differently, so
+
+```rust
+trait T { /// ensures: ret == a
+           fn f(&self, a: u8, b: u8) -> u8; }
+impl T for S { fn f(&self, b: u8, a: u8) -> u8 { a } }
+```
+
+was reported `Verified`: the contract's `a` resolved to the implementation's `a`,
+which is the trait's `b`. The two signatures are the same method, so their
+parameters correspond by *position*; `Specs::contract_for_fn` now returns the
+contract together with an `ArgRename` built by `align_signature`, and
+`arg_vars_named`/`signed_args_named`/`field_env_named` bind under the declaration's
+names. `FnContract::slots` keeps every position, **receiver included** -- the call
+route's `params` drops the receiver because a call has no argument for it, but the
+body route cannot: the receiver is position 0 of every method, and aligning without
+it would shift every name by one. A declaration whose signature was not read whole,
+or whose slot count disagrees with the body's argument count, is refused rather
+than aligned by guess.
+
+**A wrapped return type was read as unsigned (false proof).** The signature reader
+took everything between `->` and the end of the line, so `fn ext() ->` followed by
+`i8;` produced `Ty::Other("")` -- unsigned. A caller testing `ext() < 0` took the
+unsigned branch and a postcondition that does not hold verified. The reader now
+requires the return type's terminator on the same line and refuses the whole
+signature otherwise, and `CalleeContract::sig_readable` makes the call route refuse
+a signature it cannot bind positionally.
+
+**A trait path with a relative root never met its declaration (silent pass).**
+`impl crate::T for S` kept the `crate::` prefix, so it never matched `T`'s
+module-qualified key: the impl was checked against nothing and the declaration was
+reported as having no implementation. `qualify_trait` now resolves `crate::` (the
+root), `self::` (the enclosing module) and `super::` (one level up) to the spelling
+the declaration is keyed by.
+
+**A bodyless declaration's contract was reported `missing` (false alarm).** An
+`extern` item has no MIR by construction and its contract is *assumed* at each call,
+which is the modular case rather than a lost proof. Reporting it `missing` made
+`is_clean()` false for a file with nothing wrong. `Specs::bodyless` records those
+keys so `resolve_targets` can tell them apart; the call is still verified, and an
+unsatisfiable assumed postcondition still fails.
+
+**An unreachable call was reported as a divergent callee (false failure).** The
+divergence query is `find_model(path && post)`, and an unsatisfiable `path` makes it
+`Unsat` for a reason that has nothing to do with the callee: the path is dead.
+`try_callee_contract` now checks the path first and drops a dead one.
+
+**A helper call inside a measured loop erased the measure (lost proof).** Entering a
+callee cleared the caller's `cut` *and* its `variant_entry`, and only the cut was
+restored. The resumed caller was still inside its loop with a cut and no head value,
+so the back edge had nothing to compare and the loop was reported incomplete --
+"the loop head was never entered" -- though its measure was sufficient. The two now
+travel together in `Frame::saved_variant`.
+
+The pattern in four of the six is the same: a value was *available* and the wrong
+one was used, or a case was folded into a neighbour that shares its shape. The two
+false proofs are the receiver-in-the-slot-list and the empty-return-type cases --
+both places where "read what is there" quietly became "assume what is not".

@@ -1431,6 +1431,38 @@ so the state after the loop is *any* state satisfying the invariant and the exit
 condition, not the state of the first pass. Omitting that step would prove false
 postconditions; `AGENTS.md` records the measured case.
 
+### Termination: a `variant:` measure
+
+An invariant alone proves *partial* correctness: the loop is safe **if** it stops,
+which a loop that never stops satisfies vacuously. A `variant:` line names the
+quantity the loop counts down, and turns that into *total* correctness:
+
+```rust,ignore
+/// invariant: i <= n
+/// variant: n - i
+/// ensures: ret == n
+pub fn count_to(n: u8) -> u8 {
+    let mut i = 0u8;
+    while i < n { i += 1; }
+    i
+}
+```
+
+At the back edge the measure after one iteration is compared against the value at
+the head, and the obligation is `I && guard => V' < V`. On a fixed bit width a
+strictly decreasing sequence cannot be infinite, so no separate lower bound is
+needed — and adding one would be wrong, because the measure is a machine word,
+where "going negative" is just a smaller word, which is the descent that proves
+termination. `while i < 5 { i += 0 }` is therefore reported as a failure on
+`loop variant decreases` rather than as verified; before this clause existed it
+came back `Verified`, which is the soundness hole the measure closes.
+
+The measure is not inferred, for the same reason the invariant is not: a guessed
+measure is a guessed proof. A loop with no `variant:` is still checked for partial
+correctness, and no termination claim is made for it. A `variant:` with no
+`invariant:` is refused, because the invariant is what locates the loop the measure
+is about.
+
 ### Recursion: a `decreases:` measure
 
 A recursive function is proved by *induction*, not by unrolling. Adding a
@@ -2044,12 +2076,21 @@ says "I could not decide" is worth more than one that guesses.
 
 ### The known gaps, stated
 
-1. **Calls are inlined one level.** A call to a function in the same file is
-   symbolically executed; a call to anything else is `Unknown`. A *self-call* with
-   a `decreases:` measure is the exception: it is answered by the contract by
-   well-founded induction rather than inlined, so a recursive function with a
-   measure is decidable and one without it is reported incomplete at the depth
-   bound.
+1. **Calls are inlined one level, or answered by a contract.** A call to a
+   function in the same file is symbolically executed; a call to a function whose
+   body is *not* in the file but whose contract is -- an `extern` declaration, or
+   any item the dump does not carry a body for -- is answered from that contract:
+   its `requires:` is proved of the call's arguments, its `ensures:` is assumed of
+   the result, and an unsatisfiable postcondition refuses the call as divergent.
+   The precondition obligation is what makes the assumption sound; a call outside
+   the callee's precondition fails rather than being trusted. A callee with no
+   postcondition gives nothing to assume and stays incomplete. A *self-call* with
+   a `decreases:` measure is answered by the same contract route with well-founded
+   induction added, so a recursive function with a measure is decidable and one
+   without it is reported incomplete at the depth bound. A callee whose parameter
+   list the source scanner cannot read (a pattern parameter, a wrapped signature)
+   is refused rather than bound positionally, and a reference argument is refused
+   because there is no aliasing model to carry a write back to the caller.
 2. **The dump is textual.** The frontend parses `--emit=mir` output rather than
    linking `rustc-dev`. That keeps the dependency count at zero and makes the
    input inspectable, but it means a rustc release that changes the pretty-printer
