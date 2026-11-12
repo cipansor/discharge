@@ -10,6 +10,22 @@ cd "$(dirname "$0")/.."
 
 fail() { echo "GATE FAILED: $1" >&2; exit 1; }
 
+# `tests/mir.rs` shells out to a `rustc` named by `VERIF_RUSTC`, and that suite runs in
+# gate 2 -- long before the MIR gate that used to resolve the variable. Resolving it here
+# is what makes `sh scripts/gate.sh` work on a fresh checkout with no setup. Without this,
+# a contributor who follows CONTRIBUTING.md gets 21 failures at gate 2 that read as "the
+# code is wrong" when the truth is "the compiler was never named" -- exactly the confusion
+# `tests/mir.rs` documents itself as avoiding. CI sets it explicitly to a nightly; the
+# fallback is the `rustc` on PATH, which is a stable release and is enough, because the
+# frontend uses `--emit=mir` and not the nightly-only `-Zunpretty=mir`.
+#
+# It must be a *path*, not a toolchain name: the frontend runs it as a subprocess, so a
+# bare `nightly` would look for a binary by that name and fail.
+if [ -z "${VERIF_RUSTC:-}" ] && command -v rustc >/dev/null 2>&1; then
+  VERIF_RUSTC="$(command -v rustc)"
+  export VERIF_RUSTC
+fi
+
 echo "== 1/18 clippy (all targets, std; and the no_std lib) =="
 cargo clippy --workspace --features std --all-targets -- -D warnings || fail "clippy (std)"
 # `--features std` compiles only the host half. Every `#[cfg(not(feature = "std"))]` item --
@@ -112,14 +128,8 @@ echo "== 8/18 MIR frontend, on real rustc MIR =="
 # these tests. Falling back to `rustc` on PATH is what lets the gate run with no setup at all;
 # it used to skip in that case, which left the stable claim unpinned. It skips only when no
 # `rustc` can be found at all, and says so, exactly like Kani and Verus below.
-if [ -z "${VERIF_RUSTC:-}" ]; then
-  if command -v rustc >/dev/null 2>&1; then
-    VERIF_RUSTC="$(command -v rustc)"
-    export VERIF_RUSTC
-    echo "   (VERIF_RUSTC not set; using the rustc on PATH: $VERIF_RUSTC)"
-  fi
-fi
 if [ -n "${VERIF_RUSTC:-}" ]; then
+  echo "   (VERIF_RUSTC=$VERIF_RUSTC)"
   cargo run -q --features std --example mir_demo || fail "MIR demo"
 else
   echo "   (no rustc on PATH and VERIF_RUSTC unset; skipped -- the frontend needs a rustc)"
@@ -286,6 +296,20 @@ RUSTDOCFLAGS="-D warnings" cargo doc -q -p verif --no-deps --all-features \
   || fail "rustdoc warnings (verif, all features)"
 RUSTDOCFLAGS="-D warnings" cargo doc -q -p verif-arithmetic --no-deps \
   || fail "rustdoc warnings (verif-arithmetic)"
+
+# The README is the crate page on crates.io and the only document with a
+# hand-written table of contents. Rustdoc does not read it, so nothing above
+# checks it: a renamed heading leaves a contents entry pointing at an anchor that
+# no longer exists, and the dead link renders as plain text rather than an error.
+# `scripts/check_doc_links.py` resolves every internal anchor and relative file
+# link across the top-level documents -- including a fragment on a link into
+# *another* document, which is where a renamed heading hides -- and leaves
+# external URLs alone (a network check would fail for reasons that have nothing to
+# do with this tree). It is folded into this step rather than given its own number
+# so the "N/18" headings and the gate references scattered through the docs keep
+# meaning what they say.
+python3 scripts/check_doc_links.py \
+  || fail "broken links in the documentation"
 
 echo "== 16/18 the tree ships no build artifacts =="
 # `scripts/gate.sh` runs the oracles, and the oracles run `rustc`, which leaves

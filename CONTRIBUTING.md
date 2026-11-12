@@ -32,9 +32,13 @@ expected to keep them checkable:
   `Outcome`) with `Display`, never a stringly-typed answer.
 - **Documented public API.** The crate denies `missing_docs`, and gate 15
   builds the docs with `-D warnings`, so an intra-doc link to a renamed item is
-  a build failure rather than a dead link on docs.rs.
+  a build failure rather than a dead link on docs.rs. The same step resolves
+  every internal link in `README.md` (`scripts/check_doc_links.py`), so the
+  hand-written contents list cannot rot into dead anchors.
 - **A README example that runs.** `README.md` is the crate's front page on
-  crates.io and its first doctest; keep the flagship example compiling.
+  crates.io and its first doctest; keep the flagship example compiling. The
+  crate-level docs in `src/lib.rs` are the docs.rs front page and carry their own
+  doctests, so `cargo test` runs them too.
 
 ## Before you open a pull request
 
@@ -48,7 +52,8 @@ It must print `ALL GATES GREEN`. The gates are: clippy on both feature sets,
 the test suite with a count that fails on failure, the Ferrocene qualified build
 (skipped when absent), the `no_std` bare-metal build, the zero-dependency check,
 the z3/Kani/Verus/`rustc_public`/Lean/Coq differential oracles, the comparison
-fixtures, the MSRV build on the declared floor, the documentation build, the
+fixtures, the MSRV build on the declared floor, the documentation build (rustdoc
+`-D warnings` plus the `README.md` link check), the
 build-artifact check, the pinned-`unsafe` check, and the build-time zero-cost
 check. A gate that *skips* says so; it is not the same as a gate that passed, and
 the output keeps the two apart.

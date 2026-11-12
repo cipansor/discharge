@@ -23,3 +23,12 @@ exclude = ["*.rlib", "target/", ".sweep/"]
 # else, which is the property the parent's gate 4 enforces.
 [features]
 default = []
+
+# No docs.rs configuration is needed *and* none is possible: with no features and
+# no `cfg`-gated items, the default build is the whole surface, so there is no
+# "silently smaller published docs" failure to prevent here. The parent crate
+# does need `all-features = true` (its `mir` frontend is `std`-gated); this one
+# would only be adding a flag with no reader.
+#
+# Recorded as a comment rather than an empty `[package.metadata.docs.rs]` table,
+# because an empty table is indistinguishable from one someone meant to fill in.

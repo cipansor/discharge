@@ -8192,3 +8192,157 @@ tested with a negative control: `--verify-checkout` fails when the tag is absent
 and when it points at another commit (including one whose version matches);
 `--confirm-index` succeeds on a published crate, retries a 404-then-200, and
 fails a 403 immediately rather than after the timeout.
+
+## The docs.rs front page was three claims behind the code
+
+The crate-level doc comment in `src/lib.rs` is not a comment. It is the page
+docs.rs renders, the first thing a reader sees, and it said the crate "builds
+**four** things" over a table of thirteen modules. Three of the sixteen modules
+were missing from that table entirely -- `macros`, `vc` and `mir` -- so a reader
+who trusted the front page would not learn that the contract vocabulary or the
+real-Rust frontend existed. The `README` had the same class of drift in its own
+module table (`bitblast` was absent, so the SAT fallback appeared from nowhere)
+and pointed at "gate 9" for the `rustc_public` oracle, which is gate 10.
+
+None of this is caught by the gates that existed. `#![deny(missing_docs)]` checks
+that an item *has* documentation, not that the prose about it is true, and
+`cargo doc -D warnings` checks that links resolve, not that the table is complete.
+A count in prose is exactly the kind of claim this repository otherwise refuses to
+leave unchecked, and it had been wrong in the one place with the widest audience.
+
+What changed:
+
+- **`src/lib.rs`** is now a landing page rather than a preamble: what the crate
+  is, three runnable examples (one per proof mechanism, plus a contract), a module
+  map grouped by purpose, the feature-flag table, and the "what this is not"
+  boundary. The "four things" count is gone; the map is grouped so adding a module
+  does not invalidate a number.
+- **`verif-arithmetic/src/lib.rs`** gets the same treatment: the module table it
+  lacked, the `ENUM_BUDGET` honesty boundary stated once, an explicit "no feature
+  flags, and here is why docs.rs needs no metadata" note, and a pointer to when to
+  use the parent crate instead.
+- **`README.md`** gains a grouped table of contents, and its module table is
+  complete. The stale "gate 9" is corrected to gate 10.
+- **`scripts/check_doc_links.py`** resolves every internal anchor and relative
+  file link in the `README`, and gate 15 runs it. This is the part that makes the
+  rest stay true: the contents list is hand-written, so without a check it rots
+  the first time a heading is renamed, and a dead anchor renders as ordinary text
+  rather than an error. It reproduces GitHub's anchor rule (including the
+  duplicate-heading `-1` suffix) rather than approximating it, and it ignores
+  external URLs on purpose -- a network check would fail for reasons that have
+  nothing to do with this tree.
+
+The examples added to `src/lib.rs` are doctests, so `cargo test` executes them:
+`with_fresh` is not `std`-gated, so they run in the default build too. The
+crate-docs now carry three runnable examples where they previously carried one,
+and the suite count moved from 806 to 808 accordingly -- a `+2` and not a `+3`
+because the old single example was replaced rather than kept. That the count
+moved at all is the check that the examples are real and not prose.
+
+## A documentation review found three claims the new docs made that were false
+
+The rewrite above was itself reviewed, and three findings came back. All three
+were real, and two of them were defects in the *checker* and the *docs* rather
+than in the code -- which is the point worth recording: the material that is
+supposed to be authoritative is the material least covered by the gates.
+
+**The link checker dropped the fragment on a cross-document link.** `check`
+partitioned the target into file and fragment, then used only the file part for
+the existence test, so `[Ground rules](CONTRIBUTING.md#missing-heading)` passed
+as long as `CONTRIBUTING.md` existed. A renamed heading in another document is
+exactly the failure the checker was added to catch, and it caught it only for
+same-document links. The fix reads the target file and resolves the fragment
+against its anchors -- the same `anchors()` the same-document path uses -- with
+the target's anchors cached per file, since the README links the same documents
+repeatedly and re-reading them per link would be quadratic. Non-Markdown targets
+(a `.rs`, a `.toml`) have no headings to resolve, so for those the existence
+check remains the whole check. This is a textbook case of a guard that looks
+comprehensive and covers one of the two shapes it must: the same-document branch
+was tested, the cross-document branch was not, and the untested branch is the one
+with the wider reach. The checker now also discovers its inputs (`*.md` at the
+root) instead of taking the README alone, so a document added later is checked
+without anyone remembering to list it.
+
+**`saturating_add`/`saturating_sub` were described as returning `Option`.** The
+table in `verif-arithmetic`'s crate doc grouped them with `checked_add` and said
+"each returns `Option`, and `None` is exactly the case the machine op would have
+wrapped". They return `u32` and clamp. A reader who trusted the table would write
+`if let Some(x) = saturating_add(a, b)`, which does not compile -- the mildest
+outcome available, since the wrong belief is "I will get a `None` and handle it",
+and the whole reason to reach for the saturating form is to not handle it. The
+table now separates the two families by what the caller does with the overflow.
+
+**The third quick-start example demonstrated the runtime solver while the text
+called it type-level.** `proof::Certificate::discharge` calls `smt::prove` and
+returns `Option`; it is the runtime route. The compile-time route is
+`assert_proof!`, which asks for a `proof::Theorem` impl and lets `rustc` refuse.
+The example now uses `assert_proof!(And<Truth, Imp<Truth, Truth>>)`, and the
+"three ways" table names `proof::Theorem` as the entry point, with a paragraph
+that separates the two because they are genuinely easy to confuse -- the module
+row for `proof` said "a Curry-Howard proof kernel plus composable `Certificate`s"
+without saying which of the two the compiler checks. The compile_fail doctests
+already in `proof.rs` are what make `assert_proof!` more than a naming
+convention: they assert that `Falsity` and `Truth => Falsity` do not build.
+
+## `gate.sh` needed an environment variable it did not set itself
+
+Running the gates the way `CONTRIBUTING.md` tells a contributor to run them --
+`sh scripts/gate.sh`, on a fresh checkout, with nothing exported -- failed 21
+tests at gate 2. Every failure was in `tests/mir.rs`, and the message was
+`reads must be present`: a frontend outcome, which reads as "the verifier is
+broken". It is not. `tests/mir.rs` shells out to the compiler named by
+`VERIF_RUSTC`, and the tests that need it are written to skip when it is unset --
+but `verify_src` returns `None` when `rustc()` is `None`, and several tests call
+`.expect("reads must be present")` on that `None`, so they *panic* instead of
+skipping. Whether they skip or panic depends on the assertion each one happens to
+make, which is why the count was 21 and not 239.
+
+`gate.sh` did resolve `VERIF_RUSTC`, but in gate 8 -- the MIR frontend gate --
+and `tests/mir.rs` is run by gate 2. So the variable was set for the gate that
+did not need it and unset for the gate that did. It only ever worked in CI
+because the workflow exports it before calling the script (to a nightly, with a
+comment explaining that it must be a path and not a toolchain name), which means
+the documented local command and the CI command disagreed, and the difference was
+invisible until someone ran the documented one. This is the same defect class as
+the release workflow above: a step correct about its own output and wrong about
+what the next step needs.
+
+The resolution block now sits at the top of the script, before gate 1, and gate 8
+just reports what it resolved. The fallback is `rustc` on `PATH` -- a stable
+release, which is sufficient because the frontend uses `--emit=mir` and not the
+nightly-only `-Zunpretty=mir`. The run below was made with `VERIF_RUSTC` unset to
+exercise exactly the fresh-checkout path that was broken, and all 239 `mir` tests
+pass.
+
+The same review turned up a false positive in the new link checker: it skipped
+fenced code blocks but not inline code spans, so the paragraph you are reading --
+which quotes `[Ground rules](CONTRIBUTING.md#missing-heading)` as the example the
+checker exists to catch -- failed the check. A link in an inline span renders as
+code and is not clickable, so `strip_inline_code` now removes those spans first,
+matching backtick runs of equal length so ``a`b`` is one span.
+
+## A second review found two more, one of them in the fix itself
+
+**`strip_inline_code` accepted a mismatched closing run.** The first version
+found the closer with `str.find("`" * run)`, which matches the *first* backtick of
+a longer run. Markdown closes a code span only on a run of exactly the opening
+length, so `` `[broken](#absent)`` `` is not a span at all -- the link is real and
+clickable -- but `find` paired the single opener with the first backtick of the
+double run, dropped everything between them, and the checker never saw the link.
+The bug was in the direction that matters: not a false alarm but a *silent pass*,
+and it appeared in the very function added to stop broken links slipping through.
+A test with only well-formed backticks cannot see it, which is why the case to
+test is the malformed one.
+
+The closer is now found by measuring each candidate run to its end and accepting
+it only when the length matches, skipping longer and shorter runs whole. The
+property under test is stated as "a link is dropped only when it is inside a real
+code span", and the mismatched pairs are the cases that must keep it.
+
+**The quick-start intro promised something the third example cannot give.** It
+said each of the three returns "a verdict you can inspect". `assert_proof!` runs
+before the program does, so there is no verdict and nothing to inspect -- that is
+the whole difference from the two runtime routes, and the paragraph immediately
+below now says so. The lesson is narrower than the last one: after changing an
+example to be compile-time, the sentence introducing it is still written for the
+runtime version, and prose is not type-checked.
