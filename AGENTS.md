@@ -2855,6 +2855,47 @@ The regression test `a_clause_shaped_doc_comment_that_is_not_a_clause_is_refused
 against the pre-fix code first and fails there with
 `verified (0 obligation(s), 0 panic(s) ruled out)`.
 
+## A loop invariant alone proves only partial correctness; the measure is separate
+
+The invariant path cut a loop at its head and proved `I` on entry and across an
+iteration. That is *partial* correctness: it says the loop is safe if it stops,
+which a loop that never stops satisfies vacuously. Measured before the fix,
+`while i < 5 { i += 0 }` -- a loop that never leaves -- came back `Verified`. The
+tool certified a function that does not return.
+
+The missing piece was the measure, and the shape of the fix is where the care is.
+`variant: <expr>` is a clause of its own, not a second meaning for `invariant:`.
+The measure is evaluated **twice in different states**:
+
+* At the head, over the *havoced* state -- the same fresh locals the invariant was
+  assumed on. This is the value `V` the body's iteration starts from.
+* At the back edge, over the state the body's own symbolic execution produced.
+  This is `V'`, derived rather than restated.
+
+The obligation is then `path => V' < V`. Reading `V` from the *arriving* state
+instead of the havoced one would compare an iteration against the first pass's
+value, which proves the decrease for one iteration rather than for the loop --
+the same mistake the invariant's havoc step exists to prevent, in the measure.
+
+No lower-bound obligation is emitted, and this is deliberate. On a fixed bit width
+a strictly decreasing sequence cannot be infinite, so strictness alone is the
+well-founded basis. A `V >= 0` check would be *wrong* here: the measure is a
+machine word, so a measure that "goes negative" is just a smaller word, which is
+exactly the descent that proves termination. This is the opposite of the recursion
+case, where the measure is over the mathematical integers and non-negativity is
+load-bearing -- so the two `decreases:` checks are not the same check, even though
+both are called "decrease".
+
+The width wall shows up honestly. A `u32` measure bit-blasts to a query larger
+than the engine's diagram budget, so it comes back `Incomplete` rather than
+`Verified`; `u8`/`u16` decide. That is a refusal, not a failure, and it is the same
+budget every other wide query meets.
+
+`variant:` is only taken with an `invariant:`, because the invariant is what
+locates the loop head the measure is evaluated at. An orphan measure is refused
+rather than ignored -- ignoring it would report partial correctness as if it were
+total.
+
 ## A call to `core` made the whole path unknown, and modelling it needed a tag that is a term
 
 The MIR frontend's biggest coverage gap was not a parser shape or a width wall: it was that

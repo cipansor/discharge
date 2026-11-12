@@ -131,6 +131,20 @@ pub struct FnContract {
     /// measures could disagree and picking either would be guessing which proof the
     /// source asked for.
     pub decreases: Vec<String>,
+    /// The loop termination measure, from `/// variant: <expr>`.
+    ///
+    /// Without one, a loop is proved for *partial* correctness only: a divergent
+    /// loop can verify, because nothing says the header is ever left. The measure
+    /// is the well-founded quantity the loop counts down, and it is supplied
+    /// rather than inferred for the same reason an invariant is -- a guessed
+    /// measure is a guessed proof.
+    ///
+    /// The measure is checked against the loop the `invariant:` attaches to, so a
+    /// `variant:` without an `invariant:` is refused rather than silently ignored
+    /// (there would be no loop head to evaluate it at, and no invariant to carry
+    /// it). Like `decreases:`, at most one is taken: two measures could disagree,
+    /// and picking either would be guessing which proof the source asked for.
+    pub variant: Option<String>,
     /// Clause-shaped doc-comment lines that are *not* clauses this frontend
     /// understands, as `(line number, the line as written)`.
     ///
@@ -1854,6 +1868,18 @@ pub fn extract(source: &str) -> Specs {
                 pending.invariants.push(r.trim().to_string());
             } else if let Some(r) = t.strip_prefix("decreases:") {
                 pending.decreases.push(r.trim().to_string());
+            } else if let Some(r) = t.strip_prefix("variant:") {
+                // A loop termination measure. Two would disagree, so a second is
+                // recorded as an unknown clause and the function is refused --
+                // the same discipline as several `invariant:`.
+                if pending.variant.is_some() {
+                    pending.unknown.push((
+                        lineno + 1,
+                        format!("{t} — a second `variant:`; the first is the measure"),
+                    ));
+                } else {
+                    pending.variant = Some(r.trim().to_string());
+                }
             } else if let Some(note) = clause_shaped_word(t) {
                 // A line that reads like a clause but is not one this frontend
                 // takes. A typo (`ensuers:`) would otherwise be dropped and the
@@ -1873,6 +1899,7 @@ pub fn extract(source: &str) -> Specs {
                 || !pending.ensures.is_empty()
                 || !pending.invariants.is_empty()
                 || !pending.decreases.is_empty()
+                || pending.variant.is_some()
                 // A function carrying *only* a clause the frontend does not take
                 // is still recorded, so it can be refused rather than dropped:
                 // dropping it would leave the function unverified with no
@@ -1920,34 +1947,24 @@ pub fn extract(source: &str) -> Specs {
 }
 
 /// A note explaining why a clause-shaped doc-comment line was not taken, when
-/// the line reads like a clause but is not one of the four the frontend accepts.
+/// the line reads like a clause but is not one of the five the frontend accepts
+/// (`requires:`, `ensures:`, `invariant:`, `decreases:`, `variant:`).
 ///
-/// Two shapes reach here and they need different advice:
-///
-/// * A *typo* (`ensuers:`, `requiers:`) is one or two edits from a real keyword,
-///   so the note names the keyword it looks like. This is the dangerous case:
-///   the clause would otherwise be dropped and the function verified without it.
-/// * `variant:` is not a typo -- it is the loop termination measure, which this
-///   frontend does not yet take. The note says so rather than suggesting a
-///   different clause, because a reader who wrote a measure is entitled to be
-///   told the measure is unsupported, not corrected into an invariant.
+/// The shape that reaches here is a *typo*: `ensuers:` and `requiers:` are one
+/// transposition from a real keyword. That is the dangerous case, because the
+/// clause would otherwise be dropped and the function verified without it -- a
+/// postcondition that is never checked reads as a green report. The note names
+/// the keyword the line looks like.
 ///
 /// Ordinary prose (`direction:`, `type:`) is more than two edits from every
 /// keyword and is left as documentation, so a sentence that merely contains a
 /// colon does not fire this.
 fn clause_shaped_word(t: &str) -> Option<String> {
-    const KEYWORDS: [&str; 4] = ["requires", "ensures", "invariant", "decreases"];
+    const KEYWORDS: [&str; 5] = ["requires", "ensures", "invariant", "decreases", "variant"];
     let word = t.split(':').next()?.trim();
     // A clause keyword is a bare identifier; anything else is prose or a value.
     if word.is_empty() || !word.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
         return None;
-    }
-    if word == "variant" {
-        return Some(
-            "`variant:` (a loop termination measure) is not supported yet; the loop would be \
-             checked for partial correctness only"
-                .to_string(),
-        );
     }
     KEYWORDS
         .into_iter()

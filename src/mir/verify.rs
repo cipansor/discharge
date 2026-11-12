@@ -254,6 +254,29 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         },
     };
 
+    // The loop termination measure, if the contract carries one. A `variant:`
+    // without an `invariant:` is refused rather than ignored: the measure has no
+    // loop head to be evaluated at (the invariant is what locates the loop), so
+    // taking it would mean guessing which loop it is about. Ignoring it silently
+    // would be worse still -- the reader wrote a termination claim and the tool
+    // would report partial correctness as if it were total.
+    let variant: Option<&str> = match contract {
+        None => None,
+        Some(c) => match c.variant.as_deref() {
+            None => None,
+            Some(v) => {
+                if c.invariants.is_empty() {
+                    return FnOutcome::Skipped {
+                        reason: "a `variant:` was declared with no `invariant:`; the measure \
+                                 needs the loop the invariant locates"
+                            .to_string(),
+                    };
+                }
+                Some(v)
+            }
+        },
+    };
+
     // Build the precondition. No contract means `true`, which is the right
     // default: a function with no `requires` is checked for panic freedom on
     // every input.
@@ -520,7 +543,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         f,
         pre,
         post,
-        invariant,
+        exec::LoopSpec { invariant, variant },
         &exec::Seeds {
             fields: fields.seeds.clone(),
             nested: fields.nested_seeds.clone(),

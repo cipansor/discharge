@@ -3449,6 +3449,99 @@ fn a_leaf_write_inside_an_element_is_read_back() {
     }
 }
 
+/// A `variant:` measure turns partial correctness into total correctness.
+///
+/// Without a measure a loop is only proved for *partial* correctness: a divergent
+/// loop verifies, because nothing says the header is ever left. With one, the back
+/// edge also proves `I && guard => V' < V`, and on a fixed bit width a strictly
+/// decreasing sequence cannot be infinite -- so the loop must stop.
+///
+/// The negative twins are the point. `a_loop_that_cannot_terminate_fails` is the
+/// soundness check: before the measure existed the divergent loop *verified*, and
+/// the whole reason to add the feature is that this must not happen.
+#[test]
+fn a_variant_measure_proves_loop_termination() {
+    // A real countdown loop: the measure decreases every iteration, so the
+    // termination obligation is discharged. `u8`/`u16` are used because the
+    // bit-blasted query for a 32-bit measure is larger than the engine's diagram
+    // budget -- that is a refusal, not a failure, and it is the same budget that
+    // bounds every other wide query.
+    let ok = verify_src(
+        "f",
+        "/// invariant: i <= n\n/// variant: n - i\n/// ensures: ret == n\n\
+         pub fn f(n: u8) -> u8 { let mut i = 0u8; while i < n { i += 1; } i }\n",
+    );
+    let Some(o) = ok else { return };
+    assert!(o.is_verified(), "a decreasing measure must prove termination; got: {o}");
+}
+
+/// A loop whose body never advances the measure is *not* proved, and the failure
+/// names the termination obligation rather than a postcondition.
+///
+/// This is the case the feature exists for. `while i < 5 { i += 0 }` never leaves
+/// the loop, so a tool that reports it `Verified` is certifying a function that
+/// does not return. Before `variant:` the loop had no termination obligation at
+/// all and came back `Verified`; now the measure `i` is proved not to decrease and
+/// the function fails.
+#[test]
+fn a_loop_that_cannot_terminate_fails() {
+    let div = verify_src(
+        "f",
+        "/// invariant: i >= 0\n/// variant: i\n/// ensures: ret == 0\n\
+         pub fn f(n: u32) -> u32 { let _ = n; let mut i = 0u32; while i < 5 { i += 0; } i }\n",
+    );
+    let Some(o) = div else { return };
+    assert!(!o.is_verified(), "a divergent loop must not verify; got: {o}");
+    match &o {
+        FnOutcome::Failed { kind, .. } => {
+            assert!(kind.contains("variant"), "the failure names termination; got: {kind}")
+        }
+        other => panic!("expected a termination failure, got: {other}"),
+    }
+}
+
+/// A measure that moves the wrong way fails, so the obligation is a real proof
+/// and not a restatement of the invariant.
+#[test]
+fn a_measure_that_increases_fails() {
+    let wrong = verify_src(
+        "f",
+        "/// invariant: i <= n\n/// variant: i\n/// ensures: ret == n\n\
+         pub fn f(n: u8) -> u8 { let mut i = 0u8; while i < n { i += 1; } i }\n",
+    );
+    let Some(o) = wrong else { return };
+    assert!(!o.is_verified(), "an increasing measure must fail; got: {o}");
+}
+
+/// Without a measure the loop is still checked, for partial correctness: the
+/// invariant and the postcondition are proved exactly as before, and no
+/// termination claim is made. Adding the feature must not make the measure
+/// mandatory.
+#[test]
+fn a_loop_without_a_measure_is_still_verified_for_partial_correctness() {
+    let partial = verify_src(
+        "f",
+        "/// invariant: i <= n\n/// ensures: ret == n\n\
+         pub fn f(n: u8) -> u8 { let mut i = 0u8; while i < n { i += 1; } i }\n",
+    );
+    let Some(o) = partial else { return };
+    assert!(o.is_verified(), "partial correctness must still be proved; got: {o}");
+}
+
+/// A measure with no invariant has no loop to attach to, so it is refused rather
+/// than ignored -- an ignored measure would report partial correctness as if it
+/// were total.
+#[test]
+fn a_measure_without_an_invariant_is_refused() {
+    let orphan = verify_src(
+        "f",
+        "/// variant: n\n/// ensures: ret == 5\npub fn f(n: u32) -> u32 { let _ = n; 5 }\n",
+    );
+    let Some(o) = orphan else { return };
+    assert!(!o.is_verified(), "an orphan measure must not verify; got: {o}");
+    assert!(matches!(o, FnOutcome::Skipped { .. }), "expected a refusal; got: {o}");
+}
+
 /// A clause-shaped doc comment that is not a clause is refused, not dropped.
 ///
 /// `/// ensuers: ret == 99` used to be discarded: the function then had no
@@ -3477,13 +3570,12 @@ fn a_clause_shaped_doc_comment_that_is_not_a_clause_is_refused() {
     assert!(o.to_string().contains("ensuers"), "the refusal names the line; got: {o}");
     assert!(o.to_string().contains("ensures"), "and suggests the keyword; got: {o}");
 
-    let measure = verify_src(
-        "g",
-        "/// invariant: i <= n\n/// variant: n - i\n/// ensures: ret == n\n\
-         pub fn g(n: u32) -> u32 { let mut i = 0u32; while i < n { i += 1; } i }\n",
-    );
-    let Some(o) = measure else { return };
-    assert!(!o.is_verified(), "an unsupported `variant:` must not pass silently; got: {o}");
+    // `variant:` is a *supported* clause, so it is no longer a near miss. A
+    // measure with no invariant is still refused, because the invariant is what
+    // locates the loop the measure is about.
+    let orphan = verify_src("g", "/// variant: n\n/// ensures: ret == 5\npub fn g(n: u32) -> u32 { let _ = n; 5 }\n");
+    let Some(o) = orphan else { return };
+    assert!(!o.is_verified(), "an orphan measure must not pass silently; got: {o}");
     assert!(o.to_string().contains("variant"), "the refusal names it; got: {o}");
 
     // Prose is left alone. `direction:` is three edits from `decreases`, so it is

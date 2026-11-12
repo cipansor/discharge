@@ -174,6 +174,11 @@ pub enum ObligationKind {
     /// The declared loop invariant is left true by one iteration. This is the
     /// step of the induction.
     LoopInvariantPreserve,
+    /// The `variant:` measure strictly decreases across one iteration. This is
+    /// the well-founded basis for *total* correctness: without it the invariant
+    /// only shows the loop is safe if it terminates, which a divergent loop
+    /// satisfies vacuously.
+    LoopVariant,
     /// A recursive call's arguments satisfy the function's own precondition. The
     /// call is not inlined, so the contract is *assumed* -- and the precondition is
     /// what makes that assumption an induction hypothesis rather than a
@@ -194,6 +199,7 @@ impl std::fmt::Display for ObligationKind {
             ObligationKind::VacuousPrecondition => write!(f, "vacuous precondition"),
             ObligationKind::LoopInvariantInit => write!(f, "loop invariant holds on entry"),
             ObligationKind::LoopInvariantPreserve => write!(f, "loop invariant preserved"),
+            ObligationKind::LoopVariant => write!(f, "loop variant decreases"),
             ObligationKind::RecursivePrecondition => {
                 write!(f, "recursive call satisfies the precondition")
             }
@@ -249,6 +255,7 @@ impl Obligation {
             ObligationKind::Postcondition
             | ObligationKind::LoopInvariantInit
             | ObligationKind::LoopInvariantPreserve
+            | ObligationKind::LoopVariant
             | ObligationKind::RecursivePrecondition
             | ObligationKind::RecursiveDecreases => self.verdict.is_proved(),
             ObligationKind::Panic { .. } | ObligationKind::Unreachable => {
@@ -302,6 +309,7 @@ impl Obligation {
                 | ObligationKind::VacuousPrecondition
                 | ObligationKind::LoopInvariantInit
                 | ObligationKind::LoopInvariantPreserve
+                | ObligationKind::LoopVariant
                 | ObligationKind::RecursivePrecondition
                 | ObligationKind::RecursiveDecreases => {
                     "invalid: a `Valid` verdict is a discharge for this kind".to_string()
@@ -317,6 +325,7 @@ impl Obligation {
                 // established (or re-established), so the loop proves nothing.
                 ObligationKind::LoopInvariantInit
                 | ObligationKind::LoopInvariantPreserve
+                | ObligationKind::LoopVariant
                 | ObligationKind::RecursivePrecondition
                 | ObligationKind::RecursiveDecreases => {
                     "the property holds for no input (false on every input)".to_string()
@@ -1951,6 +1960,16 @@ struct State {
     /// header is assumed to satisfy the invariant on entry and the back edge is
     /// checked against it instead of being unwound.
     cut: Option<Cut>,
+    /// The `variant:` measure as evaluated at the loop head, with its signedness.
+    ///
+    /// Set when the entry edge havocs the written locals and assumes the
+    /// invariant, so it is the measure over *any* header state satisfying `I` --
+    /// the same state the body then runs from. The back edge compares the measure
+    /// there against the value here, and the two are related by the body's own
+    /// symbolic execution, which is what makes the decrease an induction step
+    /// rather than a restatement. `None` when the loop has no measure, or on a
+    /// path that has not yet passed the header.
+    variant_entry: Option<(Var, bool)>,
 }
 
 /// A loop that is proved by its invariant rather than by unwinding.
@@ -1997,6 +2016,28 @@ struct Cut {
     /// The invariant's text, re-evaluated in the post-state of each incoming
     /// edge, because only the executor knows what the locals hold there.
     text: String,
+    /// The `variant:` measure's text, when the loop carries one.
+    ///
+    /// `None` means partial correctness only. With a measure, the back edge also
+    /// proves `I && guard => V' < V` and `I && guard => V' >= 0`, which is what
+    /// turns "the loop is safe if it stops" into "it stops".
+    variant: Option<String>,
+}
+
+/// The loop clauses a function carries: its invariant, and its optional measure.
+///
+/// Bundled rather than passed as two arguments because they always travel
+/// together and are meaningful only together: the invariant locates the loop head,
+/// and the measure is evaluated at that head. Two bare `Option<&str>` parameters
+/// would let a caller swap them, and a swapped pair would evaluate the invariant
+/// as a measure -- a type error at best, and at worst a well-typed expression that
+/// silently proves the wrong thing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LoopSpec<'a> {
+    /// The `invariant:` text, or `None` when the function has no loop contract.
+    pub invariant: Option<&'a str>,
+    /// The `variant:` text, or `None` for partial correctness only.
+    pub variant: Option<&'a str>,
 }
 
 /// Symbolic inputs a contract names, handed to the executor so that the
@@ -2126,7 +2167,7 @@ pub fn verify_fn<F>(
     f: &MirFn,
     pre: Option<Pred>,
     post: Option<F>,
-    invariant: Option<&str>,
+    loops: LoopSpec<'_>,
     seeds: &Seeds,
     rec: Option<Recursion>,
 ) -> MirReport
@@ -2327,12 +2368,19 @@ where
     // the walk starts, and a function with an invariant but no detectable back
     // edge is refused rather than silently unwound: the contract made a claim
     // and the tool must either honour it or say it could not.
-    let cut = match invariant {
+    let cut = match loops.invariant {
         None => None,
         Some(text) => match detect_loop(f) {
             Some((header, back_edges)) => {
                 let havoc = loop_writes(f, header);
-                Some(Cut { func: root, header, back_edges, havoc, text: text.to_string() })
+                Some(Cut {
+                    func: root,
+                    header,
+                    back_edges,
+                    havoc,
+                    text: text.to_string(),
+                    variant: loops.variant.map(str::to_string),
+                })
             }
             None => {
                 report.unknown_paths.push(
@@ -2381,6 +2429,7 @@ where
         visits: BTreeMap::new(),
         depth: 0,
         cut,
+        variant_entry: None,
     }];
 
     let mut explored: usize = 0;
@@ -3367,6 +3416,53 @@ fn advance(
         kind,
         verdict: prove_obligation(st.path, inv, pins),
     });
+    // Termination, at the back edge and only there. The measure is read *now*,
+    // after the body has run, and compared against the value at the head: the
+    // obligation is `path => V' < V`, where `V'` came out of the body's own
+    // symbolic execution and `V` was evaluated over a havoced header state. That
+    // is what makes it an induction step rather than a restatement. The relation
+    // is strict and, on a fixed bit width, that is enough on its own: a strictly
+    // decreasing sequence in a finite domain cannot be infinite, so no separate
+    // lower-bound check is needed -- and one would be *wrong* here, because the
+    // measure is a machine word, where "going negative" is just a smaller word,
+    // which is exactly the descent that proves termination.
+    if back {
+        if let Some(vtext) = cut.variant.clone() {
+            match st.variant_entry {
+                None => report.unknown_paths.push(
+                    "a loop `variant:` was declared but the loop head was never entered, so \
+                     there is no measure at the head to compare against"
+                        .into(),
+                ),
+                Some((v_entry, entry_signed)) => {
+                    match eval_measure_here(cur, &st.env, &vtext) {
+                        Ok((after, after_signed)) => {
+                            if after_signed != entry_signed || smt::bits(after) != smt::bits(v_entry)
+                            {
+                                report.unknown_paths.push(
+                                    "the loop `variant:` measure changed type across an iteration"
+                                        .into(),
+                                );
+                            } else {
+                                let decreases = if entry_signed {
+                                    smt::slt(after, v_entry)
+                                } else {
+                                    smt::ult(after, v_entry)
+                                };
+                                report.obligations.push(Obligation {
+                                    kind: ObligationKind::LoopVariant,
+                                    verdict: prove_obligation(st.path, decreases, pins),
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            report.unknown_paths.push(format!("unreadable `variant`: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
     // The cut closes here. A back edge is not followed: the assertion above is
     // the induction step, and re-entering the header would be the unwinding this
     // replaces.
@@ -3405,7 +3501,33 @@ fn advance(
         }
     };
     st.path = smt::and(st.path, inv);
+    // The measure at the head, over the same havoced state the invariant was
+    // assumed on. Reading it here rather than from the arriving state is what
+    // makes the back-edge comparison an induction step: the head is *any* state
+    // satisfying `I`, not the one the first pass happened to produce.
+    if let Some(vtext) = &cut.variant {
+        st.variant_entry = match eval_measure_here(cur, &st.env, vtext) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                report.unknown_paths.push(format!("unreadable `variant`: {e}"));
+                return;
+            }
+        };
+    }
     work.push(State { block: target, ..st });
+}
+
+
+/// Evaluate a `variant:` measure in the current state, as a value with its sign.
+///
+/// The loop counterpart of [`eval_invariant_here`]: a measure is an expression
+/// rather than a proposition, so it is read with the measure parser and returns
+/// the term and its signedness together. Sharing the parse with
+/// [`measure_signed`] is what keeps the value and its relation consistent.
+fn eval_measure_here(f: &MirFn, env: &Env, text: &str) -> Result<(Var, bool), String> {
+    let names = invariant_names(f, env);
+    crate::mir::spec::eval_measure(text, &names, &signed_names(f), &env.consts)
+        .map_err(|e| e.to_string())
 }
 
 /// Answer a modelled `core::num` call, if the callee is one.
@@ -4343,6 +4465,7 @@ where
                         visits: st.visits,
                         depth: st.depth.saturating_sub(1),
                         cut,
+                        variant_entry: None,
                     });
                 }
             }
@@ -4418,6 +4541,7 @@ where
                     frame: st.frame.clone(),
                     depth: st.depth,
                     cut: st.cut.clone(),
+                    variant_entry: st.variant_entry,
                 };
                 advance(prog, next, *target, report, work, pins);
             }
@@ -4439,6 +4563,7 @@ where
                 frame: st.frame.clone(),
                 depth: st.depth,
                 cut: st.cut.clone(),
+                variant_entry: st.variant_entry,
             };
             advance(prog, next, *otherwise, report, work, pins);
         }
@@ -4796,6 +4921,7 @@ where
                 // A callee is a different function with its own locals, so the
                 // caller's loop cut does not apply inside it.
                 cut: None,
+                variant_entry: None,
             });
         }
         Term::Unknown(text) => {

@@ -1431,6 +1431,38 @@ so the state after the loop is *any* state satisfying the invariant and the exit
 condition, not the state of the first pass. Omitting that step would prove false
 postconditions; `AGENTS.md` records the measured case.
 
+### Termination: a `variant:` measure
+
+An invariant alone proves *partial* correctness: the loop is safe **if** it stops,
+which a loop that never stops satisfies vacuously. A `variant:` line names the
+quantity the loop counts down, and turns that into *total* correctness:
+
+```rust,ignore
+/// invariant: i <= n
+/// variant: n - i
+/// ensures: ret == n
+pub fn count_to(n: u8) -> u8 {
+    let mut i = 0u8;
+    while i < n { i += 1; }
+    i
+}
+```
+
+At the back edge the measure after one iteration is compared against the value at
+the head, and the obligation is `I && guard => V' < V`. On a fixed bit width a
+strictly decreasing sequence cannot be infinite, so no separate lower bound is
+needed — and adding one would be wrong, because the measure is a machine word,
+where "going negative" is just a smaller word, which is the descent that proves
+termination. `while i < 5 { i += 0 }` is therefore reported as a failure on
+`loop variant decreases` rather than as verified; before this clause existed it
+came back `Verified`, which is the soundness hole the measure closes.
+
+The measure is not inferred, for the same reason the invariant is not: a guessed
+measure is a guessed proof. A loop with no `variant:` is still checked for partial
+correctness, and no termination claim is made for it. A `variant:` with no
+`invariant:` is refused, because the invariant is what locates the loop the measure
+is about.
+
 ### Recursion: a `decreases:` measure
 
 A recursive function is proved by *induction*, not by unrolling. Adding a
