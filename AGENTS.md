@@ -8685,3 +8685,195 @@ The pattern in four of the six is the same: a value was *available* and the wron
 one was used, or a case was folded into a neighbour that shares its shape. The two
 false proofs are the receiver-in-the-slot-list and the empty-return-type cases --
 both places where "read what is there" quietly became "assume what is not".
+
+## `assert!` was a dropped path, not a check -- and the shape behind it
+
+The sixth review fixed the trait-contract route. This one came from asking a
+different question: *what ordinary Rust does the frontend still refuse?* A probe
+of a dozen idioms found the answer was `assert!`, the most common safety guard in
+the language.
+
+`assert!(x <= 200)` lowers to a `switchInt` that routes the *failing* case into
+
+```
+_3 = core::panicking::panic(const "assertion failed: x <= 200") -> unwind continue;
+```
+
+There is no `[return: bbN]` arm, because the call never returns. The parser looked
+only for the `[return:` shape, so the terminator came back
+`Term::Unknown("missing")`, the block's path was reported unmodelled, and the whole
+function was `Incomplete`. Nothing was *wrong* -- but nothing was checked either,
+and a verifier that silently skips the guards you wrote is worse than one that
+refuses loudly.
+
+**The fix is the sound direction, and it is the same shape as `wp`'s
+`DivergentCall`.** A construct that cuts a path off must be *recorded*, because
+everything downstream of it is vacuously true -- the lesson this file already
+carries three times (`Assume(false)`, an unsatisfiable precondition, a
+never-returning call). So the diverging call becomes a **panic obligation**: the
+query is `path`, "is this call reachable", discharged by `Unsat`, exactly the
+polarity of an `assert` terminator. The `switchInt` that routes into the call
+already carries `!guard` in its path, so the query is really about the guard. An
+`assert!` under a precondition that implies it is `Verified`; without one it is
+`Failed` with the counterexample that fires it (`x = 224` for `x <= 200`), and the
+report names the assertion from the message the dump passes (a string literal, or
+the pieces of the `core::fmt` chain in edition 2024).
+
+Two details that were not obvious:
+
+* **A user function returning `!` lowers the same way** -- `_3 = die() -> unwind
+  continue`, no return arm. The model treats it identically, so
+  `if x == 0 { die(); }` is a failure at `x == 0` and is proved unreachable under
+  `requires: x != 0`. This is why the obligation kind is `DivergingCall`, not
+  `Panic`: only some of these are panics, and calling `die` a panic would be a
+  small lie in the report.
+* **The `assert` *terminator* and the `assert!` *macro* are different lowerings.**
+  The overflow checks rustc emits are `Term::Assert`, which already assumed the
+  guard on the fall-through. The macro is a `switchInt` plus a diverging call, so
+  the assumption had to be made by the branch, not by the call -- the guard lives
+  in the *other* arm's path. `an_assert_guard_is_assumed_by_the_code_after_it`
+  pins it: without the assumption `x + 1` after `assert!(x <= 200)` reports a
+  possible overflow.
+
+The tests are a matched pair, because a fix for a dropped path is exactly the kind
+that can flip into a blanket failure: one pins the proof, one pins the refutation.
+
+### The oracle's own argument list was the first thing the new cases caught
+
+Adding a `panic!` to the regression corpus made gate 10 fail:
+
+```
+panic_guarded:
+  text : 3 blocks, panics []
+  typed: 4 blocks, panics []
+```
+
+The parser was right. The *oracle* was comparing two different compilations of one
+file: `emit_mir` passed `--crate-type=lib --emit=mir` and **no edition**, so rustc's
+default applied -- and the default is 2015, not the 2024 the crate itself is on --
+while the typed side pinned `--edition 2021`. `panic!("literal")` lowers to a single
+diverging call, `core::panicking::panic(const "…")`, under 2015; under 2021 or 2024
+it lowers to `Arguments::from_str(…) -> [return: bb2, …]` plus
+`std::rt::panic_fmt(…)`, one extra basic block. The oracle's comment claimed its
+argument list "mirrors what the text emitter passes" -- it did not, and nothing had
+exercised the difference until a `panic!` with a literal entered a corpus the oracle
+checks.
+
+This is the failure mode the oracle exists to prevent, one level up: a comparison
+between two things that are not the same thing is not evidence, and it is worse
+than no comparison because it reports a disagreement that cannot be acted on.
+
+The fix pins the edition to **2024** on *both* sides rather than leaving either to
+rustc's default. Pinning only one side is what caused the bug; leaving both
+implicit would have made the tool's behaviour depend on which compiler's default it
+happened to run under, which is exactly the kind of hidden input this crate refuses
+elsewhere. 2024 is the crate's own edition (`Cargo.toml`), it is what the test
+suite's `unsafe extern "C"` fixtures already require, and it compiles both corpora
+clean on the MSRV (1.85) and on stable (1.99) -- checked, not assumed. The only
+difference between the two compilations now is text versus typed IR.
+
+The lesson is the same one this file keeps recording, in a new place: a harness
+that *asserts* a property it does not itself establish will eventually assert it
+about itself. The oracle's check of the parser was sound; the oracle's own inputs
+were not held to the standard it held the parser to.
+
+### What the same probe found and did *not* fix
+
+A `for` loop is still refused, and now says so in the known gaps: `for x in 0..n`
+lowers to `IntoIterator::into_iter` and `Iterator::next(&mut range)`. `next` is the
+harder half -- it is a trait method that *writes through* its `&mut` argument, so
+modelling it needs the `&mut` write-back the crate does not have (a reference
+argument is refused for that reason). A `while` loop with `invariant:`/`variant:`
+states the same iteration and is strictly stronger: the measure gives total
+correctness where an unwound `for` gives a bounded check. The gap is documented
+rather than papered over, and the report names the unmodelled call so it is visible
+rather than silent.
+
+## Recovering an edition-2024 `panic!` message: `core::fmt` is a two-spelling chain
+
+The diverging-call fix above made `panic!` *checked*. It did not make it
+*readable*: the report named the panic from a string literal operand, and edition
+2024 has no such operand. `panic!("zero")` under 2024 lowers to
+
+```
+_4 = Arguments::<'_>::from_str(const "zero") -> [return: bb2, unwind continue];
+_3 = std::rt::panic_fmt(move _4) -> unwind continue;
+```
+
+so the message is a *local* the chain built, not an argument. Reading it needs a
+small model of `core::fmt`, and the model is where the two toolchains the gate
+runs diverge.
+
+**Four spellings, and the gate runs two of them.** The builders are:
+
+| Spelling | Toolchain | Message source |
+| --- | --- | --- |
+| `Arguments::from_str(const "…")` | both | the literal, one piece |
+| `Arguments::new_const::<P>(&PIECES)` | 1.85 (MSRV) | a promoted `&[&str; P]`, no arguments |
+| `Arguments::new_v1::<P, A>(&PIECES, &ARGS)` | 1.85 (MSRV) | the same promoted array, `A` arguments |
+| `Arguments::new::<LEN, A>(const b"…", &ARGS)` | stable (1.99) | one encoded byte template |
+
+The last two are the same source text compiled by two compilers, so a model that
+answers only one of them is a model that is green on one toolchain and
+`Incomplete` on the other -- which is exactly what the MSRV run reported while
+stable was green. Both are answered.
+
+**Three details that are not obvious, and each cost a round trip.**
+
+* **The promoted array is not reachable by walking a body.** The pieces live in a
+  `const f::promoted[0]: &[&str; 1] = { … }` item printed *outside* any function,
+  and the call passes `&_4` where `_4 = const f::promoted[0]`. The executor never
+  walks that item, so the pieces are collected at parse time, next to the other
+  `const` items, into `MirProgram::promoted_strs` -- the one place in this frontend
+  where a fact is read from the dump rather than from the function's own body, and
+  it is read from the *same* dump so the two cannot drift.
+* **A whole-place write forgets the destination's parts.** The pieces are recorded
+  on the local the reference was assigned to, and the obvious place to record them
+  -- inside `eval_rvalue` -- is wrong: the `set` that follows calls `forget_parts`,
+  which clears `piece_sets` (it must, or a stale read of an overwritten local would
+  be a *wrong* message). The record therefore happens in the `Stmt::Assign` arm
+  *after* `set`, which is the only ordering that survives.
+* **The byte template arrives through a local too.** On stable the template is
+  `_9 = const b"\x04bad \xc0\x00"` and then `new::<7, 1>(move _9, …)`, so it is
+  kept raw in `tmpl_bytes` and decoded by the consuming call -- the decode needs
+  the argument count, which only the call has.
+
+**The placeholder count is the argument count, not the piece count.** This is the
+one that produced a wrong *message* rather than a missing one.
+`panic!("{} tail", x)` prints `["", " tail"]` with **one** argument, so a join that
+put a `{}` in every gap would report `{} tail{}` for a message with one
+placeholder -- a message that is not the one in the source, which is worse than
+naming none. `join_format_pieces(pieces, args)` therefore takes the count from the
+generic list (`new_v1::<P, A>` -> `A`, `new::<LEN, A>` -> `A`, `new_const` -> 0)
+and appends the surplus placeholders after the last piece. `generic_arg` refuses a
+missing or non-numeric item rather than guessing, so a printer change surfaces as
+"unmodelled", not as a wrong message.
+
+**The guard is the destination's type, not the callee's name.** `new_const` and
+friends are printed *unqualified* (`Arguments::<'_>::new_const::<1>`), so a name
+cannot tell `core`'s builder from a local function called `new`; the destination
+type `std::fmt::Arguments<'_>` can, and no other call has it. The consumer
+(`std::rt::panic_fmt`) *is* qualified, so its guard is on the name. Both
+directions of a misjudgement are a refusal: a local `new` is left to its own body,
+and an unknown `core::fmt` call stays "unmodelled".
+
+The tests are a matched pair again, and they run under whichever toolchain
+`VERIF_RUSTC` names -- so the 1.85 `new_v1`/promoted-array spelling and the stable
+`new::<LEN, A>` byte-template spelling are both exercised by the gate's two
+toolchains rather than by one machine's luck.
+
+**A name must never be reported as its type arguments.** `panic!("{}", x)` has no
+literal piece at all -- there is nothing to recover -- so the report falls back to
+the callee's name, and the naive `name.rsplit("::").next()` gave `<u8>` for
+`panic_display::<u8>` / `panic_cold_display::<u8>`. That is the mangled path the
+message recovery exists to avoid, just reached from the other side. The fallback
+now goes through the same generic-stripping helper the `core::fmt` dispatch uses,
+so it reads `panic_display`, and `unreachable!()` / `todo!()` -- which *do* pass a
+literal, `"internal error: entered unreachable code"` / `"not yet implemented"` --
+keep naming the text the programmer wrote. The three are pinned together so a
+change aimed at the formatted case cannot quietly regress the plain one.
+
+One more fail-closed turn: the `panic_fmt` consumer used to record an *empty*
+message when its argument was not a local it knew, which would print `panic: ` with
+nothing after it. It now refuses, so the report names the call it could not model
+instead of showing a blank message.

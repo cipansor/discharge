@@ -200,6 +200,19 @@ pub enum ObligationKind {
     /// refusing is what keeps "the program cannot get past this call" from being
     /// read as a proof of what follows it.
     CalleeDiverges,
+    /// A call that never returns, reached on this path.
+    ///
+    /// `panic!`, `assert!`, `unwrap`, the bounds checks rustc inserts, and any
+    /// user function returning `!` all lower to a call with no `[return: bbN]`
+    /// arm: the path ends there. It is a *reachable failure*, so the obligation is
+    /// "is this call reachable", discharged by `Unsat`. Treating it as a dropped
+    /// line instead lost the whole path -- an `assert!` was never checked, and a
+    /// function whose safety rested on one came back `Incomplete`.
+    DivergingCall {
+        /// The panic message, when the dump passed one as a string literal; the
+        /// callee's name otherwise. It is what names the failure in the report.
+        message: String,
+    },
 }
 
 impl std::fmt::Display for ObligationKind {
@@ -224,6 +237,7 @@ impl std::fmt::Display for ObligationKind {
             ObligationKind::CalleeDiverges => {
                 write!(f, "the callee's postcondition is unsatisfiable")
             }
+            ObligationKind::DivergingCall { message } => write!(f, "panic: {message}"),
         }
     }
 }
@@ -278,9 +292,9 @@ impl Obligation {
             | ObligationKind::RecursiveDecreases
             | ObligationKind::CalleePrecondition
             | ObligationKind::CalleeDiverges => self.verdict.is_proved(),
-            ObligationKind::Panic { .. } | ObligationKind::Unreachable => {
-                matches!(self.verdict, Verdict::Unsat)
-            }
+            ObligationKind::Panic { .. }
+            | ObligationKind::Unreachable
+            | ObligationKind::DivergingCall { .. } => matches!(self.verdict, Verdict::Unsat),
             ObligationKind::VacuousPrecondition => {
                 !matches!(self.verdict, Verdict::Unsat | Verdict::Unknown)
             }
@@ -319,7 +333,9 @@ impl Obligation {
             Verdict::Valid => match self.kind {
                 // A panic query is `path => can_happen`; `Valid` means it always
                 // happens, and there is no single witness to name.
-                ObligationKind::Panic { .. } | ObligationKind::Unreachable => {
+                ObligationKind::Panic { .. }
+                | ObligationKind::Unreachable
+                | ObligationKind::DivergingCall { .. } => {
                     "holds for every input (the failure fires on all of them)".to_string()
                 }
                 // A postcondition or invariant query is `path => P`; `Valid` is
@@ -360,7 +376,9 @@ impl Obligation {
                         .to_string()
                 }
                 // The good answer for a reachability query, so this is a discharge.
-                ObligationKind::Panic { .. } | ObligationKind::Unreachable => {
+                ObligationKind::Panic { .. }
+                | ObligationKind::Unreachable
+                | ObligationKind::DivergingCall { .. } => {
                     "invalid: an `Unsat` verdict is a discharge for this kind".to_string()
                 }
                 // The precondition describes no input, so the contract is vacuous.
@@ -588,6 +606,32 @@ struct Env {
     /// contract's comparison was checked at, instead of widening a small tag to
     /// 64.
     tag_widths: BTreeMap<u32, u8>,
+    /// The rendered `format_args!` message each local holds, keyed by local.
+    ///
+    /// A `panic!` message is not a literal in edition 2024: it is a
+    /// `fmt::Arguments` value built by a chain of `core::fmt` calls, and the
+    /// `panic_fmt` that consumes it is a *diverging* call whose only argument is a
+    /// local. Without a store for the message the report could only name the
+    /// mangled callee, so this carries the finished message from where it is built
+    /// to where it is consumed. Only string-valued locals are ever inserted.
+    strs: BTreeMap<u32, String>,
+    /// The *pieces* each local holds, keyed by local, for a local that carries a
+    /// promoted `&[&str]`.
+    ///
+    /// The pieces are kept apart from [`Self::strs`] because the number of
+    /// placeholders is not known until the `Arguments` call that consumes them
+    /// says how many arguments it was given: the same pieces render `"zero "` for
+    /// `new_const` and `"zero {}"` for `new_v1::<1, 1>`. Joining early would bake
+    /// in the wrong count.
+    piece_sets: BTreeMap<u32, Vec<String>>,
+    /// The `b"…"` template each local holds, keyed by local, for the `new::<LEN, A>`
+    /// spelling. Kept raw -- not decoded -- because the decode needs the argument
+    /// count, which only the consuming call knows.
+    tmpl_bytes: BTreeMap<u32, Vec<u8>>,
+    /// The string pieces of each `promoted` constant, copied from
+    /// [`crate::mir::parse::MirProgram::promoted_strs`] so `eval_rvalue` can read
+    /// a `const NAME::promoted[0]` operand without the whole program in hand.
+    promoted: BTreeMap<String, Vec<String>>,
 }
 
 /// A modelled value with a length and elements: a slice or an array.
@@ -659,13 +703,22 @@ impl Env {
             enums: BTreeMap::new(),
             consts: BTreeMap::new(),
             tag_widths: BTreeMap::new(),
+            strs: BTreeMap::new(),
+            piece_sets: BTreeMap::new(),
+            tmpl_bytes: BTreeMap::new(),
+            promoted: BTreeMap::new(),
         }
     }
 
-    /// Same as [`Env::new`], with the program's enum layouts and `const` items
-    /// attached.
-    fn with_enums(enums: &BTreeMap<String, EnumLayout>, consts: &BTreeMap<String, Const>) -> Env {
-        Env { enums: enums.clone(), consts: consts.clone(), ..Env::new() }
+    /// [`Env::new`] plus the program's enum layouts, `const` items and promoted
+    /// `&[&str]` pieces, so the `core::fmt` model can read a `panic!` message back.
+    fn with_prog(prog: &MirProgram) -> Env {
+        Env {
+            enums: prog.enums.clone(),
+            consts: prog.consts.clone(),
+            promoted: prog.promoted_strs.clone(),
+            ..Env::new()
+        }
     }
 
     /// The element variable for `index` of an indexed value (slice or array)
@@ -1628,6 +1681,9 @@ impl Env {
         self.payloads.retain(|(l, _), _| *l != local);
         self.discriminants.remove(&local);
         self.tag_widths.remove(&local);
+        self.strs.remove(&local);
+        self.piece_sets.remove(&local);
+        self.tmpl_bytes.remove(&local);
         if let Some(s) = self.indexed.get_mut(&local) {
             s.elems.clear();
             // The seeded elements are gone, so a later read must not find them.
@@ -2340,7 +2396,7 @@ where
         }
     };
 
-    let mut env = Env::with_enums(&prog.enums, &prog.consts);
+    let mut env = Env::with_prog(prog);
     // A pinned variable takes the literal its precondition fixes it to, so the
     // body's operations fold instead of building a circuit over an input that has
     // only one value. The pin is keyed by *variable index*, so it applies wherever
@@ -2639,6 +2695,33 @@ fn detect_loop(f: &MirFn) -> Option<(usize, Vec<usize>)> {
     header.map(|h| (h, back_edges))
 }
 
+/// What a diverging call's report should say it was.
+///
+/// The dump passes the panic message as a string literal
+/// (`core::panicking::panic(const "assertion failed: x <= 200")`), so a report can
+/// name the failed assertion instead of the mangled path. When there is no message
+/// at all -- `panic!("{}", x)` prints `panic_display::<u8>`, `unwrap` on a `None`
+/// prints `unwrap_failed` -- the callee's own name is the honest fallback, read
+/// through its generics so the report says `panic_display`, not `<u8>`.
+fn panic_message(name: &str, args: &[Operand], env: &Env) -> String {
+    for a in args {
+        // A literal message, as edition 2015/2021 prints it.
+        if let Operand::Const(Const::Str(s)) = a {
+            return s.clone();
+        }
+        // Edition 2024: the message is a local the `core::fmt` chain built, so it
+        // is read from the string store rather than from an operand.
+        if let Operand::Move(p) | Operand::Copy(p) = a {
+            if p.proj.is_empty() {
+                if let Some(s) = env.strs.get(&p.local) {
+                    return s.clone();
+                }
+            }
+        }
+    }
+    path_tail(name).to_string()
+}
+
 /// Every block a terminator can jump to.
 fn successors(t: &Term) -> Vec<usize> {
     match t {
@@ -2648,6 +2731,11 @@ fn successors(t: &Term) -> Vec<usize> {
             v.push(*otherwise);
             v
         }
+        // A diverging call has no normal successor. Reporting `target` (which the
+        // parser leaves at `usize::MAX`) would send the walk to a block that does
+        // not exist and turn the path into a "missing block" unknown; reporting
+        // none says what is true -- the path ends here.
+        Term::Call { diverges: true, .. } => Vec::new(),
         Term::Call { target, .. } => vec![*target],
         Term::Assert { target, .. } => vec![*target],
         Term::Return | Term::Unreachable | Term::Unknown(_) => Vec::new(),
@@ -3873,6 +3961,204 @@ fn eval_measure_here(f: &MirFn, env: &Env, text: &str) -> Result<(Var, bool), St
         .map_err(|e| e.to_string())
 }
 
+/// The last segment of a path, with any generic arguments stripped.
+///
+/// The dump spells a call with its generics (`Arguments::<'_>::new_const::<1>`,
+/// `new_v1::<1, 1>`, `rt::Argument::<'_>::new_display::<T>`,
+/// `std::rt::panic_display::<u8>`), so the bare last segment is `<1>`/`<T>`/`<u8>`
+/// rather than the name. The `::<…>` groups are skipped as *balanced* brackets --
+/// a group can nest (`Argument::<&'_ str>`) -- and the last `::`-segment of what is
+/// left is the name. A path with no generics (`std::rt::panic_fmt`) is returned
+/// unchanged. Both the `core::fmt` model's dispatch and a panic report's fallback
+/// name go through this, so a name is never reported as its type arguments.
+fn path_tail(name: &str) -> &str {
+    // The last `::` at generic-depth zero that is not the `::` of a `::<…>`
+    // bracket, so the method name is what follows it up to the first `<`.
+    let b = name.as_bytes();
+    let mut depth = 0i32;
+    let mut last_sep: Option<usize> = None;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'<' => depth += 1,
+            b'>' => depth -= 1,
+            b':' if depth == 0
+                && i + 1 < b.len()
+                && b[i + 1] == b':'
+                && b.get(i + 2) != Some(&b'<') =>
+            {
+                last_sep = Some(i + 2);
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let rest = match last_sep {
+        Some(k) => &name[k..],
+        None => name,
+    };
+    let head = match rest.find('<') {
+        Some(k) => &rest[..k],
+        None => rest,
+    };
+    // `new_const::<1>` leaves `new_const::` once the `<…>` is cut, so the
+    // separator that introduced the generic goes with it.
+    head.strip_suffix("::").unwrap_or(head)
+}
+
+/// The `i`-th argument of the last `::<…>` group in a path, parsed as a `usize`.
+///
+/// `Arguments::<'_>::new_v1::<2, 1>` has `("_", "2", "1")` as its groups, so index
+/// `1` is the argument count. A missing or non-numeric item returns `None`, which
+/// the caller turns into "unmodelled" -- a printer change is refused rather than
+/// guessed at.
+fn generic_arg(name: &str, i: usize) -> Option<usize> {
+    let open = name.rfind("::<")?;
+    let rest = &name[open + 3..];
+    let close = rest.find('>')?;
+    let item = rest[..close].split(',').nth(i)?;
+    item.trim().parse().ok()
+}
+
+/// Whether `name` is a call the `core::fmt` model answers, and the model's
+/// `Result` for it.
+///
+/// Edition 2024 builds a `panic!`/`assert!` message out of `core::fmt` calls
+/// rather than a single literal, so a panic's message has to be *recovered* from
+/// the chain rather than read off one operand. The chain is small and fixed:
+///
+/// * `core::fmt::rt::Argument::<'_>::new_display::<T>(&v)` -- wraps one argument
+///   for display. Its payload is the argument's *value*, which this model does
+///   not need (the message keeps the `{}` placeholder), so it is a no-op.
+/// * `Arguments::<'_>::from_str(const "…")` -- the whole message is one literal.
+/// * `Arguments::<'_>::new_const::<N>(&PIECES)` -- `N` literal pieces and no
+///   arguments.
+/// * `Arguments::<'_>::new_v1::<P, A>(&PIECES, &ARGS)` -- `P` pieces and `A`
+///   arguments, which render as the pieces joined by `{}`.
+/// * `Arguments::<'_>::new::<LEN, A>(const b"…", &ARGS)` -- the newer spelling
+///   with the template in one byte string.
+/// * `std::rt::panic_fmt(args)` -- the diverging consumer; its message is
+///   whatever the `Arguments` local holds.
+///
+/// Anything not on this list returns `None`, so a `core::fmt` call this model
+/// does not know stays "unmodelled" rather than becoming a wrong message.
+///
+/// The placeholder count is the *argument* count, which is why the pieces are
+/// joined by the consuming call and not by the builder: see
+/// [`crate::mir::parse::join_format_pieces`].
+fn try_fmt_call(
+    name: &str,
+    args: &[Operand],
+    dest: &Place,
+    env: &mut Env,
+    dest_ty: Option<&Ty>,
+) -> Option<Result<(), String>> {
+    use crate::mir::parse::{decode_format_template, join_format_pieces};
+    // The `Arguments`-building calls are printed *unqualified*
+    // (`Arguments::<'_>::new_const::<1>`), so a name cannot tell them from a local
+    // item of the same name. The destination's *type* can: `new_const`/`new_v1`/
+    // `new`/`from_str` all return `core::fmt::Arguments<'_>`, and no other call
+    // does. That is what this guard keys on -- a local function named `new` whose
+    // destination is not an `Arguments` is left to its own body, and a call this
+    // model does not know stays "unmodelled" rather than becoming a wrong message.
+    let makes_args = dest_ty.is_some_and(|t| match t {
+        Ty::Other(s) => s.contains("fmt::Arguments"),
+        _ => false,
+    });
+    // The consumer's name *is* qualified (`std::rt::panic_fmt`,
+    // `core::panicking::panic_fmt`), so its own guard is on the name. A user item
+    // cannot be spelled in someone else's crate, so a name with one of these
+    // prefixes is `core`'s -- and a local `panic_fmt` is answered by its body in
+    // the same dump first.
+    let qualified = ["std::fmt::", "core::fmt::", "std::rt::", "core::panicking::"]
+        .iter()
+        .any(|p| name.starts_with(p) || name.contains(&format!("::{p}")));
+    if !makes_args && !qualified {
+        return None;
+    }
+    // The pieces an operand names: either a promoted `const NAME::promoted[0]`
+    // (recorded on the local it was assigned to) or a local that already carries
+    // them.
+    let pieces_of = |env: &Env, o: &Operand| -> Option<Vec<String>> {
+        match o {
+            Operand::Const(Const::Other(n)) => env.promoted.get(n).cloned(),
+            Operand::Copy(p) | Operand::Move(p) if p.proj.is_empty() => {
+                env.piece_sets.get(&p.local).cloned()
+            }
+            _ => None,
+        }
+    };
+    let tail = path_tail(name);
+    if tail == "panic_fmt" || tail == "panic_nounwind_fmt" {
+        // The consumer. Its argument is the `Arguments` local, whose rendered
+        // message the builders below left in the string store. A consumer whose
+        // argument carries no message is *not* answered: recording an empty
+        // message would report `panic: ` with nothing after it, and an empty
+        // report is worse than the refusal that says which call was not modelled.
+        let msg = args.iter().find_map(|a| match a {
+            Operand::Move(p) | Operand::Copy(p) if p.proj.is_empty() => {
+                env.strs.get(&p.local).cloned()
+            }
+            _ => None,
+        })?;
+        env.strs.insert(dest.local, msg);
+        return Some(Ok(()));
+    }
+    if tail == "from_str" {
+        // `Arguments::from_str("literal")`: the message is the literal itself.
+        let lit = args.iter().find_map(|a| match a {
+            Operand::Const(Const::Str(s)) => Some(s.clone()),
+            _ => None,
+        })?;
+        env.strs.insert(dest.local, lit);
+        return Some(Ok(()));
+    }
+    if tail == "new_const" {
+        // `new_const::<P>(&PIECES)`: `P` literal pieces and no arguments, so the
+        // pieces are the message as they stand.
+        let pieces = args.iter().find_map(|a| pieces_of(env, a))?;
+        env.strs.insert(dest.local, join_format_pieces(&pieces, 0));
+        return Some(Ok(()));
+    }
+    if tail == "new_v1" {
+        // `new_v1::<P, A>(&PIECES, &ARGS)`: `P` pieces and `A` arguments. The
+        // argument count is what says how many placeholders the message has, so it
+        // is read from the generic list rather than guessed from the pieces.
+        let pieces = args.iter().find_map(|a| pieces_of(env, a))?;
+        let n = generic_arg(name, 1)?;
+        env.strs.insert(dest.local, join_format_pieces(&pieces, n));
+        return Some(Ok(()));
+    }
+    if tail == "new" {
+        // `Arguments::new::<LEN, A>(const b"…", &ARGS)`: the template is one byte
+        // string, decoded to pieces. It can be a direct operand or -- as stable
+        // prints it -- a local it was assigned to first.
+        let bytes = args
+            .iter()
+            .find_map(|a| match a {
+                Operand::Const(Const::Bytes(b)) => Some(b.clone()),
+                Operand::Copy(p) | Operand::Move(p) if p.proj.is_empty() => {
+                    env.tmpl_bytes.get(&p.local).cloned()
+                }
+                _ => None,
+            })?;
+        let pieces = decode_format_template(&bytes)?;
+        let n = generic_arg(name, 1)?;
+        env.strs.insert(dest.local, join_format_pieces(&pieces, n));
+        return Some(Ok(()));
+    }
+    // `rt::Argument::<'_>::new_display::<T>(&v)` and its siblings wrap one
+    // argument; the message keeps the placeholder, so the wrapper is a no-op. The
+    // destination stays a non-string local, which is what it is.
+    if name.contains("core::fmt::rt::Argument") && tail.starts_with("new_") {
+        env.set(dest, Val::Unknown);
+        return Some(Ok(()));
+    }
+    None
+}
+
 /// Answer a modelled `core::num` call, if the callee is one.
 ///
 /// `None` means the callee is not a modelled intrinsic, and the caller falls
@@ -4239,6 +4525,23 @@ where
                     }
                 }
                 st.env.set(dest, v);
+                // A promoted `&[&str]` constant (`_4 = const f::promoted[0]`) is the
+                // format-piece array a `panic!`/`assert!` message is built from on
+                // edition 2024. Its pieces are recorded *here*, after `set`, because
+                // a whole-place write forgets the destination's parts -- recording
+                // them inside `eval_rvalue` would have them cleared by the very
+                // `set` that follows. The value itself is not a bit-vector.
+                if let Rvalue::Use(Operand::Const(Const::Other(n))) = rv {
+                    if let Some(pieces) = st.env.promoted.get(n).cloned() {
+                        st.env.piece_sets.insert(dest.local, pieces);
+                    }
+                }
+                // The `b"…"` template of `Arguments::new` reaches the call through a
+                // local (`_9 = const b"…"` then `new::<7, 1>(move _9, …)`), so it is
+                // recorded the same way and for the same reason.
+                if let Rvalue::Use(Operand::Const(Const::Bytes(b))) = rv {
+                    st.env.tmpl_bytes.insert(dest.local, b.clone());
+                }
                 // A *nested* aggregate assignment moves the source's parts under the
                 // destination's path. Two shapes need it: a struct literal into a nested field
                 // (`o.i = Inner { v: 9 }` -> `(_1.0) = move _2`), and a nested-to-nested move
@@ -4912,11 +5215,33 @@ where
             };
             advance(prog, next, *otherwise, report, work, pins);
         }
-        Term::Call { callee, args, dest, target } => {
+        Term::Call { callee, args, dest, diverges, target } => {
             let Callee::Name(name) = callee else {
                 report.unknown_paths.push("indirect call not modelled".into());
                 return;
             };
+            // A call that never returns is a reachable failure, not a line to skip.
+            //
+            // `panic!`, `assert!`, `unwrap`, and the bounds and slice checks rustc
+            // inserts lower to a diverging call into `core::panicking`: the path
+            // ends there, with no normal successor. What the caller must prove is
+            // that the call cannot be reached -- `assert!(x <= 200)` is a promise,
+            // and dropping the path silently would let a caller keep a postcondition
+            // the assert was there to guarantee. So the obligation is `path` itself,
+            // "is this call reachable", discharged by `Unsat`: the same polarity as
+            // an `assert` terminator and for the same reason. Nothing is assumed
+            // afterwards, because there is no afterwards. The block the `switchInt`
+            // routes here already carries `!guard` in its path, so the guard is what
+            // the query is really about.
+            if *diverges {
+                report.obligations.push(Obligation {
+                    kind: ObligationKind::DivergingCall {
+                        message: panic_message(name, args, &st.env),
+                    },
+                    verdict: find_obligation(st.path, pins),
+                });
+                return;
+            }
             // A self-call is answered by the function's own contract when it
             // carries a `decreases:` measure, rather than inlined: inlining it
             // would only unroll once and hit the depth bound. See
@@ -4961,6 +5286,23 @@ where
             // half of the guard.
             let same_dump = resolve_callee(prog, name);
             if same_dump.is_none() {
+                // The `core::fmt` chain behind a `panic!`/`assert!` message. It
+                // runs before `try_intrinsic` because these are not integer
+                // intrinsics, and it answers only the exact shapes it knows; every
+                // other `core::fmt` call still falls through to "unmodelled".
+                if let Some(done) =
+                    try_fmt_call(name, args, dest, &mut st.env, type_of_place(cur, dest).as_ref())
+                {
+                    let next = match done {
+                        Ok(()) => State { block: *target, ..st },
+                        Err(e) => {
+                            report.unknown_paths.push(e);
+                            return;
+                        }
+                    };
+                    advance(prog, next, *target, report, work, pins);
+                    return;
+                }
                 if let Some(done) =
                     try_intrinsic(prog, st.frame.func, name, args, dest, &mut st.env)
                 {
@@ -5041,7 +5383,7 @@ where
                 report.unknown_paths.push(format!("callee `{name}` has no body"));
                 return;
             };
-            let mut env = Env::with_enums(&prog.enums, &prog.consts);
+            let mut env = Env::with_prog(prog);
             // Which caller locals were handed over through a reference, so the
             // return path knows whose store the callee's post-state belongs to.
             let mut by_ref: Vec<(Place, u32)> = Vec::new();
@@ -5327,6 +5669,10 @@ fn operand(env: &mut Env, o: &Operand) -> Val {
                 None => Val::Unknown,
             },
             Const::Bool(b) => Val::Bool(smt::truth(*b)),
+            // A string or byte-string literal has no bit-vector, so it is not a
+            // `Val`; the `core::fmt` model reads it through the env's string store
+            // instead.
+            Const::Str(_) | Const::Bytes(_) => Val::Unknown,
             // An enum variant *construction*: `Mode::Idle`. The dump prints it as
             // a path constant, and it is the one place a tag is a *known* value
             // rather than an input -- a locally built enum then has a constant
@@ -7580,5 +7926,35 @@ fn count_via_helper(_1: u8) -> u8 {
 
         // An intrinsic call keeps its `<impl` projection, which marks it external.
         assert_eq!(call_type("core::num::<impl u8>::wrapping_add").as_deref(), Some("u8"));
+    }
+
+    /// The tail of a path is read through its generics.
+    ///
+    /// The dump spells these calls with their generics, so a naive last-segment
+    /// split gives `<1>`/`<T>` rather than the method name -- and the model would
+    /// then answer nothing at all, which is how the MSRV run reported
+    /// `Arguments::<'_>::new_const::<1>` as unmodelled while stable was green.
+    /// The turbofish separator (`new_const::<1>`) and a nested group
+    /// (`Argument::<&'_ str>`) are both covered.
+    #[test]
+    fn a_path_tail_is_read_through_its_generics() {
+        assert_eq!(path_tail("Arguments::<'_>::new_const::<1>"), "new_const");
+        assert_eq!(path_tail("Arguments::<'_>::new_v1::<2, 2>"), "new_v1");
+        assert_eq!(path_tail("Arguments::<'_>::new::<7, 1>"), "new");
+        assert_eq!(path_tail("Arguments::<'_>::from_str"), "from_str");
+        assert_eq!(path_tail("core::fmt::rt::Argument::<'_>::new_display::<u8>"), "new_display");
+        assert_eq!(path_tail("std::rt::panic_fmt"), "panic_fmt");
+        assert_eq!(path_tail("panic_fmt"), "panic_fmt");
+    }
+
+    /// The generic argument list is read as data, and a missing item is refused.
+    #[test]
+    fn a_generic_argument_is_read_or_refused() {
+        assert_eq!(generic_arg("Arguments::<'_>::new_v1::<2, 1>", 1), Some(1));
+        assert_eq!(generic_arg("Arguments::<'_>::new::<7, 1>", 1), Some(1));
+        // No turbofish, a missing index, and a non-numeric item are all `None`.
+        assert_eq!(generic_arg("Arguments::<'_>::new_const", 1), None);
+        assert_eq!(generic_arg("Arguments::<'_>::new_v1::<2>", 1), None);
+        assert_eq!(generic_arg("Arguments::<'_>::new_v1::<2, A>", 1), None);
     }
 }

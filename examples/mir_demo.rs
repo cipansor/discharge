@@ -36,7 +36,7 @@ pub enum Expect {
 }
 
 /// The expectations, stated as data so the demo and the test suite share them.
-pub fn expectations() -> [(&'static str, Expect); 21] {
+pub fn expectations() -> [(&'static str, Expect); 24] {
     use Expect::*;
     [
         ("clamp", Verified),
@@ -83,6 +83,15 @@ pub fn expectations() -> [(&'static str, Expect); 21] {
         ("signed_mul_negative", Failed),
         // Negation guarded against `MIN`, the one input with no positive form.
         ("checked_neg", Verified),
+
+        // --- a guard the programmer wrote -----------------------------------
+        // `assert!` and `panic!` lower to a *diverging* call with no return arm.
+        // The frontend used to read that as an unmodelled line and drop the path,
+        // so the assert was never checked; it is now a panic obligation, and the
+        // pair below pins both directions.
+        ("assert_guarded", Verified),
+        ("assert_misguarded", Failed),
+        ("panic_guarded", Verified),
     ]
 }
 

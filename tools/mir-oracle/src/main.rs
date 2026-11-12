@@ -241,16 +241,26 @@ fn main() {
     let text_shapes = verif::mir::shape::of_text_mir(&text);
 
     // The typed side, through `rustc_public`. The argument list mirrors what the
-    // text emitter passes so both compile the same crate type. `--out-dir` points
-    // the compiler's artifacts at a temp directory: without it `rustc` drops
-    // `lib<name>.rlib` next to the source, which would litter the repository on
-    // every run.
+    // text emitter passes -- the same crate type *and* the same edition, so the
+    // two compile the same file the same way. Both sides used to disagree about
+    // the edition: the emitter passed none (rustc's default, 2015) while this side
+    // pinned 2021, and `panic!("literal")` lowers to one diverging call under 2015
+    // but to `Arguments::from_str` plus `std::rt::panic_fmt` under 2021 -- one
+    // extra basic block. Every shape with a `panic!` therefore disagreed for a
+    // reason that had nothing to do with the parser, and the oracle -- the one
+    // check that exists to catch a printer change -- failed on its own argument
+    // list instead. Both now name edition 2024 explicitly, so the only difference
+    // left between the two compilations is text versus typed IR.
+    //
+    // `--out-dir` points the compiler's artifacts at a temp directory: without it
+    // `rustc` drops `lib<name>.rlib` next to the source, which would litter the
+    // repository on every run.
     let out_dir = std::env::temp_dir().join(format!("mir-oracle-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&out_dir);
     let mut typed_args = vec![
         target.to_string_lossy().into_owned(),
         "--edition".to_string(),
-        "2021".to_string(),
+        "2024".to_string(),
         "--crate-type".to_string(),
         "lib".to_string(),
         "--out-dir".to_string(),

@@ -4587,7 +4587,7 @@ impl<'a> Parser<'a> {
                 ))),
             },
             Const::Bool(b) => Ok((smt::word(u64::from(*b), 1), Sign::Literal)),
-            Const::Unit | Const::Other(_) => Err(self.err(format!(
+            Const::Unit | Const::Str(_) | Const::Bytes(_) | Const::Other(_) => Err(self.err(format!(
                 "the constant `{name}` is not a literal, so its value is not known to the \
                  contract reader"
             ))),

@@ -49,6 +49,16 @@ pub enum MirSource {
 /// 1.85). The error is returned rather than papered over, because "the frontend
 /// could not run" and "the code is wrong" must never be reported the same way.
 ///
+/// The edition is pinned to 2024, the newest, rather than left to `rustc`'s
+/// default. The default is 2015 -- a decade behind the crate's own edition, and
+/// not the edition any of the targets are written in -- and it changes the
+/// lowering: `panic!("literal")` is one diverging call under 2015 but an
+/// `Arguments::from_str` plus `std::rt::panic_fmt` under 2024. Leaving it implicit
+/// meant the text dump and any tool that passed an edition explicitly (the
+/// `rustc_public` oracle did) compiled the same file differently and disagreed
+/// about the result. Pinning it here is what makes "the dump and the typed IR
+/// describe the same program" true by construction instead of by coincidence.
+///
 /// The compiler is taken from `VERIF_RUSTC` when set, and otherwise from
 /// `rustc` on `PATH`. The dedicated variable exists so that pointing this tool at
 /// a *different* compiler -- a nightly, or the rustc_public oracle's toolchain --
@@ -80,6 +90,7 @@ pub fn emit_mir_with(rustc: &str, file: &Path) -> Result<String, String> {
         file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
     ));
     let out = Command::new(rustc)
+        .arg("--edition=2024")
         .arg("--crate-type=lib")
         .arg("--emit=mir")
         .arg("-o")

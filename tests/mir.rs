@@ -79,6 +79,9 @@ fn verify_all() -> Option<verify::FileReport> {
         "clamp_bounds",
         "first_of",
         "slice_alias_tripwire",
+        "assert_guarded",
+        "assert_misguarded",
+        "panic_guarded",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -8760,4 +8763,205 @@ fn a_helper_call_in_a_measured_loop_keeps_the_termination_measure() {
         o.is_verified(),
         "the helper call must not erase the loop's measure, got: {o}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A diverging call is a checked panic, not a dropped path
+// ---------------------------------------------------------------------------
+
+/// `assert!` is a promise, and the frontend now checks it instead of dropping it.
+///
+/// `assert!(x <= 200)` lowers to a `switchInt` that routes the *failing* case into
+/// a diverging call to `core::panicking::panic`, with no `[return: bbN]` arm. The
+/// parser only recognised the `[return:` shape, so the terminator came back
+/// `Unknown("missing")`, the path was reported unmodelled, and the whole function
+/// was `Incomplete` -- the assert, the most ordinary safety guard in Rust, was
+/// never checked at all. Both halves are pinned here: the guard is *discharged*
+/// under a precondition that implies it, and *refuted* with a real counterexample
+/// when it is not.
+#[test]
+fn an_assert_is_checked_and_discharged_under_its_precondition() {
+    let src = "/// requires: x <= 200\n\
+               /// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { assert!(x <= 200); 1 }\n";
+    let o = verify_src("f", src).expect("f must be in the report");
+    assert!(
+        o.is_verified(),
+        "the guard follows from the precondition, so the assert cannot fire: {o}"
+    );
+}
+
+/// The teeth: with no precondition the assert is a real panic, and it is reported.
+///
+/// The counterexample is a value above 200, which is exactly the input the assert
+/// exists to reject. Reading the diverging call as a harmless drop would instead
+/// have left the function `Incomplete`, which is a lost proof of nothing -- this
+/// makes the missing precondition a *failure*, the sound direction.
+#[test]
+fn an_unproved_assert_is_refuted_with_a_counterexample() {
+    let src = "/// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { assert!(x <= 200); 1 }\n";
+    let o = verify_src("f", src).expect("f must be in the report");
+    match o {
+        FnOutcome::Failed { kind, detail } => {
+            assert!(
+                kind.contains("assertion failed: x <= 200"),
+                "the report should name the failed assertion, got `{kind}`"
+            );
+            assert!(!detail.is_empty(), "a failure must carry a counterexample");
+        }
+        other => panic!("an assert with no guard must fail, got: {other}"),
+    }
+}
+
+/// An assert is *assumed* on the fall-through path, so the code after it can rely
+/// on the guard -- the same rule the `assert` terminator already had.
+///
+/// Without this the guard would be checked and then thrown away, so `x + 1` after
+/// `assert!(x <= 200)` would be reported as a possible overflow even though the
+/// assert rules it out. The postcondition `ret == x + 1` is what makes the
+/// assumption load-bearing: it only holds if the guard is carried forward.
+#[test]
+fn an_assert_guard_is_assumed_by_the_code_after_it() {
+    let src = "/// requires: x <= 200\n\
+               /// ensures: ret == x + 1\n\
+               pub fn f(x: u8) -> u8 { assert!(x <= 200); x + 1 }\n";
+    let o = verify_src("f", src).expect("f must be in the report");
+    assert!(o.is_verified(), "the assert must be assumed on the fall-through path: {o}");
+}
+
+/// `debug_assert!` lowers the same way, so it is checked and assumed too.
+#[test]
+fn a_debug_assert_is_checked_like_an_assert() {
+    let src = "/// requires: x <= 200\n\
+               /// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { debug_assert!(x <= 200); 1 }\n";
+    let o = verify_src("f", src).expect("f must be in the report");
+    assert!(o.is_verified(), "a debug_assert is the same terminator as an assert: {o}");
+}
+
+/// `panic!` is a reachable failure, so an unguarded one is refuted, and a guarded
+/// one is proved unreachable.
+///
+/// The message is carried from the string literal the dump passes, so the report
+/// names the panic rather than the mangled callee path.
+#[test]
+fn a_panic_is_refuted_unless_its_guard_excludes_it() {
+    let unguarded = "/// ensures: ret == 1\n\
+                     pub fn f(x: u8) -> u8 { if x == 0 { panic!(\"zero\"); } 1 }\n";
+    let o = verify_src("f", unguarded).expect("f must be in the report");
+    match o {
+        FnOutcome::Failed { kind, .. } => {
+            assert!(kind.contains("zero"), "the report should name the panic, got `{kind}`");
+        }
+        other => panic!("an unguarded panic must fail, got: {other}"),
+    }
+    let guarded = "/// requires: x != 0\n\
+                   /// ensures: ret == 1\n\
+                   pub fn f(x: u8) -> u8 { if x == 0 { panic!(\"zero\"); } 1 }\n";
+    let o = verify_src("f", guarded).expect("f must be in the report");
+    assert!(o.is_verified(), "the precondition excludes the panic: {o}");
+}
+
+/// A *formatted* panic message is recovered from the `core::fmt` chain, not from
+/// a literal operand.
+///
+/// Edition 2024 never puts `panic!("bad {}", x)` in the MIR as one string: the
+/// pieces are a promoted `&[&str]` and the placeholders are separate `rt::Argument`
+/// values, assembled by `Arguments::new_v1` on 1.85 and by
+/// `Arguments::new::<LEN, _>` (a single encoded byte template) on stable. Both
+/// spellings have to be read, and this test is what pins that -- it runs on
+/// whichever toolchain `VERIF_RUSTC` names, so the two shapes are covered by the
+/// same assertion on the two toolchains the gate uses.
+#[test]
+fn a_formatted_panic_message_is_recovered_from_the_fmt_chain() {
+    let unguarded = "/// ensures: ret == 1\n\
+                     pub fn f(x: u8) -> u8 { if x == 0 { panic!(\"bad {}\", x); } 1 }\n";
+    let Some(o) = verify_src("f", unguarded) else { return };
+    match o {
+        FnOutcome::Failed { kind, .. } => {
+            assert!(
+                kind.contains("bad {}"),
+                "the report should name the panic's pieces, got `{kind}`"
+            );
+        }
+        other => panic!("a formatted panic with no guard must fail, got: {other}"),
+    }
+    // A formatted `assert!` is the same chain with the guard in front of it.
+    let guarded = "/// requires: x <= 100\n\
+                   /// ensures: ret == 1\n\
+                   pub fn f(x: u8) -> u8 { assert!(x <= 100, \"bad {}\", x); 1 }\n";
+    let o = verify_src("f", guarded).expect("f must be in the report");
+    assert!(o.is_verified(), "the precondition implies the formatted assert: {o}");
+    let misguarded = "/// ensures: ret == 1\n\
+                      pub fn f(x: u8) -> u8 { assert!(x <= 100, \"bad {}\", x); 1 }\n";
+    let o = verify_src("f", misguarded).expect("f must be in the report");
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("bad {}"),
+            "the formatted assert should be named by its pieces, got `{kind}`"
+        ),
+        other => panic!("an unguarded formatted assert must fail, got: {other}"),
+    }
+    // `panic!("{}", x)` has no literal piece at all -- it lowers to a
+    // `panic_display::<u8>` / `panic_cold_display::<u8>` call -- so there is no
+    // message to recover and the callee's own name is the fallback. It must be the
+    // *name*, read through the generics, and not the type arguments: the report
+    // used to read `<u8>`, which is a mangled path rather than a fallback. The
+    // two toolchains spell the callee differently, so only the shape is pinned.
+    let no_pieces = "/// ensures: ret == 1\n\
+                     pub fn f(x: u8) -> u8 { if x == 0 { panic!(\"{}\", x); } 1 }\n";
+    let o = verify_src("f", no_pieces).expect("f must be in the report");
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("display") && !kind.contains('<'),
+            "the fallback should be the callee's name, not its generics, got `{kind}`"
+        ),
+        other => panic!("an unguarded panic must fail, got: {other}"),
+    }
+}
+
+/// The other two panicking macros name their own message too.
+///
+/// `unreachable!()` and `todo!()` pass a *literal*, so they take the
+/// `core::panicking::panic(const "…")` / `Arguments::from_str` path rather than the
+/// `core::fmt` chain, and the report should carry the text the programmer wrote --
+/// not the mangled callee. They are here because a fix aimed at the formatted case
+/// must not regress the plain one.
+#[test]
+fn a_literal_panic_macro_names_its_message() {
+    let src = "/// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { if x == 0 { unreachable!(); } 1 }\n";
+    let Some(o) = verify_src("f", src) else { return };
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("entered unreachable code"),
+            "the report should carry the macro's text, got `{kind}`"
+        ),
+        other => panic!("an unguarded `unreachable!` must fail, got: {other}"),
+    }
+    let src = "/// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { if x == 0 { todo!(); } 1 }\n";
+    let o = verify_src("f", src).expect("f must be in the report");
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("not yet implemented"),
+            "the report should carry the macro's text, got `{kind}`"
+        ),
+        other => panic!("an unguarded `todo!` must fail, got: {other}"),
+    }
+}
+
+/// The bounds check rustc inserts for `xs[0]` is a diverging call too, and it is
+/// proved unreachable from the length precondition.
+///
+/// This is the shape an ordinary slice access lowers to, so the check is what
+/// makes a `&[T]` argument safe to reason about at all.
+#[test]
+fn an_index_bounds_check_is_proved_unreachable() {
+    let src = "/// requires: xs.len() >= 1\n\
+               /// ensures: ret == 0\n\
+               pub fn f(xs: &[u8]) -> u8 { xs[0] * 0 }\n";
+    let o = verify_src("f", src).expect("f must be in the report");
+    assert!(o.is_verified(), "the length precondition rules the bounds check out: {o}");
 }
