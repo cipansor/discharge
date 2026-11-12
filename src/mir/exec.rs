@@ -188,6 +188,18 @@ pub enum ObligationKind {
     /// entry. This is the well-founded basis the induction needs; without it the
     /// assumption would be circular.
     RecursiveDecreases,
+    /// A call to a *contracted* function outside the dump satisfies that
+    /// function's precondition. The callee's contract is assumed for the result,
+    /// so the precondition is what makes the assumption sound rather than a
+    /// restatement of the goal -- the same argument as
+    /// [`ObligationKind::RecursivePrecondition`], one step out.
+    CalleePrecondition,
+    /// The callee's postcondition cannot hold for any input (`ensures false`, or a
+    /// set of conjuncts with no model), so the call never returns and every claim
+    /// after it is vacuous. The MIR twin of [`crate::wp::Rule::DivergentCall`]:
+    /// refusing is what keeps "the program cannot get past this call" from being
+    /// read as a proof of what follows it.
+    CalleeDiverges,
 }
 
 impl std::fmt::Display for ObligationKind {
@@ -205,6 +217,12 @@ impl std::fmt::Display for ObligationKind {
             }
             ObligationKind::RecursiveDecreases => {
                 write!(f, "recursive call decreases the measure")
+            }
+            ObligationKind::CalleePrecondition => {
+                write!(f, "call satisfies the callee's precondition")
+            }
+            ObligationKind::CalleeDiverges => {
+                write!(f, "the callee's postcondition is unsatisfiable")
             }
         }
     }
@@ -257,7 +275,9 @@ impl Obligation {
             | ObligationKind::LoopInvariantPreserve
             | ObligationKind::LoopVariant
             | ObligationKind::RecursivePrecondition
-            | ObligationKind::RecursiveDecreases => self.verdict.is_proved(),
+            | ObligationKind::RecursiveDecreases
+            | ObligationKind::CalleePrecondition
+            | ObligationKind::CalleeDiverges => self.verdict.is_proved(),
             ObligationKind::Panic { .. } | ObligationKind::Unreachable => {
                 matches!(self.verdict, Verdict::Unsat)
             }
@@ -311,7 +331,9 @@ impl Obligation {
                 | ObligationKind::LoopInvariantPreserve
                 | ObligationKind::LoopVariant
                 | ObligationKind::RecursivePrecondition
-                | ObligationKind::RecursiveDecreases => {
+                | ObligationKind::RecursiveDecreases
+                | ObligationKind::CalleePrecondition
+                | ObligationKind::CalleeDiverges => {
                     "invalid: a `Valid` verdict is a discharge for this kind".to_string()
                 }
             },
@@ -327,8 +349,15 @@ impl Obligation {
                 | ObligationKind::LoopInvariantPreserve
                 | ObligationKind::LoopVariant
                 | ObligationKind::RecursivePrecondition
-                | ObligationKind::RecursiveDecreases => {
+                | ObligationKind::RecursiveDecreases
+                | ObligationKind::CalleePrecondition => {
                     "the property holds for no input (false on every input)".to_string()
+                }
+                // `find_model` on the callee's postcondition: `Unsat` means no
+                // input can satisfy it, so the call never returns.
+                ObligationKind::CalleeDiverges => {
+                    "the callee's postcondition holds for no input, so the call never returns"
+                        .to_string()
                 }
                 // The good answer for a reachability query, so this is a discharge.
                 ObligationKind::Panic { .. } | ObligationKind::Unreachable => {
@@ -2024,6 +2053,94 @@ struct Cut {
     variant: Option<String>,
 }
 
+/// The contract of one callee, in the form the executor needs to assume it.
+///
+/// This is the modular half of the call story. A callee *inside* the dump is
+/// inlined, so its body is executed and no assumption is made; a callee whose
+/// body the dump does not contain has nothing to execute, and without a contract
+/// the honest answer is `unknown`. With one, the call becomes the two obligations
+/// every modular verifier uses -- prove the precondition of the arguments, assume
+/// the postcondition of the result -- which is what lets a caller be verified
+/// without its callee's body, and what keeps the proof from being circular: the
+/// precondition is *proved*, not assumed, so assuming the postcondition is an
+/// induction hypothesis rather than a restatement of the goal.
+///
+/// `ensures` is `None` when the callee declared no postcondition. That is not the
+/// same as `ensures true`: with no postcondition there is nothing to assume, so
+/// the call's result stays unknown and the path is reported rather than guessed.
+/// The distinction is the difference between "the callee promises nothing" and
+/// "the callee promises everything", and only the first is what an absent clause
+/// means.
+#[derive(Clone, Debug, Default)]
+pub struct CalleeContract {
+    /// The declared `requires` clauses, as source text.
+    pub requires: Vec<String>,
+    /// The declared `ensures` clauses, as source text.
+    pub ensures: Vec<String>,
+    /// The callee's parameter names, in declaration order.
+    ///
+    /// A callee outside the dump has no MIR, so its `debug` bindings -- the place
+    /// the executor usually reads a parameter's source name from -- do not exist.
+    /// The names come from the *source* signature instead, and they have to line
+    /// up positionally with the call's argument list, because that is the only
+    /// thing tying `requires: n <= 10` to the first argument. A callee whose
+    /// signature the scanner could not read is refused rather than bound
+    /// positionally to nothing, which would make every precondition vacuously
+    /// true.
+    pub params: Vec<String>,
+    /// The parameter names whose types are signed, for comparison signedness.
+    pub signed: BTreeSet<String>,
+    /// Whether the return type is signed, for a postcondition comparison.
+    pub ret_signed: bool,
+}
+
+/// The contracts of the callees a function may call.
+///
+/// Resolution is delegated to [`spec::Specs::resolve`], so a contract keyed by an
+/// `impl`'s location and one keyed by a source path are both found by the same
+/// rule the frontend already uses to attach a contract to its function. A name
+/// that resolves to a function the dump *does* contain is answered `None`: the
+/// body is there, and inlining it is strictly more precise than assuming a
+/// contract about it.
+pub struct CalleeEnv<'a> {
+    /// The dump, consulted only to tell "has a body here" from "does not".
+    prog: &'a MirProgram,
+    /// The contracts read from the source.
+    specs: &'a spec::Specs,
+}
+
+impl<'a> CalleeEnv<'a> {
+    /// Build for one program and its specs.
+    pub fn new(prog: &'a MirProgram, specs: &'a spec::Specs) -> Self {
+        CalleeEnv { prog, specs }
+    }
+
+    /// The contract for a call, or `None` when there is none to assume.
+    ///
+    /// `None` covers three different situations and the caller does not need to
+    /// tell them apart, because each has the same right answer: the callee's body
+    /// is in the dump (inline it), the callee has no contract (report the call as
+    /// unmodelled), or the name resolves to nothing at all (the same).
+    pub fn get(&self, name: &str) -> Option<CalleeContract> {
+        if resolve_callee(self.prog, name).is_some() {
+            return None;
+        }
+        let c = self.specs.resolve(name)?;
+        Some(CalleeContract {
+            requires: c.requires.clone(),
+            ensures: c.ensures.clone(),
+            params: c.params.iter().map(|(n, _)| n.clone()).collect(),
+            signed: c
+                .params
+                .iter()
+                .filter(|(_, t)| t.is_signed())
+                .map(|(n, _)| n.clone())
+                .collect(),
+            ret_signed: c.ret.as_ref().map(|t| t.is_signed()).unwrap_or(false),
+        })
+    }
+}
+
 /// The loop clauses a function carries: its invariant, and its optional measure.
 ///
 /// Bundled rather than passed as two arguments because they always travel
@@ -2162,12 +2279,14 @@ struct RecCtx {
 /// is what makes preservation expressible: the same text is evaluated a second
 /// time in the post-state of one iteration, and a predicate built once could not
 /// see that state. Without an invariant a loop is unwound, as before.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_fn<F>(
     prog: &MirProgram,
     f: &MirFn,
     pre: Option<Pred>,
     post: Option<F>,
     loops: LoopSpec<'_>,
+    callees: &CalleeEnv<'_>,
     seeds: &Seeds,
     rec: Option<Recursion>,
 ) -> MirReport
@@ -2446,7 +2565,7 @@ where
             break;
         }
         explored += 1;
-        run_state(prog, st, &post, &mut report, &mut work, &seeds.pins, root, &rec_ctx);
+        run_state(prog, st, &post, &mut report, &mut work, &seeds.pins, root, &rec_ctx, callees);
     }
     report
 }
@@ -3158,6 +3277,190 @@ fn resolve_callee(prog: &MirProgram, name: &str) -> Option<usize> {
     None
 }
 
+/// Answer a call from the callee's *contract* when the callee's body is not in
+/// the dump.
+///
+/// The call is *always* handled, so this returns `()`. There is no body to inline
+/// and so no fall-through: the alternative to a verdict here is the generic
+/// "unmodelled function" message, and every branch below has something more
+/// specific to say -- a decided call, or a refusal naming what stopped it.
+///
+/// The two obligations are the standard modular pair, and the *order* between
+/// them is what keeps the assumption sound. The precondition is proved of the
+/// arguments first; only then is the postcondition assumed of the result. A route
+/// that assumed the postcondition without proving the precondition would be
+/// assuming the conclusion, which is the whole reason a contract is not a free
+/// pass.
+///
+/// The divergence check is the third piece and it is not optional. `ensures
+/// false` describes a callee that never returns, so a caller's claims *after* the
+/// call are vacuously true -- and a report that counted them would say "verified"
+/// about a function that does not run. `find_model` on the postcondition answers
+/// this: `Unsat` means no input satisfies it, so the call diverges. This is the
+/// MIR twin of [`crate::wp::Rule::DivergentCall`], and it is a *refutation* query,
+/// so its discharge is `Unsat` rather than `Valid`.
+#[allow(clippy::too_many_arguments)]
+fn try_callee_contract(
+    prog: &MirProgram,
+    st: &mut State,
+    name: &str,
+    cc: &CalleeContract,
+    args: &[Operand],
+    dest: &Place,
+    target: usize,
+    report: &mut MirReport,
+    work: &mut Vec<State>,
+    pins: &[(u32, u64)],
+) {
+    let cur = &prog.fns[st.frame.func];
+    // The names have to line up positionally with the arguments, and there is no
+    // second signal to fall back on: a callee outside the dump has no `debug`
+    // bindings, so the source signature is the only source of names. A mismatch
+    // means the scanner and the call disagree about the arity, and binding the
+    // names it did read would attach `requires: n <= 10` to whatever argument
+    // happens to be first. Refusing is the only safe answer.
+    if cc.params.len() != args.len() {
+        report.unknown_paths.push(format!(
+            "call to `{name}`: the callee's contract names {} parameter(s) but the call has {} \
+             argument(s), so the precondition cannot be attached to them",
+            cc.params.len(),
+            args.len()
+        ));
+        return;
+    }
+    // A reference argument is refused. `Ty::Ref` is modelled as its referent, so
+    // the callee's write through `&mut` would be a write to a value the caller
+    // passed *by value* here -- the mutation would not reach the caller's local,
+    // and a postcondition about it would be checked against the wrong state. A
+    // contract over reference parameters needs the aliasing model this frontend
+    // does not have, so the call stays unknown rather than being assumed.
+    let by_ref = args.iter().any(|a| match a {
+        Operand::Copy(p) | Operand::Move(p) => {
+            matches!(cur.ty_of(p.local), Some(Ty::Ref(_)))
+        }
+        Operand::Const(_) => false,
+    });
+    if by_ref {
+        report.unknown_paths.push(format!(
+            "call to `{name}` passes a reference, and a callee outside the dump has no \
+             aliasing model to reason about it through its contract"
+        ));
+        return;
+    }
+    let mut names: BTreeMap<String, Var> = BTreeMap::new();
+    for (param, a) in cc.params.iter().zip(args) {
+        match operand(&mut st.env, a) {
+            Val::Sym(v, _) => {
+                names.insert(param.clone(), v);
+            }
+            Val::Bool(p) => {
+                names.insert(param.clone(), smt::ite(p, smt::word(1, 1), smt::word(0, 1)));
+            }
+            _ => {
+                report.unknown_paths.push(format!(
+                    "call to `{name}`: argument `{param}` is not a modelled value, so the \
+                     contract cannot be evaluated at the call site"
+                ));
+                return;
+            }
+        }
+    }
+    let fields = FieldEnv::with_consts(prog.consts.clone());
+
+    // `Pre`: the callee's precondition, proved of the call's arguments.
+    let mut pre: Option<Pred> = None;
+    for r in &cc.requires {
+        match spec::eval_requires(r, &names, &cc.signed, &fields) {
+            Ok(p) => pre = Some(match pre {
+                None => p,
+                Some(prev) => smt::and(prev, p),
+            }),
+            Err(e) => {
+                report.unknown_paths.push(format!(
+                    "unreadable `requires` on the callee `{name}`: {e}"
+                ));
+                return;
+            }
+        }
+    }
+    if let Some(p) = pre {
+        report.obligations.push(Obligation {
+            kind: ObligationKind::CalleePrecondition,
+            verdict: prove_obligation(st.path, p, pins),
+        });
+    }
+
+    // The return width comes from the *caller's* destination, which is the one
+    // place the return type is available without the callee's MIR.
+    let Some(w) = type_of_place(cur, dest).and_then(|t| t.width()) else {
+        report.unknown_paths.push(format!(
+            "call to `{name}` returns an aggregate, which is not modelled through a contract"
+        ));
+        return;
+    };
+    let ret_v = smt::var(w);
+
+    // The postcondition, over a fresh `ret` and the call's arguments. Built once
+    // and used twice: refuted to detect divergence, then assumed.
+    let mut post: Option<Pred> = None;
+    for e in &cc.ensures {
+        match spec::eval_ensures(
+            e,
+            &names,
+            Some(ret_v),
+            spec::RET_IS_UNKNOWN,
+            &cc.signed,
+            cc.ret_signed,
+            &fields,
+        ) {
+            Ok(p) => post = Some(match post {
+                None => p,
+                Some(prev) => smt::and(prev, p),
+            }),
+            Err(e) => {
+                report.unknown_paths.push(format!(
+                    "unreadable `ensures` on the callee `{name}`: {e}"
+                ));
+                return;
+            }
+        }
+    }
+    let Some(post) = post else {
+        // No postcondition is not "postcondition `true`". With nothing to assume
+        // the result is unknown, and there is no body to inline, so the call is
+        // reported rather than guessed.
+        report.unknown_paths.push(format!(
+            "call to `{name}`: the callee has no `ensures`, so there is nothing to assume \
+             about its result and no body in the dump to execute"
+        ));
+        return;
+    };
+
+    // Divergence: can any input satisfy the postcondition? `Unsat` says no, so the
+    // call never returns and every claim after it would be vacuous.
+    let diverges = matches!(
+        find_obligation(smt::and(st.path, post), pins),
+        Verdict::Unsat
+    );
+    if diverges {
+        report.obligations.push(Obligation {
+            kind: ObligationKind::CalleeDiverges,
+            verdict: find_obligation(smt::and(st.path, post), pins),
+        });
+        return;
+    }
+
+    // Assume the postcondition for the result.
+    st.path = smt::and(st.path, post);
+    let ret_val = if w == 1 {
+        Val::Bool(ret_v.eq_val(1))
+    } else {
+        Val::Sym(ret_v, Sign::of_bool(cc.ret_signed))
+    };
+    st.env.set(dest, ret_val);
+    advance(prog, st.clone(), target, report, work, pins);
+}
+
 /// Answer a self-recursive call by its contract instead of inlining it.
 ///
 /// Returns `Some(())` when the call was handled (the caller must then continue at
@@ -3812,6 +4115,7 @@ fn run_state<F>(
     pins: &[(u32, u64)],
     root: usize,
     rec: &Option<RecCtx>,
+    callees: &CalleeEnv<'_>,
 )
 where
     F: Fn(Option<Var>, &[(u32, Var)]) -> Result<Pred, String>,
@@ -4627,6 +4931,24 @@ where
                         }
                     };
                     advance(prog, next, *target, report, work, pins);
+                    return;
+                }
+            }
+            // A callee whose body is *not* in the dump, but whose contract is,
+            // is answered by that contract instead of being refused. This is the
+            // modular case, and it is the only one where a call can be decided
+            // without the callee's body: the body is what the dump would have
+            // inlined, so with no body the alternative is "unmodelled function".
+            //
+            // It runs *after* the same-dump lookup on purpose. When the body is
+            // there, inlining it is strictly more precise than assuming a contract
+            // about it -- it proves the callee's actual behaviour rather than what
+            // the callee promised -- so the contract route must not shadow it.
+            if same_dump.is_none() {
+                if let Some(cc) = callees.get(name) {
+                    try_callee_contract(
+                        prog, &mut st, name, &cc, args, dest, *target, report, work, pins,
+                    );
                     return;
                 }
             }

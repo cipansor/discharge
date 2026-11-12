@@ -2076,12 +2076,21 @@ says "I could not decide" is worth more than one that guesses.
 
 ### The known gaps, stated
 
-1. **Calls are inlined one level.** A call to a function in the same file is
-   symbolically executed; a call to anything else is `Unknown`. A *self-call* with
-   a `decreases:` measure is the exception: it is answered by the contract by
-   well-founded induction rather than inlined, so a recursive function with a
-   measure is decidable and one without it is reported incomplete at the depth
-   bound.
+1. **Calls are inlined one level, or answered by a contract.** A call to a
+   function in the same file is symbolically executed; a call to a function whose
+   body is *not* in the file but whose contract is -- an `extern` declaration, or
+   any item the dump does not carry a body for -- is answered from that contract:
+   its `requires:` is proved of the call's arguments, its `ensures:` is assumed of
+   the result, and an unsatisfiable postcondition refuses the call as divergent.
+   The precondition obligation is what makes the assumption sound; a call outside
+   the callee's precondition fails rather than being trusted. A callee with no
+   postcondition gives nothing to assume and stays incomplete. A *self-call* with
+   a `decreases:` measure is answered by the same contract route with well-founded
+   induction added, so a recursive function with a measure is decidable and one
+   without it is reported incomplete at the depth bound. A callee whose parameter
+   list the source scanner cannot read (a pattern parameter, a wrapped signature)
+   is refused rather than bound positionally, and a reference argument is refused
+   because there is no aliasing model to carry a write back to the caller.
 2. **The dump is textual.** The frontend parses `--emit=mir` output rather than
    linking `rustc-dev`. That keeps the dependency count at zero and makes the
    input inspectable, but it means a rustc release that changes the pretty-printer

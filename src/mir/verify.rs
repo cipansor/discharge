@@ -538,12 +538,17 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     };
     let pins: Vec<(u32, u64)> = pin_buf[..n_pins].to_vec();
 
+    // The callees a call may be answered from a contract rather than a body. A
+    // name the dump already contains is not in here: its body is inlined, which
+    // is strictly more precise than assuming what it promised.
+    let callees = exec::CalleeEnv::new(prog, specs);
     let report = exec::verify_fn(
         prog,
         f,
         pre,
         post,
         exec::LoopSpec { invariant, variant },
+        &callees,
         &exec::Seeds {
             fields: fields.seeds.clone(),
             nested: fields.nested_seeds.clone(),

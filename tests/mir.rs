@@ -8035,3 +8035,225 @@ fn an_unclosed_block_comment_after_const_is_not_a_panic() {
         let _ = spec::const_generic_params(src);
     }
 }
+
+/// The `(name, outcome)` pairs for a source written to a temp file, for a test
+/// that needs more than one function out of the same file.
+///
+/// [`verify_src`] returns one outcome and asserts the function was not dropped,
+/// which is what a single-function test wants. The modular-call tests need to
+/// read a *caller* and confirm what happened to a *callee* in the same run, so
+/// this hands back every outcome and lets the test pick.
+fn verify_all_src(src: &str) -> Option<Vec<(String, FnOutcome)>> {
+    let rustc = rustc()?;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir()
+        .join(format!("verif-all-{}-{seq}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("probe.rs");
+    std::fs::write(&file, src).expect("write probe");
+    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let _ = std::fs::remove_dir_all(&dir);
+    Some(report.outcomes)
+}
+
+/// The outcome for `name` out of a multi-function run.
+fn pick<'a>(outcomes: &'a [(String, FnOutcome)], name: &str) -> &'a FnOutcome {
+    outcomes
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, o)| o)
+        .unwrap_or_else(|| {
+            let seen: Vec<&str> = outcomes.iter().map(|(n, _)| n.as_str()).collect();
+            panic!("`{name}` missing from {seen:?}")
+        })
+}
+
+// ---------------------------------------------------------------------------
+// Modular verification: a call answered by the callee's contract
+// ---------------------------------------------------------------------------
+
+/// A call to a function whose body is not in the dump, but whose contract is,
+/// is decided by the contract.
+///
+/// This is the gap the README used to state as "calls are inlined one level": a
+/// callee with no body had no route to a verdict at all. The contract gives one,
+/// and the two obligations it produces are visible in the count -- the
+/// precondition proved, and (with the postcondition assumed) the caller's own
+/// postcondition proved from it.
+#[test]
+fn a_callee_contract_decides_a_call_with_no_body() {
+    let src = "unsafe extern \"C\" {\n    /// requires: n <= 10\n    /// ensures: ret <= n + 1\n    \
+               fn ext_bump(n: u32) -> u32;\n}\n\n\
+               /// requires: x <= 10\n/// ensures: ret <= 11\n\
+               pub fn caller_ok(x: u32) -> u32 { unsafe { ext_bump(x) } }\n";
+    let Some(all) = verify_all_src(src) else { return };
+    let o = pick(&all, "caller_ok");
+    assert!(o.is_verified(), "the contract should decide this call, got: {o}");
+    match o {
+        FnOutcome::Verified { obligations, .. } => assert!(
+            *obligations >= 2,
+            "the precondition obligation and the caller's postcondition must both \
+             be present, got {obligations}"
+        ),
+        _ => unreachable!(),
+    }
+}
+
+/// A caller that does not establish the callee's precondition is refused.
+///
+/// The postcondition is *assumed*, so a caller that reaches the call with an
+/// argument outside the precondition would be assuming something the callee
+/// never promised. Only the precondition obligation catches this -- the
+/// postcondition `ret <= 101` follows from the assumption -- which is exactly
+/// why the precondition has to be a proof obligation rather than a comment.
+#[test]
+fn a_caller_that_does_not_establish_the_precondition_fails() {
+    let src = "unsafe extern \"C\" {\n    /// requires: n <= 10\n    /// ensures: ret <= n + 1\n    \
+               fn ext_bump(n: u32) -> u32;\n}\n\n\
+               /// requires: x <= 100\n/// ensures: ret <= 101\n\
+               pub fn caller_pre_fails(x: u32) -> u32 { unsafe { ext_bump(x) } }\n";
+    let Some(all) = verify_all_src(src) else { return };
+    let o = pick(&all, "caller_pre_fails");
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("callee's precondition"),
+            "the failure must name the precondition, got: {kind}"
+        ),
+        _ => panic!("a call outside the callee's precondition must FAIL, got: {o}"),
+    }
+}
+
+/// A callee whose postcondition is unsatisfiable never returns, and the caller
+/// must not be credited with a proof past the call.
+///
+/// `ensures false` describes a function that cannot return. Assuming it would
+/// make every claim after the call vacuously true, so a caller whose body is
+/// `diverge(x); unreachable` would "verify". This is the MIR twin of `wp`'s
+/// `Rule::DivergentCall`, and the verdict is a *refutation* of the
+/// postcondition -- `Unsat` -- so its discharge is `Unsat` rather than `Valid`.
+#[test]
+fn a_call_to_a_callee_whose_postcondition_is_unsatisfiable_fails() {
+    let src = "unsafe extern \"C\" {\n    /// requires: n <= 10\n    /// ensures: false\n    \
+               fn ext_never_returns(n: u32) -> u32;\n}\n\n\
+               /// requires: x <= 10\n/// ensures: ret == 0\n\
+               pub fn caller_of_divergent(x: u32) -> u32 { unsafe { ext_never_returns(x) } }\n";
+    let Some(all) = verify_all_src(src) else { return };
+    let o = pick(&all, "caller_of_divergent");
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("postcondition is unsatisfiable"),
+            "the failure must name the divergence, got: {kind}"
+        ),
+        _ => panic!("a divergent callee must FAIL the caller, got: {o}"),
+    }
+}
+
+/// A callee with a precondition but no postcondition promises nothing about its
+/// result, so there is nothing to assume and the call is incomplete.
+///
+/// The alternative reading -- no `ensures` means `ensures true` -- would let the
+/// caller's own postcondition be proved from nothing at all. An absent clause is
+/// the absence of a promise, not a promise of everything.
+#[test]
+fn a_callee_with_no_postcondition_is_not_assumed_to_promise_everything() {
+    let src = "unsafe extern \"C\" {\n    /// requires: n <= 10\n    fn ext_no_post(n: u32) -> u32;\n}\n\n\
+               /// requires: x <= 10\n/// ensures: ret <= 11\n\
+               pub fn caller_of_silent(x: u32) -> u32 { unsafe { ext_no_post(x) } }\n";
+    let Some(all) = verify_all_src(src) else { return };
+    let o = pick(&all, "caller_of_silent");
+    assert!(
+        !o.is_verified(),
+        "a callee with no `ensures` gives nothing to assume, got: {o}"
+    );
+    match o {
+        FnOutcome::Incomplete { reasons, .. } => assert!(
+            reasons.iter().any(|r| r.contains("no `ensures`")),
+            "the reason must say the callee has no postcondition, got: {reasons:?}"
+        ),
+        _ => panic!("expected Incomplete, got: {o}"),
+    }
+}
+
+/// A callee whose signature the scanner cannot read is refused rather than bound
+/// positionally to the wrong parameter.
+///
+/// rustc enforces a call's arity, so a *real* mismatch cannot come from valid
+/// Rust. It comes from the scanner: a parameter written as a pattern (`_: u32`)
+/// has no name for a contract to mention, so [`spec`]'s signature reader stops
+/// and reports no parameters at all. The call still has an argument, the two
+/// counts disagree, and the contract's `requires: n <= 10` has no parameter to
+/// attach to. Binding it to the first argument anyway would prove a precondition
+/// nobody stated, so the call is refused.
+#[test]
+fn a_signature_the_scanner_cannot_read_refuses_the_call() {
+    let src = "unsafe extern \"C\" {\n    /// requires: n <= 10\n    /// ensures: ret <= n + 1\n    \
+               fn ext_bump(_: u32) -> u32;\n}\n\n\
+               /// requires: x <= 10\n/// ensures: ret <= 11\n\
+               pub fn caller_unnamed(x: u32) -> u32 { unsafe { ext_bump(x) } }\n";
+    let Some(all) = verify_all_src(src) else { return };
+    let o = pick(&all, "caller_unnamed");
+    assert!(
+        !o.is_verified(),
+        "a parameter the scanner could not name must not be bound positionally, got: {o}"
+    );
+    match o {
+        FnOutcome::Incomplete { reasons, .. } => assert!(
+            reasons.iter().any(|r| r.contains("parameter(s)")),
+            "the reason must name the arity, got: {reasons:?}"
+        ),
+        _ => panic!("expected Incomplete, got: {o}"),
+    }
+}
+
+/// A caller that passes a reference to a callee outside the dump is refused.
+///
+/// `Ty::Ref` is modelled as its referent, so a `&mut` argument handed to a callee
+/// with no body would have its write vanish: the callee's contract talks about
+/// the referent, the caller holds the value, and a postcondition about the write
+/// would be checked against a state the callee never produced. No aliasing model,
+/// no contract route.
+#[test]
+fn a_call_passing_a_reference_to_a_bodyless_callee_is_refused() {
+    let src = "unsafe extern \"C\" {\n    /// requires: *r <= 10\n    /// ensures: true\n    \
+               fn ext_take(r: &mut u32);\n}\n\n\
+               /// requires: x <= 10\n/// ensures: ret <= 10\n\
+               pub fn caller_by_ref(x: u32) -> u32 {\n    let mut y = x;\n    \
+               unsafe { ext_take(&mut y) };\n    y\n}\n";
+    let Some(all) = verify_all_src(src) else { return };
+    let o = pick(&all, "caller_by_ref");
+    assert!(
+        !o.is_verified(),
+        "a reference argument needs the aliasing model, got: {o}"
+    );
+    match o {
+        FnOutcome::Incomplete { reasons, .. } => assert!(
+            reasons.iter().any(|r| r.contains("passes a reference")),
+            "the reason must name the reference, got: {reasons:?}"
+        ),
+        _ => panic!("expected Incomplete, got: {o}"),
+    }
+}
+
+/// A callee whose body *is* in the dump is inlined, not answered from its
+/// contract.
+///
+/// Inlining is strictly more precise -- it executes the callee rather than
+/// trusting what it promised -- so the contract route must not shadow it. The
+/// discriminating test is a callee whose contract is *weaker* than its body: the
+/// caller's claim is only provable from the body, so a pass proves the body was
+/// used. A contract-only route would leave it undecided.
+#[test]
+fn a_callee_with_a_body_is_inlined_rather_than_answered_from_its_contract() {
+    let src = "/// ensures: ret <= 100\n\
+               pub fn callee(a: u32) -> u32 { a }\n\n\
+               /// requires: x <= 3\n/// ensures: ret <= 3\n\
+               pub fn caller(x: u32) -> u32 { callee(x) }\n";
+    let Some(all) = verify_all_src(src) else { return };
+    let o = pick(&all, "caller");
+    assert!(
+        o.is_verified(),
+        "the callee's body is in the dump, so inlining proves `ret <= 3`; a contract-only \
+         route would only give `ret <= 100`, got: {o}"
+    );
+}

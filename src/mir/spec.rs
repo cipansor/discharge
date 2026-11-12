@@ -165,6 +165,22 @@ pub struct FnContract {
     pub unknown: Vec<(usize, String)>,
     /// Line number of the `fn` item, for diagnostics.
     pub line: usize,
+    /// The parameter names and types from the signature, in declaration order.
+    ///
+    /// A callee whose body is in the dump gets its parameter *names* from the
+    /// dump's `debug` bindings, which is where the executor reads them. A callee
+    /// whose body is *not* in the dump has no `debug` bindings at all, so the
+    /// source signature is the only place its names exist -- and a call answered
+    /// from that callee's contract has to bind the contract's `requires: n <= 10`
+    /// to the right argument, which needs the name. Positional binding is the only
+    /// thing tying the two together, so a signature this scanner could not read
+    /// leaves the list empty and the call is refused rather than bound by guess.
+    pub params: Vec<(String, Ty)>,
+    /// The declared return type, for a postcondition over `ret`. `None` when the
+    /// scanner could not read the signature, which refuses the call rather than
+    /// defaulting the type -- a `ret` of the wrong width would make a postcondition
+    /// comparison meaningless.
+    pub ret: Option<Ty>,
 }
 
 /// Every function's contract, keyed by function name.
@@ -1908,6 +1924,9 @@ pub fn extract(source: &str) -> Specs {
                 || !pending.unknown.is_empty()
             {
                 pending.line = lineno + 1;
+                let (params, ret) = fn_signature(line);
+                pending.params = params;
+                pending.ret = ret;
                 // A method's contract is keyed by its `impl`'s location, so two
                 // `impl` blocks that each declare `value` keep separate entries
                 // instead of one overwriting the other.
@@ -2000,6 +2019,96 @@ fn edit_distance(a: &str, b: &str) -> usize {
         std::mem::swap(&mut prev, &mut cur);
     }
     prev[b.len()]
+}
+
+/// The parameter list and return type of an `fn` item, from its source signature.
+///
+/// This exists for the *callee outside the dump*: its body is not in the MIR, so
+/// the `debug` bindings the executor usually reads a parameter's name from do not
+/// exist, and the contract's `requires` has to be attached to an argument
+/// positionally. A signature that cannot be read leaves both lists empty and the
+/// call is refused, which is the safe direction: binding `requires: n <= 10` to
+/// whatever argument happens to be first would prove a precondition nobody stated.
+///
+/// The parser is deliberately shallow. It takes the text between the parameter
+/// list's parentheses and the text after `->`, splits the parameters on top-level
+/// commas (so `&[u8; 4]`, `(u8, u8)` and `fn(u8) -> u8` stay whole), and reads the
+/// text before each parameter's `:` as its name, dropping a leading `mut `. So
+/// `mut x: u32` and `x: u32` are both `x`. Anything else before the colon -- `_`,
+/// `self`, a destructuring pattern -- stops the whole list, because a positional
+/// bind that is short by one would shift every later argument onto the wrong
+/// parameter.
+///
+/// The return type is the text between `->` and the body's `{` (or a `;` for a
+/// declaration), trimmed. A function with no `->` returns `()`.
+fn fn_signature(line: &str) -> (Vec<(String, Ty)>, Option<Ty>) {
+    let Some(open) = line.find('(') else {
+        return (Vec::new(), None);
+    };
+    // The parameter list runs to its *matching* close paren, not the first one: a
+    // parameter whose type is itself parenthesised (`a: (u8, u8)`) puts a `)`
+    // inside the list, and stopping there would read `a: (u8, u8` as the whole
+    // signature -- a list short by one parameter, which the positional bind would
+    // then attach the wrong argument to. A signature that wraps onto a later line
+    // is not read here, and the empty list it produces refuses the call rather
+    // than binding wrongly.
+    let mut depth = 0usize;
+    let mut close = None;
+    for (i, ch) in line[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(close) = close else {
+        return (Vec::new(), None);
+    };
+    let mut params = Vec::new();
+    let list = line[open + 1..close].trim();
+    if !list.is_empty() {
+        for part in split_top_level(list, ',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            // `name: Type`, with an optional `mut`/`ref` before the name and a
+            // pattern (`_`) in place of one.
+            let Some(colon) = part.find(':') else {
+                return (Vec::new(), None);
+            };
+            let before = part[..colon].trim();
+            let name = before
+                .strip_prefix("mut ")
+                .unwrap_or(before)
+                .trim()
+                .to_string();
+            // A pattern (`_`, `(a, b)`) has no single name to bind, and a
+            // `self` receiver is not a value parameter a contract can name.
+            if name.is_empty()
+                || name == "_"
+                || name == "self"
+                || !name.chars().all(|c| c.is_alphanumeric() || c == '_')
+            {
+                return (Vec::new(), None);
+            }
+            params.push((name, Ty::parse(part[colon + 1..].trim())));
+        }
+    }
+    // The return type: after `->`, up to the body's `{` or the declaration's `;`.
+    let after = &line[close..];
+    let ret = after.find("->").map(|i| {
+        let rest = &after[i + 2..];
+        let end = rest.find(['{', ';']).unwrap_or(rest.len());
+        Ty::parse(rest[..end].trim())
+    });
+    (params, ret)
 }
 
 fn fn_name(line: &str) -> Option<String> {
@@ -6459,6 +6568,46 @@ pub fn arg_vars(f: &crate::mir::parse::MirFn) -> BTreeMap<String, Var> {
 
 #[cfg(test)]
 mod tests {
+    /// The signature reader, which is only reached for a callee outside the dump.
+    ///
+    /// A parameter list the reader cannot make sense of has to come back *empty*,
+    /// not partially filled: the caller binds the contract's names positionally, so
+    /// a list that is short by one would attach `requires: n <= 10` to the wrong
+    /// argument. Each case below is a shape that must produce no list at all.
+    #[test]
+    fn fn_signature_reads_names_positionally_or_not_at_all() {
+        use super::{fn_signature, Ty};
+        let (p, r) = fn_signature("pub fn f(n: u32, mut m: i8) -> u16 {");
+        assert_eq!(
+            p,
+            vec![("n".to_string(), Ty::U32), ("m".to_string(), Ty::I8)]
+        );
+        assert_eq!(r, Some(Ty::U16));
+        // A declaration, with no body and so no `{`.
+        let (p, r) = fn_signature("    fn ext(a: u32) -> u32;");
+        assert_eq!(p, vec![("a".to_string(), Ty::U32)]);
+        assert_eq!(r, Some(Ty::U32));
+        // No return type is not "no signature": the parameters still bind, and the
+        // return is `None` so a postcondition over `ret` is refused.
+        let (p, r) = fn_signature("fn g(a: u32) {");
+        assert_eq!(p, vec![("a".to_string(), Ty::U32)]);
+        assert_eq!(r, None);
+        // A parameter list that cannot be read whole is not read in part.
+        for bad in [
+            "fn h(_: u32) {",
+            "fn h(self) {",
+            "fn h((a, b): (u32, u32)) {",
+            "fn h(a u32) {",
+            "fn h(a: u32",
+        ] {
+            let (p, _) = fn_signature(bad);
+            assert!(p.is_empty(), "`{bad}` must yield no parameters, got {p:?}");
+        }
+        // A nested comma is not a parameter boundary.
+        let (p, _) = fn_signature("fn k(a: (u8, u8), b: [u8; 2]) {");
+        assert_eq!(p.len(), 2, "a nested comma must not split a parameter: {p:?}");
+    }
+
     use super::*;
 
     fn def(src: &str) -> EnumDef {
