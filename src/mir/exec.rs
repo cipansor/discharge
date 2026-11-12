@@ -435,6 +435,18 @@ struct Env {
     /// this run explicitly wrote are served from here; a read of an element that was never
     /// written is `Unknown`, never a seed or a literal.
     elems_path: BTreeMap<(u32, Vec<u32>, u64), Val>,
+    /// A field *inside* an element of an array or tuple literal whose element is
+    /// itself an aggregate: `[o.i, o.j]` keys element 0's leaf under
+    /// `(local, 0, [0])` (index, then the field chain within the element).
+    ///
+    /// The mirror image of [`Self::elems_path`], and a separate store for the same
+    /// reason it is separate from [`Self::elems`]: the key is the whole path, and
+    /// here the index comes *first* and the field chain is inside the element. That
+    /// is how `[o.i, o.j][0].v` reads -- `_2[_5].0`, an index then a field -- which
+    /// is the opposite order from `o.a[0]`. Keying it the other way round would
+    /// collide `a[0].v` with `a.v[0]`. Only leaves this run wrote are served; a
+    /// field no write reached is `Unknown`, never a seed.
+    elem_parts: BTreeMap<(u32, u64, Vec<u32>), Val>,
     /// Tuple fields, keyed by (local, field).
     fields: BTreeMap<(u32, u32), Val>,
     /// A *nested* field path, keyed by (local, the projection chain from the
@@ -583,6 +595,7 @@ impl Env {
             locals: BTreeMap::new(),
             elems: BTreeMap::new(),
             elems_path: BTreeMap::new(),
+            elem_parts: BTreeMap::new(),
             fields: BTreeMap::new(),
             nested: BTreeMap::new(),
             payloads: BTreeMap::new(),
@@ -967,14 +980,27 @@ impl Env {
             .filter(|((l, _, _), _)| *l == s)
             .map(|((_, chain, k), v)| (chain.clone(), *k, *v))
             .collect();
+        // A field inside an element of an aggregate literal is a part too:
+        // `let b = a` must carry `a[0].v` to `b[0].v`, or the copy reads the
+        // destination's stale leaf (or nothing at all).
+        let elem_parts: Vec<(u64, Vec<u32>, Val)> = self
+            .elem_parts
+            .iter()
+            .filter(|((l, _, _), _)| *l == s)
+            .map(|((_, k, chain), v)| (*k, chain.clone(), *v))
+            .collect();
         let any = !fields.is_empty()
             || !elems.is_empty()
             || !payloads.is_empty()
             || !nested.is_empty()
             || !path_elems.is_empty()
+            || !elem_parts.is_empty()
             || disc.is_some()
             || indexed.is_some();
         self.forget_parts(dst);
+        for (k, chain, v) in elem_parts {
+            self.elem_parts.insert((dst, k, chain), v);
+        }
         for (chain, v) in nested {
             self.nested.insert((dst, chain), v);
         }
@@ -1074,6 +1100,27 @@ impl Env {
                         // for a caller that did not.
                         None => Val::Unknown,
                     },
+                    // A field *inside* an element whose element is an aggregate:
+                    // `[o.i, o.j][0].v` is `_2[_5].0`, an index then a field. The
+                    // chain after the index is what names the leaf, and it is
+                    // keyed in `elem_parts` in this order. Tried before the
+                    // field-path store so `a[0].v` cannot be answered by a
+                    // differently ordered `a.v[0]`.
+                    //
+                    // The trailing field steps are consumed here (`i` advances past
+                    // them): letting the loop run on would re-read `Field(0)`
+                    // against the local and replace the leaf just found with the
+                    // whole element, which is the wrong value this arm exists to
+                    // avoid.
+                    None if p.proj.len() > i + 1 => {
+                        let inner = match field_steps(&p.proj[i + 1..]) {
+                            Some(chain) if !chain.is_empty() => chain,
+                            _ => return Val::Unknown,
+                        };
+                        let v = *self.elem_parts.get(&(p.local, *k, inner.clone())).unwrap_or(&Val::Unknown);
+                        i += inner.len();
+                        v
+                    }
                     // An element of an array reached through a *field path*: `o.a[0]` is keyed
                     // by `(local, the field chain before the index, index)`. The path form is
                     // tried first; a whole-local array has an empty chain, which is the plain
@@ -1111,6 +1158,21 @@ impl Env {
                             Some(s) => {
                                 let sign = Sign::of_bool(s.elem_signed);
                                 s.elems.get(&k).map(|v| Val::Sym(*v, sign)).unwrap_or(Val::Unknown)
+                            }
+                            // A field inside an element: `_2[_5].0`. Same shape as
+                            // the constant-index case above, with the index pinned
+                            // to `k` by the subscript's own value.
+                            None if p.proj.len() > i + 1 => {
+                                let inner = match field_steps(&p.proj[i + 1..]) {
+                                    Some(chain) if !chain.is_empty() => chain,
+                                    _ => return Val::Unknown,
+                                };
+                                let v = *self
+                                    .elem_parts
+                                    .get(&(p.local, k, inner.clone()))
+                                    .unwrap_or(&Val::Unknown);
+                                i += inner.len();
+                                v
                             }
                             None => {
                                 let chain = field_steps(&p.proj[..i]).unwrap_or_default();
@@ -1364,6 +1426,9 @@ impl Env {
         // Elements of field-path arrays under a whole-value write describe a value that is no
         // longer there; keeping them would be a stale read of the old array.
         self.elems_path.retain(|(l, _, _), _| *l != local);
+        // Fields *inside* an element of an aggregate literal describe a value that
+        // is no longer there once the local is overwritten as a whole.
+        self.elem_parts.retain(|(l, _, _), _| *l != local);
         self.payloads.retain(|(l, _), _| *l != local);
         self.discriminants.remove(&local);
         self.tag_widths.remove(&local);
@@ -1400,6 +1465,9 @@ impl Env {
 
     /// Mark every element of `local` unknown, keeping the length.
     fn poison_elems(&mut self, local: u32) {
+        // A field inside an element describes an element that is no longer pinned,
+        // so it goes with the elements themselves.
+        self.elem_parts.retain(|(l, _, _), _| *l != local);
         match self.indexed.get_mut(&local) {
             Some(s) => s.poisoned = true,
             // A literal array written through a symbolic subscript: the whole
@@ -1433,6 +1501,59 @@ impl Env {
     fn write_elem_at(&mut self, local: u32, chain: Vec<u32>, index: u64, v: Val) {
         self.elems_path.retain(|(l, c, k), _| *l != local || *c != chain || *k != index);
         self.elems_path.insert((local, chain, index), v);
+    }
+
+    /// Re-root the parts of an aggregate operand onto one element of an array or
+    /// tuple literal: `[o.i, o.j]` moves element 0's `v` leaf to `(dest, 0, [0])`.
+    /// The literal path used to store only the element's own value, so a field of
+    /// that element read `Unknown` and `[o.i, o.j][0].v` stayed `incomplete` --
+    /// even for `[Inner { v: 3 }, Inner { v: 4 }]`, where the parts are right there.
+    /// This is [`Self::rebase_parts`] for the index-first shape, and it writes two
+    /// keys because the model reads the two spellings of a tuple component
+    /// differently: `Proj::Field` consults `nested`, while `Proj::Index` consults
+    /// `elem_parts` (a real array index does not go through `nested`).
+    ///
+    /// A *whole-local* source only: a nested source's parts are already keyed by a
+    /// path this cannot re-key without the same order problem, and leaving those
+    /// `Unknown` is a coverage gap, never a wrong value.
+    fn rebase_elem_parts(&mut self, src: &Place, dest: u32, index: u64) -> bool {
+        let src = self.resolve(src);
+        if !src.proj.is_empty() {
+            return false;
+        }
+        let s = src.local;
+        // The element being written replaces whatever leaf it had: a leaf the new
+        // source does not carry must not survive from the old one, which would be a
+        // stale *wrong* value rather than a missing one.
+        self.elem_parts.retain(|(l, k, _), _| *l != dest || *k != index);
+        self.nested
+            .retain(|(l, chain), _| *l != dest || chain.first() != Some(&(index as u32)));
+        let mut moved = false;
+        let fields: Vec<(u32, Val)> = self
+            .fields
+            .iter()
+            .filter(|((l, _), _)| *l == s)
+            .map(|((_, k), v)| (*k, *v))
+            .collect();
+        for (k, v) in fields {
+            self.elem_parts.insert((dest, index, vec![k]), v);
+            self.nested.insert((dest, vec![index as u32, k]), v);
+            moved = true;
+        }
+        let nested: Vec<(Vec<u32>, Val)> = self
+            .nested
+            .iter()
+            .filter(|((l, _), _)| *l == s)
+            .map(|((_, chain), v)| (chain.clone(), *v))
+            .collect();
+        for (chain, v) in nested {
+            let mut key = vec![index as u32];
+            key.extend(chain.iter().copied());
+            self.elem_parts.insert((dest, index, chain), v);
+            self.nested.insert((dest, key), v);
+            moved = true;
+        }
+        moved
     }
 
     /// Record the payload of a modelled `Option`, with its width.
@@ -3424,6 +3545,30 @@ where
                     if !q.proj.is_empty() || !dest.proj.is_empty() {
                         st.env.rebase_parts(q, dest);
                     }
+                    // An element *write* of a whole aggregate: `b[0] = Inner { v: 7 }`
+                    // lowers to `_4[_6] = move _5`. The operand's leaves live in its
+                    // own parts, and the element slot is keyed index-first, which
+                    // `rebase_parts` refuses (it re-roots field chains only). Without
+                    // this the write stores the element's scalar (there is none) and
+                    // the leaf reads `Unknown`, so `b[0].v` after the write stayed
+                    // unreadable. Gated on the operand's type, as the literal path is.
+                    //
+                    // The subscript is a *local* (`_6`), so it is `IndexVar`; only an
+                    // index the run can pin names one element, and a symbolic one has
+                    // no slot to re-root onto.
+                    if matches!(type_of_place(cur, q), Some(Ty::Other(_))) {
+                        let index = match dest.proj.as_slice() {
+                            [Proj::Index(k)] => Some(*k),
+                            [Proj::IndexVar(li)] => match st.env.locals.get(li) {
+                                Some(Val::Sym(x, _)) => smt::evaluate(*x, |_| None),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(k) = index {
+                            st.env.rebase_elem_parts(q, dest.local, k);
+                        }
+                    }
                 }
             }
         }
@@ -4613,6 +4758,19 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
             for (i, o) in ops.iter().enumerate() {
                 let v = operand(env, o);
                 env.set(&Place { local: dest.local, proj: vec![Proj::Index(i as u64)] }, v);
+                // An aggregate *operand* keeps its value in its parts, so
+                // `[o.i, o.j]` stores the element's value but not the leaves under
+                // it, and a later `a[0].v` reads `Unknown` -- the index-first
+                // mirror of the `Rvalue::Struct` hole below. The parts are re-rooted
+                // onto the element after the `set`, which forgets the paths beneath
+                // the element. Gated on the operand's *type* for the same reason the
+                // struct case is: a by-value aggregate operand reads `Unknown` as a
+                // whole, so a value test would miss it.
+                if let Operand::Copy(q) | Operand::Move(q) = o {
+                    if matches!(v, Val::Agg) || matches!(type_of_place(f, q), Some(Ty::Other(_))) {
+                        env.rebase_elem_parts(q, dest.local, i as u64);
+                    }
+                }
             }
             Val::Agg
         }

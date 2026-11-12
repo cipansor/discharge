@@ -3591,8 +3591,18 @@ optional file argument, which is what made the measurement cheap.)
   re-roots an aggregate operand's parts onto the field (`rebase_parts`, gated on the operand's
   type, because a by-value struct argument reads `Unknown` as a whole). Pinned by
   `nested_return_carries_the_field` / `nested_return_is_not_the_stale_field`. An *array literal
-  of aggregates* (`[o.i, o.j]`) is still `incomplete`, because the literal path stores under
-  `elems` by index and does not carry the element aggregates' parts. And an *array whose type is
+  of aggregates* (`[o.i, o.j]`) is now closed: the literal path stores the element under `elems`
+  by index, and the element's *leaves* are re-rooted onto that element in a store keyed
+  index-first (`elem_parts`, mirrored in `nested` for the tuple spelling), because the read
+  `a[0].v` lowers to `_2[_5].0` -- an index then a field, the opposite order from `o.a[0]`, so
+  `rebase_parts` (field chains only) could not carry it. The read arm consumes the trailing field
+  steps; without that the loop re-reads `Field(0)` against the local and replaces the leaf with
+  the whole element. A whole-aggregate *element write* (`b[0] = Inner { v: 7 }`) re-roots the same
+  way, and `copy_parts` carries `elem_parts` across a whole-value copy. Pinned by
+  `an_array_literal_of_aggregates_is_read_back` / `..._second_element_...` /
+  `..._aggregate_fields_...` / `a_tuple_literal_of_aggregates_...` /
+  `an_element_write_of_an_aggregate_...` and their `_cannot_prove_this` twins, asserted in
+  `an_aggregate_literal_element_carries_its_own_leaves`. And an *array whose type is
   a field* (`o.a[0]`) is skipped, since the `indexed` store is keyed by local only (see the note
   below).
   Two notes on what this did *not* need. The nested literal always reaches the

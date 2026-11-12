@@ -3357,6 +3357,57 @@ fn an_array_field_of_a_moved_aggregate_carries_its_elements() {
     }
 }
 
+/// An array or tuple *literal* whose elements are aggregates carries the elements' leaves.
+///
+/// `[o.i, o.j]` stores each element's own value but not the leaves under it, so
+/// `a[0].v` read `Unknown` and the contract stayed `Incomplete` in *both* directions
+/// -- a coverage hole, not a false proof, since a missing value proves nothing. The
+/// read is `_2[_5].0`: an index *then* a field, the opposite order from `o.a[0]`,
+/// which is why it needed its own key rather than `rebase_parts`. The pairs pin both
+/// directions: a read that leaked the *other* element's leaf, or kept the pre-write
+/// leaf, would decide the false entry and the pair would look green while proving
+/// something untrue.
+#[test]
+fn an_aggregate_literal_element_carries_its_own_leaves() {
+    let Some(report) = verify_realistic(&[
+        "an_array_literal_of_aggregates_is_read_back",
+        "an_array_literal_of_aggregates_is_not_the_other_element_cannot_prove_this",
+        "an_array_literal_of_aggregates_second_element_is_read_back",
+        "an_array_literal_of_aggregates_second_is_not_the_first_cannot_prove_this",
+        "an_array_literal_of_aggregate_fields_is_read_back",
+        "an_array_literal_of_aggregate_fields_is_not_the_other_cannot_prove_this",
+        "a_tuple_literal_of_aggregates_is_read_back",
+        "a_tuple_literal_of_aggregates_is_not_the_other_cannot_prove_this",
+        "an_element_write_of_an_aggregate_is_read_back",
+        "an_element_write_of_an_aggregate_is_not_the_old_leaf_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    for name in [
+        "an_array_literal_of_aggregates_is_read_back",
+        "an_array_literal_of_aggregates_second_element_is_read_back",
+        "an_array_literal_of_aggregate_fields_is_read_back",
+        "a_tuple_literal_of_aggregates_is_read_back",
+        "an_element_write_of_an_aggregate_is_read_back",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "an aggregate element's leaves must reach the read; got: {o}");
+    }
+    for name in [
+        "an_array_literal_of_aggregates_is_not_the_other_element_cannot_prove_this",
+        "an_array_literal_of_aggregates_second_is_not_the_first_cannot_prove_this",
+        "an_array_literal_of_aggregate_fields_is_not_the_other_cannot_prove_this",
+        "a_tuple_literal_of_aggregates_is_not_the_other_cannot_prove_this",
+        "an_element_write_of_an_aggregate_is_not_the_old_leaf_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a leaked or stale element leaf must not prove this; got: {o}"
+        );
+    }
+}
+
 /// A whole-aggregate replacement through a sub-place target decides.
 ///
 /// `set_whole(&mut o.i, InnerBox { v: 9 })` replaces the whole referent. This was once

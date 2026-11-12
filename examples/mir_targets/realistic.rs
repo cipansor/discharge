@@ -8310,3 +8310,124 @@ pub fn cfg_quoted_delimiter_keeps_the_live_alias() -> u16 {
 pub fn cfg_quoted_delimiter_is_not_the_wrong_alias_tripwire() -> u16 {
     <u16 as std::convert::From<CfgQuotedLocal>>::from(CfgQuotedLocal)
 }
+
+// ---------------------------------------------------------------------------
+// An array or tuple *literal* whose elements are aggregates.
+//
+// `[o.i, o.j]` stores each element's own value but not the leaves under it, so
+// `a[0].v` read `Unknown` and the contract stayed `incomplete` -- a coverage hole,
+// not a false proof (a missing value proves nothing). The literal path re-roots
+// the element aggregates' parts onto the element slot now, in the index-first key
+// `a[0].v` reads. The false directions below pin that the leaves do not leak
+// between elements: if element 0 answered with element 1's leaf, the "other
+// element" tripwire would *verify*.
+// ---------------------------------------------------------------------------
+
+/// The inner aggregate an element of the literal holds.
+pub struct ElemInner {
+    pub v: u8,
+}
+
+/// The outer aggregate the elements are read out of.
+pub struct ElemOuter {
+    pub i: ElemInner,
+    pub j: ElemInner,
+}
+
+/// Builds an `ElemOuter` from two values, so the elements come from a call rather
+/// than a literal in the same body.
+/// requires: true
+/// ensures: ret.i.v == x && ret.j.v == y
+pub fn elem_outer(x: u8, y: u8) -> ElemOuter {
+    ElemOuter { i: ElemInner { v: x }, j: ElemInner { v: y } }
+}
+
+/// An array literal of inline aggregate elements, read by index then field.
+/// requires: true
+/// ensures: ret == 3
+pub fn an_array_literal_of_aggregates_is_read_back() -> u8 {
+    let a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
+    a[0].v
+}
+
+/// The false direction: element 0's leaf is `3`, so a read that leaked element 1's
+/// leaf would decide this wrongly.
+/// requires: true
+/// ensures: ret == 4
+pub fn an_array_literal_of_aggregates_is_not_the_other_element_cannot_prove_this() -> u8 {
+    let a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
+    a[0].v
+}
+
+/// The *second* element, so a fix that pinned index 0 for every read is caught.
+/// requires: true
+/// ensures: ret == 4
+pub fn an_array_literal_of_aggregates_second_element_is_read_back() -> u8 {
+    let a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
+    a[1].v
+}
+
+/// The false direction of the second element.
+/// requires: true
+/// ensures: ret == 3
+pub fn an_array_literal_of_aggregates_second_is_not_the_first_cannot_prove_this() -> u8 {
+    let a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
+    a[1].v
+}
+
+/// The elements are *field reads* of another aggregate, so the parts come from a
+/// call's return rather than a literal, and the literal only stores their value.
+/// requires: true
+/// ensures: ret == 3
+pub fn an_array_literal_of_aggregate_fields_is_read_back() -> u8 {
+    let o = elem_outer(3, 4);
+    let a = [o.i, o.j];
+    a[0].v
+}
+
+/// The false direction of the field-derived literal.
+/// requires: true
+/// ensures: ret == 4
+pub fn an_array_literal_of_aggregate_fields_is_not_the_other_cannot_prove_this() -> u8 {
+    let o = elem_outer(3, 4);
+    let a = [o.i, o.j];
+    a[0].v
+}
+
+/// A *tuple* literal of aggregates: the same carry, but the read is the
+/// field-then-field spelling `t.0.v` rather than index-then-field.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_tuple_literal_of_aggregates_is_read_back() -> u8 {
+    let t = (ElemInner { v: 3 }, ElemInner { v: 4 });
+    t.0.v
+}
+
+/// The false direction of the tuple literal.
+/// requires: true
+/// ensures: ret == 4
+pub fn a_tuple_literal_of_aggregates_is_not_the_other_cannot_prove_this() -> u8 {
+    let t = (ElemInner { v: 3 }, ElemInner { v: 4 });
+    t.0.v
+}
+
+/// A whole-aggregate *element write* followed by a leaf read: the write's own
+/// leaves must land on the element, and the pre-write leaf must not survive.
+/// requires: true
+/// ensures: ret == 7
+pub fn an_element_write_of_an_aggregate_is_read_back() -> u8 {
+    let a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
+    let mut b = a;
+    b[0] = ElemInner { v: 7 };
+    b[0].v
+}
+
+/// The false direction of the element write: the pre-write leaf is `3`.
+/// requires: true
+/// ensures: ret == 3
+pub fn an_element_write_of_an_aggregate_is_not_the_old_leaf_cannot_prove_this() -> u8 {
+    let a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
+    let mut b = a;
+    b[0] = ElemInner { v: 7 };
+    b[0].v
+}
