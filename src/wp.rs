@@ -1323,7 +1323,7 @@ impl Report {
     /// of discharging them let a report call itself `Total` on the strength of a measure
     /// it had failed to justify. `a_variant_that_does_not_decrease_is_not_termination`
     /// in `tests/wp.rs` pins it.
-    pub fn has_termination_proof(&self) -> bool {
+    pub fn terminates(&self) -> bool {
         let mut loops = 0;
         let mut variants = 0;
         for ob in self.obligations[..self.count].iter().flatten() {
@@ -1357,7 +1357,7 @@ impl Report {
     /// establish if they all held. Check [`Report::is_verified`] first, or use
     /// [`Report::establishes`], which asks both questions at once.
     pub fn correctness(&self) -> Correctness {
-        if self.has_termination_proof() {
+        if self.terminates() {
             Correctness::Total
         } else {
             Correctness::Partial
@@ -1374,7 +1374,7 @@ impl Report {
     pub fn establishes(&self) -> Established {
         if !self.is_verified() {
             Established::Nothing
-        } else if self.has_termination_proof() {
+        } else if self.terminates() {
             Established::Total
         } else {
             Established::Partial
@@ -1575,7 +1575,7 @@ impl Search {
 /// hear, so pass the whole thing — [`domain_of_bits`] when the input is an unsigned value
 /// of known width. The return type keeps the two cases apart instead of collapsing them
 /// into `None`; see [`Search`].
-pub fn find_counterexample_by_enumeration(
+pub fn enumerate_counterexample(
     domain: u64,
     pre: impl Fn(u64) -> bool,
     body: impl Fn(u64) -> u64,

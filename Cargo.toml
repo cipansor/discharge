@@ -1,26 +1,26 @@
 [workspace]
-# `discharge` and the proved-arithmetic sibling. The `tools/mir-oracle` crate is
+# `verif` and the proved-arithmetic sibling. The `tools/mir-oracle` crate is
 # deliberately *not* a member: it links rustc internals behind
 # `#![feature(rustc_private)]`, so it builds only on a nightly with `rustc-dev`.
 # Making it a member would make `cargo build --workspace` require a nightly, which
 # is exactly what a stable, zero-dependency crate must not do. It is built by name
 # (`cargo build -p mir-oracle`) with the oracle toolchain, and `exclude` keeps
 # cargo from trying to pull it in through the `tools/` glob.
-members = ["discharge-arithmetic"]
+members = ["verif-arithmetic"]
 exclude = ["tools/mir-oracle"]
 resolver = "2"
 
 [package]
-name = "discharge"
+name = "verif"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "In-code formal verification for Rust: an embedded bit-blasting SMT decision procedure, a symbolic DSL, contracts and a machine-checked proof kernel. SPARK-inspired, no_std, no external dependencies."
 authors = ["Yayasan Pesantren Cipansor and contributors <halo@cipansor.or.id>"]
 license = "Apache-2.0"
-repository = "https://github.com/cipansor/discharge"
-homepage = "https://github.com/cipansor/discharge"
-documentation = "https://docs.rs/discharge"
+repository = "https://github.com/cipansor/verif"
+homepage = "https://github.com/cipansor/verif"
+documentation = "https://docs.rs/verif"
 readme = "README.md"
 keywords = ["formal-verification", "smt", "no_std", "safety-critical", "contracts"]
 categories = ["no-std", "embedded", "development-tools::testing"]
@@ -43,7 +43,7 @@ exclude = ["*.rlib", "target/", ".sweep/"]
 # path-only dependency makes the manifest unpackagable ("all dependencies must have a
 # version requirement specified when packaging"). It matches the sibling's `version`
 # by hand; the two move together.
-discharge-arithmetic = { path = "discharge-arithmetic", version = "0.1.0" }
+verif-arithmetic = { path = "verif-arithmetic", version = "0.1.0" }
 
 # docs.rs builds with default features unless told otherwise, and the default here is *no*
 # features (`no_std`). Without this, the published docs would silently omit every `std`-only
@@ -84,7 +84,7 @@ test = true
 [profile.release]
 opt-level = 2
 
-# The exhaustive enumerations in `discharge-arithmetic`'s proofs are tight integer
+# The exhaustive enumerations in `verif-arithmetic`'s proofs are tight integer
 # loops, and an unoptimised build runs them roughly eight times slower than
 # `prove::ENUM_BUDGET`'s comment assumes. A `2^32` walk costs ~21 s in the default
 # test profile and ~2.6 s with `opt-level = 2`, which is the difference between a

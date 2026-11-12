@@ -1,0 +1,157 @@
+# Release: tag-driven, one crate per tag.
+#
+# Pushing `verif-v0.1.0` publishes `verif` at 0.1.0 and nothing else. The two
+# crates version independently, so there is no bare `v<version>` tag - it could
+# not say which crate it meant. A mistaken `v0.1.0` still starts this workflow
+# (see the filter below) so that it fails with an explanation rather than
+# matching nothing and looking like success.
+#
+# `workflow_dispatch` is there for a re-run after a partial release; it takes the
+# tag as an input. The checkout is pinned to that tag and then verified against
+# it, so a dispatch cannot package a branch while naming a tag. A crate whose
+# version is already on crates.io is reported and skipped rather than failing the
+# run, so a second run finishes the rest.
+#
+# Publish order matters: `verif` depends on `verif-arithmetic`, and `cargo
+# publish` resolves a path dependency against the registry, so the sibling has to
+# be uploaded first. `scripts/publish.py` derives that order from the manifests
+# and refuses a tag that names the wrong version.
+#
+# A push carrying several tags starts this workflow ONCE, for one of them, not
+# once per tag. Push one tag at a time, or dispatch the rest by hand.
+
+name: Release
+
+on:
+  push:
+    # `*-v*` is the real tag shape. `v*` is here only so a mistaken bare
+    # `v0.1.0` tag starts the workflow and fails at the check below with an
+    # explanation, instead of matching nothing and looking like success.
+    tags: ["*-v*", "v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish, e.g. verif-v0.1.0"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+# The crates.io upload uses a secret token, not GITHUB_TOKEN. `contents: write`
+# is for the GitHub release at the end, which is created with the built-in token.
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      # Full history, not the default shallow clone: the release notes are built
+      # from `git log` over the crate's files and from its previous tag, and a
+      # shallow checkout would silently produce an empty range.
+      #
+      # `ref` pins the checkout to the tag. Without it a manual dispatch checks out
+      # whatever ref the Actions UI selected -- usually the default branch -- and
+      # the tag input only controls what is *named*. Two commits can declare the
+      # same version, so the version check below cannot tell them apart: the branch
+      # would be packaged and uploaded under the tag, and the GitHub release
+      # created against the tag's commit. `--verify-checkout` then compares the
+      # commits, which is the check that can tell.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      # The tag names one crate and one version, and the version has to be the
+      # one in that crate's manifest - the tag is what a reader trusts, so a
+      # disagreement stops the release instead of publishing something the tag
+      # does not name. A bare `v<version>` tag is refused here too, so a manual
+      # dispatch cannot fall back to releasing everything.
+      #
+      # This runs before the toolchain is installed, so a wrong tag fails in
+      # seconds instead of after a download. It needs only python3.
+      - name: Check the tag names one crate
+        run: python3 scripts/publish.py --tag "$RELEASE_TAG" --check-tag
+
+      # And that the tag is what was checked out, not merely what was named.
+      - name: Check the checkout is the tag
+        run: python3 scripts/publish.py --tag "$RELEASE_TAG" --verify-checkout
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      # Checked before the upload, so a missing or expired secret fails early
+      # rather than after the build. The token is a repository secret with
+      # publish scope; this step never prints it.
+      - name: Check the crates.io token
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::No CARGO_REGISTRY_TOKEN secret is configured."
+            exit 1
+          fi
+          echo "CARGO_REGISTRY_TOKEN is configured."
+
+      # A crate that credits an upstream project in its code must name it in
+      # NOTICE. No compiler catches that, and a release is the last moment to.
+      - run: sh scripts/check_package.sh
+
+      # Dry-run first: this catches a manifest that will not package before
+      # anything is uploaded, and an upload cannot be undone. No `--strict`: a
+      # crate that depends on another here is legitimately "blocked" until that
+      # dependency is uploaded, and --strict would fail the release before it
+      # started.
+      - name: Dry-run the publish
+        run: python3 scripts/publish.py
+
+      # Notes are written OUTSIDE the checkout, to `$RUNNER_TEMP`. This is not
+      # tidiness: `verif` is packaged from the repository root, and `cargo publish`
+      # refuses a crate whose directory holds uncommitted changes. A `notes.md` at
+      # the root is exactly such a change, so writing it there would make the crate
+      # the dry-run just checked different from the one the next step uploads, and
+      # the upload would fail with "1 files in the working directory contain changes
+      # that were not yet committed into git: notes.md". The sibling is unaffected,
+      # because its crate directory is the subdirectory -- which is what made this
+      # easy to miss. Keeping the file out of the tree keeps the two inputs equal.
+      - name: Generate the release notes
+        env:
+          NOTES_FILE: ${{ runner.temp }}/release-notes.md
+        run: python3 scripts/publish.py --tag "$RELEASE_TAG" --notes > "$NOTES_FILE"
+
+      # `--yes` skips the interactive confirmation, which no runner can answer.
+      # The token is a crates.io API token with publish scope, stored as a
+      # repository secret; `cargo publish` reads it from CARGO_REGISTRY_TOKEN.
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: python3 scripts/publish.py --publish --yes --tag "$RELEASE_TAG"
+
+      # docs.rs builds asynchronously after the upload, so this waits for the
+      # version to appear in the index, not for the docs to be live. The wait is a
+      # poll with a backoff inside `--confirm-index`: an immediate 404 right after a
+      # successful upload is the index catching up, not a failed release, and
+      # treating it as one would abort the workflow after the upload had already
+      # happened -- the crate published, the GitHub release never created.
+      - name: Confirm the crate is in the index
+        run: python3 scripts/publish.py --tag "$RELEASE_TAG" --confirm-index
+
+      # Idempotent, so a re-run after a partial release updates the notes instead
+      # of failing because the release already exists.
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NOTES_FILE: ${{ runner.temp }}/release-notes.md
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --notes-file "$NOTES_FILE"
+          else
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --notes-file "$NOTES_FILE" \
+              --verify-tag
+          fi

@@ -6,9 +6,9 @@
 //! 2. the *rules* are attributed correctly, so a failure points at the right
 //!    clause instead of just reporting `false`.
 
-use discharge::prelude::*;
-use discharge::smt::{self, var, Verdict};
-use discharge::wp::{self, find_counterexample_by_enumeration, verify, Established, Rule, Stmt};
+use verif::prelude::*;
+use verif::smt::{self, var, Verdict};
+use verif::wp::{self, enumerate_counterexample, verify, Established, Rule, Stmt};
 
 /// A clamp, the canonical safety-critical shape: `y := min(max(x, lo), hi)`.
 /// Written with nested `if`s so the verifier has to consider both branches.
@@ -49,7 +49,7 @@ fn clamp_meets_its_contract_and_execution_agrees() {
 
         // Independent check: no 8-bit input may escape the range. The domain is
         // *derived* from the input width, so it cannot drift from the symbolic width.
-        let found = find_counterexample_by_enumeration(
+        let found = enumerate_counterexample(
             wp::domain_of_bits(8),
             |_| true,
             |v| clamp_exec(v as u8, lo as u8, hi as u8) as u64,
@@ -91,7 +91,7 @@ fn a_too_tight_bound_is_refuted_and_execution_agrees() {
         // Execution must agree, and must produce a witness. A truncated domain would
         // also be worth reporting here, and the return type makes that impossible to
         // confuse with a clean sweep.
-        let found = find_counterexample_by_enumeration(
+        let found = enumerate_counterexample(
             wp::domain_of_bits(8),
             |_| true,
             |v| clamp_exec(v as u8, 20, 200) as u64,
@@ -295,7 +295,7 @@ fn the_exported_query_negates_the_goal() {
         // a compliant solver would answer `unsat`.
         let vars = [x];
         let q = Query::new(&vars, goal);
-        let text = q.to_smtlib2_string();
+        let text = q.to_smtlib2();
         assert!(
             text.contains("(assert (not (bvule x0_8 (_ bv255 8))))"),
             "{}",
@@ -488,7 +488,7 @@ fn the_report_says_whether_termination_was_proved() {
         verify_program(&loop_, i.le_val(10), i.le_val(10))
     });
     assert!(total.is_verified());
-    assert!(total.has_termination_proof());
+    assert!(total.terminates());
     assert_eq!(total.correctness(), wp::Correctness::Total);
 
     // The same loop without a variant establishes only partial correctness.
@@ -504,7 +504,7 @@ fn the_report_says_whether_termination_was_proved() {
         verify_program(&loop_, i.le_val(10), i.le_val(10))
     });
     assert!(partial.is_verified(), "still a valid partial-correctness proof");
-    assert!(!partial.has_termination_proof());
+    assert!(!partial.terminates());
     assert_eq!(partial.correctness(), wp::Correctness::Partial);
 }
 
@@ -548,7 +548,7 @@ fn one_unannotated_loop_makes_the_whole_report_partial() {
         let report = verify_program(&prog, smt::truth(true), smt::truth(true));
         assert!(report.is_verified(), "{:?}", report.first_failure());
         assert!(
-            !report.has_termination_proof(),
+            !report.terminates(),
             "the second loop has no variant, so termination is not proved"
         );
         assert_eq!(report.correctness(), wp::Correctness::Partial);
@@ -559,7 +559,7 @@ fn one_unannotated_loop_makes_the_whole_report_partial() {
 fn a_variant_that_does_not_decrease_is_not_termination() {
     // The defect the differential harness found, pinned here so it cannot come back.
     //
-    // `has_termination_proof` used to count variant obligations instead of discharging
+    // `terminates` used to count variant obligations instead of discharging
     // them. So a loop annotated with a measure that does *not* decrease reported
     // `Total`: the report was not verified (the variant obligation failed), yet
     // `correctness()` still said `Total`. Two halves of one question, read separately,
@@ -583,7 +583,7 @@ fn a_variant_that_does_not_decrease_is_not_termination() {
 
         // The point: no termination claim may survive that failure.
         assert!(
-            !report.has_termination_proof(),
+            !report.terminates(),
             "a variant that was not proved to decrease is not a termination proof"
         );
         assert_eq!(report.correctness(), wp::Correctness::Partial);
@@ -977,7 +977,7 @@ fn a_truncated_domain_cannot_masquerade_as_a_clean_sweep() {
     let run = |v: u64| clamp_exec(v as u8, 20, 200) as u64;
 
     // A prefix of the domain: honest, but only about the prefix.
-    let prefix = find_counterexample_by_enumeration(100, |_| true, run, post);
+    let prefix = enumerate_counterexample(100, |_| true, run, post);
     assert_eq!(prefix, wp::Search::NoWitness);
     assert!(
         prefix.is_clean_over_domain(),
@@ -985,7 +985,7 @@ fn a_truncated_domain_cannot_masquerade_as_a_clean_sweep() {
     );
 
     // The whole domain: the counterexample is there, and must be found.
-    let full = find_counterexample_by_enumeration(wp::domain_of_bits(8), |_| true, run, post);
+    let full = enumerate_counterexample(wp::domain_of_bits(8), |_| true, run, post);
     assert_eq!(
         full,
         wp::Search::Witness(101),
@@ -1029,7 +1029,7 @@ fn a_report_does_not_change_its_verdict_after_a_reset() {
     //   filler  1: contract discharge = "Valid"            <- a failing report read as proved
     //
     // That is the worst answer this crate can give, on its headline verdict. Obligations
-    // now record the arena generation, and `discharge` returns `Unknown` when the arena has
+    // now record the arena generation, and `verif` returns `Unknown` when the arena has
     // moved on, so a stale report fails rather than flips.
     let report = smt::with_fresh(|| {
         let x = var(8);
@@ -1115,7 +1115,7 @@ fn a_report_read_in_its_own_arena_is_unchanged() {
 fn the_export_does_not_invert_a_constant_goal() {
     smt::with_fresh(|| {
         let q = Query::new(&[], smt::truth(false));
-        let text = q.to_smtlib2_string();
+        let text = q.to_smtlib2();
         // The goal is `false`; its negation is `true`, and a solver would answer `sat`.
         // The buggy printer wrote the goal as `(= 0 0)` (= true), whose negation is false.
         assert!(
@@ -1130,7 +1130,7 @@ fn the_export_does_not_invert_a_constant_goal() {
         );
 
         let q = Query::new(&[], smt::truth(true));
-        let text = q.to_smtlib2_string();
+        let text = q.to_smtlib2();
         assert!(
             text.contains("(distinct (_ bv1 1) (_ bv0 1))"),
             "a constant-true goal must export as `1 != 0`:\n{}",
@@ -1148,7 +1148,7 @@ fn the_export_uses_boolean_operators_for_booleans() {
 
         // `not(x == y)` is a boolean; its operand is a boolean. `bvnot` would be ill-sorted.
         let q = Query::new(&vars, smt::not(smt::eq(x, y)));
-        let text = q.to_smtlib2_string();
+        let text = q.to_smtlib2();
         assert!(
             text.contains("(not (= x0_8 x1_8))"),
             "a negated comparison must use the boolean `not`:\n{}",
@@ -1162,7 +1162,7 @@ fn the_export_uses_boolean_operators_for_booleans() {
 
         // `implies` is `!a || b`, both booleans.
         let q = Query::new(&vars, smt::implies(smt::eq(x, y), smt::ult(x, y)));
-        let text = q.to_smtlib2_string();
+        let text = q.to_smtlib2();
         assert!(
             text.contains("(or (not (= x0_8 x1_8)) (bvult x0_8 x1_8))"),
             "an implication must be printed as a boolean `or` of booleans:\n{}",
@@ -1172,7 +1172,7 @@ fn the_export_uses_boolean_operators_for_booleans() {
         // A wider conjunction is still a bit-vector operation.
         let wide = smt::band(x, y);
         let q = Query::new(&vars, smt::eq(wide, x));
-        let text = q.to_smtlib2_string();
+        let text = q.to_smtlib2();
         assert!(
             text.contains("(bvand x0_8 x1_8)"),
             "a wide bitwise and must stay `bvand`:\n{}",
@@ -1191,7 +1191,7 @@ fn the_export_widens_with_zero_extend() {
         let x = var(8);
 
         let wide = smt::truncate(x, 16);
-        let text = Query::new(&[x], smt::eq(wide, smt::word(255, 16))).to_smtlib2_string();
+        let text = Query::new(&[x], smt::eq(wide, smt::word(255, 16))).to_smtlib2();
         assert!(
             text.contains("((_ zero_extend 8) x0_8)"),
             "a widening truncate must zero-extend:\n{}",
@@ -1204,7 +1204,7 @@ fn the_export_widens_with_zero_extend() {
         );
 
         let narrow = smt::truncate(x, 3);
-        let text = Query::new(&[x], smt::eq(narrow, smt::word(5, 3))).to_smtlib2_string();
+        let text = Query::new(&[x], smt::eq(narrow, smt::word(5, 3))).to_smtlib2();
         assert!(
             text.contains("((_ extract 2 0) x0_8)"),
             "a narrowing truncate must still extract the low bits:\n{}",

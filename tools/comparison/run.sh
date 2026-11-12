@@ -6,7 +6,7 @@
 # was the only record. That is the failure mode this repository names explicitly --
 # a one-off verification is not a gate, and only a gate survives the next change.
 #
-# The `discharge` half is `examples/comparison_check.rs`, a driver that asserts the
+# The `verif` half is `examples/comparison_check.rs`, a driver that asserts the
 # per-function `FnOutcome` of each fixture. It is a driver and not a scrape of
 # `mir_coverage`'s `decided N of M` line on purpose: that line counts only
 # `Verified`, so `Failed`, `Incomplete` and `Skipped` all leave it at zero, and a
@@ -50,22 +50,22 @@ missing=""
 need coqc || missing="$missing coqc"
 need lean || missing="$missing lean"
 
-# `discharge` needs the nightly named for its MIR frontend, as the README says.
-if [ -z "${DISCHARGE_RUSTC:-}" ]; then
+# `verif` needs the nightly named for its MIR frontend, as the README says.
+if [ -z "${VERIF_RUSTC:-}" ]; then
   if need rustup; then
-    DISCHARGE_RUSTC="$(rustup which --toolchain nightly-2026-08-21 rustc 2>/dev/null || true)"
+    VERIF_RUSTC="$(rustup which --toolchain nightly-2026-08-21 rustc 2>/dev/null || true)"
   fi
 fi
-[ -n "${DISCHARGE_RUSTC:-}" ] || missing="$missing nightly-rustc"
+[ -n "${VERIF_RUSTC:-}" ] || missing="$missing nightly-rustc"
 
 if [ -n "$missing" ]; then
   echo "comparison: required tool(s) absent:$missing -- skipped" >&2
   exit 2
 fi
-export DISCHARGE_RUSTC
+export VERIF_RUSTC
 
-echo "comparison: discharge on the fixtures (per-function outcome, not a count)"
-cargo run -q --features std --example comparison_check || fail "discharge fixtures (see the driver output above)"
+echo "comparison: verif on the fixtures (per-function outcome, not a count)"
+cargo run -q --features std --example comparison_check || fail "verif fixtures (see the driver output above)"
 
 # Coq: the fixture proves, each tooth is refused, and each tooth compiles once its
 # defect is corrected. `-Q dir ""` maps the directory to the empty logical prefix so

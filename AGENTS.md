@@ -4,11 +4,110 @@ Repository-level notes for agents working in this workspace.
 
 ## Layout
 
-- The repository root *is* the `discharge` crate: a Rust crate that embeds a
+- The repository root *is* the `verif` crate: a Rust crate that embeds a
   formal-verification engine — a bit-blasting SMT decision procedure, a symbolic
   DSL, a Curry–Howard proof kernel, contracts, and exhaustive verification.
   `no_std`, zero dependencies, allocation-free. (`src/`, `tests/`, `examples/`,
   `scripts/`, `Cargo.toml` all live at the root.)
+- The proved runtime primitives live in the sibling crate `verif-arithmetic`
+  (`verif-arithmetic/`), re-exported at the crate root as `verif::arith` — so
+  callers write `verif::arith::prove::*`, not the `verif::verif_arithmetic`
+  stutter. Both crates are named after the *verb* the tool performs
+  (`verif` = verification, `verif-arithmetic` = verified arithmetic); the
+  earlier name `discharge` survives only as the English verb in prose ("the
+  proof is *discharged*") and as the `*::discharge()` method that performs the
+  discharge, never as a crate or module identifier.
+- Governance files, so the tree is publishable and auditable: `LICENSE`
+  (Apache-2.0, in the root *and* in `verif-arithmetic/`, because a `.crate` must
+  carry its own), `NOTICE` (third-party attribution — SPARK, z3, Kani, Verus,
+  Lean, Coq, Ferrocene and the rest, each of which is an oracle or a comparison,
+  never a dependency), `SECURITY.md` (soundness bugs are the vulnerability class
+  that matters in a verifier), `CONTRIBUTING.md`, `README.md` (the long-form
+  document, and the crate's page on crates.io), and `AGENTS.md` (this file).
+
+## Renaming the crate: `discharge` → `verif`
+
+Done in one commit. The traps, so a future rename does not repeat them:
+
+- **`discharge` is two things at once.** It is the crate name *and* the English
+  verb for what the prover does (`discharged`, `discharges`, `dischargeable`,
+  and the `discharge()` methods). A blind `sed s/discharge/verif/g` rewrites the
+  prose too — "the proof is *verifed*" — and renames `Certificate::discharge`,
+  the one name the whole crate is *about*. The mechanical pass must target only
+  the identifier forms: `discharge::`, `discharge-arithmetic`,
+  `discharge_arithmetic`, `DISCHARGE_*`, `cipansor/discharge`, `docs.rs/discharge`,
+  `-p discharge`, `name = "discharge"`. The verb forms are left alone on purpose.
+- **`pub use verif_arithmetic;` does not rename the dependency.** `arith` is not
+  a dependency name, so `pub use arith;` is `E0433: cannot find crate`. The
+  sibling is aliased, not renamed: `pub use verif_arithmetic as arith;`. The
+  `Cargo.toml` key stays `verif-arithmetic` (it is the real crate), and only the
+  *import* path shortens.
+- **`git checkout -- <file>` un-renames that file.** Four files were reverted
+  mid-run to undo a bad edit and came back holding the *old* crate name; the
+  build caught it only in `tests/oracle.rs`, because the lib re-export masked it.
+  After any revert during a rename, re-grep for the old name before trusting it.
+- **The env var moves with the name.** `DISCHARGE_RUSTC`/`DISCHARGE_MSRV` →
+  `VERIF_RUSTC`/`VERIF_MSRV`, in `scripts/`, `.github/workflows/ci.yml`,
+  `tools/`, and every README/AGENTS mention. A stale `DISCHARGE_RUSTC` in one
+  script silently points the MIR frontend at the wrong compiler.
+- **The GitHub repository rename is a manual step.** `repository`/`homepage` in
+  both `Cargo.toml`s now read `github.com/cipansor/verif`, but GitHub will keep
+  serving the old path only until the owner renames the repo; until then the
+  metadata URL and the real URL disagree. This is a human action, not a code one.
+
+## Publishing to crates.io
+
+The repository is arranged so both crates can be published, and the checks that
+make that true are separate from the ones that make the *code* correct. A crate
+that builds and passes all eighteen gates can still be unpublishable, and the
+failure only surfaces at `cargo publish` — the worst moment, because an upload
+cannot be undone.
+
+- **The crates version independently.** No `[workspace.package] version`, no
+  `version.workspace = true`. A shared version re-versions both crates at once,
+  which is how a release comes to publish a crate nobody asked for. Each
+  `Cargo.toml` states its own `version`.
+- **A release tag names one crate**: `<crate>-v<version>`, e.g.
+  `verif-v0.1.0`. There is deliberately no bare `v<version>` tag — one tag
+  cannot say which of two crates it means. `.github/workflows/release.yml`
+  refuses one rather than interpreting it.
+- **`verif` cannot be packaged until `verif-arithmetic` is on crates.io.**
+  `cargo publish` resolves a `path` dependency against the registry. The two
+  error shapes are `no matching package named ...` (first release) and
+  `failed to select a version for the requirement ...` (a later release, when an
+  older version exists). Both mean "publish the sibling first".
+  `scripts/publish.py` derives the order from the manifests and reports the
+  second as *blocked*, not *broken*.
+- **`verif`'s directory is the repository root**, so `dirty_by_crate` in
+  `publish.py` cannot attribute a root file to `verif` by path prefix (every
+  path is under the root). It relies on cargo's own `--allow-dirty` refusal
+  instead, which is scoped to the crate directory.
+- **`verif-v0.1.0` starts with a `v`.** A bare-tag check written as
+  `tag.startswith("v")` rejects the parent's own valid tags, because the crate is
+  named `verif`. Match `^v[0-9]` instead — the digit is what distinguishes a
+  version from a crate name.
+- **`[package.metadata.docs.rs] all-features = true` is load-bearing.** The
+  default feature set is empty (`no_std`), so without it docs.rs would publish
+  a crate smaller than the one that ships: no `mir` frontend, no proc-macro
+  surface. `scripts/check_package.sh` requires the table only for a crate that
+  actually has a non-default feature, so `verif-arithmetic` needs none.
+- **A `.crate` must carry its own `LICENSE`.** `verif-arithmetic/` had none, so
+  its package shipped no licence text and no README at all. Each crate directory
+  now has `LICENSE`, `README.md` and `NOTICE`, and `check_package.sh` fails if
+  one goes missing. `verif-arithmetic/Cargo.toml` also gained `readme`.
+- **Attribution is per crate, not global.** A project named in `verif`'s source
+  is `verif`'s to attribute; requiring the sibling to name it too is noise.
+  `verif-arithmetic/src/lib.rs` does mention `rustc_public`, so its `NOTICE`
+  names it — that was the one real finding of the first run.
+- **`scripts/check_package.sh` is hermetic.** It reads manifests and the tracked
+  file list and runs no compiler, so it is cheap enough for every pull request.
+  It is a separate script rather than gate 19 because renumbering `gate.sh`'s
+  eighteen checks is churn that risks the checks themselves.
+- **`.github/workflows/release.yml` checks the token before installing
+  anything**, so a missing secret fails in seconds instead of after the build.
+  It dry-runs first, then publishes, then waits for the version to appear in the
+  index. A version already on crates.io is skipped rather than treated as a
+  failure, so a re-run after a partial release finishes the rest.
 
 ## Build and test commands
 
@@ -41,9 +140,9 @@ cargo run --features std --example flight_control
 # The MIR frontend: verify real Rust, reading the MIR rustc lowers it to.
 # `--emit=mir` needs nightly, and the compiler is named separately from RUSTC
 # so that pointing this at a nightly does not disturb the cargo building it.
-DISCHARGE_RUSTC="$(rustup which --toolchain nightly rustc)" \
+VERIF_RUSTC="$(rustup which --toolchain nightly rustc)" \
   cargo run --features std --example mir_demo
-DISCHARGE_RUSTC="$(rustup which --toolchain nightly rustc)" \
+VERIF_RUSTC="$(rustup which --toolchain nightly rustc)" \
   cargo test --features std --test mir
 ```
 
@@ -96,18 +195,21 @@ Three engine consequences worth remembering:
   multiplier does not. An out-of-range amount has a defined value (zero, or sign
   fill for an arithmetic right shift), matching the shift-count-masking choice the
   differential oracle already pins.
-- **Widened products past 16 bits are declined, not approximated -- for the *signed*
-  case.** A signed non-constant multiply at `w > 8` needs a `2w`-bit product, which
-  is the BDD wall, and a *weaker* overflow predicate would be worse than declining,
-  because it would make an overflowing function look panic-free. So the code returns
-  "no predicate" and the path is reported `incomplete`.
-  This was measured rather than assumed. The engine does have a SAT fallback for
-  when the arena fills, so the tempting fix is to raise the width and let the
+- **Widened products are gone from both overflow predicates.** A signed non-constant
+  multiply used to need a `2w`-bit product, which is the BDD wall, and a *weaker*
+  overflow predicate would be worse than declining, because it would make an overflowing
+  function look panic-free. So the code returned "no predicate" past 16 bits and the
+  path was reported `incomplete`.
+  The refusal rested on the belief that no division form is exact for every combination
+  of the signs. That is false, and it was replaced by the exact form
+  `y != 0 && |x| > limit / |y|`, with `limit = 2^(w-1) - 1` for same signs and
+  `2^(w-1)` for different ones. No widening, so it works at `i64`.
+  The old widening was measured rather than assumed: the engine has a SAT fallback for
+  when the arena fills, so the tempting fix was to raise the width and let the
   fallback take it. Raising the threshold from 16 to 32 does not reach the
   fallback: `mir_demo` on a widening multiply then runs past 300 s and has to be
   killed, because the cost is in *building* the 32-bit diagram, before the arena
-  ever fills. The threshold is a time guard, and 16 is where it sits. If you raise
-  it, time the demo rather than trusting the fallback's existence.
+  ever fills. That is why the fix is a division and not a bigger multiplier.
 
 - **Signedness is part of the *value*, not a display detail.** The engine's
   arithmetic is bit-vector arithmetic, so every operation has one bit-pattern
@@ -152,6 +254,36 @@ Three engine consequences worth remembering:
   - A module-nested item is keyed by its full path (`low::K`), which is how the
     dump prints both the definition and the use, so it resolves only when the
     contract spells the path -- a bare `K` does not silently pick one module.
+  - A `const` item is collected *before* the function loop, in two stages: every
+    literal (and every CTFE block that folds to one) first, then the
+    expression-bodied ones to a fixpoint. A single in-order pass folded
+    `const FWD_NEXT: u8 = FWD_LIMIT + 1` while the later `const FWD_LIMIT: u8 =
+    10` was still unresolved, because rustc prints source declaration order and
+    Rust lets a constant name a later one. The fixpoint sees each round's
+    resolved constants; a cycle resolves nothing and stops, leaving those items
+    unmodelled as before. `parse_const_item`/`const_key` are the item reader, so
+    the same keying rules apply to the prepass and the fixpoint.
+
+  - A comparison's width and sign come from its *operands*, never from its
+    destination. `const LESS: bool = -1i8 < 0i8` folds as `_0 = Lt(const -1_i8,
+    const 0_i8)`: a `bool` return place assigned from `i8` operands. Reading the
+    shape off the `bool` destination compared the `-1i8` pattern, 255, as unsigned
+    and folded the comparison to `false` -- and a contract claiming `ret == false`
+    was *proved* from a wrong value. `is_comparison` routes the comparison arms
+    through `c_operand_shape`, which takes the common operand shape and refuses a
+    mismatch rather than guessing.
+
+- **The const folder's word is 64 bits.** `CVal::Word` holds a `u64`, so a width
+  past 64 (`i128`/`u128`) is refused by `c_width_ok` rather than carried. An
+  expression-bodied `i128` (`const HUGE: i128 = 1 + 2`) reaches `c_checked` as an
+  `AddWithOverflow` at width 128, whose exact overflow test negates
+  `1i128 << 127` -- `i128::MIN` -- which panics in a debug build, at *parse* time,
+  for an item no target named. Every width-taking folder (`cval_of_const`,
+  `c_binop`, `c_unop`, `c_checked`, `c_cast`) checks it, and `fold_const_block`
+  refuses such a `ret_ty` up front; the item stays unmodelled and a contract that
+  named it is a skip. `Ty::width` still reports 128 because the *constant reader*
+  needs it to compute `u128::MAX` and a negative literal's two's-complement
+  pattern -- only the folder refuses it. See `Ty::has_unrepresentable_leaf`.
 
 ## The unsigned multiply-overflow test is exact *division*, not a widened product
 
@@ -165,9 +297,9 @@ operands this is *exact*, not a sufficient condition: for `y != 0`, `x * y > MAX
 (`smt::divmod`) the engine already has, and no `2w`-bit multiplier -- so the BDD wall
 the old comment describes is never built. It also works at `w == 64`, where there is no
 width left to widen to and the old path could not produce a predicate at all. The signed
-case still widens and still refuses past 16 bits: its predicate is about the
-sign-extended product, and there is no division form that is exact for every combination
-of the three signs.
+case now uses the same idea rather than widening: `|x| > limit / |y|`, with `limit`
+`2^(w-1) - 1` for same signs and `2^(w-1)` for different ones. The claim that no such
+form is exact for every combination of the signs was wrong.
 
 The form is deliberately the one the guard in the saturation idiom is written in
 (`if b != 0 && a > MAX / b`), in the same operand order, so the two terms are
@@ -382,7 +514,7 @@ it *silently* prove nothing useful:
    the engine derives the measure after one iteration by *symbolic evaluation*
    (`variant_after`, which builds expressions, not predicates) and emits
    `I && c => V' < V`. Without it, only partial correctness holds and
-   `Report::correctness()` says `Partial`. `has_termination_proof()` compares the
+   `Report::correctness()` says `Partial`. `terminates()` compares the
    loop count against the variant count: one unannotated loop makes the whole
    report partial.
    A known gap: `variant_after` treats a nested `while` as a no-op, so an outer
@@ -883,7 +1015,7 @@ coverage than it has. So the sweep question generalises:
 
 ## An ambiguous negative is the same bug as a silent truncation
 
-The eighth hole lived in `find_counterexample_by_enumeration`, the function the tests use to
+The eighth hole lived in `enumerate_counterexample`, the function the tests use to
 check the engine. It took a `limit` and returned `Option<u64>`, so `None` meant either "swept
 the whole domain, nothing violated" or "stopped early, nothing violated". Searching a prefix of
 the domain reported no counterexample for a property that is false.
@@ -1503,7 +1635,7 @@ missing, dropped, or merely assumed — and make that case a failure rather than
 
 ## Termination claims must be discharged, not counted
 
-`Report::has_termination_proof` counts only variant obligations whose verdict is
+`Report::terminates` counts only variant obligations whose verdict is
 *proved*. Counting the obligations instead of discharging them was a real defect: a
 loop whose measure does not decrease reported `Total` while the report was unverified.
 When adding a rule that contributes to a summary claim, discharge the obligation before
@@ -1579,7 +1711,7 @@ script is a test, and a test that fails while the defect is present has proved n
 the defect is removed and it passes.
 
 **Follow-up: the gate that enforced the rule broke it, by reading a count.** The comparison
-gate first asserted `discharge`'s coverage summary — the `decided 0 of 1` line — for each
+gate first asserted `verif`'s coverage summary — the `decided 0 of 1` line — for each
 injected bug. That line counts only `FnOutcome::Verified`, so `Failed`, `Incomplete` *and*
 `Skipped` all leave it at zero. A fixture whose contract had become unreadable (a typo in an
 `ensures` name) therefore still printed `decided 0 of 1` and the gate reported a caught
@@ -1798,7 +1930,7 @@ holds". The questions to ask, generalising the three above:
 * When a summary (`verified`, `Total`) is computed, does it distinguish "proved" from
   "proved only because the path was cut"?
 * A cut makes the *continuation* vacuous. Does any summary read the continuation without
-  noticing the cut? `has_termination_proof` did: `loops == variants == 0` on a program
+  noticing the cut? `terminates` did: `loops == variants == 0` on a program
   whose only divergence was a call.
 
 ## A type's invariant must hold for every constructor, including the degenerate input
@@ -1949,7 +2081,7 @@ somewhere -- the `lib` shape lets the bare-metal build exist, and `test = true` 
 them, which is the "gate that silently did not run" trap again.
 
 What the gate buys is narrow and worth stating plainly: it checks the *qualified compiler
-accepts the sources unchanged*. It does not qualify `discharge`. A qualified compiler is not
+accepts the sources unchanged*. It does not qualify `verif`. A qualified compiler is not
 a qualified verifier, and this crate's decision procedure is outside Ferrocene's scope. The
 README's "no qualification evidence" line is still true after this gate runs, and the gate's
 comment says so at the definition site.
@@ -1984,7 +2116,7 @@ not just along each grammar's own edges -- a base case that hardcodes a depth is
 
 ## A file tree in the docs is a claim about the filesystem, and nothing checks it
 
-The README's "Layout" section drew `discharge/` as a tree. It had drifted from the
+The README's "Layout" section drew `verif/` as a tree. It had drifted from the
 filesystem in three ways at once: `src/lib.rs` was missing, `tests/sym.rs` was missing,
 `examples/report_probe.rs` was missing, and the `examples/` and `scripts/` blocks were
 *drawn* as if each were the last child of the root (two `└──` siblings), so the tree was
@@ -2436,7 +2568,7 @@ because they are easy to reintroduce.
    `Contract::precondition_is_satisfiable` was `find_model(pre) != Verdict::Unsat`, which
    folds `Unknown` in with "found a model" and answers `true`. An ill-formed precondition
    (an equality between an 8-bit and a 16-bit variable, say) then reads as *satisfiable*,
-   so a caller checking `discharge` and the boolean together claims a non-vacuous proof
+   so a caller checking `verif` and the boolean together claims a non-vacuous proof
    with no evidence the precondition is reachable. The fix adds
    `Contract::precondition_satisfiability`, returning the verdict, and makes the boolean
    `true` only for `Valid` or a `Counterexample` -- the two outcomes that *are* a satisfying
@@ -2498,11 +2630,11 @@ Collapsing that match into `self.verdict.is_proved()` is the natural single-pola
 and it is a soundness hole in both directions at once.
 
 That mutant survives `cargo test` completely. The reason is not that the logic is unreached;
-it is that the only tests for it live in `tests/mir.rs`, which needs `DISCHARGE_RUSTC`
+it is that the only tests for it live in `tests/mir.rs`, which needs `VERIF_RUSTC`
 pointing at a nightly, and **skips itself when it is absent** with a bare
 `let Some(report) = verify_all() else { return };`. A skipped test reports `ok`. So the suite
 count is *identical* whether the MIR frontend ran or not: 325 with the nightly, 325 without.
-CI never set `DISCHARGE_RUSTC`, so in the one place that gates a merge, the polarity had no
+CI never set `VERIF_RUSTC`, so in the one place that gates a merge, the polarity had no
 teeth at all. A green suite said nothing about it.
 
 Two fixes, and both are needed. First, an in-module oracle in `src/mir/exec.rs` that runs
@@ -2511,7 +2643,7 @@ does not need a compiler or a model -- `Valid`, `Unsat` and `Unknown` are unit v
 a real `Cex` comes from `find_model` on a satisfiable-but-not-valid query. Verified by
 mutation: collapsing the match, treating a `Valid` panic as ruled out, and discharging every
 vacuity check each fail the oracle on a stable-only machine. Second, CI now installs the
-nightly and points `DISCHARGE_RUSTC` at it, so the end-to-end tests actually run. That
+nightly and points `VERIF_RUSTC` at it, so the end-to-end tests actually run. That
 variable must be a *path*, not a toolchain name: the frontend runs it with `Command::new`.
 
 The lesson to carry: a test that can silently become a no-op is not a test. When a harness
@@ -2747,6 +2879,41 @@ themselves in the `detail` column — an unreadable `requires` (`c.lo <= c.hi`, 
 and a tuple-returning `ensures` (`ret.0 <= a`). Those are the next gaps, and they are parser
 gaps rather than engine ones, which the scoreboard says without being asked.
 
+## A product is widened to `2w == 32`, and `pow`'s fold keeps its own tighter bound
+
+The `Mul` arm of `intrinsics::failure` widens the operands to `2w` and multiplies there, because
+overflow needs the *exact* product and `2w` bits hold it. That widening was capped at
+`2w == 16`, so a `u16` `saturating_mul`/`checked_mul` was refused outright — every contract over
+one reported "past what the model covers" and none could be settled. The cap is `2w == 32` now
+(`MUL_MAX_WIDTH = 16`), and the width that was refused is decided.
+
+**The division form was tried here first and is worse.** The plain-`*` path uses
+`y != 0 && x > MAX / y` (see the section above), and it is the *right* predicate there because
+the corpus's guard is written in that shape and the boolean fold cancels the two against each
+other. The intrinsics idioms are not that shape: `saturating_mul` asks about the *value* of a
+`core` call and carries no hand-written division guard to cancel against, so the divider is
+built and blasted instead of folding away. Measured: a `u16` idiom the widened test settles
+`Valid` in ~180ms came back `Unknown` after ~3.2s under the division form, and the `pow` fold —
+which composes up to 64 `mul_failure` queries — hung past the 900s test timeout, because 64
+nested dividers are far past what the blaster holds. So the two paths share the overflow *rule*
+but not its cheapest spelling, and the shared helper stays the widened one.
+
+**`pow` gets `POW_MAX_WIDTH = 8`, below the product bound, on purpose.** Its fold is a `mul` and
+a squaring per exponent bit, so it costs a large multiple of one product rather than the product
+itself. Raising its bound to 16 bought nothing and cost seconds: a `u16` `saturating_pow` with a
+symbolic exponent was still `Unknown`, but only after ~12s of diagram work, where the same
+refusal at 8 bits is immediate. An answer that cannot be reached is not worth paying for. The
+test `pow_is_modelled_only_where_a_product_is` pins the separation so a later change cannot
+collapse the two constants quietly.
+
+The teeth are a unit test and a corpus pair. `a_u16_product_is_modelled_and_exact` sweeps the
+boundary neighbourhood of a `u16` product against `core`'s own `checked_mul`/`saturating_mul`,
+so the widened test is pinned as *exact* at the new width and not merely reachable. In the
+corpus, `u16_product_guarded` must verify and `u16_product_unguarded_tripwire` — the same body
+under a guard that does not rule out overflow — must still be refuted; a bound raised without
+the refutation would be a model that proves the wrong thing, which is worse than one that
+declines.
+
 ## An inlined call must restore the caller's loop cut, or the caller unwinds a loop it had cut
 
 Cutting a loop at its invariant is a property of a *function*: the `Cut` names the header and
@@ -2803,7 +2970,7 @@ Traps that cost time, in the order they cost it:
   `librustc_driver-*.so` but cargo does not add the sysroot to its rpath, so it builds and then
   dies with `cannot open shared object file`. `build.rs` bakes `-Wl,-rpath,$(rustc --print
   sysroot)/lib` in, using the `RUSTC` cargo is building with. `run.sh` sets both `RUSTC` (what
-  cargo builds *with*) and `DISCHARGE_RUSTC` (what the frontend *runs*) to the same nightly.
+  cargo builds *with*) and `VERIF_RUSTC` (what the frontend *runs*) to the same nightly.
 * **`rustc-dev` alone is not enough: `llvm-tools-preview` is required too, and the error
   misreports the cause.** `rustc` links `libLLVM`, and cargo puts
   `<sysroot>/lib/rustlib/<target>/lib` on the build script's `LD_LIBRARY_PATH`. A bare
@@ -2829,8 +2996,8 @@ Traps that cost time, in the order they cost it:
 * **The crate is `exclude`d from the workspace, not a member.** A member would make
   `cargo build --workspace` require a nightly, which breaks the stable zero-dependency build
   that is the whole point of the crate. `exclude = ["tools/mir-oracle"]` plus `cargo build`
-  from inside `tools/mir-oracle`. `cargo metadata` lists exactly `discharge` and
-  `discharge-arithmetic`, so gate 4 still sees a two-line tree.
+  from inside `tools/mir-oracle`. `cargo metadata` lists exactly `verif` and
+  `verif-arithmetic`, so gate 4 still sees a two-line tree.
 * **`rustc_public::mir::body` is private but glob-re-exported.** Import from
   `rustc_public::mir::{…}`, not `rustc_public::mir::body::{…}`. `Local` is `pub type Local =
   usize`, not a tuple struct, so `Local(0)` does not compile — use `Place::from(0usize)`.
@@ -2902,7 +3069,7 @@ nor as a pass — and, the mirror-image bug, a compile error in the oracle is ne
 a missing toolchain and quietly skipped. `run.sh` decides between 2 and 3 by probing for
 `librustc_driver-*.so` and `libLLVM-*` in `$sysroot/lib/rustlib/$host/lib` directly, rather
 than by asking `rustup component list` (which answers for a toolchain *named* `nightly`, and
-`DISCHARGE_RUSTC` may point elsewhere).
+`VERIF_RUSTC` may point elsewhere).
 
 ## A projection is a binding decision, not a grammar rule
 
@@ -3628,12 +3795,16 @@ walking the body for slice reads and then proving `len <= 64` for functions that
 needed slice modelling, so it is left as the honest boundary.
 
 **Stage 4 — the missing intrinsics.** `wrapping_neg`, `wrapping_div`,
-`wrapping_rem`, `leading_zeros`, `trailing_zeros`, `count_ones`, `pow`. The
-`wrapping_*` family is the same arithmetic the `checked_*` arms already do, minus
-the overflow obligation, so it is mostly plumbing. `count_ones` and the zero-counts
-are small bit-vector loops and belong in `discharge-arithmetic` beside the other
-proved primitives, not in the frontend. All of these are now modelled except `pow`
-and the division families that cannot express a zero divisor as a value (see below).
+`wrapping_rem`, `leading_zeros`, `trailing_zeros`, `count_ones`, `pow`,
+`is_power_of_two`, `add_signed`/`add_unsigned`. The `wrapping_*` family is the same
+arithmetic the `checked_*` arms already do, minus the overflow obligation, so it is
+mostly plumbing.
+`count_ones` and the zero-counts are small bit-vector loops and belong in
+`verif-arithmetic` beside the other proved primitives, not in the frontend.
+All of these are now modelled except the division families that cannot express a
+zero divisor as a value (see below); the
+bit-count family is complete, `count_ones`/`count_zeros`, `leading_zeros`/`leading_ones`
+and `trailing_zeros`/`trailing_ones` each being one expression applied to `x` and `!x`.
 
 **Stage 4 progress: the two-operand families and the whole unary surface are
 modelled.** `checked_*`, `saturating_*`, `wrapping_*` and `overflowing_*` are all
@@ -3643,7 +3814,54 @@ against `core` over the whole `u8`/`i8` domain. `count_ones`, `leading_zeros` an
 `trailing_zeros` are the bit counts; `neg` and `abs` are modelled in all four
 families. The `Intrinsic` enum was restructured to say so: `Bits(BitKind)` for the
 counts, `Unary(Family, UnOp)` for the operators, and `Overflowing(BinOp)` for the
-`(T, bool)` family. Findings worth more than the coverage:
+`(T, bool)` family. The three *complement* counts `count_zeros`, `leading_ones` and
+`trailing_ones` are modelled too, and are defined as `core` defines them — the
+corresponding positive count of `!x` — so there is one expression per pair rather
+than two that could drift. `!x` is `bxor(x, all_ones(w))`, the same term the
+executor builds for a `Not` rvalue, so a bit count of a written `!x` and a bit count
+of the complement cannot disagree. `is_power_of_two` is modelled too, and it is the
+one shape whose *return type* is `bool`: the model produces a `Pred` and the executor
+writes a `Val::Bool`, which is what the `if` that consumes it branches on. It is
+unsigned-only, because `core` has no such method on the signed types. The
+mixed-signedness additions — `wrapping_add_signed`, `saturating_add_signed`,
+`checked_add_signed`, `overflowing_add_signed` and their `_unsigned` counterparts —
+are modelled too, as `Intrinsic::MixedAdd(Family)`: their two operands have
+*opposite* signedness (`u8::wrapping_add_signed` adds an `i8` to a `u8`), so they
+are their own shape rather than a `BinOp`, and the direction is read from the
+operands rather than stored in the variant. Findings worth more than the coverage:
+
+* **The mixed-add overflow flag is *not* the ordinary signed-addition rule, and a
+  model that reached for that rule would be wrong on half the domain.** The flag
+  rustc inlines is `carry XOR (addend < 0)`, where `carry` is the addition's
+  overflow read at the *method's own type* (the unsigned carry for `u8`, the signed
+  overflow for `i8`) — which is exactly the `failure(Add, …)` predicate the other
+  families already use, so the mixed shapes reuse it rather than stating a second
+  carry rule. The adjustment is load-bearing in both directions and the naive
+  reading fails both ways: for `u8::add_signed`, `250u8 + (-1i8)` is `249`, in
+  range, but the addition *carries* (`250 + 255` wraps), so the bare carry reports
+  an overflow that is not there; for `i8::add_unsigned`, `0i8 + 128u8` is `-128`,
+  which has run off the top, but the addition does *not* carry, so the bare carry
+  misses it. The addend's top bit is its sign in either reading, so one term serves
+  both. Both directions were walked over the whole `u8`/`i8` domain (65536 pairs
+  each) against `core`'s own methods; the carry alone missed 32768 of them. The
+  first cut of this model used the *self* operand's sign instead of the addend's and
+  was caught by the differential test at `i8::add_unsigned` (`0i8 + 128u8`), which is
+  why the test walks both directions rather than one.
+* **The saturating clamp differs by direction, and the two clamps are not the same
+  bound.** `u8::saturating_add_signed` clamps to the *addend's* end — `0` for a
+  negative addend, `255` for a non-negative one — while `i8::saturating_add_unsigned`
+  adds a non-negative count and can only run off the top, so it clamps to `127`. A
+  model that took the unsigned maximum for a signed self would return `255`, which
+  reads back as `-1`; the exhaustive walk caught exactly that (`0i8 + 128u8`).
+* **The value is one term in both directions.** rustc reinterprets the operand of the
+  opposite signedness and adds, so `mixed_add_result` is a plain `smt::add` and the
+  same expression serves `u8::wrapping_add_signed` and `i8::wrapping_add_unsigned`.
+  Only the failure predicate and the clamp read the direction.
+* **A `u8`/`i8` corpus pin is not enough for the `_unsigned` direction.** `0i8 +
+  128u8` is `-128` under *both* readings of the addend (`128u8` as `u8` gives `-128`;
+  `128u8` as `i8` is `-128`, and `0 + -128` also gives `-128`), so it does not
+  separate them. The separating pin is `1i8 + 128u8`: the right reading clamps to
+  `127`, the wrong one computes `1 + -128` = `-127` in range. The corpus carries both.
 
 * **`count_ones`, `leading_zeros` and `trailing_zeros` are the modelled calls whose
   result width differs from their operand's** (`u8::count_ones` returns `u32`). The
@@ -3651,7 +3869,7 @@ counts, `Unary(Family, UnOp)` for the operators, and `Overflowing(BinOp)` for th
   destination's; the executor reads the destination's width for exactly this reason,
   and the `eval` signature takes the operand width and the result width separately.
   Every other shape passes the same value for both, so the change is inert outside
-  these three.
+  these three. The three complement counts widen the same way.
 * **`saturating_neg` and every `abs` do not exist on the unsigned types**, while
   `wrapping_neg`, `checked_neg` and `overflowing_neg` do -- where negation is modular
   and the failure case is `x != 0`. So `is_modelled` reads the sign for the unary
@@ -3688,10 +3906,26 @@ counts, `Unary(Family, UnOp)` for the operators, and `Overflowing(BinOp)` for th
   panic-free*. `is_modelled` now admits only `checked_div`/`checked_rem`, and the
   corpus records why.
 
+**Evidence for the mixed-signedness additions.** `scripts/test-count.sh` **755 ->
+760** passed, 0 failed; `scripts/gate.sh` **ALL GATES GREEN**; clippy (`--all-targets`
+and the `no_std` half) and rustdoc clean; zero dependencies and `no_std` untouched.
+Five new unit tests walk both directions over the whole `u8`/`i8` domain against
+`core`'s own methods — the differential test is the oracle, not a copy of the model —
+and the corpus gains eight fixtures (six verify, two are the `overflowing` flag pinned
+in both directions). The model was wrong twice on the first cut and both were caught
+by the exhaustive walk rather than by a sample: the flag used the self operand's sign
+instead of the addend's (caught at `i8::add_unsigned`), and the saturating clamp used
+the unsigned maximum for a signed self (caught at `0i8 + 128u8`). Each corpus pin was
+checked for teeth by flipping its expected value: `overflowing_add_signed_within_range_is_not_overflow`
+is the one the bare-carry model refutes, and `saturating_add_unsigned_top_bit_tripwire`
+is the one an addend-signedness swap refutes.
+
 `wrapping_div`/`wrapping_rem`/`saturating_div`/`saturating_rem` are *not* reachable
 by design, because they panic on a zero divisor and modelling them as total would
 hide that panic; `overflowing_div`/`overflowing_rem` join them for the same reason.
-`pow` remains reachable and unmodelled. The bit-count proofs do **not** go in `discharge-arithmetic`: their oracle here is Rust's own method, checked
+`pow` and the mixed-signedness additions are now modelled, so neither is a reachable
+gap. `rotate_*`, `abs_diff` and the `next_multiple_of`/`div_*` helpers remain reachable
+and unmodelled. The bit-count proofs do **not** go in `verif-arithmetic`: their oracle here is Rust's own method, checked
 exhaustively over the whole operand domain, which is a stronger oracle than a
 small-domain enumeration would be. A third engine with less coverage is not a proof,
 so the split the roadmap proposed is not made.
@@ -3739,7 +3973,7 @@ Verified, not assumed:
 and this repository only ever runs tests with `--features std`.
 
 What Ferrocene does *not* buy, stated in the README, the tool's README and here: a qualified
-compiler is not a qualified verifier, and `discharge`'s engine is outside Ferrocene's
+compiler is not a qualified verifier, and `verif`'s engine is outside Ferrocene's
 qualification scope. The gate checks the qualified compiler accepts the sources unchanged.
 
 ## Stage 3, first half: a contract may name a local that aliases an argument
@@ -4213,14 +4447,14 @@ and long-term-support toolchains that lag upstream.
    becomes `filter(|&(_, &l)| …)`.
 2. `tests/loopdiff.rs` — `gen` is a reserved keyword in edition 2024, so `fn gen(`
    was renamed to `fn make_steps(`.
-3. `discharge-arithmetic/src/prove.rs` — three `.map_or(true, |c| …)` calls became
+3. `verif-arithmetic/src/prove.rs` — three `.map_or(true, |c| …)` calls became
    `.is_none_or(|c| …)`. This one is *caused by the MSRV bump*, not by the
    edition: clippy only suggests `is_none_or` (1.82+) once `rust-version` permits
    it, so the lint appears exactly when the floor moves. Worth knowing before
    touching `rust-version` again.
 
 **The floor is now a gate, not a claim.** `scripts/gate.sh` step 13 builds with
-`1.85` (overridable via `DISCHARGE_MSRV`) so a feature newer than the floor fails
+`1.85` (overridable via `VERIF_MSRV`) so a feature newer than the floor fails
 in CI rather than in a downstream build. It follows the Ferrocene/Kani convention:
 an absent toolchain, or a `thumbv7em-none-eabihf` target not installed *for that
 toolchain*, is reported and skipped rather than folded into a pass. CI installs
@@ -4235,7 +4469,7 @@ frontend still works, and the frontend reads rustc's textual MIR, whose shape is
 stable across toolchains. A `const` that folds to a literal prints inline on current
 stable and as a CTFE brace-block on 1.85, so a parser that knew only the inline shape
 passed every gate above and silently dropped the item on the floor. Step 13 now sets
-`DISCHARGE_RUSTC` to the floor rustc and runs the frontend's own suite
+`VERIF_RUSTC` to the floor rustc and runs the frontend's own suite
 (`cargo +$MSRV test --features std --test mir`) so a toolchain-shaped gap fails here
 rather than being discovered downstream. See "A `const` printed as a CTFE brace-block
 on 1.85" below.
@@ -4248,13 +4482,13 @@ recurrence rather than a one-off:
   nothing about whether an intra-doc link still *resolves*, and `cargo test` and `cargo
   clippy` never run rustdoc. Four warnings had shipped: `mir/spec.rs` linked a renamed
   `bind`, and `smt.rs` linked three private items (`pinned_vars`, `EvalMemo`, `eval_term`)
-  from public docs. `discharge-arithmetic` had the same class (`prove.rs` linked its
+  from public docs. `verif-arithmetic` had the same class (`prove.rs` linked its
   private `forall_pair_bounded` from three public items), which is why the step checks
-  both crates and not just the parent. `discharge` is built *three* ways -- default
+  both crates and not just the parent. `verif` is built *three* ways -- default
   (`no_std`), `--features std`, and `--all-features` -- because the doc surface differs
   between them: a link to a `#[cfg(feature = "std")]` item resolves in the last two and not
   the first, which is how `smtscript` shipped an unresolved link to
-  `Query::to_smtlib2_string` that only the default build could see. docs.rs publishes the
+  `Query::to_smtlib2` that only the default build could see. docs.rs publishes the
   default build, so `[package.metadata.docs.rs] all-features = true` makes the published
   docs the union instead.
 - **Step 15: no compiled output is tracked.** `git ls-files` must not list a `.rlib`,
@@ -6383,15 +6617,15 @@ or it guards nothing; both are present and the symbolic one was checked against 
 unfixed code. Pinned by `a_wider_shift_amount_is_read_at_its_own_width{,_symbolically}`.
 
 **A constant multiply is decided without a wide multiplier.** `a * 2` at `u32` was
-`incomplete` -- the general overflow path widens to `2w` and refuses past 16 bits -- while
-the same expression at `u8` verified, so the gap was width-only. With one operand a
+`incomplete` -- the general overflow path used to widen to `2w` and refuse past 16 bits --
+while the same expression at `u8` verified, so the gap was width-only. With one operand a
 constant, `x * c` wraps exactly when `x > MAX / c`, which is one comparison against a
 compile-time constant; `i * 4` (an index scaled by an element size, usually `usize`) is the
-shape it is for. Unsigned only: the signed condition has one case per combination of the
-three signs, and a predicate that is too weak there is a false proof rather than a refusal,
-so the signed width gap is kept. `overflow_pred`'s exactness is checked exhaustively at
-`u8` (all 256 values against every constant) and at the `ceil(2^32 / c)` boundary for `u32`
-by `a_constant_multiply_overflow_is_exact`, which was confirmed to fail on an off-by-one
+shape it is for. Unsigned only, because the signed constant case has its own two-ended
+range in `signed_mul_wraps_at`; the general signed path no longer widens either.
+`overflow_pred`'s exactness is checked exhaustively at `u8` (all 256 values against every
+constant) and at the `ceil(2^32 / c)` boundary for `u32` by
+`a_constant_multiply_overflow_is_exact`, which was confirmed to fail on an off-by-one
 predicate.
 
 **`blast` multiplies by a constant as a sum of shifts.** With one operand a `Const`,
@@ -6622,10 +6856,17 @@ prints its *body* separately (`const LIMIT: u8 = const 10_u8;`) while referring 
 the use site (`_0 = const LIMIT`). The executor read only the name, so a use site was an
 unreadable path constant and any contract that touched the constant was lost -- not wrongly
 proved, but never decided, which for an embedded crate whose bounds checks read named constants
-is the common case. `MirProgram::consts` now collects each item's printed literal (only a
-literal: an item whose body is an *expression* has its own body and locals and is left for a
-future interpreter pass, and an associated constant's `{constant#0}` name is dropped), and
-`operand` folds a use site against that table. The key is the full printed path (`a::K`,
+is the common case. `MirProgram::consts` now collects each item's value -- its printed
+literal, or, when the body is an *expression* (`const NEXT: u8 = LIMIT + 1`), the value that a
+concrete folder derives by interpreting that body (`fold_const_block`, in `src/mir/parse.rs`).
+The folder walks the item's own basic blocks with every operand a literal, checks the body's
+own `assert(!overflow)` / shift checks, resolves a branch by the discriminant's *value* (so it
+follows the taken arm, never the first arm in textual order), and refuses -- leaving the item
+unmodelled -- on any shape outside that subset (a call, an unresolved path, a subscript, a
+failed assert, a zero divisor). It is a separate interpreter over the parsed blocks rather than
+the symbolic executor, because the symbolic engine's `const` table is what the folder feeds.
+An associated constant's `{constant#0}` name is still dropped. `operand` folds a use site
+against that table. The key is the full printed path (`a::K`,
 `low::K`), not the last segment, so two modules with a `const K` cannot collide -- a table keyed
 by the last segment could read the wrong value, which would be a false proof rather than a lost
 one. The item's own type suffix supplies the width and sign, exactly as for an inline literal,
@@ -6636,18 +6877,20 @@ Pinned by `tests/mir.rs::a_named_const_item_is_inlined_at_its_use_site`, whose c
 `named_const_bounds_a_comparison`, `named_const_matches_an_equality`,
 `named_negative_const_is_signed` and `nested_module_const_is_read` each carry their
 `_cannot_prove_this` twin (every twin's postcondition is false on *every* input, so a regression
-that guessed a value would fail the test). One entry pins the boundary where the value is *not*
-inlined and the contract is lost rather than proved: `named_const_of_an_expression_is_not_inlined`
-(an item whose body is an expression has its own body and locals). Another pins a second
-boundary: `a_function_local_const_is_not_inlined`. The two spellings do not meet there -- the
-*use* is printed with the enclosing function's path (`const a_local::L`) while the *definition*
-is printed bare (`const L: u8 = const 3_u8;`), rustc emitting the qualifier only where it is
-needed to disambiguate. That is also what makes the bare key safe rather than a false-proof
-risk: rustc qualifies a function-local item's definition precisely when another item shares its
-last segment (`const L: u8 = 5;` at the top level forces `const a_local::L`), so a bare `const L`
-enters the table only when nothing else could be meant by `L`. Verified to fail without the fix
-by neutralising the table lookup: the test then reports the true direction as `incomplete`. The
-parser side is pinned by `mir::parse::tests::named_const_items_are_collected_only_when_literal`.
+that guessed a value would fail the test). The expression-bodied item that used to be a boundary is now folded:
+`named_const_of_an_expression_is_inlined` (its `NEXT` is `LIMIT + 1 == 11`) verifies, its
+`_cannot_prove_this` twin (claiming `10`) is refuted, and `an_expression_const_keeps_its_width`
+holds the folded value's width. The refusals are pinned by
+`mir::parse::tests::a_const_body_outside_the_modelled_subset_is_refused_not_guessed`. A
+function-local `const` is inlined for its *owner* now too: `a_function_local_const_is_inlined`.
+Its *use* is printed with the enclosing function's path (`const a_local::L`) while the
+*definition* is printed bare (`const L: u8 = const 3_u8;`) -- rustc emitting the qualifier only
+where it is needed to disambiguate -- so the definition is recorded under the *qualified* path
+the use names, and no bare key is created. The bare key is what would be a false-proof risk:
+`a_local_const_is_not_in_scope_in_another_function` still holds that the bare name resolves to
+nothing elsewhere. Verified to fail without the fix by neutralising the table lookup: the test
+then reports the true direction as `incomplete`. The parser side is pinned by
+`mir::parse::tests::named_const_items_are_collected_only_when_literal`.
 
 ## Recursion by contract: a self-call answered by the function's own contract
 
@@ -6761,13 +7004,13 @@ need a `rustc`.
 
 ## Two shapes for the prover: in the artifact, or in the build
 
-The README's headline claim is that `discharge` is a prover that compiles *into* the
+The README's headline claim is that `verif` is a prover that compiles *into* the
 artifact, so a proof can run where Z3 cannot (`examples/bare_metal.rs` is the evidence: the
 decision procedure built for `thumbv7em-none-eabihf`). That is one shape. The other is the
 Kani/Verus shape -- verify while the crate is built, ship none of the verifier -- and it is
 reachable here for free, because the `mir` frontend is already `std`-only *host* tooling.
 
-Put `discharge` in `[build-dependencies]` and call `mir::verify::verify_file_with` from
+Put `verif` in `[build-dependencies]` and call `mir::verify::verify_file_with` from
 `build.rs`, failing the build on any outcome that is not `Verified`. A build script is a
 separate compilation unit, so cargo compiles it for the host, runs it, and discards it: the
 BDD blasting and the CDCL fallback never reach the crate's own rlib. That is a consequence
@@ -6777,12 +7020,12 @@ change to the crate.
 **The measurements, so the "zero cost" claim is a number and not an adjective.** `release`,
 `x86_64`, this repository:
 
-| configuration | artifact | `discharge` symbols |
+| configuration | artifact | `verif` symbols |
 |---|---|---|
-| baseline, no discharge | 447 728 B (binary) | 0 |
-| `discharge` as a dependency, never called | 447 696 B (binary) | 0 |
-| `discharge` in `[build-dependencies]`, called from `build.rs` | 4 860 B (rlib) | **0** |
-| `discharge::smt::prove` called from the crate's own code | 5 746 640 B (binary) | 26 |
+| baseline, no verif | 447 728 B (binary) | 0 |
+| `verif` as a dependency, never called | 447 696 B (binary) | 0 |
+| `verif` in `[build-dependencies]`, called from `build.rs` | 4 860 B (rlib) | **0** |
+| `verif::smt::prove` called from the crate's own code | 5 746 640 B (binary) | 26 |
 
 So "zero cost" is true of the build-time shape and false of the embedded one -- the two
 claims must not be conflated. The embedded engine's cost is the point of its existence
@@ -6799,15 +7042,15 @@ in the repository, which gate 16 exists to prevent) and requires three things:
    (`postcondition`, with the witness). The scratch contract is the recursion one whose
    *base case* is wrong, which is exactly the mistake a circular induction would wave
    through, so this doubles as an end-to-end check of the `decreases:` work; and
-3. the resulting rlib carries **zero** `discharge` symbols (`nm -C | grep -ci discharge`).
+3. the resulting rlib carries **zero** `verif` symbols (`nm -C | grep -ci verif`).
 
 Exit 2 when there is no `cargo` is reported and skipped, the same convention
 `tools/ferrocene/run.sh` and `tools/mir-oracle/run.sh` use: a skipped gate is not evidence.
 
 **A shell gotcha worth recording.** The scratch `Cargo.toml` is written with an *unquoted*
-heredoc so `$ROOT` expands, and the first draft put a backtick-quoted `` `discharge` `` in
+heredoc so `$ROOT` expands, and the first draft put a backtick-quoted `` `verif` `` in
 a comment inside that heredoc. The backticks were command substitution, so the script tried
-to *run* `discharge` and printed `discharge: not found` before continuing. It still passed
+to *run* `verif` and printed `verif: not found` before continuing. It still passed
 every assertion -- the failure was cosmetic -- but a gate that prints a stray error while
 going green trains a reader to ignore its output. Backticks (and `$(...)`) inside an
 unquoted heredoc are code, not prose.
@@ -6825,7 +7068,7 @@ repository already uses it in the one place it is safe: as an oracle.
 `librustc_driver-*.so` plus `libLLVM-*`. Each of those breaks a promise the crate makes:
 gate 14 pins the floor at stable 1.85, gate 5 forbids external dependencies, the README
 sells "not a nightly feature", and an experimental API that moves every nightly is not a
-foundation for a safety build. The oracle's own manifest says it: "the `discharge` crate
+foundation for a safety build. The oracle's own manifest says it: "the `verif` crate
 must build on stable with no dependencies, and `rustc_private` is neither stable nor
 dependency-free." Kani and Verus do link rustc internals -- but they are separate tools,
 and the whole point here is to *not* be that.
@@ -6865,13 +7108,13 @@ here. Two things in that section were still open, and both are closed now.
 
 **The claim was unpinned.** That section concludes the frontend is a stable-toolchain tool,
 but nothing *ran* it without a nightly: `tests/mir.rs` gates every `rustc`-dependent test on
-`DISCHARGE_RUSTC`, and gate 8 used to skip when it was unset. So the conclusion held only on
+`VERIF_RUSTC`, and gate 8 used to skip when it was unset. So the conclusion held only on
 machines that happened to name a compiler -- asserted in prose, checked by nothing. Gate 8
 now falls back to the `rustc` on `PATH` and skips only when there is no `rustc` at all, so
 the claim is exercised with no setup.
 
-**Pinning it surfaced a latent failure.** With gate 8 able to run without `DISCHARGE_RUSTC`,
-`env -u DISCHARGE_RUSTC scripts/test-count.sh` reported **1 test failing**, not skipping:
+**Pinning it surfaced a latent failure.** With gate 8 able to run without `VERIF_RUSTC`,
+`env -u VERIF_RUSTC scripts/test-count.sh` reported **1 test failing**, not skipping:
 `a_one_line_struct_does_not_swallow_the_functions_after_it` called `panic!` on the `None`
 that `verify_src` returns when no compiler is named. It was the only test in the file that
 read "no compiler" as "a bug" -- the other 174 return early -- so the suite's verdict
@@ -6883,7 +7126,7 @@ Also corrected while here: `verify.rs`'s two error strings blamed "a nightly too
 what is really a missing or empty `--emit=mir` output file -- a message that sends a reader
 to install a compiler that would not have helped. They now name the actual condition, and
 its doc comment and the README's source table and example no longer tell the reader to point
-`DISCHARGE_RUSTC` at a nightly.
+`VERIF_RUSTC` at a nightly.
 
 ## A function-local `const` was in scope in every function -- a false proof
 
@@ -7365,7 +7608,7 @@ the token needs no write scope.
 ## The seven-way comparison, and the model-drift trap
 
 `examples/comparison/` proves the same three functions (`sat_add`, `clamp`, `sum_to`)
-with `discharge`, Kani, Verus, Prusti, SPARK, Coq and Lean, and then proves that two
+with `verif`, Kani, Verus, Prusti, SPARK, Coq and Lean, and then proves that two
 injected bugs (swapped `sat_add` branches, wrong `sum_to` loop body) are refused by
 every one of them. Its README is the write-up; this is the part that costs time to
 rediscover.
@@ -7376,7 +7619,7 @@ buggy `sat_add` correct*: in unbounded `Z` the sum never wraps, so the branch th
 overflows on a real `u16` cannot overflow in the model. A correct proof of a false
 statement. The committed version models the wrap explicitly
 (`Z.modulo (a + b) 65536`) and the same false theorem is unprovable. This is the
-concrete argument for why `discharge` reads MIR instead of a hand-written model: there
+concrete argument for why `verif` reads MIR instead of a hand-written model: there
 is no transcription step, so there is no transcription to get wrong. Do not "simplify"
 the Coq or Lean model back to plain integers.
 
@@ -7414,8 +7657,538 @@ so it qualifies the toolchain, not the program: it compiles the buggy `sat_add`
 cleanly and, with a release profile, returns `0` exactly as plain `rustc` does. It is
 already gate 3 (`tools/ferrocene/run.sh`, exit 2 = absent = report and skip). A
 qualified compiler is not a qualified verifier, and building with Ferrocene confers
-nothing on `discharge`'s engine.
+nothing on `verif`'s engine.
 
 **The gate enumerates examples explicitly, so new files under `examples/` are safe**,
 but `gnatprove` writes `obj/` next to the `.gpr`; `examples/comparison/.gitignore`
 ignores it so a proof session cannot be committed.
+
+## Five reports against the intrinsic model: one false proof, one panic, one false claim, and two gaps
+
+A batch of five reports against the `core`-intrinsic model. Four were real; each fix is
+guarded by a test that fails without it, and the fifth was a wrong claim in the corpus prose
+rather than in the engine. `scripts/test-count.sh` **760 → 764** passed, 0 failed;
+`scripts/gate.sh` **ALL GATES GREEN**; clippy (`--all-targets` and the `no_std` half) and
+rustdoc clean.
+
+**Report 1 — a trait method sharing an intrinsic's name could get a *false proof*.**
+rustc prints a local trait impl's *definition* as `<impl at FILE:L:C: L:C>::is_power_of_two`
+but its *call* as `<u8 as Trait>::is_power_of_two`. The names never match, so the exact-name
+same-dump lookup missed; `try_intrinsic` classifies on the *suffix* (`is_power_of_two`), so it
+answered the call from `core`'s model before type-aware callee resolution ran. A
+`Trait::is_power_of_two` for `u8` that returns `false` then *proved* `ensures: ret == true` at
+`x == 1` — a false proof of a body that disagrees with `core`. The fix is two halves of one
+guard: (1) the `Call` term now consults `resolve_callee` *first* and only falls through to the
+model when no same-dump body exists; (2) `try_intrinsic` returns `None` for any name that does
+not carry the `<impl …>` projection. The invariant that makes (2) safe is that rustc prints
+*every* real `core` integer-method call with that projection (`core::num::<impl
+u8>::wrapping_add`) and no local method call ever carries it, so the guard refuses only names
+that could name a local body. The direction is a refusal, so a misjudged spelling loses a proof
+rather than inventing one. New corpus fixtures
+`trait_is_power_of_two_disagrees_with_core` (verifies) and `…_tripwire` (refutes) pin both
+directions; the tripwire fails without the fix.
+
+**Report 2 — the 64-bit bit counts panicked (or, without overflow checks, were wrong).**
+`bit_count(TrailingZeros, …)` built its low-bit mask `2^k - 1` with a *host* shift and ran `k`
+to `w`, so at `w == 64` the last step was `1u64 << 64`: a panic under overflow checks and,
+without them, an all-zero mask that makes `x & mask == 0` true for every operand, so every
+`trailing_zeros`/`trailing_ones` at 64 bits came back one too large. The last mask is now
+`smt::all_ones(w)`, the same low-bit mask without the shift. The existing exhaustive bit-count
+test only reaches 32 bits (`0..(1u64 << w)`), which is why it missed this; the new
+`the_64_bit_counts_agree_with_rust` walks chosen separating operands at 64 bits and fails on
+the old code.
+
+**Report 3 — the mixed-add fixtures were asserted nowhere, and every one was true.** The eight
+mixed-signedness fixtures added with the model had no test asserting their verdicts, and each
+was true at its pinned inputs, so a regression that *proved* a false claim about them would not
+have failed the suite. The fix adds the missing true pins (`checked_add_signed_in_range_is_the_sum`,
+`checked_add_unsigned_in_range_is_the_sum`, `overflowing_add_unsigned_within_range_is_not_overflow`,
+`overflowing_add_unsigned_past_the_top_is_overflow`) and one false tripwire per shape
+(`wrapping_add_signed_wrong_value_tripwire`, `saturating_add_signed_wrong_value_tripwire`,
+`overflowing_add_signed_wrong_flag_tripwire`, `checked_add_signed_none_tripwire`,
+`wrapping_add_unsigned_wrong_value_tripwire`, `saturating_add_unsigned_wrong_value_tripwire`,
+`overflowing_add_unsigned_wrong_flag_tripwire`, `checked_add_unsigned_wrong_value_tripwire`), all
+asserted by `the_mixed_signedness_additions_verify_and_their_tripwires_refute`. The
+`overflowing_add_signed_wrong_flag_tripwire` is the one a bare-carry flag model proves (checked
+for teeth by breaking the model to `Some(carry)` — it then verified the false claim).
+
+**Report 4 — the `bool` predicate was never exercised through a branch.** Every
+`is_power_of_two` fixture returned the predicate, so the `bool` reached the return place and the
+obligation read it there; a regression in *branching* on it would have left the tests green.
+The corpus gains `is_power_of_two_branching_takes_the_true_arm`,
+`…_takes_the_false_arm` and `…_of_zero_tripwire` (an `if` with different constants per arm),
+asserted by `is_power_of_two_branches_on_the_predicate`.
+
+**Report 5 — the corpus prose had the carry backwards.** The doc-comment on
+`overflowing_add_signed_below_zero_is_overflow` said "the carry fires *and* the flag is set",
+but for `0u8 + (-1i8)` there is no carry: the addition reads `-1i8` as `255u8` and
+`0u8 + 255u8` is `255` with no carry, so the flag comes purely from the addend's sign
+(`carry ^ (addend < 0)` is `false ^ true`). The claim was about the *model*, not the engine,
+and it was wrong; the prose is corrected. No behaviour changed.
+
+The lesson, again: a fixture that is never asserted is not a test, and a fixture that is always
+true cannot catch a prover that says "true" too often. The negative direction has to be in the
+suite, with a witness, or the standing tripwire rule is only a comment.
+
+## `Ord::min`/`Ord::max`: the first modelled trait methods, and the guard exception they forced
+
+The corpus's top idiom gap was `x.min(y)`/`x.max(y)`, which were `incomplete` with "call to
+unmodelled function `<u8 as Ord>::min`". Modelling them is the increment; the interesting part
+is *why they are hard*, because they are the first modelled shape whose call is a **trait**
+call rather than a `core::num::<impl …>` inherent one, and that collides with the guard that
+keeps the model from ever answering a local body.
+
+The guard (from the Report-1 work) is: `try_intrinsic` returns `None` for any name that does not
+contain `<impl`, because rustc prints every real `core` integer-method call with the
+`core::num::<impl u8>::wrapping_add` projection and no local method call carries it. But a trait
+call has no `<impl` by construction — it is `<u8 as Ord>::min` — so the guard would have made
+`Ord::min`/`max` permanently unmodellable. Removing the guard outright is *also* wrong: it was
+what allowed Report 1's false proof in the first place. The reconciliation is that the guard's
+job is really done by the caller, which consults `resolve_callee` (same-dump lookup) *before*
+the model. Two experiments pinned this: with the guard removed and the reorder in place, the
+Report-1 soundness test still passes and the whole 216-test MIR suite stays green, which shows
+the reorder — not the guard — is what carries soundness; and with the guard restored, core
+`Ord::min` is unmodelled.
+
+So the guard gains one **narrow exception**, `is_ord_callee`, admitting a name only when all of
+these hold: the method is `min`/`max`; the trait path between `as` and `>` is exactly `Ord`,
+`core::cmp::Ord`, or `std::cmp::Ord`; and the self type is a *primitive* integer. Each clause
+closes a real hole.
+
+- **The trait path must be the standard library's.** A local trait in a module prints its call
+  as `<u8 as m::Ord>::min` — trait path `m::Ord`, refused. `std::cmp::Ord` and `core::cmp::Ord`
+  cannot name a user item, because a user cannot define items inside `std`/`core`. So the
+  accepted set is exactly the prelude's `Ord`.
+- **The self type must be primitive.** A user type can be `Ord`, but the model has no definition
+  for its `min`, so admitting it would only answer a call with no meaning. Refusing keeps the
+  direction conservative.
+- **A crate-root trait named `Ord` is the one spelling that can still collide**, because it
+  prints as `<u8 as Ord>::min` — indistinguishable from the prelude's by name alone. This is
+  *not* closed by name; it is closed by the caller's same-dump lookup, which finds the local
+  body first. The corpus pins this: `ord_shim` (a module-qualified local `Ord`) verifies from
+  its body's constant, and the crate-root case was checked by probe.
+
+The model itself is total and sign-aware: `min` is `ite(sle(x,y), x, y)` signed and
+`ite(ule(x,y), x, y)` unsigned, `max` the same with `sge`/`uge`. The sign is not cosmetic —
+`i8::MIN`'s bits (`0x80`) are the largest unsigned byte, so an unsigned ordering would return
+the wrong operand for every pair with a negative side, a *wrong value* rather than a weaker
+proof. `the_ord_min_max_agree_with_rust` walks all of `u8` and all of `i8` against `core`'s own
+methods, and names the separating points (`0x80`, `0xff`/`0xfe`) so a failure names the pair.
+The integration test `ord_min_and_max_are_modelled_and_a_local_trait_still_wins` covers the
+unsigned and signed orderings, the explicit `Ord::min` spelling, a tripwire on the method form,
+and the local-trait pair — and it *fails* if the guard exception is removed (checked by
+temporary revert), so the exception is load-bearing rather than decorative.
+
+`scripts/test-count.sh` **764 → 767** passed, 0 failed; `scripts/gate.sh` **ALL GATES GREEN**.
+Corpus coverage `examples/mir_targets/realistic.rs` **344 → 349** verified over 643 → 650 lines
+(the two new tripwires refute, as they must). No new SMT primitives were needed: `sle`, `sge`,
+`ule` and `ite` already existed.
+
+## `From::from`/`Into::into`: the second trait-method exception, and the two-type shape
+
+A widening conversion is the *same shape* of exception `Ord` is — a trait method whose call
+carries no `<impl` — so it is admitted the same way: `classify` accepts `from`/`into` only under
+the standard library's trait path, `try_intrinsic`'s `<impl` guard gains `Conversion` beside
+`is_ord_callee`, and the same-dump lookup still answers any local body first.
+
+Two things make conversions harder than `Ord`, and both are handled in the model rather than
+the guard:
+
+- **The two operand *types* differ, and both are in the name.** `Ord::min`'s operands share the
+  receiver's type, so one width read off the argument suffices. A conversion's whole content is
+  the *pair* of types, and rustc spells them in opposite positions for the two directions:
+  `From` is `<DEST as From<SRC>>::from` (self type = destination, parameter = source) and `Into`
+  is `<SRC as Into<DEST>>::into` (the other way round). `conversion_types` reads both out of the
+  call's own name — independent of how the executor happened to type the argument — and the
+  executor passes the *source* width/sign as `w`/`signed` and the *destination* width as
+  `result_w`. This is the one shape where those two differ by construction (the bit counts are
+  the other, and there the result is a fixed `u32`).
+- **Only a *strict widening* is a real integer `From`.** `core` implements `From` for exactly
+  the strict widenings (`u8 → u16`, `i8 → i16`, `u8 → i16`, …) and nothing else, so requiring
+  `dst_w >= src_w` between two modelled integers accepts every real call and refuses every
+  malformed or same-width spelling, which is the conservative direction. The extension is by the
+  *source's* sign — `i8::MIN` widens to `i8::MIN` (`0xff80`), `255u8` widens to `255u16` — and
+  that is deliberately the *same* rule the executor's `as`-cast arm uses, so a conversion and a
+  cast of one shape build one term (`convert_value` is the shared helper; the unit test pins the
+  agreement against the real `From` impl over all of `u8`/`i8`).
+
+The trait-path set is `From`/`Into`, `core::convert::…` and `std::convert::…`. The `std::convert`
+spelling is not hypothetical: the corpus prints `<u16 as std::convert::From<u8>>::from` once a
+local trait also named `From` is in scope, because rustc then qualifies the prelude trait to
+disambiguate. All three are the standard library's `From` and a user cannot define items inside
+`core`/`std`, so the set is exactly the prelude's; a module-qualified `m::From` is refused by
+name, and a crate-root `From` — which prints as the bare `From` too — is closed by the same-dump
+lookup, exactly as for `Ord`.
+
+`scripts/test-count.sh` **767 → 774** passed, 0 failed; `scripts/gate.sh` **ALL GATES GREEN**.
+Corpus coverage `examples/mir_targets/realistic.rs` **349 → 353** verified over 650 → 655 lines
+(the sign-extension tripwire refutes, as it must). The strengthened
+`a_static_call_resolves_to_its_own_impl_cannot_prove_this` now *refutes* with a witness
+(`x == 0`) where it used to be `Incomplete` — the modelled conversion answers the call, so the
+local `from` is not consulted at all. No new SMT primitives were needed: `sign_extend` and
+`truncate` already existed.
+
+### The owner-type gap this work surfaced, and how it was closed
+
+While checking the local-trait case, a probe found a **false proof that predated this
+increment** (confirmed on the unmodified tree): a local `impl From<u8> for u16` whose body
+returns `7` was *wrongly* consulted for a real `<u16 as std::convert::From<u8>>::from(x)` call,
+so a contract `ret == 7` verified. The mechanism was `resolve_callee`'s owner-type match: the
+local impl's *definition* name `<impl at …>::from` shares the tail `from` with the call
+`<u16 as std::convert::From<u8>>::from`, and `method_owner_type` read the owner as `u16`, which
+equals the call's self type — so the local body won the same-dump lookup for a `core` call. The
+gap was in the same-dump resolver, not in the conversion *model* (a fallback that is never
+reached when the lookup matches), and it applied to *any* local impl on a primitive whose owner
+type matched an external trait call's self type.
+
+It is now closed by making the resolver **trait-aware**. `Specs` gains an `impl_traits` map —
+the trait each `impl` block implements, keyed by the same `(line, column)` as `impl_owners`,
+read by the new `spec::impl_trait` parser and qualified with its enclosing module (so
+`impl From<u8> for u16` inside `mod m` records `m::From`, the path rustc prints in a call). A
+*trait* call (`<T as Trait<…>>::m`) is admitted only when the call's trait path is a `::`-aligned
+suffix of the candidate impl's own trait path (`trait_candidate_admits`): a bare `conv_shim::From`
+is not a suffix of `std::convert::From`, so the local body can no longer answer the library call,
+while the local trait's *own* call (`conv_shim::From::from(x)`) still reaches its body. A bare
+`Type::m` call carries no ` as ` projection — rustc prints both an inherent method and an in-scope
+trait method that way — so it keeps the owner-type match alone, as before.
+
+The corpus pins both directions with a `conv_shim` fixture mirroring `ord_shim`:
+`local_from_does_not_answer_the_std_trait` (the false proof, must refute) and
+`local_from_is_answered_by_its_own_body` (the local trait, must verify). The integration test
+`a_local_trait_named_from_does_not_answer_the_std_trait` **fails** on the pre-fix tree — it
+reports the false proof `verified (1 obligation(s), 0 panic(s) ruled out)` — so the guard is
+load-bearing, not decorative. Unit tests pin the parser (`impl_trait`) and the map's keying and
+module-qualification.
+
+`scripts/test-count.sh` **774 → 777** passed, 0 failed; `scripts/gate.sh` **ALL GATES GREEN**.
+Corpus coverage `examples/mir_targets/realistic.rs` **353 → 354** decided over 655 → 657
+contracts (the two new `conv_shim` entries: one verifies from the local body, one refutes the
+library call it must not answer). No new SMT primitives: the guard is a name comparison, and the
+model is unchanged.
+
+## Trait identity: the bare-name and imported-trait spellings, and the self-type key
+
+The `impl_traits` guard above compared a call's trait path with the candidate impl's own path
+by `::`-aligned suffix. Two more false proofs hid behind the suffix reading, both surfaced by
+adversarial review and both now closed.
+
+**A bare name is the crate-root trait only when the crate declares one.** rustc prints a trait
+in a call as its *shortest crate-unique* path. `mod m { pub trait Trait { … } }` plus a
+crate-root `trait Trait { … }` makes the crate-root call print bare (`Trait::pick`) while the
+module trait prints qualified (`m::Trait::pick`). A suffix match accepted `m::Trait` for the
+bare call, so a contract written against the crate-root body verified from the module's body —
+a false proof. The fix is `Specs::declared_traits` (the crate's own traits as module-qualified
+paths, from `spec::declared_traits`) and a rewrite of `trait_candidate_admits` as an *identity*
+rule: identical paths match; a bare `want` matches only the crate's *unique* trait of that name
+(or the crate-root one when several share the name, which is the `have == want` case); a bare
+`have` matches a qualified `want` only when the crate declares no local trait of that name, so
+the bare name can only be the library trait.
+
+**A local `impl` of an *imported* trait needs the self type, not just the trait path.** A
+crate that only *imports* a library trait — `use std::convert::From;` plus a local
+`impl From<Local> for u16` — prints its call `<u16 as From<Local>>::from`: the bare library
+name, because the local `From` is the only one in scope. The crate declares no trait named
+`From`, so `declared_traits` alone does not refuse it, and the model would answer a call the
+compiler resolved to the local body. The owner (`u16`), the method (`from`) and the trait path
+(`From`) all match the model's conversion, so none of them separate it. What does is the call's
+*self type* (`Local`, the conversion's source, read by `call_trait_path`'s caller from between
+`as` and the trait name) against the candidate impl's own self type (`impl_self_ty`, the part
+between `impl` and `for`). `trait_candidate_admits` now takes both: when `want` is bare and the
+crate declares no trait of that name, an impl whose self type is not a plain trait path matches
+only if it equals the call's self type.
+
+The corpus cannot express the imported spelling: its own `conv_shim::From` forces rustc to
+qualify the library trait (`<u16 as std::convert::From<…>>::from`), which is the *other*
+branch. The regression test `a_local_impl_of_an_imported_trait_does_not_answer_the_model` uses
+its own inline source (via `verify_src`) so no local `From` competes with the import.
+
+`scripts/test-count.sh` **777 → 780** passed, 0 failed; `scripts/gate.sh` **ALL GATES GREEN**
+(clippy std + no_std, tests, no_std bare-metal, zero deps, rustdoc ×3, MSRV 1.85, artifacts,
+unsafe surface still 2). No new SMT primitives: both guards are name/type comparisons, and the
+model is unchanged.
+
+## Trait identity, round three: default-body overrides, generic arguments, and the import scan
+
+A second adversarial review of the same resolver surfaced four more defects -- two false proofs
+and two lost proofs -- plus one stale doc claim and a bug in the guard added by the previous
+round. All are closed here. The unifying lesson: **a trait method's identity is not its path.**
+It is the path *and* the instantiation *and*, when a default body exists, whether any impl
+overrides it.
+
+**Finding 1 (false proof): an overridden method verified against the trait's default body.**
+`trait T { fn value(&self) -> u8 { 1 } }` with `impl T for Foo { fn value(&self) -> u8 { 2 } }`
+makes `<Foo as T>::value(&foo)` return `2`, but rustc keeps the *default* `T::value` in the dump
+(printed `T::value`, no `<impl at`). `resolve_callee` looked for a default body *first* and
+inlined its `1`, so a contract `ret == 1` was **proved** for code Rust returns `2` from. The
+search for an `impl` candidate now runs first, and the default is consulted only when that search
+finds *nothing*: an impl that does not override emits no `<impl at …>::m`, so the default is the
+only body; an impl that does override contributes exactly one hit, which wins. Two or more hits
+stay ambiguous and are refused rather than resolved to the default.
+
+**Finding 2 (false proof): a local impl answered a different *instantiation* of a generic trait.**
+`impl From<Local> for u16` (body `107`) and the library's `impl From<u8> for u16` share the trait
+path (`From`), the owner (`u16`) and the method (`from`); only the trait's *argument* separates
+them. The previous round's self-type guard was supposed to catch this, but it never fired (see
+below), so `<u16 as From<u8>>::from(7u8)` was answered from the local body and `ret == 107` was
+proved. The fix reads the trait's arguments on *both* sides -- `call_trait_args` from the call's
+name, `Specs::impl_trait_args` (new, parsed by `spec::impl_trait_args`) from the impl header --
+and requires them equal. An unreadable side is refused rather than waved through, because it
+could be the impl the call did not name. `args_match` allows the one spelling gap rustc creates:
+the dump prints a type by its *shortest crate-unique* path, so `impl From<crate::Local> for u16`
+prints its call's argument as the bare `Local`; a bare dump argument therefore matches a
+module-qualified source spelling, while a *qualified* dump argument is compared exactly.
+
+**Findings 3 and 4 (lost proofs): an imported trait was qualified with its own module.**
+`mod m { use std::convert::From; impl From<…> for u16 { … } }` records the impl's trait as the
+*imported* path (`std::convert::From`), because that is what the compiler prints in the call. Two
+defects broke that. First, `module_imports` reset its running map on *every* scope change, so a
+nested `mod nested {}` inside `m` cleared `m`'s imports for the rest of `m`; the later
+`impl From<…>` was qualified `m::From` and no call matched -- a lost proof. Imports are now kept
+*per module path*, assembled from every `use` at that depth regardless of order, since Rust item
+imports are order-independent. Second, the scan read one line at a time and only stripped a bare
+`pub ` prefix, so a folded `use a::b::{\n C,\n};` and a restricted `pub(crate) use …` were both
+missed entirely -- the same lost proof. The scan now folds a `use` item through its `;` and
+`strip_visibility` handles `pub`, `pub(crate)`, `pub(super)` and `pub(in …)`.
+
+**The previous round's guard was itself broken.** `impl_self_ty` was meant to return the
+candidate's self type (the part between `impl` and `for`), but for a definition name
+`<impl at …>::from` it returned the *method* (`from`). It only appeared to work because the
+`have == want` arm of `trait_candidate_admits` matched first for the imported-trait case, so the
+self-type arm was never reached -- and Finding 2 is exactly what slipped through. `impl_self_ty`
+is removed; the argument key that replaces it is read from the *header* (via `impl_trait_args`),
+where the type is unambiguous.
+
+**Finding 5 was a stale doc claim, not a code bug.** The README and two `intrinsics.rs` comments
+said a *same-width* `From` call is refused. It is not: `<u8 as From<u8>>::from(x)` is `core`'s
+reflexive `impl<T> From<T> for T`, and `eval` accepts it (`result_w >= w`), modelling the source
+unchanged -- which the differential oracle agrees with. Only a *narrowing* is refused. The prose
+now says so, and the corpus pins the identity (`same_width_from_is_the_identity` plus a tripwire).
+
+Regression coverage: `an_override_wins_over_the_traits_default_body`,
+`a_generic_traits_arguments_separate_its_impls`, `an_imported_trait_keeps_its_imported_path`,
+`a_multiline_restricted_import_is_read` (all inline, via `verify_src`), plus corpus fixtures for
+the override and generic-argument directions and the same-width identity.
+
+`scripts/test-count.sh` **780 → 784** passed, 0 failed; `scripts/gate.sh` **ALL GATES GREEN**
+(clippy std + no_std, tests, no_std bare-metal, zero deps, z3 oracle 845 agree / 0 mismatch,
+rustdoc ×3, MSRV 1.85, artifacts, unsafe surface still 2). No new SMT primitives: every fix is a
+name, argument or scope comparison, and the model is unchanged.
+
+
+## Trait identity, round four: nested trait arguments and the conditional import
+
+A third adversarial pass over the same resolver found two more defects, both *lost* proofs, in the
+two helpers the previous round added. Both are closed here. The lesson this time: **a reader added
+for one spelling must be used on *both* sides, and raw source is not the enabled crate.**
+
+**Finding 7 (lost proof): a nested trait argument lost the local body.**
+The previous round added `call_trait_args` (the call's argument) and `Specs::impl_trait_args` (the
+impl header's argument) and required them equal. But the two readers disagreed on a *nested*
+argument: `impl_trait_args` used `spec::angle_inner` (balanced), while `call_trait_args` read to
+the first `<` and then `trim_end_matches('>')`. That strips *every* closing bracket, so
+`<W as Wrap<Option<u8>>>::get` yielded `Option<u8` -- which no balanced impl reading (`Option<u8>`)
+equals. The argument comparison then refused the match, the call had no body, and it was reported
+unmodelled: a *lost* proof (`ret == 9` for a local body returning `9` was `Incomplete`). The fix
+makes `call_trait_args` read with `angle_inner` too, so both sides spell the argument the same
+balanced way. Corpus: `nested_trait_arg_finds_the_body` verifies, its tripwire is refuted.
+
+**Finding 8 (lost proof): a `#[cfg]`-disabled import displaced a live alias.**
+`module_imports` reads raw source, but rustc emits MIR only for *enabled* items. A live
+`use std::convert::From as Conv;` binds `Conv` to the standard trait; a later
+`#[cfg(any())] use crate::Other as Conv;` binds nothing. The map was built by plain insertion in
+source order, so the disabled import overwrote the live binding, the impl written with `Conv` was
+recorded against `crate::Other`, and the call the compiler resolved to the standard trait matched
+nothing -- a lost proof (reported `converts a type the model does not hold`). The fix records, per
+binding, whether it came from an *unconditional* `use`, and a conditional binding never displaces
+an unconditional one. An unconditional binding still wins wherever it appears, and a conditional
+binding is still applied when it is the only one (the source cannot evaluate an arbitrary `cfg`,
+so the conservative reading is "this may be off, so never let it override a definite binding").
+Corpus: `cfg_disabled_import_keeps_the_live_alias` verifies, its tripwire is refuted.
+
+**The same-line attribute form.** A `#[cfg] use …` whose attribute shares the line hides the `use`
+keyword from `is_use_start`, so the import was missed *entirely* -- the same lost proof for a live
+binding. `strip_visibility` now peels any leading `#[…]` attributes (with depth-matched brackets)
+before reading the visibility, so `#[cfg(all())] use std::convert::From as Conv;` is read; and
+`is_cfg_use` sees the same-line `#[cfg]` when deciding precedence. A `#[cfg]` attribute on the
+item's own line was also previously invisible to the scanner, so it could not even be identified
+as conditional.
+
+**The multi-line attribute form.** The same hazard for an attribute that *wraps*:
+`#[cfg(all(\n    any(),\n))]` puts the closing `)]` on the line directly above the `use`, so a
+one-line look upward sees no `#[cfg…` and treats a *disabled* import as live, displacing the live
+alias (again a lost proof, `converts a type the model does not hold`). `is_cfg_use` now reads the
+whole attribute block directly above the item as complete, bracket-balanced `#[…]` items
+(`read_attr_run`), so a condition that spans lines is found. The block ends at the first line that
+is not an attribute, so a `#[cfg]` belonging to an earlier item is never read as this one's.
+Corpus: `cfg_multiline_import_keeps_the_live_alias` verifies, its tripwire is refuted.
+
+**A quoted delimiter is not a delimiter.** The same reader counted *every* character as a bracket,
+so a delimiter inside quoted text unbalanced it: `#[doc = "("]` holds an unmatched `(`, the run
+never finds its closing `]`, exhausts its lines, and `read_attr_run` returns `None` -- the disabled
+`#[cfg]` above it is then read as live and displaces the live alias (again
+`converts a type the model does not hold`). `read_attr_run` now tracks string and character
+literals (honouring backslash escapes) and skips their contents while matching `#[…]`. A `'` opens
+a char literal only when it looks like one (`'('`, `'\n'`), not when it is a lifetime (`'a`), since
+reading a lifetime as an unclosed literal would make every later attribute unreadable
+(`is_char_literal_start`). Corpus: `cfg_quoted_delimiter_keeps_the_live_alias` verifies, its
+tripwire is refuted.
+
+Regression coverage: `a_nested_trait_argument_keeps_its_balanced_spelling`,
+`a_cfg_disabled_import_does_not_displace_a_live_alias`, `a_same_line_cfg_import_is_read`,
+`a_multiline_cfg_import_does_not_displace_a_live_alias`, `a_quoted_delimiter_does_not_hide_a_cfg_import`
+(inline, via `verify_src`), `the_nested_argument_and_cfg_alias_fixtures_are_decided` (corpus, the
+one-line, multi-line and quoted-alias directions), plus six unit tests on the readers themselves
+(`leading_attributes_are_peeled_and_a_cfg_is_reported`,
+`a_use_behind_a_same_line_attribute_is_still_an_import`,
+`a_cfg_import_does_not_displace_a_live_binding`,
+`a_conditional_binding_is_held_below_an_unconditional_one`,
+`a_multiline_cfg_attribute_is_seen_above_a_use`,
+`a_delimiter_inside_a_quoted_attribute_is_not_a_delimiter`).
+
+`scripts/test-count.sh` **784 → 796** passed, 0 failed; `scripts/gate.sh` **ALL GATES GREEN**
+(clippy std + no_std, tests, no_std bare-metal, zero deps, z3 oracle 845 agree / 0 mismatch,
+rustc_public oracle 0 differ, MSRV 1.85, artifacts, unsafe surface still 2). No new SMT primitives:
+every fix is a string read on the same two sides, and the model is unchanged.
+
+## Preparing for crates.io: the checks that are not about correctness
+
+The crate could pass all eighteen gates and still be unpublishable, and the
+failure would only surface at `cargo publish` -- the worst moment, because an
+upload cannot be undone. So the packaging work is a second set of checks, and
+the interesting part is the four things it found that no compiler sees.
+
+**A `.crate` must carry its own licence.** `verif-arithmetic/` had a
+`Cargo.toml`, `src/` and `tests/` and nothing else. `cargo package --list`
+showed ten files and not one of them was a `LICENSE`, so the published crate
+would have shipped no licence text and no README at all -- legally
+unredistributable, and a crates.io page with no documentation. It now has
+`LICENSE` (a real copy, not a symlink: a symlink is not followed into the
+archive), `NOTICE`, and a `README.md` whose example is pinned as a test.
+
+**The bare-version-tag check rejected the parent's own tags.** `publish.py` was
+written from a reference where a bare `v<version>` tag is refused with
+`tag.startswith("v")`. That is correct there and wrong here: this repository's
+parent crate is named `verif`, so its release tag `verif-v0.1.0` also starts
+with `v` and was refused as "a bare version tag". The fix is `^v[0-9]` -- the
+digit is what makes `v0.1.0` a version and `verif-...` a crate name. This is the
+kind of defect a rename introduces: the reference's assumption was invisible
+until the crate it ran against was called something beginning with `v`.
+
+**The docs.rs metadata is load-bearing, and its absence is silent.** The default
+feature set is empty (`no_std`), and the `mir` frontend and the proc-macro
+surface are behind `std`. docs.rs builds the default features unless told
+otherwise, so without `[package.metadata.docs.rs] all-features = true` the
+published documentation would describe a crate *smaller* than the one that
+ships, with no error anywhere. The first version of `check_package.sh` tested
+for the key with `"docs.rs" not in str(metadata)`, which is wrong twice: the
+parsed key is nested (`{"docs": {"rs": {...}}}`), and a crate with no
+non-default feature needs no such table -- demanding one would be a flag with no
+reader, the thing this repository argues against. The check now requires it only
+where there is a feature to lose.
+
+**Attribution is per crate, not global.** The first run reported
+`verif-arithmetic/NOTICE` for `Kani` and `rustc_public`, because the scan
+collected names from *both* crates' sources and then required *each* `NOTICE` to
+name all of them. A project named only in the parent is the parent's to
+attribute. Split per crate, the real finding appeared: `rustc_public` is
+mentioned in `verif-arithmetic/src/lib.rs`, so the sibling's `NOTICE` has to name
+it. Two of the four reports were the check's own bug; that is why the check was
+run against a deliberately broken manifest as well.
+
+**`verif`'s crate directory is the repository root**, so a dirty-file check
+cannot attribute a root file to `verif` by path prefix -- every path is under the
+root. `publish.py` relies on cargo's own `--allow-dirty` refusal for that crate
+instead, which is scoped to the crate directory the way cargo intends.
+
+`scripts/check_package.sh` is hermetic: it reads the manifests and the tracked
+file list and runs no compiler, so it is cheap enough for every pull request. It
+is a separate script rather than a nineteenth gate because renumbering the
+existing eighteen is churn that risks the checks themselves. It, the
+action-pinning check and the `package` dry-run job are all in `ci.yml`; the
+release itself is `.github/workflows/release.yml`, tag-driven, one crate per tag,
+because the two crates version independently.
+
+`scripts/test-count.sh` **796 → 806** passed, 0 failed; `scripts/gate.sh` **ALL
+GATES GREEN** (all eighteen). Two of the ten new tests are the pinned README
+examples (`tests/readme.rs`, `verif-arithmetic/tests/readme.rs`); the other eight
+come with the packaging checks. No engine change: every fix is a manifest field,
+a packaging script, or a document.
+
+## Three ways the release workflow would have failed, and one it would have caused
+
+The release workflow was written and reviewed as a *plan*: the dry-run passes,
+the notes generate, the upload runs. All three of those steps were checked in
+isolation, and all three were wrong, in ways that only appear when they run in
+sequence against a real repository. The pattern is the same in each: a step was
+correct about its own output and wrong about what it left behind for the next.
+
+**`notes.md` in the root dirties the crate the next step uploads.** `verif` is
+packaged from the repository root -- its crate directory *is* the root -- and
+`cargo publish` refuses a crate whose directory has uncommitted changes. The
+notes step wrote `notes.md` there, after the dry-run and before the upload. So
+the dry-run checked a clean tree, then the notes made it dirty, and the real
+publish failed:
+
+```
+error: 1 files in the working directory contain changes that were not yet
+committed into git:
+notes.md
+```
+
+`verif-arithmetic` was unaffected, because its crate directory is the
+subdirectory -- which is exactly why this was easy to miss: the sibling release
+works, so the workflow looks correct until the parent is released. The fix is to
+write the notes outside the checkout (`$RUNNER_TEMP`) and pass that path to `gh
+release`. The dry-run and the upload now see the same tree, which is the property
+that was actually wanted; "the notes exist" was satisfied either way.
+
+This is the same defect class as the `.rlib` files gate 16 guards against -- a
+step's output landing inside a crate directory -- and it is worth naming, because
+the check for it already existed for a different file type.
+
+**A manual dispatch would have packaged the branch and released the tag.** The
+workflow pins `RELEASE_TAG` and checks it against the manifest version, and that
+check is not enough for `workflow_dispatch`: the ref is chosen in the Actions UI,
+and `inputs.tag` only controls what is *named*. If the default branch carries the
+same version as the tag -- which it does right up until the release is cut --
+the version check passes, the branch is packaged and uploaded under the tag, and
+`gh release create --verify-tag` then attaches a release to the tag's commit.
+The registry holds commit B; the release points at commit A. The version check
+cannot see this, because both commits declare `0.1.0`. The commit can:
+
+```
+error: HEAD is 74018168e010 but `verif-v0.1.0` is ed0e30bcdb93; check out the tag,
+not a branch
+```
+
+`ref: ${{ inputs.tag || github.ref }}` pins the checkout, and `--verify-checkout`
+asserts it, so the two cannot drift. A version is a claim about content; a commit
+is the content.
+
+**A transient 404 after a successful upload aborted the whole release.** The
+confirmation step called the crates.io API once and treated anything but HTTP 200
+as failure. But a successful upload and an API-visible version are separate
+events: the index is updated asynchronously, so the first request can 404 for a
+few seconds after `cargo publish` returned success. The step then failed *after*
+the crate was published and *before* the GitHub release was created -- the worst
+of both, an upload that cannot be undone and no release to explain it.
+`--confirm-index` now polls to a bounded deadline, retrying 404 and 5xx and
+network errors, and fails fast on any other 4xx: a 403 will not become a 200 by
+waiting, so retrying it only delays the report.
+
+**And the fix for the first one would have introduced the fourth.** Moving the
+notes generation into `publish.py` removed the `importlib` call the old inline
+step used, but the old step *also* left a bytecode cache behind: importing a
+script writes `scripts/__pycache__/` next to it, inside the checkout, which is
+again a root-directory change that dirties the `verif` crate. It is untracked, so
+gate 16 (which greps `git ls-files`) never saw it, and the `.crate` was fine --
+but the *next* `cargo publish` would have refused. `__pycache__/` is now in
+`.gitignore`, where it cannot be mistaken for a source change, and the notes step
+runs the script as a program rather than importing it, so no cache is written at
+all.
+
+All three subcommands are exercised on the release path itself, and each was
+tested with a negative control: `--verify-checkout` fails when the tag is absent
+and when it points at another commit (including one whose version matches);
+`--confirm-index` succeeds on a published crate, retries a 404-then-200, and
+fails a 403 immediately rather than after the timeout.

@@ -1,7 +1,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
-//! # discharge — in-code formal verification for Rust
+//! # verif — in-code formal verification for Rust
 //!
 //! SPARK/Ada earns its reputation in safety-critical work because the proof
 //! tooling is *part of the language and part of the artifact*: `gnatprove` sits
@@ -58,11 +58,11 @@
 //! # Example
 //!
 //! ```
-//! use discharge::prelude::*;
-//! use discharge::sym::*;
+//! use verif::prelude::*;
+//! use verif::sym::*;
 //!
 //! // ∀ x:u8. x & 0x0f < 16
-//! let proved = discharge::smt::with_fresh(|| {
+//! let proved = verif::smt::with_fresh(|| {
 //!     let x = var(8);
 //!     (x & 0x0fu64).lt_val(16).prove().is_proved()
 //! });
@@ -89,16 +89,16 @@ pub mod wp;
 
 // The proved runtime primitives live in a sibling crate so that the arithmetic a
 // safety build ships is `no_std`, `#![forbid(unsafe_code)]` and dependency-free
-// on its own, with its proofs carried inside it. Re-exported so that
-// `discharge::discharge_arithmetic` resolves without the caller having to name
-// the workspace layout.
-pub use discharge_arithmetic;
+// on its own, with its proofs carried inside it. Re-exported as `arith` so the
+// module reads `verif::arith` rather than the `verif::verif_arithmetic` stutter,
+// and so the caller never has to name the workspace layout.
+pub use verif_arithmetic as arith;
 
 /// The names you almost always want: the prover entry points, the symbolic
 /// constructors, and the verification macros.
 pub mod prelude {
     pub use crate::contract::{Contract, ContractError};
-    pub use crate::discharge_arithmetic::prove::{self as arithmetic_proofs, Verdict as ProofVerdict};
+    pub use crate::arith::prove::{self as arithmetic_proofs, Verdict as ProofVerdict};
     pub use crate::exhaustive::{
         find_violation_u8, find_violation_u8_2, for_all_u8, for_all_u8_2, for_all_u16,
     };

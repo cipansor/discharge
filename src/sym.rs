@@ -4,10 +4,10 @@
 //! specification reads like the code it describes:
 //!
 //! ```
-//! use discharge::prelude::*;
-//! use discharge::sym::*;
+//! use verif::prelude::*;
+//! use verif::sym::*;
 //!
-//! discharge::smt::with_fresh(|| {
+//! verif::smt::with_fresh(|| {
 //!     let x = var(32);
 //!     let y = var(32);
 //!     // ∀ x y. x + y == y + x

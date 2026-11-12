@@ -199,7 +199,7 @@ fn main() {
     let tally = tally_identities(&cases, "leandiff");
     let proved_by_engine = cases.iter().filter(|c| c.ours.is_proved()).count();
 
-    let dir: PathBuf = std::env::temp_dir().join("discharge_leandiff");
+    let dir: PathBuf = std::env::temp_dir().join("verif_leandiff");
     let _ = fs::remove_dir_all(&dir);
     let (path, by_line) = match write_file(&dir, &cases) {
         Ok(v) => v,

@@ -35,8 +35,12 @@
 //! * **`core` is not modelled.** *Closed for the `num` intrinsics.*
 //!   `checked_*`, `saturating_*`, `wrapping_*` and `overflowing_*` are computed
 //!   in the frontend from their operands rather than by reading `core`'s MIR.
-//!   So are the unary operators — `neg` and `abs` in all four families — and the
-//!   three bit counts `count_ones`, `leading_zeros` and `trailing_zeros`.
+//!   So are the unary operators — `neg` and `abs` in all four families — the
+//!   six bit counts (`count_ones`, `count_zeros`, `leading_zeros`,
+//!   `leading_ones`, `trailing_zeros` and `trailing_ones`), the `bool`
+//!   predicate `is_power_of_two`, and the mixed-signedness additions
+//!   (`wrapping_add_signed`, `saturating_add_signed`, `checked_add_signed`,
+//!   `overflowing_add_signed` and their `_unsigned` counterparts).
 //!   Division is the one narrowing: only `checked_div`/`checked_rem` are
 //!   modelled, because every other family — `overflowing_*` included — panics on
 //!   a zero divisor and hiding that panic is not something a proof may do. A
@@ -494,6 +498,38 @@ pub fn saturating_drop(a: u8, b: u8) -> u8 {
 /// ensures: ret <= 225
 pub fn wrapped_product(a: u8) -> u8 {
     a.wrapping_mul(15)
+}
+
+/// A `u16` `saturating_mul`, which the widened product now reaches.
+///
+/// This width used to be refused outright: the model's product test widened the
+/// operands to `2w`, and past `2w == 16` that multiplier was the scaling wall, so
+/// every `u16` `saturating_mul`/`checked_mul` reported "past what the model
+/// covers" and no contract over one could be settled. The bound is 16 now, and
+/// the guard below is the shape the model's own predicate has, so the obligation
+/// settles by cancellation rather than by blasting the `2w` multiplier.
+///
+/// The guard is deliberately *tight*: `100 * 100` is `10000`, far below the
+/// `u16` `MAX`, and `a <= 100 && b <= 100` is the reason. A guard that permitted
+/// a product above `65535` would make this fail, which is what the tripwire
+/// below pins.
+/// requires: a <= 100 && b <= 100
+/// ensures: ret == a * b
+pub fn u16_product_guarded(a: u16, b: u16) -> u16 {
+    a.saturating_mul(b)
+}
+
+/// The tripwire for the fixture above: the same body under a guard that does
+/// **not** rule out overflow, so the postcondition must fail.
+///
+/// `50000 * 50000` is `2_500_000_000`, which does not fit a `u16`, and the
+/// saturating product clamps to `65535` rather than wrapping — so `ret == a * b`
+/// is false there. `tests/mir.rs` requires the failure; a frontend that verified
+/// this would be proving the wrong thing.
+/// requires: a <= 50000 && b <= 50000
+/// ensures: ret == a * b
+pub fn u16_product_unguarded_tripwire(a: u16, b: u16) -> u16 {
+    a.saturating_mul(b)
 }
 
 /// A comparison through `core::cmp::Ord` rather than the builtin operator.
@@ -3188,6 +3224,419 @@ pub fn trailing_zeros_of_a_top_bit_value(x: u8) -> u32 {
 /// ensures: ret <= 6
 pub fn trailing_zeros_of_a_top_bit_value_tripwire(x: u8) -> u32 {
     x.trailing_zeros()
+}
+
+/// `count_zeros` counts the clear bits, so a `u8` of zero has all eight of them.
+/// This is the exactness pin: a model that summed the *set* bits (the polarity
+/// confusion) would answer `0` here and fail, and one that stopped at seven
+/// would fail too.
+/// requires: x == 0
+/// ensures: ret == 8
+pub fn count_zeros_of_zero_is_the_width(x: u8) -> u32 {
+    x.count_zeros()
+}
+
+/// The tripwire: `count_zeros` is not identically zero. `x == 0` has eight clear
+/// bits, so a bound of zero is false -- and a stub that returned a constant `0`
+/// would *prove* this false contract, which is what makes it the pin that the
+/// count is read rather than assumed.
+/// requires: true
+/// ensures: ret == 0
+pub fn count_zeros_of_zero_is_the_width_tripwire(x: u8) -> u32 {
+    x.count_zeros()
+}
+
+/// `leading_ones` counts the set bits above the highest clear bit, so a value
+/// with the top bit set has at least one -- and the count is on the widened
+/// `u32` result.
+/// requires: x >= 128
+/// ensures: ret >= 1
+pub fn leading_ones_of_a_top_bit_value(x: u8) -> u32 {
+    x.leading_ones()
+}
+
+/// The tripwire: `x == 0xff` has eight leading ones, so a bound of nine is false
+/// even though it looks safe for every operand with the top bit set.
+/// requires: x >= 128
+/// ensures: ret >= 9
+pub fn leading_ones_of_a_top_bit_value_tripwire(x: u8) -> u32 {
+    x.leading_ones()
+}
+
+/// `trailing_ones` counts the set bits below the lowest clear bit, so a value
+/// below `0x80` has at most seven of them.
+/// requires: x < 128
+/// ensures: ret <= 7
+pub fn trailing_ones_of_a_small_value(x: u8) -> u32 {
+    x.trailing_ones()
+}
+
+/// The tripwire: `x == 0x7f` has exactly seven trailing ones, so a bound of six
+/// is false -- and the witness is the largest operand the precondition allows.
+/// requires: x < 128
+/// ensures: ret <= 6
+pub fn trailing_ones_of_a_small_value_tripwire(x: u8) -> u32 {
+    x.trailing_ones()
+}
+
+/// `is_power_of_two` is true for the top bit of a `u8`, so the postcondition
+/// holds for `x == 128`. This is the channel pin: the result is a `bool` the
+/// `if` branches on, and a model that wrote a one-bit *word* into the local
+/// would leave it unreadable as a predicate, so this would fail rather than pass.
+/// requires: x == 128
+/// ensures: ret == true
+pub fn is_power_of_two_of_the_top_bit(x: u8) -> bool {
+    x.is_power_of_two()
+}
+
+/// The tripwire: `x == 0` is the one value the bare `x & (x - 1) == 0` mask test
+/// would accept, so a model that dropped the `x != 0` conjunct would *prove* this
+/// false contract. It is false because zero is not a power of two.
+/// requires: x == 0
+/// ensures: ret == true
+pub fn is_power_of_two_of_zero_tripwire(x: u8) -> bool {
+    x.is_power_of_two()
+}
+
+/// The complement pin, and the one the zero tripwire cannot make: three has two
+/// bits set, so the mask test has to be applied at all. A model that answered
+/// "non-zero means a power of two" would *refute* this true contract, where `0`
+/// only catches the opposite mistake -- a missing mask wrongly accepting zero.
+/// requires: x == 3
+/// ensures: ret == false
+pub fn is_power_of_two_of_three(x: u8) -> bool {
+    x.is_power_of_two()
+}
+
+/// The predicate is *consumed by a branch*, not only read in a postcondition.
+///
+/// Every other `is_power_of_two` fixture returns the predicate directly, so the
+/// `bool` reaches the return place and the obligation reads it there. Here it is
+/// the `switchInt`'s discriminant, so a model that produced a `Pred` the
+/// executor could not branch on -- or a `Val::Bool` the `if` could not read --
+/// would leave the path unknown rather than take the right arm. The two arms
+/// return different constants, so the postcondition fixes which arm was taken.
+/// requires: x == 128
+/// ensures: ret == 7
+pub fn is_power_of_two_branching_takes_the_true_arm(x: u8) -> u8 {
+    if x.is_power_of_two() {
+        7
+    } else {
+        9
+    }
+}
+
+/// The other arm of the same branch: `3` is not a power of two, so the `else`
+/// runs and the postcondition is `9`. Together with the pin above it fixes both
+/// arms, which a model that took a constant arm could not do.
+/// requires: x == 3
+/// ensures: ret == 9
+pub fn is_power_of_two_branching_takes_the_false_arm(x: u8) -> u8 {
+    if x.is_power_of_two() {
+        7
+    } else {
+        9
+    }
+}
+
+/// The branching tripwire: `0` is not a power of two, so the `else` arm runs and
+/// the result is `9`. A model that dropped the `x != 0` conjunct would take the
+/// `then` arm and *prove* this false `ret == 7` -- so the branch, not just the
+/// predicate, is what this pins.
+/// requires: x == 0
+/// ensures: ret == 7
+pub fn is_power_of_two_branching_of_zero_tripwire(x: u8) -> u8 {
+    if x.is_power_of_two() {
+        7
+    } else {
+        9
+    }
+}
+
+/// `wrapping_add_signed` adds a signed addend to an unsigned self, and the result
+/// is the plain wrapped sum: `0u8 + (-1i8)` is `255`. This is the *value* pin --
+/// a model that refused the mixed shape, or read the addend as unsigned, would
+/// not produce `255`.
+/// requires: x == 0
+/// requires: r == -1
+/// ensures: ret == 255
+pub fn wrapping_add_signed_of_a_negative(x: u8, r: i8) -> u8 {
+    x.wrapping_add_signed(r)
+}
+
+/// `saturating_add_signed` clamps at the *addend's* end, not the self type's: an
+/// unsigned self with a negative addend that borrows below zero clamps to `0`,
+/// where the ordinary unsigned `saturating_add` would wrap instead. The
+/// postcondition is the clamp value, so a model that forgot the clamp -- or took
+/// the addend as unsigned -- would not produce `0`.
+/// requires: x == 0
+/// requires: r == -1
+/// ensures: ret == 0
+pub fn saturating_add_signed_clamps_to_zero(x: u8, r: i8) -> u8 {
+    x.saturating_add_signed(r)
+}
+
+/// The flag of a mixed-signedness addition, where the *mathematical* result runs
+/// off the bottom: `0u8 + (-1i8)` is `-1`, which `u8` cannot hold, so the flag is
+/// `true` and the value is the wrapped `255`. The flag is set by the *addend's
+/// sign* here, not by the carry: the addition reads `-1i8` as `255u8`, and
+/// `0u8 + 255u8` is `255` with no carry at all, so `carry ^ (addend < 0)` is
+/// `false ^ true`. That is what makes the pin below, where the carry *does* fire
+/// and the flag is nevertheless *clear*, the one that separates this model from
+/// the naive one.
+/// requires: x == 0
+/// requires: r == -1
+/// ensures: ret == true
+pub fn overflowing_add_signed_below_zero_is_overflow(x: u8, r: i8) -> bool {
+    x.overflowing_add_signed(r).1
+}
+
+/// The pin the carry alone cannot make: `250u8 + (-1i8)` is `249`, which `u8`
+/// holds, so the flag is `false` -- even though the addition *carries*, because
+/// the addend reads as `255u8` and `250 + 255` wraps to `249`. A model that took
+/// the bare top-bit carry as the flag would report `true` here and *refute* this
+/// true contract; the addend's sign is what cancels that carry.
+/// requires: x == 250
+/// requires: r == -1
+/// ensures: ret == false
+pub fn overflowing_add_signed_within_range_is_not_overflow(x: u8, r: i8) -> bool {
+    x.overflowing_add_signed(r).1
+}
+
+/// The flag from the other side: `250u8 + 10i8` is `260`, past `u8::MAX`, so the
+/// flag is `true`. Together with the pin above it fixes the flag in both
+/// directions, which is what a model that returned a constant could not do.
+/// requires: x == 250
+/// requires: r == 10
+/// ensures: ret == true
+pub fn overflowing_add_signed_past_the_top_tripwire(x: u8, r: i8) -> bool {
+    x.overflowing_add_signed(r).1
+}
+
+/// The `_unsigned` direction, where the self operand is signed: `0i8 + 128u8` is
+/// `-128`, the value `wrapping_add_unsigned` produces by reinterpreting the
+/// addend. A model that read the addend as signed (`128u8` as `i8` is `-128`)
+/// would compute `0 + -128` and agree here by accident, so the pin below is the
+/// one that separates the two readings.
+/// requires: x == 0
+/// requires: r == 128
+/// ensures: ret == -128
+pub fn wrapping_add_unsigned_of_the_top_bit(x: i8, r: u8) -> i8 {
+    x.wrapping_add_unsigned(r)
+}
+
+/// `saturating_add_unsigned` on a signed self clamps to the *signed* maximum
+/// `127`, because the addend is unsigned and can only run off the top. `0i8 +
+/// 128u8` overflows and clamps to `127`. A model that took the unsigned maximum
+/// would return `255`, which reads back as `-1`.
+/// requires: x == 0
+/// requires: r == 128
+/// ensures: ret == 127
+pub fn saturating_add_unsigned_clamps_to_signed_max(x: i8, r: u8) -> i8 {
+    x.saturating_add_unsigned(r)
+}
+
+/// The tripwire that separates the two readings of the addend: `1i8 + 128u8` is
+/// `129`, past `i8::MAX`, so it clamps to `127`. Reading the addend as signed
+/// gives `1 + (-128)` = `-127`, which is in range and would *refute* this true
+/// contract -- so a model that got the addend's signedness wrong is caught here
+/// and not by the `x == 0` pin, where both readings agree on `-128`.
+/// requires: x == 1
+/// requires: r == 128
+/// ensures: ret == 127
+pub fn saturating_add_unsigned_top_bit_tripwire(x: i8, r: u8) -> i8 {
+    x.saturating_add_unsigned(r)
+}
+
+/// `checked_add_signed` in range: `250u8 + (-1i8)` is `249`, which `u8` holds, so
+/// the `Some` arm runs and the value is the plain sum. This is the `Some`-value
+/// pin the tripwires below need: without it a model that returned the `None` arm
+/// everywhere would still pass a false contract that happened to name the arm's
+/// constant.
+/// requires: x == 250
+/// requires: r == -1
+/// ensures: ret == 249
+pub fn checked_add_signed_in_range_is_the_sum(x: u8, r: i8) -> u8 {
+    match x.checked_add_signed(r) {
+        Some(v) => v,
+        None => 0,
+    }
+}
+
+/// `checked_add_unsigned` in range: `1i8 + 1u8` is `2`, so the `Some` arm runs.
+/// The `_unsigned` direction's `Some` value, which the false tripwire below is
+/// the complement of.
+/// requires: x == 1
+/// requires: r == 1
+/// ensures: ret == 2
+pub fn checked_add_unsigned_in_range_is_the_sum(x: i8, r: u8) -> i8 {
+    match x.checked_add_unsigned(r) {
+        Some(v) => v,
+        None => 1,
+    }
+}
+
+/// `overflowing_add_unsigned` in range: `1i8 + 1u8` is `2`, in range, so the flag
+/// is `false`. The `_unsigned` flag's clear direction, which the signed self's
+/// carry alone would report as `true` (the addend's non-negative sign does not
+/// cancel it).
+/// requires: x == 1
+/// requires: r == 1
+/// ensures: ret == false
+pub fn overflowing_add_unsigned_within_range_is_not_overflow(x: i8, r: u8) -> bool {
+    x.overflowing_add_unsigned(r).1
+}
+
+/// `overflowing_add_unsigned` off the top: `0i8 + 128u8` is `-128`, past `i8`, so
+/// the flag is `true`. Here the carry alone reports the overflow correctly, so
+/// this pin alone does not separate the two flag models -- the in-range pin above
+/// is the one that does.
+/// requires: x == 0
+/// requires: r == 128
+/// ensures: ret == true
+pub fn overflowing_add_unsigned_past_the_top_is_overflow(x: i8, r: u8) -> bool {
+    x.overflowing_add_unsigned(r).1
+}
+
+// The failing tripwires. Each is a *false* contract on a mixed-add shape with a
+// concrete witness, so the corpus carries the negative direction the standing
+// rule requires: a model that proves one of these cannot pass the suite. They are
+// kept beside the true pins so the two readings of every shape are pinned at once.
+
+/// The `wrapping` value tripwire: `250u8 + (-1i8)` is `249`, so `ret == 250` is
+/// false. The witness is `x == 250, r == -1`.
+/// requires: x == 250
+/// requires: r == -1
+/// ensures: ret == 250
+pub fn wrapping_add_signed_wrong_value_tripwire(x: u8, r: i8) -> u8 {
+    x.wrapping_add_signed(r)
+}
+
+/// The `saturating` clamp tripwire: `0u8 + (-1i8)` borrows below zero and clamps
+/// to `0`, so `ret == 1` is false. A model that forgot the clamp would wrap to
+/// `255` and also fail this, but a model that clamps to the wrong end would pass
+/// the true pin and fail here.
+/// requires: x == 0
+/// requires: r == -1
+/// ensures: ret == 1
+pub fn saturating_add_signed_wrong_value_tripwire(x: u8, r: i8) -> u8 {
+    x.saturating_add_signed(r)
+}
+
+/// The `overflowing` flag tripwire, in the direction the carry alone gets wrong:
+/// `250u8 + (-1i8)` is `249`, in range, so the flag is `false` and `ret == true`
+/// is false. This is the false contract the *bare-carry* model would prove, since
+/// that model reports the carry (which fires here) as the flag.
+/// requires: x == 250
+/// requires: r == -1
+/// ensures: ret == true
+pub fn overflowing_add_signed_wrong_flag_tripwire(x: u8, r: i8) -> bool {
+    x.overflowing_add_signed(r).1
+}
+
+/// The `checked` `None` tripwire: `250u8 + 10i8` is `260`, past `u8::MAX`, so the
+/// result is `None` and the match takes the `None` arm returning `0`. Claiming
+/// `ret == 255` -- the wrapped value -- is false, and it is the false contract a
+/// model that treated `checked` as `wrapping` would prove.
+/// requires: x == 250
+/// requires: r == 10
+/// ensures: ret == 255
+pub fn checked_add_signed_none_tripwire(x: u8, r: i8) -> u8 {
+    match x.checked_add_signed(r) {
+        Some(v) => v,
+        None => 0,
+    }
+}
+
+/// The `wrapping` `_unsigned` value tripwire: `0i8 + 128u8` is `-128`, so
+/// `ret == 127` is false -- it is the *saturating* answer, which pins that the
+/// two families are not the same shape.
+/// requires: x == 0
+/// requires: r == 128
+/// ensures: ret == 127
+pub fn wrapping_add_unsigned_wrong_value_tripwire(x: i8, r: u8) -> i8 {
+    x.wrapping_add_unsigned(r)
+}
+
+/// The `saturating` `_unsigned` value tripwire, the mirror of the pin above:
+/// `0i8 + 128u8` clamps to `127`, so `ret == -128` -- the *wrapping* answer -- is
+/// false. A model that clamped to the unsigned maximum (`255`, read back as `-1`)
+/// or that wrapped would fail the true pin and pass this one.
+/// requires: x == 0
+/// requires: r == 128
+/// ensures: ret == -128
+pub fn saturating_add_unsigned_wrong_value_tripwire(x: i8, r: u8) -> i8 {
+    x.saturating_add_unsigned(r)
+}
+
+/// The `overflowing` `_unsigned` flag tripwire: `1i8 + 1u8` is `2`, in range, so
+/// the flag is `false` and `ret == true` is false. This is the direction the
+/// signed carry gets wrong, because `1i8 + 1u8` read as a signed addition is
+/// `1 + 1`, no overflow -- and read at the addend's sign it is still clear -- so
+/// a model that used either the bare carry or the self sign proves this.
+/// requires: x == 1
+/// requires: r == 1
+/// ensures: ret == true
+pub fn overflowing_add_unsigned_wrong_flag_tripwire(x: i8, r: u8) -> bool {
+    x.overflowing_add_unsigned(r).1
+}
+
+/// The `checked` `_unsigned` tripwire: `1i8 + 1u8` is `2`, so the `Some` arm runs
+/// and `ret == 0` is false. Together with `checked_add_unsigned_in_range_is_the_sum`
+/// it pins both the value and the arm.
+/// requires: x == 1
+/// requires: r == 1
+/// ensures: ret == 0
+pub fn checked_add_unsigned_wrong_value_tripwire(x: i8, r: u8) -> i8 {
+    match x.checked_add_unsigned(r) {
+        Some(v) => v,
+        None => 1,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A *local* method that shares an intrinsic's name must be answered by its own
+// body, never by the `core` model.
+//
+// rustc prints a trait impl's *call* as `<u8 as Trait>::is_power_of_two` but its
+// *definition* as `<impl at FILE:L:C: L:C>::is_power_of_two`. The names never
+// match, so the intrinsic model -- which classifies on the suffix -- used to
+// answer the call before same-dump resolution could find the body. A trait that
+// disagrees with `core` then had a *false* proof: `trait_is_power_of_two_
+// disagrees_with_core` returns `false` at `x == 1` but the model answered `true`
+// and proved `ret == true`. The two fixtures below are the two directions -- the
+// true contract that must verify (the body really does return `false` there) and
+// the false one the model used to prove.
+// ---------------------------------------------------------------------------
+
+/// A trait method named like a `core` intrinsic, whose implementation *disagrees*
+/// with `core`: it is `false` even where `core`'s predicate is `true`.
+pub trait NotPowerOfTwo {
+    fn is_power_of_two(self) -> bool;
+}
+
+impl NotPowerOfTwo for u8 {
+    fn is_power_of_two(self) -> bool {
+        false
+    }
+}
+
+/// `1u8` *is* a power of two under `core`, but the trait above says otherwise, so
+/// the call must read the trait body and the result is `false`. A model that
+/// answered from `core`'s predicate would *refute* this true contract.
+/// requires: x == 1
+/// ensures: ret == false
+pub fn trait_is_power_of_two_disagrees_with_core(x: u8) -> bool {
+    NotPowerOfTwo::is_power_of_two(x)
+}
+
+/// The false direction: the same call claims `core`'s answer, which the trait body
+/// does not produce, so it must be refuted. This is exactly the contract the
+/// suffix-classification bug *proved*.
+/// requires: x == 1
+/// ensures: ret == true
+pub fn trait_is_power_of_two_disagrees_with_core_tripwire(x: u8) -> bool {
+    NotPowerOfTwo::is_power_of_two(x)
 }
 
 /// `saturating_neg` of a positive value is negative: the negation is in range, so
@@ -6581,11 +7030,97 @@ const WIDE_LIMIT: u16 = 1000;
 /// value, so `const NEXT: u8 = const 11_u8;`.
 const NEXT: u8 = LIMIT + 1;
 
+/// A constant expression at a wider type, whose folded value must keep that width.
+const BIG: u16 = 200 + 100;
+
 /// A negative constant, whose sign must survive inlining.
 const NEG: i8 = -1;
 
 /// A boolean constant.
 const ENABLED: bool = true;
+
+/// An *unused* 128-bit expression constant.
+///
+/// The parser walks every `const` definition when it loads a dump, including ones
+/// no selected target names, and rustc prints an expression-bodied `i128` as an
+/// `AddWithOverflow` at width 128. The folder's exact overflow test negates
+/// `1i128 << 127` -- `i128::MIN` -- which panics in a debug build, at parse time,
+/// for this item alone. The width is refused instead, so parsing this file reaches
+/// the verdicts for the functions below.
+const HUGE: i128 = 1 + 2;
+
+/// A small function in a file that also declares [`HUGE`], so the parse of the
+/// unused 128-bit item cannot take the process down before this contract decides.
+/// requires: true
+/// ensures: ret == 7
+pub fn a_file_with_an_unused_i128_const_still_verifies(x: u8) -> u8 {
+    let _ = x;
+    7
+}
+
+/// A signed comparison, whose operands keep their own type while the destination
+/// is `bool`.
+///
+/// rustc prints this as `_0 = Lt(const -1_i8, const 0_i8)`: a `bool` return place
+/// assigned from `i8` operands. Reading the width and sign off the `bool`
+/// destination compares the `-1i8` pattern, 255, as unsigned and folds the
+/// comparison to *false* -- the wrong value, which a contract claiming the false
+/// direction would then *prove*. The operands' own type decides it instead.
+const LESS: bool = -1i8 < 0i8;
+
+/// An unsigned comparison at a width of its own, the control for [`LESS`].
+const BIGGER: bool = 200u8 > 100u8;
+
+/// A signed comparison folded in a *constant* is read at its operands' type.
+/// requires: true
+/// ensures: ret == true
+pub fn a_signed_comparison_const_is_read() -> bool {
+    LESS
+}
+
+/// The false direction of [`a_signed_comparison_const_is_read`]: folding `LESS` at
+/// the `bool` destination would read the operands as unsigned and prove this. It
+/// must not verify.
+/// requires: true
+/// ensures: ret == false
+pub fn a_signed_comparison_const_is_read_cannot_prove_this() -> bool {
+    LESS
+}
+
+/// The control for [`a_signed_comparison_const_is_read`], at an unsigned type where
+/// the destination reading happens to agree.
+/// requires: true
+/// ensures: ret == true
+pub fn an_unsigned_comparison_const_is_read() -> bool {
+    BIGGER
+}
+
+/// A constant that names one the dump prints *after* it.
+///
+/// Rust keeps source declaration order in the dump, so `FWD_NEXT`'s body is printed
+/// before `FWD_LIMIT`'s literal. A single in-order pass would fold `FWD_NEXT` while
+/// `FWD_LIMIT` is still unresolved, leaving the item unmodelled and its contracts
+/// undecided; the fold runs to a fixpoint so the later literal is seen.
+const FWD_NEXT: u8 = FWD_LIMIT + 1;
+
+/// The forward-referenced limit, declared after its user.
+const FWD_LIMIT: u8 = 10;
+
+/// A forward-referenced constant resolves.
+/// requires: true
+/// ensures: ret == 11
+pub fn a_forward_referenced_const_is_read() -> u8 {
+    FWD_NEXT
+}
+
+/// The false direction of [`a_forward_referenced_const_is_read`]: leaving the
+/// forward reference unmodelled would skip rather than prove, but a *guessed* value
+/// would prove this. It must not verify.
+/// requires: true
+/// ensures: ret == 12
+pub fn a_forward_referenced_const_is_read_cannot_prove_this() -> u8 {
+    FWD_NEXT
+}
 
 /// Reading a named constant decides.
 /// requires: true
@@ -6652,19 +7187,41 @@ pub fn named_const_matches_an_equality_cannot_prove_this(x: u8) -> u8 {
     }
 }
 
-/// A constant whose definition is an *expression* rather than a literal is not
-/// inlined: rustc prints it with its own body and locals (`const NEXT: u8 = {
-/// let mut _0: u8; ... }`), so the use site stays an unreadable path constant and
-/// the contract is not decided. This is a coverage boundary, not a wrong proof --
-/// the value is simply absent, so nothing is proved either way. Inlining it would
-/// mean interpreting the item's body, which the executor already knows how to do
-/// for a function; that is future work, and this entry is the pin that says the
-/// boundary is where it is.
+/// A constant whose definition is an *expression* rather than a literal is
+/// inlined by interpreting its body: rustc prints it with its own locals and
+/// basic blocks (`const NEXT: u8 = { let mut _0: u8; ... }`), and the folder walks
+/// those blocks concretely -- every operand is a literal, so the checked add
+/// folds and the body's own `assert(!overflow)` is checked. The use site
+/// (`_0 = const NEXT`) then folds to the value, and the contract decides.
+///
+/// This was the crate's own named future-work item: before the folder the item
+/// stayed an unreadable path constant and this was `Incomplete` (a coverage
+/// boundary, never a wrong proof).
 /// requires: true
 /// ensures: ret == 11
-pub fn named_const_of_an_expression_is_not_inlined(x: u8) -> u8 {
+pub fn named_const_of_an_expression_is_inlined(x: u8) -> u8 {
     let _ = x;
     NEXT
+}
+
+/// The false direction of [`named_const_of_an_expression_is_inlined`]: a *guessed*
+/// or mis-folded value would prove this. `NEXT` is `LIMIT + 1 == 11`, so `10` is
+/// the wrong value and the contract must refute rather than pass.
+/// requires: true
+/// ensures: ret == 10
+pub fn named_const_of_an_expression_is_inlined_cannot_prove_this(x: u8) -> u8 {
+    let _ = x;
+    NEXT
+}
+
+/// A folded expression keeps the item's own width. `BIG` is `200 + 100 == 300` at
+/// `u16`; a folder that dropped to a byte would truncate it to `44` and the
+/// contract would not decide. Same tell as [`named_const_keeps_its_width`], but
+/// through the folder rather than a printed literal.
+/// requires: true
+/// ensures: ret == 300
+pub fn an_expression_const_keeps_its_width() -> u16 {
+    BIG
 }
 
 /// A constant wider than a byte keeps its own width.
@@ -6757,23 +7314,24 @@ pub fn nested_module_const_is_read_cannot_prove_this() -> u8 {
     low::K
 }
 
-/// A `const` declared *inside* a function body is not inlined, because the two
-/// spellings do not meet: the *use* is printed with the enclosing function's path
-/// (`const a_function_local_const_is_not_inlined::L`) while the *definition* is
-/// printed bare (`const L: u8 = const 3_u8;`). It stays an unreadable path
-/// constant, a coverage boundary rather than a wrong proof, since no value is read
-/// at all.
+/// A `const` declared *inside* a function body is now inlined for its owner: the
+/// *use* is printed with the enclosing function's path (`const
+/// a_function_local_const_is_inlined::L`) while the *definition* is printed bare
+/// (`const L: u8 = const 3_u8;`), and the two spellings now meet -- the definition
+/// is recorded under the qualified path the use names. The contract then reads the
+/// value and decides; before, it stayed an unreadable path constant (a coverage
+/// boundary, never a wrong proof).
 ///
 /// The bare definition is *also* why a function-local item must not become a
 /// program-wide key: a crate-level `const` gets the same bare definition, so the
 /// definition alone cannot tell the two apart. Only the use site can -- a crate
 /// item is used bare (`const L`), a local one qualified (`const f::L`) -- which is
-/// what [`bare_const_uses`] reads. See
-/// [`a_local_const_is_not_in_scope_in_another_function`] for the false proof a bare
-/// key would reopen.
+/// what [`bare_const_uses`] reads. So the value is keyed by the *qualified* path,
+/// and [`a_local_const_is_not_in_scope_in_another_function`] still holds the bare
+/// key out.
 /// requires: true
 /// ensures: ret == 3
-pub fn a_function_local_const_is_not_inlined() -> u8 {
+pub fn a_function_local_const_is_inlined() -> u8 {
     const L: u8 = 3;
     L
 }
@@ -6886,10 +7444,10 @@ pub fn a_contract_names_a_qualified_const_cannot_prove_this(x: u8) -> u8 {
     }
 }
 
-/// A constant whose definition is an *expression* is refused when a contract
-/// names it, rather than guessed at: its value lives in its own body, which the
-/// contract reader does not fold. The refusal is a skip, so nothing is proved --
-/// which is the honest answer, not a wrong proof.
+/// A constant whose definition is an *expression* now resolves in a *contract*
+/// too: the item is folded once, into the program's const table, and both the
+/// body's use site and the contract reader resolve the same value. The
+/// postcondition is `ret <= NEXT`, and the body returns exactly `NEXT`.
 /// requires: x <= NEXT
 /// ensures: ret <= NEXT
 pub fn a_contract_names_an_expression_const(x: u8) -> u8 {
@@ -7203,4 +7761,552 @@ impl TaggedRight {
     pub fn tag_cannot_prove_this() -> u8 {
         2
     }
+}
+
+/// `Ord::min`/`Ord::max` are *trait* methods, so the dump spells a call `<u8 as
+/// Ord>::min` -- the trait itself, with no `core::num::<impl …>` inherent path.
+/// They are modelled anyway: the model is one ite whose ordering predicate is
+/// chosen by the operand's sign, so both signednesses are covered.
+///
+/// The model is consulted only as a *fallback*. A trait call and a local trait
+/// method's call can spell the same name, so the executor resolves a same-dump
+/// body first and reaches the model only when none claims the name -- the same
+/// rule the intrinsic model follows, and the reason a local `Ord` below is
+/// answered by its body rather than by `core`'s ordering.
+/// requires: x <= 100
+/// requires: y <= 100
+/// ensures: ret <= 100
+pub fn ord_min_is_at_most_both(x: u8, y: u8) -> u8 {
+    x.min(y)
+}
+
+/// `max` is at least both operands, so it is at least `x`; a model that swapped
+/// the two would return `min` and refute this.
+/// requires: true
+/// ensures: ret >= x
+pub fn ord_max_is_at_least_x(x: i8, y: i8) -> i8 {
+    x.max(y)
+}
+
+/// The signed ordering is not the unsigned one. `i8::MIN`'s bits (`0x80`) are the
+/// largest *unsigned* byte, so a model that used `ule` would return `1` here; as a
+/// signed value `MIN` is below `1`, so the signed model returns `MIN`. The
+/// precondition pins the operand to the one value where the two orderings differ.
+/// requires: x == i8::MIN
+/// ensures: ret == i8::MIN
+pub fn ord_min_of_min_and_one_is_min(x: i8) -> i8 {
+    x.min(1)
+}
+
+/// The explicit `Ord::min` spelling reaches the same model as the method form.
+/// requires: x <= 100
+/// requires: y <= 100
+/// ensures: ret <= 100
+pub fn explicit_ord_min_is_modelled(x: u8, y: u8) -> u8 {
+    std::cmp::Ord::min(x, y)
+}
+
+/// The false direction: `min(x, y) == x` holds only when `x <= y`, so with no
+/// precondition it must be refuted. A model that always returned `x` -- or that
+/// treated `min` as the identity -- would prove it.
+/// requires: true
+/// ensures: ret == x
+pub fn ord_min_is_x_tripwire(x: u8, y: u8) -> u8 {
+    x.min(y)
+}
+
+/// A local trait whose method shares `Ord`'s `min` name. Its `min` returns a
+/// constant, so a call to it must be answered by *this body* and never by `core`'s
+/// ordering. The trait lives in a module, which is what rustc does for a trait
+/// outside the prelude's position -- the dump spells the call
+/// `<u8 as ord_shim::Ord>::min`, a trait segment (`ord_shim::Ord`) that is not
+/// `Ord`, so `classify` refuses it outright *and* the same-dump lookup finds the
+/// body first.
+pub mod ord_shim {
+    pub trait Ord {
+        fn min(self, other: Self) -> Self;
+    }
+    impl Ord for u8 {
+        fn min(self, _other: u8) -> u8 {
+            99
+        }
+    }
+}
+
+/// The body returns `99`, so this verifies only if the local trait's body is what
+/// answers the call. If the model answered instead it would return `min(x, y)`,
+/// which is `99` only when one operand is `99`, so the postcondition would be
+/// false.
+/// requires: true
+/// ensures: ret == 99
+pub fn local_ord_min_is_answered_by_its_body(x: u8, y: u8) -> u8 {
+    ord_shim::Ord::min(x, y)
+}
+
+/// The false direction on the same call: the *model's* answer (`min(100, 200) ==
+/// 100`) is what this claims, and the body returns `99`, so it must be refuted. A
+/// model that answered the call would return `100` and *prove* it -- this is the
+/// tripwire for that mistake.
+/// requires: x == 100
+/// requires: y == 200
+/// ensures: ret == 100
+pub fn local_ord_min_is_not_the_model_tripwire(x: u8, y: u8) -> u8 {
+    ord_shim::Ord::min(x, y)
+}
+
+/// A local trait whose *name* collides with a modelled conversion's, and whose
+/// owner type does too.
+///
+/// This is the collision the trait check in `resolve_callee` exists for, and it is
+/// sharper than `ord_shim`'s: `ord_shim::Ord` is refused by `classify` because the
+/// dump spells its call `<u8 as ord_shim::Ord>::min`, a trait segment the model
+/// does not know. Here the local trait is written `From` and lives in a module, so
+/// its own call is `<u16 as conv_shim::From>::from` -- still refused by the model.
+/// The hazard is the *other* direction: the standard library's `From<u8> for u16`
+/// shares the tail (`from`) *and* the owner (`u16`), so owner-matching alone let
+/// this body answer `<u16 as std::convert::From<u8>>::from`, a false proof of a
+/// call the compiler resolved to the library. The trait check separates them: the
+/// library call's path is not a suffix of this impl's bare `conv_shim::From`.
+pub mod conv_shim {
+    pub trait From<T> {
+        fn from(t: T) -> Self;
+    }
+    impl From<u8> for u16 {
+        fn from(_t: u8) -> u16 {
+            7
+        }
+    }
+}
+
+/// The false direction, and the tripwire for the collision above: the call is
+/// spelled with the *standard library's* trait path, so the compiler resolved it
+/// to `core`'s widening, which returns `x` -- not this module's `7`. The contract
+/// claims the local body's answer, so it must be refuted. Owner-matching alone
+/// answered the call from the local body, returned `7`, and *proved* it.
+/// requires: true
+/// ensures: ret == 7
+pub fn local_from_does_not_answer_the_std_trait(x: u8) -> u16 {
+    <u16 as std::convert::From<u8>>::from(x)
+}
+
+/// The local trait's *own* call, answered by its own body.
+///
+/// The positive counterpart: this is what must keep working once the trait check
+/// is in place. `conv_shim::From::from(x)` names the local trait, whose body
+/// returns `7`, so the claim verifies only from the body.
+/// requires: true
+/// ensures: ret == 7
+pub fn local_from_is_answered_by_its_own_body(x: u8) -> u16 {
+    conv_shim::From::from(x)
+}
+
+/// A widening conversion, `u16::from(u8)`, is a *trait* method too -- the dump
+/// spells `<u16 as From<u8>>::from` -- so like `Ord::min` it is modelled as a
+/// fallback behind the same-dump lookup. The value is the source widened by its own
+/// signedness, which for an unsigned source is a zero-fill. The contract spells the
+/// comparison at the destination width (`x as u16`) because a contract's two
+/// operands must share a width; the cast is the same widening the model performs.
+/// requires: true
+/// ensures: ret == x as u16
+pub fn from_u8_is_modelled(x: u8) -> u16 {
+    u16::from(x)
+}
+
+/// The `Into` direction of the same conversion reaches one model: `x.into()` on a
+/// `u8` is `<u8 as Into<u16>>::into`, whose destination is the type parameter.
+/// requires: true
+/// ensures: ret == x as u16
+pub fn into_u8_is_modelled(x: u8) -> u16 {
+    x.into()
+}
+
+/// A *signed* source widens by sign-extension, so `x` keeps its value across the
+/// width change -- and `i8::MIN` stays `i8::MIN`, which is what separates a
+/// sign-extension from a zero-fill. The contract compares at the destination width,
+/// as above.
+/// requires: x == i8::MIN
+/// ensures: ret == x as i16
+pub fn signed_widening_keeps_negative_values(x: i8) -> i16 {
+    i16::from(x)
+}
+
+/// The false direction: `-1i8` widens to `-1i16`, whose bits are `0xffff`, not
+/// `255`. A model that zero-filled a signed source -- the `truncate` mistake -- would
+/// return `255` and *prove* this, so it is the tripwire for that reading.
+/// requires: x == -1
+/// ensures: ret == 255
+pub fn signed_widening_is_not_zero_fill_tripwire(x: i8) -> i16 {
+    i16::from(x)
+}
+
+/// A widening that also *changes signedness*: `i16::from(u8)` zero-fills (the
+/// source is unsigned), so `255u8` stays `255` and never becomes `-1`, even though
+/// the destination is signed.
+/// requires: x == 255
+/// ensures: ret == 255
+pub fn unsigned_source_widens_to_signed_destination(x: u8) -> i16 {
+    i16::from(x)
+}
+
+
+// ---------------------------------------------------------------------------
+// Trait-identity soundness: a bare call name must not be answered by a
+// same-named trait's body, and a local impl of an *imported* library trait must
+// not be answered by the model. Each pair is a verifying half (the body must be
+// the one read) and a refuting half (the wrong answer must not be proved).
+// ---------------------------------------------------------------------------
+
+/// A crate-root trait with a *default* body, named like a modelled `core` trait.
+///
+/// rustc prints its call bare (`<u8 as Ord>::min`) and prints the default method's
+/// definition as `Ord::min` -- no `impl` block, so the same-dump lookup cannot
+/// match it by location. The body returns its first operand -- deliberately not
+/// `core`'s smaller operand -- so a call must read it and never `core`'s ordering.
+/// The bound is `Copy` (not `Sized`) so the unused operand needs no drop, and the
+/// impl is for `u16`, not `u8`, so the corpus's other `x.min(y)` calls on `u8`
+/// stay unambiguous.
+pub trait Ord: Copy {
+    fn min(self, _other: Self) -> Self {
+        self
+    }
+}
+
+impl Ord for u16 {}
+
+/// The default body returns its first operand (`x == 2` here), so this verifies
+/// only if the local trait's body answered. The model would return `min(x, y)`.
+/// requires: x == 2
+/// requires: y == 1
+/// ensures: ret == 2
+pub fn crate_root_ord_default_verifies_from_its_body(x: u16, y: u16) -> u16 {
+    <u16 as Ord>::min(x, y)
+}
+
+/// The false direction: `core`'s ordering returns `1` for `(2, 1)`, but the local
+/// trait's body returns `2`, so this must be refuted. A model that answered the
+/// bare call would *prove* it -- the false proof this pins.
+/// requires: x == 2
+/// requires: y == 1
+/// ensures: ret == 1
+pub fn crate_root_ord_default_is_not_the_model_tripwire(x: u16, y: u16) -> u16 {
+    <u16 as Ord>::min(x, y)
+}
+
+/// The crate-root trait the bare call names, and an unrelated module trait that
+/// shares its name.
+///
+/// rustc prints a bare `Trait` call when the crate-root `Trait` is in scope, even
+/// though a module trait of the same name exists elsewhere -- the shortest path
+/// that is unambiguous *at the call site*. A suffix match let the module trait's
+/// body answer the crate-root trait's call; its body returns `7`, distinct from the
+/// crate-root trait's `9`, so the two are separable.
+pub mod suffix_shim {
+    pub trait Trait {
+        fn pick(&self) -> u8 {
+            7
+        }
+    }
+    pub struct Other;
+    impl Trait for Other {}
+}
+
+/// The crate-root trait the bare call names.
+pub trait Trait {
+    fn pick(&self) -> u8 {
+        9
+    }
+}
+
+pub struct Root;
+
+impl Trait for Root {}
+
+/// The call names the crate-root trait (bare `Trait`, because `Root: Trait` is in
+/// scope at the call site), whose body returns `9`. It verifies only if that trait
+/// -- not `suffix_shim::Trait`'s `7` -- answered.
+/// requires: true
+/// ensures: ret == 9
+pub fn suffix_collision_verifies_from_the_named_trait(r: &Root) -> u8 {
+    <Root as Trait>::pick(r)
+}
+
+/// The false direction: the module trait's body returns `7`, not `9`, so this must
+/// be refuted. A suffix match answered the bare call from `suffix_shim::Trait` and
+/// *proved* it -- the false proof this pins.
+/// requires: true
+/// ensures: ret == 7
+pub fn suffix_collision_is_not_the_module_trait_tripwire(r: &Root) -> u8 {
+    <Root as Trait>::pick(r)
+}
+
+// --- A trait's default body must not answer a call an `impl` overrides --------
+//
+// rustc keeps a trait's *default* method in the dump even when an implementation
+// overrides it, so `<Foo as T>::value(&foo)` names the override while the trait's
+// own `T::value` body (returning `1`) is still present. The resolver used to pick
+// the default first and inline it, proving `ret == 1` for code Rust returns `2`
+// from -- a false proof. The impl candidate must win, and the default is used only
+// when no impl overrides the method.
+
+/// A trait with a default `value` that returns `1`.
+pub trait Defaulted {
+    fn value(&self) -> u8 {
+        1
+    }
+}
+
+pub struct Overrider;
+
+impl Defaulted for Overrider {
+    fn value(&self) -> u8 {
+        2
+    }
+}
+
+/// `Overrider` overrides `value` to return `2`, so this verifies only if the
+/// override's body answered rather than the default's `1`.
+/// requires: true
+/// ensures: ret == 2
+pub fn override_wins_over_the_default_body(o: &Overrider) -> u8 {
+    <Overrider as Defaulted>::value(o)
+}
+
+/// The false direction: the default body returns `1`, not the override's `2`, so
+/// this must be refuted. Answering from the default *proved* it -- the false proof
+/// this pins.
+/// requires: true
+/// ensures: ret == 1
+pub fn override_is_not_the_default_body_tripwire(o: &Overrider) -> u8 {
+    <Overrider as Defaulted>::value(o)
+}
+
+pub struct Inheritor;
+
+impl Defaulted for Inheritor {}
+
+/// `Inheritor` does not override `value`, so the trait's default is the body Rust
+/// calls; this verifies only if the default is still reachable when nothing
+/// overrides it.
+/// requires: true
+/// ensures: ret == 1
+pub fn an_unoverridden_method_still_uses_the_default(i: &Inheritor) -> u8 {
+    <Inheritor as Defaulted>::value(i)
+}
+
+// --- A local `impl` of an imported trait must not answer a library call -------
+//
+// `use std::convert::From;` plus a local `impl From<Local> for u16` prints its
+// call `<u16 as From<Local>>::from`, the bare library name. The trait path, the
+// owner and the method all match the library's `impl From<u8> for u16`, so only
+// the trait's *argument* (`Local` vs `u8`) separates them. Without it the local
+// body (returning `107`) answered a real `<u16 as From<u8>>::from(7u8)` and proved
+// `ret == 107` -- a false proof.
+
+pub struct ConvLocal;
+
+impl From<ConvLocal> for u16 {
+    fn from(_: ConvLocal) -> Self {
+        107
+    }
+}
+
+/// A real library conversion, `7u8` widened to `u16`, so this verifies only if the
+/// modelled conversion answered rather than the local `From<ConvLocal>` body's
+/// `107`.
+/// requires: true
+/// ensures: ret == 7
+pub fn library_from_is_not_the_local_body() -> u16 {
+    <u16 as From<u8>>::from(7u8)
+}
+
+/// The false direction: the local body returns `107`, not the widened `7`, so this
+/// must be refuted. A match that ignored the trait argument *proved* it.
+/// requires: true
+/// ensures: ret == 107
+pub fn library_from_is_not_the_local_body_tripwire() -> u16 {
+    <u16 as From<u8>>::from(7u8)
+}
+
+// --- A same-width conversion is `core`'s reflexive identity --------------------
+//
+// `impl<T> From<T> for T` makes `<u8 as From<u8>>::from(x)` the identity, so a
+// model that refused a same-width call would report a real call unknown -- a lost
+// proof. It is modelled as the source unchanged.
+
+/// requires: x == 200
+/// ensures: ret == 200
+pub fn same_width_from_is_the_identity(x: u8) -> u8 {
+    <u8 as From<u8>>::from(x)
+}
+
+/// The false direction: the identity returns `x`, so claiming anything else must be
+/// refuted. A model that guessed a truncation or a constant would *prove* it.
+/// requires: x == 200
+/// ensures: ret == 7
+pub fn same_width_from_is_not_a_guess_tripwire(x: u8) -> u8 {
+    <u8 as From<u8>>::from(x)
+}
+
+// --- A nested trait argument must keep its balanced spelling -------------------
+//
+// `<NestedHolder as NestedWrap<Option<u8>>>::get` carries a nested generic
+// argument. The call side and the impl side must read it the same way -- balanced,
+// `Option<u8>` -- or the two spellings disagree (`Option<u8` versus `Option<u8>`)
+// and the local body is lost, the call reported as unmodelled. A "strip trailing
+// `>`" reading on the call side cut *every* closing bracket.
+
+pub trait NestedWrap<T> {
+    fn get(&self) -> u8;
+}
+
+pub struct NestedHolder;
+
+impl NestedWrap<Option<u8>> for NestedHolder {
+    fn get(&self) -> u8 {
+        9
+    }
+}
+
+/// The local body returns `9`, so this verifies only if the balanced argument
+/// matched the impl and the body answered.
+/// requires: true
+/// ensures: ret == 9
+pub fn nested_trait_arg_finds_the_body(h: &NestedHolder) -> u8 {
+    <NestedHolder as NestedWrap<Option<u8>>>::get(h)
+}
+
+/// The false direction: the body returns `9`, so this must be refuted. A resolver
+/// that lost the body reported the call unmodelled instead (a lost proof).
+/// requires: true
+/// ensures: ret == 4
+pub fn nested_trait_arg_is_not_a_guess_tripwire(h: &NestedHolder) -> u8 {
+    <NestedHolder as NestedWrap<Option<u8>>>::get(h)
+}
+
+// --- A `#[cfg]`-disabled import must not displace a live alias -----------------
+//
+// The import scan reads raw source, but rustc emits MIR only for enabled items. A
+// live `use std::convert::From as Conv;` binds `Conv`; a later
+// `#[cfg(any())] use crate::CfgOther as Conv;` binds nothing, yet a naive map let it
+// overwrite the live binding, so the impl written with `Conv` was recorded with the
+// wrong trait and its call was lost. `conv_shim::From` above forces rustc to print
+// the standard path qualified, so the two candidate paths are visibly different.
+
+pub struct CfgLocal;
+
+pub mod cfg_alias_shim {
+    use crate::CfgLocal;
+    use std::convert::From as Conv;
+
+    impl Conv<CfgLocal> for u16 {
+        fn from(_: CfgLocal) -> Self {
+            107
+        }
+    }
+
+    #[cfg(any())]
+    use crate::CfgOther as Conv;
+}
+
+pub struct CfgOther;
+
+/// The live alias still binds `Conv` to the standard trait, so the impl's call
+/// resolves to its body (returning `107`) and verifies.
+/// requires: true
+/// ensures: ret == 107
+pub fn cfg_disabled_import_keeps_the_live_alias() -> u16 {
+    <u16 as std::convert::From<CfgLocal>>::from(CfgLocal)
+}
+
+/// The false direction: the body returns `107`, so this must be refuted. Recording
+/// the impl with the *wrong* trait (the disabled alias) lost the call instead.
+/// requires: true
+/// ensures: ret == 9
+pub fn cfg_disabled_import_is_not_the_wrong_alias_tripwire() -> u16 {
+    <u16 as std::convert::From<CfgLocal>>::from(CfgLocal)
+}
+
+// --- A multi-line `#[cfg]` import must also not displace a live alias ----------
+//
+// The same hazard as above, but the attribute spans lines. The line next to the
+// `use` is then its closing `)]`, not its `#[cfg…`, so a reader that looks at one
+// line above misses the condition entirely and treats a *disabled* import as live.
+// Reading the attribute block as whole, balanced `#[…]` items closes it.
+
+pub struct CfgMultiLocal;
+
+pub mod cfg_multi_alias_shim {
+    use crate::CfgMultiLocal;
+    use std::convert::From as Conv;
+
+    impl Conv<CfgMultiLocal> for u16 {
+        fn from(_: CfgMultiLocal) -> Self {
+            108
+        }
+    }
+
+    #[cfg(all(
+        any(),
+    ))]
+    use crate::CfgMultiOther as Conv;
+}
+
+pub struct CfgMultiOther;
+
+/// The live alias still binds `Conv` to the standard trait, so the impl's call
+/// resolves to its body (returning `108`) and verifies.
+/// requires: true
+/// ensures: ret == 108
+pub fn cfg_multiline_import_keeps_the_live_alias() -> u16 {
+    <u16 as std::convert::From<CfgMultiLocal>>::from(CfgMultiLocal)
+}
+
+/// The false direction: the body returns `108`, so this must be refuted. Missing
+/// the multi-line condition recorded the impl with the wrong trait and lost the call.
+/// requires: true
+/// ensures: ret == 9
+pub fn cfg_multiline_import_is_not_the_wrong_alias_tripwire() -> u16 {
+    <u16 as std::convert::From<CfgMultiLocal>>::from(CfgMultiLocal)
+}
+
+// --- A quoted delimiter in an attribute must not hide a `#[cfg]` import --------
+//
+// `#[doc = "("]` holds an unmatched `(` in a string. Counting every character as a
+// delimiter makes the reader run past the attribute's real end, so the disabled
+// `#[cfg]` above it is not seen and the disabled import is treated as live, displacing
+// the live alias. Skipping quoted text (with escapes) while matching `#[…]` closes it.
+
+pub struct CfgQuotedLocal;
+
+pub mod cfg_quoted_alias_shim {
+    use crate::CfgQuotedLocal;
+    use std::convert::From as Conv;
+
+    impl Conv<CfgQuotedLocal> for u16 {
+        fn from(_: CfgQuotedLocal) -> Self {
+            109
+        }
+    }
+
+    #[cfg(any())]
+    #[doc = "("]
+    use crate::CfgQuotedOther as Conv;
+}
+
+pub struct CfgQuotedOther;
+
+/// The live alias still binds `Conv` to the standard trait, so the impl's call
+/// resolves to its body (returning `109`) and verifies.
+/// requires: true
+/// ensures: ret == 109
+pub fn cfg_quoted_delimiter_keeps_the_live_alias() -> u16 {
+    <u16 as std::convert::From<CfgQuotedLocal>>::from(CfgQuotedLocal)
+}
+
+/// The false direction: the body returns `109`, so this must be refuted. Counting the
+/// quoted `(` as a delimiter hid the condition and lost the call instead.
+/// requires: true
+/// ensures: ret == 9
+pub fn cfg_quoted_delimiter_is_not_the_wrong_alias_tripwire() -> u16 {
+    <u16 as std::convert::From<CfgQuotedLocal>>::from(CfgQuotedLocal)
 }

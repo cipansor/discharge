@@ -6,7 +6,7 @@
 //! clauses directly. It also checks a returned model actually satisfies the clauses, which
 //! catches a solver that reports `Sat` for the wrong reason.
 
-use discharge::sat::{self, Lit, Sat};
+use verif::sat::{self, Lit, Sat};
 
 struct Lcg(u64);
 impl Lcg {

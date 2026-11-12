@@ -3,11 +3,11 @@
 //! Run with a nightly compiler available:
 //!
 //! ```text
-//! DISCHARGE_RUSTC=$(rustup which --toolchain nightly rustc) \
+//! VERIF_RUSTC=$(rustup which --toolchain nightly rustc) \
 //!   cargo test --features std --test mir
 //! ```
 //!
-//! The tests that need `rustc` skip themselves when `DISCHARGE_RUSTC` is unset,
+//! The tests that need `rustc` skip themselves when `VERIF_RUSTC` is unset,
 //! because `--emit=mir` needs nightly and failing on a stable toolchain would say
 //! "the code is wrong" when the truth is "the tool could not run".
 //!
@@ -27,8 +27,8 @@
 //! tests, because the IR is crate-internal. This file covers the public surface:
 //! the contract scanner, contract evaluation, and the end-to-end verdicts.
 
-use discharge::mir::spec;
-use discharge::mir::verify::{self, FnOutcome};
+use verif::mir::spec;
+use verif::mir::verify::{self, FnOutcome};
 
 // The functions under verification, compiled from the exact file the frontend
 // reads. `#[path]` rather than a copy means the test and the verifier can never
@@ -41,7 +41,7 @@ const TARGET: &str = "examples/mir_targets/actuator.rs";
 
 /// The nightly compiler, or `None` so the test can skip.
 fn rustc() -> Option<String> {
-    std::env::var("DISCHARGE_RUSTC").ok().filter(|s| !s.is_empty())
+    std::env::var("VERIF_RUSTC").ok().filter(|s| !s.is_empty())
 }
 
 fn verify_all() -> Option<verify::FileReport> {
@@ -148,7 +148,7 @@ fn scanner_finds_a_pub_crate_fn() {
 
 #[test]
 fn contract_expressions_evaluate() {
-    use discharge::smt;
+    use verif::smt;
     smt::with_fresh(|| {
         let mut args = std::collections::BTreeMap::new();
         args.insert("b".to_string(), smt::var_named(2, 32));
@@ -160,7 +160,7 @@ fn contract_expressions_evaluate() {
 
 #[test]
 fn a_contradictory_contract_is_refused_or_vacuous() {
-    use discharge::smt;
+    use verif::smt;
     smt::with_fresh(|| {
         let mut args = std::collections::BTreeMap::new();
         args.insert("b".to_string(), smt::var_named(2, 32));
@@ -173,7 +173,7 @@ fn a_contradictory_contract_is_refused_or_vacuous() {
 
 #[test]
 fn refuses_a_contract_it_cannot_read() {
-    use discharge::smt;
+    use verif::smt;
     smt::with_fresh(|| {
         let args = std::collections::BTreeMap::new();
         // A function call is not in the grammar, so it must be refused rather
@@ -202,7 +202,7 @@ fn refuses_a_contract_it_cannot_read() {
 /// length, `ret` for the narrow return: the literal must end up 8 bits wide.
 #[test]
 fn a_literal_is_sized_from_the_operand_it_meets() {
-    use discharge::smt;
+    use verif::smt;
     smt::with_fresh(|| {
         let mut args = std::collections::BTreeMap::new();
         // A 64-bit "length", in scope but not mentioned by the contract.
@@ -235,7 +235,7 @@ fn a_literal_is_sized_from_the_operand_it_meets() {
 /// actionable.
 #[test]
 fn a_literal_that_does_not_fit_is_refused_not_truncated() {
-    use discharge::smt;
+    use verif::smt;
     smt::with_fresh(|| {
         let mut args = std::collections::BTreeMap::new();
         args.insert("a".to_string(), smt::var(8));
@@ -259,7 +259,7 @@ fn a_literal_that_does_not_fit_is_refused_not_truncated() {
 /// The message must say *that*, so the reader knows to name a component.
 #[test]
 fn a_bare_ret_on_an_aggregate_names_the_aggregate_reason() {
-    use discharge::smt;
+    use verif::smt;
     smt::with_fresh(|| {
         let args = std::collections::BTreeMap::new();
         let err = spec::eval_ensures(
@@ -287,7 +287,7 @@ fn a_bare_ret_on_an_aggregate_names_the_aggregate_reason() {
 /// not exist. The two causes have to be two messages.
 #[test]
 fn a_bare_ret_with_an_unknown_value_names_the_unknown_reason() {
-    use discharge::smt;
+    use verif::smt;
     smt::with_fresh(|| {
         let args = std::collections::BTreeMap::new();
         let err = spec::eval_ensures(
@@ -330,7 +330,7 @@ fn a_literal_in_arithmetic_is_sized_to_its_operand() {
 /// contract's other operands.
 #[test]
 fn a_named_type_bound_keeps_its_own_width() {
-    use discharge::smt;
+    use verif::smt;
     smt::with_fresh(|| {
         let mut args = std::collections::BTreeMap::new();
         args.insert("a".to_string(), smt::var(8));
@@ -354,7 +354,7 @@ fn a_named_type_bound_keeps_its_own_width() {
 /// positive number and the comparison would mean something else entirely.
 #[test]
 fn a_negative_literal_is_sign_extended_to_the_operand() {
-    use discharge::smt;
+    use verif::smt;
     smt::with_fresh(|| {
         let mut args = std::collections::BTreeMap::new();
         args.insert("a".to_string(), smt::var(8));
@@ -872,7 +872,7 @@ fn a_scoped_debug_alias_does_not_rename_a_parameter() {
 #[test]
 fn an_unreadable_ensures_is_reported_not_ignored() {
     let Some(rustc) = rustc() else { return };
-    let dir = std::env::temp_dir().join("discharge_unreadable_ensures");
+    let dir = std::env::temp_dir().join("verif_unreadable_ensures");
     let _ = std::fs::create_dir_all(&dir);
     let src = dir.join("u.rs");
     std::fs::write(
@@ -1250,6 +1250,771 @@ fn stage_two_rvalues_are_modelled_and_their_tripwires_refuted() {
         let FnOutcome::Failed { .. } = o else {
             panic!("`{name}` is a false contract that must be refuted, got: {o}");
         };
+    }
+}
+
+/// A `u16` product is decided end to end, which the product bound now admits.
+///
+/// The `u16` `saturating_mul` in the corpus used to report "past what the model
+/// covers": the widened product test needs a `2w`-bit multiplier, and the bound
+/// stopped the widening at `2w == 16`. The bound is 16 now, so the guarded
+/// fixture must verify and the deliberately unguarded one must still be refuted.
+/// The pair matters more than the verify: a bound raised without the refutation
+/// would be a model that proves the wrong thing, which is worse than one that
+/// declines.
+#[test]
+fn a_u16_product_is_decided_end_to_end() {
+    let Some(report) = verify_realistic(&["u16_product_guarded"]) else { return };
+    let o = outcome(&report, "u16_product_guarded");
+    assert!(o.is_verified(), "`u16_product_guarded` must verify, got: {o}");
+
+    let Some(report) = verify_realistic(&["u16_product_unguarded_tripwire"]) else { return };
+    let o = outcome(&report, "u16_product_unguarded_tripwire");
+    let FnOutcome::Failed { .. } = o else {
+        panic!("`u16_product_unguarded_tripwire` is false and must be refuted, got: {o}");
+    };
+}
+
+
+/// The complement bit counts `count_zeros`, `leading_ones` and `trailing_ones`,
+/// each pinned by a true half and a tripwire.
+///
+/// Each is `core`'s own definition -- the corresponding *positive* count of `!x`
+/// -- so a model that summed the wrong polarity would be wrong by the complement,
+/// which is a wrong value and not a weaker proof. `count_zeros` is pinned at a
+/// single operand where the two polarities disagree, and the two one-sided counts
+/// are pinned at the boundary of their precondition. The tripwires are the
+/// evidence the count is read at all: a constant answer would prove neither the
+/// true half nor the false one.
+#[test]
+fn the_complement_bit_counts_agree_with_rust() {
+    let verified = [
+        "count_zeros_of_zero_is_the_width",
+        "leading_ones_of_a_top_bit_value",
+        "trailing_ones_of_a_small_value",
+    ];
+    let refuted = [
+        "count_zeros_of_zero_is_the_width_tripwire",
+        "leading_ones_of_a_top_bit_value_tripwire",
+        "trailing_ones_of_a_small_value_tripwire",
+    ];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { .. } = o else {
+            panic!("`{name}` is a false contract that must be refuted, got: {o}");
+        };
+    }
+}
+
+/// `is_power_of_two` is modelled as a `bool` the `if` branches on.
+///
+/// This is the `bool`-channel pin, and it is a different kind of test from the
+/// bit counts: the model produces a `Pred` rather than a `Var`, and the executor
+/// writes it as a `Val::Bool`. A model that wrote a one-bit *word* into the
+/// destination would leave the local readable only as a word, and the postcondition
+/// `ret == true` would not read it -- so `is_power_of_two_of_the_top_bit` fails
+/// rather than passing by accident. The zero tripwire is the sharp one: `0` is the
+/// single value the bare `x & (x - 1) == 0` mask test would accept, so a model
+/// that dropped the `x != 0` conjunct would *prove* the false contract.
+#[test]
+fn is_power_of_two_is_a_modelled_bool() {
+    let verified = ["is_power_of_two_of_the_top_bit", "is_power_of_two_of_three"];
+    let refuted = ["is_power_of_two_of_zero_tripwire"];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { .. } = o else {
+            panic!("`{name}` is a false contract that must be refuted, got: {o}");
+        };
+    }
+}
+
+/// The `bool` is consumed by a `switchInt`, not only read in a postcondition.
+///
+/// `is_power_of_two_is_a_modelled_bool` returns the predicate, so the `bool`
+/// reaches the return place and the obligation reads it there; a regression in
+/// *branching* on it would leave those tests green. These fixtures put the
+/// predicate in an `if`, where the executor has to turn the `Pred` into a path
+/// condition and take one of two arms returning different constants. The two
+/// arms are pinned separately, so a model that took a constant arm fails one of
+/// them, and the zero tripwire pins the `x != 0` conjunct *through the branch*:
+/// a model that dropped it takes the `then` arm and proves the false `ret == 7`.
+#[test]
+fn is_power_of_two_branches_on_the_predicate() {
+    let verified = [
+        "is_power_of_two_branching_takes_the_true_arm",
+        "is_power_of_two_branching_takes_the_false_arm",
+    ];
+    let refuted = ["is_power_of_two_branching_of_zero_tripwire"];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { .. } = o else {
+            panic!("`{name}` is a false contract that must be refuted, got: {o}");
+        };
+    }
+}
+
+/// The mixed-signedness additions, each pinned in both directions.
+///
+/// Every shape gets a true contract *and* a false one with a concrete witness, so
+/// the suite carries the negative direction the standing tripwire rule requires:
+/// a model that proves a false claim about `add_signed`/`add_unsigned` fails here
+/// rather than passing because every fixture happened to be true. The false pins
+/// are chosen to separate the readings that the true pins cannot:
+///
+/// * `overflowing_add_signed_wrong_flag_tripwire` (`250u8 + (-1i8)`, in range) is
+///   the one a *bare-carry* flag model would prove, since the carry fires there.
+/// * `overflowing_add_unsigned_wrong_flag_tripwire` (`1i8 + 1u8`, in range) is
+///   the one a *signed-addition* flag model would prove.
+/// * `saturating_add_unsigned_wrong_value_tripwire` names the *wrapping* answer,
+///   which pins that the two families are not the same shape.
+///
+/// The checked family is read through a `match` rather than `ret.is_some()`,
+/// because the contract language cannot name an `Option` payload; the arm the
+/// match takes is what the `Some`/`None` verdicts pin.
+#[test]
+fn the_mixed_signedness_additions_verify_and_their_tripwires_refute() {
+    let verified = [
+        "wrapping_add_signed_of_a_negative",
+        "saturating_add_signed_clamps_to_zero",
+        "overflowing_add_signed_below_zero_is_overflow",
+        "overflowing_add_signed_within_range_is_not_overflow",
+        "overflowing_add_signed_past_the_top_tripwire",
+        "wrapping_add_unsigned_of_the_top_bit",
+        "saturating_add_unsigned_clamps_to_signed_max",
+        "saturating_add_unsigned_top_bit_tripwire",
+        "checked_add_signed_in_range_is_the_sum",
+        "checked_add_unsigned_in_range_is_the_sum",
+        "overflowing_add_unsigned_within_range_is_not_overflow",
+        "overflowing_add_unsigned_past_the_top_is_overflow",
+    ];
+    let refuted = [
+        "wrapping_add_signed_wrong_value_tripwire",
+        "saturating_add_signed_wrong_value_tripwire",
+        "overflowing_add_signed_wrong_flag_tripwire",
+        "checked_add_signed_none_tripwire",
+        "wrapping_add_unsigned_wrong_value_tripwire",
+        "saturating_add_unsigned_wrong_value_tripwire",
+        "overflowing_add_unsigned_wrong_flag_tripwire",
+        "checked_add_unsigned_wrong_value_tripwire",
+    ];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` is a false mixed-add contract that must be refuted, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
+/// A local method sharing an intrinsic's name is answered by its body, not `core`.
+///
+/// rustc prints a trait impl's call as `<u8 as Trait>::is_power_of_two` and its
+/// definition as `<impl at …>::is_power_of_two`, so the exact-name lookup missed
+/// and the intrinsic model -- classifying on the suffix -- answered first. A trait
+/// that disagrees with `core` then got a *false proof*: the body returns `false`
+/// at `x == 1`, but the model returned `core`'s `true` and proved `ret == true`.
+/// The true contract must verify (the body really is `false` there) and the false
+/// one must be refuted, which pins both that the body was read and that the model
+/// no longer shadows it.
+#[test]
+fn a_trait_method_sharing_an_intrinsic_name_is_answered_by_its_body() {
+    let verified = ["trait_is_power_of_two_disagrees_with_core"];
+    let refuted = ["trait_is_power_of_two_disagrees_with_core_tripwire"];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(
+            o.is_verified(),
+            "`{name}` must verify: the trait body returns `false` at `x == 1`, so a \
+             model that answered from `core`'s predicate would refute it; got: {o}"
+        );
+    }
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!(
+                "`{name}` must be refuted: it claims `core`'s answer, which the trait \
+                 body does not produce. A pass is the false proof this pins. got: {o}"
+            );
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
+/// `Ord::min`/`Ord::max` are modelled, and a local trait sharing their name is
+/// answered by its body rather than by the model.
+///
+/// The two halves pin both directions. The verifying half covers the unsigned and
+/// signed orderings and the explicit `Ord::min` spelling; `ord_min_of_min_and_one_is_min`
+/// is the one that separates them, since `i8::MIN`'s bits sort the other way
+/// unsigned. The refuting half is the tripwire on the method form, plus the
+/// local-trait pair: `local_ord_min_is_answered_by_its_body` verifies only from the
+/// body's constant, and `local_ord_min_is_not_the_model_tripwire` is refuted only
+/// if the body -- not the model -- answered, so the model cannot silently take the
+/// call over.
+#[test]
+fn ord_min_and_max_are_modelled_and_a_local_trait_still_wins() {
+    let verified = [
+        "ord_min_is_at_most_both",
+        "ord_max_is_at_least_x",
+        "ord_min_of_min_and_one_is_min",
+        "explicit_ord_min_is_modelled",
+        "local_ord_min_is_answered_by_its_body",
+    ];
+    let refuted = ["ord_min_is_x_tripwire", "local_ord_min_is_not_the_model_tripwire"];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` is a false contract that must be refuted, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
+/// A widening conversion (`From::from`/`Into::into`) is modelled, by the source's
+/// signedness.
+///
+/// The three verifying entries pin the three cases that separate a correct model
+/// from a wrong one: `from_u8_is_modelled` and `into_u8_is_modelled` are the two
+/// trait spellings reaching one value, and
+/// `unsigned_source_widens_to_signed_destination` is the *signedness change* that
+/// must zero-fill (the source is unsigned) even though the destination is signed.
+/// `signed_widening_keeps_negative_values` is the sign-extension half: `i8::MIN`
+/// stays `i8::MIN` in an `i16`.
+///
+/// The tripwire is the evidence the source's signedness is read at all:
+/// `-1i8` widens to `-1i16` (`0xffff`), so a model that zero-filled a signed source
+/// would return `255` and *prove* `ret == 255`. Refuting it is what shows the
+/// extension is chosen by the source's sign and not by `truncate`.
+#[test]
+fn widening_conversions_are_modelled_by_the_sources_signedness() {
+    let verified = [
+        "from_u8_is_modelled",
+        "into_u8_is_modelled",
+        "signed_widening_keeps_negative_values",
+        "unsigned_source_widens_to_signed_destination",
+    ];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let refuted = ["signed_widening_is_not_zero_fill_tripwire"];
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` is a false contract that must be refuted, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
+/// A local trait whose name and owner type collide with a modelled conversion's
+/// must not answer a call the compiler resolved to the *library* trait.
+///
+/// The `conv_shim` module implements its own `From<u8> for u16` returning `7`,
+/// while `core`'s `From<u8> for u16` widens `x`. Both share the method tail
+/// (`from`) and the owner (`u16`), so before the trait check
+/// `resolve_callee` answered `<u16 as std::convert::From<u8>>::from` from the
+/// local body and *proved* `ret == 7` -- a false proof of a library call. This
+/// test is the tripwire: `local_from_does_not_answer_the_std_trait` must be
+/// refuted, and the local trait's own call
+/// (`local_from_is_answered_by_its_own_body`) must still verify, so the guard
+/// separates the two traits rather than refusing the local one outright.
+#[test]
+fn a_local_trait_named_from_does_not_answer_the_std_trait() {
+    let verified = ["local_from_is_answered_by_its_own_body"];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify from the local body, got: {o}");
+    }
+    let refuted = ["local_from_does_not_answer_the_std_trait"];
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` claims the local body's answer for a library call and must be refuted, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
+/// A bare trait call must not be answered by the model when the crate declares a
+/// crate-root trait of that name with a *default* body.
+///
+/// rustc prints a crate-root trait's call bare (`<u8 as Ord>::min`), and a default
+/// method has no `impl` block in the dump -- its definition is printed as
+/// `Ord::min`. So `resolve_callee` cannot match it by location, and before the
+/// `declared_traits` guard the model answered `<u8 as Ord>::min` from `core`'s
+/// ordering. `crate_root_ord_default_*` pair pins both directions: the body returns
+/// a constant, so the verifying half proves the body was read and the refuted half
+/// proves the model was not consulted.
+#[test]
+fn a_bare_crate_root_trait_call_is_not_answered_by_the_model() {
+    let verified = ["crate_root_ord_default_verifies_from_its_body"];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify from the default body, got: {o}");
+    }
+    let refuted = ["crate_root_ord_default_is_not_the_model_tripwire"];
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!(
+                "`{name}` claims `core`'s ordering for a call the compiler resolved to \
+                 the local trait and must be refuted, got: {o}"
+            );
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
+/// An unrelated same-named trait must not answer a bare trait call.
+///
+/// `m::Trait` is a different trait from the crate-root `Trait`, but rustc prints a
+/// *bare* `Trait` call, so a suffix match let the module trait's body answer the
+/// crate-root trait's call -- a false proof. `suffix_collision_*` pin both
+/// directions: the call names the crate-root trait (whose default body returns
+/// `9`), and the module trait's body returns `7`, so the refuted half fails only if
+/// the module trait was *not* consulted.
+#[test]
+fn an_unrelated_same_named_trait_does_not_answer_a_bare_call() {
+    let verified = ["suffix_collision_verifies_from_the_named_trait"];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify from the crate-root trait, got: {o}");
+    }
+    let refuted = ["suffix_collision_is_not_the_module_trait_tripwire"];
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!(
+                "`{name}` claims the module trait's body for a call naming the crate-root \
+                 trait and must be refuted, got: {o}"
+            );
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
+/// A local trait method reached through an imported library trait path must not be
+/// answered by the model.
+///
+/// `use std::convert::From;` plus a local `impl From<Local> for u16` prints the call
+/// `<u16 as From<Local>>::from` -- the *bare* library name, because the local `From`
+/// is the only one in scope. The crate declares no trait named `From`, so the
+/// `declared_traits` guard alone would not refuse it, and the model would answer a
+/// call the compiler resolved to the local body. The owner (`u16`), the method
+/// (`from`) and the *self type* (`Local`, the conversion's source) together name
+/// the same method. This lives in its own source file rather than the shared corpus
+/// because the corpus's own `conv_shim::From` forces rustc to qualify the library
+/// trait, which hides the bare spelling.
+#[test]
+fn a_local_impl_of_an_imported_trait_does_not_answer_the_model() {
+    let src = r#"
+pub struct Local;
+impl From<Local> for u16 {
+    fn from(_x: Local) -> Self {
+        107
+    }
+}
+/// requires: true
+/// ensures: ret == 107
+pub fn imported_from_verifies_from_the_local_body() -> u16 {
+    <u16 as From<Local>>::from(Local)
+}
+/// requires: true
+/// ensures: ret == 7
+pub fn imported_from_is_not_the_model_tripwire() -> u16 {
+    <u16 as From<Local>>::from(Local)
+}
+"#;
+    let o = verify_src("imported_from_verifies_from_the_local_body", src);
+    let Some(o) = o else { return };
+    assert!(
+        o.is_verified(),
+        "`imported_from_verifies_from_the_local_body` must verify from the local body, got: {o}"
+    );
+    let o = verify_src("imported_from_is_not_the_model_tripwire", src);
+    let Some(o) = o else { return };
+    match &o {
+        FnOutcome::Failed { kind, .. } => {
+            assert_eq!(kind, "postcondition", "the tripwire got: {o}");
+        }
+        _ => panic!(
+            "`imported_from_is_not_the_model_tripwire` claims the modelled conversion for a \
+             call the compiler resolved to a local impl and must be refuted, got: {o}"
+        ),
+    }
+}
+
+/// A trait's *default* body must not answer a call that an `impl` overrides.
+///
+/// rustc keeps a trait's default method in the dump even when an implementation
+/// overrides it, so `<Foo as T>::value(&foo)` names the override while the trait's
+/// own `T::value` body (returning `1`) is still present. `resolve_callee` used to
+/// prefer the default body, inlining `1` for code Rust returns `2` from -- a false
+/// proof. The impl candidate must win; the default is used only when no impl
+/// overrides the method.
+#[test]
+fn an_override_wins_over_the_traits_default_body() {
+    let src = r#"
+pub trait T { fn value(&self) -> u8 { 1 } }
+pub struct Foo(pub u8);
+impl T for Foo { fn value(&self) -> u8 { 2 } }
+pub struct Bar(pub u8);
+impl T for Bar {}
+/// requires: true
+/// ensures: ret == 2
+pub fn override_verifies(f: &Foo) -> u8 { <Foo as T>::value(f) }
+/// requires: true
+/// ensures: ret == 1
+pub fn override_is_not_the_default_tripwire(f: &Foo) -> u8 { <Foo as T>::value(f) }
+/// requires: true
+/// ensures: ret == 1
+pub fn default_still_used_when_not_overridden(b: &Bar) -> u8 { <Bar as T>::value(b) }
+"#;
+    let Some(o) = verify_src("override_verifies", src) else { return };
+    assert!(o.is_verified(), "the override's body must answer, got: {o}");
+    let Some(o) = verify_src("default_still_used_when_not_overridden", src) else { return };
+    assert!(o.is_verified(), "the default must still answer when nothing overrides it, got: {o}");
+    let Some(o) = verify_src("override_is_not_the_default_tripwire", src) else { return };
+    match &o {
+        FnOutcome::Failed { kind, .. } => assert_eq!(kind, "postcondition", "got: {o}"),
+        _ => panic!("the default body must not answer a call an impl overrides, got: {o}"),
+    }
+}
+
+/// A local `impl` of a generic trait must not answer a call to a *different*
+/// instantiation of the same trait.
+///
+/// `impl From<Local> for u16` and the library's `impl From<u8> for u16` share the
+/// trait path (`From`), the owner (`u16`) and the method (`from`); only the trait's
+/// *argument* separates them. A call `<u16 as From<u8>>::from(7u8)` must reach the
+/// modelled widening (`7`), and the local impl's own call
+/// `<u16 as From<Local>>::from(...)` must reach its body (`107`).
+#[test]
+fn a_generic_traits_arguments_separate_its_impls() {
+    let src = r#"
+pub struct Local;
+impl From<Local> for u16 { fn from(_: Local) -> Self { 107 } }
+/// requires: true
+/// ensures: ret == 7
+pub fn library_call_is_seven() -> u16 { <u16 as From<u8>>::from(7u8) }
+/// requires: true
+/// ensures: ret == 107
+pub fn library_call_is_not_the_local_body_tripwire() -> u16 { <u16 as From<u8>>::from(7u8) }
+/// requires: true
+/// ensures: ret == 107
+pub fn local_call_is_onehundredseven() -> u16 { <u16 as From<Local>>::from(Local) }
+"#;
+    let Some(o) = verify_src("library_call_is_seven", src) else { return };
+    assert!(o.is_verified(), "the modelled widening must answer a library call, got: {o}");
+    let Some(o) = verify_src("local_call_is_onehundredseven", src) else { return };
+    assert!(o.is_verified(), "the local impl's own instantiation must answer, got: {o}");
+    let Some(o) = verify_src("library_call_is_not_the_local_body_tripwire", src) else { return };
+    match &o {
+        FnOutcome::Failed { kind, .. } => assert_eq!(kind, "postcondition", "got: {o}"),
+        _ => panic!("a different instantiation's body must not answer, got: {o}"),
+    }
+}
+
+/// A trait imported into a module must be recorded as the imported path, not
+/// prefixed with the module.
+///
+/// `use std::convert::From;` makes a bare `From` inside `m` the standard trait, and
+/// rustc prints the call with the library path. The scanner used to prefix `m`
+/// unconditionally (`m::From`), which matched no call -- a lost proof. The same
+/// must hold after a nested module, whose scope used to reset the parent's imports.
+#[test]
+fn an_imported_trait_keeps_its_imported_path() {
+    let src = r#"
+pub struct Local;
+pub mod m {
+    use std::convert::From;
+    pub mod nested {}
+    impl From<crate::Local> for u16 { fn from(_: crate::Local) -> Self { 107 } }
+}
+/// requires: true
+/// ensures: ret == 107
+pub fn imported_trait_after_nested_module() -> u16 {
+    <u16 as std::convert::From<crate::Local>>::from(crate::Local)
+}
+"#;
+    let Some(o) = verify_src("imported_trait_after_nested_module", src) else { return };
+    assert!(o.is_verified(), "the impl must be reached through its imported trait, got: {o}");
+}
+
+/// A multi-line, restricted-visibility import must still be read.
+///
+/// `pub(crate) use a::b::{\n    C,\n};` is one item whose path spans lines and
+/// whose visibility is not a bare `pub `. A line-at-a-time scan with a `pub `
+/// prefix missed it, so the impl was qualified with its own module and no call
+/// matched -- a lost proof.
+#[test]
+fn a_multiline_restricted_import_is_read() {
+    let src = r#"
+pub struct Local;
+pub mod m {
+    pub(crate) use std::convert::{
+        From,
+    };
+    impl From<crate::Local> for u16 { fn from(_: crate::Local) -> Self { 107 } }
+}
+/// requires: true
+/// ensures: ret == 107
+pub fn multiline_imported_trait() -> u16 {
+    <u16 as std::convert::From<crate::Local>>::from(crate::Local)
+}
+"#;
+    let Some(o) = verify_src("multiline_imported_trait", src) else { return };
+    assert!(o.is_verified(), "a folded restricted import must still qualify the trait, got: {o}");
+}
+
+/// A nested trait argument keeps its balanced spelling on both sides of the match.
+///
+/// `call_trait_args` reads the argument off the *call* (`<W as Wrap<Option<u8>>>::get`)
+/// and `impl_trait_args` reads it off the impl header (`impl Wrap<Option<u8>> for W`).
+/// A "strip trailing `>`" reading on the call side cuts *every* closing bracket, so
+/// the call would say `Option<u8` while the impl says `Option<u8>`, the two would not
+/// match, and the local body would be lost -- the call reported as unmodelled. The
+/// verifying entry is the evidence the body answers; the tripwire is the evidence it
+/// is the *body* (returning `9`) and not a guess, since a model that constant-folded
+/// or refused would not refute it.
+#[test]
+fn a_nested_trait_argument_keeps_its_balanced_spelling() {
+    let src = r#"
+pub trait Wrap<T> { fn get(&self) -> u8; }
+pub struct W;
+impl Wrap<Option<u8>> for W { fn get(&self) -> u8 { 9 } }
+/// requires: true
+/// ensures: ret == 9
+pub fn nested_arg(w: &W) -> u8 { <W as Wrap<Option<u8>>>::get(w) }
+/// requires: true
+/// ensures: ret == 4
+pub fn nested_arg_tripwire(w: &W) -> u8 { <W as Wrap<Option<u8>>>::get(w) }
+"#;
+    let Some(o) = verify_src("nested_arg", src) else { return };
+    assert!(o.is_verified(), "a nested trait argument must still find the local body, got: {o}");
+    let Some(o) = verify_src("nested_arg_tripwire", src) else { return };
+    match &o {
+        FnOutcome::Failed { kind, .. } => assert_eq!(kind, "postcondition", "got: {o}"),
+        _ => panic!("the local body returns 9, so `ret == 4` must be refuted, got: {o}"),
+    }
+}
+
+/// A `#[cfg]`-disabled later `use` must not displace a live alias.
+///
+/// The import scan reads raw source, but rustc emits MIR only for enabled items. A
+/// live `use std::convert::From as Conv;` binds `Conv`; a later
+/// `#[cfg(any())] use crate::Other as Conv;` binds nothing, yet a naive map lets it
+/// overwrite the live binding, so the impl written with `Conv` is recorded with the
+/// wrong trait and its call is lost. The verifying entry is the evidence the live
+/// binding still resolves; the tripwire is the evidence the *local body* (returning
+/// `107`) answers, not the model. The same-line attribute form is covered too, since
+/// the attribute hides the `use` keyword from the scanner there.
+#[test]
+fn a_cfg_disabled_import_does_not_displace_a_live_alias() {
+    let src = r#"
+pub trait From { fn make() -> u8 { 0 } }
+pub mod m {
+    use std::convert::From as Conv;
+    pub struct Local;
+    impl Conv<Local> for u16 { fn from(_: Local) -> Self { 107 } }
+    #[cfg(any())]
+    use crate::Other as Conv;
+}
+pub struct Other;
+/// requires: true
+/// ensures: ret == 107
+pub fn cfg_live() -> u16 { <u16 as std::convert::From<m::Local>>::from(m::Local) }
+/// requires: true
+/// ensures: ret == 5
+pub fn cfg_tripwire() -> u16 { <u16 as std::convert::From<m::Local>>::from(m::Local) }
+"#;
+    let Some(o) = verify_src("cfg_live", src) else { return };
+    assert!(o.is_verified(), "a live alias must survive a later cfg-disabled import, got: {o}");
+    let Some(o) = verify_src("cfg_tripwire", src) else { return };
+    match &o {
+        FnOutcome::Failed { kind, .. } => assert_eq!(kind, "postcondition", "got: {o}"),
+        _ => panic!("the live local body returns 107, so `ret == 5` must be refuted, got: {o}"),
+    }
+}
+
+/// A same-line `#[cfg] use …` is read, not skipped.
+///
+/// An attribute on the item's own line (`#[cfg(all())] use std::convert::From as
+/// Conv;`) hides the `use` keyword from [`is_use_start`] unless the attribute is
+/// split off first. When it is skipped, the binding is lost entirely, so an impl
+/// written with `Conv` is qualified with its own module (`m::Conv`) and the call the
+/// compiler resolved to the imported trait matches nothing -- a lost proof. The
+/// condition here is *enabled*, so the binding is the live one and the call must
+/// still reach the impl's body.
+#[test]
+fn a_same_line_cfg_import_is_read() {
+    let src = r#"
+pub mod m {
+    #[cfg(all())] use std::convert::From as Conv;
+    pub struct Local;
+    impl Conv<Local> for u16 { fn from(_: Local) -> Self { 107 } }
+}
+/// requires: true
+/// ensures: ret == 107
+pub fn same_line_live_import() -> u16 {
+    <u16 as std::convert::From<m::Local>>::from(m::Local)
+}
+"#;
+    let Some(o) = verify_src("same_line_live_import", src) else { return };
+    assert!(o.is_verified(), "a same-line cfg import must still bind, got: {o}");
+}
+
+/// A `#[cfg]` attribute that spans lines is read as a whole, not by its first line.
+///
+/// The same hazard as the one-line `#[cfg(any())]` case, but the attribute wraps, so
+/// the line directly above the `use` is its closing `)]` rather than its `#[cfg…`.
+/// A reader that inspects one line above the `use` sees `))]`, concludes there is no
+/// condition, treats the disabled import as live, and lets it displace the live
+/// alias -- recording the impl with the wrong trait and losing the call. The
+/// verifying entry is the evidence the live alias survives; the tripwire is the
+/// evidence the local body (returning `107`) answers, not the model.
+#[test]
+fn a_multiline_cfg_import_does_not_displace_a_live_alias() {
+    let src = r#"
+pub trait From { fn make() -> u8 { 0 } }
+pub mod m {
+    use std::convert::From as Conv;
+    pub struct Local;
+    impl Conv<Local> for u16 { fn from(_: Local) -> Self { 107 } }
+    #[cfg(all(
+        any(),
+    ))]
+    use crate::Other as Conv;
+}
+pub struct Other;
+/// requires: true
+/// ensures: ret == 107
+pub fn multi_cfg_live() -> u16 { <u16 as std::convert::From<m::Local>>::from(m::Local) }
+/// requires: true
+/// ensures: ret == 5
+pub fn multi_cfg_tripwire() -> u16 { <u16 as std::convert::From<m::Local>>::from(m::Local) }
+"#;
+    let Some(o) = verify_src("multi_cfg_live", src) else { return };
+    assert!(o.is_verified(), "a multi-line cfg import must not displace a live alias, got: {o}");
+    let Some(o) = verify_src("multi_cfg_tripwire", src) else { return };
+    match &o {
+        FnOutcome::Failed { kind, .. } => assert_eq!(kind, "postcondition", "got: {o}"),
+        _ => panic!("the live local body returns 107, so `ret == 5` must be refuted, got: {o}"),
+    }
+}
+
+/// A quoted delimiter in an attribute must not hide the `#[cfg]` above it.
+///
+/// `#[doc = "("]` holds an unmatched `(` inside a string. A reader that counts every
+/// character as a delimiter never finds the attribute's closing `]`, runs past it, and
+/// then reports the whole attribute run as unreadable -- so the disabled `#[cfg]`
+/// import above it is treated as live and displaces the live alias. The impl written
+/// with `Conv` is then recorded against the wrong trait and the call is lost
+/// (`converts a type the model does not hold`). The verifying entry is the evidence
+/// the live alias survives; the tripwire is the evidence the local body (returning
+/// `107`) answers, not the model.
+#[test]
+fn a_quoted_delimiter_does_not_hide_a_cfg_import() {
+    let src = r#"
+pub trait From { fn make() -> u8 { 0 } }
+pub mod m {
+    use std::convert::From as Conv;
+    pub struct Local;
+    impl Conv<Local> for u16 { fn from(_: Local) -> Self { 107 } }
+    #[cfg(any())]
+    #[doc = "("]
+    use crate::Other as Conv;
+}
+pub struct Other;
+/// requires: true
+/// ensures: ret == 107
+pub fn quoted_cfg_live() -> u16 { <u16 as std::convert::From<m::Local>>::from(m::Local) }
+/// requires: true
+/// ensures: ret == 5
+pub fn quoted_cfg_tripwire() -> u16 { <u16 as std::convert::From<m::Local>>::from(m::Local) }
+"#;
+    let Some(o) = verify_src("quoted_cfg_live", src) else { return };
+    assert!(o.is_verified(), "a quoted delimiter must not hide the cfg import, got: {o}");
+    let Some(o) = verify_src("quoted_cfg_tripwire", src) else { return };
+    match &o {
+        FnOutcome::Failed { kind, .. } => assert_eq!(kind, "postcondition", "got: {o}"),
+        _ => panic!("the live local body returns 107, so `ret == 5` must be refuted, got: {o}"),
+    }
+}
+
+/// The corpus pins both directions for the nested argument and the cfg alias.
+///
+/// The inline tests above use a small self-contained source; these entries sit in
+/// `examples/mir_targets/realistic.rs` beside the other trait-identity fixtures, so
+/// the two new spellings are exercised against the full corpus (where `conv_shim`
+/// already forces rustc to qualify the standard path) and not only in isolation.
+#[test]
+fn the_nested_argument_and_cfg_alias_fixtures_are_decided() {
+    let verified = [
+        "nested_trait_arg_finds_the_body",
+        "cfg_disabled_import_keeps_the_live_alias",
+        "cfg_multiline_import_keeps_the_live_alias",
+        "cfg_quoted_delimiter_keeps_the_live_alias",
+    ];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify from its local body, got: {o}");
+    }
+    let refuted = [
+        "nested_trait_arg_is_not_a_guess_tripwire",
+        "cfg_disabled_import_is_not_the_wrong_alias_tripwire",
+        "cfg_multiline_import_is_not_the_wrong_alias_tripwire",
+        "cfg_quoted_delimiter_is_not_the_wrong_alias_tripwire",
+    ];
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` is a false contract that must be refuted, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
     }
 }
 
@@ -2699,9 +3464,10 @@ fn a_named_const_item_is_inlined_at_its_use_site() {
 /// and each false twin must be refuted; a name that resolved to nothing (or to a
 /// wrong value) would leave the twin unproved or, worse, prove it.
 ///
-/// The two cases that are *refusals* rather than proofs are checked separately: an
-/// expression-bodied constant has no literal to fold, and a misspelled name is not
-/// an argument. Both must be `Skipped`, never `verified` and never a wrong value.
+/// The case that is a *refusal* rather than a proof is checked separately: a
+/// misspelled name is not an argument and must be `Skipped`, never `verified`.
+/// (An expression-bodied constant used to be the other refusal; it is folded now,
+/// and its resolution is asserted in the body of this test.)
 #[test]
 fn a_contract_may_name_a_const_item() {
     let Some(report) = verify_realistic(&[
@@ -2735,13 +3501,144 @@ fn a_contract_may_name_a_const_item() {
             "a wrong const value must not prove this; got: {o}"
         );
     }
-    for name in ["a_contract_names_an_expression_const", "a_misspelled_const_is_refused"] {
-        let o = outcome(&report, name);
-        assert!(
-            matches!(o, FnOutcome::Skipped { .. }),
-            "an unresolvable const name must be refused, not guessed; got: {o}"
-        );
-    }
+    // An *expression* const now resolves: the item is folded once, into the
+    // program's const table, so a contract naming it reads the same value the
+    // body's use site does.
+    let expr = outcome(&report, "a_contract_names_an_expression_const");
+    assert!(
+        expr.is_verified(),
+        "a contract must resolve an expression const now that it is folded; got: {expr}"
+    );
+    // A *misspelled* name is still refused, not guessed: folding must not turn an
+    // unknown name into a value.
+    let misspelled = outcome(&report, "a_misspelled_const_is_refused");
+    assert!(
+        matches!(misspelled, FnOutcome::Skipped { .. }),
+        "an unresolvable const name must be refused, not guessed; got: {misspelled}"
+    );
+}
+
+/// A `const` whose body is an *expression* is inlined, in both directions.
+///
+/// rustc prints such an item with its own locals and blocks (`const NEXT: u8 = {
+/// let mut _0: u8; ... _1 = AddWithOverflow(const LIMIT, const 1_u8); ... }`)
+/// rather than as a single literal, so the value lives in the body. The folder
+/// interprets that body concretely -- every operand is a literal, so the checked
+/// add folds and the body's own `assert(!overflow)` is checked -- and records the
+/// result in the program's const table. Both the body's use site and a contract
+/// that names the item then read the same value.
+///
+/// The false twin is the pin that matters: a *guessed* or mis-folded value would
+/// prove `ret == 10`, which is wrong. It must be refuted.
+#[test]
+fn an_expression_const_is_inlined_in_both_directions() {
+    let Some(report) = verify_realistic(&[
+        "named_const_of_an_expression_is_inlined",
+        "named_const_of_an_expression_is_inlined_cannot_prove_this",
+        "an_expression_const_keeps_its_width",
+    ]) else {
+        return;
+    };
+    let true_direction = outcome(&report, "named_const_of_an_expression_is_inlined");
+    assert!(
+        true_direction.is_verified(),
+        "an expression const must fold to its value; got: {true_direction}"
+    );
+    let false_direction =
+        outcome(&report, "named_const_of_an_expression_is_inlined_cannot_prove_this");
+    assert!(
+        matches!(false_direction, FnOutcome::Failed { .. }),
+        "`NEXT` is 11, so `ret == 10` must be refuted, not proved; got: {false_direction}"
+    );
+    // The folded value must keep the item's own width: a folder that dropped to
+    // `u8` would truncate `BIG == 300` and the contract would not decide.
+    let width = outcome(&report, "an_expression_const_keeps_its_width");
+    assert!(width.is_verified(), "an expression const keeps its width; got: {width}");
+}
+
+/// A comparison folded in a *constant* is read at its operands' type, not at the
+/// `bool` destination's.
+///
+/// rustc prints `const LESS: bool = -1i8 < 0i8` as `_0 = Lt(const -1_i8, const
+/// 0_i8)`: the return place is `bool`, but the operands are `i8`. Taking the width
+/// and signedness from the destination made the folder compare the `-1i8` pattern,
+/// 255, as *unsigned* -- so `-1i8 < 0i8` folded to `false`, and a contract claiming
+/// `ret == false` was *proved* from a wrong value. That is a false proof, not a lost
+/// one, which is why the false twin here is the load-bearing assertion.
+#[test]
+fn a_signed_comparison_const_uses_the_operand_type() {
+    let Some(report) = verify_realistic(&[
+        "a_signed_comparison_const_is_read",
+        "a_signed_comparison_const_is_read_cannot_prove_this",
+        "an_unsigned_comparison_const_is_read",
+    ]) else {
+        return;
+    };
+    let signed = outcome(&report, "a_signed_comparison_const_is_read");
+    assert!(
+        signed.is_verified(),
+        "`-1i8 < 0i8` is true and the contract must prove it; got: {signed}"
+    );
+    let false_direction = outcome(&report, "a_signed_comparison_const_is_read_cannot_prove_this");
+    assert!(
+        matches!(false_direction, FnOutcome::Failed { .. }),
+        "`LESS` is true, so `ret == false` must be refuted -- reading the operands \
+         as unsigned proves it from a wrong value; got: {false_direction}"
+    );
+    // The unsigned control folds the same way under either reading, so it pins
+    // that the fix did not simply invert every comparison.
+    let unsigned = outcome(&report, "an_unsigned_comparison_const_is_read");
+    assert!(unsigned.is_verified(), "`200u8 > 100u8` is true; got: {unsigned}");
+}
+
+/// A constant may name one the dump prints *after* it.
+///
+/// rustc keeps source declaration order, so `FWD_NEXT`'s expression body is printed
+/// before `FWD_LIMIT`'s literal. A single in-order pass folds `FWD_NEXT` while
+/// `FWD_LIMIT` is still unresolved and leaves the item unmodelled -- its contracts
+/// undecided. The fold runs to a fixpoint, so a later constant is seen. The false
+/// twin pins that the value is real: a guess would prove `ret == 12`.
+#[test]
+fn a_forward_referenced_const_is_resolved() {
+    let Some(report) = verify_realistic(&[
+        "a_forward_referenced_const_is_read",
+        "a_forward_referenced_const_is_read_cannot_prove_this",
+    ]) else {
+        return;
+    };
+    let resolved = outcome(&report, "a_forward_referenced_const_is_read");
+    assert!(
+        resolved.is_verified(),
+        "a constant may name a later one; the fold must reach a fixpoint; got: {resolved}"
+    );
+    let false_direction = outcome(&report, "a_forward_referenced_const_is_read_cannot_prove_this");
+    assert!(
+        matches!(false_direction, FnOutcome::Failed { .. }),
+        "`FWD_NEXT` is 11, so `ret == 12` must be refuted; got: {false_direction}"
+    );
+}
+
+/// A file that declares an *unused* 128-bit expression constant still verifies its
+/// smaller functions.
+///
+/// The parser reads every `const` definition when it loads a dump, including ones no
+/// target names. rustc prints an expression-bodied `i128` as an `AddWithOverflow` at
+/// width 128, and the folder's exact overflow test negates `1i128 << 127` --
+/// `i128::MIN` -- which panics in a debug build, taking the whole run down for an
+/// item nobody asked about. The width is refused, so the item is simply unmodelled
+/// and the verdicts still arrive.
+#[test]
+fn an_unused_i128_expression_const_does_not_abort_the_run() {
+    let Some(report) =
+        verify_realistic(&["a_file_with_an_unused_i128_const_still_verifies"])
+    else {
+        return;
+    };
+    let o = outcome(&report, "a_file_with_an_unused_i128_const_still_verifies");
+    assert!(
+        o.is_verified(),
+        "an unused i128 const must not abort the parse; got: {o}"
+    );
 }
 
 /// A function-local `const` is not in scope in another function.
@@ -3269,7 +4166,7 @@ fn a_reference_component_the_contract_does_not_name_does_not_skip_the_function()
 #[test]
 fn a_contract_naming_an_unknown_field_is_refused() {
     let mut args = std::collections::BTreeMap::new();
-    args.insert("c".to_string(), discharge::smt::var(8));
+    args.insert("c".to_string(), verif::smt::var(8));
     // `c` is a known aggregate with no bindings, so the refusal names the field.
     let mut env = spec::FieldEnv::default();
     env.declare_arg("c");
@@ -3290,7 +4187,7 @@ fn a_contract_naming_an_unknown_field_is_refused() {
 #[test]
 fn the_field_rewrite_does_not_fire_inside_a_longer_name() {
     let mut fields = spec::FieldEnv::default();
-    let c = discharge::smt::var(8);
+    let c = verif::smt::var(8);
     fields.bind_bits(1, "c", "lo", 0, 8, false).unwrap();
     let mut args = std::collections::BTreeMap::new();
     args.insert("myc".to_string(), c);
@@ -3376,8 +4273,8 @@ fn a_contract_naming_a_different_symbolic_index_is_refused() {
 /// is the kind of thing a later refactor silently drops.
 #[test]
 fn a_contract_error_quotes_the_source_text() {
-    use discharge::mir::spec;
-    use discharge::smt;
+    use verif::mir::spec;
+    use verif::smt;
     let mut fields = spec::FieldEnv::default();
     let mut args = std::collections::BTreeMap::new();
     // Bind `a[i]` as a symbolic subscript, so the rewrite fires. `i` is an
@@ -3652,7 +4549,7 @@ fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir()
-        .join(format!("discharge-{name}-{}-{seq}", std::process::id()));
+        .join(format!("verif-{name}-{}-{seq}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("probe.rs");
     std::fs::write(&file, src).expect("write probe");
@@ -3836,10 +4733,10 @@ pub fn reassigned_then_field(mut c: B, d: B) -> u8 {
 /// pins the function after the struct as still present and still decided.
 ///
 /// The `None` case is a *skip*, not a failure, like every other `rustc`-dependent
-/// test in this file: `verify_src` returns `None` when no `DISCHARGE_RUSTC` is
+/// test in this file: `verify_src` returns `None` when no `VERIF_RUSTC` is
 /// named, and there is nothing to assert about a compiler that is not there. This
 /// one used to `panic!` on `None`, which made the whole suite fail on a machine
-/// with no `DISCHARGE_RUSTC` -- the one test in the file that read "no compiler"
+/// with no `VERIF_RUSTC` -- the one test in the file that read "no compiler"
 /// as "a bug", so the suite's verdict depended on the environment rather than on
 /// the code. It is a skip now, and the reason is worth keeping: the property is
 /// real and worth pinning, but a missing toolchain is not evidence against it.
@@ -3911,7 +4808,7 @@ pub fn chain_must_be_read(a: [u8; 4], i: usize) -> u8 {
 }
 "#;
     let Some(rustc) = rustc() else { return };
-    let dir = std::env::temp_dir().join(format!("discharge-chain-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("verif-chain-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("chain.rs");
     std::fs::write(&file, src).expect("write probe");
@@ -6115,6 +7012,93 @@ fn a_string_literal_does_not_leak_a_local_const() {
     );
 }
 
+/// A local trait whose `from` shares `From`'s name must be answered by its own
+/// body, never by the conversion model.
+///
+/// The model refuses a module-qualified trait path (`conv_shim::From`) by name, so
+/// a call to it reaches the same-dump lookup. This is the false-proof direction:
+/// the body returns `7`, so `ret == x` is false at `x == 0`. If the model answered
+/// the call it would return `x` and *prove* the claim -- exactly the mistake the
+/// trait-path check exists to prevent. A module is used (not a crate-root trait)
+/// because a local `impl From<u8> for u16` at the crate root has a *separate*,
+/// pre-existing hazard in `resolve_callee`'s owner-type match.
+#[test]
+fn a_local_trait_from_is_answered_by_its_body() {
+    let src = r#"
+pub mod conv_shim {
+    pub trait From<T> {
+        fn from(t: T) -> Self;
+    }
+    impl From<u8> for u16 {
+        fn from(_t: u8) -> u16 {
+            7
+        }
+    }
+}
+/// requires: x == 0
+/// ensures: ret == x as u16
+pub fn local_from_is_not_the_model(x: u8) -> u16 {
+    conv_shim::From::from(x)
+}
+"#;
+    let Some(o) = verify_src("local_from_is_not_the_model", src) else { return };
+    let FnOutcome::Failed { ref kind, .. } = o else {
+        panic!("the local trait's body must refute the claim, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "got: {o}");
+}
+
+/// A widening conversion agrees with a plain `as` cast of the same shape.
+///
+/// `u16::from(x)` and `x as u16` are the same widening, so their results must be
+/// one term. The model builds the conversion through the same extension the cast
+/// arm uses; if the two ever disagreed, `ret == x as u16` would be refuted here.
+#[test]
+fn a_conversion_agrees_with_a_cast_of_the_same_shape() {
+    let src = r#"
+/// requires: true
+/// ensures: ret == x as u16
+pub fn from_matches_cast(x: u8) -> u16 {
+    u16::from(x)
+}
+/// requires: true
+/// ensures: ret == x as i32
+pub fn into_signed_matches_cast(x: i8) -> i32 {
+    x.into()
+}
+"#;
+    let Some(o) = verify_src("from_matches_cast", src) else { return };
+    assert!(o.is_verified(), "`u16::from(x)` must agree with `x as u16`; got: {o}");
+    let Some(o) = verify_src("into_signed_matches_cast", src) else { return };
+    assert!(o.is_verified(), "`x.into()` must agree with `x as i32`; got: {o}");
+}
+
+/// A call to an *unmodelled* conversion is reported unknown, not guessed.
+///
+/// `u8::from(true)` is a real `From` impl, but the source is a `bool`, which has no
+/// bit-vector the engine widens -- `u8` is one bit's worth of a value, but a `bool`
+/// local is a predicate, not a word. The model refuses it (rather than guessing a
+/// width from the destination alone), and the path is reported unknown. This pins
+/// that the refusal is a *reported* gap rather than a silent approximation.
+#[test]
+fn an_unmodelled_conversion_is_reported_unknown_not_guessed() {
+    let src = r#"
+/// requires: true
+/// ensures: ret == 1
+pub fn from_bool_is_unmodelled(flag: bool) -> u8 {
+    u8::from(flag)
+}
+"#;
+    let Some(o) = verify_src("from_bool_is_unmodelled", src) else { return };
+    assert!(
+        !o.is_verified(),
+        "a conversion the model does not hold must not verify; got: {o}"
+    );
+    let FnOutcome::Incomplete { .. } = o else {
+        panic!("an unmodelled conversion must be `Incomplete`, got: {o}");
+    };
+}
+
 /// F3: a call to an *external* static associated function must not be answered by
 /// a local method that merely shares its tail.
 ///
@@ -6127,8 +7111,11 @@ fn a_string_literal_does_not_leak_a_local_const() {
 ///
 /// The owner type now comes from the `impl` block's own source line, keyed by the
 /// location the dump prints, so the external call no longer matches the local
-/// method. The verdict must not be `Verified`; it is `Incomplete` here, which is
-/// the honest answer for a call the frontend does not model.
+/// method. The verdict is no longer `Verified`, and it is no longer merely
+/// `Incomplete` either: the intrinsic model now *answers* the conversion, so the
+/// fixture is refuted with a witness (`x == 0`, where `u16::from(x)` is `0`, not
+/// `99`). That is the stronger evidence -- the call is answered by `core`'s own
+/// conversion, and the local `from` is not consulted at all.
 #[test]
 fn an_external_static_call_is_not_answered_by_a_local_method() {
     let Some(report) = verify_realistic(&["a_static_call_resolves_to_its_own_impl_cannot_prove_this"])
@@ -6140,6 +7127,10 @@ fn an_external_static_call_is_not_answered_by_a_local_method() {
         !o.is_verified(),
         "a call to `u16::from` must not be answered by a local `from`; got: {o}"
     );
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("the modelled conversion must refute the fixture, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "got: {o}");
 }
 
 /// F3 companion: the owner-type check must not refuse a call to a *local* static
@@ -6270,7 +7261,7 @@ fn a_cfg_excluded_contract_does_not_steal_a_compiled_body() {
     let src = "pub mod a {\n    /// ensures: ret == 1\n    pub fn f() -> u8 { 1 }\n}\n\
                pub mod b {\n    pub mod a {\n        /// ensures: ret == 1\n        #[cfg(any())]\n        pub fn f() -> u8 { 2 }\n    }\n}\n";
     let rustc = rustc().expect("rustc");
-    let dir = std::env::temp_dir().join(format!("discharge-cfg-steal-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("verif-cfg-steal-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("probe.rs");
     std::fs::write(&file, src).expect("write probe");
@@ -6608,9 +7599,11 @@ fn a_nested_or_method_local_const_is_not_a_program_wide_name() {
 /// `_0` arm per branch (`bb1: _0 = const 7_u8`, `bb2: _0 = const 8_u8`). Folding
 /// the first arm stores `K = 7`, so `ensures: ret == 7` on a function that returns
 /// `K` is reported **verified** -- a false proof about a value the constant never
-/// has -- while the true claim `ret == 8` is refused. The fix refuses to fold a
-/// branching body at all, so both contracts go unreadable (a skip) rather than one
-/// being falsely proved.
+/// has -- while the true claim `ret == 8` is refused. The folder instead follows
+/// the `switchInt` on the discriminant's actual value, so it takes `bb2` and
+/// stores `K = 8`: the true claim decides and the false one is refuted. (An
+/// earlier fix refused a branching body outright; resolving the branch by value is
+/// strictly more coverage with the same soundness.)
 ///
 /// This is the *reachable* form of the bug: rustc emits a brace-block for an
 /// `if`-based constant on **current stable** as well as on 1.85, so the hole was
@@ -6627,9 +7620,9 @@ fn a_branching_const_does_not_fold_to_its_first_arm() {
         "`K` is 8, so `ret == 7` must not be reported verified, got: {false_claim}"
     );
     assert!(
-        !true_claim.is_verified(),
-        "a branching const body is not folded, so `ret == 8` is unreadable (a skip), \
-         not a proof, got: {true_claim}"
+        true_claim.is_verified(),
+        "a branching const body folds to the *taken* arm, so `ret == 8` decides; \
+         got: {true_claim}"
     );
 }
 
@@ -6643,7 +7636,7 @@ fn a_branching_const_does_not_fold_to_its_first_arm() {
 /// error to report, not a crash here.
 #[test]
 fn an_unclosed_block_comment_after_const_is_not_a_panic() {
-    use discharge::mir::spec;
+    use verif::mir::spec;
     for src in [
         "fn f<const /*",
         "fn f<const /*x",

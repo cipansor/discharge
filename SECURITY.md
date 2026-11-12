@@ -5,7 +5,7 @@
 Report vulnerabilities through **GitHub's private vulnerability reporting** on
 this repository:
 
-<https://github.com/cipansor/discharge/security/advisories/new>
+<https://github.com/cipansor/verif/security/advisories/new>
 
 That form is private: only the maintainers see the report until an advisory is
 published, and it gives us a place to discuss a fix and request a CVE in one
@@ -45,7 +45,7 @@ In scope:
   re-entrantly from an interrupt, is in scope. `scripts/gate.sh` step 16 pins the
   count and requires a `// SAFETY:` justification on every block, so this
   paragraph cannot drift from the code.
-- **The MIR frontend.** `discharge::mir` shells out to `rustc --emit=mir` and
+- **The MIR frontend.** `verif::mir` shells out to `rustc --emit=mir` and
   parses the textual dump. A crafted or merely unusual input that makes the
   parser accept something it should refuse (rather than failing closed) is in
   scope.
@@ -71,7 +71,7 @@ Stated plainly, so a report is not spent on a non-goal:
 
 - **It is a verifier, not a sandbox.** It reasons about code you give it; it
   does not contain code you run.
-- **The frontend is a development tool.** `discharge::mir` is `std`-only and
+- **The frontend is a development tool.** `verif::mir` is `std`-only and
   shells out to `rustc`. It is not part of the artifact that ships to a
   microcontroller. The embedded engine is.
 - **Zero dependencies is a security property, and it is checked in CI.** The

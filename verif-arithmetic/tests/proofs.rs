@@ -8,8 +8,8 @@
 //! hard way (see its `verify_accumulator_no_overflow`), and this module keeps the
 //! lesson.
 
-use discharge_arithmetic::prove::{self, Verdict, Witness};
-use discharge_arithmetic::*;
+use verif_arithmetic::prove::{self, Verdict, Witness};
+use verif_arithmetic::*;
 
 // ---------------------------------------------------------------------------
 // The obligations hold

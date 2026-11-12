@@ -2292,6 +2292,84 @@ fn call_type(name: &str) -> Option<String> {
     Some(base_type(name.rsplit_once("::")?.0))
 }
 
+/// Whether a name is `core`'s own `Ord::min`/`Ord::max` for a primitive type.
+///
+/// These are one of the two modelled shapes whose dump spelling carries no `<impl`
+/// -- a trait method names the trait, `<u8 as Ord>::min` -- so the executor's guard
+/// has to admit them by name. (The other is a conversion; see [`convert`], which
+/// checks its own name and types.) It admits only a *primitive* self type: a user
+/// type cannot be `Ord`'s receiver here, so `<MyType as Ord>::min` is refused even
+/// though `core` really does implement `Ord` for it. That is deliberate and it is
+/// the conservative direction -- the model has no definition for a user type's
+/// `min` anyway, and refusing it means a name that *could* be a local trait's is
+/// never answered by the model. The trait path must be the standard library's
+/// `Ord` (see [`intrinsics::names_ord_trait`]), so `m::Ord::min` and
+/// `MyOrd::min` are both refused. See [`try_intrinsic`].
+fn is_ord_callee(name: &str) -> bool {
+    if !intrinsics::names_ord_trait(name) {
+        return false;
+    }
+    let self_ty = call_type(name).unwrap_or_default();
+    matches!(self_ty.as_str(), "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16"
+        | "i32" | "i64" | "i128" | "isize")
+}
+
+/// Answer a widening conversion (`From::from`/`Into::into`), or report why not.
+///
+/// The two types come from the call's *name* (`<u16 as From<u8>>::from`), because
+/// the model's whole content is that they differ; the single argument's declared
+/// type would give the source twice. Both must be modelled integers, and the
+/// destination must be at least as wide as the source: a real integer `From` only
+/// widens, so anything else is not the method this model knows. A destination the
+/// engine cannot hold is refused by `int_width` (`u128`/`i128`), which is the
+/// honest answer rather than a truncated one.
+///
+/// The source's *signedness* comes from the name's source type, and is what the
+/// model extends by; the argument's own `Val` sign is deliberately not consulted,
+/// so the value and the extension cannot be read from different places and
+/// disagree. The result carries the destination's sign, since the local it is
+/// written to has the destination's type.
+fn convert(
+    name: &str,
+    kind: intrinsics::Conversion,
+    args: &[Operand],
+    dest: &Place,
+    env: &mut Env,
+) -> Result<(), String> {
+    let Some((src_ty, dst_ty)) = intrinsics::conversion_types(name, kind) else {
+        return Err(format!("unmodelled conversion `{name}`"));
+    };
+    let (Some(src_w), Some(dst_w)) =
+        (intrinsics::int_width(&src_ty), intrinsics::int_width(&dst_ty))
+    else {
+        return Err(format!("`{name}` converts a type the model does not hold"));
+    };
+    if dst_w < src_w {
+        return Err(format!("`{name}` is not a widening conversion"));
+    }
+    let Some(arg) = args.first() else {
+        return Err(format!("unmodelled arity for `{name}`"));
+    };
+    let Val::Sym(x, _) = operand(env, arg) else {
+        return Err(format!("unmodelled argument to `{name}`"));
+    };
+    // `w` and `signed` are the source's, `result_w` the destination's, so `eval`
+    // extends by the source sign to the destination width -- the one place the two
+    // types are both read.
+    let Some(intrinsics::Outcome::Value(v)) = intrinsics::eval(
+        intrinsics::Intrinsic::Conversion(kind),
+        x,
+        x,
+        src_w,
+        src_ty.is_signed(),
+        dst_w,
+    ) else {
+        return Err(format!("`{name}` past what the model covers"));
+    };
+    env.set(dest, Val::Sym(v, Sign::of(&dst_ty)));
+    Ok(())
+}
+
 /// The `self` type of an *instance* method, read from its receiver's declared
 /// type.
 ///
@@ -2350,6 +2428,198 @@ fn method_owner_type(prog: &MirProgram, f: &MirFn) -> Option<String> {
     prog.impl_owners.get(&loc).cloned()
 }
 
+/// The trait a *call* names, as the path between `as` and `>`, or `None` when the
+/// call is not a trait call.
+///
+/// `Some("std::convert::From")` for `<u16 as std::convert::From<u8>>::from`,
+/// `Some("From")` for `<u16 as From<u8>>::from`, and `None` for an inherent call
+/// like `Vec2::push` or `<impl at …>::m`. The ` as `-delimited projection is what
+/// rustc prints for a trait method call, so the trait path is read there and
+/// nowhere else -- a bare `Type::m` has no trait to compare.
+fn call_trait_path(name: &str) -> Option<String> {
+    let after = name.rsplit_once(" as ")?.1;
+    let (trait_ty, _) = after.split_once(">::")?;
+    Some(trait_ty.split_once('<').map(|(t, _)| t).unwrap_or(trait_ty).trim().to_string())
+}
+
+/// The trait *arguments* a call instantiates, as written: `u8` for
+/// `<u16 as From<u8>>::from`, `Option<u8>` for `<W as Wrap<Option<u8>>>::get`, and
+/// `None` for a call with no generic arguments (`<Foo as Trait>::m`) or one that is
+/// not a trait call.
+///
+/// A `From<Local>` impl and the library's `From<u8>` impl share both the trait path
+/// (`From`) and the owner (`u16`), so the *argument* is the only thing separating
+/// them, and it is what a call to the wrong one would answer from. Returning the
+/// whole list (`From<u8, u8>` gives `u8, u8`) keeps the identity exact rather than
+/// sampling the first parameter. See [`trait_candidate_admits`].
+///
+/// The argument is read with [`crate::mir::spec::angle_inner`], the same balanced
+/// reader the `impl` side uses, so the two spellings are compared as written. A
+/// "strip trailing `>`" reading would cut *every* closing bracket off a nested
+/// argument (`Wrap<Option<u8>>` -> `Option<u8`), which no impl's balanced reading
+/// equals, so a call to such a trait would be refused -- a lost proof.
+fn call_trait_args(name: &str) -> Option<String> {
+    let after = name.rsplit_once(" as ")?.1;
+    // `after` is `TRAIT<…>>::method`; the first `>::` closes the trait's own
+    // argument list and the projection, so the text before it is the trait as
+    // written. See [`crate::mir::spec::angle_inner`] for the balanced read.
+    let (trait_ty, _) = after.split_once(">::")?;
+    let inner = crate::mir::spec::angle_inner(trait_ty)?;
+    (!inner.is_empty()).then(|| inner.to_string())
+}
+
+/// Whether a local method candidate may answer a *trait* call.
+///
+/// `want` is the trait path the call names (`std::convert::From`); `have` is the
+/// path the candidate's own `impl` block implements, read from the source, or
+/// `None` for an inherent `impl`. `want_args`/`have_args` are the two sides'
+/// generic arguments as written (`u8` for both sides of `<u16 as From<u8>>::from`
+/// against `impl From<u8> for u16`), or `None` when a side names none.
+///
+/// The rule is an identity match, not a suffix match. rustc prints a trait in a
+/// call as its *shortest crate-unique* path, so a bare `Trait` in the dump names
+/// this crate's crate-root trait only when the crate declares one; when it does
+/// not, the bare name is the shortening of the crate's *only* trait of that name
+/// (or an external trait), and the candidate's module-qualified path is what
+/// tells which. A suffix match would accept the unrelated `m::Trait` for a bare
+/// `Trait` call -- a false proof -- so the two spellings are reconciled exactly:
+///
+/// * identical paths match (`std::convert::From` vs `std::convert::From`);
+/// * a bare `want` (`From`) matches the candidate when the crate declares no
+///   trait of that name at all, or declares exactly one, and `have` is it -- the
+///   compiler would have printed that trait bare, so the candidate is the one the
+///   call named;
+/// * a bare `have` (`From`) matches a qualified `want` (`std::convert::From`)
+///   only when the crate declares no local trait of that name, so the bare name
+///   can only be the library trait -- and it is a `::`-aligned tail of `want`, so
+///   the two name the same trait.
+///
+/// Every name match is then held to the *instantiation*. A generic trait's
+/// identity is not its path alone: `impl From<Local> for u16` and the library's
+/// `impl From<u8> for u16` share path, owner and method, and differ only in the
+/// trait's argument, so a call to one answered from the other's body is a false
+/// proof. Two written forms are compared when both sides name arguments: they must
+/// be *equal*. An unknown side (`None`) is refused rather than waved through,
+/// because a candidate whose arguments could not be read might be the very impl
+/// the call did not name.
+///
+/// Everything else is refused. An inherent candidate (`have` is `None`) can never
+/// answer a trait call: its method is not the trait's. That is what closes the
+/// `impl MyFrom<u8> for u16` case, where the impl's *trait* differs from the
+/// call's even though the method tail (`from`) matches.
+///
+/// A trait call with no candidate to compare against is the caller's business; an
+/// exact-name match is handled before this is reached.
+fn trait_candidate_admits(
+    prog: &MirProgram,
+    want: &str,
+    have: Option<&str>,
+    want_args: Option<&str>,
+    have_args: Option<&str>,
+) -> bool {
+    let Some(have) = have else {
+        return false;
+    };
+    let names_match = if have == want {
+        true
+    } else if want.contains("::") {
+        // `want` is qualified, so it is not the crate-root trait. `have` may be the
+        // bare tail rustc prints for the crate's *unique* trait of that name, which
+        // is this same trait only when it is that one.
+        crate::mir::spec::is_path_suffix(want, have)
+            && local_traits_named(prog, want).is_some_and(|only| only.len() == 1 && only[0] == have)
+    } else {
+        // `want` is bare. rustc prints it that way for the crate's unique trait of
+        // that name, or for the crate-root trait when several share the name, or for
+        // an external trait it could not shorten further.
+        match local_traits_named(prog, want) {
+            // No local trait of that name: the bare name is an external trait. A
+            // local `impl` of it is still this crate's impl of *that* trait, so it
+            // may answer the call -- the instantiation check below is what keeps it
+            // from answering a call to a *different* instantiation of the trait.
+            None => true,
+            // The crate's only trait of that name -- the one rustc prints bare.
+            Some(only) if only.len() == 1 => only[0] == have,
+            // Several share the name: rustc prints the crate-root one bare, and that
+            // is the `have == want` case handled above.
+            Some(_) => false,
+        }
+    };
+    if !names_match {
+        return false;
+    }
+    // The instantiation. Both sides must name the same arguments; an unreadable side
+    // is refused, since it could be the impl the call did not name.
+    match (want_args, have_args) {
+        (Some(w), Some(h)) => args_match(w, h),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Whether a call's trait argument and a candidate `impl`'s own name the same
+/// instantiation.
+///
+/// The two come from different places: the call's from the MIR dump, the impl's from
+/// the source, and rustc prints a type with its *shortest crate-unique* path. So a
+/// source `impl From<crate::Local> for u16` prints its call's argument as the bare
+/// `Local`, and comparing the written forms would refuse the impl's own call. A
+/// *bare* dump argument names a type unique in the crate, so a module-qualified
+/// source spelling of it is that same type; a *qualified* dump argument is compared
+/// exactly, so an `impl From<a::Local> for u16` cannot answer a call naming
+/// `b::Local`. See [`trait_candidate_admits`].
+fn args_match(want: &str, have: &str) -> bool {
+    want == have || (!want.contains("::") && have.rsplit("::").next() == Some(want))
+}
+
+/// The local traits declared with the last segment `name`, as their
+/// module-qualified paths; `None` when the crate declares none.
+///
+/// rustc prints a trait in a call as its shortest crate-unique path, so this set
+/// is exactly what decides whether a bare call name is this crate's trait (and
+/// which one) or must be an external trait. See [`trait_candidate_admits`].
+fn local_traits_named(prog: &MirProgram, name: &str) -> Option<Vec<String>> {
+    let bare = name.rsplit("::").next().unwrap_or(name);
+    let hits: Vec<String> = prog
+        .declared_traits
+        .iter()
+        .filter(|t| t.rsplit("::").next() == Some(bare))
+        .cloned()
+        .collect();
+    (!hits.is_empty()).then_some(hits)
+}
+
+/// Whether a call's self type, method and *trait path* name a method some local
+/// trait `impl` declares.
+///
+/// rustc prints a trait call with the trait path (`<W as From<u8>>::from`), not
+/// the `impl` location, so [`resolve_callee`] cannot match it by location. The two
+/// still name the same method exactly when the call's self type is the impl's
+/// owner, the call's method tail is a method that impl declares, and the call's
+/// trait is the impl's own trait under the identity rule of
+/// [`trait_candidate_admits`] -- an unrelated same-owner trait must not match. This
+/// keeps a *local* trait method from being answered by the model even when the
+/// trait's name is not declared in this crate: `use std::convert::From;` plus a
+/// local `impl From<u8> for W` prints its call `<W as From<u8>>::from`, whose tail
+/// `from` would otherwise be modelled as `core`'s conversion -- a false proof. A
+/// local `impl conv_shim::From for u16`, by contrast, does not name the call's
+/// `std::convert::From`, so the library conversion is still modelled. See
+/// [`try_intrinsic`].
+fn local_impl_declares(prog: &MirProgram, self_ty: &str, method_tail: &str, want: &str, want_args: Option<&str>) -> bool {
+    prog.fns.iter().any(|g| {
+        let Some(loc) = impl_self_loc(g) else {
+            return false;
+        };
+        let Some(have_trait) = prog.impl_traits.get(&loc).map(String::as_str) else {
+            return false;
+        };
+        let have_args = prog.impl_trait_args.get(&loc).map(String::as_str);
+        g.name.rsplit("::").next() == Some(method_tail)
+            && method_owner_type(prog, g).is_some_and(|owner| owner == self_ty)
+            && trait_candidate_admits(prog, want, Some(have_trait), want_args, have_args)
+    })
+}
+
 /// Resolve a call name to the function in the dump it names.
 ///
 /// An exact match is the free-function case: rustc prints a same-crate free
@@ -2373,6 +2643,14 @@ fn method_owner_type(prog: &MirProgram, f: &MirFn) -> Option<String> {
 ///   cannot be established the candidate is refused, because a static method's
 ///   tail is otherwise shared by any type (`<u16 as From<u8>>::from` would answer
 ///   a local `impl Foo { fn from }`, a false proof).
+/// * A *trait* call must agree on the trait. The owner type is not enough: a local
+///   `impl From<u8> for u16` and the standard library's `impl From<u8> for u16`
+///   share both the tail `from` and the owner `u16`, so owner-matching alone let
+///   the local body answer `<u16 as std::convert::From<u8>>::from`, a false proof
+///   of a call the compiler resolved to the library. The call's trait path must
+///   name the candidate `impl`'s own trait, and the two must instantiate it the
+///   same way (see [`trait_candidate_admits`]), which the source records. An
+///   *inherent* candidate never answers a trait call.
 /// * A free function never matches a qualified call, because rustc prints a
 ///   same-crate free function's call bare -- the exact-match case above.
 ///
@@ -2387,22 +2665,83 @@ fn resolve_callee(prog: &MirProgram, name: &str) -> Option<usize> {
     }
     let tail = name.rsplit("::").next()?;
     let want_ty = call_type(name)?;
+    // The trait the call names, when it is a trait call (`<T as Trait<..>>::m`).
+    // `None` for a bare `Type::m`, which rustc prints for both an inherent method
+    // and a trait method in scope, so no trait check applies there.
+    let want_trait = call_trait_path(name);
+    let want_args = call_trait_args(name);
     let mut hits = prog.fns.iter().enumerate().filter(|(_, g)| {
         if g.name.rsplit("::").next() != Some(tail) {
             return false;
         }
-        match method_self_type(g) {
+        let self_matches = match method_self_type(g) {
             Some(self_ty) => self_ty == want_ty,
             None => match method_owner_type(prog, g) {
                 Some(owner_ty) => owner_ty == want_ty,
                 None => false,
             },
+        };
+        if !self_matches {
+            return false;
+        }
+        // The candidate's own trait, from its `impl` block's location.
+        let have_trait = impl_self_loc(g)
+            .and_then(|loc| prog.impl_traits.get(&loc))
+            .map(String::as_str);
+        let have_args = impl_self_loc(g)
+            .and_then(|loc| prog.impl_trait_args.get(&loc))
+            .map(String::as_str);
+        match want_trait.as_deref() {
+            Some(want) => trait_candidate_admits(prog, want, have_trait, want_args.as_deref(), have_args),
+            // An inherent-looking call (`MyType::from`, with no ` as ` projection).
+            // rustc prints both an inherent method and a trait method in scope this
+            // way, so the candidate is *not* required to be inherent -- a bare
+            // `MyType::from` that resolves to a trait impl is legitimate. The owner
+            // match alone is as strong as it was before the trait check existed, and
+            // the ambiguity that would make it unsafe (two `from`s in scope, so
+            // rustc could not pick one) does not compile.
+            None => true,
         }
     });
-    match (hits.next(), hits.next()) {
-        (Some((i, _)), None) => Some(i),
-        _ => None,
+    let first = hits.next();
+    let second = hits.next();
+    if let (Some((i, _)), None) = (first, second) {
+        return Some(i);
     }
+    // Reaching here means the search found no *single* impl candidate. Two or more
+    // hits are ambiguous, so the call is refused rather than guessed at -- and
+    // crucially not answered from the trait's default, which would verify a contract
+    // against a body an override replaced (a false proof). The default is the body
+    // Rust calls only when *no* impl candidate exists at all: an impl that does not
+    // override the method emits no `<impl at …>::m`, so the search finds nothing and
+    // the default is the only body. See the default branch below.
+    if first.is_some() {
+        return None;
+    }
+    // A trait's *default* method has no `impl` block in the dump: rustc prints its
+    // definition as `Trait::m` -- the trait's path, with no `<impl at` -- so the
+    // location lookup above cannot find it and its `self` type is the trait's
+    // `Self`. Match it by the trait path the call names and the method tail, and
+    // only when the two trait paths are *equal*: a default method is the only body
+    // for its trait, so the definition and the call print the same path for it,
+    // whereas admitting a bare local trait for a qualified call
+    // (`<u8 as std::cmp::Ord>::min` against a crate-root `Ord::min`) would be a
+    // false proof. See [`trait_candidate_admits`].
+    if let Some(want) = want_trait.as_deref() {
+        let owner = |g: &MirFn| {
+            let prefix = g.name.strip_suffix(tail)?;
+            let prefix = prefix.strip_suffix("::")?;
+            (!prefix.is_empty()).then(|| prefix.to_string())
+        };
+        if let Some(i) = prog.fns.iter().position(|g| {
+            g.impl_loc.is_none()
+                && g.name.rsplit("::").next() == Some(tail)
+                && owner(g).is_some_and(|have| have == want)
+        }) {
+            return Some(i);
+        }
+    }
+    None
 }
 
 /// Answer a self-recursive call by its contract instead of inlining it.
@@ -2721,6 +3060,78 @@ fn try_intrinsic(
     env: &mut Env,
 ) -> Option<Result<(), String>> {
     let op = intrinsics::classify(name)?;
+    // A modelled method is only ever `core`'s own, and rustc prints a `core`
+    // integer method's call with the `<impl …>` projection (`core::num::<impl
+    // u8>::wrapping_add`). A *local* method never carries it: a trait impl's call
+    // is `<u8 as Trait>::m` and its body is `<impl at …>::m`, so a name without
+    // `<impl` is a same-dump call and must be answered by its body, never by the
+    // model. Without this, a `Trait::is_power_of_two` on `u8` that returns `false`
+    // is modelled as `core`'s predicate and *proves* `ensures: ret == true` at
+    // `x == 1` -- a false proof of a body that disagrees with `core`. The caller
+    // already resolves same-dump names first (see the `Call` term), so this is the
+    // local half of the same guard: it keeps `try_intrinsic` from ever answering
+    // for a name that could name a local body. The direction is a refusal, so a
+    // spelling the guard misjudges loses a proof rather than inventing one.
+    //
+    // `Ord::min`/`Ord::max` are the one exception, and only because they cannot be
+    // spelled with `<impl`: a *trait* method's call names the trait, `<u8 as
+    // Ord>::min`, never the `core::num::<impl u8>` inherent path. Refusing every
+    // such name would make them permanently unmodellable. What keeps the exception
+    // sound is the same thing that keeps the guard sound -- the caller resolving a
+    // same-dump body first -- plus `classify` accepting `min`/`max` only when the
+    // trait path is the standard library's `Ord` (a module-qualified `m::Ord` is
+    // refused) and only for a *primitive* self type (see `is_ord_callee`): a
+    // crate-root trait named `Ord` is the one spelling that could name a local
+    // body, and it is in the dump, so `resolve_callee` finds it first and the model
+    // is never consulted for it.
+    //
+    // `From`/`Into` are the same shape of exception for the same reason: a
+    // conversion is a trait method, spelled `<u16 as From<u8>>::from`, with no
+    // `<impl`. The extra care they need is that the two operand types differ, so
+    // the model reads both from the name and refuses anything that is not a
+    // widening between modelled integers (see the branch below). The crate-root
+    // collision -- a user `From` that prints as the bare `From` -- is again closed
+    // by the same-dump lookup, not by the name.
+    let trait_method =
+        is_ord_callee(name) || matches!(op, intrinsics::Intrinsic::Conversion(_));
+    if !name.contains("<impl") && !trait_method {
+        return None;
+    }
+    // A *bare* trait path that names a local crate-root trait must not be answered
+    // by the model. rustc prints a crate-root trait's call bare (`<u8 as Ord>::min`),
+    // so a local `trait Ord` with a *default* body the dump prints as `Ord::min`
+    // (no `<impl`, so `resolve_callee` cannot match it) would otherwise be answered
+    // by `core`'s ordering -- a false proof of a call the compiler resolved to the
+    // local trait. A qualified path (`std::cmp::Ord`, `std::convert::From`) cannot
+    // name a local item, and a bare path with no local crate-root trait of that
+    // name is the library trait rustc shortened, so both are still modelled. See
+    // [`trait_candidate_admits`] for the same identity rule on the body side.
+    if let Some(t) = call_trait_path(name) {
+        if !t.contains("::") && prog.declared_traits.contains(&t) {
+            return None;
+        }
+    }
+    // A trait call whose self type and method a *local* trait impl declares must be
+    // answered by that body, not the model -- even when the trait's name is not
+    // declared here (`use std::convert::From;`). rustc prints the call with the
+    // trait path rather than the impl location, so the location lookup above cannot
+    // see it, but the owner type and the method tail name the same method exactly.
+    // Answering `<W as From<u8>>::from` from the model would be a false proof of a
+    // conversion the compiler resolved to the local body. See [`local_impl_declares`].
+    if let Some(t) = call_trait_path(name) {
+        let self_ty = call_type(name).unwrap_or_default();
+        let tail = name.rsplit("::").next().unwrap_or(name);
+        if local_impl_declares(prog, &self_ty, tail, &t, call_trait_args(name).as_deref()) {
+            return None;
+        }
+    }
+    // A conversion is the one shape whose *two operand types* differ, so it reads
+    // both from the call's own name rather than from the single argument's type,
+    // and it is answered before the generic operand read below (which assumes one
+    // width for every operand).
+    if let intrinsics::Intrinsic::Conversion(kind) = op {
+        return Some(convert(name, kind, args, dest, env));
+    }
     let cur = &prog.fns[func];
     // The operand width, from the first argument's declared type. It is not the
     // destination's: `checked_add` on a `u8` writes an `Option<u8>`, and taking
@@ -2745,11 +3156,13 @@ fn try_intrinsic(
     if op.is_unary() {
         // A bit count does not read the sign at all -- the bits of a negative
         // value are just bits -- so a dump that did not print one is still
-        // modelled. A unary *operator* does read it, because `neg` and `abs`
-        // mean different things on the two types, so a missing sign is refused
-        // there rather than guessed.
+        // modelled. A unary *operator* and the `bool` predicate both read it:
+        // `neg` and `abs` mean different things on the two types, and
+        // `is_power_of_two` exists only on the unsigned ones. A missing sign is
+        // refused there rather than guessed, and a printed *signed* one makes
+        // `eval` decline, so a signed operand cannot be read as an unsigned one.
         let signed = match op {
-            intrinsics::Intrinsic::Unary(..) => sign.known()?,
+            intrinsics::Intrinsic::Unary(..) | intrinsics::Intrinsic::Bool(_) => sign.known()?,
             _ => false,
         };
         // A bit count returns a type wider than its operand (`u8` -> `u32`), so
@@ -2789,6 +3202,14 @@ fn try_intrinsic(
                 let field = |i| Place { local: dest.local, proj: vec![Proj::Field(i)] };
                 env.set(&field(0), Val::Sym(value, Sign::of_bool(signed)));
                 env.set(&field(1), Val::Bool(overflowed));
+                Ok(())
+            }
+            Outcome::Bool(p) => {
+                // `is_power_of_two` returns a `bool` and nothing else. The
+                // destination local is a `bool`, so the predicate is written as
+                // one; a one-bit *word* here would leave the local readable only
+                // as a word, and the `if` that consumes it reads a predicate.
+                env.set(dest, Val::Bool(p));
                 Ok(())
             }
         });
@@ -2839,6 +3260,9 @@ fn try_intrinsic(
                 env.set(&field(1), Val::Bool(overflowed));
                 Ok(())
             }
+            // A `bool` predicate is unary (`is_power_of_two` is the only one),
+            // so it never reaches the `pow` path.
+            Outcome::Bool(_) => unreachable!("a bool predicate is unary"),
         });
     }
     let y = match args.get(1) {
@@ -2876,6 +3300,8 @@ fn try_intrinsic(
             env.set(&field(0), Val::Sym(value, sign));
             env.set(&field(1), Val::Bool(overflowed));
         }
+        // A `bool` predicate is unary, so it never reaches the two-operand path.
+        Outcome::Bool(_) => unreachable!("a bool predicate is unary"),
     }
     Some(Ok(()))
 }
@@ -3611,8 +4037,22 @@ where
             // same-dump name, so a user `wrapping_add` and `u8::wrapping_add` can
             // coexist: the first is inlined by the exact match, the second falls
             // through to the model.
-            let exact = prog.fns.iter().position(|g| g.name == *name);
-            if exact.is_none() {
+            //
+            // The same-dump lookup has to run on the *resolved* name, not only on the
+            // exact one, and the model is only a fallback once that fails. A local
+            // trait impl prints its *call* as `<u8 as Trait>::is_power_of_two` but its
+            // *definition* as `<impl at FILE:L:C: L:C>::is_power_of_two`, so the exact
+            // name never matches and the suffix classifies -- answering the call from
+            // `core`'s model instead of the user's body. A `Trait::is_power_of_two`
+            // for `u8` that returns `false` then *proves* `ensures: ret == true` at
+            // `x == 1`, a false proof of a trait implementation that disagrees with
+            // `core`. So [`resolve_callee`] is consulted first (it already refuses a
+            // name that carries `<impl`, which is every real intrinsic call, and
+            // requires the method's `self` type to agree), and the model answers only
+            // when no same-dump body was found. See [`try_intrinsic`] for the second
+            // half of the guard.
+            let same_dump = resolve_callee(prog, name);
+            if same_dump.is_none() {
                 if let Some(done) =
                     try_intrinsic(prog, st.frame.func, name, args, dest, &mut st.env)
                 {
@@ -3643,7 +4083,7 @@ where
             // share one. Inlining the wrong body is a false proof, so the tail
             // match also requires the same method `self` type and a unique
             // candidate; see [`resolve_callee`].
-            let inline_idx = resolve_callee(prog, name);
+            let inline_idx = same_dump;
             let Some(idx) = inline_idx else {
                 report.unknown_paths.push(format!("call to unmodelled function `{name}`"));
                 return;
@@ -4745,26 +5185,15 @@ fn overflow_pred(op: BinOp, a: Val, b: Val, w: u8) -> Option<Pred> {
         BinOp::Sub => smt::ult(x, y),
         // `x * y` wraps exactly when the exact product needs more than `w` bits.
         //
-        // The two signs need different tests, and only the signed one widens.
-        // Unsigned `x * y` wraps exactly when `y != 0 && x > MAX / y`, which is a
-        // division and needs no wide product at all -- see the arm below. The
-        // *signed* predicate is about the sign-extended product, and there is no
-        // division form that is exact for every combination of the three signs, so
-        // it is computed by widening: `smt::truncate` zero-extends when the target
-        // width is larger, so the operands are widened to `2w`, multiplied exactly
-        // there, and compared with the sign-extension of the wrapped result. Either
-        // way the test is exact rather than a sufficient condition, which matters
-        // because a too-weak predicate here would make the `assert` look
-        // dischargeable and report an overflowing function as panic-free.
-        //
-        // Widening is where signedness matters, and the direction is worth being
-        // exact about. rustc computes the *sign-extended* product and then tests
-        // whether it equals the `w`-bit result sign-extended back to `2w`. That
-        // test is about magnitudes, so it is neither "the unsigned product is
-        // below `2^w`" (which fires spuriously for `-1 * -1` at `i8`) nor the
-        // `2^(2w-1)` magnitude rule (which fires spuriously for `-128 * 1`). The
-        // sign-extended product is built here, and the equality is what is
-        // checked.
+        // Neither sign needs a wide product. Unsigned `x * y` wraps exactly when
+        // `y != 0 && x > MAX / y`; the *signed* form is `|x| > limit / |y|` with
+        // `y != 0`, where `limit` is `2^(w-1) - 1` for same signs and `2^(w-1)` for
+        // different ones. Both are divisions, and both are exact rather than
+        // sufficient, which matters because a too-weak predicate here would make
+        // the `assert` look dischargeable and report an overflowing function as
+        // panic-free. The signed form used to widen to `2w` and compare with the
+        // sign-extended wrapped result -- the BDD wall -- which is why it refused
+        // past 16 bits; see the arms below.
         BinOp::Mul => {
             // Both operands constant: the product is a literal, so the overflow
             // is a literal too. This arm is reachable only once an argument can
@@ -4845,34 +5274,54 @@ fn overflow_pred(op: BinOp, a: Val, b: Val, w: u8) -> Option<Pred> {
                 let over = smt::ult(smt::udiv(smt::word(max, w), y), x);
                 return Some(smt::and(nonzero, over));
             }
-            let wide = w.saturating_mul(2).min(64);
-            if wide <= w {
-                // Signed at the widest supported width: the sign-extended product
-                // needs `2w` bits and there is nowhere to put them, so no sound
-                // predicate is available.
-                return None;
-            }
-            // Signed, non-constant. The widened product is a BDD-hostile shape -- a
-            // `2w`-bit multiplier is the scaling wall this crate documents -- so past
-            // 16 bits the query is not worth posing. A verifier that declines is
-            // better than one that hangs, and a *weaker* predicate here would be worse
-            // than either, because it would make an overflowing function look
-            // panic-free. (An unsigned operand no longer takes this path: the exact
-            // division test above replaces the widening there.)
-            if wide > 16 {
-                return None;
-            }
-            // Sign-extend the operands, so the product is exact; the
-            // `2w`-bit product of two `w`-bit signed values always fits in
-            // `2w` signed bits, so this multiply cannot itself wrap.
-            let exact = smt::mul(smt::sign_extend(x, wide), smt::sign_extend(y, wide));
-            // The exact product is right exactly when it equals the `w`-bit
-            // wrapped result *sign-extended* back to `2w`. Sign-extending the
-            // wrapped result is what makes this rustc's test rather than a
-            // magnitude test -- comparing a zero-extended result would fire
-            // on every negative product.
-            let want = smt::sign_extend(smt::mul(x, y), wide);
-            smt::not(smt::eq(exact, want))
+            // Signed, non-constant, and no longer widened.
+            //
+            // The old path widened both operands to `2w`, multiplied there and
+            // compared with the sign-extension of the wrapped result. That is a
+            // `2w`-bit multiplier -- the BDD scaling wall this crate documents -- so
+            // it was refused past 16 bits, and every signed multiply of two
+            // non-constant values in `i32`/`i64` code came back `incomplete`. The
+            // refusal was justified by the comment that "there is no division form
+            // that is exact for every combination of the three signs". That is
+            // false, and the exact form is the one below, which is the same safe
+            // interval `signed_mul_wraps_at` computes for a constant operand:
+            // `|x|` against the largest magnitude the divisor permits.
+            //
+            // Only two signs matter, not three. Same signs multiply positive, so
+            // the bound is `mx = 2^(w-1) - 1`; different signs multiply negative, so
+            // it is `2^(w-1)`, the magnitude of `mn`. `|mn|` is one past `mx`, which
+            // is why the two ends are not one number, and it is exactly the `-1` in
+            // `MIN * -1` -- that pair is the different-signs bound reached at the
+            // extreme, so it needs no special case here (unlike the round-trip
+            // formulation, which cannot see it and has to name it).
+            //
+            // Magnitudes rather than signed operands: the division is unsigned, and
+            // negating `MIN` wraps back to `MIN`, whose bit pattern *is* `2^(w-1)`,
+            // so the plain wrapping subtract is the right magnitude for every input
+            // -- the same reasoning the signed divider above uses. No `2w`-bit
+            // product is built, so this works at `w == 64`, where the old path had
+            // no predicate at all.
+            let (_, mx) = signed_range(w);
+            let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+            let zero = smt::word(0, w);
+            let magnitude = |v: Var| smt::ite(smt::negative(v), smt::sub(zero, v), v);
+            // `y != 0`, so the division is defined. The engine gives `x / 0` a
+            // defined value rather than trapping it, so without this the zero divisor
+            // would contribute an answer of its own -- and `x * 0` never overflows.
+            let nonzero = smt::not(smt::eq(y, zero));
+            // The largest `|x|` that pairs with this `|y|` and stays in range, chosen
+            // by whether the product is positive or negative.
+            let same_sign = smt::iff(smt::negative(x), smt::negative(y));
+            let limit = smt::ite(
+                same_sign,
+                smt::word((mx as u64) & mask, w),
+                smt::word(1u64 << (w - 1), w),
+            );
+            // `|x| > floor(limit / |y|)`, unsigned. `udiv` truncates, so the
+            // comparison is strict and equality is the safe boundary -- `42 * 3` is
+            // `126` and `43 * 3` is `129`, and the test below probes either side.
+            let over = smt::ult(smt::udiv(limit, magnitude(y)), magnitude(x));
+            smt::and(nonzero, over)
         }
         _ => return None,
     })
@@ -4883,7 +5332,7 @@ mod tests {
     //! aggregation built on it.
     //!
     //! Every other check on this logic lives in `tests/mir.rs`, which needs
-    //! `DISCHARGE_RUSTC` pointing at a nightly compiler and *skips itself* without
+    //! `VERIF_RUSTC` pointing at a nightly compiler and *skips itself* without
     //! one. A skipped test still reports `ok`, so the suite count is the same
     //! whether the polarity is exercised or not: 325 with the nightly, 325
     //! without. On a stable-only machine the rule below had no teeth at all.
@@ -5232,7 +5681,7 @@ mod tests {
     /// is reported rather than hidden.
     ///
     /// The MIR is embedded so the test runs on stable. `tests/mir.rs` covers the
-    /// same function end-to-end but skips itself without `DISCHARGE_RUSTC`.
+    /// same function end-to-end but skips itself without `VERIF_RUSTC`.
     #[test]
     fn a_branching_loop_reports_a_path_budget_rather_than_running_forever() {
         const COUNT_EVENS_MIR: &str = r#"
@@ -5785,6 +6234,150 @@ fn count_via_helper(_1: u8) -> u8 {
                     wraps(64, c, v)
                 );
             }
+        }
+    }
+
+    /// The *two-symbolic-operand* signed multiply is exact, and it exists at every
+    /// width.
+    ///
+    /// This is the predicate that used to be refused outright. The old path widened
+    /// both operands to `2w` and multiplied there, which is the BDD scaling wall, so
+    /// it returned `None` past 16 bits and every signed multiply of two non-constant
+    /// values in `i32`/`i64` code came back `incomplete`. The refusal was written down
+    /// as "there is no division form that is exact for every combination of the three
+    /// signs". That is false: the form below divides, with no widening at all.
+    ///
+    /// Two things are checked, and they are separate claims:
+    ///
+    /// * the predicate *exists* at every width, which is the refusal this replaces;
+    /// * where it exists it agrees with Rust's own `checked_mul`, which is the part
+    ///   that keeps it sound.
+    ///
+    /// The oracle is `i128`, which holds the exact product of any two `i64`s, so the
+    /// comparison is against the standard library's idea of overflow rather than this
+    /// file's.
+    #[test]
+    fn a_signed_multiply_of_two_symbols_is_exact() {
+        // `Some(wraps)` when the engine's predicate says the multiply wraps, `None`
+        // when the engine produced no predicate at all.
+        let wraps = |w: u8, a: i128, b: i128| -> Option<bool> {
+            smt::with_fresh(|| {
+                let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                let x = smt::var(w);
+                let y = smt::var(w);
+                let (xi, yi) = (smt::index(x), smt::index(y));
+                let p = overflow_pred(
+                    BinOp::Mul,
+                    Val::Sym(x, Sign::Signed),
+                    Val::Sym(y, Sign::Signed),
+                    w,
+                )?;
+                // The predicate is over the two fresh variables, so a point is an
+                // answer for each index. Negative values go in as their own `w`-bit
+                // pattern, as in the tests above.
+                smt::evaluate_pred(p, |i| {
+                    if i == xi {
+                        Some((a as u64) & mask)
+                    } else if i == yi {
+                        Some((b as u64) & mask)
+                    } else {
+                        None
+                    }
+                })
+            })
+        };
+        let want = |w: u8, a: i128, b: i128| -> bool {
+            let half = 1i128 << (w - 1);
+            let (mn, mx) = (-half, half - 1);
+            a.checked_mul(b).is_none_or(|p| p < mn || p > mx)
+        };
+
+        // The refusal this test exists for: a predicate at every width, including
+        // `i64`, where the old widened path had none and returned `incomplete`.
+        for w in 2..=64u8 {
+            assert!(
+                smt::with_fresh(|| overflow_pred(
+                    BinOp::Mul,
+                    Val::Sym(smt::var(w), Sign::Signed),
+                    Val::Sym(smt::var(w), Sign::Signed),
+                    w,
+                ))
+                .is_some(),
+                "{w}-bit signed multiply of two symbols must produce a predicate"
+            );
+        }
+
+        // Exhaustive where the domain is small enough: every pair of values at both
+        // signs, against the standard library. `-2 * -1`, `MIN * -1` and `MIN * 1`
+        // are all in here, and the whole truth table is covered rather than sampled.
+        for w in [2u8, 3, 4, 5] {
+            let half = 1i128 << (w - 1);
+            let (mn, mx) = (-half, half - 1);
+            for a in mn..=mx {
+                for b in mn..=mx {
+                    assert_eq!(
+                        wraps(w, a, b),
+                        Some(want(w, a, b)),
+                        "{w}-bit {a} * {b}: predicate said {:?} but wrapping is {}",
+                        wraps(w, a, b),
+                        want(w, a, b)
+                    );
+                }
+            }
+        }
+
+        // The boundary pairs at the wide end, one width at a time. `evaluate` walks a
+        // term DAG under a fixed depth budget, and the divider's term chain for a wide
+        // width is deeper than that budget, so the widest widths answer `None` from
+        // *evaluation* even though the predicate exists. The bounds are checked by
+        // construction -- `|x|` against the divisor's own limit -- so the pairs that
+        // matter are the ones straddling that limit at each width.
+        for w in [8u8, 12, 16, 24, 32] {
+            let half = 1i128 << (w - 1);
+            let (mn, mx) = (-half, half - 1);
+            let mut probes: Vec<i128> = vec![mn, mn + 1, -2, -1, 0, 1, 2, mx - 1, mx];
+            // The largest `|x|` that pairs with `|y| = 3`, `|y| = 5` and `|y| = 2^(w/2)`,
+            // either side of the fencepost the division rounds at.
+            for d in [3i128, 5, 1 << (w / 2), mx] {
+                let lim = mx / d;
+                probes.extend([lim - 1, lim, lim + 1, -lim - 1, -lim, -lim + 1]);
+            }
+            for a in &probes {
+                for b in &probes {
+                    if let Some(got) = wraps(w, *a, *b) {
+                        assert_eq!(
+                            got,
+                            want(w, *a, *b),
+                            "{w}-bit {a} * {b}: predicate said {got} but wrapping is {}",
+                            want(w, *a, *b)
+                        );
+                    }
+                }
+            }
+        }
+
+        // The `MIN * -1` pair by name. It is the one overflow a round-trip form cannot
+        // see, because the wrapped product is `MIN` and `|MIN| / 1` is `|MIN|`; the
+        // range form used here reaches it as the different-signs bound, so this pins
+        // that it did -- and that the *evaluated* predicate says so, not just the
+        // oracle.
+        for w in [8u8, 16, 32] {
+            let half = 1i128 << (w - 1);
+            assert_eq!(
+                wraps(w, -half, -1),
+                Some(true),
+                "{w}-bit MIN * -1 must be reported as wrapping"
+            );
+            assert_eq!(
+                wraps(w, -half, 1),
+                Some(false),
+                "{w}-bit MIN * 1 is representable and must not be reported as wrapping"
+            );
+        }
+        for w in [8u8, 16, 32, 64] {
+            let half = 1i128 << (w - 1);
+            assert!(want(w, -half, -1), "{w}-bit MIN * -1 wraps");
+            assert!(!want(w, -half, 1), "{w}-bit MIN * 1 does not wrap");
         }
     }
 

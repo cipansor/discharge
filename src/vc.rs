@@ -38,7 +38,7 @@ impl Contract {
     ///
     /// This discharges the *implication*, which is the standard Hoare reading: a
     /// contract whose precondition cannot hold is vacuously true, and
-    /// `discharge` reports it `Valid`. That is deliberate and matches
+    /// `verif` reports it `Valid`. That is deliberate and matches
     /// [`verify_contract`] and [`invariant`], but it is not the same promise as
     /// [`crate::wp::verify`], which treats an unsatisfiable precondition as a
     /// *finding* rather than a proof. If you need the non-vacuous reading, ask
@@ -50,7 +50,7 @@ impl Contract {
 
     /// Whether some input *definitely* satisfies the precondition.
     ///
-    /// `discharge` proves `pre => post`, which is vacuously true when `pre` is
+    /// `verif` proves `pre => post`, which is vacuously true when `pre` is
     /// unsatisfiable. This is the companion question: does the precondition
     /// describe any input at all? A `false` here means a `Valid` from
     /// [`Contract::discharge`] says nothing about the postcondition.
@@ -75,12 +75,12 @@ impl Contract {
     ///
     /// * [`Verdict::Valid`] — every input satisfies it (satisfiable, trivially).
     /// * [`Verdict::Counterexample`] — a model was found; the variant names it.
-    /// * [`Verdict::Unsat`] — no input satisfies it, so `discharge` is vacuous.
+    /// * [`Verdict::Unsat`] — no input satisfies it, so `verif` is vacuous.
     /// * [`Verdict::Unknown`] — the engine could not decide, e.g. an ill-formed
     ///   precondition such as an equality between an 8-bit and a 16-bit
     ///   variable. This is *not* a satisfying input and *not* a refutation; a
     ///   caller that treats `Unknown` as "fine" has no evidence the precondition
-    ///   is reachable, which is exactly the vacuity `discharge` cannot see.
+    ///   is reachable, which is exactly the vacuity `verif` cannot see.
     ///
     /// Returning the verdict rather than a `bool` is deliberate: the two-valued
     /// answer has to fold `Unknown` into one side, and folding it into `true` —
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn a_vacuous_contract_is_visible_through_the_satisfiability_verdict() {
-        // The companion question `discharge` cannot answer: `discharge` reports
+        // The companion question `verif` cannot answer: `verif` reports
         // `Valid` for a vacuous contract, and the satisfiability verdict is what
         // says the precondition describes no input at all.
         let (discharged, satisfiability) = smt::with_fresh(|| {

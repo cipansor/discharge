@@ -1,4 +1,4 @@
-# CI for the `discharge` crate.
+# CI for the `verif` crate.
 #
 # The first job runs `scripts/gate.sh` -- the same script a human runs -- so "the gates are
 # green" means the same thing locally and in CI, and there is no second copy of the commands
@@ -34,6 +34,18 @@ permissions:
   contents: read
 
 jobs:
+  # Runs first and alone: a job that contains an unpinned action dies at "Set up
+  # job" before any step runs, so the check cannot live only in the job it is
+  # meant to police. This job holds one pinned action, so it survives to report
+  # the real reason. The `gate` job runs the check too, for the case where the
+  # unpinned action is added here.
+  pinned:
+    name: actions pinned to a SHA
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: python3 scripts/check_actions_pinned.py
+
   gate:
     name: gates (clippy, tests, no_std, zero deps, z3 oracle)
     runs-on: ubuntu-latest
@@ -55,7 +67,7 @@ jobs:
           # The MSRV gate in `scripts/gate.sh` builds with the oldest compiler the manifests
           # promise to support. It is installed here so the gate *runs* rather than skipping:
           # a floor that is never exercised is the claim this gate exists to stop trusting.
-          # It must match `rust-version` in `Cargo.toml` and `discharge-arithmetic/Cargo.toml`.
+          # It must match `rust-version` in `Cargo.toml` and `verif-arithmetic/Cargo.toml`.
           rustup toolchain install 1.85 --profile minimal --no-self-update
           rustup default stable
           rustup target add thumbv7em-none-eabihf
@@ -72,13 +84,25 @@ jobs:
       - name: Install the z3 oracle
         run: python3 -m pip install z3-solver
 
-      # `DISCHARGE_RUSTC` must be a path to a `rustc`, not a toolchain name: the frontend
+      # The org rejects unpinned actions, and the failure is a red workflow rather
+      # than a clear message, so catch it here too (the `pinned` job is what
+      # survives an unpinned action in this file).
+      - name: Check every action is pinned to a commit SHA
+        run: python3 scripts/check_actions_pinned.py
+
+      # Packaging hygiene: a manifest missing `readme`, a crate directory with no
+      # LICENSE, a project credited in the source but absent from NOTICE. None of
+      # those fail a build, which is why the check exists.
+      - name: Packaging hygiene
+        run: sh scripts/check_package.sh
+
+      # `VERIF_RUSTC` must be a path to a `rustc`, not a toolchain name: the frontend
       # runs it as a subprocess (`Command::new(rustc)`), so a bare `nightly` would look for
       # a binary by that name and fail.
       - name: Run scripts/gate.sh
         run: |
-          DISCHARGE_RUSTC="$(rustup which --toolchain nightly rustc)"
-          export DISCHARGE_RUSTC
+          VERIF_RUSTC="$(rustup which --toolchain nightly rustc)"
+          export VERIF_RUSTC
           sh scripts/gate.sh
 
   ferrocene:
@@ -255,7 +279,7 @@ jobs:
 
       # This job is the whole reason `tools/mir-oracle` exists: it links `rustc_public`,
       # which needs a nightly plus the `rustc-dev` component. Neither may leak into
-      # `discharge` -- the crate builds on stable with no dependencies -- so the oracle is a
+      # `verif` -- the crate builds on stable with no dependencies -- so the oracle is a
       # separate, excluded workspace member and only this job pays for the nightly.
       #
       # `llvm-tools-preview` is required too, and its absence is not obvious from the error.
@@ -283,8 +307,8 @@ jobs:
       # rather than being swallowed here.
       - name: Run the MIR oracle
         run: |
-          DISCHARGE_RUSTC="$(rustup which --toolchain nightly rustc)"
-          export DISCHARGE_RUSTC
+          VERIF_RUSTC="$(rustup which --toolchain nightly rustc)"
+          export VERIF_RUSTC
           sh tools/mir-oracle/run.sh
 
       - name: Run the oracle's own tests
@@ -361,7 +385,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # This job runs `tools/comparison/run.sh`, which needs all three of: a nightly
-      # `rustc` (the `discharge` half reads real MIR), `coqc`, and Lean. It is a separate
+      # `rustc` (the `verif` half reads real MIR), `coqc`, and Lean. It is a separate
       # job rather than a step in `gate` because `gate` installs none of Coq or Lean, so
       # the comparison gate would *skip* there and a skipped gate is not evidence.
       - name: Install Rust (stable + nightly)
@@ -388,6 +412,52 @@ jobs:
       # here would itself be a failure worth seeing.
       - name: Run the comparison gate
         run: |
-          DISCHARGE_RUSTC="$(rustup which --toolchain nightly rustc)"
-          export DISCHARGE_RUSTC
+          VERIF_RUSTC="$(rustup which --toolchain nightly rustc)"
+          export VERIF_RUSTC
           sh tools/comparison/run.sh
+
+  # The crates.io half: a crate that builds and passes every gate can still be
+  # unpackagable, and the failure only shows up at `cargo publish` -- the worst
+  # moment, because an upload cannot be undone. This job packages both crates and
+  # dry-runs the publish in dependency order.
+  #
+  # `verif` depends on `verif-arithmetic` by path, and `cargo publish` resolves
+  # that against the registry, so the parent's dry-run is *expected* to be blocked
+  # until the sibling is on crates.io. `scripts/publish.py` reports that as
+  # "blocked, waiting on ..." and exits 0, so this job distinguishes "the sibling
+  # is not published yet" (normal before the first release) from "the manifest is
+  # broken" (a failure). No `--strict` here, for the same reason.
+  package:
+    name: package (dry-run publish, in dependency order)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      # A crate directory with no LICENSE, or a manifest missing `readme`, is a
+      # `.crate` that is legally or practically unusable. No compiler sees it.
+      - name: Packaging hygiene
+        run: sh scripts/check_package.sh
+
+      # `cargo package` on the sibling, which has no in-repo dependency, must
+      # succeed outright -- there is nothing for it to wait on. The parent is
+      # allowed to be blocked, and `publish.py` says which of the two happened.
+      - name: Dry-run the publish, in dependency order
+        run: python3 scripts/publish.py
+
+      # The `--strict` run is what a maintainer runs after publishing the sibling:
+      # it turns "blocked on a dependency" into a failure. It is expected to fail
+      # here only while the sibling is unpublished, so it is not a gate; it is
+      # reported, not enforced.
+      - name: Report whether the parent is publishable yet
+        run: |
+          if python3 scripts/publish.py --strict >/dev/null 2>&1; then
+            echo "Both crates are publishable now."
+          else
+            echo "::notice::The parent is blocked until verif-arithmetic is on crates.io."
+            echo "This is the expected state before the first release of the sibling."
+          fi

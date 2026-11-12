@@ -1,6 +1,6 @@
-use discharge::mem;
-use discharge::smt;
-use discharge::smt::*;
+use verif::mem;
+use verif::smt;
+use verif::smt::*;
 
 #[test]
 fn commutativity_of_add_is_proved() {

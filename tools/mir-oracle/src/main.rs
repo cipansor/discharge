@@ -1,6 +1,6 @@
 //! A `rustc_public` oracle for the text-MIR frontend.
 //!
-//! `discharge`'s MIR frontend reads the *textual* `--emit=mir` dump. That is a
+//! `verif`'s MIR frontend reads the *textual* `--emit=mir` dump. That is a
 //! deliberate choice (no `rustc-dev` dependency, inspectable input), and its
 //! stated cost is that a rustc release which changes the pretty-printer can
 //! break the parser, and only the parser would notice. This tool is the answer
@@ -8,16 +8,16 @@
 //! `rustc_public`, summarises both, and fails if the summaries disagree.
 //!
 //! ```text
-//!   rustc --emit=mir  ──► text ──► discharge::mir::shape ──┐
+//!   rustc --emit=mir  ──► text ──► verif::mir::shape ──┐
 //!                                                          ├──► compare
 //!   rustc_public      ──► typed MIR ──► shape (this file) ──┘
 //! ```
 //!
 //! It is a separate crate because it links rustc internals: it needs
 //! `#![feature(rustc_private)]`, a nightly toolchain, and the `rustc-dev`
-//! component. None of those may touch `discharge`, which must build on stable
+//! component. None of those may touch `verif`, which must build on stable
 //! with zero dependencies. The dependency arrow points one way — this crate
-//! depends on `discharge`, never the reverse — so the oracle can never become
+//! depends on `verif`, never the reverse — so the oracle can never become
 //! part of what ships.
 //!
 //! # What is compared, and why this and not the text
@@ -34,7 +34,7 @@
 //! # Usage
 //!
 //! ```console
-//! $ DISCHARGE_RUSTC=$(rustup which --toolchain nightly rustc) \
+//! $ VERIF_RUSTC=$(rustup which --toolchain nightly rustc) \
 //!     cargo run -p mir-oracle -- examples/mir_targets/actuator.rs
 //! actuator.rs: 30 functions, 30 shapes agree, 0 differ
 //! ```
@@ -57,11 +57,11 @@ use std::path::Path;
 use rustc_public::mir::{AssertMessage, Body, TerminatorKind};
 use rustc_public::{CrateDef, ItemKind};
 
-use discharge::mir::shape::{AssertShape, FnShape, PanicKind, Polarity};
+use verif::mir::shape::{AssertShape, FnShape, PanicKind, Polarity};
 
 /// The shape of one function, computed from `rustc`'s own typed MIR.
 ///
-/// This is the mirror of `discharge::mir::shape::FnShape`, built from the
+/// This is the mirror of `verif::mir::shape::FnShape`, built from the
 /// structured IR rather than from printed text, so the two are independent.
 fn shape_of_body(body: &Body) -> FnShape {
     let mut panics = Vec::new();
@@ -136,7 +136,7 @@ fn classify(msg: &AssertMessage) -> PanicKind {
 /// initialised from a literal is a single line (`const K: u8 = const 5_u8;`), an
 /// item initialised from an expression gets a body that is *not* introduced by an
 /// `fn` header, and a constructor's body is printed under a `// MIR FOR CTFE`
-/// marker that [`of_text_mir`](discharge::mir::shape::of_text_mir)'s parser skips
+/// marker that [`of_text_mir`](verif::mir::shape::of_text_mir)'s parser skips
 /// so it does not count the type twice. Counting those typed bodies as functions
 /// made every one of them a spurious "function the text side dropped", which is
 /// the one report this oracle must never make falsely -- a real dropped function
@@ -222,7 +222,7 @@ fn fmt_group(group: &[FnShape]) -> String {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let Some(target) = args.get(1) else {
-        eprintln!("usage: mir-oracle <file.rs>   (set DISCHARGE_RUSTC to a nightly rustc)");
+        eprintln!("usage: mir-oracle <file.rs>   (set VERIF_RUSTC to a nightly rustc)");
         std::process::exit(2);
     };
     let target = Path::new(target);
@@ -230,15 +230,15 @@ fn main() {
     // The text side, exactly as the frontend reads it: `rustc --emit=mir` through
     // the crate's own emitter, so the oracle exercises the real code path rather
     // than a re-implementation of it.
-    let text = match discharge::mir::verify::emit_mir(target) {
+    let text = match verif::mir::verify::emit_mir(target) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("mir-oracle: could not get text MIR: {e}");
-            eprintln!("mir-oracle: set DISCHARGE_RUSTC to a nightly `rustc`");
+            eprintln!("mir-oracle: set VERIF_RUSTC to a nightly `rustc`");
             std::process::exit(2);
         }
     };
-    let text_shapes = discharge::mir::shape::of_text_mir(&text);
+    let text_shapes = verif::mir::shape::of_text_mir(&text);
 
     // The typed side, through `rustc_public`. The argument list mirrors what the
     // text emitter passes so both compile the same crate type. `--out-dir` points

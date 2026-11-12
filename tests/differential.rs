@@ -2,11 +2,11 @@
 //! agree. This is the test that makes the whole approach trustworthy — if the
 //! BDD engine ever disagreed with reality, this file would catch it.
 
-use discharge::exhaustive::{for_all_u8, for_all_u8_2, find_violation_u8};
-use discharge::prelude::*;
-use discharge::smtscript::Query;
-use discharge::smt::{self, Verdict};
-use discharge::wp;
+use verif::exhaustive::{for_all_u8, for_all_u8_2, find_violation_u8};
+use verif::prelude::*;
+use verif::smtscript::Query;
+use verif::smt::{self, Verdict};
+use verif::wp;
 
 /// For a predicate over one 8-bit variable, symbolic proof and enumeration must
 /// give the same answer.
@@ -202,7 +202,7 @@ fn the_evaluator_agrees_with_the_engine_on_every_operator() {
     // first — an oracle that disagrees with the engine would send me chasing bugs in
     // the wrong place. For each operation and every 8-bit input pair, the evaluator's
     // answer must equal what the engine says when both inputs are pinned.
-    use discharge::smt::{self, var};
+    use verif::smt::{self, var};
 
     // Build every operation, then compare per input pair.
     type BinOp = fn(smt::Var, smt::Var) -> smt::Var;
@@ -259,7 +259,7 @@ fn the_evaluator_agrees_with_the_engine_on_every_operator() {
 
 #[test]
 fn the_evaluator_handles_widths_truncation_and_shifts() {
-    use discharge::smt::{self, var};
+    use verif::smt::{self, var};
 
     smt::with_fresh(|| {
         let a = var(8);
@@ -1671,7 +1671,7 @@ fn the_exported_smtlib2_is_well_sorted_and_means_the_same_thing() {
             let a = var(8);
             let b = var(8);
             let pred = p.build(a, b);
-            Query::new(&[a, b], pred).to_smtlib2_string()
+            Query::new(&[a, b], pred).to_smtlib2()
         });
         let parsed = match parse_exported(&text) {
             Ok(e) => e,
@@ -1732,8 +1732,8 @@ fn the_export_keeps_a_constant_goal_upright() {
     // Pinned directly: `truth(false)` must not export as `(assert false)`.
     smt::with_fresh(|| {
         let a = var(8);
-        let t = Query::new(&[a], smt::truth(true)).to_smtlib2_string();
-        let f = Query::new(&[a], smt::truth(false)).to_smtlib2_string();
+        let t = Query::new(&[a], smt::truth(true)).to_smtlib2();
+        let f = Query::new(&[a], smt::truth(false)).to_smtlib2();
         // `true` exports as `(not true)` = false; `false` exports as `(not false)` = true.
         assert!(!parse_exported(&t).unwrap().eval(0, 0).b(), "{}", t);
         assert!(parse_exported(&f).unwrap().eval(0, 0).b(), "{}", f);
@@ -1759,7 +1759,7 @@ fn the_export_clamps_an_oversized_shift_amount() {
             ];
             let mut out = String::new();
             for (i, t) in terms.iter().enumerate() {
-                out.push_str(&Query::new(&vars, *t).to_smtlib2_string());
+                out.push_str(&Query::new(&vars, *t).to_smtlib2());
                 if i + 1 < terms.len() {
                     out.push('\n');
                 }
@@ -1987,7 +1987,7 @@ fn the_export_handles_truncate_ite_and_ashr_inner() {
             let b = var(8);
             let t = e.build(a, b);
             let goal = smt::eq_const(t, 0);
-            let s = Query::new(&[a, b], goal).to_smtlib2_string();
+            let s = Query::new(&[a, b], goal).to_smtlib2();
             let w = smt::bits(t);
             let mut want = [[false; 256]; 256];
             for x in 0..256u64 {
@@ -2042,7 +2042,7 @@ fn the_export_prints_assumptions_as_extra_asserts() {
         let b = var(8);
         let pre = smt::ult(a, b);
         let goal = smt::ule(a, b);
-        Query::new(&[a, b], goal).assuming(&[pre]).to_smtlib2_string()
+        Query::new(&[a, b], goal).assuming(&[pre]).to_smtlib2()
     });
     let asserts: Vec<&str> = text.lines().filter(|l| l.starts_with("(assert")).collect();
     assert_eq!(asserts.len(), 2, "one assert per assumption plus the goal:\n{}", text);
@@ -2082,7 +2082,7 @@ fn the_export_refuses_an_ill_formed_term_instead_of_printing_it() {
             "a mixed-width operation must be refused, not decided"
         );
         assert!(smt::is_ill_formed(), "the arena must record the refusal");
-        let text = Query::new(&[a, b], smt::eq(mixed, smt::word(0, 12))).to_smtlib2_string();
+        let text = Query::new(&[a, b], smt::eq(mixed, smt::word(0, 12))).to_smtlib2();
         assert!(
             !text.contains("(check-sat)"),
             "a refused term must not produce a query:\n{}",
@@ -2098,7 +2098,7 @@ fn a_well_formed_query_is_still_exported_in_full() {
     // previous test would pass if the exporter refused *everything*.
     smt::with_fresh(|| {
         let x = var(8);
-        let text = Query::new(&[x], x.lt_val(100)).to_smtlib2_string();
+        let text = Query::new(&[x], x.lt_val(100)).to_smtlib2();
         assert!(!smt::is_ill_formed(), "a same-width query is well-formed");
         assert!(text.contains("(check-sat)"), "a healthy query must be exported:\n{}", text);
         assert!(text.contains("(declare-fun"), "declarations must be present:\n{}", text);

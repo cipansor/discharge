@@ -2,8 +2,8 @@
 //
 // Generates random predicates over small bit-vectors, asks the engine, exports the SAME
 // predicate as SMT-LIB2, and asks z3. The two verdicts must agree whenever both decide.
-use discharge::smt::{self, Pred, Var, Verdict};
-use discharge::smtscript::Query;
+use verif::smt::{self, Pred, Var, Verdict};
+use verif::smtscript::Query;
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 
@@ -266,7 +266,7 @@ fn main() {
                 .into_iter()
                 .map(|(name, p)| {
                     let v = smt::prove(p);
-                    (name, Query::new(&[x, y], p).to_smtlib2_string(), v)
+                    (name, Query::new(&[x, y], p).to_smtlib2(), v)
                 })
                 .collect::<Vec<_>>()
         });
@@ -311,7 +311,7 @@ fn main() {
             let vars: Vec<Var> = (0..nv).map(|_| smt::var(w)).collect();
             let p = rand_pred(&mut r, &vars, 3);
             let v = smt::prove(p);
-            (Query::new(&vars, p).to_smtlib2_string(), v)
+            (Query::new(&vars, p).to_smtlib2(), v)
         });
         // A refused export contains no `(check-sat)`: the engine answered `Unknown` for an
         // ill-formed term and the printer declined to write a query no solver could parse.

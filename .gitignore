@@ -8,3 +8,10 @@ target/
 # coqc's `lia` tactic writes a cache in the working directory; it is an
 # output of a proof run, not a source file.
 .lia.cache
+
+# Importing a packaging script (`importlib` in a workflow step, a test) writes a
+# bytecode cache next to it, inside the checkout. `verif` is packaged from the
+# repository root, so that cache is a root-directory change and `cargo publish`
+# refuses a dirty crate -- the release would fail on a file no one wrote on
+# purpose. Ignored here so a cache can never be mistaken for a source change.
+__pycache__/

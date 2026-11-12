@@ -6,9 +6,9 @@
 //!
 //! Run with: `cargo run --features std --example memory`
 
-use discharge::mem::{declare, Mem, MAX_CELLS};
-use discharge::smt::{self, var, Verdict};
-use discharge::wp::{self, Stmt};
+use verif::mem::{declare, Mem, MAX_CELLS};
+use verif::smt::{self, var, Verdict};
+use verif::wp::{self, Stmt};
 
 fn main() {
     println!("=== a bounded memory: 4 cells of 8 bits ===\n");

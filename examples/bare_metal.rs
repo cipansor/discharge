@@ -29,7 +29,7 @@
 
 #![no_std]
 
-use discharge::smt::{self, var, word, Verdict};
+use verif::smt::{self, var, word, Verdict};
 
 /// The command limit an actuator path is built around.
 pub const MAX_COMMAND: u16 = 3000;

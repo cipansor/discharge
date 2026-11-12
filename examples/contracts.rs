@@ -8,8 +8,8 @@
 //!
 //! Run with: `cargo run --features std --example contracts`
 
-use discharge::smt::{self, var, Verdict};
-use discharge::wp::{self, Proc, Rule, Stmt};
+use verif::smt::{self, var, Verdict};
+use verif::wp::{self, Proc, Rule, Stmt};
 
 /// `sat_inc`: requires `x <= 20`, ensures `r <= 20 && (x < 20 => r == x + 1)`.
 ///
@@ -250,7 +250,7 @@ fn main() {
         let derived = wp::writes(&body);
         println!("dbl's body writes {} variable(s); derived frame covers `scratch`: {}",
                  derived.len(), derived.contains(&scratch));
-        let empty: [discharge::smt::Var; 0] = [];
+        let empty: [verif::smt::Var; 0] = [];
         println!("declaring an empty frame        : accepted = {}", Stmt::frame(&dbl, &actuals, &empty));
         println!("  -> rejected, so the false proof is unreachable");
         let honest = [r, scratch];

@@ -30,10 +30,38 @@
 //!   four `abs` spellings — the unary operators. They share the `0 - x` core,
 //!   and `abs` is "negate if negative" on top of it, so there is one expression
 //!   rather than four.
-//! * `count_ones`, `leading_zeros`, `trailing_zeros` — bit counts, built at the
-//!   operand's width and zero-extended to the *return* type's. `u8::count_ones`
-//!   returns `u32`, so this is the one shape whose result is wider than its
-//!   operand; the extension is the promotion Rust performs.
+//! * `count_ones`, `count_zeros`, `leading_zeros`, `leading_ones`,
+//!   `trailing_zeros`, `trailing_ones` — bit counts, built at the operand's width
+//!   and zero-extended to the *return* type's. `u8::count_ones` returns `u32`, so
+//!   this is the one shape whose result is wider than its operand; the extension is
+//!   the promotion Rust performs. The three *complement* counts are `core`'s own
+//!   definition — the corresponding positive count of `!x` — rather than a second
+//!   summation.
+//! * `is_power_of_two` — a `bool`, not a number: `x != 0 && x & (x - 1) == 0`.
+//!   It is the one modelled shape whose *return type* is `bool`, so the model
+//!   produces a [`Pred`] and the executor writes a `Val::Bool`, which is what the
+//!   `if` that consumes it branches on. It is unsigned-only, because `core` has no
+//!   such method on the signed types.
+//! * `Ord::min`/`Ord::max` — the two *trait* methods, so the dump spells a call
+//!   `<u8 as Ord>::min` rather than a `core::num::<impl …>` path. The model is one
+//!   `ite` whose ordering predicate the operand's sign selects (`sle`/`sge` for a
+//!   signed type, `ule`/`uge` for an unsigned one), so both signednesses are exact
+//!   and `i8::MIN` -- whose bits sort the other way unsigned -- is ordered
+//!   correctly. Only the standard library's `Ord` path is accepted; see
+//!   [`names_ord_trait`].
+//! * `From::from`/`Into::into` — the two *widening conversion* trait methods,
+//!   spelled `<u16 as From<u8>>::from` and `<u8 as Into<u16>>::into`. Unlike every
+//!   other shape the two operand *types* differ, so the model reads both from the
+//!   call's name and extends the source by its *own* signedness (`i8::MIN` widens
+//!   to `i8::MIN`, `255u8` to `255u16`). Only a strict widening between modelled
+//!   integers is accepted -- which is every integer `From` `core` implements, so a
+//!   real call is never a guess; see [`Conversion`].
+//! * `add_signed`/`add_unsigned` — an addition whose two operands have *opposite*
+//!   signedness (`u8::wrapping_add_signed` adds an `i8` to a `u8`). The value is a
+//!   plain addition of the two words, so it is the same term in both directions;
+//!   the flag is the addition's own overflow *adjusted by the addend's sign*, which
+//!   is what makes it exact rather than the ordinary signed-addition rule. See
+//!   [`mixed_add_failure`] for why the adjustment is not optional.
 //!
 //! # What is not, and why refusing is the right answer
 //!
@@ -52,13 +80,15 @@
 //!   under one name is not something to guess at.
 //! * `unchecked_*` is undefined behaviour on overflow. There is no value to
 //!   model, and a proof about UB is not a proof, so it is refused.
-//! * `pow` is the remaining gap. `pow(x, k)` is a `k`-fold product whose exponent
-//!   is an *operand*, so its model needs the exponent's bits, and it is not
-//!   written yet. `count_zeros`, `is_*`, `rotate_*`, `add_signed`, the float ops
-//!   and the `next_multiple_of`/`div_*` helpers are likewise absent, and an
-//!   unmodelled name is refused rather than approximated.
+//! * `pow` is modelled as a fold over the exponent's bits (see [`POW_MAX_WIDTH`]).
+//!   `rotate_*`, `abs_diff`, the float ops and the
+//!   `next_multiple_of`/`div_*` helpers remain absent, and an unmodelled name is
+//!   refused rather than approximated. The other `is_*` predicates
+//!   (`is_ascii*`, `is_negative`, the digit predicates) are absent too: they
+//!   answer about a *character* or a *sign*, not about the bits the engine holds,
+//!   and each would need its own definition rather than a shared one.
 
-use crate::mir::parse::BinOp;
+use crate::mir::parse::{BinOp, Ty};
 use crate::smt::{self, Pred, Var};
 
 /// The widest bit-vector the divider is asked about.
@@ -69,14 +99,44 @@ use crate::smt::{self, Pred, Var};
 /// hangs is worse than one that says "I could not decide".
 pub const DIV_MAX_WIDTH: u8 = 32;
 
-/// The widest operand whose *product* the model will widen to test.
+/// The widest operand whose *product* the intrinsics model will widen to test.
 ///
 /// Overflow for a product needs the exact `2w`-bit result, and a `2w`-bit
 /// multiplier is the scaling wall this crate documents. Past this the query is
-/// not worth posing, so the model declines and the path stays unknown. This is
-/// the same wall the plain `*` path hits; the bound is stated here so the two
-/// cannot drift.
-pub const MUL_MAX_WIDTH: u8 = 8;
+/// not worth posing, so the model declines and the path stays unknown. The plain
+/// `*` path reaches further -- it uses an exact division test rather than a
+/// widened product, and `DIV_MAX_WIDTH` is its limit -- so this bound is the
+/// intrinsics' own, stated here so the two cannot be confused.
+///
+/// Sixteen is measured rather than guessed. The widened product is what makes a
+/// `u16` product decidable at all: with this bound at 8, every `u16`
+/// `saturating_mul`/`checked_mul` reported "past what the model covers" and no
+/// contract over one could be settled. At 16 a guarded `u16` product is
+/// *verified* and a mis-guarded one is correctly *refuted*, both in under 200ms,
+/// because the obligation's guard and the model's predicate are the same term and
+/// the boolean fold settles them without blasting the multiplier. The `2w == 32`
+/// multiplier is built only when the fold cannot cancel it, and even a fully
+/// unconstrained `u16` product answers inside the budget.
+///
+/// It is *not* the division form the plain-`*` path uses. That form was measured
+/// here and is strictly worse: a `u16` idiom that the widened test settles in
+/// 180ms came back `Unknown` after 3.2s, because these idioms ask about the
+/// *value* of a `core` call and carry no hand-written guard for a division to
+/// cancel against. The two paths therefore share the overflow *rule* but not its
+/// cheapest spelling.
+pub const MUL_MAX_WIDTH: u8 = 16;
+
+/// The widest base `pow` is modelled at.
+///
+/// Lower than [`MUL_MAX_WIDTH`], and deliberately so. `pow`'s fold is up to 64
+/// `mul_failure` queries composed into one term -- a `mul` and a squaring per
+/// exponent bit -- so it costs a large multiple of a single product rather than
+/// the product itself. Raising this to the product bound buys nothing and costs
+/// seconds: a `u16` `saturating_pow` with a symbolic exponent was still
+/// `Unknown`, but only after twelve seconds of diagram work, where the same
+/// refusal at 8 bits is immediate. An answer that cannot be reached is not worth
+/// paying for, so the fold keeps the tighter bound.
+pub const POW_MAX_WIDTH: u8 = 8;
 
 /// The discriminant of the `Some` variant, where a modelled `Option` payload
 /// lives. rustc numbers `None` 0 and `Some` 1.
@@ -107,7 +167,8 @@ pub enum Intrinsic {
     /// case -- `wrapping_neg` returns the wrapped value, `checked_neg` returns
     /// `None`, `saturating_neg` clamps, `overflowing_neg` reports the flag.
     Unary(Family, UnOp),
-    /// A bit count: `count_ones`, `leading_zeros` or `trailing_zeros`.
+    /// A bit count: one of `count_ones`, `count_zeros`, `leading_zeros`,
+    /// `leading_ones`, `trailing_zeros` or `trailing_ones`.
     ///
     /// Its result is wider than its operand (`u8::count_ones` returns `u32`), so
     /// unlike every other shape it is built at the operand's width and
@@ -124,6 +185,46 @@ pub enum Intrinsic {
     /// carried for the same reason it is on `Unary`: the four disagree about the
     /// failure case, and `pow`'s failure is an *overflow*, not a zero divisor.
     Pow(Family),
+    /// A mixed-signedness addition: `wrapping_add_signed`, `saturating_add_signed`,
+    /// `checked_add_signed`, `overflowing_add_signed` and their `_unsigned`
+    /// counterparts.
+    ///
+    /// Its two operands have *opposite* signedness -- `u8::wrapping_add_signed`
+    /// adds an `i8` to a `u8` -- so it is its own shape rather than a `BinOp`,
+    /// whose operands share a type. It is one variant and not two because the
+    /// *value* is the same addition of two `w`-bit words either way: rustc
+    /// reinterprets the operand of the opposite signedness and adds, which is one
+    /// term whatever the direction. Only the failure predicate reads which side is
+    /// signed, and that is already carried by the operand's sign -- the executor
+    /// passes it as `signed` -- so the direction is not stored a second time here,
+    /// where it could drift from the sign the model actually reads.
+    MixedAdd(Family),
+    /// A `bool`-valued predicate (`is_power_of_two`).
+    ///
+    /// Its *return type* is `bool`, not an integer, so unlike every other shape
+    /// it produces a [`Pred`] rather than a [`Var`]. It is one bit by
+    /// construction, so `result_w` is not read for it.
+    Bool(BoolKind),
+    /// `Ord::min` or `Ord::max`: the smaller or larger of two operands of one
+    /// type.
+    ///
+    /// Unlike every other shape this is a *trait* method, so its dump spelling is
+    /// `<u8 as Ord>::min` rather than a `core::num::<impl …>` path. The executor
+    /// therefore lets a same-dump body win and consults this model only as a
+    /// fallback, so a local trait method of the same shape is inlined rather than
+    /// modelled. It is total and reads the sign to pick the ordering, so both
+    /// signednesses are modelled.
+    MinMax(MinMaxKind),
+    /// A widening integer conversion: `From::from` or `Into::into`.
+    ///
+    /// Like [`Intrinsic::MinMax`] this is a *trait* method, so the dump spells a
+    /// call `<u16 as From<u8>>::from` (or `<u8 as Into<u16>>::into`) rather than a
+    /// `core::num::<impl …>` path, and the model is a fallback behind the same-dump
+    /// lookup. Unlike every other shape the two operand *types* differ -- that is
+    /// the whole content of the call -- so the source and destination signednesses
+    /// are carried explicitly. Only a strictly *widening* conversion is modelled;
+    /// see [`Conversion`].
+    Conversion(Conversion),
 }
 
 /// Which family of a `core::num` method name a call belongs to.
@@ -148,15 +249,165 @@ pub enum UnOp {
     Abs,
 }
 
+/// A `bool`-valued predicate: a `core::num` method that answers a truth value
+/// rather than a number.
+///
+/// These are the methods whose *return type* is `bool`, so unlike every other
+/// shape the model produces a [`Pred`] rather than a [`Var`] and the executor
+/// writes it with [`Env::set`] as a `Val::Bool`. The return width is one bit by
+/// construction, which is why no `result_w` is read for them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoolKind {
+    /// `is_power_of_two`: true exactly for `1 << k`, `k < w`.
+    ///
+    /// A *total* predicate, and unsigned-only: `is_power_of_two` is not a method
+    /// on the signed types, so a dump that calls it is unsigned or is not a real
+    /// dump. `0` is not a power of two (the zero bit pattern is `0` clear bits,
+    /// not one), and the type's width is the highest exponent it can hold, so a
+    /// signed reading would be wrong in both directions -- see [`is_modelled`].
+    PowerOfTwo,
+}
+
+/// `Ord::min` and `Ord::max`: the smaller or larger of two values of one type.
+///
+/// Unlike every other shape these are *trait* methods, not inherent ones, so the
+/// dump spells a call `<u8 as Ord>::min` -- the `Ord` trait itself, with no
+/// `core::num::<impl …>` path. That is why the model is a *fallback*: the executor
+/// resolves a same-dump body first and reaches the model only when none claims the
+/// name, so a local trait method of the same shape is inlined rather than
+/// modelled. The trait path must also be the standard library's `Ord`, which is
+/// what keeps a differently-qualified local trait out (see [`names_ord_trait`]).
+/// The model itself is total and reads the sign to pick the comparison: `min`/`max`
+/// are the same two-operand ite either way, only the ordering predicate differs, so
+/// both signednesses are modelled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MinMaxKind {
+    /// The smaller of the two operands: `a <= b ? a : b`.
+    Min,
+    /// The larger of the two operands: `a >= b ? a : b`.
+    Max,
+}
+
+/// A widening integer conversion: `u16::from(x)` where `x: u8`, `x.into()`.
+///
+/// The two operand types differ -- that is what the call *is* -- so unlike every
+/// other shape the model reads two widths and two signednesses. The value is the
+/// source widened to the destination's width, and the *source's* signedness picks
+/// the extension: a signed source sign-extends (`-1i8` to `i16` is `-1`), an
+/// unsigned one zero-fills (`255u8` to `u16` is `255`). The destination's
+/// signedness only labels the result.
+///
+/// # Why only a *widening* conversion is modelled
+///
+/// `core` implements `From` for the integer types only where the source fits
+/// entirely in the destination, and never across signedness: `u16::from(u8)`,
+/// `i16::from(i8)` and `i16::from(u8)` exist, while `u16::from(i8)` and
+/// `i8::from(u8)` do not (they would not be total, so `core` has no such `impl`).
+/// So a real `<D as From<S>>::from` call with `S` and `D` both integer is
+/// *necessarily* a widening or a same-width call, and both are exactly a zero- or
+/// sign-extension of the source's `w` bits to the destination's width (a same-width
+/// extension leaves the value unchanged, which is `core`'s reflexive `impl<T>
+/// From<T> for T`). A model that saw only a *narrowing* call would have to guess at
+/// a truncation `core` never performs; [`eval`] refuses those by name, and the
+/// executor refuses a call whose types it cannot read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Conversion {
+    /// `From::from`: `<D as From<S>>::from(x)`.
+    From,
+    /// `Into::into`: `<S as Into<D>>::into(x)`.
+    Into,
+}
+
+/// The source and destination types of a conversion call, read from its name.
+///
+/// A conversion's two types are both in the name, and reading them there is what
+/// keeps the model independent of how the executor happens to have typed the
+/// argument: `From`'s spelling is `<DEST as From<SRC>>::from`, so the *self* type
+/// is the destination and the type parameter is the source, while `Into`'s is
+/// `<SRC as Into<DEST>>::into`, where they are the other way round. A name whose
+/// self type or parameter does not parse as an integer is refused by the caller,
+/// which reads the widths with [`int_width`] and requires the destination to be at
+/// least as wide as the source -- a real integer `From` is always a widening.
+pub fn conversion_types(name: &str, kind: Conversion) -> Option<(Ty, Ty)> {
+    let (self_part, after_as) = name.rsplit_once(" as ")?;
+    let self_ty = Ty::parse(self_part.trim_start_matches('<'));
+    let open = after_as.find('<')?;
+    let close = after_as.find(">::")?;
+    if close <= open {
+        return None;
+    }
+    // `after_as` is `TRAIT<PARAM>>::method`, so the slice up to `>::` carries the
+    // trait's own closing `>`. An integer type never contains `>`, so dropping a
+    // trailing one is exactly the type parameter and not a nested generic.
+    let param = after_as[open + 1..close].trim_end_matches('>');
+    let param_ty = Ty::parse(param);
+    Some(match kind {
+        Conversion::From => (param_ty, self_ty),
+        Conversion::Into => (self_ty, param_ty),
+    })
+}
+
+/// Whether a type is one of the integer types the model reads a width and a
+/// signedness from.
+///
+/// `u128`/`i128` are excluded: the engine is 64 bits wide, so a conversion *into*
+/// them has no term to build. `bool` and `char` are excluded too -- `u8::from(true)`
+/// and `u32::from('a')` are real `From` impls, but their source is not an integer
+/// whose bits the engine holds, so there is nothing to widen.
+pub fn is_modelled_int(ty: &Ty) -> bool {
+    matches!(
+        ty,
+        Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::Usize | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64
+            | Ty::Isize
+    )
+}
+
+/// The width of a modelled integer type, in bits.
+pub fn int_width(ty: &Ty) -> Option<u8> {
+    if !is_modelled_int(ty) {
+        return None;
+    }
+    ty.width()
+}
+
+/// The bit-vector of a conversion's argument: the source widened to `dst_w`.
+///
+/// `x` is the source term at its own width, `src_signed` its signedness. A signed
+/// source sign-extends and an unsigned one zero-fills, which is the *same* choice
+/// the executor's `as`-cast makes (see the `Rvalue::Cast` arm); a conversion and a
+/// cast of the same shape are the same term. When the destination is no wider than
+/// the source -- which a real `From` never is, but a malformed dump could spell --
+/// the value is truncated, so nothing here can build a term wider than `dst_w`.
+pub fn convert_value(x: Var, src_signed: bool, dst_w: u8) -> Var {
+    if src_signed {
+        smt::sign_extend(x, dst_w)
+    } else {
+        smt::truncate(x, dst_w)
+    }
+}
+
 /// A bit count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BitKind {
-    /// The number of set bits.
+    /// The number of set bits: `count_ones`.
     Ones,
-    /// The number of high zero bits, before the highest set bit.
+    /// The number of high zero bits, before the highest set bit: `leading_zeros`.
     LeadingZeros,
-    /// The number of low zero bits, before the lowest set bit.
+    /// The number of low zero bits, before the lowest set bit: `trailing_zeros`.
     TrailingZeros,
+    /// The number of clear bits: `count_zeros`.
+    ///
+    /// `core` defines it as `count_ones(!x)`, and the model computes it that way
+    /// rather than by a second summation, so the two cannot disagree.
+    CountZeros,
+    /// The number of high set bits, before the highest clear bit: `leading_ones`.
+    ///
+    /// `core` defines it as `leading_zeros(!x)`.
+    LeadingOnes,
+    /// The number of low set bits, before the lowest clear bit: `trailing_ones`.
+    ///
+    /// `core` defines it as `trailing_zeros(!x)`.
+    TrailingOnes,
 }
 
 impl Intrinsic {
@@ -165,7 +416,7 @@ impl Intrinsic {
     /// `eval` and the executor both branch on this: a unary call has no second
     /// argument to read, so the two-operand path must not be entered for it.
     pub fn is_unary(self) -> bool {
-        matches!(self, Intrinsic::Unary(..) | Intrinsic::Bits(_))
+        matches!(self, Intrinsic::Unary(..) | Intrinsic::Bits(_) | Intrinsic::Bool(_))
     }
 }
 
@@ -189,6 +440,12 @@ pub enum Outcome {
     /// word: nothing compares it to a variant discriminant, so it is read by a
     /// `bool` consumer (`assert(!flag)`, or a `ret.1` in a contract).
     Tuple { value: Var, overflowed: Pred },
+    /// A `bool`: the whole result of a predicate method (`is_power_of_two`).
+    ///
+    /// The destination local's type is `bool`, so the value is a `Pred` and not a
+    /// `Var` -- writing a one-bit word into a `bool` local would leave the local
+    /// readable only as a word, and the `if` that consumes it reads a predicate.
+    Bool(Pred),
 }
 
 /// The family a `core::num` method name belongs to, if any.
@@ -198,18 +455,57 @@ pub enum Outcome {
 /// matched, not a prefix of it, so `wrapping_add_signed` and `saturating_pow`
 /// are refused rather than read as `wrapping_add` and `saturating_add`.
 ///
-/// The three bit counts are matched before the prefix split: they have no
+/// The bit counts are matched before the prefix split: they have no
 /// `wrapping_`/`saturating_`/`checked_`/`overflowing_` prefix, and reading them
-/// through the split would look for an operator named `ones`, `leading_zeros` or
-/// `trailing_zeros` in the operator table. Matching them first keeps the split
-/// honest -- it only ever sees a name it could actually have prefixed.
+/// through the split would look for an operator named `ones`, `zeros`,
+/// `leading_zeros` or `trailing_ones` in the operator table. Matching them first
+/// keeps the split honest -- it only ever sees a name it could actually have
+/// prefixed.
 pub fn classify(name: &str) -> Option<Intrinsic> {
     let short = name.rsplit("::").next().unwrap_or(name);
     match short {
         "count_ones" => return Some(Intrinsic::Bits(BitKind::Ones)),
+        "count_zeros" => return Some(Intrinsic::Bits(BitKind::CountZeros)),
         "leading_zeros" => return Some(Intrinsic::Bits(BitKind::LeadingZeros)),
+        "leading_ones" => return Some(Intrinsic::Bits(BitKind::LeadingOnes)),
         "trailing_zeros" => return Some(Intrinsic::Bits(BitKind::TrailingZeros)),
+        "trailing_ones" => return Some(Intrinsic::Bits(BitKind::TrailingOnes)),
         _ => {}
+    }
+    // The `bool`-valued predicates. Like the bit counts they carry no family
+    // prefix, so they are matched before the split for the same reason.
+    if short == "is_power_of_two" {
+        return Some(Intrinsic::Bool(BoolKind::PowerOfTwo));
+    }
+    // `Ord::min`/`Ord::max`. These are *trait* methods, so the name is matched on
+    // the trait path rather than a `core::num::<impl …>` path: the dump spells the
+    // call `<u8 as Ord>::min`, naming the trait itself. `min`/`max` are matched
+    // only when that path is the standard library's `Ord` (see `names_ord_trait`),
+    // so a same-named method on any other trait (or an inherent one) is not read as
+    // `Ord`'s. That is a *narrower* match than the suffix match the other shapes
+    // use, deliberately: the trait name is the only thing distinguishing this from
+    // an unrelated `min`, and widening it would answer a call the model has no
+    // definition for.
+    if short == "min" || short == "max" {
+        if !names_ord_trait(name) {
+            return None;
+        }
+        let kind = if short == "min" { MinMaxKind::Min } else { MinMaxKind::Max };
+        return Some(Intrinsic::MinMax(kind));
+    }
+    // `From::from`/`Into::into`. These are *trait* methods with a type parameter,
+    // so the dump spells `<u16 as From<u8>>::from`: the trait path is read the same
+    // way `Ord`'s is (see `trait_path`), which is what keeps a module-qualified
+    // local trait (`m::From`) out. The two operand *types* are not in this name --
+    // they are read from the call's arguments and destination by the executor --
+    // so `classify` can only answer "this is a conversion"; whether it is one the
+    // model covers is decided there, from the types.
+    if short == "from" || short == "into" {
+        if !names_conversion_trait(name) {
+            return None;
+        }
+        let kind = if short == "from" { Conversion::From } else { Conversion::Into };
+        return Some(Intrinsic::Conversion(kind));
     }
     let (family, op) = if let Some(rest) = short.strip_prefix("wrapping_") {
         (Family::Wrapping, rest)
@@ -225,6 +521,11 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     match op {
         "neg" => return Some(Intrinsic::Unary(family, UnOp::Neg)),
         "abs" => return Some(Intrinsic::Unary(family, UnOp::Abs)),
+        // The mixed-signedness additions: their two operands have opposite
+        // signedness, so they are their own shape rather than a `BinOp`. The
+        // whole suffix is matched, so `add_signed_thing` is refused rather than
+        // read as `add_signed`.
+        "add_signed" | "add_unsigned" => return Some(Intrinsic::MixedAdd(family)),
         // `pow` is a fold over the exponent's bits rather than one operator, so
         // it is its own shape too. It is matched here rather than falling into
         // the operator table below, which has no `pow` entry and would refuse it.
@@ -252,6 +553,73 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     })
 }
 
+/// Whether a `min`/`max` name is `Ord`'s, and `Ord`'s alone.
+///
+/// The dump spells a trait call `<u8 as Ord>::min`, naming the trait between the
+/// `as` and the `>`; a module-qualified trait spells `<u8 as m::Ord>::min`. The
+/// trait path rustc prints for the prelude's own `Ord` is not always the bare
+/// name: with `std` in scope a call is `<i8 as std::cmp::Ord>::max`, and against
+/// `core` it is `<u8 as Ord>::min`. Both spellings are accepted, and so is
+/// `core::cmp::Ord`.
+///
+/// The accepted set is exactly the standard library's `Ord` and nothing else, and
+/// that is what makes the match sound: `std::cmp::Ord` and `core::cmp::Ord` cannot
+/// name a user item, because a user cannot define items inside `std` or `core`. A
+/// local trait is always qualified with *its own* module (`m::Ord`, `ord_shim::Ord`),
+/// so it is refused. This is the narrow half of the guard in `try_intrinsic`: it
+/// keeps the model from claiming a name that could be a local trait's, and the
+/// caller's same-dump lookup is what answers the one spelling that could still
+/// collide (a crate-root `Ord`, which the prelude also names `Ord`).
+pub fn names_ord_trait(name: &str) -> bool {
+    matches!(trait_path(name), Some("Ord" | "core::cmp::Ord" | "std::cmp::Ord"))
+}
+
+/// Whether a `from`/`into` name is `core`'s own `From`/`Into`, and theirs alone.
+///
+/// The dump spells the call `<u16 as From<u8>>::from` or `<u8 as Into<u16>>::into`,
+/// so the trait is named between `as` and the `<` that opens its type parameter.
+/// `core::convert::From` and `std::convert::From` are the same trait as the
+/// prelude's `From`; rustc prints the bare name, but a program with a local trait
+/// also called `From` in scope makes it print the qualified one to disambiguate
+/// (the corpus does exactly this), so all three spellings are accepted.
+///
+/// The accepted set is exactly the standard library's `From` and `Into`: those
+/// cannot name a user item, because a user cannot define items inside `core` or
+/// `std`. A local trait is qualified with its own module (`m::From`), so it is
+/// refused. The one spelling that can still collide is a *crate-root* trait named
+/// `From`, which the dump also prints as the bare `From` -- the caller's same-dump
+/// lookup is what answers that, and this predicate deliberately does not try to
+/// tell it apart by name, because it cannot. See [`Intrinsic::Conversion`].
+pub fn names_conversion_trait(name: &str) -> bool {
+    matches!(
+        trait_path(name),
+        Some(
+            "From"
+                | "core::convert::From"
+                | "std::convert::From"
+                | "Into"
+                | "core::convert::Into"
+                | "std::convert::Into"
+        )
+    )
+}
+
+/// The trait a method call names, read out of a rustc-printed path.
+///
+/// A call is `<SELF as TRAIT<…>>::method`, so the trait is between the last ` as `
+/// and the `<` that opens the trait's own type parameters. A name with no ` as `
+/// is not a trait call at all -- a free function or an inherent method -- so it
+/// names no trait here. A trait with no type parameters has no `<`, and is not one
+/// of the shapes this reads, so it yields `None` rather than a truncated guess.
+fn trait_path(name: &str) -> Option<&str> {
+    let after_as = name.rsplit_once(" as ")?.1;
+    // Cut the method off first (`From<i8>>::from` -> `From<i8>`), then drop the
+    // trait's type parameters (`From<i8>` -> `From`). Doing it the other way round
+    // would consume the `>::` that delimits the method.
+    let (trait_ty, _) = after_as.split_once(">::")?;
+    Some(trait_ty.split_once('<').map(|(t, _)| t).unwrap_or(trait_ty))
+}
+
 /// Whether the model has a definition for this operation at this width.
 ///
 /// `w` is the *operand* width, not the return type's: `checked_add` on a `u8`
@@ -267,6 +635,14 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // width the engine holds. Its *result* is wider than its operand, and
         // the model builds it at the operand's width and zero-extends.
         Intrinsic::Bits(_) => true,
+        // A `bool` predicate. `is_power_of_two` exists only on the *unsigned*
+        // types, so a signed operand is either a dump of something that is not
+        // this method or a reading the model must not guess at: the signed
+        // reading would accept `MIN` (its bits are a power of two but its value
+        // is negative) and the model has no way to tell the two apart once it
+        // has only the sign flag. It is total, so the only question is the width,
+        // which is already bounded above.
+        Intrinsic::Bool(_) => !signed,
         // The unary operators. Two membership facts decide whether a call can be
         // modelled at all, and both are about the *type*, not the width:
         //
@@ -305,9 +681,10 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         },
         // `pow`. Unlike the families above it reads a `u32` exponent beside a
         // base of the method's own width, so it is its own shape. It is modelled
-        // only where a *product* is: the fold's every step is a `mul_failure`
-        // query, and past [`MUL_MAX_WIDTH`] the widened multiply is the scaling
-        // wall, so the answer would be "unknown" at the first step anyway.
+        // only where a *product* is, and then only up to its own tighter bound:
+        // the fold's every step is a `mul_failure` query, so its cost is a large
+        // multiple of one product's rather than the product's own. See
+        // [`POW_MAX_WIDTH`] for the measurement behind the difference.
         //
         // All four families are modelled, and `pow` is not the division trap: its
         // failure is an overflow, and an overflow is a *value* in every family --
@@ -315,7 +692,28 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // `overflowing` sets the flag. Nothing here can panic, so there is no
         // panic to hide. The plain `pow`, which panics on overflow, is not a
         // modelled name at all: `classify` has no prefix for it.
-        Intrinsic::Pow(_) => w <= MUL_MAX_WIDTH,
+        Intrinsic::Pow(_) => w <= POW_MAX_WIDTH,
+        // The mixed-signedness additions. The operand of the method's own type
+        // has the method's sign, and the other operand's sign is what tells the
+        // model which one it is reading; the method itself exists on *both*
+        // signednesses for the opposite operand's sign -- `u8::add_signed` takes
+        // an `i8`, `i8::add_unsigned` takes a `u8` -- so there is no membership
+        // fact to check, only the width. Nothing here can panic, so all four
+        // families are modelled.
+        Intrinsic::MixedAdd(_) => true,
+        // `Ord::min`/`Ord::max`. Total, and modelled on both signednesses: the
+        // model reads the sign to pick the ordering, so a signed operand is not a
+        // guess but the method's own meaning. There is no membership fact to
+        // check -- `Ord` is implemented for every integer -- only the width,
+        // which is already bounded above.
+        Intrinsic::MinMax(_) => true,
+        // A widening conversion. The *value* is a plain extension, so it is total
+        // and can fail only at a width the engine cannot hold -- which the guard
+        // above already refused. Whether the call is a real integer widening at
+        // all is a question about its two *types*, not this one operand width, so
+        // it is decided by the executor (see `conversion_types`), which refuses a
+        // non-integer or narrowing call rather than reaching here.
+        Intrinsic::Conversion(_) => true,
     }
 }
 
@@ -326,8 +724,9 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
 /// guessing.
 ///
 /// `w` is the operand width. `result_w` is the destination type's width, which
-/// differs from `w` only for the bit counts (`u8::count_ones` returns `u32`); for
-/// every other shape the two are equal, and the caller passes `w` for both. The
+/// differs from `w` for the bit counts (`u8::count_ones` returns `u32`) and for a
+/// widening conversion (whose destination is wider than its source); for every
+/// other shape the two are equal, and the caller passes `w` for both. The
 /// result term is built at `result_w` so that it has the width of the local it is
 /// written to -- a term narrower than its local would make the next read of that
 /// local ill-formed.
@@ -348,6 +747,11 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             }
             Outcome::Value(smt::truncate(bit_count(kind, x), result_w))
         }
+        // A `bool` predicate. The result *is* the predicate, so there is no
+        // `result_w` to read: a `bool` is one bit and the destination local's
+        // type says so. The executor writes it as a `Val::Bool`, which is what
+        // the `if` that consumes it reads.
+        Intrinsic::Bool(kind) => Outcome::Bool(bool_pred(kind, x)),
         Intrinsic::Unary(family, un) => {
             if result_w == 0 || result_w > 64 {
                 return None;
@@ -447,7 +851,96 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
                 Family::Overflowing => Outcome::Tuple { value, overflowed: fails },
             }
         }
+        // The mixed-signedness additions. `y` is the addend, whose signedness is
+        // the *opposite* of the method's own, and `signed` is the method's own --
+        // so the direction is not carried in the shape, only read here.
+        //
+        // The value is one term in both directions, so only the failure and the
+        // clamp depend on the direction. The clamp is where the two directions
+        // genuinely differ: `u8::saturating_add_signed` clamps to the *addend's*
+        // end (`MAX` for a non-negative addend, `0` for a negative one), while
+        // `i8::saturating_add_unsigned` adds a non-negative count and can only run
+        // off the top, so it clamps to `MAX`. Both are the addend's sign read the
+        // right way round -- a non-negative addend can only take an unsigned self
+        // past `MAX`, and a negative one only below `0`.
+        Intrinsic::MixedAdd(family) => {
+            if result_w == 0 || result_w > 64 {
+                return None;
+            }
+            let plain = mixed_add_result(x, y);
+            let fails = mixed_add_failure(x, y, w, signed)?;
+            match family {
+                Family::Wrapping => Outcome::Value(smt::truncate(plain, result_w)),
+                Family::Saturating => {
+                    // The high bound is the *self type's* maximum: `127` for the
+                    // signed direction, `255` for the unsigned one. Taking the
+                    // unsigned maximum for a signed self would clamp `i8` to
+                    // `0xff`, which reads back as `-1`.
+                    let (_, hi) = bounds(w, signed)?;
+                    let bound = if signed {
+                        // The self operand is signed and the addend unsigned, so
+                        // the only way past the top is up.
+                        hi
+                    } else {
+                        // The self operand is unsigned: a non-negative addend
+                        // takes it above `MAX`, a negative one below `0`.
+                        smt::ite(smt::negative(y), smt::word(0, w), hi)
+                    };
+                    Outcome::Value(smt::truncate(smt::ite(fails, bound, plain), result_w))
+                }
+                Family::Checked => Outcome::Option {
+                    tag: smt::ite(fails, smt::word(0, w), smt::word(1, w)),
+                    payload: smt::truncate(plain, result_w),
+                },
+                Family::Overflowing => {
+                    Outcome::Tuple { value: smt::truncate(plain, result_w), overflowed: fails }
+                }
+            }
+        }
+        // `Ord::min`/`Ord::max`: the smaller or larger operand, by the type's own
+        // ordering. Total, so the result is a plain value and no failure term is
+        // built. The sign selects the ordering -- `sle`/`sge` on a signed type,
+        // `ule`/`uge` on an unsigned one -- and that is the *only* thing the sign
+        // changes here: on a signed type `i8::MIN` is below `0`, so a `ule` would
+        // return the wrong operand for every negative pair, which is a wrong value
+        // rather than a weaker proof.
+        Intrinsic::MinMax(kind) => {
+            if result_w == 0 || result_w > 64 {
+                return None;
+            }
+            Outcome::Value(smt::truncate(min_max_result(kind, x, y, signed), result_w))
+        }
+        // A widening (or same-width) conversion. The operand *is* the source, so
+        // its width and signedness are `w` and `signed`, and the destination is
+        // `result_w`. The value is the source extended by its own signedness -- the
+        // same rule the executor's `as`-cast uses, so a conversion and a cast of one
+        // shape build one term. A destination narrower than the source is refused: a
+        // real integer `From` never narrows, so a narrowing call is not the method
+        // this model knows, and truncating it would be a guess at a conversion
+        // `core` never performs. A same-width destination is `core`'s reflexive
+        // `impl<T> From<T> for T`, and the extension leaves the source unchanged.
+        Intrinsic::Conversion(_) => {
+            if result_w < w {
+                return None;
+            }
+            Outcome::Value(convert_value(x, signed, result_w))
+        }
     })
+}
+
+/// The smaller or larger of two operands, under the type's ordering.
+///
+/// Both results are one ite over the same operands; only the comparison differs,
+/// so the two cannot drift about which operand wins a tie (`min` returns the
+/// first on `<=`, `max` the first on `>=`, and both are the value either way).
+fn min_max_result(kind: MinMaxKind, x: Var, y: Var, signed: bool) -> Var {
+    let take_x = match (kind, signed) {
+        (MinMaxKind::Min, true) => smt::sle(x, y),
+        (MinMaxKind::Min, false) => smt::ule(x, y),
+        (MinMaxKind::Max, true) => smt::sge(x, y),
+        (MinMaxKind::Max, false) => smt::ule(y, x),
+    };
+    smt::ite(take_x, x, y)
 }
 
 /// The wrapped result of a unary operator, before any family reads it.
@@ -489,8 +982,10 @@ fn unary_failure(un: UnOp, x: Var, w: u8, signed: bool) -> Option<Pred> {
 
 /// The number of bits of the requested kind, as a term of the *operand's* width.
 ///
-/// All three are built from the same primitive -- "is bit `k` set" -- so they
-/// cannot disagree about which bit is which.
+/// The three *positive* counts are built from the same primitive -- "is bit `k`
+/// set" -- so they cannot disagree about which bit is which, and the three
+/// *complement* counts are defined as the corresponding positive count of `!x`,
+/// so there is one expression per pair rather than two that could drift.
 fn bit_count(kind: BitKind, x: Var) -> Var {
     let w = smt::bits(x);
     let one = smt::word(1, w);
@@ -512,6 +1007,9 @@ fn bit_count(kind: BitKind, x: Var) -> Var {
         // `w` bits clear. Starting at `k == 1` omits that term and reports `w - 1`
         // for zero -- an off-by-one at exactly one input, which the exhaustive
         // walk against `core` is what caught.
+        //
+        // `k` runs to `w - 1`, so the host shift `1u64 << k` is at most `63` even
+        // at `w == 64` and never overflows.
         BitKind::LeadingZeros => {
             for k in 0..w {
                 acc = smt::add(acc, smt::ite(smt::ult_const(x, 1u64 << k), one, zero));
@@ -520,14 +1018,71 @@ fn bit_count(kind: BitKind, x: Var) -> Var {
         // The zero bits below the lowest set bit: the `k`-th term is added while
         // the low `k` bits are all clear. Written as `x & (2^k - 1) == 0`, which
         // is one `and` and one compare per bit.
+        //
+        // The mask `2^k - 1` is built with a *host* shift, and `k` runs to `w`, so
+        // at `w == 64` the last step would evaluate `1u64 << 64` -- which panics
+        // under overflow checks and, without them, masks the shift amount to `0`
+        // and yields an all-zero mask. An all-zero mask makes `x & mask == 0` true
+        // for *every* operand, so the final term adds `1` unconditionally and
+        // every `trailing_zeros`/`trailing_ones` at 64 bits is one too large --
+        // `0u64.trailing_zeros()` would read `65`, not `64`. The last mask is
+        // therefore `all_ones(w)`, which is the same low-bit mask without the
+        // shift (`x & all_ones == x`, and `x == 0` iff all `w` low bits are clear).
         BitKind::TrailingZeros => {
             for k in 1..=w {
-                let low = smt::band(x, smt::word((1u64 << k) - 1, w));
+                let mask = if k == w {
+                    smt::all_ones(w)
+                } else {
+                    smt::word((1u64 << k) - 1, w)
+                };
+                let low = smt::band(x, mask);
                 acc = smt::add(acc, smt::ite(smt::eq_const(low, 0), one, zero));
             }
         }
+        // The complements are *not* a second summation: each is `core`'s own
+        // definition, the count of the bitwise complement. `count_zeros` is
+        // `count_ones(!x)`, `leading_ones` is `leading_zeros(!x)` and
+        // `trailing_ones` is `trailing_zeros(!x)`. Recursing keeps one expression
+        // for each pair, so a fix to `leading_zeros` cannot leave `leading_ones`
+        // behind. The recursion is one level deep -- `!x` is not a count.
+        //
+        // `!x` is spelled the way the executor spells it (`bxor` with `all_ones`),
+        // not as a second complement primitive, so the model's `!x` is the *same
+        // term* the body's `!x` produces rather than a definition that could drift
+        // from it.
+        BitKind::CountZeros => return bit_count(BitKind::Ones, not_bits(x)),
+        BitKind::LeadingOnes => return bit_count(BitKind::LeadingZeros, not_bits(x)),
+        BitKind::TrailingOnes => return bit_count(BitKind::TrailingZeros, not_bits(x)),
     }
     acc
+}
+
+/// `!x` at `x`'s own width.
+///
+/// The same term the executor builds for a `Not` rvalue, so a bit count of a
+/// complement and a bit count of a written `!x` cannot disagree.
+fn not_bits(x: Var) -> Var {
+    let w = smt::bits(x);
+    smt::bxor(x, smt::all_ones(w))
+}
+
+/// The truth value of a `bool`-valued predicate.
+///
+/// `is_power_of_two` is `x != 0 && x & (x - 1) == 0`, which is the standard
+/// trick: clearing the lowest set bit of a power of two leaves zero, and for
+/// every other non-zero value it does not. `x != 0` is *not* redundant --
+/// `0 & (0 - 1)` is `0 & all_ones`, which is `0`, so the mask test alone would
+/// call zero a power of two. The mask test is spelled with the engine's own
+/// `and`/`sub`/`eq_const`, so it is the same term a hand-written
+/// `x & (x - 1) == 0` produces.
+fn bool_pred(kind: BoolKind, x: Var) -> Pred {
+    match kind {
+        BoolKind::PowerOfTwo => {
+            let w = smt::bits(x);
+            let cleared = smt::band(x, smt::sub(x, smt::word(1, w)));
+            smt::and(smt::not(smt::eq_const(x, 0)), smt::eq_const(cleared, 0))
+        }
+    }
 }
 
 /// The operation with the result taken modulo `2^w`.
@@ -616,11 +1171,15 @@ fn failure(op: BinOp, x: Var, y: Var, w: u8, signed: bool) -> Option<Pred> {
 ///
 /// The exact result is built by widening: `truncate` zero-extends when the target
 /// is wider, so the operands are widened to `2w` and multiplied exactly there.
-/// Past `2w == 16` the widened multiply is the scaling wall this crate documents,
-/// so the model declines and the caller reports the path unknown.
+/// Past `2w == 32` the widened multiply is the scaling wall this crate documents,
+/// so the model declines and the caller reports the path unknown. That is the same
+/// width [`MUL_MAX_WIDTH`] admits, so the two agree today; the guard stays here as
+/// well because it is the *correctness* condition on the term this function builds,
+/// and a caller that changed the policy bound should get a refusal rather than a
+/// term the blaster cannot hold.
 fn mul_failure(x: Var, y: Var, w: u8, signed: bool) -> Option<Pred> {
     let wide = w.saturating_mul(2).min(64);
-    if wide <= w || wide > 16 {
+    if wide <= w || wide > 32 {
         return None;
     }
     Some(if signed {
@@ -639,6 +1198,54 @@ fn mul_failure(x: Var, y: Var, w: u8, signed: bool) -> Option<Pred> {
         let limit = limit.saturating_mul(2);
         smt::uge_const(exact, limit)
     })
+}
+
+/// The wrapped value of a mixed-signedness addition.
+///
+/// The two operands have opposite signedness, but the value does not care: rustc
+/// reinterprets the operand of the opposite signedness to the method's own type
+/// and adds, which is a plain `w`-bit addition. So this is the *same term* the
+/// body would build for `x.wrapping_add(r as _)`, and one expression serves both
+/// directions.
+fn mixed_add_result(x: Var, y: Var) -> Var {
+    smt::add(x, y)
+}
+
+/// When a mixed-signedness addition has no representable result.
+///
+/// The model is the addition's top-bit carry adjusted by the *addend's* sign:
+///
+/// ```text
+/// carry = overflow of x + y read at the method's own type
+/// flag  = carry XOR sign_of_addend
+/// ```
+///
+/// The carry is read at the method's own type -- the unsigned carry when that type
+/// is unsigned, the signed overflow when it is signed -- which is exactly what
+/// [`failure`] already computes for `Add`, so the mixed shapes reuse it rather than
+/// stating a second carry rule that could drift from it. That is the `_3 = copy _2
+/// as <self type>; AddWithOverflow(_1, _3)` rustc inlines: the addend is
+/// reinterpreted to the self type and the addition's overflow is read there.
+///
+/// The adjustment is the whole subtlety, and getting it wrong is a wrong *flag*,
+/// not a weaker proof. rustc inlines `flag = carry XOR (addend < 0)`, and the
+/// addend's top bit is its sign in *either* reading, so the same term serves both
+/// directions. Taking the bare carry as the flag is wrong in both directions. For
+/// `u8::add_signed`, `250u8 + (-1i8)` is `249`, which is in range -- but the
+/// addition carries, because `250 + 255` wraps to `249`, so the carry alone would
+/// report an overflow that is not there. For `i8::add_unsigned`, `0i8 + 128u8` is
+/// `-128`, which has run off the top -- but the addition does *not* carry, so the
+/// carry alone would miss it. In each case the addend's sign is what corrects the
+/// carry: a negative addend cancels a carry that is only a legitimate borrow, and
+/// a top-bit-set unsigned addend (`128u8` read as `i8` is negative) is what makes
+/// a carry-less addition an overflow. Both directions were walked over the whole
+/// `u8`/`i8` domain (65536 pairs each) and this predicate matched `core` on every
+/// one; the carry alone missed half of them.
+fn mixed_add_failure(x: Var, y: Var, w: u8, signed: bool) -> Option<Pred> {
+    let carry = failure(BinOp::Add, x, y, w, signed)?;
+    // `y` is the addend -- the operand whose signedness is the opposite of the
+    // method's own -- and it is its top bit that the carry is adjusted by.
+    Some(smt::xor(carry, smt::negative(y)))
 }
 
 /// The wrapped value and the overflow flag of `base.pow(exp)`, by squaring.
@@ -878,6 +1485,9 @@ mod tests {
             Outcome::Tuple { value, overflowed } => {
                 (smt::evaluate_pred(overflowed, env), smt::evaluate(value, env))
             }
+            // A `bool`: there is no value channel, so it is reported through the
+            // `Option<bool>` channel the tag uses. `check_bool` reads it that way.
+            Outcome::Bool(p) => (smt::evaluate_pred(p, env), None),
         }
     }
 
@@ -1077,6 +1687,9 @@ mod tests {
                             smt::evaluate(value, env),
                             smt::evaluate_pred(overflowed, env),
                         ),
+                        // `pow` is never a `bool`, so this arm is unreachable in
+                        // this helper; it exists only to keep the match total.
+                        Outcome::Bool(_) => unreachable!("`pow` is not a bool"),
                     };
                     let want = oracle(x, e);
                     let Some((wv, wf)) = want else {
@@ -1266,6 +1879,9 @@ mod tests {
                                     None,
                                     smt::evaluate_pred(overflowed, |i| if i == bi { Some(xb) } else { env(i) }),
                                 ),
+                                // `pow` is never a `bool`; the arm keeps the
+                                // match total.
+                                Outcome::Bool(_) => unreachable!("`pow` is not a bool"),
                             };
                             let from_const = eval(Intrinsic::Pow(family), base, constant, w, signed, w)
                                 .unwrap_or_else(|| panic!("{family:?} const must be modelled"));
@@ -1285,29 +1901,41 @@ mod tests {
         }
     }
 
-    /// `pow` is modelled only where a product is, and the exponent's width is a
-    /// check rather than an assumption.
+    /// `pow` is modelled only where a product is, and only up to its own bound.
+    ///
+    /// The bound is deliberately *below* the product bound, because the fold
+    /// composes many products: this pins the separation, so a later change that
+    /// collapses the two constants has to delete an assertion rather than quietly
+    /// make every symbolic `pow` slow.
     #[test]
     fn pow_is_modelled_only_where_a_product_is() {
-        // `pow`'s every step is a widened multiply, so it shares `MUL_MAX_WIDTH`.
-        assert!(is_modelled(Intrinsic::Pow(Family::Wrapping), MUL_MAX_WIDTH, false));
-        assert!(!is_modelled(Intrinsic::Pow(Family::Wrapping), MUL_MAX_WIDTH + 1, false));
+        // A `u32` read makes the comparison opaque to clippy's constant check while
+        // still being a compile-time fact; the point is that a later change to the
+        // constants cannot silently pass.
+        assert!(
+            u32::from(POW_MAX_WIDTH) < u32::from(MUL_MAX_WIDTH),
+            "pow's fold must keep the tighter bound"
+        );
+        assert!(is_modelled(Intrinsic::Pow(Family::Wrapping), POW_MAX_WIDTH, false));
+        assert!(!is_modelled(Intrinsic::Pow(Family::Wrapping), POW_MAX_WIDTH + 1, false));
+        // A width a two-operand product admits is still refused for `pow`.
+        assert!(!is_modelled(Intrinsic::Pow(Family::Wrapping), MUL_MAX_WIDTH, false));
         assert!(eval(
             Intrinsic::Pow(Family::Overflowing),
-            smt::var(MUL_MAX_WIDTH),
+            smt::var(POW_MAX_WIDTH),
             smt::var(32),
-            MUL_MAX_WIDTH,
+            POW_MAX_WIDTH,
             false,
-            MUL_MAX_WIDTH
+            POW_MAX_WIDTH
         )
         .is_some());
         assert!(eval(
             Intrinsic::Pow(Family::Overflowing),
-            smt::var(MUL_MAX_WIDTH + 1),
+            smt::var(POW_MAX_WIDTH + 1),
             smt::var(32),
-            MUL_MAX_WIDTH + 1,
+            POW_MAX_WIDTH + 1,
             false,
-            MUL_MAX_WIDTH + 1
+            POW_MAX_WIDTH + 1
         )
         .is_none());
         // The fold runs 32 steps, so a `u32` exponent is the whole domain and a
@@ -1790,9 +2418,11 @@ mod tests {
         assert!(classify("wrapping_shl").is_none());
         assert!(classify("checked_shl").is_none());
         assert!(classify("unchecked_add").is_none());
-        // The suffix is matched whole, so `wrapping_add_signed` is not read as
-        // `wrapping_add`.
-        assert!(classify("wrapping_add_signed").is_none());
+        // The suffix is matched whole, so a near miss is not read as a modelled
+        // shape. `add_signed` *is* modelled now, but only the exact spelling: a
+        // trailing word does not classify.
+        assert!(classify("wrapping_add_signed_thing").is_none());
+        assert!(classify("add_signed").is_none());
 
         // A *known* operator that only some families can model. `saturating_div`
         // classifies as a name, and is then refused by the model: only the
@@ -1809,6 +2439,55 @@ mod tests {
         // And the names that *are* covered classify, under both spellings.
         assert!(classify("core::num::<impl u8>::checked_add").is_some());
         assert!(classify("saturating_sub").is_some());
+    }
+
+    /// A `u16` product is now inside the bound, and the widened test is still exact
+    /// there -- the width that used to be refused outright.
+    ///
+    /// The oracle is `core`'s own `checked_mul`/`saturating_mul`, so this is not a
+    /// second copy of the model. The sweep is the boundary neighbourhood plus a few
+    /// strides: `2^16` pairs is too many to enumerate, and the cases a wrong bound
+    /// gets wrong are the ones where the product lands exactly on `MAX`, one past
+    /// it, or in the high half.
+    #[test]
+    fn a_u16_product_is_modelled_and_exact() {
+        let vals: [u16; 16] = [
+            0, 1, 2, 3, 255, 256, 257, 32767, 32768, 32769, 43690, 65534, 65535, 12345, 40000, 513,
+        ];
+        smt::with_fresh(|| {
+            let a = smt::var(16);
+            let b = smt::var(16);
+            let (ai, bi) = (smt::index(a), smt::index(b));
+            let checked = eval(Intrinsic::Checked(BinOp::Mul), a, b, 16, false, 16)
+                .expect("checked_mul u16 must be modelled");
+            let sat = eval(Intrinsic::Saturating(BinOp::Mul), a, b, 16, false, 16)
+                .expect("saturating_mul u16 must be modelled");
+            for &x in &vals {
+                for &y in &vals {
+                    let (got_some, got_val) = read(checked, ai, bi, x as u64, y as u64);
+                    assert_eq!(
+                        got_some,
+                        Some(u16::checked_mul(x, y).is_some()),
+                        "checked_mul u16 at ({x}, {y}): the tag must match `core`"
+                    );
+                    if let Some(want) = u16::checked_mul(x, y) {
+                        assert_eq!(
+                            got_val,
+                            Some(want as u64),
+                            "checked_mul u16 at ({x}, {y}): the payload must match `core`"
+                        );
+                    }
+                    // The clamp is the predicate's other use, so a wrong `failure`
+                    // would show here as a value rather than only a tag.
+                    let (_, sat_val) = read(sat, ai, bi, x as u64, y as u64);
+                    assert_eq!(
+                        sat_val,
+                        Some(u16::saturating_mul(x, y) as u64),
+                        "saturating_mul u16 at ({x}, {y})"
+                    );
+                }
+            }
+        });
     }
 
     /// Above the documented width limits the model declines rather than guessing.
@@ -1984,11 +2663,20 @@ mod tests {
         // all-zero operand counts its own width instead of running into the
         // sentinel.
         fn oracle(kind: BitKind, w: u8, b: u64) -> u64 {
-            let v = (b as u32) & ((1u32 << w) - 1);
+            let mask = (1u32 << w) - 1;
+            let v = (b as u32) & mask;
+            // `core` defines each complement as the count of `!x`, so the oracle is
+            // the same method on the complement. The complement must be taken *at
+            // the operand's width* -- `!v` on a `u32` sets the bits above `w`, and
+            // counting those would be counting bits the operand does not have.
+            let c = !v & mask;
             match kind {
                 BitKind::Ones => u64::from(v.count_ones()),
                 BitKind::LeadingZeros => u64::from(v.leading_zeros() - (32 - u32::from(w))),
                 BitKind::TrailingZeros => u64::from((v | (1u32 << w)).trailing_zeros()),
+                BitKind::CountZeros => u64::from(c.count_ones()),
+                BitKind::LeadingOnes => u64::from(c.leading_zeros() - (32 - u32::from(w))),
+                BitKind::TrailingOnes => u64::from((c | (1u32 << w)).trailing_zeros()),
             }
         }
         for w in [1u8, 4, 8] {
@@ -1996,6 +2684,9 @@ mod tests {
                 (BitKind::Ones, "count_ones"),
                 (BitKind::LeadingZeros, "leading_zeros"),
                 (BitKind::TrailingZeros, "trailing_zeros"),
+                (BitKind::CountZeros, "count_zeros"),
+                (BitKind::LeadingOnes, "leading_ones"),
+                (BitKind::TrailingOnes, "trailing_ones"),
             ] {
                 let f = move |b: u64| oracle(kind, w, b);
                 check_unary(
@@ -2016,6 +2707,154 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The 64-bit bit counts, checked at chosen operands rather than by walking.
+    ///
+    /// `the_bit_counts_agree_with_rust` walks the whole domain, which is only
+    /// possible up to 32 bits (`0..(1u64 << w)`). 64 bits is exactly where the
+    /// mask construction is delicate: `trailing_zeros` builds `2^k - 1` with a
+    /// *host* shift, and its last step is `k == w`, so at 64 bits that step is
+    /// `1u64 << 64` -- a panic under overflow checks and, without them, an
+    /// all-zero mask that makes `x & mask == 0` true for every operand, so every
+    /// count comes back one too large (`0u64.trailing_zeros()` would read `65`,
+    /// not `64`). The mask is now `all_ones(w)` at that step, and this pins the
+    /// shape at the one width the exhaustive walk cannot reach.
+    ///
+    /// The operands are the ones that separate the answers: `0` (every bit of the
+    /// operand is the counted kind), all ones (none is), `1` and `1 << 63` (one
+    /// bit of each kind at each end), and a mixed pattern.
+    #[test]
+    fn the_64_bit_counts_agree_with_rust() {
+        let operands = [
+            0u64,
+            u64::MAX,
+            1,
+            1u64 << 63,
+            0x8000_0000_0000_0001,
+            0x0000_ffff_ffff_0000,
+        ];
+        let check = |kind: BitKind, name: &str, oracle: fn(u64) -> u64| {
+            smt::with_fresh(|| {
+                let a = smt::var(64);
+                let ai = smt::index(a);
+                let outcome = eval(Intrinsic::Bits(kind), a, a, 64, false, 64)
+                    .unwrap_or_else(|| panic!("{name} at 64 bits must be modelled"));
+                let Outcome::Value(v) = outcome else {
+                    panic!("{name} must produce a plain value");
+                };
+                for xb in operands {
+                    let want = oracle(xb);
+                    let got = smt::evaluate(v, |i| if i == ai { Some(xb) } else { None });
+                    assert_eq!(
+                        got,
+                        Some(want),
+                        "{name} at bits {xb:#x}: the model says {got:?}, Rust says {want}"
+                    );
+                }
+            });
+        };
+        check(BitKind::Ones, "count_ones", |v| u64::from(v.count_ones()));
+        check(BitKind::CountZeros, "count_zeros", |v| u64::from(v.count_zeros()));
+        check(BitKind::LeadingZeros, "leading_zeros", |v| u64::from(v.leading_zeros()));
+        check(BitKind::LeadingOnes, "leading_ones", |v| u64::from(v.leading_ones()));
+        check(BitKind::TrailingZeros, "trailing_zeros", |v| u64::from(v.trailing_zeros()));
+        check(BitKind::TrailingOnes, "trailing_ones", |v| u64::from(v.trailing_ones()));
+    }
+
+    /// Walk every `w`-bit value and compare a `bool`-valued model against Rust.
+    ///
+    /// The oracle answers with `core`'s own `bool`, so the expectation is never a
+    /// copy of the model. This is the sharpest of the three channels: a
+    /// `count_zeros` read as `count_ones` is a *wrong number*, but an
+    /// `is_power_of_two` read as its negation, or with the `x != 0` conjunct
+    /// dropped, is a wrong *branch* -- the `if` that consumes it takes the other
+    /// arm, and a proof built on it is a proof about the wrong program.
+    fn check_bool(
+        op: Intrinsic,
+        w: u8,
+        signed: bool,
+        oracle: impl Fn(u64) -> bool,
+        label: &str,
+    ) {
+        smt::with_fresh(|| {
+            let a = smt::var(w);
+            let outcome = eval(op, a, a, w, signed, w)
+                .unwrap_or_else(|| panic!("{label} at {w} bits must be modelled"));
+            let ai = smt::index(a);
+            for xb in 0..(1u64 << w) {
+                let want = oracle(xb);
+                let Outcome::Bool(p) = outcome else {
+                    panic!("{label} must produce a `bool`");
+                };
+                let got = smt::evaluate_pred(p, |i| if i == ai { Some(xb) } else { None });
+                assert_eq!(
+                    got,
+                    Some(want),
+                    "{label} at bits {xb}: the model says {got:?}, Rust says {want}"
+                );
+            }
+        });
+    }
+
+    /// `is_power_of_two` agrees with Rust over whole `u8` and `u16` domains.
+    ///
+    /// The oracle is `core`'s own method rather than the mask trick the model
+    /// uses, so a mistake in the trick is visible instead of being reproduced.
+    /// The interesting inputs are named rather than only swept: `0` is not a
+    /// power of two (the one value the bare `x & (x - 1)` test would accept),
+    /// `1` is (`1 << 0`), the top bit is, and `127` and `255` are not.
+    #[test]
+    fn is_power_of_two_agrees_with_rust() {
+        for w in [8u8, 16] {
+            let oracle = move |b: u64| match w {
+                8 => u8::try_from(b).unwrap().is_power_of_two(),
+                16 => u16::try_from(b).unwrap().is_power_of_two(),
+                _ => unreachable!("the test walks 8 and 16 bits"),
+            };
+            check_bool(Intrinsic::Bool(BoolKind::PowerOfTwo), w, false, oracle, "is_power_of_two");
+        }
+        // The named points, at 8 bits, so a failure names the value that broke
+        // rather than only the width.
+        let p = |b: u64| {
+            smt::with_fresh(|| {
+                let a = smt::var(8);
+                let Outcome::Bool(p) =
+                    eval(Intrinsic::Bool(BoolKind::PowerOfTwo), a, a, 8, false, 8)
+                        .expect("is_power_of_two at 8 bits must be modelled")
+                else {
+                    panic!("is_power_of_two must produce a `bool`");
+                };
+                let ai = smt::index(a);
+                smt::evaluate_pred(p, |i| if i == ai { Some(b) } else { None })
+            })
+        };
+        for (b, want, why) in [
+            (0u64, false, "zero is not a power of two"),
+            (1, true, "one is 1 << 0"),
+            (2, true, "two is 1 << 1"),
+            (127, false, "seven set bits"),
+            (128, true, "the top bit is 1 << 7"),
+            (255, false, "eight set bits"),
+        ] {
+            assert_eq!(p(b), Some(want), "{why} (at bits {b})");
+        }
+    }
+
+    /// `is_power_of_two` is refused on a signed operand, where `core` has no such
+    /// method.
+    ///
+    /// The refusal is the sound answer: read at the *bits*, `i8::MIN` is `1 << 7`
+    /// and would be accepted, but its value is negative, and once only the sign
+    /// flag survives there is no way to tell it from an unsigned `128`. Refusing
+    /// rather than guessing is what keeps the model from proving a signed reading
+    /// that `core` does not define.
+    #[test]
+    fn is_power_of_two_is_refused_when_signed() {
+        assert!(is_modelled(Intrinsic::Bool(BoolKind::PowerOfTwo), 8, false));
+        assert!(!is_modelled(Intrinsic::Bool(BoolKind::PowerOfTwo), 8, true));
+        assert!(eval(Intrinsic::Bool(BoolKind::PowerOfTwo), smt::var(8), smt::var(8), 8, true, 8)
+            .is_none());
     }
 
     /// Every unary operator in every family agrees with Rust over a whole `i8`.
@@ -2176,8 +3015,11 @@ mod tests {
         // `pow` classifies now (as `Intrinsic::Pow`, its own shape), so the
         // unmodelled examples here are the names that stay unmodelled.
         assert!(classify("powf").is_none());
-        assert!(classify("count_zeros").is_none());
         assert!(classify("count_ones_signed").is_none());
+        // `count_zeros` is modelled now; the near miss that stays unmodelled is
+        // the signed spelling, which is not a real method name.
+        assert_eq!(classify("count_zeros"), Some(Intrinsic::Bits(BitKind::CountZeros)));
+        assert!(classify("count_zeros_signed").is_none());
     }
 
     /// The bit-count names classify as counts and not as anything else.
@@ -2187,9 +3029,36 @@ mod tests {
         assert_eq!(classify("count_ones"), Some(Intrinsic::Bits(BitKind::Ones)));
         assert_eq!(classify("leading_zeros"), Some(Intrinsic::Bits(BitKind::LeadingZeros)));
         assert_eq!(classify("trailing_zeros"), Some(Intrinsic::Bits(BitKind::TrailingZeros)));
-        // The near miss: `count_zeros` is a real method this crate does not model,
-        // and it must not be read as `count_ones`.
-        assert!(classify("count_zeros").is_none());
+        assert_eq!(classify("count_zeros"), Some(Intrinsic::Bits(BitKind::CountZeros)));
+        assert_eq!(classify("leading_ones"), Some(Intrinsic::Bits(BitKind::LeadingOnes)));
+        assert_eq!(classify("trailing_ones"), Some(Intrinsic::Bits(BitKind::TrailingOnes)));
+        // The six are distinct: a `count_zeros` read as `count_ones` would be the
+        // *complement* of the right answer, which is a wrong value rather than a
+        // refusal.
+        assert_ne!(classify("count_zeros"), Some(Intrinsic::Bits(BitKind::Ones)));
+        assert_ne!(classify("leading_ones"), Some(Intrinsic::Bits(BitKind::LeadingZeros)));
+        assert_ne!(classify("trailing_ones"), Some(Intrinsic::Bits(BitKind::TrailingZeros)));
+        // A near miss that is still refused: the `_signed` spellings are not
+        // `core` methods.
+        assert!(classify("leading_ones_signed").is_none());
+    }
+
+    /// `is_power_of_two` classifies as a `bool` predicate, and only that name does.
+    #[test]
+    fn the_bool_predicate_names_classify() {
+        assert_eq!(
+            classify("core::num::<impl u32>::is_power_of_two"),
+            Some(Intrinsic::Bool(BoolKind::PowerOfTwo))
+        );
+        assert_eq!(classify("is_power_of_two"), Some(Intrinsic::Bool(BoolKind::PowerOfTwo)));
+        // Distinct from the numeric shapes: a `bool` read as a value would write
+        // a one-bit word into a `bool` local, which no `if` could read.
+        assert_ne!(classify("is_power_of_two"), Some(Intrinsic::Bits(BitKind::Ones)));
+        // Near misses that stay refused. `is_power_of_two` on the signed types is
+        // not a `core` method; the other `is_*` predicates are not modelled yet.
+        assert!(classify("is_power_of_two_signed").is_none());
+        assert!(classify("is_ascii").is_none());
+        assert!(classify("is_negative").is_none());
     }
 
     /// The unary shapes are `is_unary`; the two-operand families are not.
@@ -2201,11 +3070,509 @@ mod tests {
     #[test]
     fn only_the_unary_shapes_are_unary() {
         assert!(Intrinsic::Bits(BitKind::Ones).is_unary());
+        assert!(Intrinsic::Bool(BoolKind::PowerOfTwo).is_unary());
         assert!(Intrinsic::Unary(Family::Wrapping, UnOp::Neg).is_unary());
         assert!(Intrinsic::Unary(Family::Checked, UnOp::Abs).is_unary());
         assert!(!Intrinsic::Wrapping(BinOp::Add).is_unary());
         assert!(!Intrinsic::Saturating(BinOp::Sub).is_unary());
         assert!(!Intrinsic::Checked(BinOp::Mul).is_unary());
         assert!(!Intrinsic::Overflowing(BinOp::Add).is_unary());
+        // A mixed-signedness addition takes two operands, so it must *not* be
+        // reported unary: the executor would read one argument and mis-shape it.
+        assert!(!Intrinsic::MixedAdd(Family::Wrapping).is_unary());
+    }
+
+    /// The `add_signed`/`add_unsigned` names classify into the four families, and
+    /// no other spelling does.
+    #[test]
+    fn the_mixed_add_names_classify() {
+        assert_eq!(
+            classify("core::num::<impl u8>::wrapping_add_signed"),
+            Some(Intrinsic::MixedAdd(Family::Wrapping))
+        );
+        assert_eq!(
+            classify("saturating_add_signed"),
+            Some(Intrinsic::MixedAdd(Family::Saturating))
+        );
+        assert_eq!(classify("checked_add_signed"), Some(Intrinsic::MixedAdd(Family::Checked)));
+        assert_eq!(
+            classify("overflowing_add_signed"),
+            Some(Intrinsic::MixedAdd(Family::Overflowing))
+        );
+        // The `_unsigned` spelling is the same shape: the direction is read from
+        // the operands, not from the name.
+        assert_eq!(
+            classify("core::num::<impl i8>::wrapping_add_unsigned"),
+            Some(Intrinsic::MixedAdd(Family::Wrapping))
+        );
+        assert_eq!(
+            classify("overflowing_add_unsigned"),
+            Some(Intrinsic::MixedAdd(Family::Overflowing))
+        );
+        // The bare `add_signed` is not a `core` name -- every method carries a
+        // family prefix -- so it does not classify.
+        assert!(classify("add_signed").is_none());
+        assert!(classify("add_unsigned").is_none());
+    }
+
+    /// Walk every `u8`/`i8` pair of a mixed-signedness addition against `core`.
+    ///
+    /// The two operands have opposite signedness, so the generic [`check`] and
+    /// [`check_tuple`] helpers do not fit: they read both operands at the same
+    /// width *and* the same signedness. Here the first operand is read at the
+    /// method's own sign and the second at the opposite, and `core`'s own method
+    /// is the oracle in both directions.
+    ///
+    /// `self_is_unsigned` says which direction is under test, and it must agree
+    /// with the `signed` flag handed to `eval`: the flag is the sign of the
+    /// operand with the method's own type, so `u8::add_signed` passes `false` and
+    /// `i8::add_unsigned` passes `true`. Passing the other one is the bug the
+    /// whole `signed_operand` selection exists to prevent, so it is what the two
+    /// calls below vary.
+    fn check_mixed(
+        op: Intrinsic,
+        self_is_unsigned: bool,
+        rust: impl Fn(u64, u64) -> (Option<bool>, Option<u64>),
+        label: &str,
+    ) {
+        let w = 8u8;
+        smt::with_fresh(|| {
+            let a = smt::var(w);
+            let b = smt::var(w);
+            // `signed` is the *self* operand's sign, which is the opposite of the
+            // addend's.
+            let signed = !self_is_unsigned;
+            let outcome = eval(op, a, b, w, signed, w)
+                .unwrap_or_else(|| panic!("{label} at {w} bits must be modelled"));
+            let (ai, bi) = (smt::index(a), smt::index(b));
+            each_pair(w, |xb, yb| {
+                let (want_tag, want_val) = rust(xb, yb);
+                let (got_tag, got_val) = read(outcome, ai, bi, xb, yb);
+                assert_eq!(
+                    (got_tag, got_val),
+                    (want_tag, want_val),
+                    "{label} at (self={xb}, addend={yb}): the model says \
+                     ({got_tag:?}, {got_val:?}), Rust says ({want_tag:?}, {want_val:?})"
+                );
+            });
+        });
+    }
+
+    /// `u8::wrapping_add_signed` and `i8::wrapping_add_unsigned` agree with `core`.
+    #[test]
+    fn the_wrapping_mixed_adds_agree_with_rust() {
+        // `u8` self, `i8` addend: the addend's bits are its two's-complement
+        // image, and the value is the plain wrapped sum.
+        check_mixed(
+            Intrinsic::MixedAdd(Family::Wrapping),
+            true,
+            |xb, yb| {
+                let (x, r) = (xb as u8, yb as u8 as i8);
+                (None, Some(u64::from(x.wrapping_add_signed(r))))
+            },
+            "wrapping_add_signed u8",
+        );
+        // `i8` self, `u8` addend.
+        check_mixed(
+            Intrinsic::MixedAdd(Family::Wrapping),
+            false,
+            |xb, yb| {
+                let (x, r) = (xb as u8 as i8, yb as u8);
+                (None, Some(x.wrapping_add_unsigned(r) as u8 as u64))
+            },
+            "wrapping_add_unsigned i8",
+        );
+    }
+
+    /// The `overflowing` mixed additions agree with `core` on *both* the value and
+    /// the flag, over the whole `u8`/`i8` domain.
+    ///
+    /// The flag is the sharp part: it is not the ordinary signed-addition rule, so
+    /// a model that reached for that rule would agree on the value everywhere and
+    /// disagree on the flag for half the domain. The oracle is `core`'s own
+    /// `overflowing_*`, so the expectation is never a copy of the model.
+    #[test]
+    fn the_overflowing_mixed_adds_agree_with_rust() {
+        check_mixed(
+            Intrinsic::MixedAdd(Family::Overflowing),
+            true,
+            |xb, yb| {
+                let (x, r) = (xb as u8, yb as u8 as i8);
+                let (v, o) = x.overflowing_add_signed(r);
+                (Some(o), Some(u64::from(v)))
+            },
+            "overflowing_add_signed u8",
+        );
+        check_mixed(
+            Intrinsic::MixedAdd(Family::Overflowing),
+            false,
+            |xb, yb| {
+                let (x, r) = (xb as u8 as i8, yb as u8);
+                let (v, o) = x.overflowing_add_unsigned(r);
+                (Some(o), Some(v as u8 as u64))
+            },
+            "overflowing_add_unsigned i8",
+        );
+    }
+
+    /// The `checked` mixed additions agree with `core`'s `Option`, so `None` is
+    /// exactly where the operation is undefined.
+    #[test]
+    fn the_checked_mixed_adds_agree_with_rust() {
+        check_mixed(
+            Intrinsic::MixedAdd(Family::Checked),
+            true,
+            |xb, yb| {
+                let (x, r) = (xb as u8, yb as u8 as i8);
+                match x.checked_add_signed(r) {
+                    Some(v) => (Some(true), Some(u64::from(v))),
+                    None => (Some(false), Some(u64::from(x.wrapping_add_signed(r)))),
+                }
+            },
+            "checked_add_signed u8",
+        );
+        check_mixed(
+            Intrinsic::MixedAdd(Family::Checked),
+            false,
+            |xb, yb| {
+                let (x, r) = (xb as u8 as i8, yb as u8);
+                match x.checked_add_unsigned(r) {
+                    Some(v) => (Some(true), Some(v as u8 as u64)),
+                    None => (Some(false), Some(x.wrapping_add_unsigned(r) as u8 as u64)),
+                }
+            },
+            "checked_add_unsigned i8",
+        );
+    }
+
+    /// The `saturating` mixed additions agree with `core`, including the two
+    /// *different* clamps the two directions use.
+    #[test]
+    fn the_saturating_mixed_adds_agree_with_rust() {
+        // `u8` self: clamps to `0` for a negative addend and `MAX` for a
+        // non-negative one, so both ends are exercised by the sweep.
+        check_mixed(
+            Intrinsic::MixedAdd(Family::Saturating),
+            true,
+            |xb, yb| {
+                let (x, r) = (xb as u8, yb as u8 as i8);
+                (None, Some(u64::from(x.saturating_add_signed(r))))
+            },
+            "saturating_add_signed u8",
+        );
+        // `i8` self: the addend is unsigned, so it can only run off the top and
+        // the clamp is always `MAX`. A model that reused the `u8` clamp would
+        // return `0` on the wrap and disagree here.
+        check_mixed(
+            Intrinsic::MixedAdd(Family::Saturating),
+            false,
+            |xb, yb| {
+                let (x, r) = (xb as u8 as i8, yb as u8);
+                (None, Some(x.saturating_add_unsigned(r) as u8 as u64))
+            },
+            "saturating_add_unsigned i8",
+        );
+    }
+
+    /// `Ord::min`/`Ord::max` classify only under the standard library's `Ord`.
+    #[test]
+    fn the_ord_names_classify_and_their_neighbours_do_not() {
+        assert_eq!(classify("<u8 as Ord>::min"), Some(Intrinsic::MinMax(MinMaxKind::Min)));
+        assert_eq!(classify("<u8 as Ord>::max"), Some(Intrinsic::MinMax(MinMaxKind::Max)));
+        assert_eq!(classify("<i8 as Ord>::min"), Some(Intrinsic::MinMax(MinMaxKind::Min)));
+        assert_eq!(classify("<i8 as Ord>::max"), Some(Intrinsic::MinMax(MinMaxKind::Max)));
+        // `min` and `max` are distinct shapes: reading `max` as `min` returns the
+        // other operand, a wrong value rather than a refusal.
+        assert_ne!(classify("<u8 as Ord>::max"), Some(Intrinsic::MinMax(MinMaxKind::Min)));
+        // A different trait's `min` is refused. The trait path is the only thing
+        // distinguishing `Ord`'s from another trait's, and a local trait in a
+        // module spells its call `<u8 as m::Ord>::min` -- a path that is not `Ord`.
+        assert!(classify("<u8 as m::Ord>::min").is_none());
+        assert!(classify("<u8 as MyOrd>::min").is_none());
+        assert!(classify("<u8 as ord_shim::Ord>::min").is_none());
+        assert!(classify("<u8 as Ord>::clamp").is_none());
+        // The `std`/`core`-qualified spelling the prelude's own `Ord` prints with.
+        assert_eq!(
+            classify("<i8 as std::cmp::Ord>::max"),
+            Some(Intrinsic::MinMax(MinMaxKind::Max))
+        );
+        assert_eq!(
+            classify("<u8 as core::cmp::Ord>::min"),
+            Some(Intrinsic::MinMax(MinMaxKind::Min))
+        );
+        // The `_signed` near misses stay refused.
+        assert!(classify("<u8 as Ord>::min_signed").is_none());
+    }
+
+    /// `Ord::min`/`Ord::max` agree with `core` over a whole `u8` and `i8`.
+    ///
+    /// The signed walk is what pins the ordering choice: a model that used `ule`
+    /// for a signed type would return the wrong operand for every pair with a
+    /// negative side, and `i8::MIN` (`0x80`) is the one value whose bits sort the
+    /// other way. `core`'s own `min`/`max` are the oracle, so the model's `ite` is
+    /// compared against the method rather than against a second copy of itself.
+    #[test]
+    fn the_ord_min_max_agree_with_rust() {
+        check(
+            Intrinsic::MinMax(MinMaxKind::Min),
+            8,
+            false,
+            unident,
+            ident,
+            |x, y| Some(i64::from((x as u8).min(y as u8))),
+            "u8::min",
+        );
+        check(
+            Intrinsic::MinMax(MinMaxKind::Max),
+            8,
+            false,
+            unident,
+            ident,
+            |x, y| Some(i64::from((x as u8).max(y as u8))),
+            "u8::max",
+        );
+        check(
+            Intrinsic::MinMax(MinMaxKind::Min),
+            8,
+            true,
+            |b| i8::from_ne_bytes([b as u8]) as i64,
+            |v| v as u8 as u64,
+            |x, y| Some(i64::from((x as i8).min(y as i8))),
+            "i8::min",
+        );
+        check(
+            Intrinsic::MinMax(MinMaxKind::Max),
+            8,
+            true,
+            |b| i8::from_ne_bytes([b as u8]) as i64,
+            |v| v as u8 as u64,
+            |x, y| Some(i64::from((x as i8).max(y as i8))),
+            "i8::max",
+        );
+        // The named points, so a failure names the pair that broke. `i8::MIN` is
+        // the value that separates the signed and unsigned orderings.
+        let ord = |kind: MinMaxKind, signed: bool, xb: u64, yb: u64| {
+            smt::with_fresh(|| {
+                let (a, b) = (smt::var(8), smt::var(8));
+                let Outcome::Value(v) =
+                    eval(Intrinsic::MinMax(kind), a, b, 8, signed, 8).expect("min/max at 8 bits")
+                else {
+                    panic!("min/max must produce a plain value");
+                };
+                let (ai, bi) = (smt::index(a), smt::index(b));
+                smt::evaluate(v, |i| {
+                    if i == ai {
+                        Some(xb)
+                    } else if i == bi {
+                        Some(yb)
+                    } else {
+                        None
+                    }
+                })
+            })
+        };
+        for (kind, signed, xb, yb, want, why) in [
+            (MinMaxKind::Min, false, 3, 7, 3u64, "unsigned min takes the smaller"),
+            (MinMaxKind::Max, false, 3, 7, 7, "unsigned max takes the larger"),
+            (MinMaxKind::Min, true, 0x80, 1, 0x80, "i8::MIN is the smallest signed value"),
+            (MinMaxKind::Max, true, 0x80, 1, 1, "i8::MIN is not the largest"),
+            (MinMaxKind::Min, true, 0xff, 0xfe, 0xfe, "0xfe is -2, below -1"),
+            (MinMaxKind::Max, true, 0xff, 0xfe, 0xff, "0xff is -1, above -2"),
+        ] {
+            assert_eq!(ord(kind, signed, xb, yb), Some(want), "{why} ({xb:#x}, {yb:#x})");
+        }
+    }
+
+    /// The `from`/`into` names classify, and the neighbours that only *look* like
+    /// them do not.
+    #[test]
+    fn the_conversion_names_classify_and_their_neighbours_do_not() {
+        // Both spellings of both directions, bare and fully qualified.
+        for name in [
+            "<u16 as From<u8>>::from",
+            "<u16 as core::convert::From<u8>>::from",
+            "<u16 as std::convert::From<u8>>::from",
+            "<i8 as Into<i32>>::into",
+            "<i8 as core::convert::Into<i32>>::into",
+            "<i8 as std::convert::Into<i32>>::into",
+        ] {
+            assert!(classify(name).is_some(), "`{name}` must classify as a conversion");
+        }
+        assert_eq!(
+            classify("<u16 as From<u8>>::from"),
+            Some(Intrinsic::Conversion(Conversion::From))
+        );
+        assert_eq!(
+            classify("<u8 as Into<u16>>::into"),
+            Some(Intrinsic::Conversion(Conversion::Into))
+        );
+        // A module-qualified local trait is a different path, and is refused: the
+        // same-dump lookup answers it, and the model must not.
+        assert_eq!(classify("<MyT as m::From<u8>>::from"), None);
+        assert_eq!(classify("<MyT as m::Into<u16>>::into"), None);
+        assert_eq!(classify("<MyT as MyFrom<u8>>::from"), None);
+        // An inherent method of the same name is not a trait call, so it names no
+        // `From`/`Into` and is not modelled.
+        assert_eq!(classify("core::num::<impl u8>::from"), None);
+        assert_eq!(classify("from"), None);
+        assert_eq!(classify("into"), None);
+        // The `From`-like names that are not `From`.
+        assert_eq!(classify("<u8 as TryFrom<u16>>::try_from"), None);
+        assert_eq!(classify("<u16 as FromIterator<u8>>::from_iter"), None);
+    }
+
+    /// The two types a conversion reads out of its own name.
+    #[test]
+    fn a_conversion_reads_its_source_and_destination_from_the_name() {
+        // `From`: the self type is the destination, the parameter the source.
+        assert_eq!(
+            conversion_types("<u16 as From<u8>>::from", Conversion::From),
+            Some((Ty::U8, Ty::U16))
+        );
+        // `Into`: they are the other way round.
+        assert_eq!(
+            conversion_types("<u8 as Into<u16>>::into", Conversion::Into),
+            Some((Ty::U8, Ty::U16))
+        );
+        assert_eq!(
+            conversion_types("<i8 as Into<i64>>::into", Conversion::Into),
+            Some((Ty::I8, Ty::I64))
+        );
+        // A signedness change is a widening too: `i16::from(u8)`.
+        assert_eq!(
+            conversion_types("<i16 as From<u8>>::from", Conversion::From),
+            Some((Ty::U8, Ty::I16))
+        );
+        // A non-integer operand (the `bool`/`char` `From` impls) parses, but
+        // `int_width` refuses it, so the caller reports the path unknown rather
+        // than guessing a width.
+        let (src, dst) = conversion_types("<u8 as From<bool>>::from", Conversion::From).unwrap();
+        assert_eq!(src, Ty::Bool);
+        assert_eq!(int_width(&src), None);
+        assert_eq!(int_width(&dst), Some(8));
+    }
+
+    /// A widening conversion agrees with Rust's own `From`/`Into`, over every
+    /// input of the source type.
+    #[test]
+    fn the_conversion_agrees_with_rust() {
+        // `rust` is the language's own conversion, taken as a pair of functions
+        // over the *bit pattern*: `bits` at the source width in, `bits` at the
+        // destination width out. The oracle is the real `From` impl, so it cannot
+        // drift from the model the way a second hand-written rule could.
+        let check = |src_w: u8,
+                     dst_w: u8,
+                     src_signed: bool,
+                     src_ty: Ty,
+                     dst_ty: Ty,
+                     rust: &dyn Fn(u64) -> u64,
+                     label: &str| {
+            smt::with_fresh(|| {
+                let x = smt::var(src_w);
+                let xi = smt::index(x);
+                let Outcome::Value(v) = eval(
+                    Intrinsic::Conversion(Conversion::From),
+                    x,
+                    x,
+                    src_w,
+                    src_signed,
+                    dst_w,
+                )
+                .unwrap_or_else(|| panic!("{label}: must be modelled")) else {
+                    panic!("{label}: a conversion produces a plain value");
+                };
+                for bits in 0..(1u64 << src_w) {
+                    let got = smt::evaluate(v, |i| if i == xi { Some(bits) } else { None });
+                    let want = rust(bits);
+                    assert_eq!(
+                        got,
+                        Some(want),
+                        "{label} at {bits:#x}: the model says {got:?}, Rust says {want:#x}"
+                    );
+                }
+                // The name reads the same two types the case claims.
+                assert_eq!(src_ty.is_signed(), src_signed, "{label}: source signedness");
+                assert_eq!(int_width(&src_ty), Some(src_w), "{label}: source width");
+                assert_eq!(int_width(&dst_ty), Some(dst_w), "{label}: destination width");
+            });
+        };
+
+        let u8_to_u16 = |bits: u64| u64::from(u16::from(bits as u8));
+        check(8, 16, false, Ty::U8, Ty::U16, &u8_to_u16, "u16::from(u8)");
+
+        let i8_to_i16 = |bits: u64| u64::from(i16::from(i8::from_ne_bytes([bits as u8])) as u16);
+        check(8, 16, true, Ty::I8, Ty::I16, &i8_to_i16, "i16::from(i8)");
+
+        // A signedness *change* on a widening: `u8` -> `i16` zero-fills, so `255`
+        // stays `255` and never becomes `-1`.
+        let u8_to_i16 = |bits: u64| u64::from(i16::from(bits as u8) as u16);
+        check(8, 16, false, Ty::U8, Ty::I16, &u8_to_i16, "i16::from(u8)");
+
+        let i8_to_i64 = |bits: u64| i64::from(i8::from_ne_bytes([bits as u8])) as u64;
+        check(8, 64, true, Ty::I8, Ty::I64, &i8_to_i64, "i64::from(i8)");
+
+        let u8_to_u32 = |bits: u64| u64::from(u32::from(bits as u8));
+        check(8, 32, false, Ty::U8, Ty::U32, &u8_to_u32, "u32::from(u8)");
+
+        let i16_to_i32 =
+            |bits: u64| u64::from(i32::from(i16::from_ne_bytes((bits as u16).to_ne_bytes())) as u32);
+        check(16, 32, true, Ty::I16, Ty::I32, &i16_to_i32, "i32::from(i16)");
+
+        // The named points, so a failure names the value that broke. `-1` is the
+        // one that separates sign-extension from zero-filling, and `0xff`/`0x80`
+        // are the extremes of the source type.
+        let widen = |src_w: u8, dst_w: u8, src_signed: bool, bits: u64| {
+            smt::with_fresh(|| {
+                let x = smt::var(src_w);
+                let xi = smt::index(x);
+                let Outcome::Value(v) = eval(
+                    Intrinsic::Conversion(Conversion::From),
+                    x,
+                    x,
+                    src_w,
+                    src_signed,
+                    dst_w,
+                )
+                .expect("a widening conversion is modelled") else {
+                    panic!("a conversion produces a plain value");
+                };
+                smt::evaluate(v, |i| if i == xi { Some(bits) } else { None })
+            })
+        };
+        for (src_w, dst_w, signed, bits, want, why) in [
+            (8u8, 16u8, false, 0xff, 0xffu64, "unsigned widens by zero-fill"),
+            (8, 16, true, 0xff, 0xffff, "-1i8 widens to -1i16, not 255"),
+            (8, 16, true, 0x80, 0xff80, "i8::MIN widens to i16::MIN"),
+            (8, 64, true, 0x80, 0xffff_ffff_ffff_ff80, "i8::MIN widens to i64::MIN"),
+            (8, 16, false, 0x80, 0x80, "u8::128 stays 128 in a wider unsigned"),
+            (16, 32, true, 0x8000, 0xffff_8000, "i16::MIN widens to i32::MIN"),
+        ] {
+            assert_eq!(
+                widen(src_w, dst_w, signed, bits),
+                Some(want),
+                "{why} ({bits:#x})"
+            );
+        }
+
+        // A narrowing conversion is refused, so a call `core` does not implement is
+        // never read as one it does. (A same-width call *is* `core`'s reflexive
+        // `impl<T> From<T> for T` and is modelled, so it is not refused here.)
+        smt::with_fresh(|| {
+            let x = smt::var(16);
+            assert!(
+                eval(Intrinsic::Conversion(Conversion::From), x, x, 16, false, 8).is_none(),
+                "a narrowing conversion must be refused"
+            );
+        });
+        // A same-width call *is* `core`'s reflexive `impl<T> From<T> for T`, so it
+        // must be modelled rather than refused. (Its identity semantics are pinned
+        // end to end in the corpus; here it is enough that it is not a refusal.)
+        smt::with_fresh(|| {
+            let x = smt::var(16);
+            assert!(
+                eval(Intrinsic::Conversion(Conversion::From), x, x, 16, false, 16).is_some(),
+                "a same-width conversion is the identity `core` implements, not a refusal"
+            );
+        });
     }
 }

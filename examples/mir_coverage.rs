@@ -13,7 +13,7 @@
 //! Run it with a nightly named, or it says so and stops:
 //!
 //! ```console
-//! $ DISCHARGE_RUSTC=$(rustup which --toolchain nightly rustc) \
+//! $ VERIF_RUSTC=$(rustup which --toolchain nightly rustc) \
 //!     cargo run --features std --example mir_coverage
 //! function             outcome      detail
 //! halve_guarded        verified     2 obl, 1 panic
@@ -34,8 +34,8 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use discharge::mir::spec;
-use discharge::mir::verify::{self, FnOutcome};
+use verif::mir::spec;
+use verif::mir::verify::{self, FnOutcome};
 
 const DEFAULT_TARGET: &str = "examples/mir_targets/realistic.rs";
 
@@ -44,7 +44,7 @@ fn main() {
     let target = args.next().unwrap_or_else(|| DEFAULT_TARGET.into());
     let only: Option<String> = args.next();
     let src = PathBuf::from(&target);
-    let rustc = std::env::var("DISCHARGE_RUSTC").unwrap_or_else(|_| "rustc".into());
+    let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
 
     let mir = match verify::emit_mir_with(&rustc, &src) {
         Ok(m) => m,
@@ -52,7 +52,7 @@ fn main() {
             // "the tool could not run" must never look like "the code is wrong",
             // so this is a distinct message and a distinct exit.
             eprintln!("mir_coverage: could not get MIR from {}: {e}", src.display());
-            eprintln!("mir_coverage: set DISCHARGE_RUSTC to a nightly `rustc`");
+            eprintln!("mir_coverage: set VERIF_RUSTC to a nightly `rustc`");
             std::process::exit(2);
         }
     };

@@ -8,11 +8,11 @@
 //   filler  0: contract discharge = "Counterexample"   <- correct
 //   filler  1: contract discharge = "Valid"            <- a failing report read as proved
 //
-// Obligations now record the arena generation, and `discharge` returns Unknown when the
+// Obligations now record the arena generation, and `verif` returns Unknown when the
 // arena has moved on.
-use discharge::prelude::*;
-use discharge::smt;
-use discharge::wp::{verify, Stmt};
+use verif::prelude::*;
+use verif::smt;
+use verif::wp::{verify, Stmt};
 
 fn main() {
     let report = smt::with_fresh(|| {
@@ -31,7 +31,7 @@ fn main() {
                 let _ = smt::truth(true);
             }
             let v = report.contract.discharge();
-            println!("filler {:>2}        : is_verified() = {}  (discharge = {:?})",
+            println!("filler {:>2}        : is_verified() = {}  (verif = {:?})",
                      n, report.is_verified(),
                      match v { smt::Verdict::Valid => "Valid", smt::Verdict::Unsat => "Unsat",
                                smt::Verdict::Counterexample(_) => "Counterexample",

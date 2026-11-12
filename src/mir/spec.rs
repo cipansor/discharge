@@ -195,6 +195,41 @@ pub struct Specs {
     /// `impl Foo::from` from an external `u16::from` (a false proof: a call to the
     /// external function is answered by the local body). See `line_scopes`.
     pub impl_owners: BTreeMap<(usize, usize), String>,
+    /// The *trait* each `impl` block implements, keyed by the same location as
+    /// [`Self::impl_owners`]. Absent for an inherent `impl`, which is the common
+    /// case. The value is the trait's *path* as written (`From`,
+    /// `std::convert::From`), not just its last segment.
+    ///
+    /// This is the second half of telling a local `impl From<u8> for u16` from the
+    /// standard library's: both print a call as `<u16 as From<u8>>::from` when the
+    /// local `From` is in scope, and both have owner `u16`, so the *owner alone
+    /// cannot separate them*. The trait path can, because the compiler qualifies
+    /// the library trait in the call it resolved there
+    /// (`<u16 as std::convert::From<u8>>::from`) and the local impl's bare `From`
+    /// is not a suffix of that. See `impl_trait` and the executor's
+    /// `resolve_callee`.
+    pub impl_traits: BTreeMap<(usize, usize), String>,
+    /// The *trait arguments* each `impl` block instantiates, keyed as
+    /// [`Self::impl_traits`] and holding them as written (`u8` for
+    /// `impl From<u8> for u16`). Absent for an inherent `impl` or a trait with no
+    /// arguments.
+    ///
+    /// Path and owner cannot separate the library's `From<u8> for u16` from a local
+    /// `From<Local> for u16`; both have owner `u16` and both answer the method tail
+    /// `from`. The instantiation is what separates them, so a call to one is not
+    /// answered from the other's body. See `impl_trait_args` and the executor's
+    /// `resolve_callee`.
+    pub impl_trait_args: BTreeMap<(usize, usize), String>,
+    /// The traits the crate itself declares, as module-qualified paths: `From` for
+    /// a crate-root trait, `m::Trait` for one inside `mod m`.
+    ///
+    /// rustc prints a trait in a call as its *shortest crate-unique* path, so a
+    /// bare `Trait` in a dump names this crate's crate-root trait only when the
+    /// crate declares no other trait of that name. Without this set a bare call
+    /// name cannot be told apart from an unrelated same-named trait in another
+    /// module, and a suffix match would let the wrong `impl` answer -- a false
+    /// proof. See the executor's `trait_candidate_admits`.
+    pub declared_traits: BTreeSet<String>,
     /// Contracts on methods, keyed by `(impl line, impl column, method name)`.
     ///
     /// A method's contract cannot live in [`Self::by_fn`] under its bare name: two
@@ -948,6 +983,649 @@ pub(crate) fn impl_owner(header: &str) -> Option<String> {
     }
 }
 
+/// The text inside the first balanced `<…>` of `s`, or `None` when there is none.
+///
+/// Balanced rather than "up to the first `>`": a trait argument can itself be
+/// generic (`impl Trait<Option<u8>> for Foo`), and cutting at the first `>` would
+/// read `Option<u8` as the argument -- a different instantiation from the call's
+/// `Option<u8>`, so a call to the impl would be refused. See [`impl_trait_args`].
+pub(crate) fn angle_inner(s: &str) -> Option<&str> {
+    let open = s.find('<')?;
+    let mut depth = 0usize;
+    for (i, c) in s[open..].char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(s[open + 1..open + i].trim());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The text of an `impl` header's *trait clause*: everything between the skipped
+/// `impl<…>` parameter list and the ` for `, or `None` for an inherent `impl`.
+///
+/// `impl<T> From<T> for Wrapper<T>` gives `From<T>`, `impl From<u8> for u16` gives
+/// `From<u8>`, and `impl u16` gives `None`. This is the shared reading of the two
+/// things an `impl` says about its trait: the path ([`impl_trait`]) and the
+/// arguments ([`impl_trait_args`]).
+fn impl_trait_clause(header: &str) -> Option<&str> {
+    let after = header.trim_start().strip_prefix("unsafe ").unwrap_or(header.trim_start());
+    let rest = after.strip_prefix("impl")?;
+    // Skip an `impl<T, U>` parameter list, as `impl_owner` does.
+    let rest = rest.trim_start();
+    let rest = if let Some(r) = rest.strip_prefix('<') {
+        let mut depth = 1usize;
+        let mut end = 0usize;
+        for (i, c) in r.char_indices() {
+            match c {
+                '<' => depth += 1,
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        &r[end..]
+    } else {
+        rest
+    };
+    // A trait impl has `Trait for Type`; an inherent one has only `Type`.
+    let (before, _) = rest.split_once(" for ")?;
+    Some(before)
+}
+
+/// The *trait* an `impl` block implements, read from its header, or `None` for an
+/// inherent `impl`.
+///
+/// `impl From<u8> for u16` yields `Some("From")`, `impl std::convert::From<u8>
+/// for u16` yields `Some("std::convert::From")` and `impl u16` yields `None`. The
+/// full path is kept, not just the last segment, because that is exactly what
+/// separates a local `impl From<u8> for u16` from the standard library's: a call
+/// the compiler resolved to the library trait prints its path
+/// (`<u16 as std::convert::From<u8>>::from`), which is *not* a suffix of the bare
+/// `From` a local impl was written with. See [`Specs::impl_traits`].
+///
+/// The `impl`'s type parameters (`impl<T> From<T> for …`) are skipped first,
+/// exactly as in [`impl_owner`], and the trait is the text *before* ` for ` when
+/// there is one, up to (not including) its own `<…>` type-argument list.
+pub(crate) fn impl_trait(header: &str) -> Option<String> {
+    let before = impl_trait_clause(header)?;
+    // The trait path is the leading `a::b::C` of the clause; its own `<…>` type
+    // arguments and any `where` clause are dropped.
+    let path: String = before
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+        .collect();
+    let path = path.trim_end_matches(':').to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+/// The *trait arguments* an `impl` block instantiates, as written, or `None` for an
+/// inherent `impl` or one whose trait names no arguments.
+///
+/// `impl From<u8> for u16` yields `Some("u8")` and `impl From<Local> for u16` yields
+/// `Some("Local")`. These are the one thing that separates two impls of a generic
+/// trait that share a path, an owner and a method: the library's `From<u8> for u16`
+/// and a local `From<Local> for u16` differ only here, so a call to one must not be
+/// answered from the other's body. See [`Specs::impl_trait_args`].
+pub(crate) fn impl_trait_args(header: &str) -> Option<String> {
+    let before = impl_trait_clause(header)?;
+    let inner = angle_inner(before)?;
+    (!inner.is_empty()).then(|| inner.to_string())
+}
+
+/// Whether a trait path written in an `impl` header names an external crate, so
+/// that prefixing the enclosing module would be wrong.
+///
+/// `std::convert::From`, `core::cmp::Ord`, `alloc::…` and a `crate::`/`self::`
+/// path are already rooted; a bare `From` or a `super::m::From` is relative to the
+/// module the `impl` sits in. See [`extract`]'s use of [`Specs::impl_traits`].
+fn is_absolute_trait_path(path: &str) -> bool {
+    let first = path.split("::").next().unwrap_or(path);
+    matches!(first, "std" | "core" | "alloc" | "crate" | "self" | "super")
+}
+
+/// The traits the crate declares, as module-qualified paths (`Trait` for a
+/// crate-root trait, `m::Trait` for one inside `mod m`).
+///
+/// rustc prints a trait in a call as its *shortest crate-unique* path, so a bare
+/// name in a dump is this crate's crate-root trait only when one exists; when it
+/// does not, a bare name is the shortening of the crate's only trait of that name
+/// (or an external trait). Recording the declared set is what lets the executor
+/// tell those apart instead of treating a same-named suffix as identity. See
+/// [`Specs::declared_traits`].
+pub(crate) fn declared_traits(scopes: &[LineScope], lines: &[&str]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for (idx, raw) in lines.iter().enumerate() {
+        // `item_head` already ignores an `impl` line and every other item kind.
+        let Some((ItemKind::Trait, name)) = item_head(raw) else {
+            continue;
+        };
+        let qualified = if scopes[idx].path.is_empty() {
+            name
+        } else {
+            format!("{}::{}", scopes[idx].path.join("::"), name)
+        };
+        out.insert(qualified);
+    }
+    out
+}
+
+/// Qualify a trait path written in an `impl` header the way rustc prints a call
+/// to it: resolve a leading name through the module's imports, then prefix the
+/// enclosing module path.
+///
+/// `use std::convert::From;` makes a bare `From` inside that module the standard
+/// trait, whose call prints as `std::convert::From`; without resolving the import
+/// the scanner would record `m::From` and no call would match -- a lost proof. A
+/// path that already names a crate (`std::…`, `core::…`) is kept as written, and a
+/// bare name with no import is prefixed with the module, which is how rustc prints
+/// a module-local trait. See [`Specs::impl_traits`].
+fn qualify_trait(
+    written: &str,
+    scope: &[String],
+    imports: &BTreeMap<String, String>,
+) -> String {
+    if is_absolute_trait_path(written) {
+        return written.to_string();
+    }
+    let first = written.split("::").next().unwrap_or(written);
+    if let Some(full) = imports.get(first) {
+        return format!("{full}{}", &written[first.len()..]);
+    }
+    if scope.is_empty() {
+        written.to_string()
+    } else {
+        format!("{}::{}", scope.join("::"), written)
+    }
+}
+
+/// The text of an `impl` header, spanning lines until its body-opening `{` (or the
+/// `;` of a bodyless item).
+///
+/// Rust permits the header to wrap, so `impl Trait\n    for Foo {` declares the
+/// same impl as a one-line spelling. Reading only the `impl` keyword's own line
+/// loses the trait there, and a lost trait is a refused projected call -- a lost
+/// proof. See [`extract`].
+fn impl_header(lines: &[&str], start: usize) -> String {
+    let mut out = String::new();
+    let mut angle = 0i32;
+    let mut seen_angle = false;
+    for raw in &lines[start..] {
+        let mut line = *raw;
+        // Drop a trailing line comment so a `{` inside it is not the body brace.
+        if let Some(i) = line.find("//") {
+            line = &line[..i];
+        }
+        let mut cut = line.len();
+        for (i, c) in line.char_indices() {
+            match c {
+                '<' if !seen_angle => {
+                    angle += 1;
+                    seen_angle = true;
+                }
+                '<' if angle > 0 => angle += 1,
+                '>' if angle > 0 => angle -= 1,
+                '{' if angle == 0 => {
+                    cut = i;
+                    break;
+                }
+                ';' if angle == 0 => {
+                    cut = i;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        out.push_str(&line[..cut]);
+        if cut < line.len() {
+            break;
+        }
+        out.push(' ');
+    }
+    out
+}
+
+/// The `use` imports visible on each line, keyed by the enclosing module path.
+///
+/// A trait's *written* name need not name a trait the crate declares: `use
+/// std::convert::From;` makes a bare `From` inside that module the standard
+/// trait, and rustc prints the call with the library path it resolved. Without
+/// this map the scanner would qualify the impl with its own module
+/// (`m::From`) and no call would match it -- a lost proof. See [`extract`].
+///
+/// Imports are kept *per module path*, not in one running map. A Rust import is
+/// visible across its whole scope, so the map for `m` must hold what `m` imports
+/// even at a line that comes after a nested `mod nested {}`: a single map that is
+/// reset on every scope change (the old behaviour) loses `m`'s `use` for the rest
+/// of `m`, and the later `impl From<…>` in `m` is then qualified `m::From` and no
+/// call matches it -- a lost proof. Item imports are also order-independent
+/// (`use` after the impl still binds), so each module's map is assembled from
+/// every `use` at its own nesting depth before any line reads it. See
+/// [`Specs::impl_traits`].
+///
+/// A `#[cfg]`-conditional import is the one that is *not* order-independent: it
+/// binds only when its condition holds, and rustc then binds nothing at all. The
+/// source cannot evaluate an arbitrary condition, so a conditional binding is
+/// held below an unconditional one and never displaces it: a live
+/// `use std::convert::From as Conv;` followed by a disabled
+/// `#[cfg(any())] use crate::Other as Conv;` must keep `Conv` bound to the
+/// standard trait, or the impl written with `Conv` is recorded with the wrong
+/// trait and its call is lost. See [`is_cfg_use`].
+fn module_imports(scopes: &[LineScope], lines: &[&str]) -> Vec<BTreeMap<String, String>> {
+    // One map per module path, assembled from every `use` at that path, then handed
+    // to each line of that module. Each entry carries whether the binding came from
+    // an unconditional `use`, which is what decides precedence.
+    let mut per_module: BTreeMap<Vec<String>, BTreeMap<String, (String, bool)>> = BTreeMap::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if !is_use_start(lines[i]) {
+            i += 1;
+            continue;
+        }
+        let conditional = is_cfg_use(lines, i);
+        // A `use` item ends at its `;`, which may be on a later line
+        // (`use a::b::{\n    C,\n};`). Reading one line at a time loses such an
+        // import, and a lost import is a wrongly qualified impl -- a lost proof.
+        // Join the item's lines, then read the whole thing. See [`parse_use`].
+        let mut item = String::new();
+        let mut j = i;
+        loop {
+            item.push_str(lines[j]);
+            item.push(' ');
+            if lines[j].contains(';') || j + 1 >= lines.len() {
+                break;
+            }
+            j += 1;
+        }
+        let map = per_module.entry(scopes[i].path.clone()).or_default();
+        for (short, full) in parse_use(&item) {
+            // An unconditional binding is definitely live, so a conditional one must
+            // not overwrite it (the conditional may be `#[cfg]`-disabled, in which
+            // case rustc binds nothing and the earlier binding is the live one).
+            let live_unconditional = map.get(&short).is_some_and(|(_, unconditional)| *unconditional);
+            if conditional && live_unconditional {
+                continue;
+            }
+            map.insert(short, (full, !conditional));
+        }
+        i = j + 1;
+    }
+    lines
+        .iter()
+        .enumerate()
+        .map(|(idx, _)| {
+            per_module
+                .get(&scopes[idx].path)
+                .map(|m| m.iter().map(|(k, (v, _))| (k.clone(), v.clone())).collect())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// Whether the `use` item starting at `lines[i]` carries a `#[cfg]` attribute.
+///
+/// The attribute sits on the line (or contiguous attribute lines) directly above
+/// the item, or on the item's own line. A conditional import may be `#[cfg]`-disabled,
+/// and rustc then binds nothing for it; treating it as live can rewrite an alias a
+/// *live* import already bound, and a wrongly qualified impl is a lost proof. Only
+/// the presence of a condition is read, never its value -- the source cannot
+/// evaluate an arbitrary `cfg`, and a conservative "this may be off" is what
+/// [`module_imports`] needs. See [`module_imports`].
+fn is_cfg_use(lines: &[&str], i: usize) -> bool {
+    // An attribute on the item's own line (`#[cfg(any())] use a::B;`).
+    if split_leading_attrs(lines[i]).1 {
+        return true;
+    }
+    // The attribute block directly above the item. Reading one line at a time misses
+    // the head of a `#[cfg]` that spans lines -- the line next to the item is then
+    // its closing `)]`, not its `#[cfg…` -- so a disabled import would look live and
+    // displace a live alias. Read the whole block instead. See [`read_attr_run`].
+    attrs_above_have_cfg(lines, i)
+}
+
+/// Whether the contiguous attribute block directly above `end` holds a `#[cfg…]`.
+///
+/// The block is the longest suffix of the contiguous non-blank lines above `end`
+/// that parses as whole attributes; trying candidate starts from the top down finds
+/// it, because the first start whose read covers exactly `[start, end)` is the real
+/// block. A line that is not an attribute (a doc comment, or the tail of an earlier
+/// item) makes every start at or above it fail, so an attribute belonging to another
+/// item is never read as this item's. See [`read_attr_run`].
+fn attrs_above_have_cfg(lines: &[&str], end: usize) -> bool {
+    let mut top = end;
+    while top > 0 && !lines[top - 1].trim().is_empty() {
+        top -= 1;
+    }
+    (top..end).any(|start| read_attr_run(lines, start, end) == Some(true))
+}
+
+/// Whether a raw string literal opens at byte `i`, returning its `#` count and the
+/// offset just past the opening `"`.
+///
+/// A raw string is `r"…"`, `r#"…"#`, `r##"…"##`, … with an optional `b` or `c`
+/// prefix (`br#"…"#`, `cr#"…"#`). Inside one a backslash is *not* an escape, so the
+/// closing `"` plus `#`s is the only thing that ends it -- `r"\"` is the two bytes
+/// `\` and `"`, the `"` closing the string. Reading it as an ordinary string, the
+/// `\` would escape that `"`, the real end would be missed, and a following
+/// `#[cfg]` would go unread -- the lost proof this reader prevents. See
+/// [`attr_close_offset`].
+fn raw_string_start(bytes: &[u8], i: usize) -> Option<(usize, usize)> {
+    let mut j = i;
+    // An optional `b` or `c` prefix in front of the `r`.
+    if matches!(bytes.get(j), Some(b'b') | Some(b'c')) {
+        j += 1;
+    }
+    if bytes.get(j) != Some(&b'r') {
+        return None;
+    }
+    j += 1;
+    let mut hashes = 0;
+    while bytes.get(j) == Some(&b'#') {
+        hashes += 1;
+        j += 1;
+    }
+    if bytes.get(j) != Some(&b'"') {
+        return None;
+    }
+    Some((hashes, j + 1))
+}
+
+/// Whether the `'` at byte `i` opens a character literal rather than a lifetime.
+///
+/// A char literal holds one character (`'('`) or a backslash escape (`'\n'`,
+/// `'\''`), so it opens only when a `\` follows or a closing `'` follows the next
+/// character. A lifetime (`'a`, `'static`) has no closing quote and is left alone.
+/// See [`attr_close_offset`].
+fn is_char_literal_start_bytes(bytes: &[u8], i: usize) -> bool {
+    match bytes.get(i + 1) {
+        Some(b'\\') => true,
+        Some(_) => bytes.get(i + 2) == Some(&b'\''),
+        None => false,
+    }
+}
+
+/// The offset just past the closing `"` of an ordinary string opening at `i`.
+fn skip_string(bytes: &[u8], i: usize) -> usize {
+    let mut j = i + 1;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\\' => j += 2,
+            b'"' => return j + 1,
+            _ => j += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// The offset just past the closing `'` of a char literal opening at `i`.
+fn skip_char(bytes: &[u8], i: usize) -> usize {
+    let mut j = i + 1;
+    if bytes.get(j) == Some(&b'\\') {
+        j += 1;
+    }
+    j += 1;
+    if bytes.get(j) == Some(&b'\'') {
+        j + 1
+    } else {
+        j
+    }
+}
+
+/// The offset just past a raw string's closing `"` + `#`s, whose opening `"` is at
+/// `after_quote` and whose `#` count is `hashes`.
+fn skip_raw_string(bytes: &[u8], after_quote: usize, hashes: usize) -> usize {
+    let mut j = after_quote;
+    while j < bytes.len() {
+        if bytes[j] == b'"' {
+            let mut h = 0;
+            let mut k = j + 1;
+            while h < hashes && bytes.get(k) == Some(&b'#') {
+                h += 1;
+                k += 1;
+            }
+            if h == hashes {
+                return k;
+            }
+        }
+        j += 1;
+    }
+    bytes.len()
+}
+
+/// The offset just past the `]` that closes an attribute whose `[` is at `open`.
+///
+/// The attribute body's `(…)`/`[…]` nest, so brackets are matched by depth. Text
+/// that is *not* a delimiter is skipped whole: ordinary and raw string literals,
+/// char literals, and `//` / `/* … */` comments. Each of these can hold a quote or
+/// a bracket that, counted, would either end the attribute early or run it past
+/// its real end -- and a run past the end reads a *disabled* `#[cfg]` as live, the
+/// lost proof this reader exists to prevent. Comments are skipped because Rust
+/// discards them before parsing: a `"` in a comment is not a string, and a `]` in
+/// one is not the close. `None` when no `]` closes the attribute.
+fn attr_close_offset(text: &str, open: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 1i32;
+    let mut i = open + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            // A line comment runs to the end of the line; a block comment nests and
+            // may span lines.
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let mut d = 1u32;
+                i += 2;
+                while i < bytes.len() && d > 0 {
+                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                        d += 1;
+                        i += 2;
+                    } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                        d -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'"' => i = skip_string(bytes, i),
+            b'\'' if is_char_literal_start_bytes(bytes, i) => i = skip_char(bytes, i),
+            b'r' | b'b' | b'c' => match raw_string_start(bytes, i) {
+                Some((hashes, after)) => i = skip_raw_string(bytes, after, hashes),
+                None => i += 1,
+            },
+            b'[' | b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b']' | b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Read the lines `[start, end)` as a run of whole `#[…]` attributes, returning
+/// whether any is a `#[cfg…]`; `None` when they are not all attributes.
+///
+/// Each attribute is read from its `#[` through the balanced `]` that closes it, so
+/// one spanning lines (`#[cfg(all(\n    unix,\n))]`) is read whole rather than by its
+/// first line alone. A delimiter inside quoted text is not a delimiter: `#[doc = "("]`
+/// holds an unmatched `(` in a string, and counting it would make the attribute run
+/// past its real end, exhaust the lines, and read a *disabled* `#[cfg]` as if it were
+/// live -- the lost proof this reader exists to prevent. String, raw-string, char
+/// literal and comment contents are therefore skipped whole. See [`is_cfg_use`] and
+/// [`attr_close_offset`].
+fn read_attr_run(lines: &[&str], start: usize, end: usize) -> Option<bool> {
+    let mut cfg = false;
+    let mut k = start;
+    while k < end {
+        let trimmed = lines[k].trim_start();
+        let head = trimmed.strip_prefix("#[")?;
+        // The `[` of `#[` sits this far into the line.
+        let lead = lines[k].len() - trimmed.len();
+        let flat = lines[k..end].join("\n");
+        let close = attr_close_offset(&flat, lead + 1)?;
+        // How many lines the attribute spans, so the next one starts after it.
+        let spanned = flat[..close].matches('\n').count();
+        if head.starts_with("cfg") {
+            cfg = true;
+        }
+        k += spanned + 1;
+    }
+    Some(cfg)
+}
+
+/// Split any leading `#[…]` attributes off `line`, returning the rest and whether a
+/// `#[cfg…]` attribute was among them.
+///
+/// An attribute on the item's own line (`#[cfg(any())] use a::B;`) would otherwise
+/// hide the `use` from [`is_use_start`], and the item would be missed entirely -- a
+/// lost import. The body's `(…)`/`[…]` nest, so brackets are matched by depth and the
+/// attribute ends at the first `]` that closes its own `[`. Text that is not a
+/// delimiter -- string, raw-string and char literal contents, and comments -- is
+/// skipped by [`attr_close_offset`], so a `(` or a quote inside one does not hide
+/// the `use` behind the attribute. See [`is_cfg_use`].
+fn split_leading_attrs(line: &str) -> (&str, bool) {
+    let mut rest = line.trim_start();
+    let mut cfg = false;
+    while let Some(after) = rest.strip_prefix("#[") {
+        if after.starts_with("cfg") {
+            cfg = true;
+        }
+        // `after` begins just past the `#[`, so the attribute's `[` is at index 1
+        // of it; `attr_close_offset` returns the offset just past the closing `]`.
+        match attr_close_offset(rest, 1) {
+            // `after` is `rest[2..]`, so an offset `e` into `rest` is `e - 2` into
+            // `after`.
+            Some(e) => rest = after[e - 2..].trim_start(),
+            // An unbalanced attribute is not one this reads; leave the line alone.
+            None => break,
+        }
+    }
+    (rest, cfg)
+}
+
+/// Strip a leading visibility (`pub`, `pub(crate)`, `pub(super)`, `pub(in …)`) from
+/// an item's first line, so the `use` keyword behind it can be read.
+///
+/// A restricted visibility is not a `pub ` prefix, so the old `strip_prefix("pub ")`
+/// missed `pub(crate) use …` entirely and the import was lost. `pub` must be
+/// followed by whitespace or `(`, so a name that merely starts with it
+/// (`public_thing`) is left alone.
+fn strip_visibility(line: &str) -> &str {
+    let s = split_leading_attrs(line).0;
+    let Some(rest) = s.strip_prefix("pub") else {
+        return s;
+    };
+    match rest.chars().next() {
+        // `pub` alone, or `pub ` followed by the item.
+        None => rest,
+        Some(c) if c.is_whitespace() => rest.trim_start(),
+        // `pub(crate)`, `pub(super)`, `pub(in path)`.
+        Some('(') => match rest.find(')') {
+            Some(close) => rest[close + 1..].trim_start(),
+            None => rest,
+        },
+        // A name that merely starts with `pub` (`public_thing`) is not a visibility.
+        Some(_) => s,
+    }
+}
+
+/// Whether a line opens a `use` item (after any visibility).
+fn is_use_start(line: &str) -> bool {
+    strip_visibility(line).starts_with("use ")
+        || strip_visibility(line).trim_end() == "use"
+}
+
+/// The `(short name, full path)` pairs a `use` item introduces.
+///
+/// Handles `use a::b::C;`, `use a::b::C as D;`, `use a::b::{C, D};` and the
+/// `crate::`/`self::`/`super::` roots. A glob or a re-export with no name to bind
+/// is skipped: the map is a hint for qualification, and a wrong entry would be
+/// worse than a missing one.
+fn parse_use(raw: &str) -> Vec<(String, String)> {
+    let after_vis = strip_visibility(raw);
+    let rest = match after_vis.strip_prefix("use ") {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+    // A folded multi-line item or a trailing line comment can follow the path, so
+    // cut at the item's `;` (or a `//`) before reading it.
+    let rest = match rest.find(';') {
+        Some(i) => &rest[..i],
+        None => rest,
+    };
+    let rest = match rest.find("//") {
+        Some(i) => &rest[..i],
+        None => rest,
+    };
+    let rest = rest.trim();
+    // A grouped import: `a::b::{C, D as E}`.
+    if let Some((prefix, group)) = rest.split_once("::{") {
+        let group = group.strip_suffix('}').unwrap_or(group);
+        let mut out = Vec::new();
+        for item in group.split(',') {
+            let item = item.trim();
+            if item.is_empty() || item.contains('*') {
+                continue;
+            }
+            let (path, alias) = match item.split_once(" as ") {
+                Some((p, a)) => (p.trim(), a.trim()),
+                None => (item, ""),
+            };
+            let full = format!("{}::{}", prefix, path);
+            let short = if alias.is_empty() {
+                path.rsplit("::").next().unwrap_or(path).to_string()
+            } else {
+                alias.to_string()
+            };
+            out.push((short, full));
+        }
+        return out;
+    }
+    if rest.contains('*') {
+        return Vec::new();
+    }
+    let (path, alias) = match rest.split_once(" as ") {
+        Some((p, a)) => (p.trim(), a.trim()),
+        None => (rest, ""),
+    };
+    let short = if alias.is_empty() {
+        path.rsplit("::").next().unwrap_or(path).to_string()
+    } else {
+        alias.to_string()
+    };
+    if short.is_empty() {
+        Vec::new()
+    } else {
+        vec![(short, path.to_string())]
+    }
+}
 
 /// Extract contracts from Rust source text.
 ///
@@ -984,13 +1662,39 @@ pub fn extract(source: &str) -> Specs {
     let enclosing: Vec<Option<(usize, usize)>> =
         scopes.iter().map(|s| s.impl_loc).collect();
     let scope_path: Vec<Vec<String>> = scopes.iter().map(|s| s.path.clone()).collect();
-    for (idx, raw) in source.lines().enumerate() {
+    let lines: Vec<&str> = source.lines().collect();
+    let imports = module_imports(&scopes, &lines);
+    for (idx, raw) in lines.iter().enumerate() {
         if let Some(col) = impl_keyword_col(raw) {
-            if let Some(owner) = impl_owner(raw) {
+            // The header can wrap over several lines, so the whole header through
+            // its body-opening `{` is what names the owner and the trait. Reading
+            // only the `impl` keyword's own line loses a trait declared as
+            // `impl Trait\n    for Foo {` -- a refused projected call, a lost
+            // proof. See [`impl_header`].
+            let header = impl_header(&lines, idx);
+            if let Some(owner) = impl_owner(&header) {
                 specs.impl_owners.insert((idx + 1, col), owner);
+            }
+            if let Some(tr) = impl_trait(&header) {
+                // Qualify the trait the way a call prints it: resolve a module
+                // import first (`use std::convert::From;` makes the bare `From`
+                // the library trait), then prefix the enclosing module for a
+                // module-local trait. A path that already names a crate
+                // (`std::convert::From`, `core::…`, `crate::…`) is kept as
+                // written. See [`qualify_trait`].
+                let qualified = qualify_trait(&tr, &scope_path[idx], &imports[idx]);
+                specs.impl_traits.insert((idx + 1, col), qualified);
+            }
+            if let Some(args) = impl_trait_args(&header) {
+                specs.impl_trait_args.insert((idx + 1, col), args);
             }
         }
     }
+    // The traits the crate declares, so the executor can tell a *bare* call name
+    // (`<u16 as Trait>::m`) that names this crate's crate-root trait from the
+    // collision where the same bare name could be an unrelated module trait that
+    // rustc shortened. See [`Specs::declared_traits`].
+    specs.declared_traits = declared_traits(&scopes, &lines);
 
     // Struct layouts, read in the same pass. The MIR dump names a struct
     // (`_1: &Config`) but never prints its fields, so a contract like
@@ -7544,5 +8248,325 @@ fn h<
             // The property is "does not panic"; the call itself is the assertion.
             let _ = const_generic_params(source);
         }
+    }
+
+    /// The trait an `impl` block implements is read from its header, and an
+    /// inherent `impl` has none.
+    ///
+    /// This is what separates a local `impl From<u8> for u16` from the standard
+    /// library's when both own `u16` and both spell their method `from`. The path
+    /// is kept whole (`std::convert::From`), because a bare `From` is *not* a
+    /// suffix of the qualified path a call prints for the library trait, and that
+    /// non-match is the guard. See [`Specs::impl_traits`].
+    #[test]
+    fn impl_trait_reads_the_trait_and_refuses_an_inherent_impl() {
+        assert_eq!(impl_trait("impl From<u8> for u16 {"), Some("From".to_string()));
+        assert_eq!(
+            impl_trait("impl std::convert::From<u8> for u16 {"),
+            Some("std::convert::From".to_string())
+        );
+        assert_eq!(impl_trait("impl core::cmp::Ord for Foo {"), Some("core::cmp::Ord".to_string()));
+        // An `impl<T>` parameter list is skipped, as for the owner.
+        assert_eq!(impl_trait("impl<T> From<T> for Wrapper<T> {"), Some("From".to_string()));
+        // `unsafe impl` still names its trait.
+        assert_eq!(impl_trait("unsafe impl Send for Foo {}"), Some("Send".to_string()));
+        // An inherent impl has no trait.
+        assert_eq!(impl_trait("impl u16 {"), None);
+        assert_eq!(impl_trait("impl<T> Wrapper<T> {"), None);
+        // A nested type argument does not end the path early.
+        assert_eq!(
+            impl_trait("impl Convert<Option<u8>> for Foo {"),
+            Some("Convert".to_string())
+        );
+    }
+
+    /// The `impl_traits` map is keyed by the `impl` keyword's location -- the same
+    /// key as `impl_owners` -- and qualifies the trait with its enclosing module.
+    ///
+    /// A call prints a module-local trait with its module (`<u16 as m::From<u8>>::from`),
+    /// so the recorded path must carry that module too, or the guard would refuse a
+    /// legitimate local impl. A crate-root impl keeps its bare path.
+    #[test]
+    fn impl_traits_are_keyed_by_location_and_module_qualified() {
+        let src = "mod m {\n    pub trait From<T> { fn from(t: T) -> Self; }\n    \
+                   impl From<u8> for u16 { fn from(_t: u8) -> u16 { 7 } }\n}\n\
+                   struct Wrapper(u8);\n\
+                   impl Wrapper { fn make() -> Wrapper { Wrapper(0) } }\n";
+        let specs = extract(src);
+        // `impl From` is on line 3; the module `m` prefixes it.
+        assert_eq!(specs.impl_traits.get(&(3, 5)), Some(&"m::From".to_string()));
+        assert_eq!(specs.impl_owners.get(&(3, 5)), Some(&"u16".to_string()));
+        // The inherent `impl Wrapper` on line 6 has an owner but no trait.
+        assert_eq!(specs.impl_owners.get(&(6, 1)), Some(&"Wrapper".to_string()));
+        assert_eq!(specs.impl_traits.get(&(6, 1)), None);
+    }
+
+    /// `split_leading_attrs` peels every leading attribute and reports a `#[cfg]`
+    /// among them, so a same-line attribute cannot hide the item behind it.
+    #[test]
+    fn leading_attributes_are_peeled_and_a_cfg_is_reported() {
+        // No attribute: the line is returned unchanged and no `cfg` is seen.
+        assert_eq!(split_leading_attrs("use a::B;"), ("use a::B;", false));
+        // A bare attribute on its own line is peeled.
+        assert_eq!(split_leading_attrs("#[cfg(any())] use a::B;"), ("use a::B;", true));
+        // Two attributes: the `cfg` is reported even when it is not the first.
+        assert_eq!(
+            split_leading_attrs("#[allow(unused)] #[cfg(test)] use a::B;"),
+            ("use a::B;", true)
+        );
+        // A non-`cfg` attribute is peeled but not reported.
+        assert_eq!(split_leading_attrs("#[allow(dead_code)] use a::B;"), ("use a::B;", false));
+        // The body's own brackets nest, so the attribute ends at its own `]`.
+        assert_eq!(
+            split_leading_attrs("#[cfg(all(unix, target_os = \"linux\"))] use a::B;"),
+            ("use a::B;", true)
+        );
+        // `cfg_attr` is a `cfg`-family attribute, so it is reported too.
+        assert_eq!(split_leading_attrs("#[cfg_attr(x, allow(y))] use a::B;"), ("use a::B;", true));
+    }
+
+    /// `is_use_start` sees a `use` behind a same-line attribute, and `strip_visibility`
+    /// reads the visibility that follows one.
+    #[test]
+    fn a_use_behind_a_same_line_attribute_is_still_an_import() {
+        assert!(is_use_start("#[cfg(all())] use std::convert::From;"));
+        assert!(is_use_start("#[allow(unused)] pub(crate) use a::B;"));
+        assert!(!is_use_start("#[allow(unused)] let x = 1;"));
+        // A visibility behind a same-line attribute is stripped as before.
+        assert_eq!(strip_visibility("#[allow(x)] pub(crate) use a::B;"), "use a::B;");
+    }
+
+    /// A `#[cfg]`-conditional import never displaces an unconditional binding, but a
+    /// later unconditional one still wins over an earlier conditional.
+    #[test]
+    fn a_cfg_import_does_not_displace_a_live_binding() {
+        // Two modules at the same depth: line 1 `m`, and the crate root for the rest.
+        let lines: Vec<&str> = vec![
+            "mod m {",
+            "    use std::convert::From as Conv;",
+            "    #[cfg(any())]",
+            "    use crate::Other as Conv;",
+            "}",
+            "struct Other;",
+            "use crate::Other as Root;",
+        ];
+        let scopes = line_scopes(&lines.join("\n"));
+        let imports = module_imports(&scopes, &lines);
+        // The module `m` keeps `Conv` bound to the standard trait: the disabled
+        // conditional did not overwrite the live unconditional binding.
+        let m = &imports[1];
+        assert_eq!(m.get("Conv"), Some(&"std::convert::From".to_string()));
+        // The crate-root `Root` import is read as usual.
+        assert_eq!(imports[6].get("Root"), Some(&"crate::Other".to_string()));
+    }
+
+    /// A conditional binding that is the *only* one still binds, and a later
+    /// unconditional binding replaces an earlier conditional one.
+    #[test]
+    fn a_conditional_binding_is_held_below_an_unconditional_one() {
+        let lines: Vec<&str> = vec![
+            "mod m {",
+            "    #[cfg(all())] use std::convert::From as Conv;",
+            "    pub struct Local;",
+            "}",
+        ];
+        let scopes = line_scopes(&lines.join("\n"));
+        let imports = module_imports(&scopes, &lines);
+        // Only a conditional binding: it is applied, so the impl it names resolves.
+        assert_eq!(imports[1].get("Conv"), Some(&"std::convert::From".to_string()));
+
+        let lines: Vec<&str> = vec![
+            "mod m {",
+            "    #[cfg(any())] use crate::Other as Conv;",
+            "    use std::convert::From as Conv;",
+            "}",
+        ];
+        let scopes = line_scopes(&lines.join("\n"));
+        let imports = module_imports(&scopes, &lines);
+        // The unconditional binding comes later and replaces the conditional one.
+        assert_eq!(imports[1].get("Conv"), Some(&"std::convert::From".to_string()));
+    }
+
+    /// `is_cfg_use` reads a `#[cfg]` that spans lines, and does not read an
+    /// attribute belonging to a different item.
+    #[test]
+    fn a_multiline_cfg_attribute_is_seen_above_a_use() {
+        // A one-line `#[cfg]` above the `use` is seen (the pre-existing case).
+        let lines: Vec<&str> = vec!["#[cfg(any())]", "use a::B as C;"];
+        assert!(is_cfg_use(&lines, 1));
+
+        // A `#[cfg]` that wraps: the line above the `use` is its closing `)]`, so a
+        // one-line look misses it. The whole attribute must be read.
+        let lines: Vec<&str> = vec![
+            "#[cfg(all(",
+            "    any(),",
+            "))]",
+            "use a::B as C;",
+        ];
+        assert!(is_cfg_use(&lines, 3), "a multi-line cfg must still be seen");
+
+        // A non-`cfg` attribute above the `use` is not a condition.
+        let lines: Vec<&str> = vec!["#[allow(unused)]", "use a::B as C;"];
+        assert!(!is_cfg_use(&lines, 1));
+
+        // A non-attribute line (an earlier item's text) ends the block: the `#[cfg]`
+        // above it belongs to that item, not to this `use`.
+        let lines: Vec<&str> = vec!["#[cfg(any())]", "struct X;", "use a::B as C;"];
+        assert!(!is_cfg_use(&lines, 2), "a non-attribute line ends the attribute block");
+
+        // A blank line also ends the block.
+        let lines: Vec<&str> = vec!["#[cfg(any())]", "", "use a::B as C;"];
+        assert!(!is_cfg_use(&lines, 2), "a blank line ends the attribute block");
+
+        // Two attributes, the `cfg` second, the first spanning a line: both belong to
+        // the `use`, so the condition is seen.
+        let lines: Vec<&str> = vec![
+            "#[allow(",
+            "    unused,",
+            ")]",
+            "#[cfg(any())]",
+            "use a::B as C;",
+        ];
+        assert!(is_cfg_use(&lines, 4), "a cfg below another attribute is still this item's");
+    }
+
+    /// A delimiter inside a quoted string or char literal is not a delimiter.
+    ///
+    /// `#[doc = "("]` carries an unmatched `(` in a string. Counting it as a delimiter
+    /// makes the reader run past the attribute's real end, so a `#[cfg]` above it is
+    /// not read and a *disabled* import looks live -- the alias it displaces is the
+    /// lost proof this reader prevents. The reader must skip string and character
+    /// literal contents (honouring escapes) while matching `#[…]`.
+    #[test]
+    fn a_delimiter_inside_a_quoted_attribute_is_not_a_delimiter() {
+        // A `#[cfg]` followed by a `#[doc = "("]`: the `(` is in a string, so the
+        // attribute run still ends at the `]` and the condition is read.
+        let lines: Vec<&str> = vec![
+            "#[cfg(any())]",
+            "#[doc = \"(\"]",
+            "use a::B as C;",
+        ];
+        assert!(is_cfg_use(&lines, 2), "an unmatched `(` in a string must not hide the cfg");
+
+        // The same with the bracket characters that would otherwise close the run.
+        let lines: Vec<&str> = vec![
+            "#[cfg(any())]",
+            "#[doc = \"]\"]",
+            "use a::B as C;",
+        ];
+        assert!(is_cfg_use(&lines, 2), "a `]` in a string must not close the attribute early");
+
+        // An escaped quote does not end the string, so the `(` after it is still text.
+        let lines: Vec<&str> = vec![
+            "#[cfg(any())]",
+            "#[doc = \"\\\"(\"]",
+            "use a::B as C;",
+        ];
+        assert!(is_cfg_use(&lines, 2), "an escaped quote must not end the string");
+
+        // A char literal holding a delimiter is text too.
+        let lines: Vec<&str> = vec![
+            "#[cfg(any())]",
+            "#[doc = ')']",
+            "use a::B as C;",
+        ];
+        assert!(is_cfg_use(&lines, 2), "a `)` in a char literal must not close the attribute");
+
+        // A `cfg` whose own argument is a string containing a delimiter is still a
+        // condition, and the run still ends where the attribute does.
+        let lines: Vec<&str> = vec![
+            "#[cfg(feature = \"(\")]",
+            "#[doc = \")\"]",
+            "use a::B as C;",
+        ];
+        assert!(is_cfg_use(&lines, 2), "a quoted `(` in a cfg argument must not unbalance it");
+
+        // A lifetime in an attribute is not an unclosed char literal: it must not make
+        // the run unreadable, so the non-`cfg` case stays `false` and does not panic.
+        let lines: Vec<&str> = vec!["#[allow('a)]", "use a::B as C;"];
+        assert!(!is_cfg_use(&lines, 1), "a lifetime must not open a char literal");
+    }
+
+    /// A raw string's contents are opaque: a `\` does not escape, so the `"` that
+    /// follows it still closes the string.
+    ///
+    /// `r"\"` is the two bytes `\` and `"`; the `"` ends the literal. Read as an
+    /// ordinary string, the `\` would escape it, the literal would swallow the rest
+    /// of the line, and the `#[cfg]` above would go unread -- a disabled import
+    /// would then displace a live alias, the lost proof this reader prevents. The
+    /// raw-string form carries an optional `b`/`c` prefix and any number of `#`
+    /// delimiters.
+    #[test]
+    fn a_raw_string_attribute_is_read_opaque() {
+        // The reported shape: a raw string whose last character is a backslash.
+        let lines: Vec<&str> = vec!["#[cfg(any())]", "#[doc = r\"\\\"]", "use a::B as C;"];
+        assert!(is_cfg_use(&lines, 2), "a trailing backslash in a raw string must not hide the cfg");
+
+        // A `#`-delimited raw string, whose contents may hold a bare `"`.
+        let lines: Vec<&str> = vec!["#[cfg(any())]", "#[doc = r#\"a \" b\"#]", "use a::B as C;"];
+        assert!(is_cfg_use(&lines, 2), "a raw string with hashes must be read whole");
+
+        // A byte raw string, with the `b` prefix.
+        let lines: Vec<&str> = vec!["#[cfg(any())]", "#[doc = br\"(\"]", "use a::B as C;"];
+        assert!(is_cfg_use(&lines, 2), "a byte raw string must be read whole");
+
+        // A raw string holding a delimiter that would otherwise unbalance the run.
+        let lines: Vec<&str> = vec!["#[cfg(any())]", "#[doc = r\")\"]", "use a::B as C;"];
+        assert!(is_cfg_use(&lines, 2), "a `)` inside a raw string must not close the attribute");
+    }
+
+    /// A comment is not code: a quote inside one does not open a string, and a
+    /// bracket inside one does not close the attribute.
+    ///
+    /// Rust discards comments before parsing attributes, so a `"` in a comment is
+    /// not a string and a `]` in one is not the close. Counting them makes the
+    /// reader miss the attribute's real end and lose a following `#[cfg]` -- a
+    /// disabled import would displace a live alias, the lost proof this reader
+    /// prevents.
+    #[test]
+    fn a_comment_inside_an_attribute_is_not_code() {
+        // A line comment with a quote, inside a multi-line `cfg`.
+        let lines: Vec<&str> = vec!["#[cfg(any( // \" note", "))]", "use a::B as C;"];
+        assert!(is_cfg_use(&lines, 2), "a quote in a line comment must not open a string");
+
+        // A line comment with a closing bracket.
+        let lines: Vec<&str> = vec!["#[cfg(any() // ]", ")]", "use a::B as C;"];
+        assert!(is_cfg_use(&lines, 2), "a `]` in a line comment must not close the attribute");
+
+        // A block comment with a quote, on one line.
+        let lines: Vec<&str> = vec!["#[cfg(any())]", "#[doc = /* \" */ \"x\"]", "use a::B as C;"];
+        assert!(is_cfg_use(&lines, 2), "a quote in a block comment must not open a string");
+
+        // A block comment spanning lines.
+        let lines: Vec<&str> = vec!["#[cfg(any())]", "#[doc = /* \"", "*/ \"x\"]", "use a::B as C;"];
+        assert!(is_cfg_use(&lines, 3), "a multi-line block comment must be skipped whole");
+    }
+
+    /// A quoted attribute on the `use`'s own line does not hide the `use`.
+    ///
+    /// [`split_leading_attrs`] peels leading attributes to reach the `use` behind
+    /// them. A `(` inside a string in the attribute is not a delimiter, so counting
+    /// it runs the attribute past its real end and the `use` is never found -- the
+    /// import is lost. The same scanner [`read_attr_run`] uses is applied here.
+    #[test]
+    fn a_quoted_attribute_on_the_use_line_does_not_hide_it() {
+        // A same-line doc attribute with an unmatched `(` in a string.
+        assert_eq!(
+            split_leading_attrs("#[doc = \"(\"] use a::B;"),
+            ("use a::B;", false)
+        );
+        assert!(is_use_start("#[doc = \"(\"] use a::B;"));
+
+        // The same with a raw string and a trailing backslash.
+        assert_eq!(
+            split_leading_attrs("#[doc = r\"\\\"] use a::B;"),
+            ("use a::B;", false)
+        );
+
+        // A `cfg` attribute before a quoted one is still seen, and the `use` found.
+        assert_eq!(
+            split_leading_attrs("#[cfg(any())] #[doc = \")\"] use a::B;"),
+            ("use a::B;", true)
+        );
     }
 }

@@ -54,8 +54,8 @@ echo "== 4/18 no_std bare-metal build =="
 # built without its `std` feature; the arithmetic crate has no features at all, so its
 # default build *is* the bare-metal one.
 cargo build -q --no-default-features --target thumbv7em-none-eabihf || fail "bare-metal build"
-cargo build -q -p discharge-arithmetic --target thumbv7em-none-eabihf \
-  || fail "bare-metal build of discharge-arithmetic"
+cargo build -q -p verif-arithmetic --target thumbv7em-none-eabihf \
+  || fail "bare-metal build of verif-arithmetic"
 # `examples/bare_metal.rs` is the crate's own claim on the target: it is `no_std`, it
 # calls the decision procedure, and building it is what proves the prover is code in the
 # artifact rather than a host-side tool. A `lib` example (see `[[example]]` in Cargo.toml)
@@ -65,21 +65,21 @@ cargo build -q --no-default-features --target thumbv7em-none-eabihf --example ba
 
 echo "== 5/18 no external dependencies =="
 # The property is not "the tree has one line" any more -- the arithmetic primitives were
-# split into a sibling crate in this repository, so `discharge` legitimately depends on
-# `discharge-arithmetic`. The property that must not change is that *nothing from outside
+# split into a sibling crate in this repository, so `verif` legitimately depends on
+# `verif-arithmetic`. The property that must not change is that *nothing from outside
 # the repository* is linked: no registry crate, no git crate, nothing from crates.io.
 #
-# `discharge-arithmetic` must still be a leaf: one line, itself, no dependencies at all.
-arith_deps=$(cargo tree -p discharge-arithmetic -e normal | wc -l)
-[ "$arith_deps" -eq 1 ] || fail "discharge-arithmetic has dependencies: cargo tree lists $arith_deps lines"
+# `verif-arithmetic` must still be a leaf: one line, itself, no dependencies at all.
+arith_deps=$(cargo tree -p verif-arithmetic -e normal | wc -l)
+[ "$arith_deps" -eq 1 ] || fail "verif-arithmetic has dependencies: cargo tree lists $arith_deps lines"
 
-# `discharge` may depend on exactly the one sibling, and it must be a *path* dependency.
-discharge_deps=$(cargo tree -p discharge -e normal | wc -l)
-[ "$discharge_deps" -eq 2 ] || fail "discharge has dependencies beyond the in-repo sibling: cargo tree lists $discharge_deps lines"
-cargo tree -p discharge -e normal --prefix none | tail -n +2 | grep -q 'discharge-arithmetic v0.1.0 (' \
-  || fail "the one dependency of discharge is not the in-repo discharge-arithmetic path crate"
+# `verif` may depend on exactly the one sibling, and it must be a *path* dependency.
+verif_deps=$(cargo tree -p verif -e normal | wc -l)
+[ "$verif_deps" -eq 2 ] || fail "verif has dependencies beyond the in-repo sibling: cargo tree lists $verif_deps lines"
+cargo tree -p verif -e normal --prefix none | tail -n +2 | grep -q 'verif-arithmetic v0.1.0 (' \
+  || fail "the one dependency of verif is not the in-repo verif-arithmetic path crate"
 # A registry or git dependency would print a `(https://...)` or `(registry+...)` suffix.
-if cargo tree -p discharge -e normal --prefix none | tail -n +2 | grep -qE '\((https?://|git\+|registry\+)'; then
+if cargo tree -p verif -e normal --prefix none | tail -n +2 | grep -qE '\((https?://|git\+|registry\+)'; then
   fail "an external (registry or git) dependency has appeared in the tree"
 fi
 
@@ -107,22 +107,22 @@ echo "== 8/18 MIR frontend, on real rustc MIR =="
 # to be installed, which is the point: the "stable is enough" claim is only worth anything if
 # something checks it on a stable compiler.
 #
-# It takes the compiler from DISCHARGE_RUSTC rather than RUSTC so that naming a *different*
+# It takes the compiler from VERIF_RUSTC rather than RUSTC so that naming a *different*
 # rustc -- a nightly, or the oracle's toolchain -- does not disturb the cargo that is building
 # these tests. Falling back to `rustc` on PATH is what lets the gate run with no setup at all;
 # it used to skip in that case, which left the stable claim unpinned. It skips only when no
 # `rustc` can be found at all, and says so, exactly like Kani and Verus below.
-if [ -z "${DISCHARGE_RUSTC:-}" ]; then
+if [ -z "${VERIF_RUSTC:-}" ]; then
   if command -v rustc >/dev/null 2>&1; then
-    DISCHARGE_RUSTC="$(command -v rustc)"
-    export DISCHARGE_RUSTC
-    echo "   (DISCHARGE_RUSTC not set; using the rustc on PATH: $DISCHARGE_RUSTC)"
+    VERIF_RUSTC="$(command -v rustc)"
+    export VERIF_RUSTC
+    echo "   (VERIF_RUSTC not set; using the rustc on PATH: $VERIF_RUSTC)"
   fi
 fi
-if [ -n "${DISCHARGE_RUSTC:-}" ]; then
+if [ -n "${VERIF_RUSTC:-}" ]; then
   cargo run -q --features std --example mir_demo || fail "MIR demo"
 else
-  echo "   (no rustc on PATH and DISCHARGE_RUSTC unset; skipped -- the frontend needs a rustc)"
+  echo "   (no rustc on PATH and VERIF_RUSTC unset; skipped -- the frontend needs a rustc)"
 fi
 
 echo "== 9/18 verus differential oracle (skipped if verus is absent) =="
@@ -196,7 +196,7 @@ echo "== 13/18 comparison fixtures: contracts, teeth, and the degenerate check =
 # ran it: the fixtures were verified by hand, once, and the prose was the only record. That
 # is the failure mode this repository names explicitly -- a one-off verification is not a
 # gate, and only a gate survives the next change. This gate re-runs the cheap, hermetic
-# half: `discharge` on the positive fixture and all three bug fixtures, the degenerate
+# half: `verif` on the positive fixture and all three bug fixtures, the degenerate
 # implementations that the bounds-only contracts used to accept, and Coq and Lean on the
 # positive fixture and both teeth. The external provers (Kani, Verus, Prusti, SPARK) have
 # their own CI jobs, where their toolchains are installed.
@@ -219,9 +219,9 @@ echo "== 14/18 minimum supported Rust version (skipped if the toolchain is absen
 #
 # It is a skip when the toolchain is absent, with the same convention as Kani and Ferrocene:
 # a missing compiler is *not* evidence that the floor holds, so it is reported as a skip
-# rather than folded into a pass. `DISCHARGE_MSRV` overrides the version, so the check can
+# rather than folded into a pass. `VERIF_MSRV` overrides the version, so the check can
 # be pointed at a newer floor without editing the script.
-MSRV="${DISCHARGE_MSRV:-1.85}"
+MSRV="${VERIF_MSRV:-1.85}"
 if rustup run "$MSRV" rustc --version >/dev/null 2>&1; then
   cargo "+$MSRV" check -q --workspace --features std --all-targets \
     || fail "MSRV build with $MSRV"
@@ -245,7 +245,7 @@ if rustup run "$MSRV" rustc --version >/dev/null 2>&1; then
   # 1.99 and red on the compiler the manifest promises to support. Running the frontend's own
   # suite against the floor rustc is what makes the floor a checked claim rather than a build.
   if MSRV_RUSTC="$(rustup run "$MSRV" which rustc 2>/dev/null)"; then
-    DISCHARGE_RUSTC="$MSRV_RUSTC" cargo "+$MSRV" test -q --features std --test mir \
+    VERIF_RUSTC="$MSRV_RUSTC" cargo "+$MSRV" test -q --features std --test mir \
       || fail "MIR frontend on the MSRV ($MSRV)"
   fi
 else
@@ -267,25 +267,25 @@ echo "== 15/18 documentation builds with no warnings =="
 # passed: the point is the *public* surface, the one a reader sees, and a private-item link
 # from a public item is exactly the warning this is meant to catch.
 #
-# Both crates are checked, one command each. `discharge-arithmetic` takes no `--features std`
+# Both crates are checked, one command each. `verif-arithmetic` takes no `--features std`
 # -- it has no features, and naming one there would be a build error. It had the same class
 # of warning this gate exists for (`prove.rs` linked its private `forall_pair_bounded` from
 # three public items), which a parent-only gate would have left.
 #
-# `discharge` is built three ways, because the doc surface *differs* between feature sets and
+# `verif` is built three ways, because the doc surface *differs* between feature sets and
 # docs.rs publishes the default one. `--no-default-features` is the `no_std` build; `--features
 # std` adds the whole `mir` frontend; `--all-features` is the union that
 # `[package.metadata.docs.rs]` requests. A link to a `#[cfg(feature = "std")]` item resolves
 # in the last two and *not* in the first -- which is exactly how `smtscript` shipped an
-# unresolved link to `Query::to_smtlib2_string` that only the default build could see.
-RUSTDOCFLAGS="-D warnings" cargo doc -q -p discharge --no-deps \
-  || fail "rustdoc warnings (discharge, no_std)"
-RUSTDOCFLAGS="-D warnings" cargo doc -q -p discharge --no-deps --features std \
-  || fail "rustdoc warnings (discharge, std)"
-RUSTDOCFLAGS="-D warnings" cargo doc -q -p discharge --no-deps --all-features \
-  || fail "rustdoc warnings (discharge, all features)"
-RUSTDOCFLAGS="-D warnings" cargo doc -q -p discharge-arithmetic --no-deps \
-  || fail "rustdoc warnings (discharge-arithmetic)"
+# unresolved link to `Query::to_smtlib2` that only the default build could see.
+RUSTDOCFLAGS="-D warnings" cargo doc -q -p verif --no-deps \
+  || fail "rustdoc warnings (verif, no_std)"
+RUSTDOCFLAGS="-D warnings" cargo doc -q -p verif --no-deps --features std \
+  || fail "rustdoc warnings (verif, std)"
+RUSTDOCFLAGS="-D warnings" cargo doc -q -p verif --no-deps --all-features \
+  || fail "rustdoc warnings (verif, all features)"
+RUSTDOCFLAGS="-D warnings" cargo doc -q -p verif-arithmetic --no-deps \
+  || fail "rustdoc warnings (verif-arithmetic)"
 
 echo "== 16/18 the tree ships no build artifacts =="
 # `scripts/gate.sh` runs the oracles, and the oracles run `rustc`, which leaves
@@ -324,7 +324,7 @@ echo "== 17/18 the unsafe surface is pinned and justified =="
 # crate forbids `unsafe_op_in_unsafe_fn` and documents the arena discipline in prose, and a
 # block whose justification is not written down is a block nobody can review.
 #
-# `discharge-arithmetic` is not checked here because it is `#![forbid(unsafe_code)]` -- it
+# `verif-arithmetic` is not checked here because it is `#![forbid(unsafe_code)]` -- it
 # cannot have one -- which is the stronger statement.
 unsafe_blocks=$(grep -rc 'unsafe {' src/ --include='*.rs' | awk -F: '{s+=$NF} END {print s+0}')
 [ "$unsafe_blocks" -eq 2 ] || fail "expected exactly 2 'unsafe' blocks in src/, found $unsafe_blocks (update SECURITY.md and this gate together if that is deliberate)"
@@ -346,7 +346,7 @@ echo "== 18/18 the build-time path verifies at compile time and costs nothing ==
 # The crate's headline claim is a prover that compiles *into* the artifact. This gate
 # checks the other shape a safety build often wants, and the one Kani and Verus actually
 # have: the checker runs while the crate is built and the shipped binary carries none of
-# it. `discharge` supports that through its `std`-only `mir` frontend as a
+# it. `verif` supports that through its `std`-only `mir` frontend as a
 # `[build-dependencies]` entry -- a build script is a separate compilation unit, so the
 # decision procedure is compiled for the host and never linked into the crate's own rlib.
 #
@@ -355,7 +355,7 @@ echo "== 18/18 the build-time path verifies at compile time and costs nothing ==
 # `tools/build-verify/run.sh` builds a scratch crate three ways and requires (1) a good
 # contract to build *and* the verifier to report `verified` (a build script that did
 # nothing would otherwise pass), (2) a broken contract to fail the build on its named
-# obligation, and (3) the resulting rlib to carry zero `discharge` symbols. Exit 2 means
+# obligation, and (3) the resulting rlib to carry zero `verif` symbols. Exit 2 means
 # no cargo, which is reported and skipped like the other toolchain gates; exit 1 is a real
 # failure.
 code=0
