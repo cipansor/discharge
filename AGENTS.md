@@ -8113,3 +8113,82 @@ GATES GREEN** (all eighteen). Two of the ten new tests are the pinned README
 examples (`tests/readme.rs`, `verif-arithmetic/tests/readme.rs`); the other eight
 come with the packaging checks. No engine change: every fix is a manifest field,
 a packaging script, or a document.
+
+## Three ways the release workflow would have failed, and one it would have caused
+
+The release workflow was written and reviewed as a *plan*: the dry-run passes,
+the notes generate, the upload runs. All three of those steps were checked in
+isolation, and all three were wrong, in ways that only appear when they run in
+sequence against a real repository. The pattern is the same in each: a step was
+correct about its own output and wrong about what it left behind for the next.
+
+**`notes.md` in the root dirties the crate the next step uploads.** `verif` is
+packaged from the repository root -- its crate directory *is* the root -- and
+`cargo publish` refuses a crate whose directory has uncommitted changes. The
+notes step wrote `notes.md` there, after the dry-run and before the upload. So
+the dry-run checked a clean tree, then the notes made it dirty, and the real
+publish failed:
+
+```
+error: 1 files in the working directory contain changes that were not yet
+committed into git:
+notes.md
+```
+
+`verif-arithmetic` was unaffected, because its crate directory is the
+subdirectory -- which is exactly why this was easy to miss: the sibling release
+works, so the workflow looks correct until the parent is released. The fix is to
+write the notes outside the checkout (`$RUNNER_TEMP`) and pass that path to `gh
+release`. The dry-run and the upload now see the same tree, which is the property
+that was actually wanted; "the notes exist" was satisfied either way.
+
+This is the same defect class as the `.rlib` files gate 16 guards against -- a
+step's output landing inside a crate directory -- and it is worth naming, because
+the check for it already existed for a different file type.
+
+**A manual dispatch would have packaged the branch and released the tag.** The
+workflow pins `RELEASE_TAG` and checks it against the manifest version, and that
+check is not enough for `workflow_dispatch`: the ref is chosen in the Actions UI,
+and `inputs.tag` only controls what is *named*. If the default branch carries the
+same version as the tag -- which it does right up until the release is cut --
+the version check passes, the branch is packaged and uploaded under the tag, and
+`gh release create --verify-tag` then attaches a release to the tag's commit.
+The registry holds commit B; the release points at commit A. The version check
+cannot see this, because both commits declare `0.1.0`. The commit can:
+
+```
+error: HEAD is 74018168e010 but `verif-v0.1.0` is ed0e30bcdb93; check out the tag,
+not a branch
+```
+
+`ref: ${{ inputs.tag || github.ref }}` pins the checkout, and `--verify-checkout`
+asserts it, so the two cannot drift. A version is a claim about content; a commit
+is the content.
+
+**A transient 404 after a successful upload aborted the whole release.** The
+confirmation step called the crates.io API once and treated anything but HTTP 200
+as failure. But a successful upload and an API-visible version are separate
+events: the index is updated asynchronously, so the first request can 404 for a
+few seconds after `cargo publish` returned success. The step then failed *after*
+the crate was published and *before* the GitHub release was created -- the worst
+of both, an upload that cannot be undone and no release to explain it.
+`--confirm-index` now polls to a bounded deadline, retrying 404 and 5xx and
+network errors, and fails fast on any other 4xx: a 403 will not become a 200 by
+waiting, so retrying it only delays the report.
+
+**And the fix for the first one would have introduced the fourth.** Moving the
+notes generation into `publish.py` removed the `importlib` call the old inline
+step used, but the old step *also* left a bytecode cache behind: importing a
+script writes `scripts/__pycache__/` next to it, inside the checkout, which is
+again a root-directory change that dirties the `verif` crate. It is untracked, so
+gate 16 (which greps `git ls-files`) never saw it, and the `.crate` was fine --
+but the *next* `cargo publish` would have refused. `__pycache__/` is now in
+`.gitignore`, where it cannot be mistaken for a source change, and the notes step
+runs the script as a program rather than importing it, so no cache is written at
+all.
+
+All three subcommands are exercised on the release path itself, and each was
+tested with a negative control: `--verify-checkout` fails when the tag is absent
+and when it points at another commit (including one whose version matches);
+`--confirm-index` succeeds on a published crate, retries a 404-then-200, and
+fails a 403 immediately rather than after the timeout.

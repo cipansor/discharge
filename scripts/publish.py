@@ -47,6 +47,8 @@ import subprocess
 import sys
 import time
 import tomllib
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -202,6 +204,109 @@ def dirty_by_crate(crates: list[str]) -> dict[str, list[str]]:
     return blocked
 
 
+def notes_for(tag: str) -> str:
+    """Release notes for the crate a tag names, from the commits that touched it.
+
+    Scoped to one crate's files, so a release for one crate does not list the
+    other's commits. The parent crate owns the repository root, so its pathspec is
+    "everything except the sibling and the tools" rather than a directory; the
+    sibling owns exactly its own directory. A plain list of directories would put
+    every sibling commit into the parent's notes.
+
+    The range starts at this crate's previous tag, so the notes cover what changed
+    since the last release of *this* crate, not since the last release of any.
+    """
+    crate, version = crates_from_tag(tag)
+
+    if CRATES[crate] == ROOT:
+        paths = [".", ":(exclude)verif-arithmetic", ":(exclude)tools"]
+    else:
+        paths = [str(CRATES[crate].relative_to(ROOT))]
+
+    previous = subprocess.run(
+        ["git", "tag", "--list", f"{crate}-v*", "--sort=-v:refname"],
+        cwd=ROOT, capture_output=True, text=True, check=True,
+    ).stdout.split()
+    previous = [t for t in previous if t != tag]
+    rev = f"{previous[0]}..HEAD" if previous else "HEAD"
+
+    log = subprocess.run(
+        ["git", "log", "--no-merges", "--format=- %s", rev, "--", *paths],
+        cwd=ROOT, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    header = f"# {crate} {version}\n\n## Changes\n\n"
+    return header + (log if log else "- (no commits touched this crate)") + "\n"
+
+
+def verify_checkout(tag: str) -> tuple[bool, str]:
+    """Check that HEAD is the commit the tag points at.
+
+    A manual dispatch can select any ref in the Actions UI, and the tag input only
+    controls what is *named*: if the selected branch happens to carry the same
+    version, the manifest check passes and the branch's contents are published
+    under the tag, while the GitHub release is created against the tag's commit.
+    Two commits, one release, and the registry holds the one nobody tagged.
+
+    The version check cannot catch that, because both commits declare the same
+    version. Comparing the commit can.
+    """
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True
+    )
+    if head.returncode != 0:
+        return False, "cannot read HEAD"
+    tagged = subprocess.run(
+        ["git", "rev-list", "-n", "1", tag], cwd=ROOT, capture_output=True, text=True
+    )
+    if tagged.returncode != 0:
+        return False, f"tag `{tag}` does not exist in this checkout"
+    if head.stdout.strip() != tagged.stdout.strip():
+        return False, (
+            f"HEAD is {head.stdout.strip()[:12]} but `{tag}` is "
+            f"{tagged.stdout.strip()[:12]}; check out the tag, not a branch"
+        )
+    return True, tagged.stdout.strip()[:12]
+
+
+def confirm_index(crate: str, version: str, timeout: float, interval: float) -> tuple[bool, str]:
+    """Wait, briefly, for a published version to appear in the crates.io index.
+
+    A successful upload and an API-visible version are separate events: the index
+    is updated asynchronously, so an immediate request can 404 for a few seconds
+    after `cargo publish` returned success. Treating that first 404 as a failure
+    aborts a workflow whose crate *is* published -- leaving the release half-done,
+    with the upload done and the GitHub release never created.
+
+    So a 404 is retried, not fatal. A network error is retried too. Any other HTTP
+    error is not: a 403 or a 400 will not become a 200 by waiting, and retrying it
+    only delays the report.
+    """
+    url = f"https://crates.io/api/v1/crates/{crate}/{version}"
+    deadline = time.time() + timeout
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            code = urllib.request.urlopen(url, timeout=30).status
+        except urllib.error.HTTPError as error:
+            code = error.code
+        except (urllib.error.URLError, OSError) as error:
+            code = None
+            detail = str(error)
+
+        if code == 200:
+            return True, f"HTTP 200 after {attempt} request(s)"
+        if code is not None and code != 404 and code < 500:
+            return False, f"HTTP {code} is not a temporary condition"
+
+        if time.time() >= deadline:
+            seen = f"HTTP {code}" if code is not None else f"no response ({detail})"
+            return False, f"still not in the index after {timeout:.0f}s ({seen})"
+
+        time.sleep(interval)
+
+
 def run_publish(crate: str, dry_run: bool) -> tuple[str, str]:
     """Return (verdict, detail).
 
@@ -269,6 +374,33 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="validate --tag and exit without packaging anything",
     )
+    parser.add_argument(
+        "--verify-checkout",
+        action="store_true",
+        help="assert HEAD is the commit --tag points at, then exit",
+    )
+    parser.add_argument(
+        "--notes",
+        action="store_true",
+        help="print the release notes for --tag on stdout, then exit",
+    )
+    parser.add_argument(
+        "--confirm-index",
+        action="store_true",
+        help="wait for --tag's version to appear in the crates.io index, then exit",
+    )
+    parser.add_argument(
+        "--index-timeout",
+        type=float,
+        default=300.0,
+        help="seconds to wait for the index (default 300)",
+    )
+    parser.add_argument(
+        "--index-interval",
+        type=float,
+        default=10.0,
+        help="seconds between index requests (default 10)",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -306,6 +438,48 @@ def main(argv: list[str]) -> int:
             return 1
         crate, version = crates_from_tag(args.tag)
         print(f"tag {args.tag} names {crate} {version}, which matches its manifest")
+        return 0
+
+    # The three release subcommands. Each is a separate mode rather than a flag on
+    # the check run, because the workflow needs to run them at different points --
+    # the checkout check before anything is installed, the notes before the
+    # upload, the index confirmation after it -- and a mode that does one thing is
+    # the one that can be tested on its own.
+    if args.verify_checkout or args.notes or args.confirm_index:
+        if not args.tag:
+            print(
+                "error: --verify-checkout, --notes and --confirm-index need --tag",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            crate, version = crates_from_tag(args.tag)
+        except ReleaseError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+
+        if args.verify_checkout:
+            ok, detail = verify_checkout(args.tag)
+            if not ok:
+                print(f"error: {detail}", file=sys.stderr)
+                return 1
+            print(f"checkout: HEAD is `{args.tag}` at {detail}")
+            return 0
+
+        if args.notes:
+            sys.stdout.write(notes_for(args.tag))
+            return 0
+
+        ok, detail = confirm_index(
+            crate, version, args.index_timeout, args.index_interval
+        )
+        print(f"{crate} {version}: {detail}")
+        if not ok:
+            print(
+                f"error: {crate} {version} did not appear in the crates.io index",
+                file=sys.stderr,
+            )
+            return 1
         return 0
 
     order = topo_order(list(CRATES), deps)
