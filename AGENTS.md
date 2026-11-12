@@ -598,6 +598,64 @@ here, so it remains unsupported. The full rule, its soundness argument, and the
 four ways it is pinned are recorded in "Recursion by contract" near the end of
 this file.
 
+### The MIR frontend's version: a callee with no body is answered from its contract
+
+The MIR executor had the same gap for a long time and it was the README's first
+stated limitation: a call to a function in the same file was symbolically
+executed, and a call to anything else was `Unknown`. Only a self-call with a
+`decreases:` measure had a verdict, by induction. `try_callee_contract` in
+`src/mir/exec.rs` closes the rest: a callee whose *body* the dump does not
+contain, but whose *contract* the source does, is answered from that contract.
+An `extern` declaration is the smallest shape that produces it, but the path is
+not special-cased -- any item the dump carries no body for goes through it.
+
+The order of the three checks is the whole soundness argument:
+
+1. **`CalleePrecondition`** proves the callee's `requires:` of the call's
+   arguments. This is what makes the assumption sound. Proving a caller's
+   postcondition from an assumed postcondition whose precondition was never
+   established is assuming the conclusion, and this obligation is what stops a
+   contract from being a free pass.
+2. **`CalleeDiverges`** refutes the postcondition *before* assuming it. `ensures
+   false` describes a callee that never returns, so every claim after the call
+   would be vacuously true, and a report that counted them would call a function
+   that does not run "verified". The query is `find_model(path && post)`, so its
+   discharge is `Unsat` rather than `Valid` -- the MIR twin of
+   `wp::Rule::DivergentCall`, and a kind whose polarity is the opposite of every
+   other `Callee*` obligation.
+3. The postcondition is **assumed** of a fresh return variable, whose width comes
+   from the *caller's* destination (the one place the return type exists without
+   the callee's MIR).
+
+Four refusals are deliberate, and each is the safe direction:
+
+* A callee with **no `ensures`** gives nothing to assume. "No postcondition" is
+  not "postcondition `true`": the first promises nothing, the second promises
+  everything. Reading the absence as `true` would let a caller's postcondition be
+  proved from nothing at all.
+* A **parameter list the source scanner cannot read** leaves the names unbound
+  and the call is refused. There is no second signal -- a bodyless callee has no
+  `debug` bindings -- so positional binding is the only tie between
+  `requires: n <= 10` and the first argument, and a list short by one would prove
+  a precondition nobody stated. `spec::fn_signature` therefore returns an *empty*
+  list on any shape it cannot read whole (`_`, `self`, a destructuring pattern, a
+  wrapped signature), never a partial one.
+* A **reference argument** is refused. `Ty::Ref` is modelled as its referent, so a
+  `&mut` write would land on the caller's value and not reach the local it names;
+  there is no aliasing model to carry it back. Note that rustc also *elides* the
+  receiver from a method call's argument list (`Slot::stash(_1, _2)`), so a
+  receiver-aware arity check is a separate problem this route does not attempt.
+* **Inlining wins when it can.** The contract route runs *after* `resolve_callee`,
+  never before. When the body is in the dump, inlining executes the callee rather
+  than trusting what it promised, so it is strictly more precise; a contract route
+  that shadowed it would trade a proof for a promise. The test that pins this
+  deliberately gives the callee a contract *weaker* than its body, so a pass can
+  only mean the body was executed.
+
+`CalleeEnv` resolves through `Specs::resolve`, so an `impl`-keyed contract and a
+path-keyed one are both found by the rule the frontend already uses to attach a
+contract to its function, rather than by a second lookup rule that could drift.
+
 ## A verifier needs a differential harness, not just unit tests
 
 Both soundness holes in the call rule were found by accident. `tests/modular_differential.rs`
