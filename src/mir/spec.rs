@@ -131,6 +131,24 @@ pub struct FnContract {
     /// measures could disagree and picking either would be guessing which proof the
     /// source asked for.
     pub decreases: Vec<String>,
+    /// Clause-shaped doc-comment lines that are *not* clauses this frontend
+    /// understands, as `(line number, the line as written)`.
+    ///
+    /// A line that looks like a clause (`word: ...`) but is not one of the four
+    /// keywords is the dangerous shape, because the reader cannot tell a typo
+    /// from prose. `/// ensuers: ret == 99` used to be dropped on the floor: the
+    /// function then had *no* postcondition, was checked against `true`, and was
+    /// reported `Verified` with zero obligations -- a green report for a claim
+    /// nobody read. The same held for `variant:` (a loop measure this frontend
+    /// does not yet take), which a reader would reasonably expect to be
+    /// *honoured* rather than ignored. Both are recorded here and the function is
+    /// *skipped* rather than silently verified without them, which is the same
+    /// discipline the unreadable-contract path already follows.
+    ///
+    /// Only a line whose leading word is close to a real keyword is recorded, so
+    /// ordinary prose that happens to use a colon (`/// direction: ...`) is left
+    /// alone. A near miss is the typo case; a distant word is a sentence.
+    pub unknown: Vec<(usize, String)>,
     /// Line number of the `fn` item, for diagnostics.
     pub line: usize,
 }
@@ -1836,6 +1854,13 @@ pub fn extract(source: &str) -> Specs {
                 pending.invariants.push(r.trim().to_string());
             } else if let Some(r) = t.strip_prefix("decreases:") {
                 pending.decreases.push(r.trim().to_string());
+            } else if let Some(note) = clause_shaped_word(t) {
+                // A line that reads like a clause but is not one this frontend
+                // takes. A typo (`ensuers:`) would otherwise be dropped and the
+                // function verified with no postcondition at all; a `variant:`
+                // would be ignored although the reader expects it honoured.
+                // Recorded and refused, never dropped.
+                pending.unknown.push((lineno + 1, format!("{t} — {note}")));
             }
             continue;
         }
@@ -1848,6 +1873,12 @@ pub fn extract(source: &str) -> Specs {
                 || !pending.ensures.is_empty()
                 || !pending.invariants.is_empty()
                 || !pending.decreases.is_empty()
+                // A function carrying *only* a clause the frontend does not take
+                // is still recorded, so it can be refused rather than dropped:
+                // dropping it would leave the function unverified with no
+                // mention, which is the same silent-loss shape `unknown` exists
+                // to close.
+                || !pending.unknown.is_empty()
             {
                 pending.line = lineno + 1;
                 // A method's contract is keyed by its `impl`'s location, so two
@@ -1888,7 +1919,72 @@ pub fn extract(source: &str) -> Specs {
     specs
 }
 
-/// Pull the function name out of a `pub fn name(...)` / `fn name(...)` line.
+/// A note explaining why a clause-shaped doc-comment line was not taken, when
+/// the line reads like a clause but is not one of the four the frontend accepts.
+///
+/// Two shapes reach here and they need different advice:
+///
+/// * A *typo* (`ensuers:`, `requiers:`) is one or two edits from a real keyword,
+///   so the note names the keyword it looks like. This is the dangerous case:
+///   the clause would otherwise be dropped and the function verified without it.
+/// * `variant:` is not a typo -- it is the loop termination measure, which this
+///   frontend does not yet take. The note says so rather than suggesting a
+///   different clause, because a reader who wrote a measure is entitled to be
+///   told the measure is unsupported, not corrected into an invariant.
+///
+/// Ordinary prose (`direction:`, `type:`) is more than two edits from every
+/// keyword and is left as documentation, so a sentence that merely contains a
+/// colon does not fire this.
+fn clause_shaped_word(t: &str) -> Option<String> {
+    const KEYWORDS: [&str; 4] = ["requires", "ensures", "invariant", "decreases"];
+    let word = t.split(':').next()?.trim();
+    // A clause keyword is a bare identifier; anything else is prose or a value.
+    if word.is_empty() || !word.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return None;
+    }
+    if word == "variant" {
+        return Some(
+            "`variant:` (a loop termination measure) is not supported yet; the loop would be \
+             checked for partial correctness only"
+                .to_string(),
+        );
+    }
+    KEYWORDS
+        .into_iter()
+        .filter(|k| edit_distance_at_most_two(word, k))
+        .min_by_key(|k| edit_distance(word, k))
+        .map(|k| format!("did you mean `{k}:`?"))
+}
+
+/// True when `a` and `b` are within two single-character edits of each other.
+///
+/// A bounded Levenshtein: the band is two, so a word that differs by a typo
+/// (`ensuers` vs `ensures`) is caught and a different word (`direction`) is not.
+/// The bound is what keeps this from firing on prose.
+fn edit_distance_at_most_two(a: &str, b: &str) -> bool {
+    edit_distance(a, b) <= 2
+}
+
+/// The Levenshtein distance between two short words, saturating at 3.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.len().abs_diff(b.len()) > 2 {
+        return 3;
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != cb);
+            cur[j + 1] = sub.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
 fn fn_name(line: &str) -> Option<String> {
     let t = line.trim_start_matches("pub(crate) ").trim_start_matches("pub ").trim();
     let rest = t.strip_prefix("const ").unwrap_or(t).trim();

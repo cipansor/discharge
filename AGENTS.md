@@ -2816,6 +2816,45 @@ The general lesson: for a loop, an invariant is not a predicate to *check at the
 it is a predicate to *assume over the whole state space it describes*. Asserting it at the
 back edge is necessary and not sufficient; the header has to forget what it cannot know.
 
+## A clause that is not a clause must be refused, not dropped
+
+The contract reader takes four clause keywords: `requires:`, `ensures:`, `invariant:`,
+`decreases:`. Anything else on a `///` line used to be ignored, and that is a **false
+proof**, not a lost one. Measured at the time of the fix:
+
+    /// requires: x == 0
+    /// ensuers: ret == 99        <- one transposition from `ensures`
+    pub fn f(x: u32) -> u32 { 5 }
+
+came back `Verified` with **zero obligations**. The typo meant the function had no
+postcondition at all, so the body was checked against `true`, and the report was green
+for a claim nobody had read. The `ensuers` case is the sharp one because it is the
+*false* direction: had the claim been true, the green report would have been earned by
+luck, and had it been false -- as here -- the tool would have certified it. `variant:`
+was the same shape from the other side: a reader who writes a loop termination measure
+reasonably expects it honoured, and the tool ignored it, so a total-correctness claim
+rested on nothing.
+
+The fix records any clause-shaped line the frontend does not take and **skips** the
+function, naming the line and the keyword it looks like. The hard part is not the
+refusal, it is *deciding what counts as clause-shaped*: a naive "any `/// word:`" rule
+would refuse ordinary documentation, and the corpus is full of it (`/// direction: ...`,
+`/// type: ...`, `/// width: ...`). The rule is a bounded edit distance of two on the
+word before the first colon, so `ensuers` (one transposition) and `requiers` (one
+transposition) are caught while `direction` (three edits from `decreases`) is left as
+prose. Measured over `examples/`, `tests/` and `src/`: the only near misses anywhere are
+inside the tests for this rule itself, so the corpus does not trip it.
+
+`variant:` gets a distinct message rather than a "did you mean" suggestion, because it is
+not a typo -- it is a feature this frontend does not have yet, and correcting the reader
+into an invariant would hide that. That message is the honest statement of the gap, and
+it is the reason this section exists in a document about *soundness* rather than one
+about ergonomics.
+
+The regression test `a_clause_shaped_doc_comment_that_is_not_a_clause_is_refused` was run
+against the pre-fix code first and fails there with
+`verified (0 obligation(s), 0 panic(s) ruled out)`.
+
 ## A call to `core` made the whole path unknown, and modelling it needed a tag that is a term
 
 The MIR frontend's biggest coverage gap was not a parser shape or a width wall: it was that

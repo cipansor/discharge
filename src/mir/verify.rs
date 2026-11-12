@@ -192,6 +192,25 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     // unresolved contract is not "no contract" here -- it is the false-proof
     // case, where the body would be checked against `true` and no `ensures`.
     let contract = specs.resolve(&f.name);
+    // A clause the frontend does not take is refused rather than ignored. This
+    // is the silent-loss direction: `/// ensuers: ret == 99` was dropped, so the
+    // function had no postcondition, was checked against `true`, and came back
+    // `Verified` with zero obligations -- a green report for a claim nobody read.
+    // A `variant:` is the same shape from the other side: the reader wrote a
+    // termination measure and the tool ignored it, so a total-correctness claim
+    // would rest on nothing. Refusing names the line and the keyword it looks
+    // like, which is what a typo needs, and it is the same discipline as an
+    // unreadable `requires`.
+    if let Some(c) = contract {
+        if let Some((line, text)) = c.unknown.first() {
+            return FnOutcome::Skipped {
+                reason: format!(
+                    "line {line}: `{text}` is not a clause this frontend takes; refusing \
+                     rather than verifying the function without it"
+                ),
+            };
+        }
+    }
     let arg_vars = spec::arg_vars(f);
     let signed = spec::signed_args(f);
     // Fields of struct-typed arguments, bound to their own symbolic inputs. The

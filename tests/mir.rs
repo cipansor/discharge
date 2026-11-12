@@ -3449,6 +3449,54 @@ fn a_leaf_write_inside_an_element_is_read_back() {
     }
 }
 
+/// A clause-shaped doc comment that is not a clause is refused, not dropped.
+///
+/// `/// ensuers: ret == 99` used to be discarded: the function then had no
+/// postcondition, was checked against `true`, and came back `Verified` with zero
+/// obligations -- a green report for a claim nobody read. The same held for
+/// `variant:`, where the reader wrote a termination measure and the tool ignored
+/// it. Both are now `Skipped` with the line named, which is the discipline an
+/// unreadable `requires` already follows.
+///
+/// The negative twins pin the other direction: ordinary prose that happens to
+/// contain a colon (`/// direction: ...`) is more than two edits from every
+/// keyword and must *not* be refused, or documentation would start failing
+/// builds.
+#[test]
+fn a_clause_shaped_doc_comment_that_is_not_a_clause_is_refused() {
+    let typo = verify_src(
+        "f",
+        "/// requires: x == 0\n/// ensuers: ret == 99\npub fn f(x: u32) -> u32 { 5 }\n",
+    );
+    let Some(o) = typo else { return };
+    assert!(!o.is_verified(), "a typo must not verify the function without it; got: {o}");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "a dropped clause is a refusal, not a silent pass; got: {o}"
+    );
+    assert!(o.to_string().contains("ensuers"), "the refusal names the line; got: {o}");
+    assert!(o.to_string().contains("ensures"), "and suggests the keyword; got: {o}");
+
+    let measure = verify_src(
+        "g",
+        "/// invariant: i <= n\n/// variant: n - i\n/// ensures: ret == n\n\
+         pub fn g(n: u32) -> u32 { let mut i = 0u32; while i < n { i += 1; } i }\n",
+    );
+    let Some(o) = measure else { return };
+    assert!(!o.is_verified(), "an unsupported `variant:` must not pass silently; got: {o}");
+    assert!(o.to_string().contains("variant"), "the refusal names it; got: {o}");
+
+    // Prose is left alone. `direction:` is three edits from `decreases`, so it is
+    // documentation rather than a typo, and the function verifies normally.
+    let prose = verify_src(
+        "h",
+        "/// direction: a contract claiming the pre-write value would be proved.\n\
+         /// requires: x == 0\n/// ensures: ret == 5\npub fn h(x: u32) -> u32 { 5 }\n",
+    );
+    let Some(o) = prose else { return };
+    assert!(o.is_verified(), "prose with a colon is not a clause; got: {o}");
+}
+
 /// A pinned write after a symbolic one re-establishes that element, and the value
 /// must be readable -- including through an element copy.
 ///
