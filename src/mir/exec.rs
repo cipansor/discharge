@@ -1344,6 +1344,57 @@ impl Env {
             // it lands in the same store the nested read consults. A chain that is
             // not all field projections (an index, a downcast) is left to the
             // catch-all, which poisons an indexed local rather than guessing.
+            // `a[0].v = 7` -- a leaf inside an element of a whole-local array or
+            // tuple, which lowers to `(_1[_3].0: u8) = 7`. No arm above covers an
+            // index followed by fields, so the write reached no store the read
+            // consults and the literal's old leaf survived: the false `ret == 3`
+            // was **proved** against a body returning 7. The index has to be
+            // pinnable for the same reason the element arms above require it.
+            [Proj::Index(k), fields @ ..] => {
+                if let Some(chain) = field_steps(fields) {
+                    if !chain.is_empty() {
+                        self.write_elem_part(p.local, *k, &chain, v);
+                        return;
+                    }
+                }
+                self.poison_elems(p.local);
+            }
+            [Proj::IndexVar(li), fields @ ..] => {
+                let index = match self.locals.get(li) {
+                    Some(Val::Sym(x, _)) => smt::evaluate(*x, |_| None),
+                    _ => None,
+                };
+                match index.and_then(|k| field_steps(fields).filter(|c| !c.is_empty()).map(|c| (k, c))) {
+                    Some((k, chain)) => self.write_elem_part(p.local, k, &chain, v),
+                    // A symbolic subscript the run cannot pin may hit any element,
+                    // so none of their leaves can be trusted afterwards.
+                    None => self.poison_elems(p.local),
+                }
+            }
+            // `(*_1)[0].v = 7` and `((*_1)[0].0).v = 7` -- the same leaf through a
+            // `&mut [T; N]` argument. `resolve` has already collapsed the leading
+            // deref when the argument is one, so these are reached only for a
+            // reference local with no recorded target; the element and its leaf
+            // still belong to this local's store, so they go to the same key.
+            [Proj::Deref, Proj::Index(k), fields @ ..] => {
+                if let Some(chain) = field_steps(fields) {
+                    if !chain.is_empty() {
+                        self.write_elem_part(p.local, *k, &chain, v);
+                        return;
+                    }
+                }
+                self.poison_elems(p.local);
+            }
+            [Proj::Deref, Proj::IndexVar(li), fields @ ..] => {
+                let index = match self.locals.get(li) {
+                    Some(Val::Sym(x, _)) => smt::evaluate(*x, |_| None),
+                    _ => None,
+                };
+                match index.and_then(|k| field_steps(fields).filter(|c| !c.is_empty()).map(|c| (k, c))) {
+                    Some((k, chain)) => self.write_elem_part(p.local, k, &chain, v),
+                    None => self.poison_elems(p.local),
+                }
+            }
             rest => {
                 if let Some(chain) = field_chain(rest) {
                     self.forget_nested_under(p.local, &chain);
@@ -1447,6 +1498,14 @@ impl Env {
     /// live in `elems`. The read path keys on the same distinction, so the two
     /// must agree here or a write becomes invisible to the read.
     fn write_elem(&mut self, local: u32, index: u64, v: Val) {
+        // The element is replaced whole, so every leaf the old element had goes
+        // with it. Leaving one would be a stale *wrong* value: a source the
+        // rebase below cannot carry (`a[0] = other[1]`, whose parts are keyed
+        // index-first on `other`) would then keep the destination's pre-write
+        // leaf, and a contract about it could be proved against the changed array.
+        self.elem_parts.retain(|(l, k, _), _| *l != local || *k != index);
+        self.nested
+            .retain(|(l, c), _| *l != local || c.first() != Some(&(index as u32)));
         match self.indexed.get_mut(&local) {
             Some(s) => match v {
                 Val::Sym(x, _) => {
@@ -1475,6 +1534,29 @@ impl Env {
             // left stale.
             None => self.elems.retain(|(l, _), _| *l != local),
         }
+    }
+
+    /// Record a leaf *inside* an element of a whole-local array or tuple:
+    /// `a[0].v = 7`, which lowers to `(_1[_3].0: u8) = 7`.
+    ///
+    /// The read for this shape consults `elem_parts`, keyed index-first, so a write
+    /// that reached only `elems` (the element's own value) or no store at all left
+    /// the literal's old leaf in place -- a stale *wrong* value, not a missing one,
+    /// so `a[0].v = 7; a[0].v` could prove a contract about the pre-write `3`. Both
+    /// keys are written, like [`Self::rebase_elem_parts`]: `elem_parts` for the
+    /// `Index` spelling and `nested` for the `Field` spelling of a tuple component.
+    fn write_elem_part(&mut self, local: u32, index: u64, chain: &[u32], v: Val) {
+        // A leaf the write replaces makes every path *through* it stale, so those go
+        // with it: keeping one would be the same wrong value this store exists to
+        // avoid.
+        self.elem_parts
+            .retain(|(l, k, c), _| *l != local || *k != index || !c.starts_with(chain));
+        let mut prefix = Vec::with_capacity(chain.len() + 1);
+        prefix.push(index as u32);
+        prefix.extend_from_slice(chain);
+        self.nested.retain(|(l, c), _| *l != local || !c.starts_with(&prefix));
+        self.elem_parts.insert((local, index, chain.to_vec()), v);
+        self.nested.insert((local, prefix), v);
     }
 
     /// Mark every element of the array at `chain` under `local` unknown.
@@ -1516,8 +1598,45 @@ impl Env {
     /// A *whole-local* source only: a nested source's parts are already keyed by a
     /// path this cannot re-key without the same order problem, and leaving those
     /// `Unknown` is a coverage gap, never a wrong value.
+    /// A source that is itself an element of a whole-local array or tuple
+    /// (`a[0] = other[1]`) is the same re-root, one level down: `other[1]`'s leaves
+    /// are keyed index-first on `other`, and they have to move to `dest[index]`.
+    /// Without it the destination kept the leaf it had before the write -- the
+    /// stale value [`Self::write_elem`] now clears -- so the assignment was a
+    /// missing *write* rather than a missing read.
     fn rebase_elem_parts(&mut self, src: &Place, dest: u32, index: u64) -> bool {
         let src = self.resolve(src);
+        // A whole-local source, or an element of one. The latter's parts are keyed
+        // by the source's own index, which is what makes them re-keyable here.
+        if let [Proj::Index(sk)] = src.proj.as_slice() {
+            let sk = *sk;
+            let leaves: Vec<(Vec<u32>, Val)> = self
+                .elem_parts
+                .iter()
+                .filter(|((l, k, _), _)| *l == src.local && *k == sk)
+                .map(|((_, _, c), v)| (c.clone(), *v))
+                .collect();
+            let nested: Vec<(Vec<u32>, Val)> = self
+                .nested
+                .iter()
+                .filter(|((l, c), _)| *l == src.local && c.first() == Some(&(sk as u32)))
+                .map(|((_, c), v)| (c[1..].to_vec(), *v))
+                .collect();
+            let moved = !leaves.is_empty() || !nested.is_empty();
+            for (chain, v) in leaves {
+                self.elem_parts.insert((dest, index, chain.clone()), v);
+                let mut prefix = vec![index as u32];
+                prefix.extend_from_slice(&chain);
+                self.nested.insert((dest, prefix), v);
+            }
+            for (chain, v) in nested {
+                self.elem_parts.insert((dest, index, chain.clone()), v);
+                let mut prefix = vec![index as u32];
+                prefix.extend_from_slice(&chain);
+                self.nested.insert((dest, prefix), v);
+            }
+            return moved;
+        }
         if !src.proj.is_empty() {
             return false;
         }
@@ -3872,6 +3991,27 @@ where
                                 None => dropped = true,
                             }
                         }
+                        // The leaves *inside* those elements (`x.a[0].v`), keyed
+                        // index-first. Only a whole-local target is carried: this
+                        // store is keyed by an *element index* on a local that is
+                        // itself an array, and a sub-place target's array is reached
+                        // through a field path, which this store has no key for --
+                        // `elems_path` holds those elements' own values, not their
+                        // leaves. Inventing a prefixed key here would write an entry
+                        // no read consults, so the caller's leaves go instead (the
+                        // `dropped` path), which loses precision and never keeps a
+                        // stale value.
+                        for ((l, k, chain), v) in st.env.elem_parts.iter() {
+                            if *l != *cal {
+                                continue;
+                            }
+                            match &rest_chain {
+                                Some(rc) if rc.is_empty() => {
+                                    env.elem_parts.insert((cl, *k, chain.clone()), *v);
+                                }
+                                _ => dropped = true,
+                            }
+                        }
                         if dropped {
                             env.forget_parts(cl);
                         }
@@ -4004,6 +4144,19 @@ where
                                 env.fields.retain(|(l, _), _| *l != dest.local);
                                 env.nested.retain(|(l, _), _| *l != dest.local);
                                 env.elems_path.retain(|(l, _, _), _| *l != dest.local);
+                                env.elem_parts.retain(|(l, _, _), _| *l != dest.local);
+                                // The elements' own values (`_0[k]`) cross first, as
+                                // `elems` entries above; their *leaves* cross here, in
+                                // the index-first key the caller's `mk()[0].v` read
+                                // consults. A returned array of aggregates otherwise
+                                // lost every leaf and the contract stayed unreadable --
+                                // `incomplete` where the true contract should decide.
+                                for ((l, k, chain), v) in st.env.elem_parts.iter() {
+                                    if *l != 0 {
+                                        continue;
+                                    }
+                                    env.elem_parts.insert((dest.local, *k, chain.clone()), *v);
+                                }
                                 for ((l, f), v) in st.env.fields.iter() {
                                     if *l != 0 {
                                         continue;
@@ -4367,6 +4520,16 @@ where
                     for ((l0, chain, k), v) in st.env.elems_path.iter() {
                         if *l0 == sl {
                             env.elems_path.insert((l, chain.clone(), *k), *v);
+                        }
+                    }
+                    // The leaves *inside* those elements (`o.a[0].v`), keyed
+                    // index-first. A helper that reads a leaf through its argument
+                    // (`a[0].v`) otherwise saw `Unknown`; and one that wrote it had
+                    // the write die with the frame, so the caller read the leaf its
+                    // literal had before the call.
+                    for ((l0, k, chain), v) in st.env.elem_parts.iter() {
+                        if *l0 == sl {
+                            env.elem_parts.insert((l, *k, chain.clone()), *v);
                         }
                     }
                 } else if is_ref {
@@ -4964,6 +5127,11 @@ fn type_of_place(f: &MirFn, p: &Place) -> Option<Ty> {
         ty = match (pr, &ty) {
             (Proj::Field(i), Ty::Tuple(ts)) => ts.get(*i as usize)?.clone(),
             (Proj::Index(_), Ty::Array(inner, _)) => (**inner).clone(),
+            // A subscript that is a local names the same element as a constant one,
+            // so it types the same. Without this `type_of_place` refused
+            // `a[_3]`/`other[_4]` and the whole-element rebase that needs the
+            // element's type never ran.
+            (Proj::IndexVar(_), Ty::Array(inner, _)) => (**inner).clone(),
             (Proj::Deref, Ty::Ref(inner)) => (**inner).clone(),
             (Proj::Downcast(_), _) => return None,
             _ => return None,

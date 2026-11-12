@@ -3408,6 +3408,83 @@ fn an_aggregate_literal_element_carries_its_own_leaves() {
     }
 }
 
+/// A write to a leaf *inside* an element of an array or tuple of aggregates is
+/// read back, and a stale leaf cannot prove the false twin.
+///
+/// `elem_parts` is keyed index-first -- the key the read `a[0].v` consults -- so a
+/// write that reached only `elems` (the element's own value) or no store at all left
+/// the literal's old leaf in place. A stale leaf is a *wrong* value rather than a
+/// missing one, so each `..._cannot_prove_this` twin below is a false contract the
+/// old model **proved**; without them a fix that dropped the write would look green.
+/// The tuple twin exercises the mirror key, which is the only path a `t.0.v` read
+/// takes, and the second-element twin catches a fix that pinned index 0 for every
+/// leaf write.
+#[test]
+fn a_leaf_write_inside_an_element_is_read_back() {
+    let verified = [
+        "an_element_leaf_write_is_read_back",
+        "an_element_leaf_write_leaves_its_sibling",
+        "a_second_element_leaf_write_is_read_back",
+        "a_tuple_component_leaf_write_is_read_back",
+    ];
+    let refuted = [
+        "an_element_leaf_write_is_not_the_old_leaf_cannot_prove_this",
+        "an_element_leaf_write_is_not_the_sibling_cannot_prove_this",
+        "a_second_element_leaf_write_is_not_the_old_leaf_cannot_prove_this",
+        "a_tuple_component_leaf_write_is_not_the_old_leaf_cannot_prove_this",
+    ];
+    let mut names = verified.to_vec();
+    names.extend_from_slice(&refuted);
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a leaf write inside an element must reach the read; got: {o}");
+    }
+    for name in refuted {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a stale element leaf must not prove this; got: {o}"
+        );
+    }
+}
+
+/// The leaf store crosses both call boundaries: an argument and a return.
+///
+/// A helper that writes a leaf through `&mut [T; N]` had its write die with the
+/// frame, so the caller read the leaf its literal had before the call and a false
+/// `ret == 3` was **proved**. A helper that only *reads* a leaf through its argument
+/// saw `Unknown`, and a helper that *returns* an array of aggregates lost every leaf
+/// so the caller could not read one at all. Each pair pins one direction: the
+/// `..._cannot_prove_this` twins are the false contracts a dropped carry would decide.
+#[test]
+fn an_element_leaf_store_crosses_a_call_boundary() {
+    let verified = [
+        "a_helper_leaf_write_through_a_mutable_array_is_read_back",
+        "a_helper_leaf_read_through_an_array_argument_decides",
+        "a_returned_array_of_aggregates_keeps_its_leaves",
+    ];
+    let refuted = [
+        "a_helper_leaf_write_is_not_the_callers_leaf_cannot_prove_this",
+        "a_helper_leaf_read_is_not_a_made_up_value_cannot_prove_this",
+        "a_returned_array_of_aggregates_is_not_a_made_up_value_cannot_prove_this",
+    ];
+    let mut names = verified.to_vec();
+    names.extend_from_slice(&refuted);
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a leaf must cross the call boundary; got: {o}");
+    }
+    for name in refuted {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a dropped or stale leaf carry must not prove this; got: {o}"
+        );
+    }
+}
+
 /// A whole-aggregate replacement through a sub-place target decides.
 ///
 /// `set_whole(&mut o.i, InnerBox { v: 9 })` replaces the whole referent. This was once

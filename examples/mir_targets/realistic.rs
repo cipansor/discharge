@@ -8431,3 +8431,163 @@ pub fn an_element_write_of_an_aggregate_is_not_the_old_leaf_cannot_prove_this() 
     b[0] = ElemInner { v: 7 };
     b[0].v
 }
+
+// ---------------------------------------------------------------------------
+// Writes to a leaf *inside* an element of an array or tuple of aggregates, and
+// the two call boundaries that used to drop the store.
+//
+// `elem_parts` is keyed index-first, which is what the read `a[0].v` consults. A
+// write that reached only `elems` -- the element's own value -- or no store at all
+// left the literal's old leaf in place, and a stale leaf is a *wrong* value, not a
+// missing one: `a[0].v = 7; a[0].v` could **prove** `ret == 3`. The `_cannot_prove_this`
+// twins below are what pin that; without them a fix that dropped the write would
+// look green.
+// ---------------------------------------------------------------------------
+
+/// A leaf write inside an element, then the leaf read back.
+/// requires: true
+/// ensures: ret == 7
+pub fn an_element_leaf_write_is_read_back() -> u8 {
+    let mut a = [ElemInner { v: 3 }];
+    a[0].v = 7;
+    a[0].v
+}
+
+/// The false direction: the pre-write leaf is `3`, so a write that never reached
+/// the leaf store would decide this wrongly.
+/// requires: true
+/// ensures: ret == 3
+pub fn an_element_leaf_write_is_not_the_old_leaf_cannot_prove_this() -> u8 {
+    let mut a = [ElemInner { v: 3 }];
+    a[0].v = 7;
+    a[0].v
+}
+
+/// The leaf write must not touch its *sibling* element.
+/// requires: true
+/// ensures: ret == 4
+pub fn an_element_leaf_write_leaves_its_sibling() -> u8 {
+    let mut a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
+    a[0].v = 7;
+    a[1].v
+}
+
+/// The false direction of the sibling check.
+/// requires: true
+/// ensures: ret == 7
+pub fn an_element_leaf_write_is_not_the_sibling_cannot_prove_this() -> u8 {
+    let mut a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
+    a[0].v = 7;
+    a[1].v
+}
+
+/// The *second* element's leaf, so a fix that pinned index 0 for every leaf write
+/// is caught.
+/// requires: true
+/// ensures: ret == 9
+pub fn a_second_element_leaf_write_is_read_back() -> u8 {
+    let mut a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
+    a[1].v = 9;
+    a[1].v
+}
+
+/// The false direction of the second element's leaf write.
+/// requires: true
+/// ensures: ret == 4
+pub fn a_second_element_leaf_write_is_not_the_old_leaf_cannot_prove_this() -> u8 {
+    let mut a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
+    a[1].v = 9;
+    a[1].v
+}
+
+/// The tuple spelling of the same leaf write: `t.0.v = 7` reads through a field
+/// chain, so it exercises the mirror key rather than the index-first one.
+/// requires: true
+/// ensures: ret == 7
+pub fn a_tuple_component_leaf_write_is_read_back() -> u8 {
+    let mut t = (ElemInner { v: 3 }, ElemInner { v: 4 });
+    t.0.v = 7;
+    t.0.v
+}
+
+/// The false direction of the tuple component's leaf write.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_tuple_component_leaf_write_is_not_the_old_leaf_cannot_prove_this() -> u8 {
+    let mut t = (ElemInner { v: 3 }, ElemInner { v: 4 });
+    t.0.v = 7;
+    t.0.v
+}
+
+/// A helper that writes a leaf through `&mut [ElemInner; 1]`: the write has to
+/// cross back to the caller, and the caller's pre-call leaf must not survive it.
+/// requires: true
+/// ensures: ret == 7
+pub fn a_helper_leaf_write_through_a_mutable_array_is_read_back() -> u8 {
+    let mut a = [ElemInner { v: 3 }];
+    write_first_leaf(&mut a, 7);
+    a[0].v
+}
+
+/// The false direction of the helper's leaf write: the caller's own leaf is `3`,
+/// so a call boundary that dropped the write would decide this wrongly.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_helper_leaf_write_is_not_the_callers_leaf_cannot_prove_this() -> u8 {
+    let mut a = [ElemInner { v: 3 }];
+    write_first_leaf(&mut a, 7);
+    a[0].v
+}
+
+/// Writes the first element's leaf through a mutable array argument.
+/// requires: true
+/// ensures: true
+pub fn write_first_leaf(a: &mut [ElemInner; 1], v: u8) {
+    a[0].v = v;
+}
+
+/// A helper that only *reads* a leaf through its argument: the caller's leaf has
+/// to cross *into* the callee, or the helper's contract is unreadable.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_helper_leaf_read_through_an_array_argument_decides() -> u8 {
+    let a = [ElemInner { v: 3 }];
+    read_first_leaf(&a)
+}
+
+/// The false direction of the helper's leaf read.
+/// requires: true
+/// ensures: ret == 9
+pub fn a_helper_leaf_read_is_not_a_made_up_value_cannot_prove_this() -> u8 {
+    let a = [ElemInner { v: 3 }];
+    read_first_leaf(&a)
+}
+
+/// Reads the first element's leaf through an array argument.
+/// requires: true
+/// ensures: ret == a[0].v
+pub fn read_first_leaf(a: &[ElemInner; 1]) -> u8 {
+    a[0].v
+}
+
+/// A helper that *returns* an array of aggregates: the element's leaves have to
+/// cross the return boundary with it, or the caller cannot read them at all.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_returned_array_of_aggregates_keeps_its_leaves() -> u8 {
+    make_one(3)[0].v
+}
+
+/// The false direction of the returned array's leaf.
+/// requires: true
+/// ensures: ret == 9
+pub fn a_returned_array_of_aggregates_is_not_a_made_up_value_cannot_prove_this() -> u8 {
+    make_one(3)[0].v
+}
+
+/// Builds a one-element array of aggregates from a value.
+/// requires: true
+/// ensures: ret[0].v == x
+pub fn make_one(x: u8) -> [ElemInner; 1] {
+    [ElemInner { v: x }]
+}

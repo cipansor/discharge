@@ -3602,7 +3602,25 @@ optional file argument, which is what made the measurement cheap.)
   `an_array_literal_of_aggregates_is_read_back` / `..._second_element_...` /
   `..._aggregate_fields_...` / `a_tuple_literal_of_aggregates_...` /
   `an_element_write_of_an_aggregate_...` and their `_cannot_prove_this` twins, asserted in
-  `an_aggregate_literal_element_carries_its_own_leaves`. And an *array whose type is
+  `an_aggregate_literal_element_carries_its_own_leaves`.
+  A *write* to a leaf inside such an element (`a[0].v = 7`, which lowers to
+  `(_1[_3].0: u8) = 7` -- an index then a field, `set`'s arms covered neither) is
+  `write_elem_part`: it drops the leaves the write replaces, writes both keys, and
+  poisons a subscript the run cannot pin. `write_elem` clears the element's old leaves
+  first, so a whole-element write whose source cannot be re-rooted (`a[0] = other[1]`,
+  which `rebase_elem_parts` now also carries) leaves them unknown rather than stale.
+  The store then crosses both call boundaries: the argument transfer and the reference
+  copy-back carry it (whole-local targets only -- a sub-place target's array is reached
+  through a field path this store has no key for, so its caller leaves are dropped, not
+  prefixed), and the return merge re-keys the callee's `_0` leaves onto the caller's
+  destination. Each of those was a *false proof*: the stale leaf decided a contract about
+  the pre-write value. Pinned by
+  `an_element_leaf_write_is_read_back` / `..._leaves_its_sibling` /
+  `a_second_element_leaf_write_...` / `a_tuple_component_leaf_write_...` and
+  `a_helper_leaf_write_through_a_mutable_array_...` / `a_helper_leaf_read_...` /
+  `a_returned_array_of_aggregates_...` with their `_cannot_prove_this` twins, asserted in
+  `a_leaf_write_inside_an_element_is_read_back` and
+  `an_element_leaf_store_crosses_a_call_boundary`. And an *array whose type is
   a field* (`o.a[0]`) is skipped, since the `indexed` store is keyed by local only (see the note
   below).
   Two notes on what this did *not* need. The nested literal always reaches the
