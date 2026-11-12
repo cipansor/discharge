@@ -37,7 +37,7 @@ cd "$(dirname "$0")/../.."
 TARGET=thumbv7em-none-eabihf
 
 # Resolve the qualified `rustc`. `FERROCENE_RUSTC` wins, the same shape as
-# `DISCHARGE_RUSTC` for the MIR frontend and `COQC_BIN` for the Coq oracle.
+# `VERIF_RUSTC` for the MIR frontend and `COQC_BIN` for the Coq oracle.
 RUSTC_BIN="${FERROCENE_RUSTC:-}"
 if [ -z "$RUSTC_BIN" ] && command -v criticalup >/dev/null 2>&1; then
   # CriticalUp discovers `criticalup.toml` by scanning the working directory and then its
@@ -64,11 +64,11 @@ fi
 # The parent is built without `std`, the arithmetic sibling has no features at all, so both
 # builds are the bare-metal ones a flight computer would link.
 RUSTC="$RUSTC_BIN" cargo build -q --no-default-features --target "$TARGET" || {
-  echo "ferrocene: build of discharge for $TARGET failed" >&2
+  echo "ferrocene: build of verif for $TARGET failed" >&2
   exit 1
 }
-RUSTC="$RUSTC_BIN" cargo build -q -p discharge-arithmetic --target "$TARGET" || {
-  echo "ferrocene: build of discharge-arithmetic for $TARGET failed" >&2
+RUSTC="$RUSTC_BIN" cargo build -q -p verif-arithmetic --target "$TARGET" || {
+  echo "ferrocene: build of verif-arithmetic for $TARGET failed" >&2
   exit 1
 }
 # The example is the part that matters most: it is `#![no_std]` and it *calls the
@@ -80,4 +80,4 @@ RUSTC="$RUSTC_BIN" cargo build -q --no-default-features --target "$TARGET" --exa
   exit 1
 }
 
-echo "ferrocene: built discharge, discharge-arithmetic and examples/bare_metal.rs for $TARGET with $version"
+echo "ferrocene: built verif, verif-arithmetic and examples/bare_metal.rs for $TARGET with $version"

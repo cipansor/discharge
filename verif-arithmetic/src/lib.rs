@@ -1,4 +1,4 @@
-//! # discharge-arithmetic — proved integer primitives for safety-critical Rust
+//! # verif-arithmetic — proved integer primitives for safety-critical Rust
 //!
 //! The "library half" of the SPARK story: the arithmetic a flight-control or
 //! motor-control loop reaches for, with the property that makes each one safe
@@ -31,7 +31,7 @@
 //!
 //! ## The symbolic oracle lives in the parent crate
 //!
-//! [`discharge`](https://github.com/cipansor/discharge) — the parent crate —
+//! [`verif`](https://github.com/cipansor/verif) — the parent crate —
 //! depends on this one, keeps its own bit-blasting `smt` engine, and states the
 //! **same** obligations symbolically at widths 8, 16 and 32. `tests/oracle.rs`
 //! in the parent then cross-checks the two: the enumeration and the symbolic
@@ -44,7 +44,7 @@
 //! A dependency that can lie to you is not a proof; a second opinion is.
 //!
 //! ```
-//! use discharge_arithmetic::{checked_add, prove};
+//! use verif_arithmetic::{checked_add, prove};
 //!
 //! // The runtime behaviour...
 //! assert_eq!(checked_add(200, 55), Some(255));

@@ -116,7 +116,7 @@ fn main() {
     let tally = tally_identities(&cases, "kanidiff");
     let proved_by_engine = cases.iter().filter(|c| c.ours.is_proved()).count();
 
-    let dir: PathBuf = std::env::temp_dir().join("discharge_kanidiff");
+    let dir: PathBuf = std::env::temp_dir().join("verif_kanidiff");
     let _ = fs::remove_dir_all(&dir);
     if let Err(e) = write_crate(&dir, &cases) {
         eprintln!("kanidiff: could not write the case crate at {}: {e}", dir.display());

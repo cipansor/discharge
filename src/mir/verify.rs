@@ -49,13 +49,13 @@ pub enum MirSource {
 /// 1.85). The error is returned rather than papered over, because "the frontend
 /// could not run" and "the code is wrong" must never be reported the same way.
 ///
-/// The compiler is taken from `DISCHARGE_RUSTC` when set, and otherwise from
+/// The compiler is taken from `VERIF_RUSTC` when set, and otherwise from
 /// `rustc` on `PATH`. The dedicated variable exists so that pointing this tool at
 /// a *different* compiler -- a nightly, or the rustc_public oracle's toolchain --
 /// does not disturb the `rustc` that cargo is using to build the test suite;
 /// setting `RUSTC` would do exactly that.
 pub fn emit_mir(file: &Path) -> Result<String, String> {
-    let rustc = std::env::var("DISCHARGE_RUSTC").unwrap_or_else(|_| "rustc".into());
+    let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
     emit_mir_with(&rustc, file)
 }
 
@@ -74,7 +74,7 @@ pub fn emit_mir_with(rustc: &str, file: &Path) -> Result<String, String> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let out_path = std::env::temp_dir().join(format!(
-        "discharge-mir-{}-{}-{}.mir",
+        "verif-mir-{}-{}-{}.mir",
         std::process::id(),
         seq,
         file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
@@ -600,7 +600,7 @@ impl FileReport {
 /// contract test wants: verifying the whole file on every call would be slow and
 /// would report unrelated functions.
 pub fn verify_file(source: &Path, only: &[String]) -> Result<FileReport, String> {
-    let rustc = std::env::var("DISCHARGE_RUSTC").unwrap_or_else(|_| "rustc".into());
+    let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
     verify_file_with(&rustc, source, only)
 }
 

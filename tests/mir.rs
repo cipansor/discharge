@@ -3,11 +3,11 @@
 //! Run with a nightly compiler available:
 //!
 //! ```text
-//! DISCHARGE_RUSTC=$(rustup which --toolchain nightly rustc) \
+//! VERIF_RUSTC=$(rustup which --toolchain nightly rustc) \
 //!   cargo test --features std --test mir
 //! ```
 //!
-//! The tests that need `rustc` skip themselves when `DISCHARGE_RUSTC` is unset,
+//! The tests that need `rustc` skip themselves when `VERIF_RUSTC` is unset,
 //! because `--emit=mir` needs nightly and failing on a stable toolchain would say
 //! "the code is wrong" when the truth is "the tool could not run".
 //!
@@ -27,8 +27,8 @@
 //! tests, because the IR is crate-internal. This file covers the public surface:
 //! the contract scanner, contract evaluation, and the end-to-end verdicts.
 
-use discharge::mir::spec;
-use discharge::mir::verify::{self, FnOutcome};
+use verif::mir::spec;
+use verif::mir::verify::{self, FnOutcome};
 
 // The functions under verification, compiled from the exact file the frontend
 // reads. `#[path]` rather than a copy means the test and the verifier can never
@@ -41,7 +41,7 @@ const TARGET: &str = "examples/mir_targets/actuator.rs";
 
 /// The nightly compiler, or `None` so the test can skip.
 fn rustc() -> Option<String> {
-    std::env::var("DISCHARGE_RUSTC").ok().filter(|s| !s.is_empty())
+    std::env::var("VERIF_RUSTC").ok().filter(|s| !s.is_empty())
 }
 
 fn verify_all() -> Option<verify::FileReport> {
@@ -148,7 +148,7 @@ fn scanner_finds_a_pub_crate_fn() {
 
 #[test]
 fn contract_expressions_evaluate() {
-    use discharge::smt;
+    use verif::smt;
     smt::with_fresh(|| {
         let mut args = std::collections::BTreeMap::new();
         args.insert("b".to_string(), smt::var_named(2, 32));
@@ -160,7 +160,7 @@ fn contract_expressions_evaluate() {
 
 #[test]
 fn a_contradictory_contract_is_refused_or_vacuous() {
-    use discharge::smt;
+    use verif::smt;
     smt::with_fresh(|| {
         let mut args = std::collections::BTreeMap::new();
         args.insert("b".to_string(), smt::var_named(2, 32));
@@ -173,7 +173,7 @@ fn a_contradictory_contract_is_refused_or_vacuous() {
 
 #[test]
 fn refuses_a_contract_it_cannot_read() {
-    use discharge::smt;
+    use verif::smt;
     smt::with_fresh(|| {
         let args = std::collections::BTreeMap::new();
         // A function call is not in the grammar, so it must be refused rather
@@ -202,7 +202,7 @@ fn refuses_a_contract_it_cannot_read() {
 /// length, `ret` for the narrow return: the literal must end up 8 bits wide.
 #[test]
 fn a_literal_is_sized_from_the_operand_it_meets() {
-    use discharge::smt;
+    use verif::smt;
     smt::with_fresh(|| {
         let mut args = std::collections::BTreeMap::new();
         // A 64-bit "length", in scope but not mentioned by the contract.
@@ -235,7 +235,7 @@ fn a_literal_is_sized_from_the_operand_it_meets() {
 /// actionable.
 #[test]
 fn a_literal_that_does_not_fit_is_refused_not_truncated() {
-    use discharge::smt;
+    use verif::smt;
     smt::with_fresh(|| {
         let mut args = std::collections::BTreeMap::new();
         args.insert("a".to_string(), smt::var(8));
@@ -259,7 +259,7 @@ fn a_literal_that_does_not_fit_is_refused_not_truncated() {
 /// The message must say *that*, so the reader knows to name a component.
 #[test]
 fn a_bare_ret_on_an_aggregate_names_the_aggregate_reason() {
-    use discharge::smt;
+    use verif::smt;
     smt::with_fresh(|| {
         let args = std::collections::BTreeMap::new();
         let err = spec::eval_ensures(
@@ -287,7 +287,7 @@ fn a_bare_ret_on_an_aggregate_names_the_aggregate_reason() {
 /// not exist. The two causes have to be two messages.
 #[test]
 fn a_bare_ret_with_an_unknown_value_names_the_unknown_reason() {
-    use discharge::smt;
+    use verif::smt;
     smt::with_fresh(|| {
         let args = std::collections::BTreeMap::new();
         let err = spec::eval_ensures(
@@ -330,7 +330,7 @@ fn a_literal_in_arithmetic_is_sized_to_its_operand() {
 /// contract's other operands.
 #[test]
 fn a_named_type_bound_keeps_its_own_width() {
-    use discharge::smt;
+    use verif::smt;
     smt::with_fresh(|| {
         let mut args = std::collections::BTreeMap::new();
         args.insert("a".to_string(), smt::var(8));
@@ -354,7 +354,7 @@ fn a_named_type_bound_keeps_its_own_width() {
 /// positive number and the comparison would mean something else entirely.
 #[test]
 fn a_negative_literal_is_sign_extended_to_the_operand() {
-    use discharge::smt;
+    use verif::smt;
     smt::with_fresh(|| {
         let mut args = std::collections::BTreeMap::new();
         args.insert("a".to_string(), smt::var(8));
@@ -872,7 +872,7 @@ fn a_scoped_debug_alias_does_not_rename_a_parameter() {
 #[test]
 fn an_unreadable_ensures_is_reported_not_ignored() {
     let Some(rustc) = rustc() else { return };
-    let dir = std::env::temp_dir().join("discharge_unreadable_ensures");
+    let dir = std::env::temp_dir().join("verif_unreadable_ensures");
     let _ = std::fs::create_dir_all(&dir);
     let src = dir.join("u.rs");
     std::fs::write(
@@ -4166,7 +4166,7 @@ fn a_reference_component_the_contract_does_not_name_does_not_skip_the_function()
 #[test]
 fn a_contract_naming_an_unknown_field_is_refused() {
     let mut args = std::collections::BTreeMap::new();
-    args.insert("c".to_string(), discharge::smt::var(8));
+    args.insert("c".to_string(), verif::smt::var(8));
     // `c` is a known aggregate with no bindings, so the refusal names the field.
     let mut env = spec::FieldEnv::default();
     env.declare_arg("c");
@@ -4187,7 +4187,7 @@ fn a_contract_naming_an_unknown_field_is_refused() {
 #[test]
 fn the_field_rewrite_does_not_fire_inside_a_longer_name() {
     let mut fields = spec::FieldEnv::default();
-    let c = discharge::smt::var(8);
+    let c = verif::smt::var(8);
     fields.bind_bits(1, "c", "lo", 0, 8, false).unwrap();
     let mut args = std::collections::BTreeMap::new();
     args.insert("myc".to_string(), c);
@@ -4273,8 +4273,8 @@ fn a_contract_naming_a_different_symbolic_index_is_refused() {
 /// is the kind of thing a later refactor silently drops.
 #[test]
 fn a_contract_error_quotes_the_source_text() {
-    use discharge::mir::spec;
-    use discharge::smt;
+    use verif::mir::spec;
+    use verif::smt;
     let mut fields = spec::FieldEnv::default();
     let mut args = std::collections::BTreeMap::new();
     // Bind `a[i]` as a symbolic subscript, so the rewrite fires. `i` is an
@@ -4549,7 +4549,7 @@ fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir()
-        .join(format!("discharge-{name}-{}-{seq}", std::process::id()));
+        .join(format!("verif-{name}-{}-{seq}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("probe.rs");
     std::fs::write(&file, src).expect("write probe");
@@ -4733,10 +4733,10 @@ pub fn reassigned_then_field(mut c: B, d: B) -> u8 {
 /// pins the function after the struct as still present and still decided.
 ///
 /// The `None` case is a *skip*, not a failure, like every other `rustc`-dependent
-/// test in this file: `verify_src` returns `None` when no `DISCHARGE_RUSTC` is
+/// test in this file: `verify_src` returns `None` when no `VERIF_RUSTC` is
 /// named, and there is nothing to assert about a compiler that is not there. This
 /// one used to `panic!` on `None`, which made the whole suite fail on a machine
-/// with no `DISCHARGE_RUSTC` -- the one test in the file that read "no compiler"
+/// with no `VERIF_RUSTC` -- the one test in the file that read "no compiler"
 /// as "a bug", so the suite's verdict depended on the environment rather than on
 /// the code. It is a skip now, and the reason is worth keeping: the property is
 /// real and worth pinning, but a missing toolchain is not evidence against it.
@@ -4808,7 +4808,7 @@ pub fn chain_must_be_read(a: [u8; 4], i: usize) -> u8 {
 }
 "#;
     let Some(rustc) = rustc() else { return };
-    let dir = std::env::temp_dir().join(format!("discharge-chain-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("verif-chain-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("chain.rs");
     std::fs::write(&file, src).expect("write probe");
@@ -7261,7 +7261,7 @@ fn a_cfg_excluded_contract_does_not_steal_a_compiled_body() {
     let src = "pub mod a {\n    /// ensures: ret == 1\n    pub fn f() -> u8 { 1 }\n}\n\
                pub mod b {\n    pub mod a {\n        /// ensures: ret == 1\n        #[cfg(any())]\n        pub fn f() -> u8 { 2 }\n    }\n}\n";
     let rustc = rustc().expect("rustc");
-    let dir = std::env::temp_dir().join(format!("discharge-cfg-steal-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("verif-cfg-steal-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("probe.rs");
     std::fs::write(&file, src).expect("write probe");
@@ -7636,7 +7636,7 @@ fn a_branching_const_does_not_fold_to_its_first_arm() {
 /// error to report, not a crash here.
 #[test]
 fn an_unclosed_block_comment_after_const_is_not_a_panic() {
-    use discharge::mir::spec;
+    use verif::mir::spec;
     for src in [
         "fn f<const /*",
         "fn f<const /*x",

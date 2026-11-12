@@ -2,7 +2,7 @@
 //!
 //! The runtime half — [`safe_add`], [`safe_sub`], [`safe_mul`], [`safe_div`],
 //! [`safe_rem`], and the refinement-typed [`Bounded`] — now lives in the
-//! standalone `discharge-arithmetic` crate, which proves its own properties by
+//! standalone `verif-arithmetic` crate, which proves its own properties by
 //! exhaustive enumeration without the `smt` engine. Those items are re-exported
 //! here unchanged.
 //!
@@ -13,7 +13,7 @@
 use crate::smt::{self, Verdict};
 
 // The runtime primitives, unchanged, now owned by the standalone crate.
-pub use discharge_arithmetic::bounded::{
+pub use verif_arithmetic::bounded::{
     safe_add, safe_div, safe_mul, safe_rem, safe_sub, Bounded,
 };
 

@@ -10,10 +10,10 @@
 //! Every loop is also executed on a real array, so the verified property is
 //! compared against what the code actually does.
 
-use discharge::mem::{declare, Mem, MAX_CELLS};
-use discharge::quant;
-use discharge::smt::{self, var, Var, Verdict};
-use discharge::wp::{self, Stmt};
+use verif::mem::{declare, Mem, MAX_CELLS};
+use verif::quant;
+use verif::smt::{self, var, Var, Verdict};
+use verif::wp::{self, Stmt};
 
 /// A 4-cell, 8-bit memory over a caller-owned buffer.
 fn mem4<'a>(buf: &'a mut [Var; 4]) -> Mem<'a> {
@@ -113,7 +113,7 @@ fn forall_below_is_strong_enough_to_verify_a_fill_loop() {
             "the fill loop should verify: {:?}",
             report.first_failure()
         );
-        assert!(report.has_termination_proof());
+        assert!(report.terminates());
     });
 
     // Execution: the same loop on a real array, from dirty contents.

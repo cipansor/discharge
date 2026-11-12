@@ -6,11 +6,11 @@
 //! compared against the `smt::word` form it is defined as, and the `Var op Var` operators
 //! are checked against the algebraic law they should satisfy.
 
-use discharge::smt::{self, var, Var, Verdict};
-use discharge::sym::*;
+use verif::smt::{self, var, Var, Verdict};
+use verif::sym::*;
 
 /// `lhs` and `rhs` are equivalent for every input.
-fn equiv(lhs: discharge::smt::Pred, rhs: discharge::smt::Pred) {
+fn equiv(lhs: verif::smt::Pred, rhs: verif::smt::Pred) {
     assert_eq!(
         smt::prove_equiv(lhs, rhs),
         Verdict::Valid,

@@ -25,7 +25,7 @@ verifier:
 | `clamp` | Branch coverage: all three arms must be proved, not the one a test ran. |
 | `sum_to` | A loop. Deciding it needs an **induction hypothesis**, not unwinding to a fixed depth. |
 
-`target.rs` is the Rust source, with `discharge` contracts as doc comments.
+`target.rs` is the Rust source, with `verif` contracts as doc comments.
 Every other file is the same three functions written the way that tool wants
 them.
 
@@ -40,7 +40,7 @@ there as controls, not as competitors.
 | --- | --- | --- | --- | --- | --- | --- |
 | plain `rustc` | no verification | — | no (release build returns `0`) | no | no | — |
 | Ferrocene | **qualified** compiler (TÜV SÜD) | not applicable — a compiler, not a verifier | no | no | no | — |
-| `discharge` | in-crate decision procedure | 3/3 | yes, concrete witness | yes, invariant not preserved | yes, concrete witness | doc comments in the same file |
+| `verif` | in-crate decision procedure | 3/3 | yes, concrete witness | yes, invariant not preserved | yes, concrete witness | doc comments in the same file |
 | Kani 0.68.0 | bounded model check (CBMC) | 3/3 | yes | yes (with `unwind(10)`) | yes | a separate `#[cfg(kani)]` harness module |
 | Verus | SMT (Z3), deductive | 4 verified | yes | yes | yes | `requires`/`ensures`/`decreases` attributes |
 | Prusti 0.2.2 | SMT (Viper), deductive | 3/3 | yes | yes | yes | `#[requires]`/`#[ensures]` + `body_invariant!` |
@@ -86,8 +86,8 @@ sed 's/if a > u16::MAX - b { u16::MAX } else { a + b }/u16::MAX/' kani.rs > /tmp
 ```
 
 Measured: with the bounds-only contract, the degenerate `sat_add` passed Kani
-and `discharge`; with the full contract, Kani reports `verify_sat_add` FAILED
-and `discharge` reports `postcondition — v1:u16 = 0, v2:u16 = 0`. The same holds
+and `verif`; with the full contract, Kani reports `verify_sat_add` FAILED
+and `verif` reports `postcondition — v1:u16 = 0, v2:u16 = 0`. The same holds
 for `clamp` (`always return lo` is refused with a concrete witness).
 
 This is why the table above has a third bug column. A comparison that only shows
@@ -106,7 +106,7 @@ recalled.
 
 | Tool | Total lines | Spec or proof lines | Notes |
 | --- | --- | --- | --- |
-| `discharge` | 55 | 12 contract lines | one doc comment per obligation, next to the code |
+| `verif` | 55 | 12 contract lines | one doc comment per obligation, next to the code |
 | Kani | 56 | 45 harness lines | the harness restates every signature; nothing keeps it in sync with the function |
 | Verus | 51 | 12 spec lines | plus `decreases` on every loop |
 | Prusti | 34 | 12 spec lines | plus `body_invariant!` on every loop |
@@ -117,7 +117,7 @@ recalled.
 The rule behind each "spec or proof" figure, all run from this directory:
 
 ```console
-grep -cE '^/// (requires|ensures|invariant|decreases):' target.rs   # discharge: 12
+grep -cE '^/// (requires|ensures|invariant|decreases):' target.rs   # verif: 12
 awk '/^#\[cfg\(kani\)\]/{f=1} f' kani.rs | grep -c .                # Kani: 45
 grep -cE '^\s*(requires|ensures|invariant|decreases)\b|==>' verus.rs # Verus: 12
 grep -cE '#\[(requires|ensures)|body_invariant!' prusti.rs          # Prusti: 12
@@ -127,13 +127,13 @@ awk '/:= by/{f=1} f' lean/example.lean | grep -c .                  # Lean: 20
 ```
 
 Two things the earlier version of this table got wrong, both now fixed. It
-reported `14` contract lines for `discharge` by counting *every* `///` line in
+reported `14` contract lines for `verif` by counting *every* `///` line in
 `target.rs`, which includes the four prose doc lines above the functions; the
 contract clauses are 12, and that is the figure comparable to the other rows.
 And the totals were stale: they predate the contracts being strengthened from
 bounds to full specifications (see below), which added clauses to every tool.
 
-The `discharge` contract count is the honest comparison point for "verification
+The `verif` contract count is the honest comparison point for "verification
 in the code": 12 clauses, in the same file, immediately above the function they
 constrain. Kani needs a harness that duplicates the signature; Coq and Lean
 need a model and a proof, both in another file.
@@ -165,7 +165,7 @@ checks it against the code. The model now lives in `coq/model.v` /
 fixtures — so the teeth cannot drift from the model they are testing, which is
 the same failure one level down.
 
-`discharge` has no model to drift, because its frontend reads the **MIR that
+`verif` has no model to drift, because its frontend reads the **MIR that
 `rustc` actually emitted** for the function. There is no transcription step, so
 there is no transcription to get wrong. The obligations are about the machine's
 wrapping `u16` add because that is what the MIR contains.
@@ -173,7 +173,7 @@ wrapping `u16` add because that is what the MIR contains.
 This is the real reason "verification that lives in the code" is a different
 thing from "verification of a model of the code". It is not about taste.
 
-## What `discharge` is better at, and what it is not
+## What `verif` is better at, and what it is not
 
 Better here:
 
@@ -187,12 +187,12 @@ Better here:
   artifact. The comparison tools are all host-side binaries you install,
   configure, and trust; `gnatprove` alone pulls in CVC5, Alt-Ergo, Why3 and a
   bundled Z3.
-- **Speed.** `discharge` decided all three functions in about 0.01 s. Kani and
+- **Speed.** `verif` decided all three functions in about 0.01 s. Kani and
   Prusti take seconds to minutes, dominated by CBMC and by JVM/Viper startup.
 
 Not better, and worth saying plainly:
 
-- **No interactive proof.** `discharge` is a decision procedure over bit-vector
+- **No interactive proof.** `verif` is a decision procedure over bit-vector
   arithmetic plus a bounded Hoare logic. You cannot state a property that needs
   induction over an unbounded domain, or a higher-order lemma. Coq and Lean can.
   When the BDD arena fills, the engine says `Unknown` rather than guessing — the
@@ -204,7 +204,7 @@ Not better, and worth saying plainly:
 - **Pointers, aliasing and concurrency are out of scope**, as the main README
   states. `mem` models a bounded array by integer index.
 
-The honest summary: `discharge` removes the *transcription* risk and the
+The honest summary: `verif` removes the *transcription* risk and the
 *external-toolchain* cost that the other approaches carry, and it does so in
 `no_std` code that ships inside the artifact. It does not remove the need for
 qualification, and it does not replace an interactive prover when the property
@@ -219,14 +219,14 @@ ASIL D, IEC 61508 SIL 3 (with support for customer certification toward SIL 4),
 and IEC 62304 Class C, with a certified subset of the core library — and what it
 qualifies is the **compiler**, not the program.
 
-That distinction is the whole point of listing it. `discharge` and Ferrocene are
+That distinction is the whole point of listing it. `verif` and Ferrocene are
 not competitors; they are the two halves of what a certified Rust safety case
 needs:
 
 - Ferrocene answers *"can I trust the toolchain that produced this binary?"*
   A qualified compiler removes the need to qualify the compiler yourself, which
   is otherwise an enormous cost in any regulated project.
-- `discharge` answers *"is the program's logic correct?"* Ferrocene does not
+- `verif` answers *"is the program's logic correct?"* Ferrocene does not
   answer that at all. Compile the swapped-branch `sat_add` with Ferrocene and it
   builds cleanly: Ferrocene is a downstream of `rustc`, and a release profile
   turns off the overflow check that would catch it, so the function returns `0`
@@ -234,7 +234,7 @@ needs:
   qualified compiler for a correct language subset still compiles a logic bug
   faithfully.
 
-So the honest reading of the table is that Ferrocene and `discharge` are
+So the honest reading of the table is that Ferrocene and `verif` are
 complementary, and the repository already treats them that way: `tools/ferrocene/`
 is gate 3 in `scripts/gate.sh`, and it checks that the qualified compiler accepts
 the same `no_std` sources for `thumbv7em-none-eabihf` — including
@@ -244,8 +244,8 @@ the same `no_std` sources for `thumbv7em-none-eabihf` — including
 Two things worth stating plainly, because they are the traps in this area:
 
 1. **A qualified compiler is not a qualified verifier.** Building with Ferrocene
-   confers no qualification on `discharge`'s engine, which is outside Ferrocene's
-   qualification scope. `discharge`'s own README says it has no qualification
+   confers no qualification on `verif`'s engine, which is outside Ferrocene's
+   qualification scope. `verif`'s own README says it has no qualification
    evidence; that stays true after a green Ferrocene build.
 2. **Ferrocene cannot be installed programmatically.** Its release archives
    require authentication through the customer portal, so `tools/ferrocene/run.sh`
@@ -255,9 +255,9 @@ Two things worth stating plainly, because they are the traps in this area:
    Ferrocene is absent, which is why its row carries no verification result.
 
 The comparison that matters for the "verification in the code" idea is still the
-one between `discharge` and the five verifiers above it. Ferrocene is on the
+one between `verif` and the five verifiers above it. Ferrocene is on the
 page because leaving it out would let a reader think qualification was
-unaddressed, and because the honest story is that `discharge` supplies the
+unaddressed, and because the honest story is that `verif` supplies the
 *logic* half that Ferrocene deliberately does not.
 
 ## The bug files
@@ -268,8 +268,8 @@ be shown to **refuse** a false claim rather than only to agree with true ones:
 - `bugs/target.rs`, `bugs/kani.rs`, `bugs/verus.rs`, `bugs/prusti.rs` — the
   swapped-branch `sat_add`, the wrong-arm `clamp`, and the wrong-body `sum_to`,
   per Rust tool.
-- `bugs/loop.rs` — the wrong loop body alone, for `discharge`.
-- `bugs/clamp.rs` — the wrong clamp arm alone, for `discharge`.
+- `bugs/loop.rs` — the wrong loop body alone, for `verif`.
+- `bugs/clamp.rs` — the wrong clamp arm alone, for `verif`.
 - `bugs/coq/teeth_sat_add.v` and `bugs/coq/teeth_sum_to.v` — **one false theorem
   per file**, each importing the same `coq/model.v` that proves the correct
   versions, so the difference is the code and not the encoding.
@@ -279,7 +279,7 @@ be shown to **refuse** a false claim rather than only to agree with true ones:
 
 Every one of the seven tools caught every defect. The specific evidence:
 
-- `discharge`: `panic: attempt to compute ... which would overflow — v1:u16 = 327…`
+- `verif`: `panic: attempt to compute ... which would overflow — v1:u16 = 327…`
   for the swap, `loop invariant preserved` for the loop, `postcondition` for the
   clamp arm.
 - Kani: three harnesses `Status: FAILURE` (`0 successfully verified harnesses,
@@ -351,12 +351,12 @@ Everything above was, for a while, verified by hand exactly once, and the prose
 was the only record. That is the failure the repo names explicitly — a one-off
 verification is not a gate, and only a gate survives the next change — so
 `tools/comparison/run.sh` (gate 13 in `scripts/gate.sh`) re-runs the cheap,
-hermetic half on every gate run: `discharge` on the positive fixture and all three
+hermetic half on every gate run: `verif` on the positive fixture and all three
 bug fixtures, the degenerate implementations, and Coq and Lean on the positive
 fixture and both teeth including the mutations. The external provers (Kani, Verus,
 Prusti, SPARK) keep their own CI jobs, where their toolchains are installed.
 
-The `discharge` half is a driver, `examples/comparison_check.rs`, and it asserts
+The `verif` half is a driver, `examples/comparison_check.rs`, and it asserts
 the per-function `FnOutcome` rather than scraping `mir_coverage`'s summary. That
 choice is the whole point. The summary line counts only `Verified`, so `Failed`,
 `Incomplete` and `Skipped` all leave it at `decided 0 of 1` — and the first version
@@ -398,21 +398,21 @@ prover is now exit `2` (a reported skip) and never exit `0`.
 
 ## Reproducing
 
-`discharge` needs a nightly `rustc` for the MIR frontend (the repo pins one).
+`verif` needs a nightly `rustc` for the MIR frontend (the repo pins one).
 The other tools are external, and none of them is a dependency of the crate.
 
 ```console
-# The whole gate, in one command: the discharge driver, Coq and Lean, both
+# The whole gate, in one command: the verif driver, Coq and Lean, both
 # mutation-checked. Exits 2 (a reported skip) when coqc, lean or a nightly
 # rustc is absent, and never 0 for work it did not do.
 sh tools/comparison/run.sh
 
-# Or the discharge half on its own -- per-function outcome, not a count
-DISCHARGE_RUSTC=$(rustup which --toolchain nightly-2026-08-21 rustc) \
+# Or the verif half on its own -- per-function outcome, not a count
+VERIF_RUSTC=$(rustup which --toolchain nightly-2026-08-21 rustc) \
   cargo run -q --features std --example comparison_check
 
 # The raw coverage scoreboard, for the numbers rather than the verdicts
-DISCHARGE_RUSTC=$(rustup which --toolchain nightly-2026-08-21 rustc) \
+VERIF_RUSTC=$(rustup which --toolchain nightly-2026-08-21 rustc) \
   cargo run -q --features std --example mir_coverage -- examples/comparison/target.rs
 
 # Kani -- copy the harness into a crate with `kani` on the path

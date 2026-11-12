@@ -29,7 +29,7 @@
 //! them separately would compare unrelated formulas and every disagreement would be noise.
 #![allow(dead_code)]
 
-use discharge::smt::{self, Pred, Var};
+use verif::smt::{self, Pred, Var};
 
 /// Width of every word. Everything is `u8` so both sides stay well-sorted: the engine
 /// refuses mixed-width comparisons, and a case it refuses makes no claim to confirm.
@@ -235,7 +235,7 @@ pub fn lean_pred(e: &PExpr) -> String {
 /// and the harness enumerates all 256 values per variable with `vm_compute`. That makes Coq
 /// a *different kind* of oracle from the other three: it does not decide the formula, it
 /// evaluates it on every point of the domain, which is exactly what
-/// `discharge-arithmetic`'s own enumeration proofs do but in a kernel that was not written
+/// `verif-arithmetic`'s own enumeration proofs do but in a kernel that was not written
 /// by this crate. Agreement is therefore evidence about the engine's *transcription* into
 /// `Z` as much as about its verdicts.
 ///

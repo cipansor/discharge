@@ -14,8 +14,8 @@
 //! readings differ (`>>`, `/`, `%`, an ordering comparison, a widening cast), the
 //! shape is refused rather than guessed.
 
-use discharge::mir::spec;
-use discharge::smt;
+use verif::mir::spec;
+use verif::smt;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Parse an `ensures:` clause for a function returning `i8`, with `x` an `i8`

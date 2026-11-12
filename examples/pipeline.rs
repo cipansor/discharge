@@ -7,9 +7,9 @@
 //!
 //! Run with: `cargo run --features std --example pipeline`
 
-use discharge::prelude::*;
-use discharge::smt::{self, var, Verdict};
-use discharge::wp::{self, Stmt};
+use verif::prelude::*;
+use verif::smt::{self, var, Verdict};
+use verif::wp::{self, Stmt};
 
 /// A bounded accumulator, the shape of loop that shows up in a controller:
 ///
@@ -96,7 +96,7 @@ fn main() {
         // unusable, which is the whole point of the export.
         let vars = [sum, i, n, step];
         let q = Query::new(&vars, report.contract.goal);
-        q.to_smtlib2_string()
+        q.to_smtlib2()
     });
 
     println!("the contract as SMT-LIB2, for independent checking:\n");
@@ -162,7 +162,7 @@ fn main() {
 
         let vars = [sum, i, n, step];
         let q = Query::new(&vars, report.contract.goal);
-        q.to_smtlib2_string()
+        q.to_smtlib2()
     });
 
     println!("\nand the obligation a solver would be handed:\n");

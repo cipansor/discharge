@@ -15,7 +15,7 @@
 // case is absent.
 #![allow(clippy::manual_checked_ops)]
 
-use discharge::smt::{self, Verdict};
+use verif::smt::{self, Verdict};
 
 /// Run a symbolic query on a thread with a large stack.
 ///

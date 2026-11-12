@@ -1,6 +1,6 @@
 //! The cross-check between the two engines.
 //!
-//! `discharge-arithmetic` proves its obligations by **exhaustive enumeration**,
+//! `verif-arithmetic` proves its obligations by **exhaustive enumeration**,
 //! with no solver. This crate proves the *same* obligations with the **symbolic
 //! bit-blasting `smt` engine**, at widths enumeration cannot reach. This module
 //! makes the two answers meet.
@@ -22,16 +22,16 @@
 //!    is reported as such.
 //!
 //! The enumeration is the crate under test; the symbolic engine is the oracle.
-//! The dependency runs one way — `discharge` depends on `discharge-arithmetic`
+//! The dependency runs one way — `verif` depends on `verif-arithmetic`
 //! — so there is no cycle, and the oracle can never be what the artifact ships.
 
-use discharge::discharge_arithmetic::prove::{self, Verdict as EnumVerdict};
-use discharge::logic::{verify_checked_add, verify_saturating_add_bounds};
-use discharge::primitives::{
+use verif::arith::prove::{self, Verdict as EnumVerdict};
+use verif::logic::{verify_checked_add, verify_saturating_add_bounds};
+use verif::primitives::{
     verify_accumulator_no_overflow, verify_bounded_sub_is_total, verify_safe_add_is_exact,
     verify_saturating_add_monotone,
 };
-use discharge::smt;
+use verif::smt;
 
 /// Both engines agree the statement is true.
 fn both_prove(name: &str, enumerated: EnumVerdict, symbolic: smt::Verdict) {
@@ -122,7 +122,7 @@ fn the_32_bit_domain_is_where_the_symbolic_engine_earns_its_keep() {
         "2^64 cases is past the enumeration budget; it must decline, not guess"
     );
     assert!(
-        discharge::primitives::verify_safe_add_is_exact(32).is_proved(),
+        verif::primitives::verify_safe_add_is_exact(32).is_proved(),
         "the symbolic engine must prove at 32 what enumeration cannot reach"
     );
 

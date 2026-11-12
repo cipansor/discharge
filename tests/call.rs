@@ -7,8 +7,8 @@
 //! respected. A modular verifier that only ever says yes would be worthless, so
 //! every positive test here has a matching negative one.
 
-use discharge::smt::{self, var, Var, Verdict};
-use discharge::wp::{self, Proc, Rule, Stmt, MAX_CALL_ARGS, MAX_WRITES};
+use verif::smt::{self, var, Var, Verdict};
+use verif::wp::{self, Proc, Rule, Stmt, MAX_CALL_ARGS, MAX_WRITES};
 
 /// `double`: requires `x <= 100`, ensures `r == x + x`.
 ///
@@ -330,7 +330,7 @@ fn a_call_inside_a_loop_body_verifies() {
 
         let report = wp::verify(&prog, smt::truth(true), smt::ule_const(a, 20));
         assert!(report.is_verified(), "{:?}", report.first_failure());
-        assert!(report.has_termination_proof());
+        assert!(report.terminates());
 
         // The call obligation is present and attributed to the caller.
         let call_obs: Vec<_> = report
@@ -1195,7 +1195,7 @@ fn a_call_to_a_never_returning_proc_is_not_total() {
         // `correctness` asks about termination alone, so it must refuse this too rather
         // than seeing `loops == variants == 0` and calling it `Total`.
         assert!(
-            !report.has_termination_proof(),
+            !report.terminates(),
             "a divergent call is not a termination proof"
         );
     });

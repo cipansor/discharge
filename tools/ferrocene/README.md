@@ -29,7 +29,7 @@ for the target.
 
 It does **not** check that the verification the crate performs is sound, and it
 does not confer qualification on the crate. A qualified *compiler* is not a
-qualified *verifier*; `discharge`'s engine is not in Ferrocene's qualification
+qualified *verifier*; `verif`'s engine is not in Ferrocene's qualification
 scope, and no amount of building with Ferrocene changes that.
 
 ## Why it skips by default

@@ -12,7 +12,7 @@
 # gets quoted. So a failure, a compile error, or a binary that never ran is a hard error
 # here, and the count is printed only when the whole run is green.
 #
-# It runs the whole workspace: `discharge` and `discharge-arithmetic` are two crates, and
+# It runs the whole workspace: `verif` and `verif-arithmetic` are two crates, and
 # a count that covered only one of them would be exactly the kind of half-truth this
 # script exists to prevent.
 set -e

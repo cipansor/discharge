@@ -11,7 +11,7 @@
 //! disagree with the constant path on an amount no one thought to try, and the
 //! frontend takes whichever path the MIR happens to present.
 
-use discharge::smt::{self, Shift, Verdict};
+use verif::smt::{self, Shift, Verdict};
 
 /// Run a symbolic query on a thread with a large stack.
 ///

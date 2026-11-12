@@ -1,4 +1,4 @@
-//! The bug used to show that `discharge` refuses a false claim, rather than
+//! The bug used to show that `verif` refuses a false claim, rather than
 //! only agreeing with true ones. The two branches of `sat_add` are swapped, so
 //! the guarded `+` is exactly the one that can overflow. The contract is the
 //! full one from `../target.rs`, so the rejection is of the same claim the

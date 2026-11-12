@@ -4,7 +4,7 @@
 #
 # This is the Kani/Verus shape, reached without their toolchains. The checker runs on
 # the host while the crate is built, and the shipped binary is the crate's own code with
-# nothing of the checker in it. `discharge` supports that shape through the `std`-only
+# nothing of the checker in it. `verif` supports that shape through the `std`-only
 # `mir` frontend: put it in `[build-dependencies]`, call `verify_file_with` from
 # `build.rs`, and fail the build when an outcome is not `Verified`. Nothing of the
 # decision procedure is linked into the crate's own artifact, because a build script is
@@ -52,10 +52,10 @@ name = "build_verify_scratch"
 version = "0.1.0"
 edition = "2021"
 
-# The whole point: discharge is a *build* dependency, so it is compiled for the host,
+# The whole point: verif is a *build* dependency, so it is compiled for the host,
 # run by the build script, and never linked into this crate's own artifact.
 [build-dependencies]
-discharge = { path = "$ROOT", features = ["std"] }
+verif = { path = "$ROOT", features = ["std"] }
 
 [dependencies]
 EOF
@@ -67,17 +67,17 @@ cat > "$WORK/build.rs" <<'EOF'
 fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
     let src = std::path::Path::new("src/lib.rs");
-    let report = discharge::mir::verify::verify_file_with("rustc", src, &[])
-        .expect("discharge: the MIR frontend could not read the source");
+    let report = verif::mir::verify::verify_file_with("rustc", src, &[])
+        .expect("verif: the MIR frontend could not read the source");
     let mut bad = Vec::new();
     for (name, outcome) in &report.outcomes {
-        println!("cargo:warning=discharge {name}: {outcome}");
+        println!("cargo:warning=verif {name}: {outcome}");
         if !outcome.is_verified() {
             bad.push(format!("{name}: {outcome}"));
         }
     }
     if !bad.is_empty() {
-        panic!("discharge: verification failed:\n  {}", bad.join("\n  "));
+        panic!("verif: verification failed:\n  {}", bad.join("\n  "));
     }
 }
 EOF
@@ -99,7 +99,7 @@ if ! out="$(cd "$WORK" && cargo build --release 2>&1)"; then
     exit 1
 fi
 case "$out" in
-    *"discharge count_down: verified"*) ;;
+    *"verif count_down: verified"*) ;;
     *)
         echo "$out" >&2
         echo "build-verify: the build succeeded but the verifier did not report 'verified' --" >&2
@@ -137,7 +137,7 @@ case "$out" in
 esac
 
 # 3. The artifact must carry nothing of the prover. A build dependency is a separate
-#    compilation unit, so the crate's own rlib should have *no* `discharge` symbol at
+#    compilation unit, so the crate's own rlib should have *no* `verif` symbol at
 #    all -- which is the "zero cost" claim, and the reason to prefer this shape in a
 #    size-constrained safety build. Restore the good source first, so the rlib is a
 #    real one rather than the failed build's leftovers.
@@ -159,15 +159,18 @@ fi
 rlib_bytes=$(wc -c < "$rlib" | tr -d ' ')
 
 if command -v nm >/dev/null 2>&1; then
-    # `nm -C` demangles, so `discharge::smt::blast` shows up as such. Zero matches means
+    # `nm -C` demangles, so `verif::smt::blast` shows up as such. The pattern is
+    # `verif::`, not `verif`: the scratch crate is itself named `build_verify_scratch`,
+    # so a bare `verif` also matches *its own* symbols (`build_verify_scratch::main`)
+    # and the check fires on a prover that was never linked in. Zero matches means
     # the prover was not linked in; any match means it was, and the artifact is not free.
-    symbols=$(nm -C "$rlib" 2>/dev/null | grep -ci 'discharge' || true)
+    symbols=$(nm -C "$rlib" 2>/dev/null | grep -c 'verif::' || true)
     if [ "$symbols" -ne 0 ]; then
-        echo "build-verify: the artifact carries $symbols 'discharge' symbol(s) -- the prover" >&2
+        echo "build-verify: the artifact carries $symbols 'verif' symbol(s) -- the prover" >&2
         echo "build-verify: reached the shipped code, so it is not zero-cost" >&2
         exit 1
     fi
-    echo "build-verify: 0 'discharge' symbols in the artifact ($rlib_bytes bytes rlib)"
+    echo "build-verify: 0 'verif' symbols in the artifact ($rlib_bytes bytes rlib)"
 else
     echo "build-verify: no nm, so the symbol check was skipped ($rlib_bytes bytes rlib)"
 fi

@@ -3,20 +3,20 @@
 //! Run with: `cargo run --features std --example mir_demo`
 //!
 //! The functions under test live in `examples/mir_targets/actuator.rs`, which
-//! does not import `discharge` at all. Contracts are doc comments
+//! does not import `verif` at all. Contracts are doc comments
 //! (`requires:` / `ensures:` lines); the *bodies* are read from the MIR that
 //! `rustc` lowers them to. Nothing is re-modelled by hand, which is the whole
 //! point — the earlier frontends in this crate proved things about expressions
 //! written next to the code, and a human had to keep the two in step.
 //!
-//! Set `DISCHARGE_RUSTC` to a nightly `rustc`, since `--emit=mir` needs one:
+//! Set `VERIF_RUSTC` to a nightly `rustc`, since `--emit=mir` needs one:
 //!
 //! ```text
-//! DISCHARGE_RUSTC=$(rustup which --toolchain nightly rustc) \
+//! VERIF_RUSTC=$(rustup which --toolchain nightly rustc) \
 //!   cargo run --features std --example mir_demo
 //! ```
 
-use discharge::mir::verify::{self, FnOutcome};
+use verif::mir::verify::{self, FnOutcome};
 
 const TARGET: &str = "examples/mir_targets/actuator.rs";
 

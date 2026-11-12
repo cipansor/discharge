@@ -32,19 +32,19 @@
 //! old `n <= 8` Coq theorem fell into.
 //!
 //! Exit status: 0 every claim held, 1 a claim did not hold, 2 no usable
-//! `DISCHARGE_RUSTC` (reported and skipped by the caller, like the other gates).
+//! `VERIF_RUSTC` (reported and skipped by the caller, like the other gates).
 //!
 //! Run it with a nightly named:
 //!
 //! ```console
-//! $ DISCHARGE_RUSTC=$(rustup which --toolchain nightly rustc) \
+//! $ VERIF_RUSTC=$(rustup which --toolchain nightly rustc) \
 //!     cargo run --features std --example comparison_check
 //! ```
 
 use std::path::{Path, PathBuf};
 
-use discharge::mir::spec;
-use discharge::mir::verify::{self, FnOutcome};
+use verif::mir::spec;
+use verif::mir::verify::{self, FnOutcome};
 
 /// What one fixture must produce.
 enum Want {
@@ -180,10 +180,10 @@ fn fixtures() -> Vec<Fixture> {
 }
 
 fn main() {
-    let rustc = match std::env::var("DISCHARGE_RUSTC") {
+    let rustc = match std::env::var("VERIF_RUSTC") {
         Ok(r) if !r.trim().is_empty() => r,
         _ => {
-            eprintln!("comparison_check: set DISCHARGE_RUSTC to a nightly `rustc`");
+            eprintln!("comparison_check: set VERIF_RUSTC to a nightly `rustc`");
             std::process::exit(2);
         }
     };
@@ -468,7 +468,7 @@ fn write_scratch(name: &str, src: &str) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "discharge-comparison-{}-{seq}-{name}.rs",
+        "verif-comparison-{}-{seq}-{name}.rs",
         std::process::id()
     ));
     std::fs::write(&path, src).expect("write scratch fixture");

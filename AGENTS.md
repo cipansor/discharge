@@ -4,11 +4,49 @@ Repository-level notes for agents working in this workspace.
 
 ## Layout
 
-- The repository root *is* the `discharge` crate: a Rust crate that embeds a
+- The repository root *is* the `verif` crate: a Rust crate that embeds a
   formal-verification engine — a bit-blasting SMT decision procedure, a symbolic
   DSL, a Curry–Howard proof kernel, contracts, and exhaustive verification.
   `no_std`, zero dependencies, allocation-free. (`src/`, `tests/`, `examples/`,
   `scripts/`, `Cargo.toml` all live at the root.)
+- The proved runtime primitives live in the sibling crate `verif-arithmetic`
+  (`verif-arithmetic/`), re-exported at the crate root as `verif::arith` — so
+  callers write `verif::arith::prove::*`, not the `verif::verif_arithmetic`
+  stutter. Both crates are named after the *verb* the tool performs
+  (`verif` = verification, `verif-arithmetic` = verified arithmetic); the
+  earlier name `discharge` survives only as the English verb in prose ("the
+  proof is *discharged*") and as the `*::discharge()` method that performs the
+  discharge, never as a crate or module identifier.
+
+## Renaming the crate: `discharge` → `verif`
+
+Done in one commit. The traps, so a future rename does not repeat them:
+
+- **`discharge` is two things at once.** It is the crate name *and* the English
+  verb for what the prover does (`discharged`, `discharges`, `dischargeable`,
+  and the `discharge()` methods). A blind `sed s/discharge/verif/g` rewrites the
+  prose too — "the proof is *verifed*" — and renames `Certificate::discharge`,
+  the one name the whole crate is *about*. The mechanical pass must target only
+  the identifier forms: `discharge::`, `discharge-arithmetic`,
+  `discharge_arithmetic`, `DISCHARGE_*`, `cipansor/discharge`, `docs.rs/discharge`,
+  `-p discharge`, `name = "discharge"`. The verb forms are left alone on purpose.
+- **`pub use verif_arithmetic;` does not rename the dependency.** `arith` is not
+  a dependency name, so `pub use arith;` is `E0433: cannot find crate`. The
+  sibling is aliased, not renamed: `pub use verif_arithmetic as arith;`. The
+  `Cargo.toml` key stays `verif-arithmetic` (it is the real crate), and only the
+  *import* path shortens.
+- **`git checkout -- <file>` un-renames that file.** Four files were reverted
+  mid-run to undo a bad edit and came back holding the *old* crate name; the
+  build caught it only in `tests/oracle.rs`, because the lib re-export masked it.
+  After any revert during a rename, re-grep for the old name before trusting it.
+- **The env var moves with the name.** `DISCHARGE_RUSTC`/`DISCHARGE_MSRV` →
+  `VERIF_RUSTC`/`VERIF_MSRV`, in `scripts/`, `.github/workflows/ci.yml`,
+  `tools/`, and every README/AGENTS mention. A stale `DISCHARGE_RUSTC` in one
+  script silently points the MIR frontend at the wrong compiler.
+- **The GitHub repository rename is a manual step.** `repository`/`homepage` in
+  both `Cargo.toml`s now read `github.com/cipansor/verif`, but GitHub will keep
+  serving the old path only until the owner renames the repo; until then the
+  metadata URL and the real URL disagree. This is a human action, not a code one.
 
 ## Build and test commands
 
@@ -41,9 +79,9 @@ cargo run --features std --example flight_control
 # The MIR frontend: verify real Rust, reading the MIR rustc lowers it to.
 # `--emit=mir` needs nightly, and the compiler is named separately from RUSTC
 # so that pointing this at a nightly does not disturb the cargo building it.
-DISCHARGE_RUSTC="$(rustup which --toolchain nightly rustc)" \
+VERIF_RUSTC="$(rustup which --toolchain nightly rustc)" \
   cargo run --features std --example mir_demo
-DISCHARGE_RUSTC="$(rustup which --toolchain nightly rustc)" \
+VERIF_RUSTC="$(rustup which --toolchain nightly rustc)" \
   cargo test --features std --test mir
 ```
 
@@ -415,7 +453,7 @@ it *silently* prove nothing useful:
    the engine derives the measure after one iteration by *symbolic evaluation*
    (`variant_after`, which builds expressions, not predicates) and emits
    `I && c => V' < V`. Without it, only partial correctness holds and
-   `Report::correctness()` says `Partial`. `has_termination_proof()` compares the
+   `Report::correctness()` says `Partial`. `terminates()` compares the
    loop count against the variant count: one unannotated loop makes the whole
    report partial.
    A known gap: `variant_after` treats a nested `while` as a no-op, so an outer
@@ -916,7 +954,7 @@ coverage than it has. So the sweep question generalises:
 
 ## An ambiguous negative is the same bug as a silent truncation
 
-The eighth hole lived in `find_counterexample_by_enumeration`, the function the tests use to
+The eighth hole lived in `enumerate_counterexample`, the function the tests use to
 check the engine. It took a `limit` and returned `Option<u64>`, so `None` meant either "swept
 the whole domain, nothing violated" or "stopped early, nothing violated". Searching a prefix of
 the domain reported no counterexample for a property that is false.
@@ -1536,7 +1574,7 @@ missing, dropped, or merely assumed — and make that case a failure rather than
 
 ## Termination claims must be discharged, not counted
 
-`Report::has_termination_proof` counts only variant obligations whose verdict is
+`Report::terminates` counts only variant obligations whose verdict is
 *proved*. Counting the obligations instead of discharging them was a real defect: a
 loop whose measure does not decrease reported `Total` while the report was unverified.
 When adding a rule that contributes to a summary claim, discharge the obligation before
@@ -1612,7 +1650,7 @@ script is a test, and a test that fails while the defect is present has proved n
 the defect is removed and it passes.
 
 **Follow-up: the gate that enforced the rule broke it, by reading a count.** The comparison
-gate first asserted `discharge`'s coverage summary — the `decided 0 of 1` line — for each
+gate first asserted `verif`'s coverage summary — the `decided 0 of 1` line — for each
 injected bug. That line counts only `FnOutcome::Verified`, so `Failed`, `Incomplete` *and*
 `Skipped` all leave it at zero. A fixture whose contract had become unreadable (a typo in an
 `ensures` name) therefore still printed `decided 0 of 1` and the gate reported a caught
@@ -1831,7 +1869,7 @@ holds". The questions to ask, generalising the three above:
 * When a summary (`verified`, `Total`) is computed, does it distinguish "proved" from
   "proved only because the path was cut"?
 * A cut makes the *continuation* vacuous. Does any summary read the continuation without
-  noticing the cut? `has_termination_proof` did: `loops == variants == 0` on a program
+  noticing the cut? `terminates` did: `loops == variants == 0` on a program
   whose only divergence was a call.
 
 ## A type's invariant must hold for every constructor, including the degenerate input
@@ -1982,7 +2020,7 @@ somewhere -- the `lib` shape lets the bare-metal build exist, and `test = true` 
 them, which is the "gate that silently did not run" trap again.
 
 What the gate buys is narrow and worth stating plainly: it checks the *qualified compiler
-accepts the sources unchanged*. It does not qualify `discharge`. A qualified compiler is not
+accepts the sources unchanged*. It does not qualify `verif`. A qualified compiler is not
 a qualified verifier, and this crate's decision procedure is outside Ferrocene's scope. The
 README's "no qualification evidence" line is still true after this gate runs, and the gate's
 comment says so at the definition site.
@@ -2017,7 +2055,7 @@ not just along each grammar's own edges -- a base case that hardcodes a depth is
 
 ## A file tree in the docs is a claim about the filesystem, and nothing checks it
 
-The README's "Layout" section drew `discharge/` as a tree. It had drifted from the
+The README's "Layout" section drew `verif/` as a tree. It had drifted from the
 filesystem in three ways at once: `src/lib.rs` was missing, `tests/sym.rs` was missing,
 `examples/report_probe.rs` was missing, and the `examples/` and `scripts/` blocks were
 *drawn* as if each were the last child of the root (two `└──` siblings), so the tree was
@@ -2469,7 +2507,7 @@ because they are easy to reintroduce.
    `Contract::precondition_is_satisfiable` was `find_model(pre) != Verdict::Unsat`, which
    folds `Unknown` in with "found a model" and answers `true`. An ill-formed precondition
    (an equality between an 8-bit and a 16-bit variable, say) then reads as *satisfiable*,
-   so a caller checking `discharge` and the boolean together claims a non-vacuous proof
+   so a caller checking `verif` and the boolean together claims a non-vacuous proof
    with no evidence the precondition is reachable. The fix adds
    `Contract::precondition_satisfiability`, returning the verdict, and makes the boolean
    `true` only for `Valid` or a `Counterexample` -- the two outcomes that *are* a satisfying
@@ -2531,11 +2569,11 @@ Collapsing that match into `self.verdict.is_proved()` is the natural single-pola
 and it is a soundness hole in both directions at once.
 
 That mutant survives `cargo test` completely. The reason is not that the logic is unreached;
-it is that the only tests for it live in `tests/mir.rs`, which needs `DISCHARGE_RUSTC`
+it is that the only tests for it live in `tests/mir.rs`, which needs `VERIF_RUSTC`
 pointing at a nightly, and **skips itself when it is absent** with a bare
 `let Some(report) = verify_all() else { return };`. A skipped test reports `ok`. So the suite
 count is *identical* whether the MIR frontend ran or not: 325 with the nightly, 325 without.
-CI never set `DISCHARGE_RUSTC`, so in the one place that gates a merge, the polarity had no
+CI never set `VERIF_RUSTC`, so in the one place that gates a merge, the polarity had no
 teeth at all. A green suite said nothing about it.
 
 Two fixes, and both are needed. First, an in-module oracle in `src/mir/exec.rs` that runs
@@ -2544,7 +2582,7 @@ does not need a compiler or a model -- `Valid`, `Unsat` and `Unknown` are unit v
 a real `Cex` comes from `find_model` on a satisfiable-but-not-valid query. Verified by
 mutation: collapsing the match, treating a `Valid` panic as ruled out, and discharging every
 vacuity check each fail the oracle on a stable-only machine. Second, CI now installs the
-nightly and points `DISCHARGE_RUSTC` at it, so the end-to-end tests actually run. That
+nightly and points `VERIF_RUSTC` at it, so the end-to-end tests actually run. That
 variable must be a *path*, not a toolchain name: the frontend runs it with `Command::new`.
 
 The lesson to carry: a test that can silently become a no-op is not a test. When a harness
@@ -2871,7 +2909,7 @@ Traps that cost time, in the order they cost it:
   `librustc_driver-*.so` but cargo does not add the sysroot to its rpath, so it builds and then
   dies with `cannot open shared object file`. `build.rs` bakes `-Wl,-rpath,$(rustc --print
   sysroot)/lib` in, using the `RUSTC` cargo is building with. `run.sh` sets both `RUSTC` (what
-  cargo builds *with*) and `DISCHARGE_RUSTC` (what the frontend *runs*) to the same nightly.
+  cargo builds *with*) and `VERIF_RUSTC` (what the frontend *runs*) to the same nightly.
 * **`rustc-dev` alone is not enough: `llvm-tools-preview` is required too, and the error
   misreports the cause.** `rustc` links `libLLVM`, and cargo puts
   `<sysroot>/lib/rustlib/<target>/lib` on the build script's `LD_LIBRARY_PATH`. A bare
@@ -2897,8 +2935,8 @@ Traps that cost time, in the order they cost it:
 * **The crate is `exclude`d from the workspace, not a member.** A member would make
   `cargo build --workspace` require a nightly, which breaks the stable zero-dependency build
   that is the whole point of the crate. `exclude = ["tools/mir-oracle"]` plus `cargo build`
-  from inside `tools/mir-oracle`. `cargo metadata` lists exactly `discharge` and
-  `discharge-arithmetic`, so gate 4 still sees a two-line tree.
+  from inside `tools/mir-oracle`. `cargo metadata` lists exactly `verif` and
+  `verif-arithmetic`, so gate 4 still sees a two-line tree.
 * **`rustc_public::mir::body` is private but glob-re-exported.** Import from
   `rustc_public::mir::{…}`, not `rustc_public::mir::body::{…}`. `Local` is `pub type Local =
   usize`, not a tuple struct, so `Local(0)` does not compile — use `Place::from(0usize)`.
@@ -2970,7 +3008,7 @@ nor as a pass — and, the mirror-image bug, a compile error in the oracle is ne
 a missing toolchain and quietly skipped. `run.sh` decides between 2 and 3 by probing for
 `librustc_driver-*.so` and `libLLVM-*` in `$sysroot/lib/rustlib/$host/lib` directly, rather
 than by asking `rustup component list` (which answers for a toolchain *named* `nightly`, and
-`DISCHARGE_RUSTC` may point elsewhere).
+`VERIF_RUSTC` may point elsewhere).
 
 ## A projection is a binding decision, not a grammar rule
 
@@ -3701,7 +3739,7 @@ needed slice modelling, so it is left as the honest boundary.
 arithmetic the `checked_*` arms already do, minus the overflow obligation, so it is
 mostly plumbing.
 `count_ones` and the zero-counts are small bit-vector loops and belong in
-`discharge-arithmetic` beside the other proved primitives, not in the frontend.
+`verif-arithmetic` beside the other proved primitives, not in the frontend.
 All of these are now modelled except the division families that cannot express a
 zero divisor as a value (see below); the
 bit-count family is complete, `count_ones`/`count_zeros`, `leading_zeros`/`leading_ones`
@@ -3826,7 +3864,7 @@ by design, because they panic on a zero divisor and modelling them as total woul
 hide that panic; `overflowing_div`/`overflowing_rem` join them for the same reason.
 `pow` and the mixed-signedness additions are now modelled, so neither is a reachable
 gap. `rotate_*`, `abs_diff` and the `next_multiple_of`/`div_*` helpers remain reachable
-and unmodelled. The bit-count proofs do **not** go in `discharge-arithmetic`: their oracle here is Rust's own method, checked
+and unmodelled. The bit-count proofs do **not** go in `verif-arithmetic`: their oracle here is Rust's own method, checked
 exhaustively over the whole operand domain, which is a stronger oracle than a
 small-domain enumeration would be. A third engine with less coverage is not a proof,
 so the split the roadmap proposed is not made.
@@ -3874,7 +3912,7 @@ Verified, not assumed:
 and this repository only ever runs tests with `--features std`.
 
 What Ferrocene does *not* buy, stated in the README, the tool's README and here: a qualified
-compiler is not a qualified verifier, and `discharge`'s engine is outside Ferrocene's
+compiler is not a qualified verifier, and `verif`'s engine is outside Ferrocene's
 qualification scope. The gate checks the qualified compiler accepts the sources unchanged.
 
 ## Stage 3, first half: a contract may name a local that aliases an argument
@@ -4348,14 +4386,14 @@ and long-term-support toolchains that lag upstream.
    becomes `filter(|&(_, &l)| …)`.
 2. `tests/loopdiff.rs` — `gen` is a reserved keyword in edition 2024, so `fn gen(`
    was renamed to `fn make_steps(`.
-3. `discharge-arithmetic/src/prove.rs` — three `.map_or(true, |c| …)` calls became
+3. `verif-arithmetic/src/prove.rs` — three `.map_or(true, |c| …)` calls became
    `.is_none_or(|c| …)`. This one is *caused by the MSRV bump*, not by the
    edition: clippy only suggests `is_none_or` (1.82+) once `rust-version` permits
    it, so the lint appears exactly when the floor moves. Worth knowing before
    touching `rust-version` again.
 
 **The floor is now a gate, not a claim.** `scripts/gate.sh` step 13 builds with
-`1.85` (overridable via `DISCHARGE_MSRV`) so a feature newer than the floor fails
+`1.85` (overridable via `VERIF_MSRV`) so a feature newer than the floor fails
 in CI rather than in a downstream build. It follows the Ferrocene/Kani convention:
 an absent toolchain, or a `thumbv7em-none-eabihf` target not installed *for that
 toolchain*, is reported and skipped rather than folded into a pass. CI installs
@@ -4370,7 +4408,7 @@ frontend still works, and the frontend reads rustc's textual MIR, whose shape is
 stable across toolchains. A `const` that folds to a literal prints inline on current
 stable and as a CTFE brace-block on 1.85, so a parser that knew only the inline shape
 passed every gate above and silently dropped the item on the floor. Step 13 now sets
-`DISCHARGE_RUSTC` to the floor rustc and runs the frontend's own suite
+`VERIF_RUSTC` to the floor rustc and runs the frontend's own suite
 (`cargo +$MSRV test --features std --test mir`) so a toolchain-shaped gap fails here
 rather than being discovered downstream. See "A `const` printed as a CTFE brace-block
 on 1.85" below.
@@ -4383,13 +4421,13 @@ recurrence rather than a one-off:
   nothing about whether an intra-doc link still *resolves*, and `cargo test` and `cargo
   clippy` never run rustdoc. Four warnings had shipped: `mir/spec.rs` linked a renamed
   `bind`, and `smt.rs` linked three private items (`pinned_vars`, `EvalMemo`, `eval_term`)
-  from public docs. `discharge-arithmetic` had the same class (`prove.rs` linked its
+  from public docs. `verif-arithmetic` had the same class (`prove.rs` linked its
   private `forall_pair_bounded` from three public items), which is why the step checks
-  both crates and not just the parent. `discharge` is built *three* ways -- default
+  both crates and not just the parent. `verif` is built *three* ways -- default
   (`no_std`), `--features std`, and `--all-features` -- because the doc surface differs
   between them: a link to a `#[cfg(feature = "std")]` item resolves in the last two and not
   the first, which is how `smtscript` shipped an unresolved link to
-  `Query::to_smtlib2_string` that only the default build could see. docs.rs publishes the
+  `Query::to_smtlib2` that only the default build could see. docs.rs publishes the
   default build, so `[package.metadata.docs.rs] all-features = true` makes the published
   docs the union instead.
 - **Step 15: no compiled output is tracked.** `git ls-files` must not list a `.rlib`,
@@ -6905,13 +6943,13 @@ need a `rustc`.
 
 ## Two shapes for the prover: in the artifact, or in the build
 
-The README's headline claim is that `discharge` is a prover that compiles *into* the
+The README's headline claim is that `verif` is a prover that compiles *into* the
 artifact, so a proof can run where Z3 cannot (`examples/bare_metal.rs` is the evidence: the
 decision procedure built for `thumbv7em-none-eabihf`). That is one shape. The other is the
 Kani/Verus shape -- verify while the crate is built, ship none of the verifier -- and it is
 reachable here for free, because the `mir` frontend is already `std`-only *host* tooling.
 
-Put `discharge` in `[build-dependencies]` and call `mir::verify::verify_file_with` from
+Put `verif` in `[build-dependencies]` and call `mir::verify::verify_file_with` from
 `build.rs`, failing the build on any outcome that is not `Verified`. A build script is a
 separate compilation unit, so cargo compiles it for the host, runs it, and discards it: the
 BDD blasting and the CDCL fallback never reach the crate's own rlib. That is a consequence
@@ -6921,12 +6959,12 @@ change to the crate.
 **The measurements, so the "zero cost" claim is a number and not an adjective.** `release`,
 `x86_64`, this repository:
 
-| configuration | artifact | `discharge` symbols |
+| configuration | artifact | `verif` symbols |
 |---|---|---|
-| baseline, no discharge | 447 728 B (binary) | 0 |
-| `discharge` as a dependency, never called | 447 696 B (binary) | 0 |
-| `discharge` in `[build-dependencies]`, called from `build.rs` | 4 860 B (rlib) | **0** |
-| `discharge::smt::prove` called from the crate's own code | 5 746 640 B (binary) | 26 |
+| baseline, no verif | 447 728 B (binary) | 0 |
+| `verif` as a dependency, never called | 447 696 B (binary) | 0 |
+| `verif` in `[build-dependencies]`, called from `build.rs` | 4 860 B (rlib) | **0** |
+| `verif::smt::prove` called from the crate's own code | 5 746 640 B (binary) | 26 |
 
 So "zero cost" is true of the build-time shape and false of the embedded one -- the two
 claims must not be conflated. The embedded engine's cost is the point of its existence
@@ -6943,15 +6981,15 @@ in the repository, which gate 16 exists to prevent) and requires three things:
    (`postcondition`, with the witness). The scratch contract is the recursion one whose
    *base case* is wrong, which is exactly the mistake a circular induction would wave
    through, so this doubles as an end-to-end check of the `decreases:` work; and
-3. the resulting rlib carries **zero** `discharge` symbols (`nm -C | grep -ci discharge`).
+3. the resulting rlib carries **zero** `verif` symbols (`nm -C | grep -ci verif`).
 
 Exit 2 when there is no `cargo` is reported and skipped, the same convention
 `tools/ferrocene/run.sh` and `tools/mir-oracle/run.sh` use: a skipped gate is not evidence.
 
 **A shell gotcha worth recording.** The scratch `Cargo.toml` is written with an *unquoted*
-heredoc so `$ROOT` expands, and the first draft put a backtick-quoted `` `discharge` `` in
+heredoc so `$ROOT` expands, and the first draft put a backtick-quoted `` `verif` `` in
 a comment inside that heredoc. The backticks were command substitution, so the script tried
-to *run* `discharge` and printed `discharge: not found` before continuing. It still passed
+to *run* `verif` and printed `verif: not found` before continuing. It still passed
 every assertion -- the failure was cosmetic -- but a gate that prints a stray error while
 going green trains a reader to ignore its output. Backticks (and `$(...)`) inside an
 unquoted heredoc are code, not prose.
@@ -6969,7 +7007,7 @@ repository already uses it in the one place it is safe: as an oracle.
 `librustc_driver-*.so` plus `libLLVM-*`. Each of those breaks a promise the crate makes:
 gate 14 pins the floor at stable 1.85, gate 5 forbids external dependencies, the README
 sells "not a nightly feature", and an experimental API that moves every nightly is not a
-foundation for a safety build. The oracle's own manifest says it: "the `discharge` crate
+foundation for a safety build. The oracle's own manifest says it: "the `verif` crate
 must build on stable with no dependencies, and `rustc_private` is neither stable nor
 dependency-free." Kani and Verus do link rustc internals -- but they are separate tools,
 and the whole point here is to *not* be that.
@@ -7009,13 +7047,13 @@ here. Two things in that section were still open, and both are closed now.
 
 **The claim was unpinned.** That section concludes the frontend is a stable-toolchain tool,
 but nothing *ran* it without a nightly: `tests/mir.rs` gates every `rustc`-dependent test on
-`DISCHARGE_RUSTC`, and gate 8 used to skip when it was unset. So the conclusion held only on
+`VERIF_RUSTC`, and gate 8 used to skip when it was unset. So the conclusion held only on
 machines that happened to name a compiler -- asserted in prose, checked by nothing. Gate 8
 now falls back to the `rustc` on `PATH` and skips only when there is no `rustc` at all, so
 the claim is exercised with no setup.
 
-**Pinning it surfaced a latent failure.** With gate 8 able to run without `DISCHARGE_RUSTC`,
-`env -u DISCHARGE_RUSTC scripts/test-count.sh` reported **1 test failing**, not skipping:
+**Pinning it surfaced a latent failure.** With gate 8 able to run without `VERIF_RUSTC`,
+`env -u VERIF_RUSTC scripts/test-count.sh` reported **1 test failing**, not skipping:
 `a_one_line_struct_does_not_swallow_the_functions_after_it` called `panic!` on the `None`
 that `verify_src` returns when no compiler is named. It was the only test in the file that
 read "no compiler" as "a bug" -- the other 174 return early -- so the suite's verdict
@@ -7027,7 +7065,7 @@ Also corrected while here: `verify.rs`'s two error strings blamed "a nightly too
 what is really a missing or empty `--emit=mir` output file -- a message that sends a reader
 to install a compiler that would not have helped. They now name the actual condition, and
 its doc comment and the README's source table and example no longer tell the reader to point
-`DISCHARGE_RUSTC` at a nightly.
+`VERIF_RUSTC` at a nightly.
 
 ## A function-local `const` was in scope in every function -- a false proof
 
@@ -7509,7 +7547,7 @@ the token needs no write scope.
 ## The seven-way comparison, and the model-drift trap
 
 `examples/comparison/` proves the same three functions (`sat_add`, `clamp`, `sum_to`)
-with `discharge`, Kani, Verus, Prusti, SPARK, Coq and Lean, and then proves that two
+with `verif`, Kani, Verus, Prusti, SPARK, Coq and Lean, and then proves that two
 injected bugs (swapped `sat_add` branches, wrong `sum_to` loop body) are refused by
 every one of them. Its README is the write-up; this is the part that costs time to
 rediscover.
@@ -7520,7 +7558,7 @@ buggy `sat_add` correct*: in unbounded `Z` the sum never wraps, so the branch th
 overflows on a real `u16` cannot overflow in the model. A correct proof of a false
 statement. The committed version models the wrap explicitly
 (`Z.modulo (a + b) 65536`) and the same false theorem is unprovable. This is the
-concrete argument for why `discharge` reads MIR instead of a hand-written model: there
+concrete argument for why `verif` reads MIR instead of a hand-written model: there
 is no transcription step, so there is no transcription to get wrong. Do not "simplify"
 the Coq or Lean model back to plain integers.
 
@@ -7558,7 +7596,7 @@ so it qualifies the toolchain, not the program: it compiles the buggy `sat_add`
 cleanly and, with a release profile, returns `0` exactly as plain `rustc` does. It is
 already gate 3 (`tools/ferrocene/run.sh`, exit 2 = absent = report and skip). A
 qualified compiler is not a qualified verifier, and building with Ferrocene confers
-nothing on `discharge`'s engine.
+nothing on `verif`'s engine.
 
 **The gate enumerates examples explicitly, so new files under `examples/` are safe**,
 but `gnatprove` writes `obj/` next to the `.gpr`; `examples/comparison/.gitignore`

@@ -15,7 +15,7 @@
 //! is reverted to the clamped predicate, `the_bound_is_refutable_at(22)` becomes
 //! false and the first assertion fails.
 
-use discharge::smt::{self, var, Verdict};
+use verif::smt::{self, var, Verdict};
 
 #[allow(dead_code)]
 #[path = "../examples/flight_control.rs"]

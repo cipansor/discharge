@@ -5332,7 +5332,7 @@ mod tests {
     //! aggregation built on it.
     //!
     //! Every other check on this logic lives in `tests/mir.rs`, which needs
-    //! `DISCHARGE_RUSTC` pointing at a nightly compiler and *skips itself* without
+    //! `VERIF_RUSTC` pointing at a nightly compiler and *skips itself* without
     //! one. A skipped test still reports `ok`, so the suite count is the same
     //! whether the polarity is exercised or not: 325 with the nightly, 325
     //! without. On a stable-only machine the rule below had no teeth at all.
@@ -5681,7 +5681,7 @@ mod tests {
     /// is reported rather than hidden.
     ///
     /// The MIR is embedded so the test runs on stable. `tests/mir.rs` covers the
-    /// same function end-to-end but skips itself without `DISCHARGE_RUSTC`.
+    /// same function end-to-end but skips itself without `VERIF_RUSTC`.
     #[test]
     fn a_branching_loop_reports_a_path_budget_rather_than_running_forever() {
         const COUNT_EVENS_MIR: &str = r#"

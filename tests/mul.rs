@@ -17,7 +17,7 @@
 //! dropped carry. So the concrete sweep below is kept and labelled for what it is,
 //! and the tests that matter go through `prove`, which is the path the frontend takes.
 
-use discharge::smt::{self, Verdict};
+use verif::smt::{self, Verdict};
 
 /// Run a symbolic query on a thread with a large stack: the BDD operations recurse.
 fn on_big_stack<F: FnOnce() + Send + 'static>(f: F) {

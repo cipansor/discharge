@@ -178,7 +178,7 @@ fn main() {
     let tally = tally_identities(&cases, "verusdiff");
     let proved_by_engine = cases.iter().filter(|c| c.ours.is_proved()).count();
 
-    let dir: PathBuf = std::env::temp_dir().join("discharge_verusdiff");
+    let dir: PathBuf = std::env::temp_dir().join("verif_verusdiff");
     let _ = fs::remove_dir_all(&dir);
     if let Err(e) = fs::create_dir_all(&dir) {
         eprintln!("verusdiff: could not create {}: {e}", dir.display());

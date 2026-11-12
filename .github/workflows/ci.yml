@@ -1,4 +1,4 @@
-# CI for the `discharge` crate.
+# CI for the `verif` crate.
 #
 # The first job runs `scripts/gate.sh` -- the same script a human runs -- so "the gates are
 # green" means the same thing locally and in CI, and there is no second copy of the commands
@@ -55,7 +55,7 @@ jobs:
           # The MSRV gate in `scripts/gate.sh` builds with the oldest compiler the manifests
           # promise to support. It is installed here so the gate *runs* rather than skipping:
           # a floor that is never exercised is the claim this gate exists to stop trusting.
-          # It must match `rust-version` in `Cargo.toml` and `discharge-arithmetic/Cargo.toml`.
+          # It must match `rust-version` in `Cargo.toml` and `verif-arithmetic/Cargo.toml`.
           rustup toolchain install 1.85 --profile minimal --no-self-update
           rustup default stable
           rustup target add thumbv7em-none-eabihf
@@ -72,13 +72,13 @@ jobs:
       - name: Install the z3 oracle
         run: python3 -m pip install z3-solver
 
-      # `DISCHARGE_RUSTC` must be a path to a `rustc`, not a toolchain name: the frontend
+      # `VERIF_RUSTC` must be a path to a `rustc`, not a toolchain name: the frontend
       # runs it as a subprocess (`Command::new(rustc)`), so a bare `nightly` would look for
       # a binary by that name and fail.
       - name: Run scripts/gate.sh
         run: |
-          DISCHARGE_RUSTC="$(rustup which --toolchain nightly rustc)"
-          export DISCHARGE_RUSTC
+          VERIF_RUSTC="$(rustup which --toolchain nightly rustc)"
+          export VERIF_RUSTC
           sh scripts/gate.sh
 
   ferrocene:
@@ -255,7 +255,7 @@ jobs:
 
       # This job is the whole reason `tools/mir-oracle` exists: it links `rustc_public`,
       # which needs a nightly plus the `rustc-dev` component. Neither may leak into
-      # `discharge` -- the crate builds on stable with no dependencies -- so the oracle is a
+      # `verif` -- the crate builds on stable with no dependencies -- so the oracle is a
       # separate, excluded workspace member and only this job pays for the nightly.
       #
       # `llvm-tools-preview` is required too, and its absence is not obvious from the error.
@@ -283,8 +283,8 @@ jobs:
       # rather than being swallowed here.
       - name: Run the MIR oracle
         run: |
-          DISCHARGE_RUSTC="$(rustup which --toolchain nightly rustc)"
-          export DISCHARGE_RUSTC
+          VERIF_RUSTC="$(rustup which --toolchain nightly rustc)"
+          export VERIF_RUSTC
           sh tools/mir-oracle/run.sh
 
       - name: Run the oracle's own tests
@@ -361,7 +361,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # This job runs `tools/comparison/run.sh`, which needs all three of: a nightly
-      # `rustc` (the `discharge` half reads real MIR), `coqc`, and Lean. It is a separate
+      # `rustc` (the `verif` half reads real MIR), `coqc`, and Lean. It is a separate
       # job rather than a step in `gate` because `gate` installs none of Coq or Lean, so
       # the comparison gate would *skip* there and a skipped gate is not evidence.
       - name: Install Rust (stable + nightly)
@@ -388,6 +388,6 @@ jobs:
       # here would itself be a failure worth seeing.
       - name: Run the comparison gate
         run: |
-          DISCHARGE_RUSTC="$(rustup which --toolchain nightly rustc)"
-          export DISCHARGE_RUSTC
+          VERIF_RUSTC="$(rustup which --toolchain nightly rustc)"
+          export VERIF_RUSTC
           sh tools/comparison/run.sh

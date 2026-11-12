@@ -1,11 +1,11 @@
 //! The symbolic **oracle** for the proved arithmetic primitives.
 //!
 //! The runtime half of this module — [`checked_add`], [`saturating_add`],
-//! [`mul_div`], [`Fixed`] — now lives in the standalone `discharge-arithmetic`
+//! [`mul_div`], [`Fixed`] — now lives in the standalone `verif-arithmetic`
 //! crate, which is `no_std`, `#![forbid(unsafe_code)]`, has no dependencies, and
 //! proves its own properties by exhaustive enumeration *without* the `smt`
 //! engine. Those items are re-exported here unchanged, so this crate's public
-//! surface and every caller of `discharge::logic` are unaffected by the split.
+//! surface and every caller of `verif::logic` are unaffected by the split.
 //!
 //! What stays in this module is the second opinion. The `verify_*` functions
 //! state the **same** obligations symbolically, at widths the enumeration cannot
@@ -21,10 +21,10 @@
 use crate::smt::{self, Verdict};
 
 // The runtime primitives, unchanged, now owned by the standalone crate.
-pub use discharge_arithmetic::checked::{
+pub use verif_arithmetic::checked::{
     checked_add, checked_mul, checked_sub, mul_div, saturating_add, saturating_sub,
 };
-pub use discharge_arithmetic::fixed::Fixed;
+pub use verif_arithmetic::fixed::Fixed;
 
 // ---------------------------------------------------------------------------
 // Symbolic proofs about the primitives

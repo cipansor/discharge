@@ -143,7 +143,7 @@ fn main() {
     let tally = tally_identities(&cases, "coqdiff");
     let proved_by_engine = cases.iter().filter(|c| c.ours.is_proved()).count();
 
-    let dir: PathBuf = std::env::temp_dir().join("discharge_coqdiff");
+    let dir: PathBuf = std::env::temp_dir().join("verif_coqdiff");
     let _ = fs::remove_dir_all(&dir);
     let (path, by_line) = match write_file(&dir, &cases) {
         Ok(v) => v,

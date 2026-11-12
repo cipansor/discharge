@@ -1,4 +1,4 @@
-# discharge — formal verification that lives inside the Rust code
+# verif — formal verification that lives inside the Rust code
 
 > An experiment: what if Rust could carry its own proof tooling the way
 > SPARK/Ada carries `gnatprove`? Not a plugin, not an external solver, not a
@@ -16,11 +16,11 @@
 `no_std`. Zero dependencies. Fixed-size, heap-free arena. `#![forbid(unsafe_op_in_unsafe_fn)]`.
 
 ```rust
-use discharge::prelude::*;
-use discharge::sym::*;
+use verif::prelude::*;
+use verif::sym::*;
 
 // ∀ x:u8. (x & 0x0f) < 16          — proved by the embedded SMT engine
-let proved = discharge::smt::with_fresh(|| {
+let proved = verif::smt::with_fresh(|| {
     let x = var(8);
     (x & 0x0fu32).lt_val(16).prove().is_proved()
 });
@@ -103,9 +103,9 @@ is the part that actually feels like SPARK: you state `requires` and `ensures`,
 describe the body, and read a verdict *per rule*.
 
 ```rust
-use discharge::prelude::*;
-use discharge::smt::{self, var};
-use discharge::wp::{self, Stmt};
+use verif::prelude::*;
+use verif::smt::{self, var};
+use verif::wp::{self, Stmt};
 
 let report = smt::with_fresh(|| {
     let sum = var(4);
@@ -253,7 +253,7 @@ proof:
 ```rust
 let vars = [sum, i, n, step];
 let q = Query::new(&vars, report.contract.goal);
-println!("{}", q.to_smtlib2_string());
+println!("{}", q.to_smtlib2());
 ```
 
 ```text
@@ -277,7 +277,7 @@ theory that matters most for safety-critical code, without touching the decision
 procedure: a memory of `2^addr_width` cells, each cell an ordinary symbolic word.
 
 ```rust
-use discharge::mem::{declare, Mem};
+use verif::mem::{declare, Mem};
 
 smt::with_fresh(|| {
     let mut buf = [var(8); 4];
@@ -728,7 +728,7 @@ The eighth hole, and the sharpest instance of the recurring class: a limit that 
 something weaker than it looks, in the one function whose whole job is to *catch* the symbolic
 engine being wrong.
 
-`find_counterexample_by_enumeration` took a `limit` and returned `Option<u64>`, so `None` meant
+`enumerate_counterexample` took a `limit` and returned `Option<u64>`, so `None` meant
 two different things: "swept the whole domain and found nothing" and "stopped early and found
 nothing". A caller reading `None` as "no counterexample exists" was wrong for the second. The
 probe made it concrete — the claim `clamp(x, 20, 200) <= 100` is false, and the first witness is
@@ -824,7 +824,7 @@ report called that progress.
 
 This is the call-shaped twin of the unreachable-`Assume` hole, and it takes the same fix: the
 walk records a `Rule::DivergentCall` finding at the call site, where the cut is, and reports
-it as a failure. `Report::has_termination_proof` refuses it too, because a divergent call is a
+it as a failure. `Report::terminates` refuses it too, because a divergent call is a
 termination finding and `correctness()` asks about termination on its own — otherwise
 `loops == variants == 0` would read as progress on the strength of loops the program does not
 have.
@@ -1237,7 +1237,7 @@ the engine discharges it. The obligation is a *model* of the code, and a model c
 drift from the code it describes. A human has to keep the two in step, and the
 day they stop agreeing the proof is about the wrong program.
 
-`discharge::mir` removes that step. It reads the **actual MIR** that `rustc`
+`verif::mir` removes that step. It reads the **actual MIR** that `rustc`
 lowers a real Rust function to, symbolically executes it, and discharges the
 obligations it finds — the overflow, underflow and divide-by-zero `assert`s that
 `rustc` itself emits, plus the pre- and postconditions you wrote. Nothing is
@@ -1628,7 +1628,7 @@ constructor runs.
 |---|---|---|
 | the body | `rustc --emit=mir` | the real lowering, including the checks `rustc` inserts |
 | the contract | the source text | MIR carries no attributes or doc comments |
-| the compiler | `DISCHARGE_RUSTC`, else `rustc` | `--emit=mir` is stable, so the `rustc` on `PATH` is enough; the variable exists to point the frontend at a *different* compiler without disturbing cargo's own |
+| the compiler | `VERIF_RUSTC`, else `rustc` | `--emit=mir` is stable, so the `rustc` on `PATH` is enough; the variable exists to point the frontend at a *different* compiler without disturbing cargo's own |
 
 The five differential oracles (z3, Kani, Lean, Coq, Verus) all build their terms
 with `smt::` calls, so they start *below* the contract reader. That left the reader
@@ -2139,11 +2139,11 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   ├── comparison/        the same three functions proved seven ways, plus
 │   │                      Ferrocene as the qualified compiler (see its README)
 │   └── mir_targets/
-│       └── actuator.rs    the Rust under verification; imports no `discharge`
+│       └── actuator.rs    the Rust under verification; imports no `verif`
 ├── tools/
 │   ├── mir-oracle/     the `rustc_public` oracle: checks the text-MIR frontend
 │   │                   against rustc's own typed MIR. Nightly + `rustc-dev`,
-│   │                   its own workspace, and never a dependency of `discharge`.
+│   │                   its own workspace, and never a dependency of `verif`.
 │   ├── comparison/     gate 13: re-runs the comparison fixtures -- the contracts,
 │   │                   the teeth, and the degenerate-implementation check
 │   └── build-verify/   gate 18: the Kani/Verus shape -- verify from `build.rs`
@@ -2182,7 +2182,7 @@ tools are present and *skip them loudly* when they are not, because all three ar
 downloads (Kani: a pinned nightly plus CBMC; Verus: a self-contained bundle with its own z3;
 the MIR oracle: a nightly with the `rustc-dev` and `llvm-tools-preview` components) that a normal local run should not
 pay for; CI installs them and runs them as hard gates. One more gate holds the comparison
-fixtures themselves — `tools/comparison/run.sh` re-runs `discharge` on the positive fixture
+fixtures themselves — `tools/comparison/run.sh` re-runs `verif` on the positive fixture
 and all three bug fixtures through `examples/comparison_check.rs`, which asserts each
 fixture's per-function `FnOutcome` and the *expected obligation kind* rather than scraping
 `mir_coverage`'s `decided N of M` line (that line counts only `Verified`, so a `Failed`,
@@ -2225,7 +2225,7 @@ byte-identical (the typed one omits `copy` qualifiers and nests `scope` blocks),
 comparing text would fail on cosmetics and prove nothing. The oracle lives in
 `tools/mir-oracle`, outside the workspace, so the nightly and the `rustc_private` feature
 never touch a crate that must build on stable with zero dependencies; the dependency arrow
-points one way, from the oracle to `discharge`. Gate 9 of `scripts/gate.sh` runs it, and the
+points one way, from the oracle to `verif`. Gate 9 of `scripts/gate.sh` runs it, and the
 `mir-oracle` CI job makes it a hard gate.
 
 ### Four more oracles, for the engine instead of the exporter
@@ -2353,7 +2353,7 @@ does violate the property.
 
 The other verification tools for Rust are a different *kind* of thing, and the
 difference is worth stating before the comparison table, because it decides what
-`discharge` can and cannot be used for.
+`verif` can and cannot be used for.
 
 **The established tools verify Rust you already wrote, out of process.** Kani
 (AWS) compiles to CBMC and model-checks; Verus and Creusot and Prusti translate
@@ -2362,7 +2362,7 @@ extracts Rust into F\*/Coq for other tools to consume; Flux adds refinement
 types checked by a solver. All of them need a bespoke toolchain or a nightly
 compiler, and all of them invoke a solver (usually Z3) as a separate binary.
 
-**`discharge` is a prover that compiles into your artifact.** The decision
+**`verif` is a prover that compiles into your artifact.** The decision
 procedure is bit-blasting BDDs in the crate, the proof is a value, and there is
 no external solver, no plugin, no nightly feature. That is a narrower and more
 awkward design point — it buys you a proof that can run where Z3 cannot — and it
@@ -2370,7 +2370,7 @@ costs you scale, as the limits below say.
 
 The honest split:
 
-| | `discharge` | Kani / Verus / Creusot / Prusti | `contracts` crate |
+| | `verif` | Kani / Verus / Creusot / Prusti | `contracts` crate |
 |---|---|---|---|
 | What is verified | the Rust function itself, from its MIR (plus a `Stmt` AST for the older frontend) | the Rust function itself (MIR/IR) | nothing — runtime `assert` |
 | Needs external solver | no | yes (Z3 / CBMC) | no |
@@ -2381,14 +2381,14 @@ The honest split:
 
 That table is an argument. [`examples/comparison/`](examples/comparison/README.md)
 is the evidence: three ordinary functions — a guarded `sat_add`, a `clamp`, and a
-counted `sum_to` — written for `discharge`, Kani, Verus, Prusti, SPARK, Coq and
+counted `sum_to` — written for `verif`, Kani, Verus, Prusti, SPARK, Coq and
 Lean, each tool asked to prove the same properties and then asked to *refuse* the
 same three injected bugs (a swapped-branch `sat_add`, a wrong-arm `clamp`, and a
 wrong-body `sum_to`). Every tool proves all three and catches all three, so the
 interesting result is not who wins but what each one is proving: Coq and Lean
 prove theorems about a hand-written **model**, and that model can silently be
 wrong (the first version of the Coq file proved the *buggy* `sat_add` correct,
-because unbounded `Z` never wraps), while `discharge` reads the MIR `rustc`
+because unbounded `Z` never wraps), while `verif` reads the MIR `rustc`
 actually emitted, so there is no transcription to drift. The contracts state the
 whole function, not a bound: `sat_add` says the result *is* the sum when it fits
 and `u16::MAX` when it does not, so the degenerate `u16::MAX` for every input is
@@ -2396,7 +2396,7 @@ refused rather than accepted. The directory also puts Ferrocene beside the
 verifiers, as the qualified *compiler* that answers the other half of a safety
 case.
 
-Two things follow. First, `discharge` does compete with the big tools on the
+Two things follow. First, `verif` does compete with the big tools on the
 question that matters — *is the proof about the code or about a model of it?* —
 and the answer is the code: `src/mir/` reads the actual MIR that `rustc` lowers a
 real function to, symbolically executes it, and discharges the overflow, shift and
@@ -2461,7 +2461,7 @@ compiles into the artifact you ship.
 
 ## The SPARK comparison, stated plainly
 
-| | SPARK/Ada + `gnatprove` | `discharge` |
+| | SPARK/Ada + `gnatprove` | `verif` |
 |---|---|---|
 | Contracts in source | `Pre`, `Post`, `Type_Invariant`, `Assert` | `requires`, `ensures`, `invariant`, `verify!` |
 | Prover location | external tool in the toolchain | **inside the compiled artifact** |
@@ -2471,7 +2471,7 @@ compiles into the artifact you ship.
 | Qualification | extensive certification evidence | none |
 | Qualified compiler | AdaCore's qualified toolchain | **Ferrocene**, checked in CI |
 
-The interesting part is not that `discharge` beats `gnatprove` — it does not, and
+The interesting part is not that `verif` beats `gnatprove` — it does not, and
 cannot, on scope. The interesting part is the *shape*: a prover that is a
 library, a proof that is a value, and a contract that compiles into the artifact
 you ship. Rust can do that, and this crate is a working sketch of how.
@@ -2487,7 +2487,7 @@ same sources this crate ships. That is gate 3 of `scripts/gate.sh` and the
 
 Be precise about what that does and does not buy, because the distinction is the
 whole point of this section. It checks that the *qualified compiler accepts the
-sources unchanged*. It does not qualify `discharge` itself: a qualified compiler
+sources unchanged*. It does not qualify `verif` itself: a qualified compiler
 is not a qualified verifier, and this crate's decision procedure is not in
 Ferrocene's scope. The README's own statement still stands — no qualification
 evidence, no DO-178C tool qualification — and building with Ferrocene does not
@@ -2516,18 +2516,18 @@ actually do, and what a size-constrained safety build usually wants: **verify wh
 crate is built, and ship none of the verifier.**
 
 It costs nothing to reach, because the `mir` frontend is already `std`-only host tooling.
-Put `discharge` in `[build-dependencies]`, call the frontend from `build.rs`, and fail the
+Put `verif` in `[build-dependencies]`, call the frontend from `build.rs`, and fail the
 build when an outcome is not `Verified`:
 
 ```rust,ignore
 // build.rs
 fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
-    let report = discharge::mir::verify::verify_file_with("rustc", "src/lib.rs".as_ref(), &[])
+    let report = verif::mir::verify::verify_file_with("rustc", "src/lib.rs".as_ref(), &[])
         .expect("the MIR frontend could not read the source");
     for (name, outcome) in &report.outcomes {
-        println!("cargo:warning=discharge {name}: {outcome}");
-        assert!(outcome.is_verified(), "discharge: {name} is not verified: {outcome}");
+        println!("cargo:warning=verif {name}: {outcome}");
+        assert!(outcome.is_verified(), "verif: {name} is not verified: {outcome}");
     }
 }
 ```
@@ -2542,9 +2542,9 @@ once:
   the broken obligation and its witness, exactly as it is under Kani or Verus. Nothing is
   checked at runtime, so nothing can be skipped in a release build.
 * **The artifact is zero-cost.** Measured on this repository, `release`, `x86_64`:
-  a baseline binary is 447 728 bytes; with `discharge` as a build dependency the crate's own
-  rlib is ~5 KB and carries **zero** `discharge` symbols; with the prover *called* from the
-  crate's own code the same program is 5 746 640 bytes and carries 26 `discharge::smt`
+  a baseline binary is 447 728 bytes; with `verif` as a build dependency the crate's own
+  rlib is ~5 KB and carries **zero** `verif` symbols; with the prover *called* from the
+  crate's own code the same program is 5 746 640 bytes and carries 26 `verif::smt`
   symbols. The difference is whether the obligation was discharged before or after the code
   shipped.
 

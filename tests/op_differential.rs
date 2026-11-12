@@ -36,7 +36,7 @@
 // that out rather than calling `checked_div`, which would only say the case is absent.
 #![allow(clippy::manual_checked_ops)]
 
-use discharge::smt::{self, Verdict};
+use verif::smt::{self, Verdict};
 
 /// Run a symbolic query on a thread with a large stack: the BDD operations recurse.
 fn on_big_stack<F: FnOnce() + Send + 'static>(f: F) {

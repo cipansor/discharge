@@ -1,4 +1,4 @@
-//! Functions under verification, with no `discharge` import at all.
+//! Functions under verification, with no `verif` import at all.
 //!
 //! This file is ordinary Rust. It does not depend on the verifier, which is the
 //! point: the code being checked and the tool doing the checking are separate
@@ -7,7 +7,7 @@
 //! demo and the test suite hand its path to the frontend instead.
 //!
 //! Contracts are doc comments (`requires:` / `ensures:`). See
-//! `discharge::mir::spec` for why they are not attributes.
+//! `verif::mir::spec` for why they are not attributes.
 
 // This file is a *verification target*, not library code. The test suite compiles
 // it so that counterexamples can be replayed against the real functions, which is

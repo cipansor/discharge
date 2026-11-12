@@ -23,16 +23,16 @@ set -eu
 cd "$(dirname "$0")/../.."
 
 # The oracle links rustc internals, so it must be built *by* the nightly that
-# provides them. `DISCHARGE_RUSTC` is the same variable the frontend itself reads,
+# provides them. `VERIF_RUSTC` is the same variable the frontend itself reads,
 # so one setting points both sides at one compiler.
-RUSTC_BIN="${DISCHARGE_RUSTC:-}"
+RUSTC_BIN="${VERIF_RUSTC:-}"
 if [ -z "$RUSTC_BIN" ]; then
   if command -v rustup >/dev/null 2>&1; then
     RUSTC_BIN="$(rustup which --toolchain nightly rustc 2>/dev/null || true)"
   fi
 fi
 if [ -z "$RUSTC_BIN" ]; then
-  echo "mir-oracle: no nightly rustc found; set DISCHARGE_RUSTC" >&2
+  echo "mir-oracle: no nightly rustc found; set VERIF_RUSTC" >&2
   exit 2
 fi
 
@@ -57,7 +57,7 @@ libdir="$sysroot/lib/rustlib/$host/lib"
 
 # The two components the oracle needs, probed by their artifacts rather than by
 # `rustup component list` (which answers for a *named* toolchain, and
-# `DISCHARGE_RUSTC` may point at one that is not named `nightly`):
+# `VERIF_RUSTC` may point at one that is not named `nightly`):
 #
 #   rustc-dev            -> librustc_driver-*.so
 #   llvm-tools-preview   -> libLLVM-*
@@ -69,7 +69,7 @@ components_present() {
   [ -e "$libdir"/librustc_driver-*.so ] && [ -e "$libdir"/libLLVM-* ]
 }
 
-# `RUSTC` here is what cargo *builds with*; `DISCHARGE_RUSTC` is what the frontend
+# `RUSTC` here is what cargo *builds with*; `VERIF_RUSTC` is what the frontend
 # *runs*. Both must be the nightly, and they are, because `rustc-dev` is a
 # property of the toolchain.
 #
@@ -98,6 +98,6 @@ cd ../..
 
 status=0
 for corpus in examples/mir_targets/actuator.rs examples/mir_targets/realistic.rs; do
-  DISCHARGE_RUSTC="$RUSTC_BIN" ./tools/mir-oracle/target/debug/mir-oracle "$corpus" || status=$?
+  VERIF_RUSTC="$RUSTC_BIN" ./tools/mir-oracle/target/debug/mir-oracle "$corpus" || status=$?
 done
 exit "$status"
