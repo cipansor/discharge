@@ -3655,7 +3655,22 @@ optional file argument, which is what made the measurement cheap.)
   `a_helper_unpinned_write_is_not_the_callers_old_leaf` / `..._sibling`, asserted
   `!is_verified()` in `an_unpinned_write_poisons_the_whole_array` -- `incomplete` is
   the honest answer for a write the run cannot pin, and the one outcome that must
-  never appear is `verified`. And an *array whose type is
+  never appear is `verified`.
+  The poison is array-wide, but the leaf maps *are* the record of which indices have
+  been re-established, so an array-wide veto must not sit in front of them: a pinned
+  write after a symbolic one (`a[i].v = 7; a[0].v = 9`) re-populates exactly its
+  index, and `poisoned_elems` must not hide it -- that made
+  `let x = a[0]; x.v` `incomplete` though the copy is always `9`. The marker is for
+  the *call boundary* only, where it means "this array is not wholly known"; it is
+  no longer consulted by `carry_elem_leaf_onto_local` or by the `elem_parts` reader.
+  Pinned by `a_pinned_leaf_rewrite_after_a_symbolic_write_is_read_back` /
+  `a_pinned_element_rewrite_after_a_symbolic_write_is_read_back` /
+  `a_pinned_leaf_rewrite_after_a_symbolic_element_write_is_read_back` /
+  `a_helper_pinned_rewrite_after_a_symbolic_write_is_read_back` (verified) against
+  the twins `a_pinned_rewrite_does_not_recover_its_sibling` /
+  `a_pinned_rewrite_does_not_revive_the_old_leaf` (`!is_verified`), so the recovery
+  is per-element and never a blanket un-poisoning.
+  And an *array whose type is
   a field* (`o.a[0]`) is skipped, since the `indexed` store is keyed by local only (see the note
   below).
   Two notes on what this did *not* need. The nested literal always reaches the

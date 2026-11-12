@@ -3449,6 +3449,43 @@ fn a_leaf_write_inside_an_element_is_read_back() {
     }
 }
 
+/// A pinned write after a symbolic one re-establishes that element, and the value
+/// must be readable -- including through an element copy.
+///
+/// The poison is array-wide, but the leaf maps are the record of which indices have
+/// been re-established: `poison_elems` clears them and a later pinned write
+/// re-populates exactly its index. An array-wide veto on top of that hid a leaf the
+/// body genuinely knows, so `a[i].v = 7; a[0].v = 9; let x = a[0]; x.v` was
+/// `incomplete` although the copy is always `9`. The recovery also has to cross the
+/// call boundary, along with the poison it follows.
+///
+/// The negative twins pin the other half: a rewrite of one element recovers neither
+/// its sibling nor its own pre-write leaf, so the fix is per-element and not a
+/// blanket un-poisoning.
+#[test]
+fn a_pinned_rewrite_after_a_symbolic_write_is_read_back() {
+    let recovered = [
+        "a_pinned_leaf_rewrite_after_a_symbolic_write_is_read_back",
+        "a_pinned_element_rewrite_after_a_symbolic_write_is_read_back",
+        "a_pinned_leaf_rewrite_after_a_symbolic_element_write_is_read_back",
+        "a_helper_pinned_rewrite_after_a_symbolic_write_is_read_back",
+    ];
+    let Some(report) = verify_realistic(&recovered) else { return };
+    for name in recovered {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a pinned rewrite is a known leaf; got: {o}");
+    }
+    let unknown = [
+        "a_pinned_rewrite_does_not_recover_its_sibling",
+        "a_pinned_rewrite_does_not_revive_the_old_leaf",
+    ];
+    let Some(report) = verify_realistic(&unknown) else { return };
+    for name in unknown {
+        let o = outcome(&report, name);
+        assert!(!o.is_verified(), "a sibling stays unknown after a pinned rewrite; got: {o}");
+    }
+}
+
 /// An unpinned element write poisons the whole array, and a copy of an element
 /// must not revive a pre-write leaf.
 ///

@@ -8795,3 +8795,89 @@ pub fn a_helper_unpinned_write_is_not_the_callers_sibling(i: usize) -> u8 {
 pub fn set_unpinned(a: &mut [ElemCopy; 2], i: usize) {
     a[i] = ElemCopy { v: 7 };
 }
+
+// ---------------------------------------------------------------------------
+// A pinned rewrite after a symbolic write *re-establishes* that element.
+//
+// A symbolic write (`a[i].v = 7`) marks the whole array unknown, so no element is
+// known afterwards. A *pinned* write to one element (`a[0].v = 9`) then names a
+// value the body does know, and it must be readable -- including through an
+// element copy. The leaf maps are the record of which indices are re-established:
+// `poison_elems` clears them, and a later pinned write re-populates exactly its
+// index, so no array-wide flag may veto a leaf that is genuinely known. What must
+// *not* come back is a sibling the poison left unknown, or the pre-write leaf.
+// ---------------------------------------------------------------------------
+
+/// A pinned leaf rewrite after a symbolic one: the copy reads `9`.
+/// requires: i < 2
+/// ensures: ret == 9
+pub fn a_pinned_leaf_rewrite_after_a_symbolic_write_is_read_back(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    a[i].v = 7;
+    a[0].v = 9;
+    let x = a[0];
+    x.v
+}
+
+/// The same through a whole-element rewrite.
+/// requires: i < 2
+/// ensures: ret == 9
+pub fn a_pinned_element_rewrite_after_a_symbolic_write_is_read_back(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    a[i].v = 7;
+    a[0] = ElemCopy { v: 9 };
+    let x = a[0];
+    x.v
+}
+
+/// A pinned rewrite after a symbolic *whole-element* write, the other order.
+/// requires: i < 2
+/// ensures: ret == 9
+pub fn a_pinned_leaf_rewrite_after_a_symbolic_element_write_is_read_back(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    a[i] = ElemCopy { v: 7 };
+    a[0].v = 9;
+    let x = a[0];
+    x.v
+}
+
+/// A helper that poisons and then re-establishes: the recovery has to cross the
+/// call boundary along with the poison.
+/// requires: i < 2
+/// ensures: ret == 9
+pub fn a_helper_pinned_rewrite_after_a_symbolic_write_is_read_back(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    poison_then_rewrite(&mut a, i);
+    let x = a[0];
+    x.v
+}
+
+/// Poisons every element, then re-establishes element 0.
+/// requires: i < 2
+/// ensures: true
+pub fn poison_then_rewrite(a: &mut [ElemCopy; 2], i: usize) {
+    a[i].v = 7;
+    a[0].v = 9;
+}
+
+/// The sibling the poison left unknown is *not* recovered by a rewrite of element 0.
+/// requires: i < 2
+/// ensures: ret == 4
+pub fn a_pinned_rewrite_does_not_recover_its_sibling(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    a[i].v = 7;
+    a[0].v = 9;
+    let x = a[1];
+    x.v
+}
+
+/// Nor the pre-write leaf of the element that was rewritten.
+/// requires: i < 2
+/// ensures: ret == 3
+pub fn a_pinned_rewrite_does_not_revive_the_old_leaf(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    a[i].v = 7;
+    a[0].v = 9;
+    let x = a[0];
+    x.v
+}

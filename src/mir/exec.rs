@@ -805,15 +805,15 @@ impl Env {
         let src = self.resolve(src);
         let Some(k) = self.elem_index_of(&src.proj) else { return false };
         let s = src.local;
-        // A poisoned array's elements are unknown, so no leaf of one is readable --
-        // not even one the poison left behind, and not from the argument store
-        // either. This is the second half of the same hole `poison_elems` closes:
-        // clearing the two leaf maps is not enough if a caller can still collect a
-        // leaf through a stale mirror, and an argument's array carries its own
-        // `poisoned` flag.
-        if self.indexed.get(&s).is_some_and(|st| st.poisoned) || self.poisoned_elems.contains(&s) {
-            return false;
-        }
+        // No poison check here, and that is deliberate: the leaf maps *are* the
+        // record of which indices have been re-established. `poison_elems` clears
+        // them, so a poisoned element carries nothing and this returns `false` on
+        // its own; a pinned write *after* the poison (`a[i].v = 7; a[0].v = 9`)
+        // re-populates exactly that index's leaf, and refusing it because the
+        // array-wide marker is still set would lose a value the body does know --
+        // `let x = a[0]; x.v` would read `Unknown` though the leaf is `9`. The
+        // marker stays for the call boundary, where it means "this array is not
+        // wholly known", which is a different question from "is this leaf known".
         let leaves: Vec<(Vec<u32>, Val)> = self
             .elem_parts
             .iter()
@@ -1215,14 +1215,15 @@ impl Env {
                             Some(chain) if !chain.is_empty() => chain,
                             _ => return Val::Unknown,
                         };
-                        let v = if self.poisoned_elems.contains(&p.local) {
-                            Val::Unknown
-                        } else {
-                            *self
-                                .elem_parts
-                                .get(&(p.local, *k, inner.clone()))
-                                .unwrap_or(&Val::Unknown)
-                        };
+                        // No poison gate: `poison_elems` cleared this map, and a
+                        // pinned write after the poison re-populated exactly its
+                        // index, so an entry here is always a value the body
+                        // established. The array-wide marker would only hide a leaf
+                        // that *is* known (`a[i].v = 7; a[0].v = 9; a[0].v`).
+                        let v = *self
+                            .elem_parts
+                            .get(&(p.local, *k, inner.clone()))
+                            .unwrap_or(&Val::Unknown);
                         i += inner.len();
                         v
                     }
