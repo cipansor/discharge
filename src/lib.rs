@@ -27,8 +27,9 @@
 //!
 //! # The three ways, in code
 //!
-//! The same obligation, discharged three ways. Each returns a verdict you can
-//! inspect; none of them ever reports `Valid` for something false.
+//! The same obligation, discharged three ways. The first two return a verdict you
+//! can inspect at run time; the third is settled before the program runs, so it has
+//! no verdict to return. None of them ever reports `Valid` for something false.
 //!
 //! ```
 //! use verif::prelude::*;

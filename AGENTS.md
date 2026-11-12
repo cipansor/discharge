@@ -8320,3 +8320,29 @@ which quotes `[Ground rules](CONTRIBUTING.md#missing-heading)` as the example th
 checker exists to catch -- failed the check. A link in an inline span renders as
 code and is not clickable, so `strip_inline_code` now removes those spans first,
 matching backtick runs of equal length so ``a`b`` is one span.
+
+## A second review found two more, one of them in the fix itself
+
+**`strip_inline_code` accepted a mismatched closing run.** The first version
+found the closer with `str.find("`" * run)`, which matches the *first* backtick of
+a longer run. Markdown closes a code span only on a run of exactly the opening
+length, so `` `[broken](#absent)`` `` is not a span at all -- the link is real and
+clickable -- but `find` paired the single opener with the first backtick of the
+double run, dropped everything between them, and the checker never saw the link.
+The bug was in the direction that matters: not a false alarm but a *silent pass*,
+and it appeared in the very function added to stop broken links slipping through.
+A test with only well-formed backticks cannot see it, which is why the case to
+test is the malformed one.
+
+The closer is now found by measuring each candidate run to its end and accepting
+it only when the length matches, skipping longer and shorter runs whole. The
+property under test is stated as "a link is dropped only when it is inside a real
+code span", and the mismatched pairs are the cases that must keep it.
+
+**The quick-start intro promised something the third example cannot give.** It
+said each of the three returns "a verdict you can inspect". `assert_proof!` runs
+before the program does, so there is no verdict and nothing to inspect -- that is
+the whole difference from the two runtime routes, and the paragraph immediately
+below now says so. The lesson is narrower than the last one: after changing an
+example to be compile-time, the sentence introducing it is still written for the
+runtime version, and prose is not type-checked.

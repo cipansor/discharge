@@ -98,14 +98,30 @@ def strip_inline_code(line: str) -> str:
         while j < n and line[j] == "`":
             j += 1
         run = j - i
-        # A code span closes with a run of exactly the same length, so ``a`b`` is
-        # one span and does not end at the inner backtick.
-        close = line.find("`" * run, j)
-        if close == -1:
-            out.append(line[i:j])  # an unmatched run is literal text
+        # A code span closes only on a run of *exactly* the opening length, so
+        # ``a`b`` is one span and does not end at the inner backtick. Measuring
+        # the whole candidate run matters: `str.find` would match the first
+        # backtick of a longer run and treat a mismatched pair as a span, which
+        # drops the text between them -- including a link, which Markdown still
+        # renders as a link. That would hide a broken link from this check.
+        close_end = -1
+        k = j
+        while k < n:
+            if line[k] != "`":
+                k += 1
+                continue
+            m = k
+            while m < n and line[m] == "`":
+                m += 1
+            if m - k == run:
+                close_end = m
+                break
+            k = m  # a longer or shorter run is not a closer; skip it whole
+        if close_end == -1:
+            out.append(line[i:j])  # an unmatched opener is literal text
             i = j
         else:
-            i = close + run
+            i = close_end
     return "".join(out)
 
 
