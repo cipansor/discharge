@@ -8192,3 +8192,49 @@ tested with a negative control: `--verify-checkout` fails when the tag is absent
 and when it points at another commit (including one whose version matches);
 `--confirm-index` succeeds on a published crate, retries a 404-then-200, and
 fails a 403 immediately rather than after the timeout.
+
+## The docs.rs front page was three claims behind the code
+
+The crate-level doc comment in `src/lib.rs` is not a comment. It is the page
+docs.rs renders, the first thing a reader sees, and it said the crate "builds
+**four** things" over a table of thirteen modules. Three of the sixteen modules
+were missing from that table entirely -- `macros`, `vc` and `mir` -- so a reader
+who trusted the front page would not learn that the contract vocabulary or the
+real-Rust frontend existed. The `README` had the same class of drift in its own
+module table (`bitblast` was absent, so the SAT fallback appeared from nowhere)
+and pointed at "gate 9" for the `rustc_public` oracle, which is gate 10.
+
+None of this is caught by the gates that existed. `#![deny(missing_docs)]` checks
+that an item *has* documentation, not that the prose about it is true, and
+`cargo doc -D warnings` checks that links resolve, not that the table is complete.
+A count in prose is exactly the kind of claim this repository otherwise refuses to
+leave unchecked, and it had been wrong in the one place with the widest audience.
+
+What changed:
+
+- **`src/lib.rs`** is now a landing page rather than a preamble: what the crate
+  is, three runnable examples (one per proof mechanism, plus a contract), a module
+  map grouped by purpose, the feature-flag table, and the "what this is not"
+  boundary. The "four things" count is gone; the map is grouped so adding a module
+  does not invalidate a number.
+- **`verif-arithmetic/src/lib.rs`** gets the same treatment: the module table it
+  lacked, the `ENUM_BUDGET` honesty boundary stated once, an explicit "no feature
+  flags, and here is why docs.rs needs no metadata" note, and a pointer to when to
+  use the parent crate instead.
+- **`README.md`** gains a grouped table of contents, and its module table is
+  complete. The stale "gate 9" is corrected to gate 10.
+- **`scripts/check_doc_links.py`** resolves every internal anchor and relative
+  file link in the `README`, and gate 15 runs it. This is the part that makes the
+  rest stay true: the contents list is hand-written, so without a check it rots
+  the first time a heading is renamed, and a dead anchor renders as ordinary text
+  rather than an error. It reproduces GitHub's anchor rule (including the
+  duplicate-heading `-1` suffix) rather than approximating it, and it ignores
+  external URLs on purpose -- a network check would fail for reasons that have
+  nothing to do with this tree.
+
+The examples added to `src/lib.rs` are doctests, so `cargo test` executes them:
+`with_fresh` is not `std`-gated, so they run in the default build too. The
+crate-docs now carry three runnable examples where they previously carried one,
+and the suite count moved from 806 to 808 accordingly -- a `+2` and not a `+3`
+because the old single example was replaced rather than kept. That the count
+moved at all is the check that the examples are real and not prose.

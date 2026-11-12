@@ -13,7 +13,30 @@
 //! `None` case is exactly the overflow case, so a caller either handles it or
 //! discharges it away.
 //!
-//! ## The proof is a decision procedure, not a citation
+//! ```
+//! use verif_arithmetic::{checked_add, prove};
+//!
+//! // The runtime behaviour...
+//! assert_eq!(checked_add(200, 55), Some(255));
+//! assert_eq!(checked_add(u32::MAX, 1), None);
+//!
+//! // ...and the proof that its overflow flag is exact.
+//! assert!(prove::checked_add_is_total().is_proved());
+//! ```
+//!
+//! # What is in this crate
+//!
+//! | Module | What it gives you |
+//! |---|---|
+//! | [`checked`] | Total arithmetic: [`checked_add`], [`checked_sub`], [`checked_mul`], [`mul_div`], [`saturating_add`], [`saturating_sub`]. Each returns `Option`, and `None` is exactly the case the machine op would have wrapped or panicked. |
+//! | [`bounded`] | The `safe_*` functions (the same total route) and [`Bounded<MIN, MAX>`](bounded::Bounded), a refinement-typed integer whose constructors are the only way in. |
+//! | [`fixed`] | [`Fixed`], a Q16.16 fixed-point number: deterministic, no floating point, no soft-float dependency. |
+//! | [`prove`] | The proofs, discharged by exhaustive enumeration. This is the module that makes the rest trustworthy. |
+//!
+//! The crate root re-exports the common names, so `use verif_arithmetic::{checked_add, Bounded, Fixed, Verdict}`
+//! is usually enough without naming a module.
+//!
+//! # The proof is a decision procedure, not a citation
 //!
 //! [`prove`] holds the proofs. Each is a **decision procedure by exhaustive
 //! enumeration**: it walks every input in the domain and returns
@@ -29,9 +52,15 @@
 //! than a guess. The proofs here are stated at the widths the enumeration can
 //! *finish*, which is the honest boundary of a method with no solver behind it.
 //!
-//! ## The symbolic oracle lives in the parent crate
+//! # Feature flags
 //!
-//! [`verif`](https://github.com/cipansor/verif) — the parent crate —
+//! There are none. This crate is `no_std`, `#![forbid(unsafe_code)]` and
+//! dependency-free by construction, and there is no configuration in which that
+//! changes. A downstream build links `core` and nothing else.
+//!
+//! # The symbolic oracle lives in the parent crate
+//!
+//! [`verif`](https://docs.rs/verif) — the parent crate —
 //! depends on this one, keeps its own bit-blasting `smt` engine, and states the
 //! **same** obligations symbolically at widths 8, 16 and 32. `tests/oracle.rs`
 //! in the parent then cross-checks the two: the enumeration and the symbolic
@@ -43,16 +72,15 @@
 //! self-contained mechanism, and the heavy external one is only ever an oracle.**
 //! A dependency that can lie to you is not a proof; a second opinion is.
 //!
-//! ```
-//! use verif_arithmetic::{checked_add, prove};
+//! # When to reach for the parent crate instead
 //!
-//! // The runtime behaviour...
-//! assert_eq!(checked_add(200, 55), Some(255));
-//! assert_eq!(checked_add(u32::MAX, 1), None);
-//!
-//! // ...and the proof that its overflow flag is exact.
-//! assert!(prove::checked_add_is_total().is_proved());
-//! ```
+//! This crate proves things by *enumerating* a domain, so it is the right tool
+//! for a primitive whose domain is small and whose proof you want carried in the
+//! artifact with no solver. When the obligation is symbolic — a bound over all
+//! `u32` inputs, a loop invariant, a contract on a whole `fn` — use
+//! [`verif`](https://docs.rs/verif), which has the BDD engine, `wp`, `mem` and
+//! the MIR frontend. The two are designed to be used together, and the parent
+//! re-exports this crate as `verif::arith`.
 
 #![no_std]
 #![forbid(unsafe_code)]

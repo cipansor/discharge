@@ -12,23 +12,67 @@
 //! This crate is an experiment in closing that gap from inside Rust itself. It
 //! embeds a **bit-blasting decision procedure** — formulas are lowered to
 //! Reduced Ordered Binary Decision Diagrams, which are a canonical form, so
-//! equivalence is node identity — and builds four things on top of it:
+//! equivalence is node identity — and builds the modules below on top of it.
 //!
-//! | Module | What it gives you |
-//! |---|---|
-//! | [`smt`] | The decision procedure: BDDs, with a CDCL SAT fallback past the BDD wall. `no_std`, zero dependencies, fixed-size arena. |
-//! | [`bitblast`] | The bit-level term graph -> CNF lowering, used by the SAT fallback. |
-//! | [`sat`] | The CDCL SAT solver used as the fallback. |
-//! | [`sym`] | A symbolic DSL: `(x + y).eq(y + x).prove()`. |
-//! | [`logic`] | Verified arithmetic and Q16.16 fixed point, with proofs attached. |
-//! | [`mod@proof`] | A Curry–Howard proof kernel plus composable certificates. |
-//! | [`mod@contract`] | `requires` / `ensures` / `invariant`, checked at runtime *and* provable symbolically. |
-//! | [`exhaustive`] | Complete proofs by enumeration over small domains. |
-//! | [`primitives`] | Drop-in safe integer ops whose absence of overflow is proved. |
-//! | [`wp`] | Weakest-precondition generation for statements, loops and calls, with a `Report`. |
-//! | [`mem`] | A bounded symbolic array with a proved `read`/`store` frame condition. |
-//! | [`quant`] | Bounded quantifiers, expanded into finite conjunctions. |
-//! | [`smtscript`] | SMT-LIB2 export, so an independent solver can decide a condition. |
+//! ```
+//! use verif::prelude::*;
+//!
+//! // ∀ x:u8. (x & 0x0f) < 16  — decided by the embedded engine
+//! let proved = verif::smt::with_fresh(|| {
+//!     let x = var(8);
+//!     (x & 0x0fu32).lt_val(16).prove().is_proved()
+//! });
+//! assert!(proved);
+//! ```
+//!
+//! # The three ways, in code
+//!
+//! The same obligation, discharged three ways. Each returns a verdict you can
+//! inspect; none of them ever reports `Valid` for something false.
+//!
+//! ```
+//! use verif::prelude::*;
+//!
+//! // 1. Symbolic: for every input, via BDDs. Fast, but can say Unknown.
+//! let symbolic = verif::smt::with_fresh(|| {
+//!     let x = var(8);
+//!     smt::prove_implies(x.le_val(200), x.le_val(255)).is_proved()
+//! });
+//! assert!(symbolic);
+//!
+//! // 2. Exhaustive: every input of a small domain, no size wall, never Unknown.
+//! assert!(for_all_u8(|a| a <= 255));
+//!
+//! // 3. Type-level: the kernel builds a proof term `rustc` itself checks.
+//! let cert = Certificate::discharge(verif::smt::with_fresh(|| {
+//!     let x = var(8);
+//!     x.le_val(255)
+//! }));
+//! assert!(cert.is_some());
+//! ```
+//!
+//! A contract you can state in the source and check at run time, with the same
+//! predicate usable symbolically:
+//!
+//! ```
+//! use verif::prelude::*;
+//!
+//! // Pre/post as a symbolic obligation: `requires x <= 200` and
+//! // `ensures x <= 255`; the engine proves the implication.
+//! let v = verif::smt::with_fresh(|| {
+//!     let x = var(8);
+//!     let contract = ensures(requires(x.le_val(200)), x.le_val(255));
+//!     contract.discharge()
+//! });
+//! assert!(v.is_proved());
+//! ```
+//!
+//! # What you get, in one line each
+//!
+//! `no_std` by default, zero external dependencies, a fixed-size heap-free arena,
+//! and `#![forbid(unsafe_op_in_unsafe_fn)]`. The engine links `core` and nothing
+//! else, which is what a bare-metal safety build wants; the host-side tools (the
+//! MIR frontend, the file-backed helpers) are behind the `std` feature.
 //!
 //! # The three ways this crate proves something
 //!
@@ -38,36 +82,106 @@
 //! 3. type-level    proof::Certificate         -- the compiler checks the proof term
 //! ```
 //!
-//! They are deliberately different tools. The symbolic engine is the fast,
-//! general one but can return [`smt::Verdict::Unknown`] at the BDD size wall.
-//! Enumeration is a complete proof that never says "unknown", but only for small
-//! domains. The kernel makes *composition* of proofs machine-checked by `rustc`.
-//! A serious safety argument uses all three, and says which one it used.
+//! They are deliberately different tools, and each has a different honesty
+//! profile. The symbolic engine is the fast, general one but can return
+//! [`smt::Verdict::Unknown`] at the BDD size wall. Enumeration is a complete
+//! proof that never says "unknown", but only for small domains. The kernel makes
+//! *composition* of proofs machine-checked by `rustc`. A serious safety argument
+//! uses all three, and says which one it used.
+//!
+//! | # | Mechanism | Entry point | Complete? | Can it lie? |
+//! |---|---|---|---|---|
+//! | 1 | Symbolic — BDD, then CDCL SAT fallback | [`smt::prove`], [`sym`] | no (scaling wall) | no — it returns `Unknown` |
+//! | 2 | Exhaustive — every input of a real domain | [`exhaustive::for_all_u8`], [`exhaustive::for_all_u16`] | yes, small domains | no |
+//! | 3 | Type-level — Curry–Howard kernel | [`proof::Certificate`] | yes, for composition | no — it will not compile |
+//!
+//! # Module map
+//!
+//! ## The engine
+//!
+//! | Module | What it is |
+//! |---|---|
+//! | [`smt`] | The decision procedure: bit-vector terms, ROBDDs, [`smt::Verdict`], counterexamples, the `no_std` arena. |
+//! | [`bitblast`] | The bit-level term graph → CNF lowering, used by the SAT fallback. |
+//! | [`sat`] | The CDCL SAT solver used as the fallback past the BDD wall. |
+//!
+//! ## Specifications and proofs
+//!
+//! | Module | What it is |
+//! |---|---|
+//! | [`sym`] | A symbolic DSL: operator overloading so a specification reads like code, `(x + y).eq(y + x).prove()`. |
+//! | [`logic`] | Checked and saturating arithmetic plus a Q16.16 [`logic::Fixed`] type, each with proofs attached. |
+//! | [`mod@proof`] | A Curry–Howard proof kernel plus composable [`proof::Certificate`]s. |
+//! | [`mod@contract`] | Runtime `requires`/`ensures`/`assert` over concrete values, with structured errors. |
+//! | [`vc`] | [`vc::requires`]/[`vc::ensures`]/[`vc::invariant`], [`vc::verify_body`], and the [`vc::Verified`] witness. |
+//! | [`wp`] | Weakest-precondition generation for statements, loops and calls, with a per-rule [`wp::Report`]. |
+//! | [`mem`] | A bounded symbolic array with a proved [`mem::Mem::read`] / [`mem::Mem::store_wp`] frame condition. |
+//! | [`quant`] | Bounded quantifiers, expanded into finite conjunctions and disjunctions. |
+//!
+//! ## Complete by enumeration
+//!
+//! | Module | What it is |
+//! |---|---|
+//! | [`exhaustive`] | Complete proofs by enumeration over `u8`/`u16` domains: no size wall, no `Unknown`. |
+//!
+//! ## The proved arithmetic, and its symbolic oracle
+//!
+//! | Module | What it is |
+//! |---|---|
+//! | [`arith`] | The sibling crate `verif-arithmetic`, re-exported: total integer operations and a refinement-typed [`arith::Bounded`], each with an enumeration proof carried in the artifact. `no_std`, `#![forbid(unsafe_code)]` and dependency-free on its own. |
+//! | [`primitives`] | The symbolic *oracle* for those same operations: the obligations restated at widths enumeration cannot reach, cross-checked against it by `tests/oracle.rs`. |
+//!
+//! ## Interop and ergonomics
+//!
+//! | Module | What it is |
+//! |---|---|
+//! | [`smtscript`] | SMT-LIB2 export, so an independent solver can decide the same condition. |
+//! | [`macros`] | `verify!`, `verify_implies!`, `contract!`, `proof!`, `assert_proof!`, `check!`, `verify_exhaustive!`. |
+//!
+//! ## Verifying real Rust (`std` only)
+//!
+//! | Module | What it is |
+//! |---|---|
+//! | `mir` | Verify **real Rust**: read `rustc`'s own MIR, symbolically execute it, and discharge rustc's overflow, underflow and division-by-zero asserts plus `/// requires:` / `/// ensures:` doc-comment contracts. |
+//!
+//! The `mir` frontend is the only module that needs a compiler at run time, so it
+//! is behind the `std` feature. Its page appears in this documentation only when
+//! that feature is enabled (the published docs on docs.rs are built with
+//! `--all-features`, so it is there).
+//!
+//! # Feature flags
+//!
+//! | Feature | Default | Effect |
+//! |---|---|---|
+//! | *(none)* | yes | `no_std`, zero dependencies, `core` only. The engine, the DSL, the kernel, the contracts, `wp`, `mem`, `quant`, `exhaustive`. |
+//! | `std` | no | Adds the `mir` frontend, the thread-local arena used by the host-side test suite, and the file-backed helpers. |
+//!
+//! There is no `alloc` feature and no allocator anywhere: every structure is
+//! fixed-size, and the arena has a documented capacity rather than growing.
 //!
 //! # What this is not
 //!
 //! It is not a replacement for SPARK's proof tooling, and it does not make
 //! arbitrary Rust correct. It reasons about **bit-vectors and boolean
-//! predicates**, plus one bounded *array* (`mem`, addressed by an integer). It
+//! predicates**, plus one bounded *array* ([`mem`], addressed by an integer). It
 //! does not model pointers, address arithmetic across objects, aliasing or
-//! concurrency: you cannot state "this pointer is valid" or "these two threads
-//! do not race". The BDD engine is not a CDCL SAT solver: equalities between two
+//! concurrency: you cannot state "this pointer is valid" or "these two threads do
+//! not race". The BDD engine is not a CDCL SAT solver: equalities between two
 //! wide multipliers can hit the size wall, in which case the honest answer is
-//! `Unknown`. Read the module docs before trusting a green test.
+//! [`smt::Verdict::Unknown`].
 //!
-//! # Example
+//! Read each module's page — and the crate `README`, which records the claim each
+//! feature makes and the check that backs it — before trusting a green test.
 //!
-//! ```
-//! use verif::prelude::*;
-//! use verif::sym::*;
+//! # Where to read more
 //!
-//! // ∀ x:u8. x & 0x0f < 16
-//! let proved = verif::smt::with_fresh(|| {
-//!     let x = var(8);
-//!     (x & 0x0fu64).lt_val(16).prove().is_proved()
-//! });
-//! assert!(proved);
-//! ```
+//! - The `README` is the long-form document: one section per claim, with the
+//!   gate that holds it.
+//! - `CONTRIBUTING.md` covers the ground rules and the gate script.
+//! - `SECURITY.md` covers reporting a **soundness bug** — a false `Valid` —
+//!   which is the vulnerability class that matters in a verifier.
+//! - `AGENTS.md` is the engineering log: why each decision was made, including
+//!   the ones that were reversed.
 
 pub mod bitblast;
 pub mod contract;

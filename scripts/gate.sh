@@ -287,6 +287,18 @@ RUSTDOCFLAGS="-D warnings" cargo doc -q -p verif --no-deps --all-features \
 RUSTDOCFLAGS="-D warnings" cargo doc -q -p verif-arithmetic --no-deps \
   || fail "rustdoc warnings (verif-arithmetic)"
 
+# The README is the crate page on crates.io and the only document with a
+# hand-written table of contents. Rustdoc does not read it, so nothing above
+# checks it: a renamed heading leaves a contents entry pointing at an anchor that
+# no longer exists, and the dead link renders as plain text rather than an error.
+# `scripts/check_doc_links.py` resolves every internal anchor and relative file
+# link, and leaves external URLs alone (a network check would fail for reasons
+# that have nothing to do with this tree). It is folded into this step rather than
+# given its own number so the "N/18" headings and the gate references scattered
+# through the docs keep meaning what they say.
+python3 scripts/check_doc_links.py \
+  || fail "broken links in README.md"
+
 echo "== 16/18 the tree ships no build artifacts =="
 # `scripts/gate.sh` runs the oracles, and the oracles run `rustc`, which leaves
 # `lib<name>.rlib` next to the source it compiled. A `git add -A` then commits them. This

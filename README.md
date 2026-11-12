@@ -50,6 +50,64 @@ all obligations discharged
 
 ---
 
+## Contents
+
+**[Getting started](#installation)**
+
+- [Installation](#installation)
+- [The idea in one paragraph](#the-idea-in-one-paragraph)
+- [The three ways this crate proves something](#the-three-ways-this-crate-proves-something)
+- [What is in the box](#what-is-in-the-box)
+- [Building and testing](#building-and-testing)
+- [Layout](#layout)
+
+**[Proving a program](#verification-conditions-are-generated-not-hand-written)**
+
+- [Verification conditions are generated, not hand-written](#verification-conditions-are-generated-not-hand-written)
+- [Memory: `read`, `store`, and the frame condition](#memory-read-store-and-the-frame-condition)
+- [Modular verification: procedures checked once, calls reasoned about through contracts](#modular-verification-procedures-checked-once-calls-reasoned-about-through-contracts)
+- [Bounded quantification: the invariant a loop over memory needs](#bounded-quantification-the-invariant-a-loop-over-memory-needs)
+- [Verifying real Rust: the MIR frontend](#verifying-real-rust-the-mir-frontend)
+
+**[How the engine is held honest](#the-exported-query-must-mean-what-the-engine-proved)** — one section per claim, each naming the check that backs it
+
+- [The exported query must mean what the engine proved](#the-exported-query-must-mean-what-the-engine-proved)
+- [Substitution must not walk a shift amount](#substitution-must-not-walk-a-shift-amount)
+- [A DSL's operator set is a claim too](#a-dsls-operator-set-is-a-claim-too)
+- [Constant operands are folded, so a closed query is decided rather than refused](#constant-operands-are-folded-so-a-closed-query-is-decided-rather-than-refused)
+- [A pin is transitive, and a closed goal is decided without its assumption](#a-pin-is-transitive-and-a-closed-goal-is-decided-without-its-assumption)
+- [A division by a power of two is a shift, on both signs](#a-division-by-a-power-of-two-is-a-shift-on-both-signs)
+- [Mixed-width operations are refused, not truncated](#mixed-width-operations-are-refused-not-truncated)
+- [Differential fuzzing: the shapes I did not think to test](#differential-fuzzing-the-shapes-i-did-not-think-to-test)
+- [The blasting is checked against Rust, not against itself](#the-blasting-is-checked-against-rust-not-against-itself)
+- [Staleness is caught once, in the arena](#staleness-is-caught-once-in-the-arena)
+- [A proof object must not change meaning underneath you](#a-proof-object-must-not-change-meaning-underneath-you)
+- [A wrapper must not overclaim](#a-wrapper-must-not-overclaim)
+- [A truncated witness has to say so](#a-truncated-witness-has-to-say-so)
+- [A negative answer has to say what it swept](#a-negative-answer-has-to-say-what-it-swept)
+- [An unreachable precondition is not a proof](#an-unreachable-precondition-is-not-a-proof)
+- [A bound must be wider than the address, or "all cells" is vacuous](#a-bound-must-be-wider-than-the-address-or-all-cells-is-vacuous)
+- [The memory family, positive side](#the-memory-family-positive-side)
+- [The differential harness now covers memory](#the-differential-harness-now-covers-memory)
+- [A guard compares an index, it does not truncate it](#a-guard-compares-an-index-it-does-not-truncate-it)
+- [A derived frame says whether it is complete](#a-derived-frame-says-whether-it-is-complete)
+- [The obligation cap fails loudly, never silently](#the-obligation-cap-fails-loudly-never-silently)
+- [Differential testing: a proof must not outrun reality](#differential-testing-a-proof-must-not-outrun-reality)
+
+**[Design notes](#why-bdds-at-all)**
+
+- [Why BDDs at all](#why-bdds-at-all)
+
+**[Where this sits](#where-this-sits-in-the-rust-ecosystem)**
+
+- [Where this sits in the Rust ecosystem](#where-this-sits-in-the-rust-ecosystem)
+- [The SPARK comparison, stated plainly](#the-spark-comparison-stated-plainly)
+- [What this is *not* — read this before trusting a green test](#what-this-is-not--read-this-before-trusting-a-green-test)
+- [Documentation](#documentation)
+- [License](#license)
+
+---
+
 ## Installation
 
 ```console
@@ -115,9 +173,14 @@ obligation. That is what `examples/flight_control.rs` demonstrates.
 
 ## What is in the box
 
+The engine is three modules (`smt`, `bitblast`, `sat`); the rest are the
+specification surface, the complete-by-enumeration half, and interop.
+
 | Module | Contents |
 |---|---|
 | `smt` | Bit-vector terms, ROBDD engine, `Verdict`, counterexamples, `no_std` arena |
+| `bitblast` | The bit-level term graph → CNF lowering, used by the SAT fallback |
+| `sat` | The CDCL SAT solver used as the fallback past the BDD wall |
 | `sym` | Operator overloading so specs read like code: `(x + y).eq(y + x).prove()` |
 | `logic` | Checked/saturating arithmetic and a Q16.16 `Fixed` type, each with proofs |
 | `proof` | Curry–Howard kernel (`Truth`, `And`, `Imp`, `Equals`) + composable `Certificate` |
@@ -128,9 +191,16 @@ obligation. That is what `examples/flight_control.rs` demonstrates.
 | `mem` | Bounded symbolic memory: `read`/`store`, frame condition, composes with `wp` |
 | `quant` | Bounded `forall`/`exists`, expanded into finite conjunctions/disjunctions |
 | `exhaustive` | Complete proofs by enumeration over `u8`/`u16` |
-| `primitives` | Total integer ops and a refinement-typed `Bounded<MIN, MAX>` |
+| `primitives` | The symbolic oracle for the `safe_*` ops and `Bounded` (the runtime half is `arith`) |
+| `arith` (sibling crate) | `verif-arithmetic`, re-exported: total integer ops and a refinement-typed `Bounded<MIN, MAX>`, each proved by enumeration |
 | `macros` | `verify!`, `verify_implies!`, `contract!`, `proof!`, `assert_proof!`, `check!`, `verify_exhaustive!` |
 | `mir` (`std` only) | verify **real Rust**: read `rustc`'s own MIR, symbolically execute it, discharge rustc's overflow/underflow/div-by-zero asserts and doc-comment contracts |
+
+The proved runtime primitives live in the sibling crate and are re-exported as
+`verif::arith`, so a caller never has to name the workspace layout. `arith` is
+`no_std`, `#![forbid(unsafe_code)]` and dependency-free on its own — that split
+is what keeps the arithmetic a safety build ships down to `core` and nothing
+else, while this crate keeps the symbolic engine that cross-checks those proofs.
 
 ## Verification conditions are generated, not hand-written
 
@@ -1984,7 +2054,7 @@ says "I could not decide" is worth more than one that guesses.
    linking `rustc-dev`. That keeps the dependency count at zero and makes the
    input inspectable, but it means a rustc release that changes the pretty-printer
    can break the parser. It fails closed when that happens, and the
-   `rustc_public` oracle in `tools/mir-oracle` (gate 9) checks the parser's
+   `rustc_public` oracle in `tools/mir-oracle` (gate 10) checks the parser's
    reading against rustc's own typed MIR, so the breakage is caught by CI rather
    than by a user.
 3. **Contracts are checked at entry and exit only.** A loop invariant written as a
@@ -2604,8 +2674,12 @@ prover symbols.
 
 - The crate's own docs are on [docs.rs/verif](https://docs.rs/verif). They are
   built with `--all-features`, so the `std`-only surface is there too.
+- The sibling crate has its own page: [docs.rs/verif-arithmetic](https://docs.rs/verif-arithmetic).
+  It is re-exported here as `verif::arith`, so its API is documented in both
+  places.
 - This README is the long-form document: each section records a claim the crate
-  makes and the check that backs it.
+  makes and the check that backs it. The [Contents](#contents) list at the top
+  groups those sections.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the ground rules and the gates.
 - [`SECURITY.md`](SECURITY.md) covers reporting a **soundness bug** — a false
   `Valid` — which is the vulnerability class that matters in a verifier.
