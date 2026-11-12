@@ -8711,3 +8711,87 @@ pub fn a_helper_element_copy_is_not_the_old_leaf_cannot_prove_this() -> u8 {
 pub fn copy_first_element(a: &mut [ElemCopy; 1], b: &[ElemCopy; 1]) {
     a[0] = b[0];
 }
+
+// ---------------------------------------------------------------------------
+// An unpinned element write poisons the whole array, and a *copy* of an element
+// must not revive a pre-write leaf.
+//
+// `a[i] = E { v: 7 }` with an unpinned `i` marks every element unknown, because
+// the write could have landed anywhere. The poison has to reach both leaf
+// representations (`elem_parts` and its `nested` mirror) *and* survive the call
+// boundary: a helper's symbolic write used to drop the callee's leaves, copy
+// nothing back, and leave the caller's own leaves in place, so `let x = a[0];
+// x.v` read the value from before the call. These are the false contracts that
+// must stay unproved -- `incomplete` is the honest answer, not `verified`.
+// ---------------------------------------------------------------------------
+
+/// An unpinned write, then an element *copy* read through the copy: the leaf must
+/// not be the pre-write `3`.
+/// requires: i < 2
+/// ensures: ret == 3
+pub fn an_element_copy_after_an_unpinned_write_is_not_the_old_leaf(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    a[i] = ElemCopy { v: 7 };
+    let x = a[0];
+    x.v
+}
+
+/// The other element's obsolete leaf, the same way.
+/// requires: i < 2
+/// ensures: ret == 4
+pub fn an_element_copy_after_an_unpinned_write_is_not_the_sibling(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    a[i] = ElemCopy { v: 7 };
+    let x = a[1];
+    x.v
+}
+
+/// The *new* leaf is not readable either: the write may have landed on element 1,
+/// so no single element is known to be `7`.
+/// requires: i < 2
+/// ensures: ret == 7
+pub fn an_element_copy_after_an_unpinned_write_is_not_the_new_leaf(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    a[i] = ElemCopy { v: 7 };
+    let x = a[0];
+    x.v
+}
+
+/// An unpinned *leaf* write, then an element copy: the same poison, reached
+/// through `a[i].v = 7` rather than a whole-element write.
+/// requires: i < 2
+/// ensures: ret == 3
+pub fn an_element_copy_after_an_unpinned_leaf_write_is_not_the_old_leaf(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    a[i].v = 7;
+    let x = a[0];
+    x.v
+}
+
+/// A helper's unpinned write, then an element copy: the poison has to cross the
+/// call boundary, which is where it was lost.
+/// requires: i < 2
+/// ensures: ret == 3
+pub fn a_helper_unpinned_write_is_not_the_callers_old_leaf(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    set_unpinned(&mut a, i);
+    let x = a[0];
+    x.v
+}
+
+/// The other element, through the same helper.
+/// requires: i < 2
+/// ensures: ret == 4
+pub fn a_helper_unpinned_write_is_not_the_callers_sibling(i: usize) -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    set_unpinned(&mut a, i);
+    let x = a[1];
+    x.v
+}
+
+/// Writes an element the run cannot pin, so the whole array is unknown.
+/// requires: i < 2
+/// ensures: true
+pub fn set_unpinned(a: &mut [ElemCopy; 2], i: usize) {
+    a[i] = ElemCopy { v: 7 };
+}

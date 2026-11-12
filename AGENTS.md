@@ -3638,7 +3638,24 @@ optional file argument, which is what made the measurement cheap.)
   `a_helper_whole_element_write_is_read_back` /
   `..._leaves_its_sibling` / `a_helper_element_copy_is_read_back` and their
   `_cannot_prove_this` twins, asserted in
-  `a_whole_element_write_of_an_aggregate_crosses_a_call_boundary`. And an *array whose type is
+  `a_whole_element_write_of_an_aggregate_crosses_a_call_boundary`.
+  An *unpinned* element write (`a[i] = x`) poisons the whole array, and the poison
+  has to reach *both* leaf representations: `poison_elems` cleared `elem_parts` and
+  left its `nested` mirror, so a later element *copy* (`let x = a[0]`) collected the
+  mirror and **proved** `x.v` was the pre-write leaf. The poison also has to cross
+  the call boundary, which it did not: a helper's symbolic write left the callee with
+  no leaves, the copy-back inserted none, and the caller's own leaves survived. A
+  literal array's elements live in `elems`, which has no `poisoned` flag of its own,
+  so `Env::poisoned_elems` records the local; the argument transfer carries it in,
+  and the copy-back drops the caller's `elems`/`nested`/`elem_parts` for that local
+  before copying anything. Pinned by
+  `an_element_copy_after_an_unpinned_write_is_not_the_old_leaf` /
+  `..._is_not_the_sibling` / `..._is_not_the_new_leaf` /
+  `..._after_an_unpinned_leaf_write_...` and
+  `a_helper_unpinned_write_is_not_the_callers_old_leaf` / `..._sibling`, asserted
+  `!is_verified()` in `an_unpinned_write_poisons_the_whole_array` -- `incomplete` is
+  the honest answer for a write the run cannot pin, and the one outcome that must
+  never appear is `verified`. And an *array whose type is
   a field* (`o.a[0]`) is skipped, since the `indexed` store is keyed by local only (see the note
   below).
   Two notes on what this did *not* need. The nested literal always reaches the

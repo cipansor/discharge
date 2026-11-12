@@ -459,6 +459,17 @@ struct Env {
     /// seeded; a nested read the contract did not name finds nothing here and
     /// stays `Unknown`, which is the same refusal the reader gives today.
     nested: BTreeMap<(u32, Vec<u32>), Val>,
+    /// Locals whose element store was poisoned by a write the run could not pin
+    /// (`a[i] = x` with a symbolic `i`). Every element is unknown, so no read may
+    /// serve one.
+    ///
+    /// `indexed`'s own `poisoned` flag covers an *argument's* array, but a literal
+    /// array's elements live in `elems`, which has no such flag. Without this marker
+    /// the poison was invisible to the call boundary: a helper's `a[i] = E { v: 7 }`
+    /// dropped the callee's elements, the copy-back copied nothing back, and the
+    /// caller's own `elems`/`nested`/`elem_parts` survived -- so a later element read
+    /// or copy returned the *pre-call* leaf, and a false contract was **proved**.
+    poisoned_elems: BTreeSet<u32>,
     /// Locals written as a *whole* place (an empty projection), so the call
     /// return merge can tell "the callee assigned `*v`" from "the callee left
     /// `v` alone". Copying the callee's value back unconditionally would replace
@@ -598,6 +609,7 @@ impl Env {
             elem_parts: BTreeMap::new(),
             fields: BTreeMap::new(),
             nested: BTreeMap::new(),
+            poisoned_elems: BTreeSet::new(),
             payloads: BTreeMap::new(),
             discriminants: BTreeMap::new(),
             deref_ok: BTreeMap::new(),
@@ -793,6 +805,15 @@ impl Env {
         let src = self.resolve(src);
         let Some(k) = self.elem_index_of(&src.proj) else { return false };
         let s = src.local;
+        // A poisoned array's elements are unknown, so no leaf of one is readable --
+        // not even one the poison left behind, and not from the argument store
+        // either. This is the second half of the same hole `poison_elems` closes:
+        // clearing the two leaf maps is not enough if a caller can still collect a
+        // leaf through a stale mirror, and an argument's array carries its own
+        // `poisoned` flag.
+        if self.indexed.get(&s).is_some_and(|st| st.poisoned) || self.poisoned_elems.contains(&s) {
+            return false;
+        }
         let leaves: Vec<(Vec<u32>, Val)> = self
             .elem_parts
             .iter()
@@ -1194,7 +1215,14 @@ impl Env {
                             Some(chain) if !chain.is_empty() => chain,
                             _ => return Val::Unknown,
                         };
-                        let v = *self.elem_parts.get(&(p.local, *k, inner.clone())).unwrap_or(&Val::Unknown);
+                        let v = if self.poisoned_elems.contains(&p.local) {
+                            Val::Unknown
+                        } else {
+                            *self
+                                .elem_parts
+                                .get(&(p.local, *k, inner.clone()))
+                                .unwrap_or(&Val::Unknown)
+                        };
                         i += inner.len();
                         v
                     }
@@ -1557,6 +1585,7 @@ impl Env {
         // Fields *inside* an element of an aggregate literal describe a value that
         // is no longer there once the local is overwritten as a whole.
         self.elem_parts.retain(|(l, _, _), _| *l != local);
+        self.poisoned_elems.remove(&local);
         self.payloads.retain(|(l, _), _| *l != local);
         self.discriminants.remove(&local);
         self.tag_widths.remove(&local);
@@ -1602,8 +1631,24 @@ impl Env {
     /// Mark every element of `local` unknown, keeping the length.
     fn poison_elems(&mut self, local: u32) {
         // A field inside an element describes an element that is no longer pinned,
-        // so it goes with the elements themselves.
+        // so it goes with the elements themselves -- in *both* representations.
+        // `elem_parts` and `nested` are two views of the same leaf, and a symbolic
+        // write that clears one and keeps the other leaves the leaf readable through
+        // the store it did not clear: `a[i] = E { v: 7 }` dropped `a[0]`'s
+        // `elem_parts` entry but not its `nested` mirror, so a later element *copy*
+        // (`let x = a[0]`) collected the mirror and **proved** `x.v == 3` against an
+        // array whose element 0 the write may have replaced. A poisoned element has
+        // no readable leaf, so neither view may survive.
         self.elem_parts.retain(|(l, _, _), _| *l != local);
+        // Every `nested` entry on an array-typed local is an element mirror: its
+        // chain starts with the element index (`[index, field..]`), because an array
+        // has no fields of its own. So the whole set goes -- dropping a leaf is a
+        // missing value, keeping one is a wrong value.
+        self.nested.retain(|(l, _), _| *l != local);
+        // Recorded so the call boundary can tell "the callee poisoned this array"
+        // from "the callee left it alone", and drop the caller's elements in the
+        // first case rather than keeping pre-call leaves.
+        self.poisoned_elems.insert(local);
         match self.indexed.get_mut(&local) {
             Some(s) => s.poisoned = true,
             // A literal array written through a symbolic subscript: the whole
@@ -4083,6 +4128,18 @@ where
                         if leaves_match {
                             env.elem_parts.retain(|(l, _, _), _| *l != cl);
                         }
+                        // A callee that wrote through an index it could not pin
+                        // poisoned its array, so it holds *no* element for the
+                        // caller to take: every element is unknown. Dropping the
+                        // caller's own elements is what keeps the pre-call leaf from
+                        // surviving the call -- keeping it would be a stale *wrong*
+                        // value, and the loops above would have inserted nothing.
+                        if leaves_match && st.env.poisoned_elems.contains(cal) {
+                            env.elems.retain(|(l, _), _| *l != cl);
+                            env.nested.retain(|(l, _), _| *l != cl);
+                            env.elem_parts.retain(|(l, _, _), _| *l != cl);
+                            env.poisoned_elems.insert(cl);
+                        }
                         for ((l, k, chain), v) in st.env.elem_parts.iter() {
                             if *l != *cal {
                                 continue;
@@ -4613,6 +4670,12 @@ where
                         if *l0 == sl {
                             env.elem_parts.insert((l, *k, chain.clone()), *v);
                         }
+                    }
+                    // An already-poisoned array stays poisoned in the callee: its
+                    // elements are unknown, so carrying them in would hand over
+                    // values the caller's own write already invalidated.
+                    if st.env.poisoned_elems.contains(&sl) {
+                        env.poisoned_elems.insert(l);
                     }
                 } else if is_ref {
                     // A sub-place target whose own type is an aggregate: `&mut

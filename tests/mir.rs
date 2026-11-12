@@ -3449,6 +3449,42 @@ fn a_leaf_write_inside_an_element_is_read_back() {
     }
 }
 
+/// An unpinned element write poisons the whole array, and a copy of an element
+/// must not revive a pre-write leaf.
+///
+/// `a[i] = E { v: 7 }` with an unpinned `i` marks every element unknown. The poison
+/// used to reach only one of the two leaf representations: `poison_elems` cleared
+/// `elem_parts` and left its `nested` mirror, so `carry_elem_leaf_onto_local`
+/// collected the mirror on the next element *copy* (`let x = a[0]`) and the copy
+/// read the value from before the write -- a **false proof** of `ret == 3`. The
+/// poison also had to cross the call boundary, which is where a helper's symbolic
+/// write lost it: the callee held no leaves, the copy-back inserted none, and the
+/// caller's own leaves survived.
+///
+/// These are asserted `!is_verified()` rather than `Failed`, because `incomplete` is
+/// the honest answer for a write the run cannot pin: the array is genuinely unknown,
+/// so neither the old leaf nor the new one may be proved. What must never happen is
+/// `verified`, which is what the false contracts below were before.
+#[test]
+fn an_unpinned_write_poisons_the_whole_array() {
+    let names = [
+        "an_element_copy_after_an_unpinned_write_is_not_the_old_leaf",
+        "an_element_copy_after_an_unpinned_write_is_not_the_sibling",
+        "an_element_copy_after_an_unpinned_write_is_not_the_new_leaf",
+        "an_element_copy_after_an_unpinned_leaf_write_is_not_the_old_leaf",
+        "a_helper_unpinned_write_is_not_the_callers_old_leaf",
+        "a_helper_unpinned_write_is_not_the_callers_sibling",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in names {
+        let o = outcome(&report, name);
+        assert!(
+            !o.is_verified(),
+            "an unpinned write leaves no element known, so this must not be proved; got: {o}"
+        );
+    }
+}
+
 /// A whole-*element* write of an aggregate crosses a call boundary too.
 ///
 /// The leaf-write family above covers `a[0].v = 7`. This is the other half: the
