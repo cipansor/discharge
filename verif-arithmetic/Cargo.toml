@@ -9,6 +9,7 @@ repository = "https://github.com/cipansor/verif"
 homepage = "https://github.com/cipansor/verif"
 documentation = "https://docs.rs/verif-arithmetic"
 authors = ["Yayasan Pesantren Cipansor and contributors <halo@cipansor.or.id>"]
+readme = "README.md"
 keywords = ["no_std", "safety-critical", "fixed-point", "checked-arithmetic", "formal-verification"]
 categories = ["no-std", "no-std::no-alloc", "embedded"]
 # Compiled output the oracle runs leave behind; excluded from the `.crate` for the same

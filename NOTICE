@@ -1,0 +1,44 @@
+verif
+Copyright 2026 Yayasan Pesantren Cipansor and contributors
+
+This product includes software developed by Yayasan Pesantren Cipansor and
+contributors (https://github.com/cipansor/verif).
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+
+Third-party projects referenced
+-------------------------------
+
+Nothing from any project below is bundled in, linked against, or redistributed
+by this crate. They are named because the crate's documentation, tests and
+comparison fixtures refer to them, and because naming a project you compare
+yourself to is the honest thing to do. Each is the property of its authors; no
+endorsement is implied in either direction.
+
+* SPARK, SPARK Pro and gnatprove -- AdaCore. The workflow this crate is
+  modelled on (contracts in the source, proofs discharged by a tool). This
+  crate is an independent experiment and is not affiliated with, sponsored by,
+  or supported by AdaCore.
+* Z3 -- Microsoft Research. Used as a differential *oracle* in the test suite
+  (`tests/oracle.rs`, `examples/z3diff.rs`), invoked as a subprocess. Not a
+  dependency of the crate.
+* Kani -- Kani Rust Verifier project. Differential oracle, invoked as a
+  subprocess. Not a dependency.
+* Verus -- Verus project. Differential oracle, invoked as a subprocess. Not a
+  dependency.
+* Prusti -- ETH Zurich. Referenced in the comparison fixtures only; not run by
+  the test suite and not a dependency.
+* MIRAI -- Meta. Referenced in documentation only; not a dependency.
+* Lean 4 -- Lean FRO. Differential oracle, invoked as a subprocess. Not a
+  dependency.
+* Coq -- Inria and contributors. Differential oracle, invoked as a subprocess.
+  Not a dependency.
+* CBMC -- used indirectly by Kani; not a dependency of this crate.
+* Ferrocene -- Ferrocene project. The *qualified* toolchain, used by an optional
+  build gate when a subscription is configured. Not a dependency.
+* rustc_public / `rustc-dev` -- the Rust project. Used by `tools/mir-oracle`, an
+  excluded workspace member that is never published and never a dependency.
+
+The crate itself depends on nothing outside this repository. `scripts/gate.sh`
+step 5 enforces that, so this section cannot drift from the manifests.

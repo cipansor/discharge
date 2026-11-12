@@ -17,6 +17,13 @@ Repository-level notes for agents working in this workspace.
   earlier name `discharge` survives only as the English verb in prose ("the
   proof is *discharged*") and as the `*::discharge()` method that performs the
   discharge, never as a crate or module identifier.
+- Governance files, so the tree is publishable and auditable: `LICENSE`
+  (Apache-2.0, in the root *and* in `verif-arithmetic/`, because a `.crate` must
+  carry its own), `NOTICE` (third-party attribution — SPARK, z3, Kani, Verus,
+  Lean, Coq, Ferrocene and the rest, each of which is an oracle or a comparison,
+  never a dependency), `SECURITY.md` (soundness bugs are the vulnerability class
+  that matters in a verifier), `CONTRIBUTING.md`, `README.md` (the long-form
+  document, and the crate's page on crates.io), and `AGENTS.md` (this file).
 
 ## Renaming the crate: `discharge` → `verif`
 
@@ -47,6 +54,60 @@ Done in one commit. The traps, so a future rename does not repeat them:
   both `Cargo.toml`s now read `github.com/cipansor/verif`, but GitHub will keep
   serving the old path only until the owner renames the repo; until then the
   metadata URL and the real URL disagree. This is a human action, not a code one.
+
+## Publishing to crates.io
+
+The repository is arranged so both crates can be published, and the checks that
+make that true are separate from the ones that make the *code* correct. A crate
+that builds and passes all eighteen gates can still be unpublishable, and the
+failure only surfaces at `cargo publish` — the worst moment, because an upload
+cannot be undone.
+
+- **The crates version independently.** No `[workspace.package] version`, no
+  `version.workspace = true`. A shared version re-versions both crates at once,
+  which is how a release comes to publish a crate nobody asked for. Each
+  `Cargo.toml` states its own `version`.
+- **A release tag names one crate**: `<crate>-v<version>`, e.g.
+  `verif-v0.1.0`. There is deliberately no bare `v<version>` tag — one tag
+  cannot say which of two crates it means. `.github/workflows/release.yml`
+  refuses one rather than interpreting it.
+- **`verif` cannot be packaged until `verif-arithmetic` is on crates.io.**
+  `cargo publish` resolves a `path` dependency against the registry. The two
+  error shapes are `no matching package named ...` (first release) and
+  `failed to select a version for the requirement ...` (a later release, when an
+  older version exists). Both mean "publish the sibling first".
+  `scripts/publish.py` derives the order from the manifests and reports the
+  second as *blocked*, not *broken*.
+- **`verif`'s directory is the repository root**, so `dirty_by_crate` in
+  `publish.py` cannot attribute a root file to `verif` by path prefix (every
+  path is under the root). It relies on cargo's own `--allow-dirty` refusal
+  instead, which is scoped to the crate directory.
+- **`verif-v0.1.0` starts with a `v`.** A bare-tag check written as
+  `tag.startswith("v")` rejects the parent's own valid tags, because the crate is
+  named `verif`. Match `^v[0-9]` instead — the digit is what distinguishes a
+  version from a crate name.
+- **`[package.metadata.docs.rs] all-features = true` is load-bearing.** The
+  default feature set is empty (`no_std`), so without it docs.rs would publish
+  a crate smaller than the one that ships: no `mir` frontend, no proc-macro
+  surface. `scripts/check_package.sh` requires the table only for a crate that
+  actually has a non-default feature, so `verif-arithmetic` needs none.
+- **A `.crate` must carry its own `LICENSE`.** `verif-arithmetic/` had none, so
+  its package shipped no licence text and no README at all. Each crate directory
+  now has `LICENSE`, `README.md` and `NOTICE`, and `check_package.sh` fails if
+  one goes missing. `verif-arithmetic/Cargo.toml` also gained `readme`.
+- **Attribution is per crate, not global.** A project named in `verif`'s source
+  is `verif`'s to attribute; requiring the sibling to name it too is noise.
+  `verif-arithmetic/src/lib.rs` does mention `rustc_public`, so its `NOTICE`
+  names it — that was the one real finding of the first run.
+- **`scripts/check_package.sh` is hermetic.** It reads manifests and the tracked
+  file list and runs no compiler, so it is cheap enough for every pull request.
+  It is a separate script rather than gate 19 because renumbering `gate.sh`'s
+  eighteen checks is churn that risks the checks themselves.
+- **`.github/workflows/release.yml` checks the token before installing
+  anything**, so a missing secret fails in seconds instead of after the build.
+  It dry-runs first, then publishes, then waits for the version to appear in the
+  index. A version already on crates.io is skipped rather than treated as a
+  failure, so a re-run after a partial release finishes the rest.
 
 ## Build and test commands
 
@@ -7988,3 +8049,67 @@ one-line, multi-line and quoted-alias directions), plus six unit tests on the re
 (clippy std + no_std, tests, no_std bare-metal, zero deps, z3 oracle 845 agree / 0 mismatch,
 rustc_public oracle 0 differ, MSRV 1.85, artifacts, unsafe surface still 2). No new SMT primitives:
 every fix is a string read on the same two sides, and the model is unchanged.
+
+## Preparing for crates.io: the checks that are not about correctness
+
+The crate could pass all eighteen gates and still be unpublishable, and the
+failure would only surface at `cargo publish` -- the worst moment, because an
+upload cannot be undone. So the packaging work is a second set of checks, and
+the interesting part is the four things it found that no compiler sees.
+
+**A `.crate` must carry its own licence.** `verif-arithmetic/` had a
+`Cargo.toml`, `src/` and `tests/` and nothing else. `cargo package --list`
+showed ten files and not one of them was a `LICENSE`, so the published crate
+would have shipped no licence text and no README at all -- legally
+unredistributable, and a crates.io page with no documentation. It now has
+`LICENSE` (a real copy, not a symlink: a symlink is not followed into the
+archive), `NOTICE`, and a `README.md` whose example is pinned as a test.
+
+**The bare-version-tag check rejected the parent's own tags.** `publish.py` was
+written from a reference where a bare `v<version>` tag is refused with
+`tag.startswith("v")`. That is correct there and wrong here: this repository's
+parent crate is named `verif`, so its release tag `verif-v0.1.0` also starts
+with `v` and was refused as "a bare version tag". The fix is `^v[0-9]` -- the
+digit is what makes `v0.1.0` a version and `verif-...` a crate name. This is the
+kind of defect a rename introduces: the reference's assumption was invisible
+until the crate it ran against was called something beginning with `v`.
+
+**The docs.rs metadata is load-bearing, and its absence is silent.** The default
+feature set is empty (`no_std`), and the `mir` frontend and the proc-macro
+surface are behind `std`. docs.rs builds the default features unless told
+otherwise, so without `[package.metadata.docs.rs] all-features = true` the
+published documentation would describe a crate *smaller* than the one that
+ships, with no error anywhere. The first version of `check_package.sh` tested
+for the key with `"docs.rs" not in str(metadata)`, which is wrong twice: the
+parsed key is nested (`{"docs": {"rs": {...}}}`), and a crate with no
+non-default feature needs no such table -- demanding one would be a flag with no
+reader, the thing this repository argues against. The check now requires it only
+where there is a feature to lose.
+
+**Attribution is per crate, not global.** The first run reported
+`verif-arithmetic/NOTICE` for `Kani` and `rustc_public`, because the scan
+collected names from *both* crates' sources and then required *each* `NOTICE` to
+name all of them. A project named only in the parent is the parent's to
+attribute. Split per crate, the real finding appeared: `rustc_public` is
+mentioned in `verif-arithmetic/src/lib.rs`, so the sibling's `NOTICE` has to name
+it. Two of the four reports were the check's own bug; that is why the check was
+run against a deliberately broken manifest as well.
+
+**`verif`'s crate directory is the repository root**, so a dirty-file check
+cannot attribute a root file to `verif` by path prefix -- every path is under the
+root. `publish.py` relies on cargo's own `--allow-dirty` refusal for that crate
+instead, which is scoped to the crate directory the way cargo intends.
+
+`scripts/check_package.sh` is hermetic: it reads the manifests and the tracked
+file list and runs no compiler, so it is cheap enough for every pull request. It
+is a separate script rather than a nineteenth gate because renumbering the
+existing eighteen is churn that risks the checks themselves. It, the
+action-pinning check and the `package` dry-run job are all in `ci.yml`; the
+release itself is `.github/workflows/release.yml`, tag-driven, one crate per tag,
+because the two crates version independently.
+
+`scripts/test-count.sh` **796 → 806** passed, 0 failed; `scripts/gate.sh` **ALL
+GATES GREEN** (all eighteen). Two of the ten new tests are the pinned README
+examples (`tests/readme.rs`, `verif-arithmetic/tests/readme.rs`); the other eight
+come with the packaging checks. No engine change: every fix is a manifest field,
+a packaging script, or a document.

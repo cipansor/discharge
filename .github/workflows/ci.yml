@@ -34,6 +34,18 @@ permissions:
   contents: read
 
 jobs:
+  # Runs first and alone: a job that contains an unpinned action dies at "Set up
+  # job" before any step runs, so the check cannot live only in the job it is
+  # meant to police. This job holds one pinned action, so it survives to report
+  # the real reason. The `gate` job runs the check too, for the case where the
+  # unpinned action is added here.
+  pinned:
+    name: actions pinned to a SHA
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: python3 scripts/check_actions_pinned.py
+
   gate:
     name: gates (clippy, tests, no_std, zero deps, z3 oracle)
     runs-on: ubuntu-latest
@@ -71,6 +83,18 @@ jobs:
           python-version: '3.x'
       - name: Install the z3 oracle
         run: python3 -m pip install z3-solver
+
+      # The org rejects unpinned actions, and the failure is a red workflow rather
+      # than a clear message, so catch it here too (the `pinned` job is what
+      # survives an unpinned action in this file).
+      - name: Check every action is pinned to a commit SHA
+        run: python3 scripts/check_actions_pinned.py
+
+      # Packaging hygiene: a manifest missing `readme`, a crate directory with no
+      # LICENSE, a project credited in the source but absent from NOTICE. None of
+      # those fail a build, which is why the check exists.
+      - name: Packaging hygiene
+        run: sh scripts/check_package.sh
 
       # `VERIF_RUSTC` must be a path to a `rustc`, not a toolchain name: the frontend
       # runs it as a subprocess (`Command::new(rustc)`), so a bare `nightly` would look for
@@ -391,3 +415,49 @@ jobs:
           VERIF_RUSTC="$(rustup which --toolchain nightly rustc)"
           export VERIF_RUSTC
           sh tools/comparison/run.sh
+
+  # The crates.io half: a crate that builds and passes every gate can still be
+  # unpackagable, and the failure only shows up at `cargo publish` -- the worst
+  # moment, because an upload cannot be undone. This job packages both crates and
+  # dry-runs the publish in dependency order.
+  #
+  # `verif` depends on `verif-arithmetic` by path, and `cargo publish` resolves
+  # that against the registry, so the parent's dry-run is *expected* to be blocked
+  # until the sibling is on crates.io. `scripts/publish.py` reports that as
+  # "blocked, waiting on ..." and exits 0, so this job distinguishes "the sibling
+  # is not published yet" (normal before the first release) from "the manifest is
+  # broken" (a failure). No `--strict` here, for the same reason.
+  package:
+    name: package (dry-run publish, in dependency order)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      # A crate directory with no LICENSE, or a manifest missing `readme`, is a
+      # `.crate` that is legally or practically unusable. No compiler sees it.
+      - name: Packaging hygiene
+        run: sh scripts/check_package.sh
+
+      # `cargo package` on the sibling, which has no in-repo dependency, must
+      # succeed outright -- there is nothing for it to wait on. The parent is
+      # allowed to be blocked, and `publish.py` says which of the two happened.
+      - name: Dry-run the publish, in dependency order
+        run: python3 scripts/publish.py
+
+      # The `--strict` run is what a maintainer runs after publishing the sibling:
+      # it turns "blocked on a dependency" into a failure. It is expected to fail
+      # here only while the sibling is unpublished, so it is not a gate; it is
+      # reported, not enforced.
+      - name: Report whether the parent is publishable yet
+        run: |
+          if python3 scripts/publish.py --strict >/dev/null 2>&1; then
+            echo "Both crates are publishable now."
+          else
+            echo "::notice::The parent is blocked until verif-arithmetic is on crates.io."
+            echo "This is the expected state before the first release of the sibling."
+          fi

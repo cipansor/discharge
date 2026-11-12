@@ -1,5 +1,10 @@
 # verif — formal verification that lives inside the Rust code
 
+[![crates.io](https://img.shields.io/crates/v/verif.svg)](https://crates.io/crates/verif)
+[![docs.rs](https://docs.rs/verif/badge.svg)](https://docs.rs/verif)
+[![CI](https://github.com/cipansor/verif/actions/workflows/ci.yml/badge.svg)](https://github.com/cipansor/verif/actions/workflows/ci.yml)
+[![license](https://img.shields.io/crates/l/verif.svg)](#license)
+
 > An experiment: what if Rust could carry its own proof tooling the way
 > SPARK/Ada carries `gnatprove`? Not a plugin, not an external solver, not a
 > nightly feature — a **bit-blasting decision procedure compiled into your
@@ -17,7 +22,6 @@
 
 ```rust
 use verif::prelude::*;
-use verif::sym::*;
 
 // ∀ x:u8. (x & 0x0f) < 16          — proved by the embedded SMT engine
 let proved = verif::smt::with_fresh(|| {
@@ -42,6 +46,38 @@ $ cargo run --features std --example flight_control
 [honesty]   (a*b)*c == a*(b*c) at 12 bits  : unknown (no conclusion: budget exhausted, ill-formed query, or stale handle)
 
 all obligations discharged
+```
+
+---
+
+## Installation
+
+```console
+$ cargo add verif
+```
+
+Or, in `Cargo.toml`:
+
+```toml
+[dependencies]
+verif = "0.1"
+
+# The host-side tools (the MIR frontend, the file-backed helpers) need `std`.
+# The engine itself does not: the default build is `no_std` and links `core`
+# and nothing else, which is what a bare-metal safety build wants.
+[dev-dependencies]
+verif = { version = "0.1", features = ["std"] }
+```
+
+The crate has **no dependencies**, so there is nothing else to add and nothing
+from crates.io in your artifact's supply chain. The proved integer primitives
+live in [`verif-arithmetic`](https://crates.io/crates/verif-arithmetic), which
+`verif` depends on; it too is `no_std` and dependency-free.
+
+Building for a microcontroller:
+
+```console
+$ cargo build --target thumbv7em-none-eabihf
 ```
 
 ---
@@ -2563,6 +2599,31 @@ asserted: the script requires a good contract to build *and* the verifier to rep
 `verified` (a build script that silently did nothing would otherwise pass), a broken
 contract to fail the build on its named obligation, and the resulting rlib to carry no
 prover symbols.
+
+## Documentation
+
+- The crate's own docs are on [docs.rs/verif](https://docs.rs/verif). They are
+  built with `--all-features`, so the `std`-only surface is there too.
+- This README is the long-form document: each section records a claim the crate
+  makes and the check that backs it.
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the ground rules and the gates.
+- [`SECURITY.md`](SECURITY.md) covers reporting a **soundness bug** — a false
+  `Valid` — which is the vulnerability class that matters in a verifier.
+- [`AGENTS.md`](AGENTS.md) is the engineering log: why each decision was made,
+  including the ones that were reversed.
+
+The gates are one script:
+
+```console
+$ sh scripts/gate.sh
+```
+
+It runs clippy, the test suite, the `no_std` bare-metal build, the
+zero-dependency check, the differential oracles (z3, Kani, Verus,
+`rustc_public`, Lean 4, Coq), the comparison fixtures, the MSRV build, the
+documentation build, the build-artifact check, the pinned-`unsafe` check and the
+build-time zero-cost check, and prints `ALL GATES GREEN` only when all of them
+hold.
 
 ## License
 

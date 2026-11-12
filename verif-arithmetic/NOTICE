@@ -1,0 +1,25 @@
+verif-arithmetic
+Copyright 2026 Yayasan Pesantren Cipansor and contributors
+
+This product includes software developed by Yayasan Pesantren Cipansor and
+contributors (https://github.com/cipansor/verif).
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+
+Third-party projects referenced
+-------------------------------
+
+Nothing from any project below is bundled in, linked against, or redistributed
+by this crate. It is named because the crate documentation compares itself to it.
+
+* SPARK, SPARK Pro and gnatprove -- AdaCore. The workflow this crate is modelled
+  on. This crate is an independent experiment and is not affiliated with,
+  sponsored by, or supported by AdaCore.
+* rustc_public / `rustc-dev` -- the Rust project. Named because the parent
+  crate's MIR frontend is cross-checked against `rustc_public` in CI. Used only
+  by that oracle, which is a separate, unpublished tool; not a dependency of
+  this crate or of the parent.
+
+The crate itself depends on nothing at all. Its default build links `core` and
+nothing else, which the parent repository's gate 5 enforces.
