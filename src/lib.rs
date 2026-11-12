@@ -43,12 +43,11 @@
 //! // 2. Exhaustive: every input of a small domain, no size wall, never Unknown.
 //! assert!(for_all_u8(|a| a <= 255));
 //!
-//! // 3. Type-level: the kernel builds a proof term `rustc` itself checks.
-//! let cert = Certificate::discharge(verif::smt::with_fresh(|| {
-//!     let x = var(8);
-//!     x.le_val(255)
-//! }));
-//! assert!(cert.is_some());
+//! // 3. Type-level: the kernel builds a proof term and `rustc` checks it, so a
+//! //    falsehood fails to compile rather than returning a verdict.
+//! use verif::proof::{And, Equals, Imp, Truth};
+//! assert_proof!(And<Truth, Imp<Truth, Truth>>);
+//! assert_proof!(Equals<u8, u8>);
 //! ```
 //!
 //! A contract you can state in the source and check at run time, with the same
@@ -79,7 +78,7 @@
 //! ```text
 //! 1. symbolic      smt::prove(p)              -- for all inputs, via BDDs
 //! 2. exhaustive    exhaustive::for_all_u16(p) -- every input, no size wall
-//! 3. type-level    proof::Certificate         -- the compiler checks the proof term
+//! 3. type-level    proof::Theorem             -- the compiler checks the proof term
 //! ```
 //!
 //! They are deliberately different tools, and each has a different honesty
@@ -93,7 +92,15 @@
 //! |---|---|---|---|---|
 //! | 1 | Symbolic — BDD, then CDCL SAT fallback | [`smt::prove`], [`sym`] | no (scaling wall) | no — it returns `Unknown` |
 //! | 2 | Exhaustive — every input of a real domain | [`exhaustive::for_all_u8`], [`exhaustive::for_all_u16`] | yes, small domains | no |
-//! | 3 | Type-level — Curry–Howard kernel | [`proof::Certificate`] | yes, for composition | no — it will not compile |
+//! | 3 | Type-level — Curry–Howard kernel | [`proof::Theorem`], `assert_proof!` | yes, for composition | no — it will not compile |
+//!
+//! The third row is the one to read carefully, because two things in this crate
+//! are easy to confuse. `assert_proof!` is a *compile-time* obligation: it asks
+//! for a [`proof::Theorem`] impl and `rustc` refuses if the proof term cannot be
+//! built, which is why a falsehood is a build error and not a bad verdict.
+//! [`proof::Certificate::discharge`] is the *runtime* solver route: it takes a
+//! predicate to the `smt` engine and returns `Option`, so it can answer `None` at
+//! run time. Both are useful; only the first is checked before the program runs.
 //!
 //! # Module map
 //!
@@ -111,7 +118,7 @@
 //! |---|---|
 //! | [`sym`] | A symbolic DSL: operator overloading so a specification reads like code, `(x + y).eq(y + x).prove()`. |
 //! | [`logic`] | Checked and saturating arithmetic plus a Q16.16 [`logic::Fixed`] type, each with proofs attached. |
-//! | [`mod@proof`] | A Curry–Howard proof kernel plus composable [`proof::Certificate`]s. |
+//! | [`mod@proof`] | The Curry–Howard kernel: [`proof::Theorem`] propositions whose proof terms `rustc` checks at compile time (so `Truth => Falsity` does not build), plus runtime [`proof::Certificate`]s for an engine-produced proof. |
 //! | [`mod@contract`] | Runtime `requires`/`ensures`/`assert` over concrete values, with structured errors. |
 //! | [`vc`] | [`vc::requires`]/[`vc::ensures`]/[`vc::invariant`], [`vc::verify_body`], and the [`vc::Verified`] witness. |
 //! | [`wp`] | Weakest-precondition generation for statements, loops and calls, with a per-rule [`wp::Report`]. |

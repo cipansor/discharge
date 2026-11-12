@@ -28,7 +28,7 @@
 //!
 //! | Module | What it gives you |
 //! |---|---|
-//! | [`checked`] | Total arithmetic: [`checked_add`], [`checked_sub`], [`checked_mul`], [`mul_div`], [`saturating_add`], [`saturating_sub`]. Each returns `Option`, and `None` is exactly the case the machine op would have wrapped or panicked. |
+//! | [`checked`] | Total arithmetic, split by what a caller does with the overflow. [`checked_add`], [`checked_sub`], [`checked_mul`] and [`mul_div`] return `Option`, where `None` is exactly the case the machine op would have wrapped or panicked. [`saturating_add`] and [`saturating_sub`] return a plain `u32` and **clamp** at the bound instead of reporting it, so there is no `None` to check. |
 //! | [`bounded`] | The `safe_*` functions (the same total route) and [`Bounded<MIN, MAX>`](bounded::Bounded), a refinement-typed integer whose constructors are the only way in. |
 //! | [`fixed`] | [`Fixed`], a Q16.16 fixed-point number: deterministic, no floating point, no soft-float dependency. |
 //! | [`prove`] | The proofs, discharged by exhaustive enumeration. This is the module that makes the rest trustworthy. |

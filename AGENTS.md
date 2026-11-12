@@ -8238,3 +8238,85 @@ crate-docs now carry three runnable examples where they previously carried one,
 and the suite count moved from 806 to 808 accordingly -- a `+2` and not a `+3`
 because the old single example was replaced rather than kept. That the count
 moved at all is the check that the examples are real and not prose.
+
+## A documentation review found three claims the new docs made that were false
+
+The rewrite above was itself reviewed, and three findings came back. All three
+were real, and two of them were defects in the *checker* and the *docs* rather
+than in the code -- which is the point worth recording: the material that is
+supposed to be authoritative is the material least covered by the gates.
+
+**The link checker dropped the fragment on a cross-document link.** `check`
+partitioned the target into file and fragment, then used only the file part for
+the existence test, so `[Ground rules](CONTRIBUTING.md#missing-heading)` passed
+as long as `CONTRIBUTING.md` existed. A renamed heading in another document is
+exactly the failure the checker was added to catch, and it caught it only for
+same-document links. The fix reads the target file and resolves the fragment
+against its anchors -- the same `anchors()` the same-document path uses -- with
+the target's anchors cached per file, since the README links the same documents
+repeatedly and re-reading them per link would be quadratic. Non-Markdown targets
+(a `.rs`, a `.toml`) have no headings to resolve, so for those the existence
+check remains the whole check. This is a textbook case of a guard that looks
+comprehensive and covers one of the two shapes it must: the same-document branch
+was tested, the cross-document branch was not, and the untested branch is the one
+with the wider reach. The checker now also discovers its inputs (`*.md` at the
+root) instead of taking the README alone, so a document added later is checked
+without anyone remembering to list it.
+
+**`saturating_add`/`saturating_sub` were described as returning `Option`.** The
+table in `verif-arithmetic`'s crate doc grouped them with `checked_add` and said
+"each returns `Option`, and `None` is exactly the case the machine op would have
+wrapped". They return `u32` and clamp. A reader who trusted the table would write
+`if let Some(x) = saturating_add(a, b)`, which does not compile -- the mildest
+outcome available, since the wrong belief is "I will get a `None` and handle it",
+and the whole reason to reach for the saturating form is to not handle it. The
+table now separates the two families by what the caller does with the overflow.
+
+**The third quick-start example demonstrated the runtime solver while the text
+called it type-level.** `proof::Certificate::discharge` calls `smt::prove` and
+returns `Option`; it is the runtime route. The compile-time route is
+`assert_proof!`, which asks for a `proof::Theorem` impl and lets `rustc` refuse.
+The example now uses `assert_proof!(And<Truth, Imp<Truth, Truth>>)`, and the
+"three ways" table names `proof::Theorem` as the entry point, with a paragraph
+that separates the two because they are genuinely easy to confuse -- the module
+row for `proof` said "a Curry-Howard proof kernel plus composable `Certificate`s"
+without saying which of the two the compiler checks. The compile_fail doctests
+already in `proof.rs` are what make `assert_proof!` more than a naming
+convention: they assert that `Falsity` and `Truth => Falsity` do not build.
+
+## `gate.sh` needed an environment variable it did not set itself
+
+Running the gates the way `CONTRIBUTING.md` tells a contributor to run them --
+`sh scripts/gate.sh`, on a fresh checkout, with nothing exported -- failed 21
+tests at gate 2. Every failure was in `tests/mir.rs`, and the message was
+`reads must be present`: a frontend outcome, which reads as "the verifier is
+broken". It is not. `tests/mir.rs` shells out to the compiler named by
+`VERIF_RUSTC`, and the tests that need it are written to skip when it is unset --
+but `verify_src` returns `None` when `rustc()` is `None`, and several tests call
+`.expect("reads must be present")` on that `None`, so they *panic* instead of
+skipping. Whether they skip or panic depends on the assertion each one happens to
+make, which is why the count was 21 and not 239.
+
+`gate.sh` did resolve `VERIF_RUSTC`, but in gate 8 -- the MIR frontend gate --
+and `tests/mir.rs` is run by gate 2. So the variable was set for the gate that
+did not need it and unset for the gate that did. It only ever worked in CI
+because the workflow exports it before calling the script (to a nightly, with a
+comment explaining that it must be a path and not a toolchain name), which means
+the documented local command and the CI command disagreed, and the difference was
+invisible until someone ran the documented one. This is the same defect class as
+the release workflow above: a step correct about its own output and wrong about
+what the next step needs.
+
+The resolution block now sits at the top of the script, before gate 1, and gate 8
+just reports what it resolved. The fallback is `rustc` on `PATH` -- a stable
+release, which is sufficient because the frontend uses `--emit=mir` and not the
+nightly-only `-Zunpretty=mir`. The run below was made with `VERIF_RUSTC` unset to
+exercise exactly the fresh-checkout path that was broken, and all 239 `mir` tests
+pass.
+
+The same review turned up a false positive in the new link checker: it skipped
+fenced code blocks but not inline code spans, so the paragraph you are reading --
+which quotes `[Ground rules](CONTRIBUTING.md#missing-heading)` as the example the
+checker exists to catch -- failed the check. A link in an inline span renders as
+code and is not clickable, so `strip_inline_code` now removes those spans first,
+matching backtick runs of equal length so ``a`b`` is one span.
