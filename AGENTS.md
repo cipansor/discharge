@@ -3620,7 +3620,25 @@ optional file argument, which is what made the measurement cheap.)
   `a_helper_leaf_write_through_a_mutable_array_...` / `a_helper_leaf_read_...` /
   `a_returned_array_of_aggregates_...` with their `_cannot_prove_this` twins, asserted in
   `a_leaf_write_inside_an_element_is_read_back` and
-  `an_element_leaf_store_crosses_a_call_boundary`. And an *array whose type is
+  `an_element_leaf_store_crosses_a_call_boundary`.
+  A *whole-element* write of an aggregate (`a[0] = E { v: 7 }`) is the other half,
+  and through a `&mut` argument it lowers to `(*_1)[_3] = move _2` -- the leading
+  `Deref` is what the re-root gate used to miss, because it read `dest.proj`
+  directly; `elem_index_of` reads past it now (and past the `Deref` on a source
+  element too, so `rebase_elem_parts` takes the element-source arm for rustc's usual
+  `IndexVar` spelling, not only a constant `Proj::Index`). An element *copy*
+  (`a[0] = b[0]`) goes through a temp, and reading an element hands over its leaf
+  *scalar* rather than its parts, so `carry_elem_leaf_onto_local` moves them onto
+  that temp; that pair was `incomplete` in both directions, not a false proof. The
+  copy-back drops the caller's own leaves for a whole-local target *before* copying
+  the callee's in, because a callee that wrote through an index it could not pin
+  poisoned its array and holds none -- keeping the caller's would leave a stale
+  pre-call leaf readable. Pinned by
+  `an_element_copy_from_another_element_is_read_back` /
+  `a_helper_whole_element_write_is_read_back` /
+  `..._leaves_its_sibling` / `a_helper_element_copy_is_read_back` and their
+  `_cannot_prove_this` twins, asserted in
+  `a_whole_element_write_of_an_aggregate_crosses_a_call_boundary`. And an *array whose type is
   a field* (`o.a[0]`) is skipped, since the `indexed` store is keyed by local only (see the note
   below).
   Two notes on what this did *not* need. The nested literal always reaches the

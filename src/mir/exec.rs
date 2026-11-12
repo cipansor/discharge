@@ -752,6 +752,83 @@ impl Env {
         cur
     }
 
+    /// The element index a place's subscript names, when the run can pin it.
+    ///
+    /// `a[0]` and `a[_3]` are the same element, and rustc spells the subscript as a
+    /// local (`IndexVar`) in almost every shape the frontend meets; a leading
+    /// `Deref` (`(*_1)[_3]`, how a write through a `&mut [T; N]` lowers) names the
+    /// same local's element, and reading past it is what the element-write paths
+    /// need -- without that a whole-element write through a helper never reached
+    /// its re-root, so the caller's leaf survived the call.
+    ///
+    /// A subscript the run cannot pin returns `None`: it names no single element, so
+    /// no single slot can be re-rooted onto. Anything past the subscript is not part
+    /// of the index either, and is refused.
+    fn elem_index_of(&self, proj: &[Proj]) -> Option<u64> {
+        let proj = match proj.first() {
+            Some(Proj::Deref) => &proj[1..],
+            _ => proj,
+        };
+        match proj {
+            [Proj::Index(k)] => Some(*k),
+            [Proj::IndexVar(li)] => match self.locals.get(li) {
+                Some(Val::Sym(x, _)) => smt::evaluate(*x, |_| None),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Move one element's leaves onto a whole local, as that local's own parts.
+    ///
+    /// The inverse of [`Self::rebase_elem_parts`]. `_5 = copy _3[_6]` -- the first
+    /// half of `a[0] = b[0]` -- reads an element of `_3` into a temp, and the leaves
+    /// under `(3, 0, chain)` become the temp's `fields`/`nested` parts, so the second
+    /// half's re-root finds them like any whole-local source. Without this the leaves
+    /// die at the temp: reading an element yields its leaf *scalar*, not its parts,
+    /// so the write saw a scalar and the destination leaf read `Unknown` -- a
+    /// coverage hole in both directions, and the reason `rebase_elem_parts`'s
+    /// element-source arm alone was not enough.
+    fn carry_elem_leaf_onto_local(&mut self, src: &Place, dest: u32) -> bool {
+        let src = self.resolve(src);
+        let Some(k) = self.elem_index_of(&src.proj) else { return false };
+        let s = src.local;
+        let leaves: Vec<(Vec<u32>, Val)> = self
+            .elem_parts
+            .iter()
+            .filter(|((l, ek, _), _)| *l == s && *ek == k)
+            .map(|((_, _, c), v)| (c.clone(), *v))
+            .collect();
+        let nested: Vec<(Vec<u32>, Val)> = self
+            .nested
+            .iter()
+            .filter(|((l, c), _)| *l == s && c.first() == Some(&(k as u32)))
+            .map(|((_, c), v)| (c[1..].to_vec(), *v))
+            .collect();
+        if leaves.is_empty() && nested.is_empty() {
+            return false;
+        }
+        if s == dest {
+            return false;
+        }
+        // The destination is replaced whole, so its previous parts must not survive:
+        // a leaf the source does not carry would be a stale *wrong* value. This is
+        // the same drop `copy_parts` does, and for the same reason -- `set` is told
+        // `Val::Agg` (parts moved), so it will not clear them itself.
+        self.forget_parts(dest);
+        for (chain, v) in leaves.into_iter().chain(nested) {
+            match chain.as_slice() {
+                [f] => {
+                    self.fields.insert((dest, *f), v);
+                }
+                _ => {
+                    self.nested.insert((dest, chain), v);
+                }
+            }
+        }
+        true
+    }
+
     /// Follow one level of *value* indirection: the place a pointer local's
     /// value addresses.
     ///
@@ -1608,34 +1685,36 @@ impl Env {
         let src = self.resolve(src);
         // A whole-local source, or an element of one. The latter's parts are keyed
         // by the source's own index, which is what makes them re-keyable here.
-        if let [Proj::Index(sk)] = src.proj.as_slice() {
-            let sk = *sk;
-            let leaves: Vec<(Vec<u32>, Val)> = self
-                .elem_parts
-                .iter()
-                .filter(|((l, k, _), _)| *l == src.local && *k == sk)
-                .map(|((_, _, c), v)| (c.clone(), *v))
-                .collect();
-            let nested: Vec<(Vec<u32>, Val)> = self
-                .nested
-                .iter()
-                .filter(|((l, c), _)| *l == src.local && c.first() == Some(&(sk as u32)))
-                .map(|((_, c), v)| (c[1..].to_vec(), *v))
-                .collect();
-            let moved = !leaves.is_empty() || !nested.is_empty();
-            for (chain, v) in leaves {
-                self.elem_parts.insert((dest, index, chain.clone()), v);
-                let mut prefix = vec![index as u32];
-                prefix.extend_from_slice(&chain);
-                self.nested.insert((dest, prefix), v);
+        if src.proj.len() == 1 || matches!(src.proj.as_slice(), [Proj::Deref, _]) {
+            if let Some(sk) = self.elem_index_of(&src.proj) {
+                let s = src.local;
+                let leaves: Vec<(Vec<u32>, Val)> = self
+                    .elem_parts
+                    .iter()
+                    .filter(|((l, k, _), _)| *l == s && *k == sk)
+                    .map(|((_, _, c), v)| (c.clone(), *v))
+                    .collect();
+                let nested: Vec<(Vec<u32>, Val)> = self
+                    .nested
+                    .iter()
+                    .filter(|((l, c), _)| *l == s && c.first() == Some(&(sk as u32)))
+                    .map(|((_, c), v)| (c[1..].to_vec(), *v))
+                    .collect();
+                let moved = !leaves.is_empty() || !nested.is_empty();
+                // The element being written replaces whatever leaf it had: a leaf
+                // the new source does not carry must not survive from the old one,
+                // which would be a stale *wrong* value rather than a missing one.
+                self.elem_parts.retain(|(l, k, _), _| *l != dest || *k != index);
+                self.nested
+                    .retain(|(l, c), _| *l != dest || c.first() != Some(&(index as u32)));
+                for (chain, v) in leaves.into_iter().chain(nested) {
+                    self.elem_parts.insert((dest, index, chain.clone()), v);
+                    let mut prefix = vec![index as u32];
+                    prefix.extend_from_slice(&chain);
+                    self.nested.insert((dest, prefix), v);
+                }
+                return moved;
             }
-            for (chain, v) in nested {
-                self.elem_parts.insert((dest, index, chain.clone()), v);
-                let mut prefix = vec![index as u32];
-                prefix.extend_from_slice(&chain);
-                self.nested.insert((dest, prefix), v);
-            }
-            return moved;
         }
         if !src.proj.is_empty() {
             return false;
@@ -3676,15 +3755,7 @@ where
                     // index the run can pin names one element, and a symbolic one has
                     // no slot to re-root onto.
                     if matches!(type_of_place(cur, q), Some(Ty::Other(_))) {
-                        let index = match dest.proj.as_slice() {
-                            [Proj::Index(k)] => Some(*k),
-                            [Proj::IndexVar(li)] => match st.env.locals.get(li) {
-                                Some(Val::Sym(x, _)) => smt::evaluate(*x, |_| None),
-                                _ => None,
-                            },
-                            _ => None,
-                        };
-                        if let Some(k) = index {
+                        if let Some(k) = st.env.elem_index_of(&dest.proj) {
                             st.env.rebase_elem_parts(q, dest.local, k);
                         }
                     }
@@ -4001,6 +4072,17 @@ where
                         // no read consults, so the caller's leaves go instead (the
                         // `dropped` path), which loses precision and never keeps a
                         // stale value.
+                        //
+                        // The caller's own leaves for that local are dropped *before*
+                        // the callee's are copied in, because a whole-local target is
+                        // replaced by the callee's post-state. A callee that wrote
+                        // through an index it could not pin poisoned its array and
+                        // holds *no* leaves for it; keeping the caller's would leave
+                        // the pre-call leaf readable, which is a stale *wrong* value.
+                        let leaves_match = matches!(&rest_chain, Some(rc) if rc.is_empty());
+                        if leaves_match {
+                            env.elem_parts.retain(|(l, _, _), _| *l != cl);
+                        }
                         for ((l, k, chain), v) in st.env.elem_parts.iter() {
                             if *l != *cal {
                                 continue;
@@ -4776,6 +4858,16 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
             if dest.proj.is_empty() {
                 if let Operand::Copy(q) | Operand::Move(q) = o {
                     if env.copy_parts(q, dest.local) {
+                        return Val::Agg;
+                    }
+                    // Reading an *element* of an array of aggregates (`_5 = copy
+                    // _3[_6]`, the first half of `a[0] = b[0]`) hands over the
+                    // element's leaf *scalar*, not its parts, so the leaves under
+                    // that element have to be carried onto the temp explicitly.
+                    // Without this they died at the temp: the assignment's re-root
+                    // then found a scalar and the destination leaf read `Unknown`,
+                    // leaving the contract `incomplete` in both directions.
+                    if env.carry_elem_leaf_onto_local(q, dest.local) {
                         return Val::Agg;
                     }
                 }

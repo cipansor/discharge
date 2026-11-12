@@ -3449,6 +3449,50 @@ fn a_leaf_write_inside_an_element_is_read_back() {
     }
 }
 
+/// A whole-*element* write of an aggregate crosses a call boundary too.
+///
+/// The leaf-write family above covers `a[0].v = 7`. This is the other half: the
+/// whole element is replaced, which lowers to `(*_1)[_3] = move _2` through a
+/// `&mut` argument. The element's own *value* crossed the boundary already, but its
+/// leaves did not, so the caller read the leaf its literal had before the call and a
+/// false `ret == 3` was **proved**. The gate that re-roots the leaves read
+/// `dest.proj` directly and so missed the leading `Deref` this shape carries; it
+/// goes through `elem_index_of` now, which reads past it.
+///
+/// The element-copy case (`a[0] = b[0]`) needed one more piece: reading an element
+/// hands over its leaf *scalar*, not its parts, so the leaves died at the temp the
+/// copy goes through. `carry_elem_leaf_onto_local` moves them onto that temp. That
+/// pair was `incomplete` in both directions before, not a false proof.
+#[test]
+fn a_whole_element_write_of_an_aggregate_crosses_a_call_boundary() {
+    let verified = [
+        "an_element_copy_from_another_element_is_read_back",
+        "a_helper_whole_element_write_is_read_back",
+        "a_helper_whole_element_write_leaves_its_sibling",
+        "a_helper_element_copy_is_read_back",
+    ];
+    let refuted = [
+        "an_element_copy_is_not_the_old_leaf_cannot_prove_this",
+        "a_helper_whole_element_write_is_not_the_callers_leaf_cannot_prove_this",
+        "a_helper_whole_element_write_is_not_the_sibling_cannot_prove_this",
+        "a_helper_element_copy_is_not_the_old_leaf_cannot_prove_this",
+    ];
+    let mut names = verified.to_vec();
+    names.extend_from_slice(&refuted);
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a whole-element write must reach the read; got: {o}");
+    }
+    for name in refuted {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a stale element leaf must not prove this; got: {o}"
+        );
+    }
+}
+
 /// The leaf store crosses both call boundaries: an argument and a return.
 ///
 /// A helper that writes a leaf through `&mut [T; N]` had its write die with the

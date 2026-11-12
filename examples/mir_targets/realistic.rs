@@ -8591,3 +8591,123 @@ pub fn a_returned_array_of_aggregates_is_not_a_made_up_value_cannot_prove_this()
 pub fn make_one(x: u8) -> [ElemInner; 1] {
     [ElemInner { v: x }]
 }
+
+// ---------------------------------------------------------------------------
+// Whole-*element* writes of aggregates, and the element copy, across a call.
+//
+// The leaf-write family above covers `a[0].v = 7`. This is the other half: the
+// whole element is replaced (`a[0] = E { v: 7 }`, which lowers to `(*_1)[_3] =
+// move _2` through a `&mut` argument). The element's own value crossed the call
+// boundary already, but its *leaves* did not, so the caller read the leaf its
+// literal had before the call and a false `ret == 3` was **proved**. The
+// `_cannot_prove_this` twins are that false contract.
+// ---------------------------------------------------------------------------
+
+/// A copyable element, so `a[0] = b[0]` is a plain element read and write rather
+/// than a move out of a borrow.
+#[derive(Clone, Copy)]
+pub struct ElemCopy {
+    pub v: u8,
+}
+
+/// An element copied from another array's element, then its leaf read back.
+/// requires: true
+/// ensures: ret == 7
+pub fn an_element_copy_from_another_element_is_read_back() -> u8 {
+    let mut a = [ElemCopy { v: 3 }];
+    let b = [ElemCopy { v: 7 }];
+    a[0] = b[0];
+    a[0].v
+}
+
+/// The false direction: the destination's pre-copy leaf is `3`, so a copy that
+/// never reached the leaf store would decide this wrongly.
+/// requires: true
+/// ensures: ret == 3
+pub fn an_element_copy_is_not_the_old_leaf_cannot_prove_this() -> u8 {
+    let mut a = [ElemCopy { v: 3 }];
+    let b = [ElemCopy { v: 7 }];
+    a[0] = b[0];
+    a[0].v
+}
+
+/// A helper replaces a whole element through `&mut [ElemCopy; 1]`: the element's
+/// leaves have to cross back to the caller.
+/// requires: true
+/// ensures: ret == 7
+pub fn a_helper_whole_element_write_is_read_back() -> u8 {
+    let mut a = [ElemCopy { v: 3 }];
+    set_whole_element(&mut a, 7);
+    a[0].v
+}
+
+/// The false direction of the helper's whole-element write.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_helper_whole_element_write_is_not_the_callers_leaf_cannot_prove_this() -> u8 {
+    let mut a = [ElemCopy { v: 3 }];
+    set_whole_element(&mut a, 7);
+    a[0].v
+}
+
+/// Replaces the first element of a mutable array argument.
+/// requires: true
+/// ensures: true
+pub fn set_whole_element(a: &mut [ElemCopy; 1], v: u8) {
+    a[0] = ElemCopy { v };
+}
+
+/// A helper replaces *one* element of a two-element array; the sibling must keep
+/// its own leaf, which a store that dropped the whole array would lose.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_helper_whole_element_write_leaves_its_sibling() -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    set_second_element(&mut a, 9);
+    a[0].v
+}
+
+/// The false direction of the sibling check: `9` is the *other* element's new
+/// leaf, so a store that put the write on element 0 would prove this.
+/// requires: true
+/// ensures: ret == 9
+pub fn a_helper_whole_element_write_is_not_the_sibling_cannot_prove_this() -> u8 {
+    let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
+    set_second_element(&mut a, 9);
+    a[0].v
+}
+
+/// Replaces the second element of a mutable array argument.
+/// requires: true
+/// ensures: true
+pub fn set_second_element(a: &mut [ElemCopy; 2], v: u8) {
+    a[1] = ElemCopy { v };
+}
+
+/// A helper copies one element onto another through two arguments: the source's
+/// leaves have to cross *in* and the destination's *out*.
+/// requires: true
+/// ensures: ret == 7
+pub fn a_helper_element_copy_is_read_back() -> u8 {
+    let mut a = [ElemCopy { v: 3 }];
+    let b = [ElemCopy { v: 7 }];
+    copy_first_element(&mut a, &b);
+    a[0].v
+}
+
+/// The false direction of the helper's element copy.
+/// requires: true
+/// ensures: ret == 3
+pub fn a_helper_element_copy_is_not_the_old_leaf_cannot_prove_this() -> u8 {
+    let mut a = [ElemCopy { v: 3 }];
+    let b = [ElemCopy { v: 7 }];
+    copy_first_element(&mut a, &b);
+    a[0].v
+}
+
+/// Copies the first element of `b` onto the first element of `a`.
+/// requires: true
+/// ensures: true
+pub fn copy_first_element(a: &mut [ElemCopy; 1], b: &[ElemCopy; 1]) {
+    a[0] = b[0];
+}
