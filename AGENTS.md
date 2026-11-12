@@ -642,9 +642,16 @@ Four refusals are deliberate, and each is the safe direction:
   wrapped signature), never a partial one.
 * A **reference argument** is refused. `Ty::Ref` is modelled as its referent, so a
   `&mut` write would land on the caller's value and not reach the local it names;
-  there is no aliasing model to carry it back. Note that rustc also *elides* the
-  receiver from a method call's argument list (`Slot::stash(_1, _2)`), so a
-  receiver-aware arity check is a separate problem this route does not attempt.
+  there is no aliasing model to carry it back. rustc does **not** elide the
+  receiver: `s.stash(x, 2)` dumps as `Slot::stash(copy _1, copy _2, const 2_u32)`
+  and a trait call as `<T as Bump>::bump(copy _1, copy _2)`, receiver first, so the
+  argument count already includes it. The real limitation is on the *source* side:
+  `spec::fn_signature` reads `name: Type` pairs, and a receiver has no such form
+  (`self`, `&self`, `&mut self`), so a method signature comes back short by the
+  receiver and `try_callee_contract` refuses on the arity mismatch. Even a
+  receiver the scanner *did* read would then hit the reference refusal above, since
+  `&self` is a `Ty::Ref`. So a bodyless method call is refused, deliberately and by
+  two independent checks, not by a missing arity check.
 * **Inlining wins when it can.** The contract route runs *after* `resolve_callee`,
   never before. When the body is in the dump, inlining executes the callee rather
   than trusting what it promised, so it is strictly more precise; a contract route
@@ -655,6 +662,46 @@ Four refusals are deliberate, and each is the safe direction:
 `CalleeEnv` resolves through `Specs::resolve`, so an `impl`-keyed contract and a
 path-keyed one are both found by the rule the frontend already uses to attach a
 contract to its function, rather than by a second lookup rule that could drift.
+
+## A trait declaration's contract belongs to its implementations
+
+A trait method declaration has no body, so rustc emits no MIR for it and it can
+never be a verification target. Its contract is a promise every implementation
+inherits, and the implementation is where it is kept or broken. Filing it with the
+free functions was a **false proof**, not a cosmetic mis-filing: `by_fn` keys match
+by unique path suffix, so a key `Bump::bump` answered a lookup for a free
+`fn bump() -> u8 { 9 }`, that body was checked against the trait's
+`ensures: ret == 9`, passed, and was reported `Bump::bump: Verified` -- naming the
+trait method as verified when no implementation existed in the file at all.
+
+Four rules follow, and the first two are the ones that make it sound:
+
+* A **bodyless `fn` inside a `trait`** goes to `Specs::by_trait`, keyed
+  `Trait::method` with the trait's module-qualified path. A trait *default* has a
+  body, is real MIR, and stays in `by_fn` under the `T::value` key rustc prints for
+  it -- `spec::fn_has_body` is what tells the two apart.
+* **Each implementation is a target**, discovered by inverting the inheritance:
+  for every `impl` and every contract its trait declares, the impl's method is
+  checked against that contract. Without this the promise was inherited by
+  `resolve` (so a *call* to it was answered correctly) but never checked on any
+  body, and the declaration was not in `by_fn` to be reported missing either -- a
+  silently unenforced claim, the one outcome this frontend treats as worse than a
+  refusal.
+* A **declaration with no implementation in the file** is reported, with the
+  reason spelled out so it is not mistaken for a missing body. It can never be a
+  target, and leaving it unmentioned would make the run clean while the claim went
+  unchecked.
+* **Two contracts for one method are refused, naming both.** When the impl and its
+  trait each declare a contract, `resolve` can return only one, so whichever it
+  dropped would vanish without a word; preferring either is indefensible. The
+  refusal is what loses nothing.
+
+Tail counts are taken over *distinct functions*, not table entries: a method that
+declares its own contract and also inherits its trait's appears in both tables, and
+counting it twice would spell its report key `Owner::method` even when it is the
+only one. Two implementations of one contracted trait are genuinely ambiguous and
+do get `Owner::method`, which is what keeps one `outcomes` entry from hiding the
+other.
 
 ## A verifier needs a differential harness, not just unit tests
 

@@ -11,7 +11,7 @@
 //! That rule is why [`FnOutcome`] has a distinct `Incomplete` state instead of
 //! folding cutoffs into `Verified`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -210,6 +210,12 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
                 ),
             };
         }
+    }
+    // Two contracts for one function: the impl's own and the trait's it inherits.
+    // `resolve` can only return one, so the other would be dropped without a word.
+    // Refused, naming both, because a claim the source wrote must not vanish.
+    if let Some(reason) = specs.contract_conflict(&f.name) {
+        return FnOutcome::Skipped { reason };
     }
     let arg_vars = spec::arg_vars(f);
     let signed = spec::signed_args(f);
@@ -711,10 +717,21 @@ fn resolve_targets<'a>(
     prog: &'a MirProgram,
     specs: &Specs,
 ) -> (Vec<(String, &'a MirFn)>, Vec<String>) {
-    // How many contracted methods share each tail, so a colliding one can be
-    // spelled `Owner::method` and stay distinguishable.
+    // Every method that will be a target, from its own contract or from a trait
+    // declaration's, so the tail count below sees both kinds. Counting only
+    // `by_method` let two impls of one contracted trait both be keyed by the bare
+    // tail, and one `outcomes` entry then hid the other -- the same collapse the
+    // location key exists to prevent.
+    let method_targets = trait_method_targets(specs);
+    // Counted over *distinct* functions, not table entries: a method that declares
+    // its own contract and also inherits its trait's appears in both, and counting
+    // it twice would spell its key `Owner::method` even though it is the only one
+    // -- a key the tests and the report do not expect, for a method that is not
+    // ambiguous at all.
+    let mut distinct: BTreeSet<(usize, usize, String)> = specs.by_method.keys().cloned().collect();
+    distinct.extend(method_targets.iter().cloned());
     let mut tail_counts: BTreeMap<&str, usize> = BTreeMap::new();
-    for (_, _, method) in specs.by_method.keys() {
+    for (_, _, method) in &distinct {
         *tail_counts.entry(method.as_str()).or_default() += 1;
     }
 
@@ -773,27 +790,94 @@ fn resolve_targets<'a>(
             None => missing.push((*key).clone()),
         }
     }
-    for (line, col, method) in specs.by_method.keys() {
-        match prog.fns.iter().find(|f| f.impl_loc == Some((*line, *col))
-            && f.name.rsplit("::").next() == Some(method.as_str()))
-        {
-            Some(f) => {
-                let ambiguous = tail_counts.get(method.as_str()).copied().unwrap_or(0) > 1
-                    || specs.by_fn.contains_key(method.as_str());
-                let key = if ambiguous {
-                    match prog.impl_owners.get(&(*line, *col)) {
-                        Some(owner) => format!("{owner}::{method}"),
-                        None => f.name.clone(),
-                    }
-                } else {
-                    method.clone()
-                };
-                targets.push((key, f));
+    // The report key for a method: the bare tail when it is unique, `Owner::method`
+    // when two contracted methods share it.
+    let method_key = |line: usize, col: usize, method: &str, f: &MirFn| {
+        let ambiguous = tail_counts.get(method).copied().unwrap_or(0) > 1
+            || specs.by_fn.contains_key(method);
+        if ambiguous {
+            match prog.impl_owners.get(&(line, col)) {
+                Some(owner) => format!("{owner}::{method}"),
+                None => f.name.clone(),
             }
-            None => missing.push(method.clone()),
+        } else {
+            method.to_string()
+        }
+    };
+    let mut seen: BTreeSet<(usize, usize, String)> = BTreeSet::new();
+    for (line, col, method) in specs.by_method.keys() {
+        seen.insert((*line, *col, method.clone()));
+        let method = method.as_str();
+        match prog.fns.iter().find(|f| f.impl_loc == Some((*line, *col))
+            && f.name.rsplit("::").next() == Some(method))
+        {
+            Some(f) => targets.push((method_key(*line, *col, method, f), f)),
+            None => missing.push(method.to_string()),
+        }
+    }
+    // An `impl` that declares no contract of its own but implements a trait that
+    // *does*: the implementation is where the promise is kept or broken, so it is a
+    // target. Without this the trait's contract was inherited by `resolve` (so a
+    // call to it was answered correctly) but never *checked* on any body, and the
+    // declaration itself is not in `by_fn` to be reported missing either -- the
+    // promise would be silently unenforced, which is the one outcome this frontend
+    // treats as worse than a refusal.
+    let mut enforced: BTreeSet<String> = BTreeSet::new();
+    for (line, col, method) in method_targets {
+        // The impl's own contract, if it has one, is already the entry above; the
+        // trait's is then a *second* specification of the same function, and
+        // `resolve` can only hand back one of them. Reporting it is the only
+        // honest answer: silently preferring either would drop a claim the source
+        // wrote. See `verify_function`, which refuses on `contract_conflict`.
+        let Some(f) = prog.fns.iter().find(|f| f.impl_loc == Some((line, col))
+            && f.name.rsplit("::").next() == Some(method.as_str())) else {
+            continue;
+        };
+        enforced.insert(format!("{}::{method}", specs.impl_traits[&(line, col)]));
+        if seen.insert((line, col, method.clone())) {
+            targets.push((method_key(line, col, &method, f), f));
+        }
+    }
+    // A trait declaration whose contract no implementation in this file carries is
+    // a promise with nothing to keep it. It has no MIR, so it can never be a
+    // target, and leaving it unmentioned would make the run `is_clean()` while the
+    // claim was never checked -- the silent-loss shape this frontend refuses
+    // everywhere else. Reported like any other un-found contract, with the reason
+    // spelled out so it is not mistaken for a missing body.
+    for key in specs.by_trait.keys() {
+        if !enforced.contains(key) {
+            missing.push(format!("{key} (a trait declaration with no implementation in this file)"));
         }
     }
     (targets, missing)
+}
+
+/// Every `(impl line, impl column, method)` whose contract comes from a *trait
+/// declaration* rather than from the implementation.
+///
+/// A declaration has no body and so can never be a target itself; the implementations
+/// are where it has to be checked. This is the inverse of
+/// [`crate::mir::spec::Specs::trait_contract`]: that one asks "what does this impl
+/// inherit for this method", this one enumerates the pairs so they can be checked.
+///
+/// Only a trait declaration the scanner read is enumerated, so an `impl` of a trait
+/// declared elsewhere (an external trait, or one whose declaration is in another
+/// file) contributes nothing -- there is no contract text to check it against.
+fn trait_method_targets(specs: &Specs) -> Vec<(usize, usize, String)> {
+    let mut out = Vec::new();
+    for ((line, col), tr) in &specs.impl_traits {
+        // Every declaration the trait carries, which is every method of it this
+        // scanner read a contract for. A trait with no contracted method
+        // contributes nothing, so an impl of it is left as it was: checked for
+        // panic freedom, with no postcondition to establish.
+        let prefix = format!("{tr}::");
+        for key in specs.by_trait.keys() {
+            if let Some(method) = key.strip_prefix(&prefix) {
+                out.push((*line, *col, method.to_string()));
+            }
+        }
+    }
+    out
 }
 
 /// The targets to check: all of them when `only` is empty, otherwise those whose

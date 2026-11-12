@@ -287,6 +287,22 @@ pub struct Specs {
     /// dump. [`Self::by_fn`] keeps free functions (whose bare name is unique
     /// within a file); a method is recorded here instead.
     pub by_method: BTreeMap<(usize, usize, String), FnContract>,
+    /// Contracts on *trait method declarations*, keyed by `Trait::method` with the
+    /// trait's module-qualified path (`Bump::bump`, `m::Bump::bump`).
+    ///
+    /// A declaration has no body, so rustc emits no MIR for it and it can never be
+    /// a verification target on its own. Its contract is a promise the trait's
+    /// *implementations* inherit, so it is checked on each impl rather than on the
+    /// declaration.
+    ///
+    /// It must not live in [`Self::by_fn`], and that is not a filing preference:
+    /// `by_fn` keys are matched by *unique path suffix*, so a key `Bump::bump`
+    /// answers a lookup for a free function named `bump` -- a different item. A
+    /// free `fn bump() -> u8 { 9 }` would then be checked against the trait's
+    /// `ensures: ret == 9`, pass, and be reported as `Bump::bump: Verified`, which
+    /// reads as "the trait's promise is discharged" when in fact *no* implementation
+    /// was ever checked. A separate table is what keeps the two apart.
+    pub by_trait: BTreeMap<String, FnContract>,
 }
 
 /// An enum's variants, in declaration order.
@@ -404,7 +420,15 @@ impl Specs {
         }
         if let Some(loc) = impl_location(name) {
             let tail = name.rsplit("::").next()?;
-            return self.by_method.get(&(loc.0, loc.1, tail.to_string()));
+            if let Some(c) = self.by_method.get(&(loc.0, loc.1, tail.to_string())) {
+                return Some(c);
+            }
+            // No contract on the impl itself. The trait's *declaration* may carry
+            // one, and an implementation inherits it: that is what a trait contract
+            // means. Without this an impl of a contracted trait was checked against
+            // nothing at all, and the trait's promise was reported `missing` with no
+            // hint that an impl existed to carry it. See [`Self::by_trait`].
+            return self.trait_contract(loc.0, loc.1, tail);
         }
         // A path-qualified non-method name (`a::f`, `T::value`): the contract may
         // be keyed by that exact path, or by a longer path it is a suffix of.
@@ -422,6 +446,43 @@ impl Specs {
         } else {
             None
         }
+    }
+
+    /// A second contract the `impl` method `name` carries, when it has both its
+    /// own and its trait's.
+    ///
+    /// `resolve` returns one contract, so when both exist the other is silently
+    /// dropped whichever way it goes. Neither choice is defensible: preferring the
+    /// impl's drops the trait's promise (the trait's contract was written to hold
+    /// for *every* implementation), and preferring the trait's drops a claim the
+    /// impl's author wrote about their own body. The caller refuses on this and
+    /// names both, which is the only answer that loses nothing.
+    pub fn contract_conflict(&self, name: &str) -> Option<String> {
+        let loc = impl_location(name)?;
+        let tail = name.rsplit("::").next()?;
+        if !self.by_method.contains_key(&(loc.0, loc.1, tail.to_string())) {
+            return None;
+        }
+        let tr = self.impl_traits.get(&(loc.0, loc.1))?;
+        if !self.by_trait.contains_key(&format!("{tr}::{tail}")) {
+            return None;
+        }
+        Some(format!(
+            "the implementation of `{tail}` declares its own contract and the trait `{tr}`              declares one for the same method, so the two would have to agree; the frontend              checks one specification per function and refuses rather than dropping either"
+        ))
+    }
+
+    /// The contract the `impl` at `(line, col)` inherits from the trait it
+    /// implements, for the method named `tail`.
+    ///
+    /// `None` when the impl implements no trait (an inherent `impl`), when the
+    /// trait declares no contract for that method, or when the trait's path and the
+    /// method tail do not name a declaration this scanner read. A `None` here is
+    /// what makes [`Self::resolve`] fall through to "no contract", which the caller
+    /// reports rather than treating as a promise.
+    pub fn trait_contract(&self, line: usize, col: usize, tail: &str) -> Option<&FnContract> {
+        let tr = self.impl_traits.get(&(line, col))?;
+        self.by_trait.get(&format!("{tr}::{tail}"))
     }
 }
 
@@ -669,6 +730,14 @@ pub(crate) struct LineScope {
     /// The innermost `impl` the line sits inside, as the `(line, column)` of its
     /// `impl` keyword, or `None`. See [`Specs::impl_owners`].
     pub impl_loc: Option<(usize, usize)>,
+    /// The enclosing `trait` names, outermost first -- empty outside a trait.
+    ///
+    /// Separate from [`Self::path`], which mixes `mod`, `trait` and `fn`: a `fn`
+    /// declared directly in a trait is a *method of that trait*, and its contract
+    /// is a promise the trait's implementations inherit, while a `fn` declared in a
+    /// `mod` is an ordinary free function. Telling the two apart from a mixed path
+    /// would mean guessing which element was the trait. See [`Specs::by_trait`].
+    pub trait_path: Vec<String>,
     /// The enclosing `mod`/`trait`/`fn` item names, outermost first. A method's
     /// `impl` is *not* an element (it is named by location, not by a path); a
     /// `fn`'s own name is not an element of the scope of the line that declares
@@ -758,7 +827,12 @@ pub(crate) fn line_scopes(source: &str) -> Vec<LineScope> {
             .filter(|f| matches!(f.kind, ItemKind::Mod | ItemKind::Trait | ItemKind::Fn))
             .map(|f| f.name.clone())
             .collect();
-        out[idx] = LineScope { impl_loc, path };
+        let trait_path: Vec<String> = stack
+            .iter()
+            .filter(|f| f.kind == ItemKind::Trait)
+            .map(|f| f.name.clone())
+            .collect();
+        out[idx] = LineScope { impl_loc, path, trait_path };
         if let Some(col) = impl_keyword_col(raw) {
             stack.push(ScopeFrame {
                 kind: ItemKind::Impl,
@@ -1948,7 +2022,22 @@ pub fn extract(source: &str) -> Specs {
                     None => {
                         let mut path = scope_path.get(lineno).cloned().unwrap_or_default();
                         path.push(name);
-                        specs.by_fn.insert(path.join("::"), std::mem::take(&mut pending));
+                        let key = path.join("::");
+                        // A *declaration* inside a `trait` (`fn f(&self) -> u8;`) is
+                        // not a function: rustc emits no MIR for it, so keeping it in
+                        // `by_fn` reports it `missing` forever and, worse, lets its
+                        // key suffix-match an unrelated free function of the same
+                        // name -- a false proof that the trait's promise was
+                        // discharged. It goes to `by_trait`, where each `impl` of the
+                        // trait inherits it. A trait *default* has a body, is real
+                        // MIR, and stays in `by_fn` under the `T::value` key rustc
+                        // prints for it.
+                        let in_trait = !scopes[lineno].trait_path.is_empty();
+                        if in_trait && !fn_has_body(&lines, lineno) {
+                            specs.by_trait.insert(key, std::mem::take(&mut pending));
+                        } else {
+                            specs.by_fn.insert(key, std::mem::take(&mut pending));
+                        }
                     }
                 }
             }
@@ -2041,6 +2130,62 @@ fn edit_distance(a: &str, b: &str) -> usize {
 ///
 /// The return type is the text between `->` and the body's `{` (or a `;` for a
 /// declaration), trimmed. A function with no `->` returns `()`.
+/// Whether the `fn` item starting on line `start` has a body.
+///
+/// A trait *declaration* (`fn f(&self) -> u8;`) has none. That is what makes it a
+/// promise to be inherited rather than a function to be checked: rustc emits no MIR
+/// for it, so a caller that treats it as an ordinary item reports it `missing`
+/// forever.
+///
+/// The scan stops at the first `{` or `;` reached outside line comments and outside
+/// *any* bracketing, so a `;` that belongs to a bracketed type is not mistaken for
+/// the declaration's own terminator. That is not hypothetical: `fn f(&self) -> [u8; 4]
+/// { … }` has a `;` before its body brace, and reading it as the terminator would
+/// file a *default* -- a real function with MIR -- as a bodyless declaration, so its
+/// contract would be inherited by implementations instead of checked on its own
+/// body. The same shape appears in `impl Trait<{ … }>` and in a parenthesised
+/// argument list.
+///
+/// Quote characters are deliberately *not* treated as literals. A lifetime
+/// (`fn f<'a>(&'a self) -> &'a u8`) looks like an opening `'` with no close, and a
+/// scanner that skipped to the next `'` would swallow the closing `)` and then
+/// refuse a real body as a declaration. A char or string literal in a *signature* is
+/// not a shape that occurs, so the bracket depth alone is the honest rule.
+///
+/// Angle brackets stop counting once the first `>` returns to zero, so a later `<`
+/// is the comparison operator rather than a bracket. Only the header is read, and it
+/// may wrap over several lines.
+fn fn_has_body(lines: &[&str], start: usize) -> bool {
+    let mut angle = 0i32;
+    let mut round = 0i32;
+    let mut square = 0i32;
+    let mut seen_angle = false;
+    for raw in &lines[start..] {
+        let mut line = *raw;
+        if let Some(i) = line.find("//") {
+            line = &line[..i];
+        }
+        for c in line.chars() {
+            match c {
+                '<' if !seen_angle => {
+                    angle += 1;
+                    seen_angle = true;
+                }
+                '<' if angle > 0 => angle += 1,
+                '>' if angle > 0 => angle -= 1,
+                '(' => round += 1,
+                ')' => round -= 1,
+                '[' => square += 1,
+                ']' => square -= 1,
+                '{' if angle == 0 && round <= 0 && square <= 0 => return true,
+                ';' if angle == 0 && round <= 0 && square <= 0 => return false,
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 fn fn_signature(line: &str) -> (Vec<(String, Ty)>, Option<Ty>) {
     let Some(open) = line.find('(') else {
         return (Vec::new(), None);

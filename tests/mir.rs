@@ -4949,6 +4949,22 @@ fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
     o
 }
 
+/// Every outcome and the `missing` list for one source, without the
+/// "must be present" guard of [`verify_src`] -- for the trait-contract tests,
+/// whose whole point is that a declaration has *no* outcome of its own.
+fn verify_all_outcomes(src: &str) -> (Vec<(String, FnOutcome)>, Vec<String>) {
+    let rustc = rustc().expect("a toolchain to dump MIR with");
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif-all-{}-{seq}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("probe.rs");
+    std::fs::write(&file, src).expect("write probe");
+    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let _ = std::fs::remove_dir_all(&dir);
+    (report.outcomes, report.missing)
+}
+
 /// A contracted function the frontend dropped is a failure, even when the report
 /// names it in `missing`.
 ///
@@ -7735,6 +7751,173 @@ fn a_multiline_impl_header_still_owns_its_methods() {
     let o = verify_src("m", src).expect("m must be present");
     let FnOutcome::Failed { kind, .. } = o else {
         panic!("a method of a multiline impl with a false postcondition must be refuted, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+}
+
+// ---------------------------------------------------------------------------
+// A trait declaration's contract
+//
+// A trait method declaration has no body, so rustc emits no MIR for it and it can
+// never be a target on its own. Its contract is a promise every implementation
+// inherits, and the implementation is where it is kept or broken. Before this,
+// the declaration's contract was filed under the free-function table, where its
+// `Trait::method` key suffix-matched an *unrelated* free function of the same
+// name -- so a free `fn bump() -> u8 { 9 }` was checked against the trait's
+// `ensures: ret == 9`, passed, and was reported `Bump::bump: Verified`. That reads
+// as "the trait's promise is discharged" when no implementation was ever checked.
+// ---------------------------------------------------------------------------
+
+/// An implementation that breaks the trait's declared postcondition is refuted.
+#[test]
+fn an_implementation_that_breaks_its_traits_contract_is_refuted() {
+    let src = "pub trait Bump {\n    /// ensures: ret == 9\n    fn bump(&self) -> u8;\n}\n\
+               pub struct S;\nimpl Bump for S { fn bump(&self) -> u8 { 7 } }\n";
+    let (outcomes, missing) = verify_all_outcomes(src);
+    assert!(missing.is_empty(), "the impl carries the promise, so nothing is missing: {missing:?}");
+    let o = pick(&outcomes, "bump");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("a body of 7 against `ret == 9` must be refuted, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+}
+
+/// The same implementation with the promise kept must verify, so the test above
+/// pins the refutation and not a blanket failure.
+#[test]
+fn an_implementation_that_keeps_its_traits_contract_verifies() {
+    let src = "pub trait Bump {\n    /// ensures: ret == 9\n    fn bump(&self) -> u8;\n}\n\
+               pub struct S;\nimpl Bump for S { fn bump(&self) -> u8 { 9 } }\n";
+    let (outcomes, _) = verify_all_outcomes(src);
+    let o = pick(&outcomes, "bump");
+    assert!(o.is_verified(), "a body of 9 against `ret == 9` must verify, got: {o}");
+}
+
+/// A free function that shares the trait method's name is not the trait's method
+/// and must not be judged by the trait's contract.
+///
+/// This is the false proof the separate table closes: the free `bump` returns 9,
+/// which satisfies the trait's claim, so before the fix the report said
+/// `Bump::bump: Verified` -- naming the *trait method* as verified although no
+/// implementation existed in the file at all.
+#[test]
+fn a_free_function_does_not_borrow_a_trait_declarations_contract() {
+    let src = "pub trait Bump {\n    /// ensures: ret == 9\n    fn bump(&self) -> u8;\n}\n\
+               pub fn bump() -> u8 { 9 }\n";
+    let (outcomes, missing) = verify_all_outcomes(src);
+    for (key, _) in &outcomes {
+        assert_ne!(
+            key, "Bump::bump",
+            "the trait declaration has no body, so it can never be reported as a verified \
+             function: {outcomes:?}"
+        );
+    }
+    assert!(
+        missing.iter().any(|m| m.starts_with("Bump::bump")),
+        "the trait's promise has no implementation here, which must be visible rather than \
+         silently unenforced; missing was {missing:?}"
+    );
+}
+
+/// A trait declaration with no implementation in the file is reported, not dropped.
+///
+/// It has no MIR, so it can never be a target; leaving it unmentioned would make
+/// the run clean while the claim was never checked.
+#[test]
+fn a_trait_declaration_with_no_implementation_is_reported() {
+    let src = "pub trait Bump {\n    /// ensures: ret == 9\n    fn bump(&self) -> u8;\n}\n";
+    let (outcomes, missing) = verify_all_outcomes(src);
+    assert!(outcomes.is_empty(), "there is no body to verify, got: {outcomes:?}");
+    assert!(
+        missing.iter().any(|m| m.starts_with("Bump::bump")),
+        "an unenforced trait contract must be reported, got: {missing:?}"
+    );
+}
+
+/// When the impl *and* the trait both declare a contract, the run refuses.
+///
+/// `resolve` can return only one of the two, so whichever it dropped would vanish
+/// without a word. The refusal names both sides instead.
+#[test]
+fn two_contracts_for_one_method_are_refused_not_silently_chosen() {
+    let src = "pub trait Bump {\n    /// ensures: ret == 9\n    fn bump(&self) -> u8;\n}\n\
+               pub struct S;\nimpl Bump for S {\n    /// ensures: ret == 7\n    \
+               fn bump(&self) -> u8 { 7 }\n}\n";
+    let (outcomes, _) = verify_all_outcomes(src);
+    let o = pick(&outcomes, "bump");
+    let FnOutcome::Skipped { reason } = o else {
+        panic!("two contracts for one function must be refused, got: {o}");
+    };
+    assert!(
+        reason.contains("Bump") && reason.contains("contract"),
+        "the refusal must name the trait and say what conflicts, got: `{reason}`"
+    );
+}
+
+/// Two implementations of one contracted trait are both checked, and stay
+/// distinguishable in the report.
+///
+/// Both are keyed by the bare tail before the fix, so one `outcomes` entry hid the
+/// other: one body's verdict was simply not reported.
+#[test]
+fn two_implementations_of_a_contracted_trait_are_both_checked() {
+    let src = "pub trait Bump {\n    /// ensures: ret == 9\n    fn bump(&self) -> u8;\n}\n\
+               pub struct A; pub struct B;\n\
+               impl Bump for A { fn bump(&self) -> u8 { 7 } }\n\
+               impl Bump for B { fn bump(&self) -> u8 { 9 } }\n";
+    let (outcomes, missing) = verify_all_outcomes(src);
+    assert!(missing.is_empty(), "both impls carry the promise: {missing:?}");
+    let a = pick(&outcomes, "A::bump");
+    let b = pick(&outcomes, "B::bump");
+    let FnOutcome::Failed { kind, .. } = a else {
+        panic!("`A::bump` returns 7 against `ret == 9` and must be refuted, got: {a}");
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+    assert!(b.is_verified(), "`B::bump` returns 9 and must verify, got: {b}");
+}
+
+/// A trait with no contract contributes nothing, so an impl that declares its own
+/// contract is checked by that one alone.
+#[test]
+fn an_impl_of_an_uncontracted_trait_keeps_its_own_contract() {
+    let src = "pub trait Bump { fn bump(&self) -> u8; }\n\
+               pub struct S;\nimpl Bump for S {\n    /// ensures: ret == 7\n    \
+               fn bump(&self) -> u8 { 7 }\n}\n";
+    let (outcomes, _) = verify_all_outcomes(src);
+    let o = pick(&outcomes, "bump");
+    assert!(o.is_verified(), "the impl's own `ret == 7` with a body of 7 must verify, got: {o}");
+}
+
+/// A trait default whose *signature* contains a `;` -- `[u8; 4]` -- is still a
+/// function, not a declaration.
+///
+/// The body detector stops at the first `;` outside brackets, and the `;` of an
+/// array type comes before the body brace. Reading it as the declaration's
+/// terminator filed this default as bodyless: its contract would then be inherited
+/// by implementations (there are none here) and its own false postcondition would
+/// never be checked, while the run still looked clean.
+#[test]
+fn a_trait_default_returning_an_array_is_still_checked() {
+    let src = "pub trait T {\n    /// ensures: ret == 9\n    fn v(&self, xs: [u8; 4]) -> u8 { 7 }\n}\n";
+    let (outcomes, missing) = verify_all_outcomes(src);
+    assert!(missing.is_empty(), "a default has a body, so nothing is missing: {missing:?}");
+    let o = pick(&outcomes, "T::v");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("a default whose `ret` is 7 against `ret == 9` must be refuted, got: {o}");
+    };
+    assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
+}
+
+/// A trait *default* has a body and real MIR, so it stays an ordinary target and is
+/// not swept into the declaration table.
+#[test]
+fn a_trait_default_method_is_not_treated_as_a_declaration() {
+    let src = "pub trait T {\n    /// ensures: ret == 9\n    fn value(&self) -> u8 { 7 }\n}\n";
+    let (outcomes, missing) = verify_all_outcomes(src);
+    assert!(missing.is_empty(), "a default has a body, so nothing is missing: {missing:?}");
+    let o = pick(&outcomes, "T::value");
+    let FnOutcome::Failed { kind, .. } = o else {
+        panic!("a default with a false postcondition must be refuted, got: {o}");
     };
     assert_eq!(kind, "postcondition", "the failure must be the postcondition, got `{kind}`");
 }
