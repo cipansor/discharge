@@ -181,6 +181,33 @@ pub struct FnContract {
     /// defaulting the type -- a `ret` of the wrong width would make a postcondition
     /// comparison meaningless.
     pub ret: Option<Ty>,
+    /// This signature's parameter slots, by position, *including* a receiver.
+    ///
+    /// [`Self::params`] drops a receiver because a call's argument list has none,
+    /// which is what the call route needs. The *body* route needs the opposite: a
+    /// trait declaration's contract names the declaration's parameters, and an
+    /// implementation may name them differently, so the two signatures have to be
+    /// lined up slot by slot -- and a receiver occupies a slot. `None` when the
+    /// signature could not be read whole, which refuses an inherited contract
+    /// rather than binding a name to the wrong argument. See
+    /// [`Specs::contract_for_fn`].
+    pub slots: Option<Vec<ParamSlot>>,
+}
+
+/// One parameter slot of a source signature, by position.
+///
+/// A contract on a trait *declaration* names the declaration's parameters, and an
+/// implementation is free to name them differently -- `fn f(&self, a: u8, b: u8)`
+/// and `fn f(&self, b: u8, a: u8)` are the same method. Aligning the two is a
+/// matter of *position*, so a reader that has to do it must keep the positions,
+/// and the receiver is position 0 of every method.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParamSlot {
+    /// `self`, `&self`, `&mut self` or `mut self`. It holds a position but names
+    /// no value a contract can compare, so nothing is rewritten for it.
+    Receiver,
+    /// A `name: Type` parameter.
+    Named(String),
 }
 
 /// Every function's contract, keyed by function name.
@@ -303,6 +330,17 @@ pub struct Specs {
     /// reads as "the trait's promise is discharged" when in fact *no* implementation
     /// was ever checked. A separate table is what keeps the two apart.
     pub by_trait: BTreeMap<String, FnContract>,
+    /// The contracted functions declared with *no body* -- an `extern` block item,
+    /// or a trait-free `fn …;`.
+    ///
+    /// Such a declaration has no MIR by construction, so it can never be a target,
+    /// and its contract is *assumed* at each call instead (the modular case the
+    /// executor's `CalleeEnv` answers). That is not a lost proof, so it must not be
+    /// reported `missing` like a contract whose body was expected and not found --
+    /// a file whose only external call verified was nevertheless `is_clean() ==
+    /// false`, which is the false alarm that trains a reader to ignore the report.
+    /// Recorded here so the report can tell the two apart.
+    pub bodyless: BTreeSet<String>,
 }
 
 /// An enum's variants, in declaration order.
@@ -468,7 +506,7 @@ impl Specs {
             return None;
         }
         Some(format!(
-            "the implementation of `{tail}` declares its own contract and the trait `{tr}`              declares one for the same method, so the two would have to agree; the frontend              checks one specification per function and refuses rather than dropping either"
+            "the implementation of `{tail}` declares its own contract and the trait `{tr}` declares one for the same method, so the two would have to agree; the frontend checks one specification per function and refuses rather than dropping either"
         ))
     }
 
@@ -483,6 +521,85 @@ impl Specs {
     pub fn trait_contract(&self, line: usize, col: usize, tail: &str) -> Option<&FnContract> {
         let tr = self.impl_traits.get(&(line, col))?;
         self.by_trait.get(&format!("{tr}::{tail}"))
+    }
+
+    /// The contract for one *body* in the dump, together with the names it uses
+    /// for that body's arguments.
+    ///
+    /// The inherited case is why this exists. An implementation may name its
+    /// parameters differently from the trait it implements, and the declaration's
+    /// contract names the *declaration's* parameters. [`Self::resolve`] returns the
+    /// right contract but nothing about the alignment, so binding it by the
+    /// implementation's own names would attach `ret == a` to whichever argument the
+    /// implementation calls `a` -- the wrong value whenever the names are swapped,
+    /// which is a false proof and not a lost one.
+    ///
+    /// `Err` when a trait contract is inherited but the two signatures cannot be
+    /// aligned exactly (an unreadable signature, or a different number of slots).
+    /// The caller refuses then: an inherited contract that cannot be bound
+    /// positionally is not a contract that may be guessed at.
+    pub fn contract_for_fn<'a>(
+        &'a self,
+        f: &crate::mir::parse::MirFn,
+    ) -> Result<(Option<&'a FnContract>, Option<ArgRename>), String> {
+        let Some(loc) = impl_location(&f.name) else {
+            return Ok((self.resolve(&f.name), None));
+        };
+        let Some(tail) = f.name.rsplit("::").next() else {
+            return Ok((self.resolve(&f.name), None));
+        };
+        // The impl's own contract wins and needs no rename: it was written against
+        // this very signature.
+        if let Some(c) = self.by_method.get(&(loc.0, loc.1, tail.to_string())) {
+            return Ok((Some(c), None));
+        }
+        let Some(decl) = self.trait_contract(loc.0, loc.1, tail) else {
+            return Ok((None, None));
+        };
+        let Some(tr) = self.impl_traits.get(&(loc.0, loc.1)) else {
+            return Ok((Some(decl), None));
+        };
+        let rename = self.align_signature(decl, f, tr, tail)?;
+        Ok((Some(decl), rename))
+    }
+
+    /// The map from a body's argument locals to the names the inherited contract
+    /// uses, or `Err` when the two signatures cannot be aligned exactly.
+    fn align_signature(
+        &self,
+        decl: &FnContract,
+        f: &crate::mir::parse::MirFn,
+        tr: &str,
+        tail: &str,
+    ) -> Result<Option<ArgRename>, String> {
+        let Some(slots) = decl.slots.as_ref() else {
+            return Err(format!(
+                "the trait `{tr}` declares a contract for `{tail}`, but its signature could not be read, so the contract's parameters cannot be aligned with the implementation's by position"
+            ));
+        };
+        // A body has one MIR local per parameter, receiver included, and the trait
+        // declaration has one slot per parameter, receiver included. Equal counts
+        // are what makes "the Nth name means the Nth local" true; a mismatch means
+        // one of the two readings is short, and binding by position would then
+        // attach a name to the wrong argument.
+        if slots.len() != f.arg_locals.len() {
+            return Err(format!(
+                "the trait `{tr}` declares {} parameter slot(s) for `{tail}`, but the implementation has {} argument local(s), so the contract cannot be aligned with the body by position",
+                slots.len(),
+                f.arg_locals.len()
+            ));
+        }
+        let mut map = BTreeMap::new();
+        for (slot, &local) in slots.iter().zip(&f.arg_locals) {
+            if let ParamSlot::Named(name) = slot {
+                // The trait's name for this *position*. Recorded even when it
+                // matches the body's own name, so the map is a complete statement
+                // of what each argument means rather than a diff that a later
+                // change could quietly get wrong.
+                map.insert(local, name.clone());
+            }
+        }
+        Ok(Some(ArgRename(map)))
     }
 }
 
@@ -1263,6 +1380,22 @@ fn qualify_trait(
     scope: &[String],
     imports: &BTreeMap<String, String>,
 ) -> String {
+    // A path written with a *relative* root names the same trait as the
+    // module-qualified path the declaration is keyed by, so it has to be resolved
+    // to that spelling or the two never meet:
+    //
+    // * `crate::T` at the crate root is `T`; inside `mod m` it is still `T`, since
+    //   `crate` names the root and the root's module path is empty.
+    // * `self::T` inside `mod m` is `m::T`.
+    // * `super::T` inside `mod m::inner` is `m::T`.
+    //
+    // Without this, `impl crate::T for S` was never paired with `T`'s declaration
+    // contract: the impl was not checked against it at all, and the declaration was
+    // reported as having no implementation -- the promise silently unenforced, which
+    // is the outcome this frontend treats as worse than a refusal.
+    if let Some(normalized) = resolve_relative_trait_path(written, scope) {
+        return normalized;
+    }
     if is_absolute_trait_path(written) {
         return written.to_string();
     }
@@ -1275,6 +1408,50 @@ fn qualify_trait(
     } else {
         format!("{}::{}", scope.join("::"), written)
     }
+}
+
+/// Resolve a trait path written with a leading `crate`/`self`/`super` to the
+/// module-qualified path a declaration is keyed by.
+///
+/// `None` when the path has no such root, which leaves the caller's import and
+/// module-prefix logic to handle it. A leading `self` at the crate root resolves to
+/// the root, so `self::T` and `T` are the same key; a `super` with no enclosing
+/// module cannot resolve and is left to the caller rather than guessed at.
+fn resolve_relative_trait_path(written: &str, scope: &[String]) -> Option<String> {
+    let mut segments: Vec<&str> = written.split("::").collect();
+    let mut base: Vec<String> = scope.to_vec();
+    let mut saw_root = false;
+    while let Some(first) = segments.first().copied() {
+        match first {
+            "crate" => {
+                base.clear();
+                segments.remove(0);
+                saw_root = true;
+            }
+            "self" => {
+                segments.remove(0);
+                saw_root = true;
+            }
+            "super" => {
+                // A `super` past the root cannot resolve; the caller keeps the
+                // written form, which will simply not match a declaration.
+                base.pop()?;
+                segments.remove(0);
+                saw_root = true;
+            }
+            _ => break,
+        }
+    }
+    if !saw_root {
+        return None;
+    }
+    // `self::` / `crate::` with nothing after it names the module itself, which is
+    // not a trait; keeping the written form makes it a non-match rather than a key.
+    if segments.is_empty() {
+        return None;
+    }
+    base.extend(segments.into_iter().map(|s| s.to_string()));
+    Some(base.join("::"))
 }
 
 /// The text of an `impl` header, spanning lines until its body-opening `{` (or the
@@ -1998,9 +2175,10 @@ pub fn extract(source: &str) -> Specs {
                 || !pending.unknown.is_empty()
             {
                 pending.line = lineno + 1;
-                let (params, ret) = fn_signature(line);
+                let (params, ret, slots) = fn_signature_full(line);
                 pending.params = params;
                 pending.ret = ret;
+                pending.slots = slots;
                 // A method's contract is keyed by its `impl`'s location, so two
                 // `impl` blocks that each declare `value` keep separate entries
                 // instead of one overwriting the other.
@@ -2036,6 +2214,9 @@ pub fn extract(source: &str) -> Specs {
                         if in_trait && !fn_has_body(&lines, lineno) {
                             specs.by_trait.insert(key, std::mem::take(&mut pending));
                         } else {
+                            if !fn_has_body(&lines, lineno) {
+                                specs.bodyless.insert(key.clone());
+                            }
                             specs.by_fn.insert(key, std::mem::take(&mut pending));
                         }
                     }
@@ -2186,9 +2367,32 @@ fn fn_has_body(lines: &[&str], start: usize) -> bool {
     false
 }
 
+#[cfg(test)]
 fn fn_signature(line: &str) -> (Vec<(String, Ty)>, Option<Ty>) {
+    let (params, ret, _) = fn_signature_full(line);
+    (params, ret)
+}
+
+/// A source signature: `(params, return, slots)`.
+///
+/// The three travel together and are all derived from one line, so a named alias
+/// keeps the reader's signature honest about that rather than repeating a
+/// three-element tuple at each use. See [`fn_signature_full`].
+type SourceSignature = (Vec<(String, Ty)>, Option<Ty>, Option<Vec<ParamSlot>>);
+
+/// The signature reader, keeping the *positions*.
+///
+/// [`fn_signature`] is the call route's view: it drops a receiver, because a
+/// call's argument list has none. This one keeps every slot, receiver included,
+/// because the body route has to align a trait declaration's parameters with an
+/// implementation's by position -- and the receiver holds one. See
+/// [`FnContract::slots`].
+///
+/// The third component is `None` when the signature could not be read *whole*,
+/// which is the only case in which a caller may not align by position.
+fn fn_signature_full(line: &str) -> SourceSignature {
     let Some(open) = line.find('(') else {
-        return (Vec::new(), None);
+        return (Vec::new(), None, None);
     };
     // The parameter list runs to its *matching* close paren, not the first one: a
     // parameter whose type is itself parenthesised (`a: (u8, u8)`) puts a `)`
@@ -2213,9 +2417,10 @@ fn fn_signature(line: &str) -> (Vec<(String, Ty)>, Option<Ty>) {
         }
     }
     let Some(close) = close else {
-        return (Vec::new(), None);
+        return (Vec::new(), None, None);
     };
     let mut params = Vec::new();
+    let mut slots = Vec::new();
     let list = line[open + 1..close].trim();
     if !list.is_empty() {
         for part in split_top_level(list, ',') {
@@ -2223,10 +2428,18 @@ fn fn_signature(line: &str) -> (Vec<(String, Ty)>, Option<Ty>) {
             if part.is_empty() {
                 continue;
             }
+            // A receiver is a slot but names no value: `self`, `&self`,
+            // `&mut self`, `mut self`. It has no `name: Type` form, so the
+            // `name: Type` reader below would reject the whole signature and lose
+            // every other position with it.
+            if is_receiver(part) {
+                slots.push(ParamSlot::Receiver);
+                continue;
+            }
             // `name: Type`, with an optional `mut`/`ref` before the name and a
             // pattern (`_`) in place of one.
             let Some(colon) = part.find(':') else {
-                return (Vec::new(), None);
+                return (Vec::new(), None, None);
             };
             let before = part[..colon].trim();
             let name = before
@@ -2234,26 +2447,60 @@ fn fn_signature(line: &str) -> (Vec<(String, Ty)>, Option<Ty>) {
                 .unwrap_or(before)
                 .trim()
                 .to_string();
-            // A pattern (`_`, `(a, b)`) has no single name to bind, and a
-            // `self` receiver is not a value parameter a contract can name.
+            // A pattern (`_`, `(a, b)`) has no single name to bind.
             if name.is_empty()
                 || name == "_"
-                || name == "self"
                 || !name.chars().all(|c| c.is_alphanumeric() || c == '_')
             {
-                return (Vec::new(), None);
+                return (Vec::new(), None, None);
             }
-            params.push((name, Ty::parse(part[colon + 1..].trim())));
+            params.push((name.clone(), Ty::parse(part[colon + 1..].trim())));
+            slots.push(ParamSlot::Named(name));
         }
     }
     // The return type: after `->`, up to the body's `{` or the declaration's `;`.
+    //
+    // The terminator has to be on *this* line. A return type that wraps to the
+    // next one leaves nothing between `->` and the end of the line, and reading
+    // that as `Ty::Other("")` would make a signed return unsigned: a caller
+    // testing `ext() < 0` would take the unsigned branch and could verify a false
+    // postcondition. Refusing the whole signature is the safe answer, and it is
+    // the same discipline the parameter list already follows.
     let after = &line[close..];
-    let ret = after.find("->").map(|i| {
-        let rest = &after[i + 2..];
-        let end = rest.find(['{', ';']).unwrap_or(rest.len());
-        Ty::parse(rest[..end].trim())
-    });
-    (params, ret)
+    let ret = match after.find("->") {
+        None => None,
+        Some(i) => {
+            let rest = &after[i + 2..];
+            match rest.find(['{', ';']) {
+                Some(end) => Some(Ty::parse(rest[..end].trim())),
+                // Nothing terminates the return type on this line. An empty
+                // remainder is the wrapped case; a *non*-empty remainder with no
+                // terminator is a header that continues on the next line.
+                None => return (Vec::new(), None, None),
+            }
+        }
+    };
+    (params, ret, Some(slots))
+}
+
+/// True when a parameter is a receiver rather than a `name: Type`.
+///
+/// Covers `self`, `&self`, `&mut self`, `mut self`, and the `self: Box<Self>`
+/// spelling, whose `:` is inside the receiver rather than after a name.
+fn is_receiver(part: &str) -> bool {
+    let t = part.trim();
+    let t = t.strip_prefix("mut ").unwrap_or(t).trim();
+    if t == "self" {
+        return true;
+    }
+    if let Some(rest) = t.strip_prefix("&mut ") {
+        return rest.trim() == "self";
+    }
+    if let Some(rest) = t.strip_prefix('&') {
+        return rest.trim() == "self";
+    }
+    // `self: Box<Self>`, `self: &Self`, …
+    t.split(':').next().map(|n| n.trim()) == Some("self")
 }
 
 fn fn_name(line: &str) -> Option<String> {
@@ -6532,6 +6779,28 @@ pub fn field_env(
     structs: &BTreeMap<String, StructDef>,
     enums: &BTreeMap<String, EnumDef>,
 ) -> FieldEnv {
+    field_env_named(f, None, structs, enums)
+}
+
+/// [`field_env`], with the contract's own names for the arguments.
+///
+/// An inherited trait contract names a field `c.lo` where `c` is the
+/// *declaration's* name for a parameter the implementation may call something
+/// else. The field bindings are keyed by the argument name, so they have to be
+/// built under the contract's name or the contract's `c.lo` resolves to nothing --
+/// and a contract that resolves to nothing is refused, not guessed at.
+pub fn field_env_named(
+    f: &crate::mir::parse::MirFn,
+    rename: Option<&ArgRename>,
+    structs: &BTreeMap<String, StructDef>,
+    enums: &BTreeMap<String, EnumDef>,
+) -> FieldEnv {
+    let contract_name = |l: crate::mir::parse::LocalIdx| -> String {
+        rename
+            .and_then(|r| r.name_of(l))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| f.name_of(l))
+    };
     // `base` is one past the highest local the function declares. Every local is
     // seeded at its own index before any field variable is read, so starting here
     // keeps the two index spaces disjoint for any function, not just a small one.
@@ -6541,7 +6810,7 @@ pub fn field_env(
     // mangled names are checked against this set, so a generated binding can
     // never shadow an argument of the same name.
     for &l in &f.arg_locals {
-        env.declared.insert(f.name_of(l));
+        env.declared.insert(contract_name(l));
     }
     for &l in &f.arg_locals {
         let Some(ty) = f.ty_of(l) else { continue };
@@ -6551,7 +6820,7 @@ pub fn field_env(
             Ty::Ref(inner) => inner.as_ref(),
             other => other,
         };
-        let arg = f.name_of(l);
+        let arg = contract_name(l);
         // A slice argument: `&[u8]`. Its length is a symbolic input, and its
         // elements are bound on demand (by `bind_index_refs` for the contract and
         // by the executor for the body).
@@ -6632,11 +6901,30 @@ pub fn field_env(
 /// them would make `k < 0` an unsigned comparison — the exact class of bug the
 /// `Sign` type was introduced to prevent.
 pub fn signed_args(f: &crate::mir::parse::MirFn) -> BTreeSet<String> {
+    signed_args_named(f, None)
+}
+
+/// [`signed_args`], with the contract's own names for the arguments.
+///
+/// The sign has to follow the *contract's* name, not the body's: an inherited
+/// contract's `a < 0` is a signed comparison exactly when the argument the
+/// declaration calls `a` is signed, which is a property of the position.
+pub fn signed_args_named(
+    f: &crate::mir::parse::MirFn,
+    rename: Option<&ArgRename>,
+) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for &l in &f.arg_locals {
         if f.ty_of(l).map(|t| t.is_signed()).unwrap_or(false) {
-            out.insert(f.name_of(l));
+            let name = rename
+                .and_then(|r| r.name_of(l))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| f.name_of(l));
+            out.insert(name);
         }
+    }
+    if rename.is_some() {
+        return out;
     }
     for (name, local) in f.alias_locals() {
         if f.ty_of(local).map(|t| t.is_signed()).unwrap_or(false) {
@@ -6695,12 +6983,60 @@ fn type_bound(ty: &str, assoc: &str) -> Option<(u64, u8)> {
 /// which names qualify, and it only ever names an argument that the body never
 /// writes, so every entry here stands for the very value the body uses.
 pub fn arg_vars(f: &crate::mir::parse::MirFn) -> BTreeMap<String, Var> {
+    arg_vars_named(f, None)
+}
+
+/// A contract's parameter names, by *position*, when the contract comes from a
+/// signature other than the body's.
+///
+/// An implementation inherits its trait's declaration contract, and the two
+/// signatures may name their parameters differently:
+///
+/// ```ignore
+/// trait T { /// ensures: ret == a
+///            fn f(&self, a: u8, b: u8) -> u8; }
+/// impl T for S { fn f(&self, b: u8, a: u8) -> u8 { a } }   // `a` is the 2nd arg
+/// ```
+///
+/// Binding the declaration's `a` to whatever the implementation happens to call
+/// `a` would check the *second* argument where the trait means the first -- a
+/// proof about the wrong value, which is the failure this crate exists to avoid.
+/// The two are the same method, so their parameters correspond by position; this
+/// map says which source name each argument local must answer to.
+pub struct ArgRename(BTreeMap<crate::mir::parse::LocalIdx, String>);
+
+impl ArgRename {
+    /// The name the contract uses for this argument local, or `None` when the
+    /// body's own name is already the right one.
+    fn name_of(&self, l: crate::mir::parse::LocalIdx) -> Option<&str> {
+        self.0.get(&l).map(|s| s.as_str())
+    }
+}
+
+/// [`arg_vars`], with the contract's own names for the arguments.
+///
+/// The aliases are deliberately *not* included when a rename is in force: they
+/// are names the implementation's body introduced (`let k = i;`), and a trait
+/// declaration has no body, so its contract cannot mean them. Including them
+/// could also collide with a declaration parameter name and shadow the very
+/// binding the rename just made.
+pub fn arg_vars_named(
+    f: &crate::mir::parse::MirFn,
+    rename: Option<&ArgRename>,
+) -> BTreeMap<String, Var> {
     let mut out = BTreeMap::new();
     for &l in &f.arg_locals {
         let ty = f.ty_of(l).cloned().unwrap_or(Ty::Other("?".into()));
         if let Some(w) = ty.width() {
-            out.insert(f.name_of(l), smt::var_named(l, w));
+            let name = rename
+                .and_then(|r| r.name_of(l))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| f.name_of(l));
+            out.insert(name, smt::var_named(l, w));
         }
+    }
+    if rename.is_some() {
+        return out;
     }
     for (name, local) in f.alias_locals() {
         let ty = f.ty_of(local).cloned().unwrap_or(Ty::Other("?".into()));

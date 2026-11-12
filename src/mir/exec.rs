@@ -1950,6 +1950,19 @@ struct Frame {
     /// `Incomplete`, never a false proof -- but it silently discards a valid
     /// proof, which is the failure this crate treats as a defect.
     saved_cut: Option<Cut>,
+    /// The loop measure that was live in the *caller* when this frame made the
+    /// call, put aside for the same reason `saved_cut` is.
+    ///
+    /// The measure and the cut travel together: the cut says which loop the path
+    /// is inside, and the measure is the value at that loop's head. Entering a
+    /// callee clears both -- they describe the caller's loop -- but the resumed
+    /// caller is still inside it, and its back edge has to compare against the
+    /// measure. Restoring the cut without the measure left the caller with a cut
+    /// and no head value, so the back edge had nothing to compare and the loop was
+    /// reported incomplete ("the loop head was never entered") even when its
+    /// measure was sufficient. A proof silently discarded, which this crate treats
+    /// as a defect.
+    saved_variant: Option<(Var, bool)>,
     /// `(caller storage, callee local)` for each argument the caller handed over
     /// through a reference (`&T`, `&mut T`, `&[T]`, `&mut [T]`). The caller side
     /// is the *place* the reference names -- `_2` for `set5(&mut x)` -- not the
@@ -2088,6 +2101,15 @@ pub struct CalleeContract {
     /// positionally to nothing, which would make every precondition vacuously
     /// true.
     pub params: Vec<String>,
+    /// Whether the callee's signature was read *whole*.
+    ///
+    /// A signature that was not read whole cannot be bound positionally, and the
+    /// return type it would have given is exactly what a `ret` clause needs to be
+    /// signed correctly. A wrapped return type (`fn ext() ->` then `i8;`) leaves the
+    /// return unreadable, and treating that as unsigned let a caller test
+    /// `ext() < 0`, take the unsigned branch, and verify a postcondition that does
+    /// not hold. Refusing the call is the only answer that does not guess.
+    pub sig_readable: bool,
     /// The parameter names whose types are signed, for comparison signedness.
     pub signed: BTreeSet<String>,
     /// Whether the return type is signed, for a postcondition comparison.
@@ -2129,6 +2151,7 @@ impl<'a> CalleeEnv<'a> {
         Some(CalleeContract {
             requires: c.requires.clone(),
             ensures: c.ensures.clone(),
+            sig_readable: c.slots.is_some(),
             params: c.params.iter().map(|(n, _)| n.clone()).collect(),
             signed: c
                 .params
@@ -2539,6 +2562,7 @@ where
             ret_dest: None,
             saved_env: None,
             saved_cut: None,
+            saved_variant: None,
             by_ref: Vec::new(),
             caller: None,
         },
@@ -3319,6 +3343,13 @@ fn try_callee_contract(
     // means the scanner and the call disagree about the arity, and binding the
     // names it did read would attach `requires: n <= 10` to whatever argument
     // happens to be first. Refusing is the only safe answer.
+    if !cc.sig_readable {
+        report.unknown_paths.push(format!(
+            "call to `{name}`: the callee's signature was not read whole, so the contract's \
+             parameters and return type cannot be bound to the call"
+        ));
+        return;
+    }
     if cc.params.len() != args.len() {
         report.unknown_paths.push(format!(
             "call to `{name}`: the callee's contract names {} parameter(s) but the call has {} \
@@ -3436,6 +3467,15 @@ fn try_callee_contract(
         return;
     };
 
+    // An unreachable call site proves nothing about the callee. When the path
+    // condition is already unsatisfiable the call is never executed, so the
+    // divergence query below would be asking about inputs the program cannot
+    // reach -- and its `Unsat` would be saying "this path is dead", not "the callee
+    // diverges". Reporting divergence there is a false failure about a call that
+    // cannot happen, so a dead path is dropped instead.
+    if matches!(find_obligation(st.path, pins), Verdict::Unsat) {
+        return;
+    }
     // Divergence: can any input satisfy the postcondition? `Unsat` says no, so the
     // call never returns and every claim after it would be vacuous.
     let diverges = matches!(
@@ -4761,6 +4801,7 @@ where
                     // The callee's `cut` is discarded: it named the callee's loop,
                     // if any, and the callee has returned.
                     let cut = caller.saved_cut.clone();
+                    let variant_entry = caller.saved_variant;
                     work.push(State {
                         block: caller.ret_target,
                         frame: *caller,
@@ -4769,7 +4810,7 @@ where
                         visits: st.visits,
                         depth: st.depth.saturating_sub(1),
                         cut,
-                        variant_entry: None,
+                        variant_entry,
                     });
                 }
             }
@@ -5220,6 +5261,7 @@ where
                 // describes the caller's loop, and the caller is still inside it
                 // when this call returns.
                 saved_cut: st.cut.clone(),
+                saved_variant: st.variant_entry,
                 by_ref: by_ref.clone(),
                 caller: st.frame.caller.clone(),
             };
@@ -5232,6 +5274,7 @@ where
                     ret_dest: None,
                     saved_env: None,
                     saved_cut: None,
+                    saved_variant: None,
                     by_ref: Vec::new(),
                     caller: Some(Box::new(caller)),
                 },

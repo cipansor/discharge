@@ -638,8 +638,13 @@ Four refusals are deliberate, and each is the safe direction:
   `debug` bindings -- so positional binding is the only tie between
   `requires: n <= 10` and the first argument, and a list short by one would prove
   a precondition nobody stated. `spec::fn_signature` therefore returns an *empty*
-  list on any shape it cannot read whole (`_`, `self`, a destructuring pattern, a
-  wrapped signature), never a partial one.
+  list on any shape it cannot read whole (a destructuring pattern, a wrapped
+  parameter list, a return type with no terminator on its line), never a partial
+  one. A *receiver* is not such a shape: it is read as a slot and dropped from the
+  call route's `params` because a call's argument list has none, which leaves a
+  method's list short by the receiver and refuses the call on the arity check
+  below. The body route needs the opposite view -- see "An inherited contract
+  binds by position".
 * A **reference argument** is refused. `Ty::Ref` is modelled as its referent, so a
   `&mut` write would land on the caller's value and not reach the local it names;
   there is no aliasing model to carry it back. rustc does **not** elide the
@@ -8609,3 +8614,74 @@ the whole difference from the two runtime routes, and the paragraph immediately
 below now says so. The lesson is narrower than the last one: after changing an
 example to be compile-time, the sentence introducing it is still written for the
 runtime version, and prose is not type-checked.
+
+## A third review found six, two of them false proofs
+
+The trait-contract work (below) introduced a body route that binds a *declaration's*
+contract to an *implementation's* MIR. Reviewing that route and the call route
+around it turned up six defects. Two could report a false claim as proved, which is
+the direction this crate exists to prevent; the rest were a lost proof, a false
+failure, a silent pass, and a false alarm. Each was reproduced with a probe before
+anything changed, and each now has a test pinned in both directions.
+
+**An inherited contract bound parameters by *name*, not by position (false proof).**
+`Specs::resolve` handed back the declaration's contract, but the executor and the
+contract evaluator bound its identifiers to the implementation's own MIR debug
+names. An implementation is free to name its parameters differently, so
+
+```rust
+trait T { /// ensures: ret == a
+           fn f(&self, a: u8, b: u8) -> u8; }
+impl T for S { fn f(&self, b: u8, a: u8) -> u8 { a } }
+```
+
+was reported `Verified`: the contract's `a` resolved to the implementation's `a`,
+which is the trait's `b`. The two signatures are the same method, so their
+parameters correspond by *position*; `Specs::contract_for_fn` now returns the
+contract together with an `ArgRename` built by `align_signature`, and
+`arg_vars_named`/`signed_args_named`/`field_env_named` bind under the declaration's
+names. `FnContract::slots` keeps every position, **receiver included** -- the call
+route's `params` drops the receiver because a call has no argument for it, but the
+body route cannot: the receiver is position 0 of every method, and aligning without
+it would shift every name by one. A declaration whose signature was not read whole,
+or whose slot count disagrees with the body's argument count, is refused rather
+than aligned by guess.
+
+**A wrapped return type was read as unsigned (false proof).** The signature reader
+took everything between `->` and the end of the line, so `fn ext() ->` followed by
+`i8;` produced `Ty::Other("")` -- unsigned. A caller testing `ext() < 0` took the
+unsigned branch and a postcondition that does not hold verified. The reader now
+requires the return type's terminator on the same line and refuses the whole
+signature otherwise, and `CalleeContract::sig_readable` makes the call route refuse
+a signature it cannot bind positionally.
+
+**A trait path with a relative root never met its declaration (silent pass).**
+`impl crate::T for S` kept the `crate::` prefix, so it never matched `T`'s
+module-qualified key: the impl was checked against nothing and the declaration was
+reported as having no implementation. `qualify_trait` now resolves `crate::` (the
+root), `self::` (the enclosing module) and `super::` (one level up) to the spelling
+the declaration is keyed by.
+
+**A bodyless declaration's contract was reported `missing` (false alarm).** An
+`extern` item has no MIR by construction and its contract is *assumed* at each call,
+which is the modular case rather than a lost proof. Reporting it `missing` made
+`is_clean()` false for a file with nothing wrong. `Specs::bodyless` records those
+keys so `resolve_targets` can tell them apart; the call is still verified, and an
+unsatisfiable assumed postcondition still fails.
+
+**An unreachable call was reported as a divergent callee (false failure).** The
+divergence query is `find_model(path && post)`, and an unsatisfiable `path` makes it
+`Unsat` for a reason that has nothing to do with the callee: the path is dead.
+`try_callee_contract` now checks the path first and drops a dead one.
+
+**A helper call inside a measured loop erased the measure (lost proof).** Entering a
+callee cleared the caller's `cut` *and* its `variant_entry`, and only the cut was
+restored. The resumed caller was still inside its loop with a cut and no head value,
+so the back edge had nothing to compare and the loop was reported incomplete --
+"the loop head was never entered" -- though its measure was sufficient. The two now
+travel together in `Frame::saved_variant`.
+
+The pattern in four of the six is the same: a value was *available* and the wrong
+one was used, or a case was folded into a neighbour that shares its shape. The two
+false proofs are the receiver-in-the-slot-list and the empty-return-type cases --
+both places where "read what is there" quietly became "assume what is not".

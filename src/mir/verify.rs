@@ -191,7 +191,15 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     // `<impl at …>::f` while the contract is keyed by the source's `f`. An
     // unresolved contract is not "no contract" here -- it is the false-proof
     // case, where the body would be checked against `true` and no `ensures`.
-    let contract = specs.resolve(&f.name);
+    //
+    // An *inherited* trait contract comes with a rename, because the declaration
+    // and the implementation may name their parameters differently and the
+    // contract means the declaration's names. Binding it by the implementation's
+    // own names would attach `ret == a` to the wrong argument -- a false proof.
+    let (contract, rename) = match specs.contract_for_fn(f) {
+        Ok(x) => x,
+        Err(reason) => return FnOutcome::Skipped { reason },
+    };
     // A clause the frontend does not take is refused rather than ignored. This
     // is the silent-loss direction: `/// ensuers: ret == 99` was dropped, so the
     // function had no postcondition, was checked against `true`, and came back
@@ -217,12 +225,12 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     if let Some(reason) = specs.contract_conflict(&f.name) {
         return FnOutcome::Skipped { reason };
     }
-    let arg_vars = spec::arg_vars(f);
-    let signed = spec::signed_args(f);
+    let arg_vars = spec::arg_vars_named(f, rename.as_ref());
+    let signed = spec::signed_args_named(f, rename.as_ref());
     // Fields of struct-typed arguments, bound to their own symbolic inputs. The
     // same bindings are handed to the executor as seeds, so `c.lo` in a contract
     // and `((*_1).0)` in the body name one variable.
-    let mut fields = spec::field_env(f, &specs.structs, &specs.enums);
+    let mut fields = spec::field_env_named(f, rename.as_ref(), &specs.structs, &specs.enums);
     // Named `const` items the contract may name, from the program's own table --
     // the same one the executor folds a body's `const LIMIT` from, so a contract's
     // `LIMIT` and the body's `LIMIT` are one value. The executor's `Env` carries
@@ -787,6 +795,11 @@ fn resolve_targets<'a>(
     for (ki, key) in keys.iter().enumerate() {
         match chosen[ki] {
             Some(fi) => targets.push(((*key).clone(), &prog.fns[fi])),
+            // A declaration with no body is *assumed* at each call, which is the
+            // modular case rather than a contract whose body went missing. It has
+            // no MIR by construction, so reporting it `missing` would make every
+            // file that calls an external function unclean.
+            None if specs.bodyless.contains(*key) => {}
             None => missing.push((*key).clone()),
         }
     }
