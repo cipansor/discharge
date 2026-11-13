@@ -7,9 +7,16 @@
 //!   cargo test --features std --test mir
 //! ```
 //!
-//! The tests that need `rustc` skip themselves when `VERIF_RUSTC` is unset,
-//! because `--emit=mir` needs nightly and failing on a stable toolchain would say
-//! "the code is wrong" when the truth is "the tool could not run".
+//! The tests that need `rustc` resolve it from `VERIF_RUSTC`, or fall back to the
+//! `rustc` on `PATH`, and skip themselves only when there is no compiler at all.
+//!
+//! The fallback matters because a test that returns early reports `ok` while
+//! checking nothing, so the suite's verdict would otherwise depend on the
+//! environment: `let Some(report) = verify_all() else { return }` passes whether
+//! the MIR frontend ran or not. `--emit=mir` is a *stable* flag (only
+//! `-Zunpretty=mir` needs a nightly), so the `rustc` cargo already uses is enough,
+//! and the fallback makes the ~21 `else { return }` tests run on any machine that
+//! can build the crate. See the `U5` item in `ROADMAP.md`.
 //!
 //! # The oracle
 //!
@@ -39,9 +46,22 @@ use actuator::*;
 
 const TARGET: &str = "examples/mir_targets/actuator.rs";
 
-/// The nightly compiler, or `None` so the test can skip.
+/// The compiler to read MIR from, or `None` so the test can skip.
+///
+/// `VERIF_RUSTC` wins when it is set (CI points it at a nightly, so the dump
+/// format is exercised on the bleeding edge). Otherwise the `rustc` on `PATH` is
+/// used, because `--emit=mir` is a stable flag and a test that silently checks
+/// nothing is worse than one that runs on a stable compiler. The skip is now
+/// reserved for a machine with no `rustc` at all, which cannot build this crate.
 fn rustc() -> Option<String> {
-    std::env::var("VERIF_RUSTC").ok().filter(|s| !s.is_empty())
+    if let Some(p) = std::env::var("VERIF_RUSTC").ok().filter(|s| !s.is_empty()) {
+        return Some(p);
+    }
+    let out = std::process::Command::new("rustc").arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some("rustc".to_string())
 }
 
 fn verify_all() -> Option<verify::FileReport> {
