@@ -1288,12 +1288,10 @@ pub struct Report {
 impl Report {
     /// The first obligation that did not hold, or `None` when everything did.
     pub fn first_failure(&self) -> Option<(Obligation, Verdict)> {
-        for i in 0..self.count {
-            if let Some(ob) = self.obligations[i] {
-                let v = ob.discharge();
-                if !v.is_proved() {
-                    return Some((ob, v));
-                }
+        for ob in self.obligations[..self.count].iter().flatten() {
+            let v = ob.discharge();
+            if !v.is_proved() {
+                return Some((*ob, v));
             }
         }
         let v = self.contract.discharge();

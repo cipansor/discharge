@@ -200,6 +200,72 @@ pub enum ObligationKind {
     /// refusing is what keeps "the program cannot get past this call" from being
     /// read as a proof of what follows it.
     CalleeDiverges,
+    /// A call that never returns, reached on this path.
+    ///
+    /// `panic!`, `assert!`, `unwrap`, the bounds checks rustc inserts, and any
+    /// user function returning `!` all lower to a call with no `[return: bbN]`
+    /// arm: the path ends there. It is a *reachable failure*, so the obligation is
+    /// "is this call reachable", discharged by `Unsat`. Treating it as a dropped
+    /// line instead lost the whole path -- an `assert!` was never checked, and a
+    /// function whose safety rested on one came back `Incomplete`.
+    DivergingCall {
+        /// What kind of divergence it is, so the report does not call a clean
+        /// `std::process::exit` a panic. See the `Divergence` enum.
+        kind: Divergence,
+        /// The message, when the dump passed one as a string literal; the
+        /// callee's name otherwise. It is what names the failure in the report.
+        message: String,
+    },
+}
+
+/// What a diverging call does, for the report's label.
+///
+/// A call that never returns is a reachable end of the path whatever it does, so
+/// all three kinds carry the same obligation. They differ in what the label should
+/// *say*: reporting `std::process::exit(0)` as `panic: exit` tells a reader the
+/// program crashed when it exited cleanly. The kind is read from the callee's
+/// name -- the dump prints `exit(…)`, `std::process::abort()` and
+/// `core::panicking::panic(…)` distinctly -- and an unrecognised `!`-returning
+/// function falls to [`Divergence::Never`], which is honest about not knowing
+/// which it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Divergence {
+    /// A panic or an assert: `core::panicking::panic(…)`, `std::rt::panic_fmt`,
+    /// `core::panicking::panic_nounwind`, `assert`, `unwrap`, a bounds check.
+    Panic,
+    /// A clean process exit: `std::process::exit` (printed `exit(…)`).
+    Exit,
+    /// An abnormal termination: `std::process::abort`.
+    Abort,
+    /// A user function that returns `!`, or any divergence the name does not
+    /// classify. It still ends the path; only the label is unspecified.
+    Never,
+}
+
+impl Divergence {
+    /// Classify a diverging call from the callee's printed name.
+    pub fn of(name: &str) -> Divergence {
+        let tail = path_tail(name);
+        if tail == "exit" || name.ends_with("process::exit") {
+            Divergence::Exit
+        } else if tail == "abort" || name.ends_with("process::abort") {
+            Divergence::Abort
+        } else if name.contains("panic") || name.contains("assert") {
+            Divergence::Panic
+        } else {
+            Divergence::Never
+        }
+    }
+
+    /// The word the report uses before the message.
+    pub fn label(self) -> &'static str {
+        match self {
+            Divergence::Panic => "panic",
+            Divergence::Exit => "exit",
+            Divergence::Abort => "abort",
+            Divergence::Never => "diverges",
+        }
+    }
 }
 
 impl std::fmt::Display for ObligationKind {
@@ -223,6 +289,17 @@ impl std::fmt::Display for ObligationKind {
             }
             ObligationKind::CalleeDiverges => {
                 write!(f, "the callee's postcondition is unsatisfiable")
+            }
+            ObligationKind::DivergingCall { kind, message } => {
+                // `exit`/`abort` carry the callee's tail as their message, which
+                // is the label already; printing `exit: exit` reads as a stutter,
+                // so the label stands alone when there is no real message.
+                let label = kind.label();
+                if message == label {
+                    write!(f, "{label}")
+                } else {
+                    write!(f, "{label}: {message}")
+                }
             }
         }
     }
@@ -278,9 +355,9 @@ impl Obligation {
             | ObligationKind::RecursiveDecreases
             | ObligationKind::CalleePrecondition
             | ObligationKind::CalleeDiverges => self.verdict.is_proved(),
-            ObligationKind::Panic { .. } | ObligationKind::Unreachable => {
-                matches!(self.verdict, Verdict::Unsat)
-            }
+            ObligationKind::Panic { .. }
+            | ObligationKind::Unreachable
+            | ObligationKind::DivergingCall { .. } => matches!(self.verdict, Verdict::Unsat),
             ObligationKind::VacuousPrecondition => {
                 !matches!(self.verdict, Verdict::Unsat | Verdict::Unknown)
             }
@@ -319,7 +396,9 @@ impl Obligation {
             Verdict::Valid => match self.kind {
                 // A panic query is `path => can_happen`; `Valid` means it always
                 // happens, and there is no single witness to name.
-                ObligationKind::Panic { .. } | ObligationKind::Unreachable => {
+                ObligationKind::Panic { .. }
+                | ObligationKind::Unreachable
+                | ObligationKind::DivergingCall { .. } => {
                     "holds for every input (the failure fires on all of them)".to_string()
                 }
                 // A postcondition or invariant query is `path => P`; `Valid` is
@@ -360,7 +439,9 @@ impl Obligation {
                         .to_string()
                 }
                 // The good answer for a reachability query, so this is a discharge.
-                ObligationKind::Panic { .. } | ObligationKind::Unreachable => {
+                ObligationKind::Panic { .. }
+                | ObligationKind::Unreachable
+                | ObligationKind::DivergingCall { .. } => {
                     "invalid: an `Unsat` verdict is a discharge for this kind".to_string()
                 }
                 // The precondition describes no input, so the contract is vacuous.
@@ -588,6 +669,32 @@ struct Env {
     /// contract's comparison was checked at, instead of widening a small tag to
     /// 64.
     tag_widths: BTreeMap<u32, u8>,
+    /// The rendered `format_args!` message each local holds, keyed by local.
+    ///
+    /// A `panic!` message is not a literal in edition 2024: it is a
+    /// `fmt::Arguments` value built by a chain of `core::fmt` calls, and the
+    /// `panic_fmt` that consumes it is a *diverging* call whose only argument is a
+    /// local. Without a store for the message the report could only name the
+    /// mangled callee, so this carries the finished message from where it is built
+    /// to where it is consumed. Only string-valued locals are ever inserted.
+    strs: BTreeMap<u32, String>,
+    /// The *pieces* each local holds, keyed by local, for a local that carries a
+    /// promoted `&[&str]`.
+    ///
+    /// The pieces are kept apart from [`Self::strs`] because the number of
+    /// placeholders is not known until the `Arguments` call that consumes them
+    /// says how many arguments it was given: the same pieces render `"zero "` for
+    /// `new_const` and `"zero {}"` for `new_v1::<1, 1>`. Joining early would bake
+    /// in the wrong count.
+    piece_sets: BTreeMap<u32, Vec<String>>,
+    /// The `b"…"` template each local holds, keyed by local, for the `new::<LEN, A>`
+    /// spelling. Kept raw -- not decoded -- because the decode needs the argument
+    /// count, which only the consuming call knows.
+    tmpl_bytes: BTreeMap<u32, Vec<u8>>,
+    /// The string pieces of each `promoted` constant, copied from
+    /// [`crate::mir::parse::MirProgram::promoted_strs`] so `eval_rvalue` can read
+    /// a `const NAME::promoted[0]` operand without the whole program in hand.
+    promoted: BTreeMap<String, Vec<String>>,
 }
 
 /// A modelled value with a length and elements: a slice or an array.
@@ -659,13 +766,22 @@ impl Env {
             enums: BTreeMap::new(),
             consts: BTreeMap::new(),
             tag_widths: BTreeMap::new(),
+            strs: BTreeMap::new(),
+            piece_sets: BTreeMap::new(),
+            tmpl_bytes: BTreeMap::new(),
+            promoted: BTreeMap::new(),
         }
     }
 
-    /// Same as [`Env::new`], with the program's enum layouts and `const` items
-    /// attached.
-    fn with_enums(enums: &BTreeMap<String, EnumLayout>, consts: &BTreeMap<String, Const>) -> Env {
-        Env { enums: enums.clone(), consts: consts.clone(), ..Env::new() }
+    /// [`Env::new`] plus the program's enum layouts, `const` items and promoted
+    /// `&[&str]` pieces, so the `core::fmt` model can read a `panic!` message back.
+    fn with_prog(prog: &MirProgram) -> Env {
+        Env {
+            enums: prog.enums.clone(),
+            consts: prog.consts.clone(),
+            promoted: prog.promoted_strs.clone(),
+            ..Env::new()
+        }
     }
 
     /// The element variable for `index` of an indexed value (slice or array)
@@ -1628,6 +1744,9 @@ impl Env {
         self.payloads.retain(|(l, _), _| *l != local);
         self.discriminants.remove(&local);
         self.tag_widths.remove(&local);
+        self.strs.remove(&local);
+        self.piece_sets.remove(&local);
+        self.tmpl_bytes.remove(&local);
         if let Some(s) = self.indexed.get_mut(&local) {
             s.elems.clear();
             // The seeded elements are gone, so a later read must not find them.
@@ -2340,7 +2459,7 @@ where
         }
     };
 
-    let mut env = Env::with_enums(&prog.enums, &prog.consts);
+    let mut env = Env::with_prog(prog);
     // A pinned variable takes the literal its precondition fixes it to, so the
     // body's operations fold instead of building a circuit over an input that has
     // only one value. The pin is keyed by *variable index*, so it applies wherever
@@ -2639,6 +2758,47 @@ fn detect_loop(f: &MirFn) -> Option<(usize, Vec<usize>)> {
     header.map(|h| (h, back_edges))
 }
 
+/// What a diverging call's report should say it was.
+///
+/// The dump passes the panic message as a string literal
+/// (`core::panicking::panic(const "assertion failed: x <= 200")`), so a report can
+/// name the failed assertion instead of the mangled path. When there is no message
+/// at all -- `panic!("{}", x)` prints `panic_display::<u8>`, `unwrap` on a `None`
+/// prints `unwrap_failed` -- the callee's own name is the honest fallback, read
+/// through its generics so the report says `panic_display`, not `<u8>`.
+fn panic_message(name: &str, args: &[Operand], env: &Env) -> String {
+    for a in args {
+        // A literal message, as edition 2015/2021 prints it.
+        if let Operand::Const(Const::Str(s)) = a {
+            return s.clone();
+        }
+        // Edition 2024: the message is a local the `core::fmt` chain built, so it
+        // is read from the string store rather than from an operand.
+        if let Operand::Move(p) | Operand::Copy(p) = a {
+            if p.proj.is_empty() {
+                if let Some(s) = env.strs.get(&p.local) {
+                    return s.clone();
+                }
+            }
+        }
+    }
+    // A recent nightly lowers `unreachable!()`/`todo!()`/`unimplemented!()`/
+    // `panic!()` with no message to a dedicated `*_default_msg` callee that takes
+    // no literal, where stable passes the text as `panic(const "…")`. The text is
+    // the same on both toolchains, so it is spelled here rather than read: a
+    // report whose message depended on the compiler version would be a claim the
+    // toolchain half-decides. An unrecognised name still falls back to the callee.
+    let tail = path_tail(name);
+    match tail {
+        "panic_default_msg" => "explicit panic",
+        "unreachable_default_msg" => "internal error: entered unreachable code",
+        "todo_default_msg" => "not yet implemented",
+        "unimplemented_default_msg" => "not implemented",
+        _ => tail,
+    }
+    .to_string()
+}
+
 /// Every block a terminator can jump to.
 fn successors(t: &Term) -> Vec<usize> {
     match t {
@@ -2648,6 +2808,11 @@ fn successors(t: &Term) -> Vec<usize> {
             v.push(*otherwise);
             v
         }
+        // A diverging call has no normal successor. Reporting `target` (which the
+        // parser leaves at `usize::MAX`) would send the walk to a block that does
+        // not exist and turn the path into a "missing block" unknown; reporting
+        // none says what is true -- the path ends here.
+        Term::Call { diverges: true, .. } => Vec::new(),
         Term::Call { target, .. } => vec![*target],
         Term::Assert { target, .. } => vec![*target],
         Term::Return | Term::Unreachable | Term::Unknown(_) => Vec::new(),
@@ -3873,6 +4038,195 @@ fn eval_measure_here(f: &MirFn, env: &Env, text: &str) -> Result<(Var, bool), St
         .map_err(|e| e.to_string())
 }
 
+/// The last segment of a path, with any generic arguments stripped.
+///
+/// The dump spells a call with its generics (`Arguments::<'_>::new_const::<1>`,
+/// `new_v1::<1, 1>`, `rt::Argument::<'_>::new_display::<T>`,
+/// `std::rt::panic_display::<u8>`), so the bare last segment is `<1>`/`<T>`/`<u8>`
+/// rather than the name. The `::<…>` groups are skipped as *balanced* brackets --
+/// a group can nest (`Argument::<&'_ str>`) -- and the last `::`-segment of what is
+/// left is the name. A path with no generics (`std::rt::panic_fmt`) is returned
+/// unchanged. Both the `core::fmt` model's dispatch and a panic report's fallback
+/// name go through this, so a name is never reported as its type arguments.
+fn path_tail(name: &str) -> &str {
+    // The last `::` at generic-depth zero that is not the `::` of a `::<…>`
+    // bracket, so the method name is what follows it up to the first `<`.
+    let b = name.as_bytes();
+    let mut depth = 0i32;
+    let mut last_sep: Option<usize> = None;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'<' => depth += 1,
+            b'>' => depth -= 1,
+            b':' if depth == 0
+                && i + 1 < b.len()
+                && b[i + 1] == b':'
+                && b.get(i + 2) != Some(&b'<') =>
+            {
+                last_sep = Some(i + 2);
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let rest = match last_sep {
+        Some(k) => &name[k..],
+        None => name,
+    };
+    let head = match rest.find('<') {
+        Some(k) => &rest[..k],
+        None => rest,
+    };
+    // `new_const::<1>` leaves `new_const::` once the `<…>` is cut, so the
+    // separator that introduced the generic goes with it.
+    head.strip_suffix("::").unwrap_or(head)
+}
+
+/// The `i`-th argument of the last `::<…>` group in a path, parsed as a `usize`.
+///
+/// `Arguments::<'_>::new_v1::<2, 1>` has `("_", "2", "1")` as its groups, so index
+/// `1` is the argument count. A missing or non-numeric item returns `None`, which
+/// the caller turns into "unmodelled" -- a printer change is refused rather than
+/// guessed at.
+fn generic_arg(name: &str, i: usize) -> Option<usize> {
+    let open = name.rfind("::<")?;
+    let rest = &name[open + 3..];
+    let close = rest.find('>')?;
+    let item = rest[..close].split(',').nth(i)?;
+    item.trim().parse().ok()
+}
+
+/// Whether `name` is a call the `core::fmt` model answers, and the model's
+/// `Result` for it.
+///
+/// Edition 2024 builds a `panic!`/`assert!` message out of `core::fmt` calls
+/// rather than a single literal, so a panic's message has to be *recovered* from
+/// the chain rather than read off one operand. The chain is small and fixed:
+///
+/// * `core::fmt::rt::Argument::<'_>::new_display::<T>(&v)` -- wraps one argument
+///   for display. Its payload is the argument's *value*, which this model does
+///   not need (the message keeps the `{}` placeholder), so it is a no-op.
+/// * `Arguments::<'_>::from_str(const "…")` -- the whole message is one literal.
+/// * `Arguments::<'_>::new_const::<N>(&PIECES)` -- `N` literal pieces and no
+///   arguments.
+/// * `Arguments::<'_>::new_v1::<P, A>(&PIECES, &ARGS)` -- `P` pieces and `A`
+///   arguments, which render as the pieces joined by `{}`.
+/// * `Arguments::<'_>::new::<LEN, A>(const b"…", &ARGS)` -- the newer spelling
+///   with the template in one byte string.
+/// * `std::rt::panic_fmt(args)` -- the diverging consumer; its message is
+///   whatever the `Arguments` local holds.
+///
+/// Anything not on this list returns `None`, so a `core::fmt` call this model
+/// does not know stays "unmodelled" rather than becoming a wrong message.
+///
+/// The placeholder count is the *argument* count, which is why the pieces are
+/// joined by the consuming call and not by the builder: see
+/// [`crate::mir::parse::join_format_pieces`].
+fn try_fmt_call(
+    name: &str,
+    args: &[Operand],
+    dest: &Place,
+    env: &mut Env,
+    dest_ty: Option<&Ty>,
+) -> Option<Result<(), String>> {
+    use crate::mir::parse::{decode_format_template, join_format_pieces};
+    // The `Arguments`-building calls are printed *unqualified*
+    // (`Arguments::<'_>::new_const::<1>`), so a name cannot tell them from a local
+    // item of the same name. The destination's *type* can: `new_const`/`new_v1`/
+    // `new`/`from_str` all return `core::fmt::Arguments<'_>`, and no other call
+    // does. That is what this guard keys on -- a local function named `new` whose
+    // destination is not an `Arguments` is left to its own body, and a call this
+    // model does not know stays "unmodelled" rather than becoming a wrong message.
+    let makes_args = dest_ty.is_some_and(|t| match t {
+        Ty::Other(s) => s.contains("fmt::Arguments"),
+        _ => false,
+    });
+    // The `rt::Argument` wrappers are printed qualified (`core::fmt::rt::Argument`),
+    // so their own guard is on the name. A user item cannot be spelled in someone
+    // else's crate, so a name with one of these prefixes is `core`'s -- and a local
+    // `Argument` is answered by its body in the same dump first.
+    let qualified = ["std::fmt::", "core::fmt::"]
+        .iter()
+        .any(|p| name.starts_with(p) || name.contains(&format!("::{p}")));
+    if !makes_args && !qualified {
+        return None;
+    }
+    // The pieces an operand names: either a promoted `const NAME::promoted[0]`
+    // (recorded on the local it was assigned to) or a local that already carries
+    // them.
+    let pieces_of = |env: &Env, o: &Operand| -> Option<Vec<String>> {
+        match o {
+            Operand::Const(Const::Other(n)) => env.promoted.get(n).cloned(),
+            Operand::Copy(p) | Operand::Move(p) if p.proj.is_empty() => {
+                env.piece_sets.get(&p.local).cloned()
+            }
+            _ => None,
+        }
+    };
+    let tail = path_tail(name);
+    // There is deliberately no arm for `panic_fmt` / `panic_nounwind_fmt` here.
+    // Those are the *consumers* of the `Arguments` chain, and they return `!`, so
+    // the executor reaches them as a diverging call (see `Divergence`) before this
+    // function is ever consulted -- `try_fmt_call` is called only on the
+    // non-diverging path. The message is recovered from the `Arguments` local's
+    // string store by `panic_message` instead. A branch that recorded the message
+    // here would be dead code; it was, and the review caught it.
+    if tail == "from_str" {
+        // `Arguments::from_str("literal")`: the message is the literal itself.
+        let lit = args.iter().find_map(|a| match a {
+            Operand::Const(Const::Str(s)) => Some(s.clone()),
+            _ => None,
+        })?;
+        env.strs.insert(dest.local, lit);
+        return Some(Ok(()));
+    }
+    if tail == "new_const" {
+        // `new_const::<P>(&PIECES)`: `P` literal pieces and no arguments, so the
+        // pieces are the message as they stand.
+        let pieces = args.iter().find_map(|a| pieces_of(env, a))?;
+        env.strs.insert(dest.local, join_format_pieces(&pieces, 0));
+        return Some(Ok(()));
+    }
+    if tail == "new_v1" {
+        // `new_v1::<P, A>(&PIECES, &ARGS)`: `P` pieces and `A` arguments. The
+        // argument count is what says how many placeholders the message has, so it
+        // is read from the generic list rather than guessed from the pieces.
+        let pieces = args.iter().find_map(|a| pieces_of(env, a))?;
+        let n = generic_arg(name, 1)?;
+        env.strs.insert(dest.local, join_format_pieces(&pieces, n));
+        return Some(Ok(()));
+    }
+    if tail == "new" {
+        // `Arguments::new::<LEN, A>(const b"…", &ARGS)`: the template is one byte
+        // string, decoded to pieces. It can be a direct operand or -- as stable
+        // prints it -- a local it was assigned to first.
+        let bytes = args
+            .iter()
+            .find_map(|a| match a {
+                Operand::Const(Const::Bytes(b)) => Some(b.clone()),
+                Operand::Copy(p) | Operand::Move(p) if p.proj.is_empty() => {
+                    env.tmpl_bytes.get(&p.local).cloned()
+                }
+                _ => None,
+            })?;
+        let pieces = decode_format_template(&bytes)?;
+        let n = generic_arg(name, 1)?;
+        env.strs.insert(dest.local, join_format_pieces(&pieces, n));
+        return Some(Ok(()));
+    }
+    // `rt::Argument::<'_>::new_display::<T>(&v)` and its siblings wrap one
+    // argument; the message keeps the placeholder, so the wrapper is a no-op. The
+    // destination stays a non-string local, which is what it is.
+    if name.contains("core::fmt::rt::Argument") && tail.starts_with("new_") {
+        env.set(dest, Val::Unknown);
+        return Some(Ok(()));
+    }
+    None
+}
+
 /// Answer a modelled `core::num` call, if the callee is one.
 ///
 /// `None` means the callee is not a modelled intrinsic, and the caller falls
@@ -3881,6 +4235,7 @@ fn eval_measure_here(f: &MirFn, env: &Env, text: &str) -> Result<(Var, bool), St
 /// [`intrinsics::DIV_MAX_WIDTH`] -- and the path is reported unknown. The
 /// distinction matters: refusing to model a call and refusing to inline it are
 /// different answers, and only the first is a coverage gap in `intrinsics`.
+#[allow(clippy::too_many_arguments)]
 fn try_intrinsic(
     prog: &MirProgram,
     func: usize,
@@ -3888,7 +4243,9 @@ fn try_intrinsic(
     args: &[Operand],
     dest: &Place,
     env: &mut Env,
-) -> Option<Result<(), String>> {
+    path: Pred,
+    pins: &[(u32, u64)],
+) -> Option<Result<Vec<Obligation>, String>> {
     let op = intrinsics::classify(name)?;
     // A modelled method is only ever `core`'s own, and rustc prints a `core`
     // integer method's call with the `<impl …>` projection (`core::num::<impl
@@ -3960,7 +4317,7 @@ fn try_intrinsic(
     // and it is answered before the generic operand read below (which assumes one
     // width for every operand).
     if let intrinsics::Intrinsic::Conversion(kind) = op {
-        return Some(convert(name, kind, args, dest, env));
+        return Some(convert(name, kind, args, dest, env).map(|()| Vec::new()));
     }
     let cur = &prog.fns[func];
     // The operand width, from the first argument's declared type. It is not the
@@ -3992,7 +4349,9 @@ fn try_intrinsic(
         // refused there rather than guessed, and a printed *signed* one makes
         // `eval` decline, so a signed operand cannot be read as an unsigned one.
         let signed = match op {
-            intrinsics::Intrinsic::Unary(..) | intrinsics::Intrinsic::Bool(_) => sign.known()?,
+            intrinsics::Intrinsic::Unary(..)
+            | intrinsics::Intrinsic::Bool(_)
+            | intrinsics::Intrinsic::Abs => sign.known()?,
             _ => false,
         };
         // A bit count returns a type wider than its operand (`u8` -> `u32`), so
@@ -4011,7 +4370,7 @@ fn try_intrinsic(
                 // labelling it anything else would be a second opinion about a
                 // type this code already knows.
                 env.set(dest, Val::Sym(v, Sign::of_bool(signed)));
-                Ok(())
+                Ok(Vec::new())
             }
             Outcome::Option { tag, payload } => {
                 // `checked_neg` and `checked_abs` return an `Option`.
@@ -4022,7 +4381,7 @@ fn try_intrinsic(
                     Val::Sym(payload, Sign::of_bool(signed)),
                     w,
                 );
-                Ok(())
+                Ok(Vec::new())
             }
             Outcome::Tuple { value, overflowed } => {
                 // `overflowing_neg` and `overflowing_abs` return `(T, bool)`,
@@ -4032,7 +4391,7 @@ fn try_intrinsic(
                 let field = |i| Place { local: dest.local, proj: vec![Proj::Field(i)] };
                 env.set(&field(0), Val::Sym(value, Sign::of_bool(signed)));
                 env.set(&field(1), Val::Bool(overflowed));
-                Ok(())
+                Ok(Vec::new())
             }
             Outcome::Bool(p) => {
                 // `is_power_of_two` returns a `bool` and nothing else. The
@@ -4040,7 +4399,21 @@ fn try_intrinsic(
                 // one; a one-bit *word* here would leave the local readable only
                 // as a word, and the `if` that consumes it reads a predicate.
                 env.set(dest, Val::Bool(p));
-                Ok(())
+                Ok(Vec::new())
+            }
+            Outcome::ValueOrPanic { value, fails } => {
+                // `iN::abs` panics at `MIN`, where the magnitude is
+                // unrepresentable. The value is written unconditionally -- a path
+                // where the call panics is reported by the obligation below, so
+                // the value it carries is never used on a live path -- and the
+                // panic is a *reachable-failure* obligation, the same polarity as
+                // a rustc-inserted `assert`: the call is safe exactly where
+                // `path ∧ fails` is unsatisfiable.
+                env.set(dest, Val::Sym(value, Sign::of_bool(signed)));
+                Ok(vec![Obligation {
+                    kind: ObligationKind::Panic { message: format!("`{name}` overflows") },
+                    verdict: find_obligation(smt::and(path, fails), pins),
+                }])
             }
         });
     }
@@ -4048,6 +4421,35 @@ fn try_intrinsic(
     // `sdiv` on an `i8` read as unsigned returns a huge positive quotient for
     // every negative operand, which is a wrong value rather than a weaker proof.
     let signed = sign.known()?;
+    // `Ord::clamp` is the one three-operand shape, so it is evaluated by its own
+    // function rather than through `eval`'s two-operand signature. `x` is the
+    // receiver (the value to clamp), and `lo`/`hi` are the other two operands.
+    // The panic is `lo > hi || x < lo || x > hi`, reported the same way `abs`'s
+    // overflow is: a reachable-failure obligation, not a value.
+    if let intrinsics::Intrinsic::Clamp = op {
+        let (Some(lo_arg), Some(hi_arg)) = (args.get(1), args.get(2)) else {
+            return Some(Err(format!("unmodelled arity for `{name}`")));
+        };
+        let lo = match operand(env, lo_arg) {
+            Val::Sym(v, _) => v,
+            _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
+        };
+        let hi = match operand(env, hi_arg) {
+            Val::Sym(v, _) => v,
+            _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
+        };
+        let Some(outcome) = intrinsics::clamp(x, lo, hi, w, signed) else {
+            return Some(Err(format!("`{name}` past what the model covers at {w} bits")));
+        };
+        let intrinsics::Outcome::ValueOrPanic { value, fails } = outcome else {
+            unreachable!("clamp yields a value-or-panic outcome")
+        };
+        env.set(dest, Val::Sym(value, Sign::of_bool(signed)));
+        return Some(Ok(vec![Obligation {
+            kind: ObligationKind::Panic { message: format!("`{name}` out of range") },
+            verdict: find_obligation(smt::and(path, fails), pins),
+        }]));
+    }
     // `pow` reads two operands of *different* types: the base has the method's
     // width and sign, the exponent is the `u32` it is declared as. So the exponent
     // is read on its own -- a `Val::Sym` and its width from the argument's type --
@@ -4077,22 +4479,26 @@ fn try_intrinsic(
         return Some(match outcome {
             Outcome::Value(v) => {
                 env.set(dest, Val::Sym(v, sign));
-                Ok(())
+                Ok(Vec::new())
             }
             Outcome::Option { tag, payload } => {
                 env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
                 env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(payload, sign), w);
-                Ok(())
+                Ok(Vec::new())
             }
             Outcome::Tuple { value, overflowed } => {
                 let field = |i| Place { local: dest.local, proj: vec![Proj::Field(i)] };
                 env.set(&field(0), Val::Sym(value, sign));
                 env.set(&field(1), Val::Bool(overflowed));
-                Ok(())
+                Ok(Vec::new())
             }
             // A `bool` predicate is unary (`is_power_of_two` is the only one),
             // so it never reaches the `pow` path.
             Outcome::Bool(_) => unreachable!("a bool predicate is unary"),
+            // A value-or-panic outcome is the unary `abs` or the three-operand
+            // `clamp`, neither of which is a `pow`; those are handled before this
+            // path.
+            Outcome::ValueOrPanic { .. } => unreachable!("a value-or-panic outcome is not a pow"),
         });
     }
     let y = match args.get(1) {
@@ -4132,8 +4538,12 @@ fn try_intrinsic(
         }
         // A `bool` predicate is unary, so it never reaches the two-operand path.
         Outcome::Bool(_) => unreachable!("a bool predicate is unary"),
+        // The value-or-panic shapes (`abs`, `clamp`) are handled before this path.
+        Outcome::ValueOrPanic { .. } => {
+            unreachable!("a value-or-panic outcome is not a two-operand family")
+        }
     }
-    Some(Ok(()))
+    Some(Ok(Vec::new()))
 }
 
 /// The declared bit width of an operand, when it has one.
@@ -4239,6 +4649,23 @@ where
                     }
                 }
                 st.env.set(dest, v);
+                // A promoted `&[&str]` constant (`_4 = const f::promoted[0]`) is the
+                // format-piece array a `panic!`/`assert!` message is built from on
+                // edition 2024. Its pieces are recorded *here*, after `set`, because
+                // a whole-place write forgets the destination's parts -- recording
+                // them inside `eval_rvalue` would have them cleared by the very
+                // `set` that follows. The value itself is not a bit-vector.
+                if let Rvalue::Use(Operand::Const(Const::Other(n))) = rv {
+                    if let Some(pieces) = st.env.promoted.get(n).cloned() {
+                        st.env.piece_sets.insert(dest.local, pieces);
+                    }
+                }
+                // The `b"…"` template of `Arguments::new` reaches the call through a
+                // local (`_9 = const b"…"` then `new::<7, 1>(move _9, …)`), so it is
+                // recorded the same way and for the same reason.
+                if let Rvalue::Use(Operand::Const(Const::Bytes(b))) = rv {
+                    st.env.tmpl_bytes.insert(dest.local, b.clone());
+                }
                 // A *nested* aggregate assignment moves the source's parts under the
                 // destination's path. Two shapes need it: a struct literal into a nested field
                 // (`o.i = Inner { v: 9 }` -> `(_1.0) = move _2`), and a nested-to-nested move
@@ -4912,11 +5339,34 @@ where
             };
             advance(prog, next, *otherwise, report, work, pins);
         }
-        Term::Call { callee, args, dest, target } => {
+        Term::Call { callee, args, dest, diverges, target } => {
             let Callee::Name(name) = callee else {
                 report.unknown_paths.push("indirect call not modelled".into());
                 return;
             };
+            // A call that never returns is a reachable failure, not a line to skip.
+            //
+            // `panic!`, `assert!`, `unwrap`, and the bounds and slice checks rustc
+            // inserts lower to a diverging call into `core::panicking`: the path
+            // ends there, with no normal successor. What the caller must prove is
+            // that the call cannot be reached -- `assert!(x <= 200)` is a promise,
+            // and dropping the path silently would let a caller keep a postcondition
+            // the assert was there to guarantee. So the obligation is `path` itself,
+            // "is this call reachable", discharged by `Unsat`: the same polarity as
+            // an `assert` terminator and for the same reason. Nothing is assumed
+            // afterwards, because there is no afterwards. The block the `switchInt`
+            // routes here already carries `!guard` in its path, so the guard is what
+            // the query is really about.
+            if *diverges {
+                report.obligations.push(Obligation {
+                    kind: ObligationKind::DivergingCall {
+                        kind: Divergence::of(name),
+                        message: panic_message(name, args, &st.env),
+                    },
+                    verdict: find_obligation(st.path, pins),
+                });
+                return;
+            }
             // A self-call is answered by the function's own contract when it
             // carries a `decreases:` measure, rather than inlined: inlining it
             // would only unroll once and hit the depth bound. See
@@ -4961,11 +5411,44 @@ where
             // half of the guard.
             let same_dump = resolve_callee(prog, name);
             if same_dump.is_none() {
+                // The `core::fmt` chain behind a `panic!`/`assert!` message. It
+                // runs before `try_intrinsic` because these are not integer
+                // intrinsics, and it answers only the exact shapes it knows; every
+                // other `core::fmt` call still falls through to "unmodelled".
                 if let Some(done) =
-                    try_intrinsic(prog, st.frame.func, name, args, dest, &mut st.env)
+                    try_fmt_call(name, args, dest, &mut st.env, type_of_place(cur, dest).as_ref())
                 {
                     let next = match done {
                         Ok(()) => State { block: *target, ..st },
+                        Err(e) => {
+                            report.unknown_paths.push(e);
+                            return;
+                        }
+                    };
+                    advance(prog, next, *target, report, work, pins);
+                    return;
+                }
+                if let Some(done) = try_intrinsic(
+                    prog,
+                    st.frame.func,
+                    name,
+                    args,
+                    dest,
+                    &mut st.env,
+                    st.path,
+                    pins,
+                ) {
+                    let next = match done {
+                        // A modelled call can contribute obligations of its own:
+                        // `iN::abs` and `Ord::clamp` panic on some inputs, and
+                        // that panic is a reachable failure, exactly like the
+                        // `assert` terminator rustc inserts. The obligations are
+                        // discharged inside `try_intrinsic` (where the operand
+                        // terms are live) and pushed here.
+                        Ok(obligations) => {
+                            report.obligations.extend(obligations);
+                            State { block: *target, ..st }
+                        }
                         Err(e) => {
                             report.unknown_paths.push(e);
                             return;
@@ -5041,7 +5524,7 @@ where
                 report.unknown_paths.push(format!("callee `{name}` has no body"));
                 return;
             };
-            let mut env = Env::with_enums(&prog.enums, &prog.consts);
+            let mut env = Env::with_prog(prog);
             // Which caller locals were handed over through a reference, so the
             // return path knows whose store the callee's post-state belongs to.
             let mut by_ref: Vec<(Place, u32)> = Vec::new();
@@ -5327,6 +5810,10 @@ fn operand(env: &mut Env, o: &Operand) -> Val {
                 None => Val::Unknown,
             },
             Const::Bool(b) => Val::Bool(smt::truth(*b)),
+            // A string or byte-string literal has no bit-vector, so it is not a
+            // `Val`; the `core::fmt` model reads it through the env's string store
+            // instead.
+            Const::Str(_) | Const::Bytes(_) => Val::Unknown,
             // An enum variant *construction*: `Mode::Idle`. The dump prints it as
             // a path constant, and it is the one place a tag is a *known* value
             // rather than an input -- a locally built enum then has a constant
@@ -7580,5 +8067,58 @@ fn count_via_helper(_1: u8) -> u8 {
 
         // An intrinsic call keeps its `<impl` projection, which marks it external.
         assert_eq!(call_type("core::num::<impl u8>::wrapping_add").as_deref(), Some("u8"));
+    }
+
+    /// The tail of a path is read through its generics.
+    ///
+    /// The dump spells these calls with their generics, so a naive last-segment
+    /// split gives `<1>`/`<T>` rather than the method name -- and the model would
+    /// then answer nothing at all, which is how the MSRV run reported
+    /// `Arguments::<'_>::new_const::<1>` as unmodelled while stable was green.
+    /// The turbofish separator (`new_const::<1>`) and a nested group
+    /// (`Argument::<&'_ str>`) are both covered.
+    #[test]
+    fn a_path_tail_is_read_through_its_generics() {
+        assert_eq!(path_tail("Arguments::<'_>::new_const::<1>"), "new_const");
+        assert_eq!(path_tail("Arguments::<'_>::new_v1::<2, 2>"), "new_v1");
+        assert_eq!(path_tail("Arguments::<'_>::new::<7, 1>"), "new");
+        assert_eq!(path_tail("Arguments::<'_>::from_str"), "from_str");
+        assert_eq!(path_tail("core::fmt::rt::Argument::<'_>::new_display::<u8>"), "new_display");
+        assert_eq!(path_tail("std::rt::panic_fmt"), "panic_fmt");
+        assert_eq!(path_tail("panic_fmt"), "panic_fmt");
+    }
+
+    /// The generic argument list is read as data, and a missing item is refused.
+    #[test]
+    fn a_generic_argument_is_read_or_refused() {
+        assert_eq!(generic_arg("Arguments::<'_>::new_v1::<2, 1>", 1), Some(1));
+        assert_eq!(generic_arg("Arguments::<'_>::new::<7, 1>", 1), Some(1));
+        // No turbofish, a missing index, and a non-numeric item are all `None`.
+        assert_eq!(generic_arg("Arguments::<'_>::new_const", 1), None);
+        assert_eq!(generic_arg("Arguments::<'_>::new_v1::<2>", 1), None);
+        assert_eq!(generic_arg("Arguments::<'_>::new_v1::<2, A>", 1), None);
+    }
+
+    /// A diverging call is labelled by *what* it does, not always `panic`.
+    ///
+    /// `std::process::exit(0)` and `std::process::abort()` end the path exactly as
+    /// a panic does, so all three carry the same obligation -- but calling a clean
+    /// `exit` a `panic` tells a reader the program crashed when it did not. The
+    /// kind is read from the callee's printed name; an unrecognised `!`-returning
+    /// function is `Never`, which is honest about not classifying it.
+    #[test]
+    fn a_diverging_call_is_labelled_by_its_kind() {
+        assert_eq!(Divergence::of("core::panicking::panic"), Divergence::Panic);
+        assert_eq!(Divergence::of("std::rt::panic_fmt"), Divergence::Panic);
+        assert_eq!(Divergence::of("core::panicking::panic_nounwind"), Divergence::Panic);
+        // `exit(…)` is printed with its tail alone (it is `std::process::exit`, but
+        // the dump elides the path).
+        assert_eq!(Divergence::of("exit"), Divergence::Exit);
+        assert_eq!(Divergence::of("std::process::exit"), Divergence::Exit);
+        assert_eq!(Divergence::of("std::process::abort"), Divergence::Abort);
+        // A user function returning `!` is not classified as any of the three.
+        assert_eq!(Divergence::of("my_crate::never_returns"), Divergence::Never);
+        assert_eq!(Divergence::Never.label(), "diverges");
+        assert_eq!(Divergence::Exit.label(), "exit");
     }
 }

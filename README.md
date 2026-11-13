@@ -86,6 +86,7 @@ all obligations discharged
 - [A truncated witness has to say so](#a-truncated-witness-has-to-say-so)
 - [A negative answer has to say what it swept](#a-negative-answer-has-to-say-what-it-swept)
 - [An unreachable precondition is not a proof](#an-unreachable-precondition-is-not-a-proof)
+- [A diverging call is a checked panic, not a dropped line](#a-diverging-call-is-a-checked-panic-not-a-dropped-line)
 - [A bound must be wider than the address, or "all cells" is vacuous](#a-bound-must-be-wider-than-the-address-or-all-cells-is-vacuous)
 - [The memory family, positive side](#the-memory-family-positive-side)
 - [The differential harness now covers memory](#the-differential-harness-now-covers-memory)
@@ -105,6 +106,11 @@ all obligations discharged
 - [What this is *not* — read this before trusting a green test](#what-this-is-not--read-this-before-trusting-a-green-test)
 - [Documentation](#documentation)
 - [License](#license)
+
+**The open work** lives in [`ROADMAP.md`](ROADMAP.md) — one item per gap, each with
+a priority, a measurable exit criterion, the competitor whose gap it closes, the
+closing move (build / bridge / won't do), and a status. A PR that closes an item
+updates its status there.
 
 ---
 
@@ -1373,8 +1379,11 @@ signed_add_guarded verified (2 obligation(s), 1 panic(s) ruled out)
 signed_mul_guarded verified (2 obligation(s), 1 panic(s) ruled out)
 signed_mul_negative FAILED: panic: attempt to compute `{} * {}`, which would overflow — v1:u8 = 128, v2:u8 = 128
 checked_neg      verified (2 obligation(s), 1 panic(s) ruled out)
+assert_guarded   verified (2 obligation(s), 0 panic(s) ruled out)
+assert_misguarded FAILED: panic: assertion failed: n <= 100 — v1:u8 = 128
+panic_guarded    verified (2 obligation(s), 0 panic(s) ruled out)
 
-verified=12 failed=9 incomplete=0
+verified=14 failed=10 incomplete=0
 All expectations met.
 ```
 
@@ -1760,6 +1769,59 @@ casting *to* one, both report the function as skipped. This is a refusal, not a
 crash — a width the engine cannot hold is decided before any width-taking
 constructor runs.
 
+### A diverging call is a checked panic, not a dropped line
+
+`assert!`, `debug_assert!`, `panic!`, `unreachable!`, `todo!`, `unwrap`, and the
+bounds and slice checks `rustc` inserts all lower the same way: a call into
+`core::panicking` (or a user function returning `!`) with **no `[return: bbN]`
+arm**, because the call never returns.
+
+```rust,ignore
+/// requires: x <= 200
+/// ensures: ret == 1
+pub fn f(x: u8) -> u8 { assert!(x <= 200); 1 }
+```
+
+The parser recognised only the `[return:` shape, so this terminator came back
+`Unknown("missing")`, the path was reported unmodelled, and the whole function was
+`Incomplete`. The most ordinary safety guard in Rust was never checked at all —
+`f` above was not proved, it was *skipped*, and a caller reading "incomplete" for
+an `assert` would be right to distrust the tool.
+
+The two call shapes are now read separately, and the diverging one becomes a
+**panic obligation** rather than a silent drop:
+
+* the obligation is `path`, "is this call reachable", discharged by `Unsat` — the
+  same polarity as the `assert` terminator, and for the same reason. The `switchInt`
+  that routes into the call already carries `!guard` in its path, so the query is
+  really about the guard;
+* the fall-through of a *non*-diverging `assert` terminator still assumes the
+  guard, so code after an `assert!` may rely on it;
+* the report names the failure from the string literal the dump passes, so an
+  unproved `assert!(x <= 200)` reads `panic: assertion failed: x <= 200` with the
+  counterexample that fires it, instead of a mangled callee path. Edition 2024 does
+  not pass a literal for a *formatted* message — `panic!("bad {}", x)` builds an
+  `Arguments` through `core::fmt` — so those pieces are recovered from that chain,
+  with the placeholder count taken from the call's own argument count
+  (`Arguments::new_v1::<P, A>`) rather than guessed from the pieces.
+
+This is the sound direction, and it is the same shape as the `DivergentCall`
+finding in `wp` — a construct that cuts a path off must be *recorded*, because
+everything downstream of it is vacuously true. The teeth are a matched pair:
+`an_assert_is_checked_and_discharged_under_its_precondition` pins the proof, and
+`an_unproved_assert_is_refuted_with_a_counterexample` pins the refutation. A user
+function returning `!` is treated the same way, so `if x == 0 { die(); }` is a
+failure at `x == 0` and is proved unreachable under `requires: x != 0`.
+
+`a_formatted_panic_message_is_recovered_from_the_fmt_chain` pins the message
+recovery on whichever toolchain `VERIF_RUSTC` names — the `new_v1`/promoted-array
+spelling on the MSRV and the `new::<LEN, A>` byte-template spelling on stable — and
+`a_literal_panic_macro_names_its_message` pins that `unreachable!()` and `todo!()`,
+which pass a literal, still name the text the programmer wrote. A name is never
+reported as its type arguments: `panic!("{}", x)` has no literal piece at all, so it
+falls back to the callee's name read through its generics (`panic_display`, not
+`<u8>`).
+
 ### What is read from where, and why
 
 | Part | Source | Reason |
@@ -1767,6 +1829,26 @@ constructor runs.
 | the body | `rustc --emit=mir` | the real lowering, including the checks `rustc` inserts |
 | the contract | the source text | MIR carries no attributes or doc comments |
 | the compiler | `VERIF_RUSTC`, else `rustc` | `--emit=mir` is stable, so the `rustc` on `PATH` is enough; the variable exists to point the frontend at a *different* compiler without disturbing cargo's own |
+| the edition | `MirOptions::edition`, else `VERIF_EDITION`, else the nearest `Cargo.toml` | the edition changes the lowering, so a verdict is only meaningful under the edition the crate is built with |
+
+The edition is resolved in that order, and it is never *guessed*: the first match
+wins, and a value that is set but not one of `2015`/`2018`/`2021`/`2024` is an
+error rather than a silent fallback. A file that lives in a crate takes the
+edition from the nearest `Cargo.toml`'s `package.edition` (resolving
+`edition.workspace = true` against the workspace root), and a `[package]` that
+omits the key resolves to **2015**, which is Cargo's own default for a package
+that does not state one. Only a *loose* file -- one with no manifest above it --
+has no crate edition to infer, and it must be given one:
+
+```bash
+# A loose file has no Cargo.toml, so name the edition explicitly.
+VERIF_EDITION=2021 VERIF_RUSTC="$(rustup which rustc)" \
+  cargo run --features std --example mir_coverage -- /tmp/probe.rs
+```
+
+A program calls the frontend directly through `MirOptions { edition: Some(..) }`,
+which takes precedence over both; the environment variable is for the examples and
+the tests, which have no options struct to fill in.
 
 The five differential oracles (z3, Kani, Lean, Coq, Verus) all build their terms
 with `smt::` calls, so they start *below* the contract reader. That left the reader
@@ -1912,6 +1994,19 @@ refused. `src/mir/intrinsics.rs` holds the model:
   unknown. The trait path must be exactly `From`/`Into`, `core::convert::…` or
   `std::convert::…` — none of which a user can define — so a local `From` in a
   module is refused by name.
+- The inherent `iN::abs` and the trait `Ord::clamp` are the first modelled methods
+  whose failure is a **panic**, so the model carries *two* channels — the value and
+  a `fails` predicate — and the executor turns the predicate into a panic
+  obligation beside the value. The value is defined at every input (the wrapped
+  absolute value, the clamp expression), and the predicate is where `core`'s own
+  `assert` fires: `abs` fails exactly at `MIN`, and `clamp` fails exactly at
+  `lo > hi`. An out-of-range `x` is *not* a clamp panic — clamping it is the whole
+  point — and reading it as one made a true corpus function fail until the probe
+  corpus caught it. `abs` takes its sign from the operand (`Abs` joins the
+  sign-reading arms), and `clamp`'s comparisons are the type's own, so a signed
+  clamp reads `i8::MIN` as below `0`. Both are refused on a non-primitive self
+  type, and `clamp` is admitted only under the standard library's `Ord` path, the
+  same rule `min`/`max` follow.
 - A *local* method that shares an intrinsic's name is answered by its own body,
   never by the model. rustc prints a trait impl's call as `<u8 as Trait>::m` but
   its definition as `<impl at …>::m`, so the names never match; the model is only
@@ -2105,6 +2200,16 @@ says "I could not decide" is worth more than one that guesses.
    behind the `std` feature. The engine it uses is the embedded one, but the
    frontend that feeds it is a development tool, not something that ships on a
    microcontroller.
+5. **A `for` loop is not modelled.** `for x in 0..n` lowers to `IntoIterator::into_iter`
+   and a `Iterator::next(&mut range)` call, and neither is in the model, so the
+   function is reported `incomplete` rather than proved. The same holds for any
+   iterator chain (`fold`, `map`, `sum`) and for a `for` over a slice or array. A
+   `while` loop carrying an `invariant:` and a `variant:` is the supported way to
+   state the same iteration, and it is *more* precise, not less: the measure gives
+   total correctness, where an unwound `for` gives a bounded check. The frontend
+   says which call it could not model (`call to unmodelled function <… as
+   IntoIterator>::into_iter`), so the gap is visible in the report rather than
+   silent.
 
 ## What this is *not* — read this before trusting a green test
 
@@ -2212,6 +2317,7 @@ is instantaneous while a 12-bit multiplier equality is not.
 ├── Cargo.toml          the crate manifest (`no_std`, zero dependencies)
 ├── Cargo.lock          committed, and a single package: the dependency set is empty
 ├── README.md           this file
+├── ROADMAP.md          the open work: one item per gap, with exit criteria
 ├── AGENTS.md           notes for agents, including the traps that cost the most time
 ├── LICENSE             Apache-2.0
 ├── SECURITY.md         how to report a vulnerability (GitHub private advisories)
@@ -2286,7 +2392,10 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   ├── comparison/        the same three functions proved seven ways, plus
 │   │                      Ferrocene as the qualified compiler (see its README)
 │   └── mir_targets/
-│       └── actuator.rs    the Rust under verification; imports no `verif`
+│       ├── actuator.rs    the Rust under verification; imports no `verif`
+│       ├── realistic.rs   the large regression corpus (adversarial fixtures included)
+│       └── everyday.rs    the independent corpus: ordinary Rust, not shaped for
+│                          the tool; Phase 1 in `ROADMAP.md` is scored on it
 ├── tools/
 │   ├── mir-oracle/     the `rustc_public` oracle: checks the text-MIR frontend
 │   │                   against rustc's own typed MIR. Nightly + `rustc-dev`,
@@ -2722,6 +2831,9 @@ prover symbols.
   makes and the check that backs it. The [Contents](#contents) list at the top
   groups those sections.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the ground rules and the gates.
+- [`ROADMAP.md`](ROADMAP.md) is the single source for open work: each item carries
+  a priority, a measurable exit criterion, the competitor whose gap it closes, the
+  closing move (build / bridge / won't do), and a status.
 - [`SECURITY.md`](SECURITY.md) covers reporting a **soundness bug** — a false
   `Valid` — which is the vulnerability class that matters in a verifier.
 - [`AGENTS.md`](AGENTS.md) is the engineering log: why each decision was made,

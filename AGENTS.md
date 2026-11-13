@@ -22,8 +22,13 @@ Repository-level notes for agents working in this workspace.
   carry its own), `NOTICE` (third-party attribution — SPARK, z3, Kani, Verus,
   Lean, Coq, Ferrocene and the rest, each of which is an oracle or a comparison,
   never a dependency), `SECURITY.md` (soundness bugs are the vulnerability class
-  that matters in a verifier), `CONTRIBUTING.md`, `README.md` (the long-form
-  document, and the crate's page on crates.io), and `AGENTS.md` (this file).
+  that matters in a verifier), `CONTRIBUTING.md`, `ROADMAP.md` (the *single source
+  for open work* — one item per gap with a priority, a measurable exit criterion,
+  the competitor whose gap it closes, the closing move, and a status), `README.md`
+  (the long-form document, and the crate's page on crates.io), and `AGENTS.md`
+  (this file). This file records what was *learned*; `ROADMAP.md` records what is
+  *left*. When a "Stage N" or "Next stage" section below is finished, its remaining
+  work moves to `ROADMAP.md` rather than living here.
 
 ## Renaming the crate: `discharge` → `verif`
 
@@ -3054,6 +3059,30 @@ Three smaller traps fell out of the same work, each a place where a plausible re
   downcast place did not parse. Checking the place form first fixes it — the same shape of
   ordering bug as the earlier `const ... as ...` case, in the opposite direction.
 
+**A `match` arm guard reads its payload through a borrow of a downcast place — a third
+instance of the same ordering bug.** `Msg::Data(n) if n < 10` lowers to
+`_4 = &((_1 as Data).0: u8); _6 = copy (*_4); _5 = Lt(move _6, const 10_u8)`. The rvalue
+contains the word ` as ` *inside its parentheses*, and `parse_rvalue` checked for a cast
+before a reference, so it split the borrow at that ` as `, read it as a cast of the
+unparseable string `&((_1`, and produced a cast of `Unknown`. `_4` therefore got no
+address, `copy (*_4)` read `Unknown`, and the `switchInt` on the guard's `bool` was
+reported "unmodelled switch discriminant" — the *guard's* payload read was the thing that
+failed, not the switch, which is what made the message point at the wrong construct. The
+reference arm now runs before the cast arm; a real cast cannot be mis-taken for a
+reference, because `&…` is not a place, so the reorder is safe in the direction that
+matters. Pinned by `mir::parse::tests::a_borrow_of_an_enum_payload_is_a_ref_not_a_cast`
+(unit, no toolchain needed) and `tests/mir.rs::a_match_guard_reads_its_payload_through_a_borrow`
+(the corpus pair `guarded_match_reads_its_payload` / `guarded_match_tripwire`). Coverage:
+`everyday.rs` 9/21 → **10/21** (`next_mode`, C5's own evidence function, now decides),
+`realistic.rs` 398/737 → **399/739**; `scripts/test-count.sh` 874 → **876** passed, 0 failed.
+
+The recurring shape, worth stating once: **`parse_rvalue`'s arms are ordered, and an
+arm's pattern can appear inside another arm's string.** ` as ` lives inside a downcast
+*place* (both the `copy ((_2 as Some).0)` form and the `&((_1 as Data).0: u8)` form), and
+`const ` lives inside a cast constant. Each ordering fix so far has been found by a shape
+whose rvalue contained another arm's keyword; when a new rvalue form is added, check it
+against the arms above it, not only against the arms below.
+
 **The oracle is Rust itself, enumerated.** The model claims to implement `core`'s definition,
 so the unit tests in `src/mir/intrinsics.rs` compare against the real `u8::checked_add` and
 its family over *all* of `u8` and all of `i8` — 65536 pairs per case, cheap because the term is
@@ -3639,6 +3668,11 @@ test that only checked the signed case would pass again the moment the rule went
 back to a single default.
 
 ## Next stage: the signedness work is a *rule*, so let the engine state it
+
+> The open work from every "Next stage" / "Stage N" section in this file is now
+> tracked in [`ROADMAP.md`](ROADMAP.md), which is the single source for what is
+> left. This section is kept as the *record* of the reasoning; check `ROADMAP.md`
+> for the current status of each item.
 
 Both false proofs fixed in this round were the same bug wearing different
 clothes. A value operation silently dropped the signedness of its operand:
@@ -8685,3 +8719,276 @@ The pattern in four of the six is the same: a value was *available* and the wron
 one was used, or a case was folded into a neighbour that shares its shape. The two
 false proofs are the receiver-in-the-slot-list and the empty-return-type cases --
 both places where "read what is there" quietly became "assume what is not".
+
+## `assert!` was a dropped path, not a check -- and the shape behind it
+
+The sixth review fixed the trait-contract route. This one came from asking a
+different question: *what ordinary Rust does the frontend still refuse?* A probe
+of a dozen idioms found the answer was `assert!`, the most common safety guard in
+the language.
+
+`assert!(x <= 200)` lowers to a `switchInt` that routes the *failing* case into
+
+```
+_3 = core::panicking::panic(const "assertion failed: x <= 200") -> unwind continue;
+```
+
+There is no `[return: bbN]` arm, because the call never returns. The parser looked
+only for the `[return:` shape, so the terminator came back
+`Term::Unknown("missing")`, the block's path was reported unmodelled, and the whole
+function was `Incomplete`. Nothing was *wrong* -- but nothing was checked either,
+and a verifier that silently skips the guards you wrote is worse than one that
+refuses loudly.
+
+**The fix is the sound direction, and it is the same shape as `wp`'s
+`DivergentCall`.** A construct that cuts a path off must be *recorded*, because
+everything downstream of it is vacuously true -- the lesson this file already
+carries three times (`Assume(false)`, an unsatisfiable precondition, a
+never-returning call). So the diverging call becomes a **panic obligation**: the
+query is `path`, "is this call reachable", discharged by `Unsat`, exactly the
+polarity of an `assert` terminator. The `switchInt` that routes into the call
+already carries `!guard` in its path, so the query is really about the guard. An
+`assert!` under a precondition that implies it is `Verified`; without one it is
+`Failed` with the counterexample that fires it (`x = 224` for `x <= 200`), and the
+report names the assertion from the message the dump passes (a string literal, or
+the pieces of the `core::fmt` chain in edition 2024).
+
+Two details that were not obvious:
+
+* **A user function returning `!` lowers the same way** -- `_3 = die() -> unwind
+  continue`, no return arm. The model treats it identically, so
+  `if x == 0 { die(); }` is a failure at `x == 0` and is proved unreachable under
+  `requires: x != 0`. This is why the obligation kind is `DivergingCall`, not
+  `Panic`: only some of these are panics, and calling `die` a panic would be a
+  small lie in the report.
+* **The `assert` *terminator* and the `assert!` *macro* are different lowerings.**
+  The overflow checks rustc emits are `Term::Assert`, which already assumed the
+  guard on the fall-through. The macro is a `switchInt` plus a diverging call, so
+  the assumption had to be made by the branch, not by the call -- the guard lives
+  in the *other* arm's path. `an_assert_guard_is_assumed_by_the_code_after_it`
+  pins it: without the assumption `x + 1` after `assert!(x <= 200)` reports a
+  possible overflow.
+
+The tests are a matched pair, because a fix for a dropped path is exactly the kind
+that can flip into a blanket failure: one pins the proof, one pins the refutation.
+
+### The oracle's own argument list was the first thing the new cases caught
+
+Adding a `panic!` to the regression corpus made gate 10 fail:
+
+```
+panic_guarded:
+  text : 3 blocks, panics []
+  typed: 4 blocks, panics []
+```
+
+The parser was right. The *oracle* was comparing two different compilations of one
+file: `emit_mir` passed `--crate-type=lib --emit=mir` and **no edition**, so rustc's
+default applied -- and the default is 2015, not the 2024 the crate itself is on --
+while the typed side pinned `--edition 2021`. `panic!("literal")` lowers to a single
+diverging call, `core::panicking::panic(const "…")`, under 2015; under 2021 or 2024
+it lowers to `Arguments::from_str(…) -> [return: bb2, …]` plus
+`std::rt::panic_fmt(…)`, one extra basic block. The oracle's comment claimed its
+argument list "mirrors what the text emitter passes" -- it did not, and nothing had
+exercised the difference until a `panic!` with a literal entered a corpus the oracle
+checks.
+
+This is the failure mode the oracle exists to prevent, one level up: a comparison
+between two things that are not the same thing is not evidence, and it is worse
+than no comparison because it reports a disagreement that cannot be acted on.
+
+The fix pins the edition to **2024** on *both* sides rather than leaving either to
+rustc's default. Pinning only one side is what caused the bug; leaving both
+implicit would have made the tool's behaviour depend on which compiler's default it
+happened to run under, which is exactly the kind of hidden input this crate refuses
+elsewhere. 2024 is the crate's own edition (`Cargo.toml`), it is what the test
+suite's `unsafe extern "C"` fixtures already require, and it compiles both corpora
+clean on the MSRV (1.85) and on stable (1.99) -- checked, not assumed. The only
+difference between the two compilations now is text versus typed IR.
+
+The lesson is the same one this file keeps recording, in a new place: a harness
+that *asserts* a property it does not itself establish will eventually assert it
+about itself. The oracle's check of the parser was sound; the oracle's own inputs
+were not held to the standard it held the parser to.
+
+### What the same probe found and did *not* fix
+
+A `for` loop is still refused, and now says so in the known gaps: `for x in 0..n`
+lowers to `IntoIterator::into_iter` and `Iterator::next(&mut range)`. `next` is the
+harder half -- it is a trait method that *writes through* its `&mut` argument, so
+modelling it needs the `&mut` write-back the crate does not have (a reference
+argument is refused for that reason). A `while` loop with `invariant:`/`variant:`
+states the same iteration and is strictly stronger: the measure gives total
+correctness where an unwound `for` gives a bounded check. The gap is documented
+rather than papered over, and the report names the unmodelled call so it is visible
+rather than silent.
+
+## Recovering an edition-2024 `panic!` message: `core::fmt` is a two-spelling chain
+
+The diverging-call fix above made `panic!` *checked*. It did not make it
+*readable*: the report named the panic from a string literal operand, and edition
+2024 has no such operand. `panic!("zero")` under 2024 lowers to
+
+```
+_4 = Arguments::<'_>::from_str(const "zero") -> [return: bb2, unwind continue];
+_3 = std::rt::panic_fmt(move _4) -> unwind continue;
+```
+
+so the message is a *local* the chain built, not an argument. Reading it needs a
+small model of `core::fmt`, and the model is where the two toolchains the gate
+runs diverge.
+
+**Four spellings, and the gate runs two of them.** The builders are:
+
+| Spelling | Toolchain | Message source |
+| --- | --- | --- |
+| `Arguments::from_str(const "…")` | both | the literal, one piece |
+| `Arguments::new_const::<P>(&PIECES)` | 1.85 (MSRV) | a promoted `&[&str; P]`, no arguments |
+| `Arguments::new_v1::<P, A>(&PIECES, &ARGS)` | 1.85 (MSRV) | the same promoted array, `A` arguments |
+| `Arguments::new::<LEN, A>(const b"…", &ARGS)` | stable (1.99) | one encoded byte template |
+
+The last two are the same source text compiled by two compilers, so a model that
+answers only one of them is a model that is green on one toolchain and
+`Incomplete` on the other -- which is exactly what the MSRV run reported while
+stable was green. Both are answered.
+
+**Three details that are not obvious, and each cost a round trip.**
+
+* **The promoted array is not reachable by walking a body.** The pieces live in a
+  `const f::promoted[0]: &[&str; 1] = { … }` item printed *outside* any function,
+  and the call passes `&_4` where `_4 = const f::promoted[0]`. The executor never
+  walks that item, so the pieces are collected at parse time, next to the other
+  `const` items, into `MirProgram::promoted_strs` -- the one place in this frontend
+  where a fact is read from the dump rather than from the function's own body, and
+  it is read from the *same* dump so the two cannot drift.
+* **A whole-place write forgets the destination's parts.** The pieces are recorded
+  on the local the reference was assigned to, and the obvious place to record them
+  -- inside `eval_rvalue` -- is wrong: the `set` that follows calls `forget_parts`,
+  which clears `piece_sets` (it must, or a stale read of an overwritten local would
+  be a *wrong* message). The record therefore happens in the `Stmt::Assign` arm
+  *after* `set`, which is the only ordering that survives.
+* **The byte template arrives through a local too.** On stable the template is
+  `_9 = const b"\x04bad \xc0\x00"` and then `new::<7, 1>(move _9, …)`, so it is
+  kept raw in `tmpl_bytes` and decoded by the consuming call -- the decode needs
+  the argument count, which only the call has.
+
+**The placeholder count is the argument count, not the piece count.** This is the
+one that produced a wrong *message* rather than a missing one.
+`panic!("{} tail", x)` prints `["", " tail"]` with **one** argument, so a join that
+put a `{}` in every gap would report `{} tail{}` for a message with one
+placeholder -- a message that is not the one in the source, which is worse than
+naming none. `join_format_pieces(pieces, args)` therefore takes the count from the
+generic list (`new_v1::<P, A>` -> `A`, `new::<LEN, A>` -> `A`, `new_const` -> 0)
+and appends the surplus placeholders after the last piece. `generic_arg` refuses a
+missing or non-numeric item rather than guessing, so a printer change surfaces as
+"unmodelled", not as a wrong message.
+
+**The guard is the destination's type, not the callee's name.** `new_const` and
+friends are printed *unqualified* (`Arguments::<'_>::new_const::<1>`), so a name
+cannot tell `core`'s builder from a local function called `new`; the destination
+type `std::fmt::Arguments<'_>` can, and no other call has it. The consumer
+(`std::rt::panic_fmt`) *is* qualified, so its guard is on the name. Both
+directions of a misjudgement are a refusal: a local `new` is left to its own body,
+and an unknown `core::fmt` call stays "unmodelled".
+
+The tests are a matched pair again, and they run under whichever toolchain
+`VERIF_RUSTC` names -- so the 1.85 `new_v1`/promoted-array spelling and the stable
+`new::<LEN, A>` byte-template spelling are both exercised by the gate's two
+toolchains rather than by one machine's luck.
+
+**A name must never be reported as its type arguments.** `panic!("{}", x)` has no
+literal piece at all -- there is nothing to recover -- so the report falls back to
+the callee's name, and the naive `name.rsplit("::").next()` gave `<u8>` for
+`panic_display::<u8>` / `panic_cold_display::<u8>`. That is the mangled path the
+message recovery exists to avoid, just reached from the other side. The fallback
+now goes through the same generic-stripping helper the `core::fmt` dispatch uses,
+so it reads `panic_display`, and `unreachable!()` / `todo!()` -- which *do* pass a
+literal, `"internal error: entered unreachable code"` / `"not yet implemented"` --
+keep naming the text the programmer wrote. The three are pinned together so a
+change aimed at the formatted case cannot quietly regress the plain one.
+
+One more fail-closed turn: the `panic_fmt` consumer used to record an *empty*
+message when its argument was not a local it knew, which would print `panic: ` with
+nothing after it. It now refuses, so the report names the call it could not model
+instead of showing a blank message.
+
+## A toolchain-shaped report, and a gate the edition work broke
+
+Two CI-only failures on the diverging-call branch, both invisible to a green local
+gate run, and both the same lesson: the *environment* is part of what a claim is
+about, so a gate that names one toolchain has not checked the other.
+
+**The panic message was read from the dump, and a nightly stopped printing it.**
+`unreachable!()`, `todo!()`, `unimplemented!()` and a message-less `panic!()` used to
+lower to `core::panicking::panic(const "…")` with the text as a literal, and
+`panic_message` read that literal. A recent nightly lowers each to a dedicated
+`core::panicking::{unreachable,todo,unimplemented,panic}_default_msg()` callee that
+takes **no** literal, so the report fell back to the callee's name
+(`panic: unreachable_default_msg`) and `a_literal_panic_macro_names_its_message`
+failed -- on the nightly CI names, and on nothing else. The fix spells the canonical
+text for those four tails, so the message is the same string stable prints. Reading
+it from the compiler would make a *report* depend on the compiler version, which is a
+claim the toolchain half-decides; the text is the same on both, so it is written down.
+An unrecognised name still falls back to the callee, which is the honest answer.
+
+**The edition work broke the comparison gate, and only on a machine with no
+`Cargo.toml` above the fixture.** Resolving the edition instead of pinning 2024 is
+right -- a verdict under the wrong edition is about a program nobody built -- but the
+degenerate fixtures in `examples/comparison_check.rs` were written as loose `.rs`
+files in `$TMPDIR`, with no manifest above them and no `VERIF_EDITION`, so the
+frontend now refused them ("no Rust edition for /tmp/…"). It passed locally only
+because the earlier gate runs had left `VERIF_EDITION` exported in that shell. The
+fix gives each scratch fixture its own temp *crate directory* with a `Cargo.toml`
+(`edition = "2021"`), which is what a real program has and which exercises the
+manifest-resolution path rather than the override. The removal became
+`remove_dir_all` on the parent.
+
+Both are pinned by the gate's own two compilers now: `scripts/gate.sh` runs the MIR
+suite under the compiler on `PATH` *and* under the MSRV, and CI runs it under a
+nightly, so a dump-shape change on any of the three fails in the run that introduces
+it. The general rule the pair teaches: a test that names one toolchain checks one
+toolchain, and "it passed locally" is a claim about the local compiler, not about
+the program.
+
+## Four review findings on the edition and label work
+
+A review of the diverging-call branch raised four items. Two were live defects in
+this branch, one was already fixed by an earlier commit in the same branch, and one
+was a test/scoreboard mismatch. Each is recorded because the *reason* recurs.
+
+**A package that omits `edition` is Cargo's 2015 default, not an error.**
+`resolve_edition` refuses a file with no edition anywhere, which is right for a
+*loose* `.rs` -- it has no crate edition to infer. But Cargo assigns edition 2015 to
+a `[package]` that does not state one, so the same refusal also rejected a valid
+2015 package: verification stopped before `rustc` ran. The two are different
+questions, and `edition_from_manifest` now answers them differently: a manifest that
+declares a `[package]` with no `edition` key resolves to 2015 (`declares_package` is
+the tell), while a loose file and a manifest with no `[package]` (a virtual
+workspace) still yield no edition. The refusal is kept exactly where it belongs.
+
+**A label must name the event that happens.** A reachable call to a user function
+returning `!` -- `die() -> ! { loop {} }` -- is a reachable *failure*, but the
+failure is a non-terminating loop, not a panic. The report said `panic: die`, naming
+an event that never occurs. `Divergence::of` already distinguished `exit`/`abort`
+from `panic`; an unrecognised `!`-returning callee is now labelled `diverges`. The
+general rule: when a report prints a *reason*, the reason has to be the thing that
+happened, not the nearest category. This was fixed earlier in the branch (`af12de8`,
+"Label a diverging call by its kind"), and the review was against the pre-fix head --
+worth checking a finding against the current head before acting on it.
+
+**A scoreboard and a regression floor must count the same thing.** The corpus test
+counted `Verified | Failed` as "decided" while `mir_coverage` counts only
+`Verified`. A corpus function that flipped from verified to refuted would keep the
+test's number and lower the printed one -- the floor and the scoreboard would
+disagree about the same run. The test now counts `Verified` only, like the
+scoreboard, and asserts *separately* that no function in this corpus of ordinary
+Rust is refuted. The rule is the one the crate keeps meeting: a count that folds two
+outcomes together cannot tell them apart, and the difference is exactly what the
+check exists to see.
+
+**A frontend behaviour change is a README change.** The edition resolution (E2) is
+new user-facing behaviour -- a loose file now needs `VERIF_EDITION`, and a package's
+edition comes from its manifest -- and the README's "what is read from where" table
+did not mention it. The table gained an `edition` row and a paragraph on the
+precedence and the loose-file override, which is what `CONTRIBUTING.md` asks for
+when behaviour changes.

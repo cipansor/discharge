@@ -46,13 +46,18 @@ fn main() {
     let src = PathBuf::from(&target);
     let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
 
-    let mir = match verify::emit_mir_with(&rustc, &src) {
+    let (mir, edition) = match verify::emit_mir_with_opts(&rustc, &src, &verify::MirOptions::default())
+    {
         Ok(m) => m,
         Err(e) => {
             // "the tool could not run" must never look like "the code is wrong",
-            // so this is a distinct message and a distinct exit.
+            // so this is a distinct message and a distinct exit. The error already
+            // names the compiler, the edition that was used and the reason (a
+            // missing edition, a compiler error), so it is printed as it stands
+            // rather than followed by a hint that would send the reader after the
+            // wrong toolchain -- `--emit=mir` is stable, and an edition error is
+            // not a toolchain problem.
             eprintln!("mir_coverage: could not get MIR from {}: {e}", src.display());
-            eprintln!("mir_coverage: set VERIF_RUSTC to a nightly `rustc`");
             std::process::exit(2);
         }
     };
@@ -75,6 +80,7 @@ fn main() {
     names.sort();
     names.dedup();
 
+    println!("# {target} ({edition})");
     println!("{:<22} {:<12} {:>9}  detail", "function", "outcome", "elapsed");
     let mut decided = 0usize;
     // With a filter, hand the *whole* requested name to the driver once. The list

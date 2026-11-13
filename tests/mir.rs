@@ -7,9 +7,16 @@
 //!   cargo test --features std --test mir
 //! ```
 //!
-//! The tests that need `rustc` skip themselves when `VERIF_RUSTC` is unset,
-//! because `--emit=mir` needs nightly and failing on a stable toolchain would say
-//! "the code is wrong" when the truth is "the tool could not run".
+//! The tests that need `rustc` resolve it from `VERIF_RUSTC`, or fall back to the
+//! `rustc` on `PATH`, and skip themselves only when there is no compiler at all.
+//!
+//! The fallback matters because a test that returns early reports `ok` while
+//! checking nothing, so the suite's verdict would otherwise depend on the
+//! environment: `let Some(report) = verify_all() else { return }` passes whether
+//! the MIR frontend ran or not. `--emit=mir` is a *stable* flag (only
+//! `-Zunpretty=mir` needs a nightly), so the `rustc` cargo already uses is enough,
+//! and the fallback makes the ~21 `else { return }` tests run on any machine that
+//! can build the crate. See the `U5` item in `ROADMAP.md`.
 //!
 //! # The oracle
 //!
@@ -39,9 +46,22 @@ use actuator::*;
 
 const TARGET: &str = "examples/mir_targets/actuator.rs";
 
-/// The nightly compiler, or `None` so the test can skip.
+/// The compiler to read MIR from, or `None` so the test can skip.
+///
+/// `VERIF_RUSTC` wins when it is set (CI points it at a nightly, so the dump
+/// format is exercised on the bleeding edge). Otherwise the `rustc` on `PATH` is
+/// used, because `--emit=mir` is a stable flag and a test that silently checks
+/// nothing is worse than one that runs on a stable compiler. The skip is now
+/// reserved for a machine with no `rustc` at all, which cannot build this crate.
 fn rustc() -> Option<String> {
-    std::env::var("VERIF_RUSTC").ok().filter(|s| !s.is_empty())
+    if let Some(p) = std::env::var("VERIF_RUSTC").ok().filter(|s| !s.is_empty()) {
+        return Some(p);
+    }
+    let out = std::process::Command::new("rustc").arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some("rustc".to_string())
 }
 
 fn verify_all() -> Option<verify::FileReport> {
@@ -79,6 +99,9 @@ fn verify_all() -> Option<verify::FileReport> {
         "clamp_bounds",
         "first_of",
         "slice_alias_tripwire",
+        "assert_guarded",
+        "assert_misguarded",
+        "panic_guarded",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -881,7 +904,7 @@ fn an_unreadable_ensures_is_reported_not_ignored() {
     )
     .expect("write source");
     let report =
-        verify::verify_file_with(&rustc, &src, &["f".to_string()]).expect("verify");
+        verify::verify_file_with_opts(&rustc, &src, &["f".to_string()], &probe_opts()).expect("verify");
     let (_, o) = report.outcomes.first().expect("one outcome");
     assert!(
         matches!(o, FnOutcome::Skipped { .. }),
@@ -1017,6 +1040,224 @@ fn verify_realistic(only: &[&str]) -> Option<verify::FileReport> {
     match verify::verify_file_with(&rustc, std::path::Path::new(REALISTIC), &only) {
         Ok(r) => Some(r),
         Err(e) => panic!("frontend failed: {e}"),
+    }
+}
+
+/// The independent corpus, scored, so the number in `ROADMAP.md` cannot drift.
+///
+/// `everyday.rs` is ordinary Rust written by an external reviewer, not shaped for
+/// the tool, so it is the honest measure of coverage (unlike `realistic.rs`, about
+/// a third of which is adversarial fixtures). Phase 1's exit criterion in
+/// `ROADMAP.md` is defined on it.
+///
+/// The assertion is a *floor*, not the exact score: adding a function that decides
+/// must not fail the test, but a change that makes the tool decide *fewer* of them
+/// -- a regression -- must. The exact score is printed by `mir_coverage`, which is
+/// what `ROADMAP.md` quotes.
+///
+/// The count is `Verified` only, which is what `mir_coverage` counts. Counting
+/// `Failed` too would let the floor and the scoreboard disagree: a corpus function
+/// that turned from `verified` into `refuted` keeps the test's number and lowers
+/// the printed one. `everyday.rs` is ordinary Rust that is supposed to *hold*, so a
+/// refutation here is a bug, not coverage -- it is asserted against separately.
+#[test]
+fn the_independent_corpus_does_not_regress() {
+    const EVERYDAY: &str = "examples/mir_targets/everyday.rs";
+    let Some(rustc) = rustc() else { return };
+    let report = match verify::verify_file_with(&rustc, std::path::Path::new(EVERYDAY), &[]) {
+        Ok(r) => r,
+        Err(e) => panic!("frontend failed: {e}"),
+    };
+    let refuted: Vec<&str> = report
+        .outcomes
+        .iter()
+        .filter(|(_, o)| matches!(o, FnOutcome::Failed { .. }))
+        .map(|(n, _)| n.as_str())
+        .collect();
+    assert!(
+        refuted.is_empty(),
+        "everyday.rs is ordinary Rust that must hold, so a refutation is a bug: {refuted:?}. \
+         A corpus function that is genuinely false belongs in a tripwire fixture, not here"
+    );
+    let verified = report
+        .outcomes
+        .iter()
+        .filter(|(_, o)| matches!(o, FnOutcome::Verified { .. }))
+        .count();
+    assert!(
+        verified >= 11,
+        "everyday.rs verified {verified} of {} functions, down from 11 (52%); a regression \
+         dropped coverage of ordinary Rust. Run: cargo run --features std --example \
+         mir_coverage -- {EVERYDAY}",
+        report.outcomes.len()
+    );
+}
+
+/// Every edition compiles the corpus to the same verdicts (review E4).
+///
+/// The frontend resolves the edition from the crate's own `Cargo.toml` rather
+/// than pinning one, because the edition is part of what the program *means*: a
+/// 2021 crate with `extern "C" { … }` is a compile error under 2024, and a `for`
+/// loop over an array iterates `&T` under 2018 and `T` under 2021. So the same
+/// source under two editions can lower to two different programs, and a verdict
+/// is only meaningful for the edition it was produced under.
+///
+/// This runs `actuator.rs` under all four editions and requires the *whole*
+/// outcome map to match, not just the decided count: a fixture that flipped from
+/// `verified` to `failed` while another flipped the other way would keep the count
+/// and change the answer. It is the check the `VERIF_EDITION` override exists for.
+#[test]
+fn every_edition_compiles_the_corpus_to_the_same_verdicts() {
+    use verify::Edition;
+    let Some(rustc) = rustc() else { return };
+    let editions =
+        [Edition::Rust2015, Edition::Rust2018, Edition::Rust2021, Edition::Rust2024];
+    let mut baseline: Option<Vec<(String, String)>> = None;
+    for ed in editions {
+        let opts = verify::MirOptions { edition: Some(ed) };
+        let report = verify::verify_file_with_opts(&rustc, std::path::Path::new(TARGET), &[], &opts)
+            .unwrap_or_else(|e| panic!("frontend failed under {}: {e}", ed.as_str()));
+        // The verdict *shape*, so a `Failed { kind }` change is caught too, not
+        // only a `Verified`/`Failed` flip.
+        let shape: Vec<(String, String)> = report
+            .outcomes
+            .iter()
+            .map(|(n, o)| (n.clone(), format!("{o:?}")))
+            .collect();
+        match &baseline {
+            None => baseline = Some(shape),
+            Some(base) => assert_eq!(
+                base,
+                &shape,
+                "edition {} disagrees with 2015 on {}",
+                ed.as_str(),
+                TARGET
+            ),
+        }
+    }
+}
+
+/// A 2021-only file is verified under *its own* edition, and refused under 2024
+/// (review E1).
+///
+/// `extern "C" { … }` must be `unsafe extern` from edition 2024, so the same bytes
+/// are a compile error there and valid under 2021. Pinning one edition would
+/// therefore refuse a valid 2021 crate -- which is exactly what the frontend did
+/// before `resolve_edition`. This asserts both directions: 2021 produces MIR and a
+/// verdict, and 2024 is a frontend error (rustc's message, not a verdict). A test
+/// that only checked the 2021 direction would pass on a frontend that ignored the
+/// edition and always used rustc's default.
+#[test]
+fn a_2021_only_file_is_verified_under_its_own_edition() {
+    use verify::Edition;
+    let Some(rustc) = rustc() else { return };
+    let src = "extern \"C\" {\n    fn abs(x: i32) -> i32;\n}\n\
+               /// ensures: ret == x\n\
+               pub fn f(x: u8) -> u8 { x }\n";
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif-edition-{}-{seq}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("probe.rs");
+    std::fs::write(&file, src).expect("write probe");
+
+    let opts21 = verify::MirOptions { edition: Some(Edition::Rust2021) };
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &opts21)
+        .expect("a 2021 file with `extern \"C\"` must compile under 2021");
+    let o = report.outcomes.iter().find(|(n, _)| n == "f").map(|(_, o)| o.clone());
+    assert!(
+        matches!(o, Some(FnOutcome::Verified { .. })),
+        "the 2021 fixture must verify under 2021, got: {o:?}"
+    );
+
+    // The same bytes under 2024 are a rustc error, so the frontend reports it
+    // rather than a verdict. That is the evidence the edition is *used*.
+    let opts24 = verify::MirOptions { edition: Some(Edition::Rust2024) };
+    assert!(
+        verify::verify_file_with_opts(&rustc, &file, &[], &opts24).is_err(),
+        "the 2021-only file must be refused under 2024, not silently compiled"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A real package that omits `package.edition` resolves to Cargo's 2015 default.
+///
+/// Cargo assigns edition 2015 to a `[package]` that does not state one, so the
+/// frontend must verify such a package rather than refuse it. This is the
+/// distinction between "what edition is this crate?" (2015, by Cargo's default)
+/// and "what edition is this loose file?" (no answer). The unit tests pin the
+/// resolution directly; this pins it end to end, because the refusal the review
+/// found happened before `rustc` was ever invoked.
+#[test]
+fn a_package_that_omits_an_edition_is_verified_as_2015() {
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif-pkg2015-{}-{seq}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    // A manifest with no `edition`, exactly as the review describes.
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("write manifest");
+    let file = dir.join("probe.rs");
+    std::fs::write(&file, "/// ensures: ret == x\npub fn f(x: u8) -> u8 { x }\n")
+        .expect("write probe");
+
+    // No explicit edition: the manifest supplies it. A refusal here is the bug.
+    let opts = verify::MirOptions { edition: None };
+    let (text, edition) = verify::emit_mir_with_opts(&rustc, &file, &opts)
+        .expect("a package without an `edition` must resolve to Cargo's 2015 default");
+    assert_eq!(edition, verify::Edition::Rust2015, "the default edition is 2015");
+    assert!(!text.is_empty(), "MIR must be emitted for the package");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A user function returning `!` is reported as a diverging call, not a panic.
+///
+/// `die() -> ! { loop {} }` never returns, so a reachable call to it is a
+/// reachable failure -- but the failure is an infinite loop, not a panic. The
+/// report used to say `panic: die`, naming an event that never occurs. The kind is
+/// read from the callee's name, and an unrecognised `!`-returning function is
+/// `diverges`, which is the honest label.
+#[test]
+fn a_non_panicking_diverging_call_is_not_labelled_a_panic() {
+    let src = "pub fn die() -> ! { loop {} }\n\
+               /// requires: true\n\
+               /// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { if x == 0 { die(); } 1 }\n";
+    let Some(o) = verify_src("f", src) else { return };
+    match o {
+        FnOutcome::Failed { kind, .. } => {
+            assert!(
+                kind.contains("diverges"),
+                "a user `!`-returning function must be labelled `diverges`, not `panic`: got `{kind}`"
+            );
+            assert!(
+                !kind.contains("panic"),
+                "a non-panicking diverging call must not be labelled a panic: got `{kind}`"
+            );
+        }
+        other => panic!("a reachable call to a `!` function must fail, got: {other}"),
+    }
+}
+
+/// A real panic *is* labelled a panic, so the label still distinguishes the two.
+///
+/// The companion to the test above: the fix must not flatten every diverging call
+/// to `diverges`. An `assert!` is a panic, and the report says so.
+#[test]
+fn a_panicking_diverging_call_is_labelled_a_panic() {
+    let src = "/// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { if x == 0 { panic!(\"boom\"); } 1 }\n";
+    let Some(o) = verify_src("f", src) else { return };
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("panic"),
+            "a real panic must be labelled `panic`: got `{kind}`"
+        ),
+        other => panic!("an unguarded panic must fail, got: {other}"),
     }
 }
 
@@ -4938,7 +5179,8 @@ fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("probe.rs");
     std::fs::write(&file, src).expect("write probe");
-    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &probe_opts())
+        .expect("frontend");
     let o = report
         .outcomes
         .into_iter()
@@ -4947,6 +5189,17 @@ fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
     let _ = std::fs::remove_dir_all(&dir);
     assert_not_dropped(name, src, o.is_some(), &report.missing);
     o
+}
+
+/// Options for a probe written to a loose temp file.
+///
+/// A probe has no `Cargo.toml` above it, so the edition cannot be resolved from a
+/// manifest -- and it is never guessed. The tests name the crate's own edition
+/// (2024) explicitly. The corpus files (`actuator.rs`, `realistic.rs`) do live
+/// under this repository's `Cargo.toml`, so those tests use the plain entry point
+/// and exercise the manifest resolution path instead.
+fn probe_opts() -> verify::MirOptions {
+    verify::MirOptions { edition: Some(verify::Edition::Rust2024) }
 }
 
 /// Every outcome and the `missing` list for one source, without the
@@ -4960,7 +5213,7 @@ fn verify_all_outcomes(src: &str) -> (Vec<(String, FnOutcome)>, Vec<String>) {
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("probe.rs");
     std::fs::write(&file, src).expect("write probe");
-    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &probe_opts()).expect("frontend");
     let _ = std::fs::remove_dir_all(&dir);
     (report.outcomes, report.missing)
 }
@@ -5213,7 +5466,7 @@ pub fn chain_must_be_read(a: [u8; 4], i: usize) -> u8 {
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("chain.rs");
     std::fs::write(&file, src).expect("write probe");
-    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &probe_opts()).expect("frontend");
     let o = outcome(&report, "chain_must_be_read");
     match o {
         FnOutcome::Failed { detail, .. } => assert!(
@@ -5253,6 +5506,29 @@ fn an_enum_payload_is_read_through_the_downcast() {
     let Some(report) = verify_realistic(&["enum_payload_reads_through"]) else { return };
     let o = outcome(&report, "enum_payload_reads_through");
     assert!(o.is_verified(), "`enum_payload_reads_through` must verify, got: {o}");
+}
+
+/// A `match` arm *guard* is decided by the payload its borrow of a downcast reads.
+///
+/// `Msg::Data(n) if n < 10` lowers to `_4 = &((_1 as Data).0: u8); _6 = copy
+/// (*_4)`, and the rvalue contains the word ` as ` inside its parentheses. A
+/// parser that checked for a cast before a reference split that at the ` as `, so
+/// the borrow got no address, `copy (*_4)` read `Unknown`, and the `switchInt` on
+/// the guard reported "unmodelled switch discriminant". The true contract must
+/// verify and the tripwire -- which claims the guard's *other* arm ran -- must be
+/// refuted with a witness naming the payload.
+#[test]
+fn a_match_guard_reads_its_payload_through_a_borrow() {
+    let Some(report) = verify_realistic(&["guarded_match_reads_its_payload"]) else { return };
+    let o = outcome(&report, "guarded_match_reads_its_payload");
+    assert!(o.is_verified(), "`guarded_match_reads_its_payload` must verify, got: {o}");
+
+    let Some(report) = verify_realistic(&["guarded_match_tripwire"]) else { return };
+    let t = outcome(&report, "guarded_match_tripwire");
+    match t {
+        FnOutcome::Failed { kind, .. } => assert_eq!(kind, "postcondition"),
+        other => panic!("`guarded_match_tripwire` must be refuted, got: {other}"),
+    }
 }
 
 /// A locally constructed variant has a *known* tag, so its `match` decides.
@@ -7666,7 +7942,7 @@ fn a_cfg_excluded_contract_does_not_steal_a_compiled_body() {
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("probe.rs");
     std::fs::write(&file, src).expect("write probe");
-    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &probe_opts()).expect("frontend");
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         report.outcomes.is_empty(),
@@ -8235,7 +8511,7 @@ fn verify_all_src(src: &str) -> Option<Vec<(String, FnOutcome)>> {
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("probe.rs");
     std::fs::write(&file, src).expect("write probe");
-    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &probe_opts()).expect("frontend");
     let _ = std::fs::remove_dir_all(&dir);
     Some(report.outcomes)
 }
@@ -8760,4 +9036,298 @@ fn a_helper_call_in_a_measured_loop_keeps_the_termination_measure() {
         o.is_verified(),
         "the helper call must not erase the loop's measure, got: {o}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A diverging call is a checked panic, not a dropped path
+// ---------------------------------------------------------------------------
+
+/// `assert!` is a promise, and the frontend now checks it instead of dropping it.
+///
+/// `assert!(x <= 200)` lowers to a `switchInt` that routes the *failing* case into
+/// a diverging call to `core::panicking::panic`, with no `[return: bbN]` arm. The
+/// parser only recognised the `[return:` shape, so the terminator came back
+/// `Unknown("missing")`, the path was reported unmodelled, and the whole function
+/// was `Incomplete` -- the assert, the most ordinary safety guard in Rust, was
+/// never checked at all. Both halves are pinned here: the guard is *discharged*
+/// under a precondition that implies it, and *refuted* with a real counterexample
+/// when it is not.
+#[test]
+fn an_assert_is_checked_and_discharged_under_its_precondition() {
+    let src = "/// requires: x <= 200\n\
+               /// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { assert!(x <= 200); 1 }\n";
+    let o = verify_src("f", src).expect("f must be in the report");
+    assert!(
+        o.is_verified(),
+        "the guard follows from the precondition, so the assert cannot fire: {o}"
+    );
+}
+
+/// The teeth: with no precondition the assert is a real panic, and it is reported.
+///
+/// The counterexample is a value above 200, which is exactly the input the assert
+/// exists to reject. Reading the diverging call as a harmless drop would instead
+/// have left the function `Incomplete`, which is a lost proof of nothing -- this
+/// makes the missing precondition a *failure*, the sound direction.
+#[test]
+fn an_unproved_assert_is_refuted_with_a_counterexample() {
+    let src = "/// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { assert!(x <= 200); 1 }\n";
+    let o = verify_src("f", src).expect("f must be in the report");
+    match o {
+        FnOutcome::Failed { kind, detail } => {
+            assert!(
+                kind.contains("assertion failed: x <= 200"),
+                "the report should name the failed assertion, got `{kind}`"
+            );
+            assert!(!detail.is_empty(), "a failure must carry a counterexample");
+        }
+        other => panic!("an assert with no guard must fail, got: {other}"),
+    }
+}
+
+/// An assert is *assumed* on the fall-through path, so the code after it can rely
+/// on the guard -- the same rule the `assert` terminator already had.
+///
+/// Without this the guard would be checked and then thrown away, so `x + 1` after
+/// `assert!(x <= 200)` would be reported as a possible overflow even though the
+/// assert rules it out. The postcondition `ret == x + 1` is what makes the
+/// assumption load-bearing: it only holds if the guard is carried forward.
+#[test]
+fn an_assert_guard_is_assumed_by_the_code_after_it() {
+    let src = "/// requires: x <= 200\n\
+               /// ensures: ret == x + 1\n\
+               pub fn f(x: u8) -> u8 { assert!(x <= 200); x + 1 }\n";
+    let o = verify_src("f", src).expect("f must be in the report");
+    assert!(o.is_verified(), "the assert must be assumed on the fall-through path: {o}");
+}
+
+/// `debug_assert!` lowers the same way, so it is checked and assumed too.
+#[test]
+fn a_debug_assert_is_checked_like_an_assert() {
+    let src = "/// requires: x <= 200\n\
+               /// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { debug_assert!(x <= 200); 1 }\n";
+    let o = verify_src("f", src).expect("f must be in the report");
+    assert!(o.is_verified(), "a debug_assert is the same terminator as an assert: {o}");
+}
+
+/// `panic!` is a reachable failure, so an unguarded one is refuted, and a guarded
+/// one is proved unreachable.
+///
+/// The message is carried from the string literal the dump passes, so the report
+/// names the panic rather than the mangled callee path.
+#[test]
+fn a_panic_is_refuted_unless_its_guard_excludes_it() {
+    let unguarded = "/// ensures: ret == 1\n\
+                     pub fn f(x: u8) -> u8 { if x == 0 { panic!(\"zero\"); } 1 }\n";
+    let o = verify_src("f", unguarded).expect("f must be in the report");
+    match o {
+        FnOutcome::Failed { kind, .. } => {
+            assert!(kind.contains("zero"), "the report should name the panic, got `{kind}`");
+        }
+        other => panic!("an unguarded panic must fail, got: {other}"),
+    }
+    let guarded = "/// requires: x != 0\n\
+                   /// ensures: ret == 1\n\
+                   pub fn f(x: u8) -> u8 { if x == 0 { panic!(\"zero\"); } 1 }\n";
+    let o = verify_src("f", guarded).expect("f must be in the report");
+    assert!(o.is_verified(), "the precondition excludes the panic: {o}");
+}
+
+/// A *formatted* panic message is recovered from the `core::fmt` chain, not from
+/// a literal operand.
+///
+/// Edition 2024 never puts `panic!("bad {}", x)` in the MIR as one string: the
+/// pieces are a promoted `&[&str]` and the placeholders are separate `rt::Argument`
+/// values, assembled by `Arguments::new_v1` on 1.85 and by
+/// `Arguments::new::<LEN, _>` (a single encoded byte template) on stable. Both
+/// spellings have to be read, and this test is what pins that -- it runs on
+/// whichever toolchain `VERIF_RUSTC` names, so the two shapes are covered by the
+/// same assertion on the two toolchains the gate uses.
+#[test]
+fn a_formatted_panic_message_is_recovered_from_the_fmt_chain() {
+    let unguarded = "/// ensures: ret == 1\n\
+                     pub fn f(x: u8) -> u8 { if x == 0 { panic!(\"bad {}\", x); } 1 }\n";
+    let Some(o) = verify_src("f", unguarded) else { return };
+    match o {
+        FnOutcome::Failed { kind, .. } => {
+            assert!(
+                kind.contains("bad {}"),
+                "the report should name the panic's pieces, got `{kind}`"
+            );
+        }
+        other => panic!("a formatted panic with no guard must fail, got: {other}"),
+    }
+    // A formatted `assert!` is the same chain with the guard in front of it.
+    let guarded = "/// requires: x <= 100\n\
+                   /// ensures: ret == 1\n\
+                   pub fn f(x: u8) -> u8 { assert!(x <= 100, \"bad {}\", x); 1 }\n";
+    let o = verify_src("f", guarded).expect("f must be in the report");
+    assert!(o.is_verified(), "the precondition implies the formatted assert: {o}");
+    let misguarded = "/// ensures: ret == 1\n\
+                      pub fn f(x: u8) -> u8 { assert!(x <= 100, \"bad {}\", x); 1 }\n";
+    let o = verify_src("f", misguarded).expect("f must be in the report");
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("bad {}"),
+            "the formatted assert should be named by its pieces, got `{kind}`"
+        ),
+        other => panic!("an unguarded formatted assert must fail, got: {other}"),
+    }
+    // `panic!("{}", x)` has no literal piece at all -- it lowers to a
+    // `panic_display::<u8>` / `panic_cold_display::<u8>` call -- so there is no
+    // message to recover and the callee's own name is the fallback. It must be the
+    // *name*, read through the generics, and not the type arguments: the report
+    // used to read `<u8>`, which is a mangled path rather than a fallback. The
+    // two toolchains spell the callee differently, so only the shape is pinned.
+    let no_pieces = "/// ensures: ret == 1\n\
+                     pub fn f(x: u8) -> u8 { if x == 0 { panic!(\"{}\", x); } 1 }\n";
+    let o = verify_src("f", no_pieces).expect("f must be in the report");
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("display") && !kind.contains('<'),
+            "the fallback should be the callee's name, not its generics, got `{kind}`"
+        ),
+        other => panic!("an unguarded panic must fail, got: {other}"),
+    }
+}
+
+/// The other two panicking macros name their own message too.
+///
+/// `unreachable!()` and `todo!()` pass a *literal*, so they take the
+/// `core::panicking::panic(const "…")` / `Arguments::from_str` path rather than the
+/// `core::fmt` chain, and the report should carry the text the programmer wrote --
+/// not the mangled callee. They are here because a fix aimed at the formatted case
+/// must not regress the plain one.
+#[test]
+fn a_literal_panic_macro_names_its_message() {
+    let src = "/// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { if x == 0 { unreachable!(); } 1 }\n";
+    let Some(o) = verify_src("f", src) else { return };
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("entered unreachable code"),
+            "the report should carry the macro's text, got `{kind}`"
+        ),
+        other => panic!("an unguarded `unreachable!` must fail, got: {other}"),
+    }
+    let src = "/// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { if x == 0 { todo!(); } 1 }\n";
+    let o = verify_src("f", src).expect("f must be in the report");
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("not yet implemented"),
+            "the report should carry the macro's text, got `{kind}`"
+        ),
+        other => panic!("an unguarded `todo!` must fail, got: {other}"),
+    }
+}
+
+/// The bounds check rustc inserts for `xs[0]` is a diverging call too, and it is
+/// proved unreachable from the length precondition.
+///
+/// This is the shape an ordinary slice access lowers to, so the check is what
+/// makes a `&[T]` argument safe to reason about at all.
+#[test]
+fn an_index_bounds_check_is_proved_unreachable() {
+    let src = "/// requires: xs.len() >= 1\n\
+               /// ensures: ret == 0\n\
+               pub fn f(xs: &[u8]) -> u8 { xs[0] * 0 }\n";
+    let o = verify_src("f", src).expect("f must be in the report");
+    assert!(o.is_verified(), "the length precondition rules the bounds check out: {o}");
+}
+
+/// A diverging call in its *cleanup* form is recognised too (review C1b).
+///
+/// With a live `Drop` local, rustc prints the diverging call's single successor as
+/// its cleanup edge (`_4 = core::panicking::panic(…) -> bb4`, with `bb4 (cleanup)`)
+/// rather than the `-> unwind continue` arm the parser first recognised. That line
+/// matched neither the `-> [return:` nor the `-> unwind` shape, so the whole path
+/// was still dropped -- an `assert!` in any function with a live RAII local (`Vec`,
+/// `String`, `Box`, a lock guard) was never checked. The parser now combines the
+/// `!`-typed destination with the `(cleanup)` marker and reads it as a diverging
+/// call, so the assert is a real failure again.
+///
+/// The `drop(_2)` line is still unmodelled (review C1), so a *guarded* version is
+/// `incomplete` for that reason -- but the *unguarded* one is a definite `FAILED`
+/// with the counterexample, which is the sound direction: a missing precondition
+/// is a failure, not a silently dropped check.
+#[test]
+fn a_diverging_call_in_a_function_with_a_drop_local_is_checked() {
+    let src = "pub struct Guard(pub u8);\n\
+               impl Drop for Guard {\n    fn drop(&mut self) {}\n}\n\
+               /// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { let _g = Guard(0); assert!(x < 200); 1 }\n";
+    let o = verify_src("f", src).expect("f must be in the report");
+    match o {
+        FnOutcome::Failed { kind, detail } => {
+            assert!(
+                kind.contains("assertion failed: x < 200"),
+                "the cleanup-form assert must be named, got `{kind}`"
+            );
+            assert!(!detail.is_empty(), "a failure must carry a counterexample");
+        }
+        other => panic!(
+            "an unguarded assert with a live Drop local must be a failure, not a \
+             dropped path, got: {other}"
+        ),
+    }
+}
+
+/// `iN::abs` and `Ord::clamp` are modelled, and their *panic* is modelled too.
+///
+/// These are the first modelled methods whose failure is a **panic** rather than
+/// a value or an `Option`, so the two halves have to be checked apart. A model
+/// that returned `|x|` with no panic predicate would verify `abs_min_can_overflow`
+/// (which panics at `i8::MIN`); a model that returned a constant would prove the
+/// value tripwires. Each true direction is asserted `Verified` and each false
+/// direction `Failed`, and the panic entries are pinned to a `panic` kind so an
+/// unrelated refusal cannot satisfy them.
+#[test]
+fn abs_and_clamp_are_modelled_with_their_panics() {
+    let names = [
+        "abs_small_reads",
+        "abs_small_is_a_value_cannot_prove_this",
+        "abs_min_can_overflow",
+        "clamp_builtin_reads",
+        "clamp_builtin_can_panic",
+        "clamp_builtin_is_a_value_cannot_prove_this",
+        "clamp_builtin_signed_reads",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+
+    for name in ["abs_small_reads", "clamp_builtin_reads", "clamp_builtin_signed_reads"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+
+    // The value tripwires: the call is a value, not an uninterpreted one. The
+    // failure *kind* is asserted, not just `Failed`, because both entries carry a
+    // precondition that discharges the panic -- so a refutation on the panic
+    // instead of the postcondition would mean the entry is not testing the value
+    // at all (the `abs` panic fires at `i32::MIN`, before the value is read).
+    for name in ["abs_small_is_a_value_cannot_prove_this", "clamp_builtin_is_a_value_cannot_prove_this"] {
+        let o = outcome(&report, name);
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.starts_with("postcondition"),
+                "`{name}` must be refuted on the value (postcondition), got `{kind}`"
+            ),
+            other => panic!("`{name}` claims a false value and must be refuted, got: {other}"),
+        }
+    }
+
+    // The panic obligations: the call *can* panic, so the function fails on the
+    // panic, not on a postcondition.
+    for name in ["abs_min_can_overflow", "clamp_builtin_can_panic"] {
+        let o = outcome(&report, name);
+        match o {
+            FnOutcome::Failed { kind, .. } => {
+                assert!(kind.starts_with("panic"), "`{name}` must fail on the panic, got `{kind}`")
+            }
+            other => panic!("`{name}` must be a failing panic, got: {other}"),
+        }
+    }
 }

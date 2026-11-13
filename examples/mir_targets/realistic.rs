@@ -1776,6 +1776,52 @@ pub fn enum_payload_tripwire(m: Msg) -> u8 {
     }
 }
 
+/// A `match` arm *guard* reads the payload through a borrow of a downcast place.
+///
+/// `Msg::Data(n) if n < 10` lowers to `_4 = &((_1 as Data).0: u8); _6 = copy
+/// (*_4); _5 = Lt(_6, 10)`, so the guard is decided by the payload the downcast
+/// names. The rvalue `&((_1 as Data).0: u8)` contains the word ` as ` inside its
+/// parentheses; a parser that checks for a cast before it checks for a reference
+/// splits it at that ` as `, the reference gets no address, and `copy (*_4)`
+/// reads `Unknown` -- so the `switchInt` on the guard's `bool` is "unmodelled
+/// switch discriminant". Modelling the borrow is what makes a guarded match
+/// decide, and it is the same reference the body's own `copy ((_1 as Data).0)`
+/// already used.
+///
+/// `ret <= m.Data`: the guarded arm returns the payload (which is at most
+/// itself) and the fall-through arm returns `10`, which a payload of ten or more
+/// still dominates. The contract holds for every payload, so a model that read
+/// the guard's payload as an unconstrained input would refute it.
+/// requires: m == Msg::Data
+/// ensures: ret <= m.Data
+pub fn guarded_match_reads_its_payload(m: Msg) -> u8 {
+    match m {
+        Msg::Data(n) if n < 10 => n,
+        Msg::Data(_) => 10,
+        Msg::Ping => 0,
+        Msg::Stop => 0,
+    }
+}
+
+/// The tripwire for a guarded match: the guard's *other* arm, claimed to be the
+/// one taken.
+///
+/// The same body, but the contract claims the return is always `10` -- the value
+/// the arm taken when the guard *fails*. For a payload below ten the guard holds
+/// and the arm returns the payload, so the contract is false and must be refuted
+/// with a witness naming the payload. A model that dropped the guard's payload
+/// read (or read it as zero) would take the same arm on every path and prove it.
+/// requires: m == Msg::Data
+/// ensures: ret == 10
+pub fn guarded_match_tripwire(m: Msg) -> u8 {
+    match m {
+        Msg::Data(n) if n < 10 => n,
+        Msg::Data(_) => 10,
+        Msg::Ping => 0,
+        Msg::Stop => 0,
+    }
+}
+
 /// A *locally constructed* variant has a known tag, so its `match` is decided
 /// rather than symbolic.
 ///
@@ -8880,4 +8926,84 @@ pub fn a_pinned_rewrite_does_not_revive_the_old_leaf(i: usize) -> u8 {
     a[0].v = 9;
     let x = a[0];
     x.v
+}
+
+/// The inherent `iN::abs`, modelled as a value plus a *reachable-panic*
+/// obligation. The precondition rules out `MIN` -- the one input where `abs`
+/// overflows -- so the call is panic-free and the postcondition is the
+/// mathematical absolute value. The precondition `x > -100` is what discharges
+/// the `abs(MIN)` panic, and `ret >= 0` is the value's own range.
+/// requires: x > -100 && x < 100
+/// ensures: ret >= 0
+pub fn abs_small_reads(x: i32) -> i32 {
+    x.abs()
+}
+
+/// The tripwire for `abs`'s *value*: the result is `|x|`, so claiming `ret <= 127`
+/// is false for a wide `i32` at `x == 1000`. A model that treated `abs` as an
+/// uninterpreted call -- or as a constant -- would prove this. It must be
+/// refuted, and the witness is a large positive input.
+///
+/// The precondition rules out `MIN` on purpose. Without it the *panic*
+/// obligation fires first (at `x == i32::MIN`), so the entry would be refuted for
+/// a reason that has nothing to do with the value -- and a model that returned a
+/// constant would still be refuted, by the panic. Discharging the panic here
+/// leaves the value as the only thing under test, and the failure kind is
+/// asserted to be the postcondition for exactly that reason.
+/// requires: x != i32::MIN
+/// ensures: ret <= 127
+pub fn abs_small_is_a_value_cannot_prove_this(x: i32) -> i32 {
+    x.abs()
+}
+
+/// The panic obligation, not the value: `i8::abs` overflows at `MIN`, so with no
+/// precondition ruling it out the call *can* panic and the function must be
+/// reported as a failing panic. This is the entry that separates "the value is
+/// modelled" from "the panic is modelled": a model that returned `|x|` and no
+/// panic predicate would verify a function that panics on a real input.
+/// requires: true
+/// ensures: true
+pub fn abs_min_can_overflow(x: i8) -> i8 {
+    x.abs()
+}
+
+/// `Ord::clamp`, the three-operand trait method. With `lo <= hi` the one panic
+/// (`assert!(lo <= hi)`) is discharged, and the postcondition is the clamp's own
+/// range: the result is at or above `lo` and at or below `hi`. `x` may be
+/// anywhere -- an out-of-range `x` is clamped, not an error.
+/// requires: lo <= hi
+/// ensures: lo <= ret
+/// ensures: ret <= hi
+pub fn clamp_builtin_reads(x: u32, lo: u32, hi: u32) -> u32 {
+    x.clamp(lo, hi)
+}
+
+/// The clamp's panic: with no precondition, `lo > hi` is reachable, so the call
+/// panics and the function must be reported as a failing panic. A model that
+/// ignored the `assert!(lo <= hi)` would verify this.
+/// requires: true
+/// ensures: true
+pub fn clamp_builtin_can_panic(x: u32, lo: u32, hi: u32) -> u32 {
+    x.clamp(lo, hi)
+}
+
+/// The clamp's *value* tripwire: the result is never above `hi`, so claiming it
+/// is below `hi - 1` for every input is false at `x == hi`. A model that treated
+/// the call as an uninterpreted value would prove it. The precondition keeps
+/// `lo <= hi`, so the panic is discharged and the value is the only thing under
+/// test (the failure kind is asserted to be the postcondition).
+/// requires: lo <= hi && x <= hi
+/// ensures: ret <= hi - 1
+pub fn clamp_builtin_is_a_value_cannot_prove_this(x: u32, lo: u32, hi: u32) -> u32 {
+    x.clamp(lo, hi)
+}
+
+/// A *signed* clamp, which pins the sign of the comparisons: `i8::MIN` is the
+/// smallest signed value, so a model reading the ordering as unsigned would
+/// return the wrong operand for every negative pair. The body clamps into
+/// `[lo, hi]` with `lo <= hi`; the postcondition is the same range.
+/// requires: lo <= hi
+/// ensures: ret >= lo
+pub fn clamp_builtin_signed_reads(x: i8, lo: i8, hi: i8) -> i8 {
+    x.clamp(lo, hi)
 }

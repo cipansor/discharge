@@ -9,10 +9,14 @@
 //! point — the earlier frontends in this crate proved things about expressions
 //! written next to the code, and a human had to keep the two in step.
 //!
-//! Set `VERIF_RUSTC` to a nightly `rustc`, since `--emit=mir` needs one:
+//! Set `VERIF_RUSTC` to name the compiler; `--emit=mir` is a *stable* flag, so any
+//! stable `rustc` works. The edition is resolved from the crate's `Cargo.toml`
+//! (2024 here), or from `VERIF_EDITION` when the file is not in a crate:
 //!
 //! ```text
-//! VERIF_RUSTC=$(rustup which --toolchain nightly rustc) \
+//! cargo run --features std --example mir_demo
+//! # a loose file with no Cargo.toml:
+//! VERIF_EDITION=2021 VERIF_RUSTC=$(rustup which rustc) \
 //!   cargo run --features std --example mir_demo
 //! ```
 
@@ -36,7 +40,7 @@ pub enum Expect {
 }
 
 /// The expectations, stated as data so the demo and the test suite share them.
-pub fn expectations() -> [(&'static str, Expect); 21] {
+pub fn expectations() -> [(&'static str, Expect); 24] {
     use Expect::*;
     [
         ("clamp", Verified),
@@ -83,6 +87,15 @@ pub fn expectations() -> [(&'static str, Expect); 21] {
         ("signed_mul_negative", Failed),
         // Negation guarded against `MIN`, the one input with no positive form.
         ("checked_neg", Verified),
+
+        // --- a guard the programmer wrote -----------------------------------
+        // `assert!` and `panic!` lower to a *diverging* call with no return arm.
+        // The frontend used to read that as an unmodelled line and drop the path,
+        // so the assert was never checked; it is now a panic obligation, and the
+        // pair below pins both directions.
+        ("assert_guarded", Verified),
+        ("assert_misguarded", Failed),
+        ("panic_guarded", Verified),
     ]
 }
 

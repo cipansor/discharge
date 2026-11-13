@@ -382,3 +382,38 @@ pub fn clamp_bounds(b: &Bounds, v: u8) -> u8 {
         v
     }
 }
+
+/// A guard the *programmer* wrote, rather than one rustc inserted.
+///
+/// `assert!` lowers to a diverging call into `core::panicking` with no return
+/// arm, and the frontend used to read that as an unmodelled line: the path was
+/// dropped and the assert was never checked. It is now a panic obligation, so the
+/// guard is *proved* here and refuted by `assert_misguarded` below.
+/// requires: n <= 100
+/// ensures: ret == 1
+pub fn assert_guarded(n: u8) -> u8 {
+    assert!(n <= 100);
+    1
+}
+
+/// The same assert without the precondition that implies it.
+///
+/// The counterexample is a value above 100 -- exactly the input the assert exists
+/// to reject. A verifier that dropped the diverging call would call this
+/// `Incomplete`, which is a lost proof of nothing; this makes the missing
+/// precondition a failure.
+/// requires: true
+pub fn assert_misguarded(n: u8) -> u8 {
+    assert!(n <= 100);
+    1
+}
+
+/// A `panic!` on a path the precondition excludes, so the panic is unreachable.
+/// requires: d != 0
+/// ensures: ret == 1
+pub fn panic_guarded(d: u8) -> u8 {
+    if d == 0 {
+        panic!("zero divisor");
+    }
+    1
+}
