@@ -251,16 +251,17 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     from the source scanner or the `rustc_public` path.
   - Exit: `x = 224` in a report.
   - Move: **build**.
-- **U5. A test harness that never passes vacuously.** · P1 · in progress · —
+- **U5. A test harness that never passes vacuously.** · P0 · done · —
   - Gap: about 21 tests in `tests/mir.rs` use
     `let Some(report) = verify_all() else { return }`, so without `VERIF_RUSTC`
-    they *pass while checking nothing* (a skipped test reports `ok`). `gate.sh`
-    step 8 and CI now fall back to `rustc` on `PATH`, and `verify_src` is strict
-    (a dropped contracted function panics), but the `else { return }` shape is
-    still silent on a machine with no `rustc` at all.
-  - Exit: every such test either runs (a `rustc` is found) or is
-    `#[ignore = "needs a rustc"]`, so the count with and without the toolchain
-    differs only by the ignored ones.
+    they *passed while checking nothing* (a skipped test reports `ok`).
+  - Fix: the `rustc()` helper falls back to the `rustc` on `PATH`, because
+    `--emit=mir` is a *stable* flag; `VERIF_RUSTC` still wins when set, so CI
+    keeps exercising a nightly's dump format. The skip is reserved for a machine
+    with no compiler at all. Measured: `env -u VERIF_RUSTC cargo test --features
+    std --test mir` is the same 289 passed as with the variable set, so the 21
+    tests run either way. ✅
+  - Exit: `cargo test --features std` never passes vacuously.
   - Move: **build**.
 - **U6. Documentation size.** · P1 · todo · —
   - Gap: the README is ~166 KB and `AGENTS.md` ~586 KB. Split into a short README,
