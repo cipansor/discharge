@@ -185,13 +185,7 @@ impl Cex {
     /// truncated before reaching it. Check [`Cex::is_complete`] to tell those apart; a
     /// `None` from an incomplete model is not evidence that the variable is unconstrained.
     pub fn value_of(&self, var: u32) -> Option<u64> {
-        for i in 0..self.n as usize {
-            let (v, _w, val) = self.assignments[i];
-            if v == var {
-                return Some(val);
-            }
-        }
-        None
+        self.assignments[..self.n as usize].iter().find(|a| a.0 == var).map(|a| a.2)
     }
 
     /// Number of variables reported.
@@ -222,8 +216,7 @@ impl Cex {
 
 impl fmt::Display for Cex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for i in 0..self.n as usize {
-            let (v, w, val) = self.assignments[i];
+        for (i, (v, w, val)) in self.assignments[..self.n as usize].iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
             }
@@ -826,8 +819,8 @@ impl Ctx {
 
     /// Forget every binding and start a new substitution epoch.
     fn clear_subst(&mut self) {
-        for i in 0..MAX_VARS {
-            self.subst_val[i] = NO_SUBST;
+        for v in self.subst_val.iter_mut() {
+            *v = NO_SUBST;
         }
         self.bump_epoch();
     }
@@ -842,8 +835,8 @@ impl Ctx {
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
             // The counter wrapped, so the stamps are meaningless: clear them.
-            for i in 0..CAP {
-                self.subst_epoch[i] = 0;
+            for e in self.subst_epoch.iter_mut() {
+                *e = 0;
             }
             self.epoch = 1;
         }
@@ -1001,8 +994,7 @@ impl Ctx {
     /// `Cex::is_complete` means the same thing on both paths.
     pub(crate) fn cex_from_sat(&self, val: impl Fn(u32) -> Option<bool>) -> Cex {
         let mut cex = Cex { assignments: [(0, 0, 0); MAX_CEX], n: 0, total: 0 };
-        for idx in 0..self.n_vars {
-            let w = self.var_width[idx];
+        for (idx, &w) in self.var_width[..self.n_vars].iter().enumerate() {
             let mut bits = 0u64;
             let mut touched = false;
             for bit in 0..w as u32 {
