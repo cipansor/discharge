@@ -49,13 +49,14 @@ with no new false proof while the independent corpus keeps growing.
     with neither is an error naming the missing edition. ✅
 - **E3. Stamp the edition on every result.** · P0 · done · —
   - Exit: `FileReport.edition` is recorded and `mir_coverage` prints it. ✅
-- **E4. An edition matrix in the gate.** · P1 · todo · Kani
-  - Gap: nothing runs the corpus under 2015/2018/2021/2024 and requires identical
-    verdicts, and no fixture pins the per-edition lowering differences
-    (`begin_panic` vs `panic_fmt`, `if let` rescoping, tail-expression
-    temporaries, the never-type fallback).
-  - Exit: `scripts/gate.sh` runs `actuator.rs` under all four editions with the
-    same verdicts, plus one fixture per lowering difference.
+- **E4. An edition matrix in the gate.** · P1 · done · Kani
+  - Gap: nothing ran the corpus under 2015/2018/2021/2024 and required identical
+    verdicts, and no fixture pinned the per-edition lowering difference.
+  - Exit: `tests/mir.rs` runs `actuator.rs` under all four editions and requires
+    the *whole* outcome map to match (not just the decided count, so a
+    `verified`↔`failed` swap is caught), plus a 2021-only `extern "C"` fixture
+    that verifies under 2021 and is refused under 2024 — the evidence the edition
+    is *used*, not pinned. ✅
   - Move: **build**.
 - **E5. One source for the edition.** · P1 · done · —
   - Exit: `tools/mir-oracle` takes the edition from the frontend's resolver

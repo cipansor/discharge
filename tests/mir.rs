@@ -1076,6 +1076,93 @@ fn the_independent_corpus_does_not_regress() {
     );
 }
 
+/// Every edition compiles the corpus to the same verdicts (review E4).
+///
+/// The frontend resolves the edition from the crate's own `Cargo.toml` rather
+/// than pinning one, because the edition is part of what the program *means*: a
+/// 2021 crate with `extern "C" { … }` is a compile error under 2024, and a `for`
+/// loop over an array iterates `&T` under 2018 and `T` under 2021. So the same
+/// source under two editions can lower to two different programs, and a verdict
+/// is only meaningful for the edition it was produced under.
+///
+/// This runs `actuator.rs` under all four editions and requires the *whole*
+/// outcome map to match, not just the decided count: a fixture that flipped from
+/// `verified` to `failed` while another flipped the other way would keep the count
+/// and change the answer. It is the check the `VERIF_EDITION` override exists for.
+#[test]
+fn every_edition_compiles_the_corpus_to_the_same_verdicts() {
+    use verify::Edition;
+    let Some(rustc) = rustc() else { return };
+    let editions =
+        [Edition::Rust2015, Edition::Rust2018, Edition::Rust2021, Edition::Rust2024];
+    let mut baseline: Option<Vec<(String, String)>> = None;
+    for ed in editions {
+        let opts = verify::MirOptions { edition: Some(ed) };
+        let report = verify::verify_file_with_opts(&rustc, std::path::Path::new(TARGET), &[], &opts)
+            .unwrap_or_else(|e| panic!("frontend failed under {}: {e}", ed.as_str()));
+        // The verdict *shape*, so a `Failed { kind }` change is caught too, not
+        // only a `Verified`/`Failed` flip.
+        let shape: Vec<(String, String)> = report
+            .outcomes
+            .iter()
+            .map(|(n, o)| (n.clone(), format!("{o:?}")))
+            .collect();
+        match &baseline {
+            None => baseline = Some(shape),
+            Some(base) => assert_eq!(
+                base,
+                &shape,
+                "edition {} disagrees with 2015 on {}",
+                ed.as_str(),
+                TARGET
+            ),
+        }
+    }
+}
+
+/// A 2021-only file is verified under *its own* edition, and refused under 2024
+/// (review E1).
+///
+/// `extern "C" { … }` must be `unsafe extern` from edition 2024, so the same bytes
+/// are a compile error there and valid under 2021. Pinning one edition would
+/// therefore refuse a valid 2021 crate -- which is exactly what the frontend did
+/// before `resolve_edition`. This asserts both directions: 2021 produces MIR and a
+/// verdict, and 2024 is a frontend error (rustc's message, not a verdict). A test
+/// that only checked the 2021 direction would pass on a frontend that ignored the
+/// edition and always used rustc's default.
+#[test]
+fn a_2021_only_file_is_verified_under_its_own_edition() {
+    use verify::Edition;
+    let Some(rustc) = rustc() else { return };
+    let src = "extern \"C\" {\n    fn abs(x: i32) -> i32;\n}\n\
+               /// ensures: ret == x\n\
+               pub fn f(x: u8) -> u8 { x }\n";
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif-edition-{}-{seq}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("probe.rs");
+    std::fs::write(&file, src).expect("write probe");
+
+    let opts21 = verify::MirOptions { edition: Some(Edition::Rust2021) };
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &opts21)
+        .expect("a 2021 file with `extern \"C\"` must compile under 2021");
+    let o = report.outcomes.iter().find(|(n, _)| n == "f").map(|(_, o)| o.clone());
+    assert!(
+        matches!(o, Some(FnOutcome::Verified { .. })),
+        "the 2021 fixture must verify under 2021, got: {o:?}"
+    );
+
+    // The same bytes under 2024 are a rustc error, so the frontend reports it
+    // rather than a verdict. That is the evidence the edition is *used*.
+    let opts24 = verify::MirOptions { edition: Some(Edition::Rust2024) };
+    assert!(
+        verify::verify_file_with_opts(&rustc, &file, &[], &opts24).is_err(),
+        "the 2021-only file must be refused under 2024, not silently compiled"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A contract can name a struct field, and the field's *value* reaches the body.
 ///
 /// `pick_from`'s precondition is `c.lo <= c.hi` and its postcondition is
