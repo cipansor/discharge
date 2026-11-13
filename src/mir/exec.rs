@@ -4235,6 +4235,7 @@ fn try_fmt_call(
 /// [`intrinsics::DIV_MAX_WIDTH`] -- and the path is reported unknown. The
 /// distinction matters: refusing to model a call and refusing to inline it are
 /// different answers, and only the first is a coverage gap in `intrinsics`.
+#[allow(clippy::too_many_arguments)]
 fn try_intrinsic(
     prog: &MirProgram,
     func: usize,
@@ -4242,7 +4243,9 @@ fn try_intrinsic(
     args: &[Operand],
     dest: &Place,
     env: &mut Env,
-) -> Option<Result<(), String>> {
+    path: Pred,
+    pins: &[(u32, u64)],
+) -> Option<Result<Vec<Obligation>, String>> {
     let op = intrinsics::classify(name)?;
     // A modelled method is only ever `core`'s own, and rustc prints a `core`
     // integer method's call with the `<impl …>` projection (`core::num::<impl
@@ -4314,7 +4317,7 @@ fn try_intrinsic(
     // and it is answered before the generic operand read below (which assumes one
     // width for every operand).
     if let intrinsics::Intrinsic::Conversion(kind) = op {
-        return Some(convert(name, kind, args, dest, env));
+        return Some(convert(name, kind, args, dest, env).map(|()| Vec::new()));
     }
     let cur = &prog.fns[func];
     // The operand width, from the first argument's declared type. It is not the
@@ -4346,7 +4349,9 @@ fn try_intrinsic(
         // refused there rather than guessed, and a printed *signed* one makes
         // `eval` decline, so a signed operand cannot be read as an unsigned one.
         let signed = match op {
-            intrinsics::Intrinsic::Unary(..) | intrinsics::Intrinsic::Bool(_) => sign.known()?,
+            intrinsics::Intrinsic::Unary(..)
+            | intrinsics::Intrinsic::Bool(_)
+            | intrinsics::Intrinsic::Abs => sign.known()?,
             _ => false,
         };
         // A bit count returns a type wider than its operand (`u8` -> `u32`), so
@@ -4365,7 +4370,7 @@ fn try_intrinsic(
                 // labelling it anything else would be a second opinion about a
                 // type this code already knows.
                 env.set(dest, Val::Sym(v, Sign::of_bool(signed)));
-                Ok(())
+                Ok(Vec::new())
             }
             Outcome::Option { tag, payload } => {
                 // `checked_neg` and `checked_abs` return an `Option`.
@@ -4376,7 +4381,7 @@ fn try_intrinsic(
                     Val::Sym(payload, Sign::of_bool(signed)),
                     w,
                 );
-                Ok(())
+                Ok(Vec::new())
             }
             Outcome::Tuple { value, overflowed } => {
                 // `overflowing_neg` and `overflowing_abs` return `(T, bool)`,
@@ -4386,7 +4391,7 @@ fn try_intrinsic(
                 let field = |i| Place { local: dest.local, proj: vec![Proj::Field(i)] };
                 env.set(&field(0), Val::Sym(value, Sign::of_bool(signed)));
                 env.set(&field(1), Val::Bool(overflowed));
-                Ok(())
+                Ok(Vec::new())
             }
             Outcome::Bool(p) => {
                 // `is_power_of_two` returns a `bool` and nothing else. The
@@ -4394,7 +4399,21 @@ fn try_intrinsic(
                 // one; a one-bit *word* here would leave the local readable only
                 // as a word, and the `if` that consumes it reads a predicate.
                 env.set(dest, Val::Bool(p));
-                Ok(())
+                Ok(Vec::new())
+            }
+            Outcome::ValueOrPanic { value, fails } => {
+                // `iN::abs` panics at `MIN`, where the magnitude is
+                // unrepresentable. The value is written unconditionally -- a path
+                // where the call panics is reported by the obligation below, so
+                // the value it carries is never used on a live path -- and the
+                // panic is a *reachable-failure* obligation, the same polarity as
+                // a rustc-inserted `assert`: the call is safe exactly where
+                // `path ∧ fails` is unsatisfiable.
+                env.set(dest, Val::Sym(value, Sign::of_bool(signed)));
+                Ok(vec![Obligation {
+                    kind: ObligationKind::Panic { message: format!("`{name}` overflows") },
+                    verdict: find_obligation(smt::and(path, fails), pins),
+                }])
             }
         });
     }
@@ -4402,6 +4421,35 @@ fn try_intrinsic(
     // `sdiv` on an `i8` read as unsigned returns a huge positive quotient for
     // every negative operand, which is a wrong value rather than a weaker proof.
     let signed = sign.known()?;
+    // `Ord::clamp` is the one three-operand shape, so it is evaluated by its own
+    // function rather than through `eval`'s two-operand signature. `x` is the
+    // receiver (the value to clamp), and `lo`/`hi` are the other two operands.
+    // The panic is `lo > hi || x < lo || x > hi`, reported the same way `abs`'s
+    // overflow is: a reachable-failure obligation, not a value.
+    if let intrinsics::Intrinsic::Clamp = op {
+        let (Some(lo_arg), Some(hi_arg)) = (args.get(1), args.get(2)) else {
+            return Some(Err(format!("unmodelled arity for `{name}`")));
+        };
+        let lo = match operand(env, lo_arg) {
+            Val::Sym(v, _) => v,
+            _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
+        };
+        let hi = match operand(env, hi_arg) {
+            Val::Sym(v, _) => v,
+            _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
+        };
+        let Some(outcome) = intrinsics::clamp(x, lo, hi, w, signed) else {
+            return Some(Err(format!("`{name}` past what the model covers at {w} bits")));
+        };
+        let intrinsics::Outcome::ValueOrPanic { value, fails } = outcome else {
+            unreachable!("clamp yields a value-or-panic outcome")
+        };
+        env.set(dest, Val::Sym(value, Sign::of_bool(signed)));
+        return Some(Ok(vec![Obligation {
+            kind: ObligationKind::Panic { message: format!("`{name}` out of range") },
+            verdict: find_obligation(smt::and(path, fails), pins),
+        }]));
+    }
     // `pow` reads two operands of *different* types: the base has the method's
     // width and sign, the exponent is the `u32` it is declared as. So the exponent
     // is read on its own -- a `Val::Sym` and its width from the argument's type --
@@ -4431,22 +4479,26 @@ fn try_intrinsic(
         return Some(match outcome {
             Outcome::Value(v) => {
                 env.set(dest, Val::Sym(v, sign));
-                Ok(())
+                Ok(Vec::new())
             }
             Outcome::Option { tag, payload } => {
                 env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
                 env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(payload, sign), w);
-                Ok(())
+                Ok(Vec::new())
             }
             Outcome::Tuple { value, overflowed } => {
                 let field = |i| Place { local: dest.local, proj: vec![Proj::Field(i)] };
                 env.set(&field(0), Val::Sym(value, sign));
                 env.set(&field(1), Val::Bool(overflowed));
-                Ok(())
+                Ok(Vec::new())
             }
             // A `bool` predicate is unary (`is_power_of_two` is the only one),
             // so it never reaches the `pow` path.
             Outcome::Bool(_) => unreachable!("a bool predicate is unary"),
+            // A value-or-panic outcome is the unary `abs` or the three-operand
+            // `clamp`, neither of which is a `pow`; those are handled before this
+            // path.
+            Outcome::ValueOrPanic { .. } => unreachable!("a value-or-panic outcome is not a pow"),
         });
     }
     let y = match args.get(1) {
@@ -4486,8 +4538,12 @@ fn try_intrinsic(
         }
         // A `bool` predicate is unary, so it never reaches the two-operand path.
         Outcome::Bool(_) => unreachable!("a bool predicate is unary"),
+        // The value-or-panic shapes (`abs`, `clamp`) are handled before this path.
+        Outcome::ValueOrPanic { .. } => {
+            unreachable!("a value-or-panic outcome is not a two-operand family")
+        }
     }
-    Some(Ok(()))
+    Some(Ok(Vec::new()))
 }
 
 /// The declared bit width of an operand, when it has one.
@@ -5372,11 +5428,27 @@ where
                     advance(prog, next, *target, report, work, pins);
                     return;
                 }
-                if let Some(done) =
-                    try_intrinsic(prog, st.frame.func, name, args, dest, &mut st.env)
-                {
+                if let Some(done) = try_intrinsic(
+                    prog,
+                    st.frame.func,
+                    name,
+                    args,
+                    dest,
+                    &mut st.env,
+                    st.path,
+                    pins,
+                ) {
                     let next = match done {
-                        Ok(()) => State { block: *target, ..st },
+                        // A modelled call can contribute obligations of its own:
+                        // `iN::abs` and `Ord::clamp` panic on some inputs, and
+                        // that panic is a reachable failure, exactly like the
+                        // `assert` terminator rustc inserts. The obligations are
+                        // discharged inside `try_intrinsic` (where the operand
+                        // terms are live) and pushed here.
+                        Ok(obligations) => {
+                            report.obligations.extend(obligations);
+                            State { block: *target, ..st }
+                        }
                         Err(e) => {
                             report.unknown_paths.push(e);
                             return;

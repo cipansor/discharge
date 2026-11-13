@@ -225,6 +225,28 @@ pub enum Intrinsic {
     /// are carried explicitly. Only a strictly *widening* conversion is modelled;
     /// see [`Conversion`].
     Conversion(Conversion),
+    /// The inherent `abs` on a signed integer: `i32::abs`.
+    ///
+    /// It is its own shape rather than a member of the four families because its
+    /// failure is a **panic**, not a value: `i32::MIN.abs()` overflows, and there
+    /// is no `wrapping_abs`-style spelling of the plain call to fall back on. So
+    /// unlike every other unary shape the model yields a
+    /// [`Outcome::ValueOrPanic`], and the executor turns the failure predicate
+    /// into a reachable-panic obligation -- the same polarity as a rustc-inserted
+    /// `assert`. `abs` exists only on the signed types, so a signed operand is the
+    /// method's own meaning and an unsigned one is not this method at all.
+    Abs,
+    /// The inherent `Ord::clamp`: `x.clamp(lo, hi)`.
+    ///
+    /// Three operands, so it does not fit `eval`'s two-operand signature and is
+    /// evaluated by [`clamp`] instead. Like [`Intrinsic::Abs`] its failure is a
+    /// **panic** -- `assert!(lo <= hi)`, the only panic in `core`'s body, since
+    /// clamping an out-of-range `x` is the method's whole purpose -- so it yields
+    /// a [`Outcome::ValueOrPanic`]. The dump spells it as the *trait* method
+    /// `<u32 as Ord>::clamp`, so it is admitted by name like
+    /// [`Intrinsic::MinMax`] and the same-dump lookup still answers a local trait
+    /// first.
+    Clamp,
 }
 
 /// Which family of a `core::num` method name a call belongs to.
@@ -416,7 +438,10 @@ impl Intrinsic {
     /// `eval` and the executor both branch on this: a unary call has no second
     /// argument to read, so the two-operand path must not be entered for it.
     pub fn is_unary(self) -> bool {
-        matches!(self, Intrinsic::Unary(..) | Intrinsic::Bits(_) | Intrinsic::Bool(_))
+        matches!(
+            self,
+            Intrinsic::Unary(..) | Intrinsic::Bits(_) | Intrinsic::Bool(_) | Intrinsic::Abs
+        )
     }
 }
 
@@ -446,6 +471,25 @@ pub enum Outcome {
     /// `Var` -- writing a one-bit word into a `bool` local would leave the local
     /// readable only as a word, and the `if` that consumes it reads a predicate.
     Bool(Pred),
+    /// A value plus a *reachable-panic* predicate: the shape for a method whose
+    /// failure is a panic rather than a value (`iN::abs` at `MIN`, `Ord::clamp`
+    /// with `lo > hi`).
+    ///
+    /// This is deliberately not the `Tuple` shape: a `Tuple` is the
+    /// `overflowing_*` return, where the flag is a `bool` the program *reads*.
+    /// Here the predicate is not part of any value -- it is the condition under
+    /// which the call panics -- so the executor turns it into an obligation of
+    /// the same polarity as a rustc-inserted `assert`: the call is safe exactly
+    /// where `path ∧ fails` is unsatisfiable. Nothing assumes the predicate on
+    /// the fall-through path; the panic is *checked* separately, and the result
+    /// value is written unconditionally because a path where the predicate holds
+    /// is already reported as a failure.
+    ValueOrPanic {
+        /// The value the call yields when it does not panic.
+        value: Var,
+        /// The condition under which the call panics.
+        fails: Pred,
+    },
 }
 
 /// The family a `core::num` method name belongs to, if any.
@@ -493,6 +537,18 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
         let kind = if short == "min" { MinMaxKind::Min } else { MinMaxKind::Max };
         return Some(Intrinsic::MinMax(kind));
     }
+    // `Ord::clamp`: the same trait-method spelling as `min`/`max`, and admitted
+    // the same way for the same reason -- a three-operand method has no
+    // `core::num::<impl …>` spelling, so refusing the name would make it
+    // permanently unmodellable. The trait path must be the standard library's
+    // `Ord`, so a module-qualified local `m::Ord` is refused, and the caller's
+    // same-dump lookup answers a crate-root `Ord` before the model is consulted.
+    if short == "clamp" {
+        if !names_ord_trait(name) {
+            return None;
+        }
+        return Some(Intrinsic::Clamp);
+    }
     // `From::from`/`Into::into`. These are *trait* methods with a type parameter,
     // so the dump spells `<u16 as From<u8>>::from`: the trait path is read the same
     // way `Ord`'s is (see `trait_path`), which is what keeps a module-qualified
@@ -506,6 +562,15 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
         }
         let kind = if short == "from" { Conversion::From } else { Conversion::Into };
         return Some(Intrinsic::Conversion(kind));
+    }
+    // The inherent `iN::abs`. It is not one of the four families -- there is no
+    // `wrapping_abs`-style spelling of the plain call, and its failure is a
+    // *panic* (`abs(MIN)` overflows) rather than a value -- so it is matched here,
+    // before the prefix split, which would otherwise see `abs` and look for an
+    // operator of that name in the table below. It is the plain `abs` only: the
+    // families' `wrapping_abs`/`checked_abs`/… are matched by the split below.
+    if short == "abs" {
+        return Some(Intrinsic::Abs);
     }
     let (family, op) = if let Some(rest) = short.strip_prefix("wrapping_") {
         (Family::Wrapping, rest)
@@ -657,6 +722,17 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
             UnOp::Abs => signed,
             UnOp::Neg => !(family == Family::Saturating && !signed),
         },
+        // The inherent `abs`. Like the families' `abs` it exists only on the
+        // signed types, so a signed operand is the method's own meaning and an
+        // unsigned one is not this method at all. Unlike them it *panics* at
+        // `MIN`, which is the whole reason it is a separate shape: the failure is
+        // an obligation, not a value.
+        Intrinsic::Abs => signed,
+        // `Ord::clamp`. It has a value at every input, and the one panic
+        // (`lo > hi`) is a failure predicate the executor discharges. Modelled on
+        // both signednesses: the comparisons are the type's own, which the model
+        // reads from the sign.
+        Intrinsic::Clamp => true,
         // The two-operand families.
         Intrinsic::Wrapping(bin)
         | Intrinsic::Saturating(bin)
@@ -925,7 +1001,60 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             }
             Outcome::Value(convert_value(x, signed, result_w))
         }
+        // The inherent `abs`. The value is the same `unary_result` the families'
+        // `abs` uses, and the failure is the same `MIN` predicate `unary_failure`
+        // computes for them -- so the four spellings cannot disagree about what
+        // `abs` is. The difference is only in what the failure *means*: here it
+        // is a panic the executor must discharge, not a value or a flag.
+        Intrinsic::Abs => {
+            if result_w == 0 || result_w > 64 {
+                return None;
+            }
+            let fails = unary_failure(UnOp::Abs, x, w, signed)?;
+            Outcome::ValueOrPanic { value: smt::truncate(unary_result(UnOp::Abs, x, w), result_w), fails }
+        }
+        // `Ord::clamp` is three-operand and is evaluated by [`clamp`] rather than
+        // here, because `eval` reads exactly two operands. Reaching this arm means
+        // a caller used `eval` for a shape it does not serve.
+        Intrinsic::Clamp => return None,
     })
+}
+
+/// The value and panic condition of `Ord::clamp`: `x.clamp(lo, hi)`.
+///
+/// `core`'s body is one assert and the value: `assert!(lo <= hi)` (rustc's
+/// "min > max" panic), then `if x < lo { lo } else if x > hi { hi } else { x }`.
+/// The panic is therefore `lo > hi` and *only* that -- an `x` outside `[lo, hi]`
+/// is the whole point of a clamp, not an error. (The first version of this model
+/// treated an out-of-range `x` as a panic too, which made `clamp_builtin` in the
+/// probe corpus `FAILED`; the corpus is what caught it.)
+///
+/// When `lo > hi` the clamp expression is still well-defined (it returns `lo`),
+/// which is why the value needs no special case: a path where `lo > hi` is
+/// already reported as a panic by the caller, so the value it carries is never
+/// used on a live path.
+///
+/// The comparisons are the type's own, selected by `signed`, so a signed clamp
+/// reads `i8::MIN` as below `0` -- an unsigned reading would return the wrong
+/// operand for every negative pair, a wrong *value* rather than a weaker proof.
+///
+/// Returns `None` only for a width the engine cannot hold; the caller reports the
+/// path as unknown rather than guessing.
+pub fn clamp(x: Var, lo: Var, hi: Var, w: u8, signed: bool) -> Option<Outcome> {
+    if !is_modelled(Intrinsic::Clamp, w, signed) {
+        return None;
+    }
+    // `x > hi` is `hi < x`; there is no dedicated `ugt`, and writing the greater
+    // comparison as the reversed lesser one keeps the sign selection in one place.
+    let (below, above) = if signed {
+        (smt::slt(x, lo), smt::slt(hi, x))
+    } else {
+        (smt::ult(x, lo), smt::ult(hi, x))
+    };
+    // The one panic: `assert!(lo <= hi)`, written as its negation.
+    let too_high = if signed { smt::slt(hi, lo) } else { smt::ult(hi, lo) };
+    let value = smt::ite(below, lo, smt::ite(above, hi, x));
+    Some(Outcome::ValueOrPanic { value, fails: too_high })
 }
 
 /// The smaller or larger of two operands, under the type's ordering.
@@ -1488,6 +1617,11 @@ mod tests {
             // A `bool`: there is no value channel, so it is reported through the
             // `Option<bool>` channel the tag uses. `check_bool` reads it that way.
             Outcome::Bool(p) => (smt::evaluate_pred(p, env), None),
+            // A value-or-panic outcome is the unary `abs` or the three-operand
+            // `clamp`, neither of which is served by this two-channel reader.
+            Outcome::ValueOrPanic { .. } => {
+                unreachable!("a value-or-panic outcome is read by its own helper")
+            }
         }
     }
 
@@ -1690,6 +1824,10 @@ mod tests {
                         // `pow` is never a `bool`, so this arm is unreachable in
                         // this helper; it exists only to keep the match total.
                         Outcome::Bool(_) => unreachable!("`pow` is not a bool"),
+                        // `pow` is never a value-or-panic shape either.
+                        Outcome::ValueOrPanic { .. } => {
+                            unreachable!("`pow` is not a value-or-panic shape")
+                        }
                     };
                     let want = oracle(x, e);
                     let Some((wv, wf)) = want else {
@@ -1882,6 +2020,9 @@ mod tests {
                                 // `pow` is never a `bool`; the arm keeps the
                                 // match total.
                                 Outcome::Bool(_) => unreachable!("`pow` is not a bool"),
+                                Outcome::ValueOrPanic { .. } => {
+                                    unreachable!("`pow` is not a value-or-panic shape")
+                                }
                             };
                             let from_const = eval(Intrinsic::Pow(family), base, constant, w, signed, w)
                                 .unwrap_or_else(|| panic!("{family:?} const must be modelled"));
@@ -3007,9 +3148,12 @@ mod tests {
         // `neg`/`abs` are *not* read as a `BinOp` operator.
         assert_eq!(classify("checked_neg"), Some(Intrinsic::Unary(Family::Checked, UnOp::Neg)));
         assert_ne!(classify("checked_neg"), Some(Intrinsic::Checked(BinOp::Add)));
-        // Still refused.
+        // The plain `abs` is now its own shape (it panics at `MIN`), so it is
+        // matched before the prefix split; the families' `wrapping_abs` etc. are
+        // still read by the split. The plain `neg` stays unmodelled: `neg` is
+        // only a family member, never an inherent method.
+        assert_eq!(classify("abs"), Some(Intrinsic::Abs));
         assert!(classify("neg").is_none());
-        assert!(classify("abs").is_none());
         assert!(classify("wrapping_neg_signed").is_none());
         assert!(classify("checked_abs_signed").is_none());
         // `pow` classifies now (as `Intrinsic::Pow`, its own shape), so the
@@ -3290,7 +3434,10 @@ mod tests {
         assert!(classify("<u8 as m::Ord>::min").is_none());
         assert!(classify("<u8 as MyOrd>::min").is_none());
         assert!(classify("<u8 as ord_shim::Ord>::min").is_none());
-        assert!(classify("<u8 as Ord>::clamp").is_none());
+        // `Ord::clamp` is the same trait's three-operand method, so it is admitted
+        // on the same trait path and refused for the same foreign ones.
+        assert_eq!(classify("<u8 as Ord>::clamp"), Some(Intrinsic::Clamp));
+        assert!(classify("<u8 as m::Ord>::clamp").is_none());
         // The `std`/`core`-qualified spelling the prelude's own `Ord` prints with.
         assert_eq!(
             classify("<i8 as std::cmp::Ord>::max"),
@@ -3381,6 +3528,158 @@ mod tests {
         ] {
             assert_eq!(ord(kind, signed, xb, yb), Some(want), "{why} ({xb:#x}, {yb:#x})");
         }
+    }
+
+    /// The inherent `abs` value and panic predicate agree with Rust everywhere.
+    ///
+    /// The value is the same `unary_result` the families' `abs` uses, so it is
+    /// checked against `iN::abs` at *every* input -- the wrapped value is defined
+    /// everywhere, and only the predicate says where Rust panics. The predicate
+    /// must be true exactly at `MIN`, which is where `iN::abs` overflows.
+    #[test]
+    fn the_abs_value_and_panic_predicate_agree_with_rust() {
+        for w in [1u8, 4, 8] {
+            smt::with_fresh(|| {
+                let a = smt::var(w);
+                let outcome = eval(Intrinsic::Abs, a, a, w, true, w).expect("abs is modelled");
+                let Outcome::ValueOrPanic { value, fails } = outcome else {
+                    panic!("abs must produce a value-or-panic outcome");
+                };
+                let ai = smt::index(a);
+                for xb in 0..(1u64 << w) {
+                    let x = signed_of(xb, w);
+                    let env = |i: u32| if i == ai { Some(xb) } else { None };
+                    let got = smt::evaluate(value, env);
+                    let want = x.wrapping_abs() as u64 & mask_of(w);
+                    assert_eq!(
+                        got,
+                        Some(want),
+                        "abs at {w} bits, bits {xb:#x}: the model says {got:?}, Rust says {want:#x}"
+                    );
+                    let want_fails = x == i64::MIN >> (64 - w);
+                    assert_eq!(
+                        smt::evaluate_pred(fails, env),
+                        Some(want_fails),
+                        "abs panic at {w} bits, bits {xb:#x}: want {want_fails}"
+                    );
+                }
+            });
+        }
+    }
+
+    /// `Ord::clamp`'s value and panic predicate agree with Rust everywhere.
+    ///
+    /// Every `(x, lo, hi)` triple at four bits is walked. The value is the
+    /// clamped `x`; the predicate is true exactly where `core`'s two asserts
+    /// would fire -- `lo > hi` or `x` outside `[lo, hi]`. This is the whole
+    /// contract of the shape: a value wrong anywhere is a wrong proof, and a
+    /// predicate that misses an out-of-range triple would let a panicking call be
+    /// reported safe.
+    #[test]
+    fn the_clamp_value_and_panic_predicate_agree_with_rust() {
+        for signed in [false, true] {
+            let w = 4u8;
+            smt::with_fresh(|| {
+                let (a, l, h) = (smt::var(w), smt::var(w), smt::var(w));
+                let outcome = clamp(a, l, h, w, signed).expect("clamp is modelled");
+                let Outcome::ValueOrPanic { value, fails } = outcome else {
+                    panic!("clamp must produce a value-or-panic outcome");
+                };
+                let (ai, li, hi_i) = (smt::index(a), smt::index(l), smt::index(h));
+                for xb in 0..(1u64 << w) {
+                    for lob in 0..(1u64 << w) {
+                        for hib in 0..(1u64 << w) {
+                            let (x, lo, hi) = if signed {
+                                (signed_of(xb, w), signed_of(lob, w), signed_of(hib, w))
+                            } else {
+                                (xb as i64, lob as i64, hib as i64)
+                            };
+                            let env = |i: u32| {
+                                if i == ai {
+                                    Some(xb)
+                                } else if i == li {
+                                    Some(lob)
+                                } else if i == hi_i {
+                                    Some(hib)
+                                } else {
+                                    None
+                                }
+                            };
+                            // The oracle is the clamp *expression*, not
+                            // `iN::clamp`, because `core`'s method panics on
+                            // `lo > hi` and there is no value to compare there.
+                            // The expression is exactly what the model builds
+                            // (`if x < lo { lo } else if x > hi { hi } else { x }`),
+                            // and it agrees with `core`'s value wherever `core`
+                            // returns one.
+                            let want = (if x < lo {
+                                lo
+                            } else if x > hi {
+                                hi
+                            } else {
+                                x
+                            }) as u64
+                                & mask_of(w);
+                            let got = smt::evaluate(value, env);
+                            assert_eq!(
+                                got,
+                                Some(want),
+                                "clamp(signed={signed}) ({x}, {lo}, {hi}): model {got:?}, Rust {want}"
+                            );
+                            // The only panic is `assert!(lo <= hi)`: an
+                            // out-of-range `x` is clamped, not an error.
+                            let want_fails = lo > hi;
+                            assert_eq!(
+                                smt::evaluate_pred(fails, env),
+                                Some(want_fails),
+                                "clamp panic(signed={signed}) ({x}, {lo}, {hi}): want {want_fails}"
+                            );
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    /// `abs` and `clamp` classify, and the neighbours that only *look* like them
+    /// do not.
+    #[test]
+    fn the_abs_and_clamp_names_classify_and_their_neighbours_do_not() {
+        assert_eq!(classify("core::num::<impl i32>::abs"), Some(Intrinsic::Abs));
+        assert_eq!(classify("abs"), Some(Intrinsic::Abs));
+        // `clamp` is `Ord`'s, so only the standard library's trait path is
+        // accepted -- a module-qualified local trait is refused.
+        assert_eq!(classify("<u32 as Ord>::clamp"), Some(Intrinsic::Clamp));
+        assert_eq!(classify("<i8 as std::cmp::Ord>::clamp"), Some(Intrinsic::Clamp));
+        assert_eq!(classify("<i8 as core::cmp::Ord>::clamp"), Some(Intrinsic::Clamp));
+        assert_eq!(classify("<MyT as m::Ord>::clamp"), None);
+        assert_eq!(classify("<MyT as MyOrd>::clamp"), None);
+        assert_eq!(classify("clamp"), None);
+        // The families' own `abs` names are still matched by the prefix split, not
+        // by the inherent `abs` arm.
+        assert_eq!(
+            classify("core::num::<impl i8>::wrapping_abs"),
+            Some(Intrinsic::Unary(Family::Wrapping, UnOp::Abs))
+        );
+        assert_eq!(classify("core::num::<impl i8>::checked_abs"),
+            Some(Intrinsic::Unary(Family::Checked, UnOp::Abs)));
+        // A name that merely ends in `abs` is not the method.
+        assert_eq!(classify("core::num::<impl i8>::no_abs"), None);
+    }
+
+    /// The bit mask of a `w`-bit value, as a `u64`.
+    fn mask_of(w: u8) -> u64 {
+        if w >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << w) - 1
+        }
+    }
+
+    /// Reinterpret a `w`-bit pattern as the signed value it denotes.
+    fn signed_of(bits: u64, w: u8) -> i64 {
+        let shift = 64 - u32::from(w);
+        ((bits << shift) as i64) >> shift
     }
 
     /// The `from`/`into` names classify, and the neighbours that only *look* like

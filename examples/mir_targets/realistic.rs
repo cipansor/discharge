@@ -8927,3 +8927,83 @@ pub fn a_pinned_rewrite_does_not_revive_the_old_leaf(i: usize) -> u8 {
     let x = a[0];
     x.v
 }
+
+/// The inherent `iN::abs`, modelled as a value plus a *reachable-panic*
+/// obligation. The precondition rules out `MIN` -- the one input where `abs`
+/// overflows -- so the call is panic-free and the postcondition is the
+/// mathematical absolute value. The precondition `x > -100` is what discharges
+/// the `abs(MIN)` panic, and `ret >= 0` is the value's own range.
+/// requires: x > -100 && x < 100
+/// ensures: ret >= 0
+pub fn abs_small_reads(x: i32) -> i32 {
+    x.abs()
+}
+
+/// The tripwire for `abs`'s *value*: the result is `|x|`, so claiming `ret <= 127`
+/// is false for a wide `i32` at `x == 1000`. A model that treated `abs` as an
+/// uninterpreted call -- or as a constant -- would prove this. It must be
+/// refuted, and the witness is a large positive input.
+///
+/// The precondition rules out `MIN` on purpose. Without it the *panic*
+/// obligation fires first (at `x == i32::MIN`), so the entry would be refuted for
+/// a reason that has nothing to do with the value -- and a model that returned a
+/// constant would still be refuted, by the panic. Discharging the panic here
+/// leaves the value as the only thing under test, and the failure kind is
+/// asserted to be the postcondition for exactly that reason.
+/// requires: x != i32::MIN
+/// ensures: ret <= 127
+pub fn abs_small_is_a_value_cannot_prove_this(x: i32) -> i32 {
+    x.abs()
+}
+
+/// The panic obligation, not the value: `i8::abs` overflows at `MIN`, so with no
+/// precondition ruling it out the call *can* panic and the function must be
+/// reported as a failing panic. This is the entry that separates "the value is
+/// modelled" from "the panic is modelled": a model that returned `|x|` and no
+/// panic predicate would verify a function that panics on a real input.
+/// requires: true
+/// ensures: true
+pub fn abs_min_can_overflow(x: i8) -> i8 {
+    x.abs()
+}
+
+/// `Ord::clamp`, the three-operand trait method. With `lo <= hi` the one panic
+/// (`assert!(lo <= hi)`) is discharged, and the postcondition is the clamp's own
+/// range: the result is at or above `lo` and at or below `hi`. `x` may be
+/// anywhere -- an out-of-range `x` is clamped, not an error.
+/// requires: lo <= hi
+/// ensures: lo <= ret
+/// ensures: ret <= hi
+pub fn clamp_builtin_reads(x: u32, lo: u32, hi: u32) -> u32 {
+    x.clamp(lo, hi)
+}
+
+/// The clamp's panic: with no precondition, `lo > hi` is reachable, so the call
+/// panics and the function must be reported as a failing panic. A model that
+/// ignored the `assert!(lo <= hi)` would verify this.
+/// requires: true
+/// ensures: true
+pub fn clamp_builtin_can_panic(x: u32, lo: u32, hi: u32) -> u32 {
+    x.clamp(lo, hi)
+}
+
+/// The clamp's *value* tripwire: the result is never above `hi`, so claiming it
+/// is below `hi - 1` for every input is false at `x == hi`. A model that treated
+/// the call as an uninterpreted value would prove it. The precondition keeps
+/// `lo <= hi`, so the panic is discharged and the value is the only thing under
+/// test (the failure kind is asserted to be the postcondition).
+/// requires: lo <= hi && x <= hi
+/// ensures: ret <= hi - 1
+pub fn clamp_builtin_is_a_value_cannot_prove_this(x: u32, lo: u32, hi: u32) -> u32 {
+    x.clamp(lo, hi)
+}
+
+/// A *signed* clamp, which pins the sign of the comparisons: `i8::MIN` is the
+/// smallest signed value, so a model reading the ordering as unsigned would
+/// return the wrong operand for every negative pair. The body clamps into
+/// `[lo, hi]` with `lo <= hi`; the postcondition is the same range.
+/// requires: lo <= hi
+/// ensures: ret >= lo
+pub fn clamp_builtin_signed_reads(x: i8, lo: i8, hi: i8) -> i8 {
+    x.clamp(lo, hi)
+}

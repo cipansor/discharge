@@ -1085,8 +1085,8 @@ fn the_independent_corpus_does_not_regress() {
         .filter(|(_, o)| matches!(o, FnOutcome::Verified { .. }))
         .count();
     assert!(
-        verified >= 9,
-        "everyday.rs verified {verified} of {} functions, down from 9 (43%); a regression \
+        verified >= 11,
+        "everyday.rs verified {verified} of {} functions, down from 11 (52%); a regression \
          dropped coverage of ordinary Rust. Run: cargo run --features std --example \
          mir_coverage -- {EVERYDAY}",
         report.outcomes.len()
@@ -9273,5 +9273,61 @@ fn a_diverging_call_in_a_function_with_a_drop_local_is_checked() {
             "an unguarded assert with a live Drop local must be a failure, not a \
              dropped path, got: {other}"
         ),
+    }
+}
+
+/// `iN::abs` and `Ord::clamp` are modelled, and their *panic* is modelled too.
+///
+/// These are the first modelled methods whose failure is a **panic** rather than
+/// a value or an `Option`, so the two halves have to be checked apart. A model
+/// that returned `|x|` with no panic predicate would verify `abs_min_can_overflow`
+/// (which panics at `i8::MIN`); a model that returned a constant would prove the
+/// value tripwires. Each true direction is asserted `Verified` and each false
+/// direction `Failed`, and the panic entries are pinned to a `panic` kind so an
+/// unrelated refusal cannot satisfy them.
+#[test]
+fn abs_and_clamp_are_modelled_with_their_panics() {
+    let names = [
+        "abs_small_reads",
+        "abs_small_is_a_value_cannot_prove_this",
+        "abs_min_can_overflow",
+        "clamp_builtin_reads",
+        "clamp_builtin_can_panic",
+        "clamp_builtin_is_a_value_cannot_prove_this",
+        "clamp_builtin_signed_reads",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+
+    for name in ["abs_small_reads", "clamp_builtin_reads", "clamp_builtin_signed_reads"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+
+    // The value tripwires: the call is a value, not an uninterpreted one. The
+    // failure *kind* is asserted, not just `Failed`, because both entries carry a
+    // precondition that discharges the panic -- so a refutation on the panic
+    // instead of the postcondition would mean the entry is not testing the value
+    // at all (the `abs` panic fires at `i32::MIN`, before the value is read).
+    for name in ["abs_small_is_a_value_cannot_prove_this", "clamp_builtin_is_a_value_cannot_prove_this"] {
+        let o = outcome(&report, name);
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.starts_with("postcondition"),
+                "`{name}` must be refuted on the value (postcondition), got `{kind}`"
+            ),
+            other => panic!("`{name}` claims a false value and must be refuted, got: {other}"),
+        }
+    }
+
+    // The panic obligations: the call *can* panic, so the function fails on the
+    // panic, not on a postcondition.
+    for name in ["abs_min_can_overflow", "clamp_builtin_can_panic"] {
+        let o = outcome(&report, name);
+        match o {
+            FnOutcome::Failed { kind, .. } => {
+                assert!(kind.starts_with("panic"), "`{name}` must fail on the panic, got `{kind}`")
+            }
+            other => panic!("`{name}` must be a failing panic, got: {other}"),
+        }
     }
 }

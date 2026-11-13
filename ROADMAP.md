@@ -18,9 +18,9 @@ baseline every item is scored against:
 
 | Corpus | Command | Verified / decided |
 |---|---|---|
-| `examples/mir_targets/actuator.rs` | `cargo run --features std --example mir_coverage -- examples/mir_targets/actuator.rs` | 15 / 30 |
-| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 399 / 739 |
-| `examples/mir_targets/everyday.rs` | same, `everyday.rs` | **10 / 21 (48%)** |
+| `examples/mir_targets/actuator.rs` | `cargo run --features std --example mir_coverage -- examples/mir_targets/actuator.rs` | 18 / 33 |
+| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 402 / 746 |
+| `examples/mir_targets/everyday.rs` | same, `everyday.rs` | **12 / 21 (57%)** |
 
 `everyday.rs` is the honest one: ordinary Rust written by an external reviewer,
 not shaped for the tool. `realistic.rs` is a regression corpus (about a third of
@@ -143,6 +143,14 @@ with no new false proof while the independent corpus keeps growing.
   - Exit: `abs_small`, `clamp_builtin`, `digit`, `first_or` verified; the list is
     in the docs.
   - Move: **build**.
+  - Progress: `iN::abs` and `Ord::clamp` are modelled. They are the first modelled
+    methods whose failure is a **panic**, so the model carries a value and a
+    `fails` predicate, and the executor emits the predicate as a panic obligation
+    (`abs` fails at `MIN`, `clamp` at `lo > hi`; an out-of-range `x` is clamped,
+    not an error — the probe corpus caught the first version that got this wrong).
+    `everyday.rs` moved 10/21 -> 12/21 (`abs_small`, `clamp_builtin` verified);
+    `realistic.rs` 399/739 -> 402/746 with the true/tripwire/panic fixtures.
+    Remaining: `abs_diff`, `rotate_*`, `is_ascii_*`, `<[T]>::len/is_empty/first/get`.
 - **C7. Arithmetic scale and speed.** · P0 · in progress · Kani, Boolector,
   Bitwuzla
   - Gap: `u32::wrapping_mul` is past the 32-bit model; `clamp_std` takes 9.9 s.
@@ -153,6 +161,13 @@ with no new false proof while the independent corpus keeps growing.
     slow shape is reported rather than waited out.
   - Exit: `hash_step` decided; `clamp_std` under 0.5 s.
   - Move: **build**.
+  - Progress: the exit criterion is **not met**. Measured on the release build,
+    `clamp_std` (`x.max(lo).min(hi)`) verifies in **7.4 s** (the review measured
+    9.4 s; the two are the same order and the criterion is "under 0.5 s"), and the
+    new `clamp_builtin_reads` (C6) — the same 32-bit three-operand `clamp` query —
+    verifies in **0.7 s**. So C6 moved the *coverage* and left the *latency*: this
+    item is the one that closes it, and the `u32` three-operand shape is the
+    workload to profile.
 
 ### Trust tracking (A1, tracked from Phase 1)
 

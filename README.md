@@ -1994,6 +1994,19 @@ refused. `src/mir/intrinsics.rs` holds the model:
   unknown. The trait path must be exactly `From`/`Into`, `core::convert::…` or
   `std::convert::…` — none of which a user can define — so a local `From` in a
   module is refused by name.
+- The inherent `iN::abs` and the trait `Ord::clamp` are the first modelled methods
+  whose failure is a **panic**, so the model carries *two* channels — the value and
+  a `fails` predicate — and the executor turns the predicate into a panic
+  obligation beside the value. The value is defined at every input (the wrapped
+  absolute value, the clamp expression), and the predicate is where `core`'s own
+  `assert` fires: `abs` fails exactly at `MIN`, and `clamp` fails exactly at
+  `lo > hi`. An out-of-range `x` is *not* a clamp panic — clamping it is the whole
+  point — and reading it as one made a true corpus function fail until the probe
+  corpus caught it. `abs` takes its sign from the operand (`Abs` joins the
+  sign-reading arms), and `clamp`'s comparisons are the type's own, so a signed
+  clamp reads `i8::MIN` as below `0`. Both are refused on a non-primitive self
+  type, and `clamp` is admitted only under the standard library's `Ord` path, the
+  same rule `min`/`max` follow.
 - A *local* method that shares an intrinsic's name is answered by its own body,
   never by the model. rustc prints a trait impl's call as `<u8 as Trait>::m` but
   its definition as `<impl at …>::m`, so the names never match; the model is only
