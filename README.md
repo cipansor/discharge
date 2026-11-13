@@ -1829,6 +1829,26 @@ falls back to the callee's name read through its generics (`panic_display`, not
 | the body | `rustc --emit=mir` | the real lowering, including the checks `rustc` inserts |
 | the contract | the source text | MIR carries no attributes or doc comments |
 | the compiler | `VERIF_RUSTC`, else `rustc` | `--emit=mir` is stable, so the `rustc` on `PATH` is enough; the variable exists to point the frontend at a *different* compiler without disturbing cargo's own |
+| the edition | `MirOptions::edition`, else `VERIF_EDITION`, else the nearest `Cargo.toml` | the edition changes the lowering, so a verdict is only meaningful under the edition the crate is built with |
+
+The edition is resolved in that order, and it is never *guessed*: the first match
+wins, and a value that is set but not one of `2015`/`2018`/`2021`/`2024` is an
+error rather than a silent fallback. A file that lives in a crate takes the
+edition from the nearest `Cargo.toml`'s `package.edition` (resolving
+`edition.workspace = true` against the workspace root), and a `[package]` that
+omits the key resolves to **2015**, which is Cargo's own default for a package
+that does not state one. Only a *loose* file -- one with no manifest above it --
+has no crate edition to infer, and it must be given one:
+
+```bash
+# A loose file has no Cargo.toml, so name the edition explicitly.
+VERIF_EDITION=2021 VERIF_RUSTC="$(rustup which rustc)" \
+  cargo run --features std --example mir_coverage -- /tmp/probe.rs
+```
+
+A program calls the frontend directly through `MirOptions { edition: Some(..) }`,
+which takes precedence over both; the environment variable is for the examples and
+the tests, which have no options struct to fill in.
 
 The five differential oracles (z3, Kani, Lean, Coq, Verus) all build their terms
 with `smt::` calls, so they start *below* the contract reader. That left the reader

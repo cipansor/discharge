@@ -92,9 +92,14 @@ pub struct MirOptions {
 /// Resolve the edition to compile `file` under: explicit first, then
 /// `VERIF_EDITION`, then the nearest `Cargo.toml`.
 ///
-/// There is deliberately no silent default. A default would compile the program
-/// under an edition it does not use, which is the exact mismatch this resolution
-/// removes, and the mismatch would be invisible in the verdict.
+/// There is deliberately no silent default for a *loose* file -- a `.rs` with no
+/// manifest above it has no crate edition to infer, and compiling it under an
+/// edition the program does not use is the exact mismatch this resolution removes.
+/// A real package, however, *does* have a default: Cargo assigns edition 2015 to a
+/// `[package]` that omits `edition`, so a manifest that declares a package without
+/// the key resolves to 2015 rather than to an error. The two are different
+/// questions -- "what edition is this crate?" and "what edition is this file?" --
+/// and only the second has no answer.
 pub fn resolve_edition(file: &Path, explicit: Option<Edition>) -> Result<Edition, String> {
     if let Some(e) = explicit {
         return Ok(e);
@@ -123,21 +128,42 @@ pub fn resolve_edition(file: &Path, explicit: Option<Edition>) -> Result<Edition
 ///
 /// `package.edition` is read directly; `edition.workspace = true` (or
 /// `edition = { workspace = true }`) is resolved against the workspace root's
-/// `[workspace.package]`. A manifest the reader cannot parse yields `None`, so the
-/// caller reports "no edition" rather than a wrong one.
+/// `[workspace.package]`. A `[package]` that *omits* `edition` resolves to 2015,
+/// which is Cargo's default for a package that does not state one -- so a valid
+/// 2015 package is verified, not refused. A manifest the reader cannot parse
+/// yields `None`, so the caller reports "no edition" rather than a wrong one.
 fn edition_from_manifest(file: &Path) -> Option<Edition> {
     let manifest = nearest_manifest(file)?;
     let text = std::fs::read_to_string(&manifest).ok()?;
-    match manifest_value(&text, "package", "edition")?.as_str() {
+    match manifest_value(&text, "package", "edition") {
         // `edition.workspace = true` / `edition = { workspace = true }`: the value
         // lives in the workspace root.
-        "workspace" => {
+        Some(v) if v == "workspace" => {
             let root = workspace_root(&manifest)?;
             let root_text = std::fs::read_to_string(&root).ok()?;
             Edition::parse(&manifest_value(&root_text, "workspace.package", "edition")?)
         }
-        v => Edition::parse(v),
+        Some(v) => Edition::parse(&v),
+        // No `edition` key. Cargo defaults a `[package]` to edition 2015, so a
+        // real package resolves to 2015; a manifest with no `[package]` at all
+        // (a pure virtual workspace) declares no crate, so it yields `None` and
+        // the caller reports "no edition" as before.
+        None => declares_package(&text).then_some(Edition::Rust2015),
     }
+}
+
+/// Whether a manifest declares a `[package]` table.
+///
+/// This is the tell between "a package that omitted `edition`" (Cargo's 2015
+/// default applies) and "a manifest with no package" (nothing to default).
+fn declares_package(text: &str) -> bool {
+    text.lines().any(|raw| {
+        let line = strip_toml_comment(raw).trim();
+        line.strip_prefix('[')
+            .and_then(|l| l.strip_suffix(']'))
+            .map(|inner| inner.trim() == "package")
+            .unwrap_or(false)
+    })
 }
 
 /// The nearest `Cargo.toml` at or above `file`, if any.
@@ -1238,3 +1264,111 @@ pub fn decide(p: crate::smt::Pred) -> Verdict {
 
 /// Re-exported so a caller can name the error type without reaching into `spec`.
 pub type ContractError = SpecError;
+
+#[cfg(test)]
+mod edition_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A scratch directory unique per call, so tests can run in parallel.
+    fn scratch(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("verif-edition-unit-{}-{seq}-{tag}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// A `[package]` that omits `edition` is Cargo's 2015 default, not an error.
+    ///
+    /// Cargo assigns edition 2015 to a package that does not state one, so
+    /// refusing it would stop verification of a package that builds. The
+    /// distinction is between a real package (a default applies) and a loose file
+    /// (nothing to default) -- and the second must still be refused, or the tool
+    /// would compile under an edition the program may not use.
+    #[test]
+    fn a_package_without_an_edition_defaults_to_2015_but_a_loose_file_does_not() {
+        let dir = scratch("no-edition");
+        let manifest = dir.join("Cargo.toml");
+        std::fs::write(&manifest, "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n").unwrap();
+        let src = dir.join("probe.rs");
+        std::fs::write(&src, "pub fn f() {}\n").unwrap();
+        assert_eq!(
+            edition_from_manifest(&src),
+            Some(Edition::Rust2015),
+            "a package that omits `edition` must resolve to Cargo's 2015 default"
+        );
+
+        // A manifest with no `[package]` (a pure virtual workspace) declares no
+        // crate, so there is nothing to default and the resolution is `None`.
+        std::fs::write(&manifest, "[workspace]\nmembers = [\"a\"]\n").unwrap();
+        assert_eq!(
+            edition_from_manifest(&src),
+            None,
+            "a manifest with no `[package]` has no crate edition to default"
+        );
+
+        // A loose file (no manifest above it) is still refused by `resolve_edition`
+        // when nothing else supplies the edition.
+        let loose = std::env::temp_dir().join(format!(
+            "verif-loose-{}-{}.rs",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&loose, "pub fn f() {}\n").unwrap();
+        // Only assert when no override is set, since the env is process-global.
+        if std::env::var("VERIF_EDITION").map(|v| v.is_empty()).unwrap_or(true) {
+            assert!(
+                resolve_edition(&loose, None).is_err(),
+                "a loose file with no edition anywhere must be refused, not defaulted"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&loose);
+    }
+
+    /// An explicit `package.edition` and a workspace-inherited one both resolve.
+    #[test]
+    fn a_stated_edition_and_a_workspace_inheritance_both_resolve() {
+        let dir = scratch("stated");
+        let src = dir.join("probe.rs");
+        std::fs::write(&src, "pub fn f() {}\n").unwrap();
+        let manifest = dir.join("Cargo.toml");
+        std::fs::write(&manifest, "[package]\nname = \"d\"\nedition = \"2021\"\n").unwrap();
+        assert_eq!(edition_from_manifest(&src), Some(Edition::Rust2021));
+
+        // `edition.workspace = true` reads the value from the workspace root.
+        let root = scratch("ws-root");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member\"]\n[workspace.package]\nedition = \"2018\"\n",
+        )
+        .unwrap();
+        let member = root.join("member");
+        let _ = std::fs::create_dir_all(&member);
+        let m_src = member.join("probe.rs");
+        std::fs::write(&m_src, "pub fn f() {}\n").unwrap();
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"m\"\nedition.workspace = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            edition_from_manifest(&m_src),
+            Some(Edition::Rust2018),
+            "`edition.workspace = true` must resolve against the workspace root"
+        );
+
+        // An unparseable edition is a refusal, not a fallback.
+        std::fs::write(&manifest, "[package]\nname = \"d\"\nedition = \"2030\"\n").unwrap();
+        assert_eq!(edition_from_manifest(&src), None, "an unknown edition is refused");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

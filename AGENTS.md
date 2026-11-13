@@ -8925,3 +8925,46 @@ nightly, so a dump-shape change on any of the three fails in the run that introd
 it. The general rule the pair teaches: a test that names one toolchain checks one
 toolchain, and "it passed locally" is a claim about the local compiler, not about
 the program.
+
+## Four review findings on the edition and label work
+
+A review of the diverging-call branch raised four items. Two were live defects in
+this branch, one was already fixed by an earlier commit in the same branch, and one
+was a test/scoreboard mismatch. Each is recorded because the *reason* recurs.
+
+**A package that omits `edition` is Cargo's 2015 default, not an error.**
+`resolve_edition` refuses a file with no edition anywhere, which is right for a
+*loose* `.rs` -- it has no crate edition to infer. But Cargo assigns edition 2015 to
+a `[package]` that does not state one, so the same refusal also rejected a valid
+2015 package: verification stopped before `rustc` ran. The two are different
+questions, and `edition_from_manifest` now answers them differently: a manifest that
+declares a `[package]` with no `edition` key resolves to 2015 (`declares_package` is
+the tell), while a loose file and a manifest with no `[package]` (a virtual
+workspace) still yield no edition. The refusal is kept exactly where it belongs.
+
+**A label must name the event that happens.** A reachable call to a user function
+returning `!` -- `die() -> ! { loop {} }` -- is a reachable *failure*, but the
+failure is a non-terminating loop, not a panic. The report said `panic: die`, naming
+an event that never occurs. `Divergence::of` already distinguished `exit`/`abort`
+from `panic`; an unrecognised `!`-returning callee is now labelled `diverges`. The
+general rule: when a report prints a *reason*, the reason has to be the thing that
+happened, not the nearest category. This was fixed earlier in the branch (`af12de8`,
+"Label a diverging call by its kind"), and the review was against the pre-fix head --
+worth checking a finding against the current head before acting on it.
+
+**A scoreboard and a regression floor must count the same thing.** The corpus test
+counted `Verified | Failed` as "decided" while `mir_coverage` counts only
+`Verified`. A corpus function that flipped from verified to refuted would keep the
+test's number and lower the printed one -- the floor and the scoreboard would
+disagree about the same run. The test now counts `Verified` only, like the
+scoreboard, and asserts *separately* that no function in this corpus of ordinary
+Rust is refuted. The rule is the one the crate keeps meeting: a count that folds two
+outcomes together cannot tell them apart, and the difference is exactly what the
+check exists to see.
+
+**A frontend behaviour change is a README change.** The edition resolution (E2) is
+new user-facing behaviour -- a loose file now needs `VERIF_EDITION`, and a package's
+edition comes from its manifest -- and the README's "what is read from where" table
+did not mention it. The table gained an `edition` row and a paragraph on the
+precedence and the loose-file override, which is what `CONTRIBUTING.md` asks for
+when behaviour changes.

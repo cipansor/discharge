@@ -1054,6 +1054,12 @@ fn verify_realistic(only: &[&str]) -> Option<verify::FileReport> {
 /// must not fail the test, but a change that makes the tool decide *fewer* of them
 /// -- a regression -- must. The exact score is printed by `mir_coverage`, which is
 /// what `ROADMAP.md` quotes.
+///
+/// The count is `Verified` only, which is what `mir_coverage` counts. Counting
+/// `Failed` too would let the floor and the scoreboard disagree: a corpus function
+/// that turned from `verified` into `refuted` keeps the test's number and lowers
+/// the printed one. `everyday.rs` is ordinary Rust that is supposed to *hold*, so a
+/// refutation here is a bug, not coverage -- it is asserted against separately.
 #[test]
 fn the_independent_corpus_does_not_regress() {
     const EVERYDAY: &str = "examples/mir_targets/everyday.rs";
@@ -1062,14 +1068,25 @@ fn the_independent_corpus_does_not_regress() {
         Ok(r) => r,
         Err(e) => panic!("frontend failed: {e}"),
     };
-    let decided = report
+    let refuted: Vec<&str> = report
         .outcomes
         .iter()
-        .filter(|(_, o)| matches!(o, FnOutcome::Verified { .. } | FnOutcome::Failed { .. }))
+        .filter(|(_, o)| matches!(o, FnOutcome::Failed { .. }))
+        .map(|(n, _)| n.as_str())
+        .collect();
+    assert!(
+        refuted.is_empty(),
+        "everyday.rs is ordinary Rust that must hold, so a refutation is a bug: {refuted:?}. \
+         A corpus function that is genuinely false belongs in a tripwire fixture, not here"
+    );
+    let verified = report
+        .outcomes
+        .iter()
+        .filter(|(_, o)| matches!(o, FnOutcome::Verified { .. }))
         .count();
     assert!(
-        decided >= 9,
-        "everyday.rs decided {decided} of {} functions, down from 9 (43%); a regression \
+        verified >= 9,
+        "everyday.rs verified {verified} of {} functions, down from 9 (43%); a regression \
          dropped coverage of ordinary Rust. Run: cargo run --features std --example \
          mir_coverage -- {EVERYDAY}",
         report.outcomes.len()
@@ -1161,6 +1178,87 @@ fn a_2021_only_file_is_verified_under_its_own_edition() {
         "the 2021-only file must be refused under 2024, not silently compiled"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A real package that omits `package.edition` resolves to Cargo's 2015 default.
+///
+/// Cargo assigns edition 2015 to a `[package]` that does not state one, so the
+/// frontend must verify such a package rather than refuse it. This is the
+/// distinction between "what edition is this crate?" (2015, by Cargo's default)
+/// and "what edition is this loose file?" (no answer). The unit tests pin the
+/// resolution directly; this pins it end to end, because the refusal the review
+/// found happened before `rustc` was ever invoked.
+#[test]
+fn a_package_that_omits_an_edition_is_verified_as_2015() {
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif-pkg2015-{}-{seq}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    // A manifest with no `edition`, exactly as the review describes.
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("write manifest");
+    let file = dir.join("probe.rs");
+    std::fs::write(&file, "/// ensures: ret == x\npub fn f(x: u8) -> u8 { x }\n")
+        .expect("write probe");
+
+    // No explicit edition: the manifest supplies it. A refusal here is the bug.
+    let opts = verify::MirOptions { edition: None };
+    let (text, edition) = verify::emit_mir_with_opts(&rustc, &file, &opts)
+        .expect("a package without an `edition` must resolve to Cargo's 2015 default");
+    assert_eq!(edition, verify::Edition::Rust2015, "the default edition is 2015");
+    assert!(!text.is_empty(), "MIR must be emitted for the package");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A user function returning `!` is reported as a diverging call, not a panic.
+///
+/// `die() -> ! { loop {} }` never returns, so a reachable call to it is a
+/// reachable failure -- but the failure is an infinite loop, not a panic. The
+/// report used to say `panic: die`, naming an event that never occurs. The kind is
+/// read from the callee's name, and an unrecognised `!`-returning function is
+/// `diverges`, which is the honest label.
+#[test]
+fn a_non_panicking_diverging_call_is_not_labelled_a_panic() {
+    let src = "pub fn die() -> ! { loop {} }\n\
+               /// requires: true\n\
+               /// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { if x == 0 { die(); } 1 }\n";
+    let Some(o) = verify_src("f", src) else { return };
+    match o {
+        FnOutcome::Failed { kind, .. } => {
+            assert!(
+                kind.contains("diverges"),
+                "a user `!`-returning function must be labelled `diverges`, not `panic`: got `{kind}`"
+            );
+            assert!(
+                !kind.contains("panic"),
+                "a non-panicking diverging call must not be labelled a panic: got `{kind}`"
+            );
+        }
+        other => panic!("a reachable call to a `!` function must fail, got: {other}"),
+    }
+}
+
+/// A real panic *is* labelled a panic, so the label still distinguishes the two.
+///
+/// The companion to the test above: the fix must not flatten every diverging call
+/// to `diverges`. An `assert!` is a panic, and the report says so.
+#[test]
+fn a_panicking_diverging_call_is_labelled_a_panic() {
+    let src = "/// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { if x == 0 { panic!(\"boom\"); } 1 }\n";
+    let Some(o) = verify_src("f", src) else { return };
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("panic"),
+            "a real panic must be labelled `panic`: got `{kind}`"
+        ),
+        other => panic!("an unguarded panic must fail, got: {other}"),
+    }
 }
 
 /// A contract can name a struct field, and the field's *value* reaches the body.
