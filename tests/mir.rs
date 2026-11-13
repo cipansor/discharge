@@ -8977,3 +8977,40 @@ fn an_index_bounds_check_is_proved_unreachable() {
     let o = verify_src("f", src).expect("f must be in the report");
     assert!(o.is_verified(), "the length precondition rules the bounds check out: {o}");
 }
+
+/// A diverging call in its *cleanup* form is recognised too (review C1b).
+///
+/// With a live `Drop` local, rustc prints the diverging call's single successor as
+/// its cleanup edge (`_4 = core::panicking::panic(…) -> bb4`, with `bb4 (cleanup)`)
+/// rather than the `-> unwind continue` arm the parser first recognised. That line
+/// matched neither the `-> [return:` nor the `-> unwind` shape, so the whole path
+/// was still dropped -- an `assert!` in any function with a live RAII local (`Vec`,
+/// `String`, `Box`, a lock guard) was never checked. The parser now combines the
+/// `!`-typed destination with the `(cleanup)` marker and reads it as a diverging
+/// call, so the assert is a real failure again.
+///
+/// The `drop(_2)` line is still unmodelled (review C1), so a *guarded* version is
+/// `incomplete` for that reason -- but the *unguarded* one is a definite `FAILED`
+/// with the counterexample, which is the sound direction: a missing precondition
+/// is a failure, not a silently dropped check.
+#[test]
+fn a_diverging_call_in_a_function_with_a_drop_local_is_checked() {
+    let src = "pub struct Guard(pub u8);\n\
+               impl Drop for Guard {\n    fn drop(&mut self) {}\n}\n\
+               /// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { let _g = Guard(0); assert!(x < 200); 1 }\n";
+    let o = verify_src("f", src).expect("f must be in the report");
+    match o {
+        FnOutcome::Failed { kind, detail } => {
+            assert!(
+                kind.contains("assertion failed: x < 200"),
+                "the cleanup-form assert must be named, got `{kind}`"
+            );
+            assert!(!detail.is_empty(), "a failure must carry a counterexample");
+        }
+        other => panic!(
+            "an unguarded assert with a live Drop local must be a failure, not a \
+             dropped path, got: {other}"
+        ),
+    }
+}

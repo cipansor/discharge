@@ -9,7 +9,7 @@
 //! [`Term::Unknown`] — which the executor turns into `Unknown`, never into a
 //! proof. A parse failure is a gap in coverage, not a silent assumption.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A local variable slot, `_0`, `_1`, …
 pub type LocalIdx = u32;
@@ -405,6 +405,18 @@ pub struct Block {
     pub id: usize,
     pub stmts: Vec<Stmt>,
     pub term: Term,
+    /// True for a `bbN (cleanup)` block: one that only runs drops and ends in
+    /// `resume`. It is not reachable by ordinary control flow; a call reaches it
+    /// only through its `unwind`/cleanup edge.
+    ///
+    /// This is what tells the *cleanup* form of a diverging call apart from an
+    /// ordinary call. A diverging call in a function with a live `Drop` local is
+    /// printed with its cleanup block as the single successor (`_4 =
+    /// core::panicking::panic(…) -> bb4`, with `bb4 (cleanup)`), not with the
+    /// `-> unwind continue` arm the parser first recognised -- so without this
+    /// marker an `assert!` in any function with a live RAII local was still a
+    /// dropped path.
+    pub cleanup: bool,
 }
 
 /// One function's MIR.
@@ -2669,6 +2681,24 @@ fn parse_stmt_or_term(line: &str, enums: &BTreeMap<String, EnumLayout>) -> Resul
             }
         }
     }
+    // The *cleanup* form of a diverging call: `_4 = core::panicking::panic(…) -> bb4;`
+    // with `bb4 (cleanup)`. With a live `Drop` local, rustc prints the call's single
+    // successor as its cleanup edge (`-> bbN`), not the `-> unwind continue` arm
+    // above -- the call still never returns, but the shape differs. The bare
+    // `-> bbN` (no `[`) is what tells it apart: an ordinary call always prints
+    // `-> [return: bbN, unwind …]`. The head is parsed here; the block is marked
+    // diverging *after* the body is read, because the `!`-typed destination and the
+    // `(cleanup)` marker are only both known then. See the fix-up in `parse_fn_body`.
+    if let Some(i) = t.find(" -> bb") {
+        let after = t[i + 4..].trim();
+        if !t[..i].contains("[return:") && !after.starts_with('[') {
+            if let Some(target) = parse_bb_ref(after.trim_end_matches(';')) {
+                if let Some((callee, args, dest)) = parse_call_head(&t[..i], enums) {
+                    return Err(Term::Call { callee, args, dest, diverges: false, target });
+                }
+            }
+        }
+    }
     if let Some(r) = t.strip_prefix("drop(") {
         let _ = r;
         let target = parse_return_target(t).unwrap_or(usize::MAX);
@@ -3034,14 +3064,21 @@ fn parse_fn_body(
             j += 1;
             continue;
         }
-        // A block header: `bbN: {`
+        // A block header: `bbN: {` (or `bbN (cleanup): {`)
         if let Some(rest) = t.strip_prefix("bb") {
             if let Some(colon) = rest.find(':') {
-                if let Ok(id) = rest[..colon].trim().parse::<usize>() {
+                let header = &rest[..colon];
+                if let Ok(id) = header.trim().split_whitespace().next().unwrap_or("").parse::<usize>()
+                {
                     if let Some(b) = cur_block.take() {
                         f.blocks.push(b);
                     }
-                    cur_block = Some(Block { id, stmts: Vec::new(), term: Term::Unknown("missing".into()) });
+                    cur_block = Some(Block {
+                        id,
+                        stmts: Vec::new(),
+                        term: Term::Unknown("missing".into()),
+                        cleanup: header.contains("cleanup"),
+                    });
                     j += 1;
                     continue;
                 }
@@ -3088,6 +3125,39 @@ fn parse_fn_body(
         }
         if let Term::Call { dest, .. } = &b.term {
             f.written.insert(dest.local);
+        }
+    }
+    // A call whose destination is a never-typed local (`let mut _4: !;`) and whose
+    // only successor is a `(cleanup)` block is the *cleanup* form of a diverging
+    // call: the callee returns `!`, so the edge into the cleanup block is its
+    // unwind path, and the path ends there. The parser cannot tell this at the
+    // line, because the destination's type is declared above and the target's
+    // `(cleanup)` marker is below, so the two facts are combined here, once both
+    // are known.
+    //
+    // The guard is deliberately narrow. The destination must be declared `!`, and
+    // the target must be a cleanup block -- an ordinary call, which always prints
+    // `-> [return: bbN, unwind …]`, has neither and is untouched. A `!`-typed
+    // destination is the *only* thing a diverging call writes, so this cannot
+    // reclassify a returning call.
+    let cleanup_blocks: BTreeMap<usize, bool> =
+        f.blocks.iter().map(|b| (b.id, b.cleanup)).collect();
+    let never_locals: BTreeSet<LocalIdx> = f
+        .locals
+        .iter()
+        .filter(|(_, ty)| matches!(ty, Ty::Other(s) if s == "!"))
+        .map(|(&l, _)| l)
+        .collect();
+    for b in &mut f.blocks {
+        let Term::Call { dest, diverges, target, .. } = &mut b.term else { continue };
+        if *diverges || *target == usize::MAX {
+            continue;
+        }
+        if never_locals.contains(&dest.local)
+            && cleanup_blocks.get(target).copied().unwrap_or(false)
+        {
+            *diverges = true;
+            *target = usize::MAX;
         }
     }
     j
@@ -3232,6 +3302,48 @@ fn add(_1: u32, _2: u32) -> u32 {
                 assert!(*diverges, "a call with no return arm diverges");
             }
             other => panic!("expected a diverging call, got {other:?}"),
+        }
+    }
+
+    /// The *cleanup* form of a diverging call is recognised too.
+    ///
+    /// With a live `Drop` local, rustc prints the call's single successor as its
+    /// cleanup edge (`-> bb4`) and marks the target `bb4 (cleanup)`, rather than
+    /// the `-> unwind continue` arm above. The call still never returns, so it must
+    /// still be a diverging call -- the destination's `!` type and the target's
+    /// `(cleanup)` marker are the two facts the parser combines once the body is
+    /// read. Without this, an `assert!` in any function with a live RAII local was
+    /// still a dropped path.
+    #[test]
+    fn parses_the_cleanup_form_of_a_diverging_call() {
+        let dump = "fn f(_1: u8) -> u8 {\n    debug x => _1;\n    let mut _0: u8;\n    let _2: Guard;\n    let mut _3: bool;\n    let mut _4: !;\n\n    bb0: {\n        _2 = Guard(const 0_u8);\n        _3 = Lt(copy _1, const 200_u8);\n        switchInt(move _3) -> [0: bb2, otherwise: bb1];\n    }\n\n    bb1: {\n        _0 = const 1_u8;\n        return;\n    }\n\n    bb2: {\n        _4 = core::panicking::panic(const \"assertion failed: x < 200\") -> bb4;\n    }\n\n    bb3 (cleanup): {\n        resume;\n    }\n\n    bb4 (cleanup): {\n        drop(_2) -> [return: bb3, unwind terminate(cleanup)];\n    }\n}\n";
+        let prog = parse_program(dump);
+        let bb2 = prog.fns[0].blocks.iter().find(|b| b.id == 2).expect("bb2");
+        match &bb2.term {
+            Term::Call { callee, diverges, .. } => {
+                assert_eq!(*callee, Callee::Name("core::panicking::panic".to_string()));
+                assert!(*diverges, "a `!`-typed call into a cleanup block diverges");
+            }
+            other => panic!("expected a diverging call, got {other:?}"),
+        }
+        // The cleanup blocks themselves are marked, and a returning call is left
+        // alone -- the marker is not applied to every `-> bbN`.
+        assert!(prog.fns[0].blocks.iter().find(|b| b.id == 4).unwrap().cleanup);
+        assert!(!prog.fns[0].blocks.iter().find(|b| b.id == 0).unwrap().cleanup);
+    }
+
+    /// An ordinary returning call keeps its target, even into a block that happens
+    /// to be a cleanup block -- the destination is not `!`, so it is not diverging.
+    #[test]
+    fn a_returning_call_into_a_cleanup_block_is_not_diverging() {
+        let dump = "fn f(_1: u8) -> u8 {\n    debug x => _1;\n    let mut _0: u8;\n    let mut _2: u8;\n\n    bb0: {\n        _2 = g(copy _1) -> bb1;\n    }\n\n    bb1 (cleanup): {\n        _0 = copy _2;\n        return;\n    }\n}\n";
+        let prog = parse_program(dump);
+        match &prog.fns[0].blocks[0].term {
+            Term::Call { diverges, target, .. } => {
+                assert!(!*diverges, "a `u8` destination is not a diverging call");
+                assert_eq!(*target, 1);
+            }
+            other => panic!("expected a call, got {other:?}"),
         }
     }
 
