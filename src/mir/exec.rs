@@ -2782,7 +2782,21 @@ fn panic_message(name: &str, args: &[Operand], env: &Env) -> String {
             }
         }
     }
-    path_tail(name).to_string()
+    // A recent nightly lowers `unreachable!()`/`todo!()`/`unimplemented!()`/
+    // `panic!()` with no message to a dedicated `*_default_msg` callee that takes
+    // no literal, where stable passes the text as `panic(const "…")`. The text is
+    // the same on both toolchains, so it is spelled here rather than read: a
+    // report whose message depended on the compiler version would be a claim the
+    // toolchain half-decides. An unrecognised name still falls back to the callee.
+    let tail = path_tail(name);
+    match tail {
+        "panic_default_msg" => "explicit panic",
+        "unreachable_default_msg" => "internal error: entered unreachable code",
+        "todo_default_msg" => "not yet implemented",
+        "unimplemented_default_msg" => "not implemented",
+        _ => tail,
+    }
+    .to_string()
 }
 
 /// Every block a terminator can jump to.

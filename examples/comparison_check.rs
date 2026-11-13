@@ -208,10 +208,10 @@ fn main() {
         let tmp = write_scratch(&name, &src);
         let why = "degenerate implementation the whole-function contract must refuse";
         let r = check_failed(&rustc, &tmp, &name, "postcondition", why);
-        // Remove the scratch file only once its MIR has been emitted, which
+        // Remove the scratch directory only once its MIR has been emitted, which
         // `check_failed` has done by the time it returns. A concurrent gate uses
         // its own path, so it never sees this removal.
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(tmp.parent().unwrap_or(&tmp));
         match r {
             Ok(line) => println!("ok   {:<20} {line}", format!("degenerate/{name}")),
             Err(why) => {
@@ -462,15 +462,28 @@ fn degenerate() -> Vec<(String, String)> {
 /// one file, and the first to finish would remove it while the second's `rustc`
 /// was still opening it -- a valid gate failing for a scheduling reason. This
 /// mirrors `verify::emit_mir_with`, which names its temp MIR per call for the
-/// same reason. The caller removes the file once its MIR has been emitted.
+/// same reason. The caller removes the directory once its MIR has been emitted.
 fn write_scratch(name: &str, src: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "verif-comparison-{}-{seq}-{name}.rs",
+    // A scratch file has no `Cargo.toml` above it, and the frontend refuses to
+    // *guess* an edition -- a verdict under an edition the program does not use is
+    // a claim about a program nobody built. A real crate always has a manifest, so
+    // the scratch fixture gets one too and exercises the manifest-resolution path
+    // rather than the override. The directory is unique per call for the same
+    // reason the file is: two gates running at once must not share a path.
+    let dir = std::env::temp_dir().join(format!(
+        "verif-comparison-{}-{seq}-{name}",
         std::process::id()
     ));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"scratch\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write scratch manifest");
+    let path = dir.join("probe.rs");
     std::fs::write(&path, src).expect("write scratch fixture");
     path
 }

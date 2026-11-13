@@ -8887,3 +8887,41 @@ One more fail-closed turn: the `panic_fmt` consumer used to record an *empty*
 message when its argument was not a local it knew, which would print `panic: ` with
 nothing after it. It now refuses, so the report names the call it could not model
 instead of showing a blank message.
+
+## A toolchain-shaped report, and a gate the edition work broke
+
+Two CI-only failures on the diverging-call branch, both invisible to a green local
+gate run, and both the same lesson: the *environment* is part of what a claim is
+about, so a gate that names one toolchain has not checked the other.
+
+**The panic message was read from the dump, and a nightly stopped printing it.**
+`unreachable!()`, `todo!()`, `unimplemented!()` and a message-less `panic!()` used to
+lower to `core::panicking::panic(const "…")` with the text as a literal, and
+`panic_message` read that literal. A recent nightly lowers each to a dedicated
+`core::panicking::{unreachable,todo,unimplemented,panic}_default_msg()` callee that
+takes **no** literal, so the report fell back to the callee's name
+(`panic: unreachable_default_msg`) and `a_literal_panic_macro_names_its_message`
+failed -- on the nightly CI names, and on nothing else. The fix spells the canonical
+text for those four tails, so the message is the same string stable prints. Reading
+it from the compiler would make a *report* depend on the compiler version, which is a
+claim the toolchain half-decides; the text is the same on both, so it is written down.
+An unrecognised name still falls back to the callee, which is the honest answer.
+
+**The edition work broke the comparison gate, and only on a machine with no
+`Cargo.toml` above the fixture.** Resolving the edition instead of pinning 2024 is
+right -- a verdict under the wrong edition is about a program nobody built -- but the
+degenerate fixtures in `examples/comparison_check.rs` were written as loose `.rs`
+files in `$TMPDIR`, with no manifest above them and no `VERIF_EDITION`, so the
+frontend now refused them ("no Rust edition for /tmp/…"). It passed locally only
+because the earlier gate runs had left `VERIF_EDITION` exported in that shell. The
+fix gives each scratch fixture its own temp *crate directory* with a `Cargo.toml`
+(`edition = "2021"`), which is what a real program has and which exercises the
+manifest-resolution path rather than the override. The removal became
+`remove_dir_all` on the parent.
+
+Both are pinned by the gate's own two compilers now: `scripts/gate.sh` runs the MIR
+suite under the compiler on `PATH` *and* under the MSRV, and CI runs it under a
+nightly, so a dump-shape change on any of the three fails in the run that introduces
+it. The general rule the pair teaches: a test that names one toolchain checks one
+toolchain, and "it passed locally" is a claim about the local compiler, not about
+the program.
