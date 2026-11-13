@@ -76,9 +76,19 @@ with no new false proof while the independent corpus keeps growing.
     so an `assert!` in any function with a live `Drop` local was a dropped path.
     Now read as a diverging call: `guard_misguarded` FAILED with a counterexample
     (`x = 224`). ✅
-  - Remaining: model `drop` itself (a no-op for a type with no drop glue; a call
-    through the call machinery for a user `impl Drop`; a no-op for std containers,
-    which change no scalar state).
+  - Remaining: model `drop` itself. rustc emits `drop(_x)` **only** for a local
+    whose type has drop glue, so there is no "scalar no-op" subset to take: every
+    such line is a type with a destructor. Treating the line as a no-op would be
+    **unsound**, not merely incomplete — `impl Drop for G { fn drop(&mut self) {
+    assert!(self.0 < 10) } }` panics inside the destructor, and a no-op would
+    report the function panic-free. (The `-> [return: bbN, unwind continue]` edge
+    is exactly the destructor's unwind path.) So the sound model is to execute the
+    destructor: a `drop` of a type with **no** drop glue is a no-op, a user
+    `impl Drop` is a call through the existing inlining machinery, and a std
+    container (`Vec`, `String`, `Box`) is a no-op that changes no scalar state —
+    each reached by resolving the dropped local's type to its `Drop::drop` body.
+    Until that lands, `drop` stays a **refusal** (`unmodelled terminator:
+    drop(_2)`), which loses a proof but never invents one.
   - Exit: `guard_guarded` verified (today: incomplete on the unmodelled `drop`).
   - Move: **build**.
 - **C2. `Option`/`Result` and `?`.** · P0 · todo · Kani, Verus, Prusti, Creusot

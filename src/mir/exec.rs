@@ -210,7 +210,7 @@ pub enum ObligationKind {
     /// function whose safety rested on one came back `Incomplete`.
     DivergingCall {
         /// What kind of divergence it is, so the report does not call a clean
-        /// `std::process::exit` a panic. See [`Divergence`].
+        /// `std::process::exit` a panic. See the `Divergence` enum.
         kind: Divergence,
         /// The message, when the dump passed one as a string literal; the
         /// callee's name otherwise. It is what names the failure in the report.
