@@ -209,10 +209,63 @@ pub enum ObligationKind {
     /// line instead lost the whole path -- an `assert!` was never checked, and a
     /// function whose safety rested on one came back `Incomplete`.
     DivergingCall {
-        /// The panic message, when the dump passed one as a string literal; the
+        /// What kind of divergence it is, so the report does not call a clean
+        /// `std::process::exit` a panic. See [`Divergence`].
+        kind: Divergence,
+        /// The message, when the dump passed one as a string literal; the
         /// callee's name otherwise. It is what names the failure in the report.
         message: String,
     },
+}
+
+/// What a diverging call does, for the report's label.
+///
+/// A call that never returns is a reachable end of the path whatever it does, so
+/// all three kinds carry the same obligation. They differ in what the label should
+/// *say*: reporting `std::process::exit(0)` as `panic: exit` tells a reader the
+/// program crashed when it exited cleanly. The kind is read from the callee's
+/// name -- the dump prints `exit(…)`, `std::process::abort()` and
+/// `core::panicking::panic(…)` distinctly -- and an unrecognised `!`-returning
+/// function falls to [`Divergence::Never`], which is honest about not knowing
+/// which it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Divergence {
+    /// A panic or an assert: `core::panicking::panic(…)`, `std::rt::panic_fmt`,
+    /// `core::panicking::panic_nounwind`, `assert`, `unwrap`, a bounds check.
+    Panic,
+    /// A clean process exit: `std::process::exit` (printed `exit(…)`).
+    Exit,
+    /// An abnormal termination: `std::process::abort`.
+    Abort,
+    /// A user function that returns `!`, or any divergence the name does not
+    /// classify. It still ends the path; only the label is unspecified.
+    Never,
+}
+
+impl Divergence {
+    /// Classify a diverging call from the callee's printed name.
+    pub fn of(name: &str) -> Divergence {
+        let tail = path_tail(name);
+        if tail == "exit" || name.ends_with("process::exit") {
+            Divergence::Exit
+        } else if tail == "abort" || name.ends_with("process::abort") {
+            Divergence::Abort
+        } else if name.contains("panic") || name.contains("assert") {
+            Divergence::Panic
+        } else {
+            Divergence::Never
+        }
+    }
+
+    /// The word the report uses before the message.
+    pub fn label(self) -> &'static str {
+        match self {
+            Divergence::Panic => "panic",
+            Divergence::Exit => "exit",
+            Divergence::Abort => "abort",
+            Divergence::Never => "diverges",
+        }
+    }
 }
 
 impl std::fmt::Display for ObligationKind {
@@ -237,7 +290,17 @@ impl std::fmt::Display for ObligationKind {
             ObligationKind::CalleeDiverges => {
                 write!(f, "the callee's postcondition is unsatisfiable")
             }
-            ObligationKind::DivergingCall { message } => write!(f, "panic: {message}"),
+            ObligationKind::DivergingCall { kind, message } => {
+                // `exit`/`abort` carry the callee's tail as their message, which
+                // is the label already; printing `exit: exit` reads as a stutter,
+                // so the label stands alone when there is no real message.
+                let label = kind.label();
+                if message == label {
+                    write!(f, "{label}")
+                } else {
+                    write!(f, "{label}: {message}")
+                }
+            }
         }
     }
 }
@@ -4067,12 +4130,11 @@ fn try_fmt_call(
         Ty::Other(s) => s.contains("fmt::Arguments"),
         _ => false,
     });
-    // The consumer's name *is* qualified (`std::rt::panic_fmt`,
-    // `core::panicking::panic_fmt`), so its own guard is on the name. A user item
-    // cannot be spelled in someone else's crate, so a name with one of these
-    // prefixes is `core`'s -- and a local `panic_fmt` is answered by its body in
-    // the same dump first.
-    let qualified = ["std::fmt::", "core::fmt::", "std::rt::", "core::panicking::"]
+    // The `rt::Argument` wrappers are printed qualified (`core::fmt::rt::Argument`),
+    // so their own guard is on the name. A user item cannot be spelled in someone
+    // else's crate, so a name with one of these prefixes is `core`'s -- and a local
+    // `Argument` is answered by its body in the same dump first.
+    let qualified = ["std::fmt::", "core::fmt::"]
         .iter()
         .any(|p| name.starts_with(p) || name.contains(&format!("::{p}")));
     if !makes_args && !qualified {
@@ -4091,21 +4153,13 @@ fn try_fmt_call(
         }
     };
     let tail = path_tail(name);
-    if tail == "panic_fmt" || tail == "panic_nounwind_fmt" {
-        // The consumer. Its argument is the `Arguments` local, whose rendered
-        // message the builders below left in the string store. A consumer whose
-        // argument carries no message is *not* answered: recording an empty
-        // message would report `panic: ` with nothing after it, and an empty
-        // report is worse than the refusal that says which call was not modelled.
-        let msg = args.iter().find_map(|a| match a {
-            Operand::Move(p) | Operand::Copy(p) if p.proj.is_empty() => {
-                env.strs.get(&p.local).cloned()
-            }
-            _ => None,
-        })?;
-        env.strs.insert(dest.local, msg);
-        return Some(Ok(()));
-    }
+    // There is deliberately no arm for `panic_fmt` / `panic_nounwind_fmt` here.
+    // Those are the *consumers* of the `Arguments` chain, and they return `!`, so
+    // the executor reaches them as a diverging call (see `Divergence`) before this
+    // function is ever consulted -- `try_fmt_call` is called only on the
+    // non-diverging path. The message is recovered from the `Arguments` local's
+    // string store by `panic_message` instead. A branch that recorded the message
+    // here would be dead code; it was, and the review caught it.
     if tail == "from_str" {
         // `Arguments::from_str("literal")`: the message is the literal itself.
         let lit = args.iter().find_map(|a| match a {
@@ -5236,6 +5290,7 @@ where
             if *diverges {
                 report.obligations.push(Obligation {
                     kind: ObligationKind::DivergingCall {
+                        kind: Divergence::of(name),
                         message: panic_message(name, args, &st.env),
                     },
                     verdict: find_obligation(st.path, pins),
@@ -7956,5 +8011,28 @@ fn count_via_helper(_1: u8) -> u8 {
         assert_eq!(generic_arg("Arguments::<'_>::new_const", 1), None);
         assert_eq!(generic_arg("Arguments::<'_>::new_v1::<2>", 1), None);
         assert_eq!(generic_arg("Arguments::<'_>::new_v1::<2, A>", 1), None);
+    }
+
+    /// A diverging call is labelled by *what* it does, not always `panic`.
+    ///
+    /// `std::process::exit(0)` and `std::process::abort()` end the path exactly as
+    /// a panic does, so all three carry the same obligation -- but calling a clean
+    /// `exit` a `panic` tells a reader the program crashed when it did not. The
+    /// kind is read from the callee's printed name; an unrecognised `!`-returning
+    /// function is `Never`, which is honest about not classifying it.
+    #[test]
+    fn a_diverging_call_is_labelled_by_its_kind() {
+        assert_eq!(Divergence::of("core::panicking::panic"), Divergence::Panic);
+        assert_eq!(Divergence::of("std::rt::panic_fmt"), Divergence::Panic);
+        assert_eq!(Divergence::of("core::panicking::panic_nounwind"), Divergence::Panic);
+        // `exit(…)` is printed with its tail alone (it is `std::process::exit`, but
+        // the dump elides the path).
+        assert_eq!(Divergence::of("exit"), Divergence::Exit);
+        assert_eq!(Divergence::of("std::process::exit"), Divergence::Exit);
+        assert_eq!(Divergence::of("std::process::abort"), Divergence::Abort);
+        // A user function returning `!` is not classified as any of the three.
+        assert_eq!(Divergence::of("my_crate::never_returns"), Divergence::Never);
+        assert_eq!(Divergence::Never.label(), "diverges");
+        assert_eq!(Divergence::Exit.label(), "exit");
     }
 }
