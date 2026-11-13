@@ -19,8 +19,8 @@ baseline every item is scored against:
 | Corpus | Command | Verified / decided |
 |---|---|---|
 | `examples/mir_targets/actuator.rs` | `cargo run --features std --example mir_coverage -- examples/mir_targets/actuator.rs` | 15 / 30 |
-| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 398 / 737 |
-| `examples/mir_targets/everyday.rs` | same, `everyday.rs` | **9 / 21 (43%)** |
+| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 399 / 739 |
+| `examples/mir_targets/everyday.rs` | same, `everyday.rs` | **10 / 21 (48%)** |
 
 `everyday.rs` is the honest one: ordinary Rust written by an external reviewer,
 not shaped for the tool. `realistic.rs` is a regression corpus (about a third of
@@ -121,12 +121,18 @@ with no new false proof while the independent corpus keeps growing.
   - Exit: `max_of` verified with an invariant and with `unwind: 5`, refuted with
     `unwind: 3` by the unwinding check.
   - Move: **build**.
-- **C5. Enums with payloads and match guards.** · P0 · in progress · Kani
-  - Gap: `match m { Run(n) if n < 10 => … }` gives "unmodelled switch
-    discriminant". Evidence: `next_mode` incomplete.
-  - Exit: `next_mode` decided, plus one refuted fixture.
-  - Move: **build** (the payload/discriminant model exists; the guard on a
-    `switchInt` arm is the missing piece).
+- **C5. Enums with payloads and match guards.** · P0 · done · Kani
+  - Gap: `match m { Run(n) if n < 10 => … }` gave "unmodelled switch
+    discriminant". Evidence: `next_mode` was incomplete.
+  - Cause: the guard reads the payload through a borrow of a downcast place,
+    `_4 = &((_1 as Run).0: u8)`, and the rvalue contains the word ` as ` inside
+    its parentheses. `parse_rvalue` checked for a cast *before* a reference, so it
+    split the borrow at that ` as `, the address was lost, and the guard's
+    `copy (*_4)` read `Unknown`. The reference arm now runs first, which a real
+    cast cannot be mistaken for (`&…` is not a place).
+  - Exit: `next_mode` decided (`verified`), plus the refuted fixture
+    `guarded_match_tripwire` in `realistic.rs`.
+  - Move: **built**.
 - **C6. The everyday `core` surface.** · P0 · in progress · Kani, Verus (`vstd`)
   - Gap: `Ord::min/max/clamp`, `iN::abs`, `abs_diff`, `rotate_*`, `is_ascii_*`,
     `<[T]>::len/is_empty/first/get`. Evidence: `abs_small`, `clamp_builtin`,

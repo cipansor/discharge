@@ -2445,6 +2445,36 @@ fn parse_rvalue(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Rvalue {
             }
         }
     }
+    // `&_1`, `&mut _1`, `&raw const _1`, `&raw mut _1`
+    //
+    // The raw forms appear for a `&mut [T]` argument's bounds check: rustc
+    // materialises the metadata through a raw borrow, `_3 = &raw const (fake)
+    // (*_1); _4 = PtrMetadata(move _3)`, where the immutable `&[T]` reads
+    // `PtrMetadata(copy _1)` directly. Both name the same place, so both are a
+    // `Ref`.
+    //
+    // The reference check comes *before* the cast check, because a borrow of an
+    // enum payload contains ` as `: `_4 = &((_1 as Run).0: u8)` is the address of
+    // a downcast place, and the cast arm's `find(" as ")` would split it into a
+    // cast of the string `&((_1` -- which parses as neither a place nor an operand,
+    // so the rvalue became a cast of `Unknown`, `_4` got no address, and the
+    // `copy (*_4)` that reads the guard read `Unknown`. That made every `match`
+    // with a `Variant(n) if guard` arm report "unmodelled switch discriminant" --
+    // the guard's own payload read was the thing that failed, not the switch. The
+    // cast arm cannot mis-take a reference, because `&…` is not a place, so trying
+    // the reference form first is safe for a real cast.
+    let raw = t.strip_prefix("&raw const ").or_else(|| t.strip_prefix("&raw mut "));
+    if let Some(r) = raw.or_else(|| t.strip_prefix("&mut ")).or_else(|| t.strip_prefix('&')) {
+        // `(fake)` is the marker rustc prints on the *place* of a `&mut [T]`
+        // argument's metadata borrow; it names the same place as its operand.
+        // It is stripped here rather than in `parse_place`, because `strip_annot`
+        // would otherwise read the whole `(fake) (*_1)` as an annotated place and
+        // strip the outer parentheses, leaving `fake) (*_1`.
+        let r = r.strip_prefix("(fake)").map(str::trim_start).unwrap_or(r);
+        if let Some(p) = parse_place(r, enums) {
+            return Rvalue::Ref(p);
+        }
+    }
     // The cast check has to come *before* the `const ` check, because rustc prints
     // a cast constant as `const 3_i32 as u32 (IntToInt)`. Matching `const ` first
     // hands the whole string to `parse_const`, which reads `i32 as u32 (IntToInt)`
@@ -2460,25 +2490,6 @@ fn parse_rvalue(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Rvalue {
     }
     if t.starts_with("copy ") || t.starts_with("move ") {
         return Rvalue::Use(parse_operand(t, enums));
-    }
-    // `&_1`, `&mut _1`, `&raw const _1`, `&raw mut _1`
-    //
-    // The raw forms appear for a `&mut [T]` argument's bounds check: rustc
-    // materialises the metadata through a raw borrow, `_3 = &raw const (fake)
-    // (*_1); _4 = PtrMetadata(move _3)`, where the immutable `&[T]` reads
-    // `PtrMetadata(copy _1)` directly. Both name the same place, so both are a
-    // `Ref`.
-    let raw = t.strip_prefix("&raw const ").or_else(|| t.strip_prefix("&raw mut "));
-    if let Some(r) = raw.or_else(|| t.strip_prefix("&mut ")).or_else(|| t.strip_prefix('&')) {
-        // `(fake)` is the marker rustc prints on the *place* of a `&mut [T]`
-        // argument's metadata borrow; it names the same place as its operand.
-        // It is stripped here rather than in `parse_place`, because `strip_annot`
-        // would otherwise read the whole `(fake) (*_1)` as an annotated place and
-        // strip the outer parentheses, leaving `fake) (*_1`.
-        let r = r.strip_prefix("(fake)").map(str::trim_start).unwrap_or(r);
-        if let Some(p) = parse_place(r, enums) {
-            return Rvalue::Ref(p);
-        }
     }
     if let Some(rest) = t.strip_prefix("Len(") {
         if let Some(p) = parse_place(strip_copy(close_paren(rest)), enums) {
@@ -3473,6 +3484,36 @@ fn add(_1: u32, _2: u32) -> u32 {
         let rv = parse_rvalue("&raw mut (fake) (*_2)", &enums);
         let Rvalue::Ref(place) = rv else { panic!("expected a Ref, got {rv:?}") };
         assert_eq!(place, Place { local: 2, proj: vec![Proj::Deref] });
+    }
+
+    /// A borrow of an enum payload parses as a `Ref`, not as a cast.
+    ///
+    /// `_4 = &((_1 as Run).0: u8)` -- how a `match` arm guard's payload read
+    /// lowers -- contains the word ` as ` inside its parentheses. The cast arm's
+    /// `find(" as ")` matched that, split the string into a cast of `&((_1`, which
+    /// parses as neither a place nor an operand, and the borrow got no address, so
+    /// the guard read `Unknown` and the `switchInt` on it was "unmodelled switch
+    /// discriminant". The reference arm is tried first, so the downcast place
+    /// parses whole and the `Ref` is produced.
+    #[test]
+    fn a_borrow_of_an_enum_payload_is_a_ref_not_a_cast() {
+        let mut enums = BTreeMap::new();
+        enums.insert(
+            "Msg".to_string(),
+            EnumLayout {
+                variants: vec![
+                    ("Ping".to_string(), 0),
+                    ("Data".to_string(), 1),
+                    ("Stop".to_string(), 2),
+                ],
+            },
+        );
+        let rv = parse_rvalue("&((_1 as Data).0: u8)", &enums);
+        let Rvalue::Ref(place) = rv else { panic!("expected a Ref, got {rv:?}") };
+        assert_eq!(place, Place { local: 1, proj: vec![Proj::Downcast(1), Proj::Field(0)] });
+        // A real cast still parses as a cast: `_1 as u32` is not a place.
+        let rv = parse_rvalue("move _1 as u32 (IntToInt)", &enums);
+        assert!(matches!(rv, Rvalue::Cast(..)), "a cast must stay a cast, got {rv:?}");
     }
 
     /// A *qualified* spelling of `Option`/`Result` resolves to the same numbering

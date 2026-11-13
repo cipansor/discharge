@@ -3059,6 +3059,30 @@ Three smaller traps fell out of the same work, each a place where a plausible re
   downcast place did not parse. Checking the place form first fixes it — the same shape of
   ordering bug as the earlier `const ... as ...` case, in the opposite direction.
 
+**A `match` arm guard reads its payload through a borrow of a downcast place — a third
+instance of the same ordering bug.** `Msg::Data(n) if n < 10` lowers to
+`_4 = &((_1 as Data).0: u8); _6 = copy (*_4); _5 = Lt(move _6, const 10_u8)`. The rvalue
+contains the word ` as ` *inside its parentheses*, and `parse_rvalue` checked for a cast
+before a reference, so it split the borrow at that ` as `, read it as a cast of the
+unparseable string `&((_1`, and produced a cast of `Unknown`. `_4` therefore got no
+address, `copy (*_4)` read `Unknown`, and the `switchInt` on the guard's `bool` was
+reported "unmodelled switch discriminant" — the *guard's* payload read was the thing that
+failed, not the switch, which is what made the message point at the wrong construct. The
+reference arm now runs before the cast arm; a real cast cannot be mis-taken for a
+reference, because `&…` is not a place, so the reorder is safe in the direction that
+matters. Pinned by `mir::parse::tests::a_borrow_of_an_enum_payload_is_a_ref_not_a_cast`
+(unit, no toolchain needed) and `tests/mir.rs::a_match_guard_reads_its_payload_through_a_borrow`
+(the corpus pair `guarded_match_reads_its_payload` / `guarded_match_tripwire`). Coverage:
+`everyday.rs` 9/21 → **10/21** (`next_mode`, C5's own evidence function, now decides),
+`realistic.rs` 398/737 → **399/739**; `scripts/test-count.sh` 874 → **876** passed, 0 failed.
+
+The recurring shape, worth stating once: **`parse_rvalue`'s arms are ordered, and an
+arm's pattern can appear inside another arm's string.** ` as ` lives inside a downcast
+*place* (both the `copy ((_2 as Some).0)` form and the `&((_1 as Data).0: u8)` form), and
+`const ` lives inside a cast constant. Each ordering fix so far has been found by a shape
+whose rvalue contained another arm's keyword; when a new rvalue form is added, check it
+against the arms above it, not only against the arms below.
+
 **The oracle is Rust itself, enumerated.** The model claims to implement `core`'s definition,
 so the unit tests in `src/mir/intrinsics.rs` compare against the real `u8::checked_add` and
 its family over *all* of `u8` and all of `i8` — 65536 pairs per case, cheap because the term is

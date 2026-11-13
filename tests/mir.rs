@@ -5508,6 +5508,29 @@ fn an_enum_payload_is_read_through_the_downcast() {
     assert!(o.is_verified(), "`enum_payload_reads_through` must verify, got: {o}");
 }
 
+/// A `match` arm *guard* is decided by the payload its borrow of a downcast reads.
+///
+/// `Msg::Data(n) if n < 10` lowers to `_4 = &((_1 as Data).0: u8); _6 = copy
+/// (*_4)`, and the rvalue contains the word ` as ` inside its parentheses. A
+/// parser that checked for a cast before a reference split that at the ` as `, so
+/// the borrow got no address, `copy (*_4)` read `Unknown`, and the `switchInt` on
+/// the guard reported "unmodelled switch discriminant". The true contract must
+/// verify and the tripwire -- which claims the guard's *other* arm ran -- must be
+/// refuted with a witness naming the payload.
+#[test]
+fn a_match_guard_reads_its_payload_through_a_borrow() {
+    let Some(report) = verify_realistic(&["guarded_match_reads_its_payload"]) else { return };
+    let o = outcome(&report, "guarded_match_reads_its_payload");
+    assert!(o.is_verified(), "`guarded_match_reads_its_payload` must verify, got: {o}");
+
+    let Some(report) = verify_realistic(&["guarded_match_tripwire"]) else { return };
+    let t = outcome(&report, "guarded_match_tripwire");
+    match t {
+        FnOutcome::Failed { kind, .. } => assert_eq!(kind, "postcondition"),
+        other => panic!("`guarded_match_tripwire` must be refuted, got: {other}"),
+    }
+}
+
 /// A locally constructed variant has a *known* tag, so its `match` decides.
 ///
 /// `let m = Mode::Idle;` lowers to `_1 = Mode::Idle;`, a bare path constant with

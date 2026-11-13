@@ -1776,6 +1776,52 @@ pub fn enum_payload_tripwire(m: Msg) -> u8 {
     }
 }
 
+/// A `match` arm *guard* reads the payload through a borrow of a downcast place.
+///
+/// `Msg::Data(n) if n < 10` lowers to `_4 = &((_1 as Data).0: u8); _6 = copy
+/// (*_4); _5 = Lt(_6, 10)`, so the guard is decided by the payload the downcast
+/// names. The rvalue `&((_1 as Data).0: u8)` contains the word ` as ` inside its
+/// parentheses; a parser that checks for a cast before it checks for a reference
+/// splits it at that ` as `, the reference gets no address, and `copy (*_4)`
+/// reads `Unknown` -- so the `switchInt` on the guard's `bool` is "unmodelled
+/// switch discriminant". Modelling the borrow is what makes a guarded match
+/// decide, and it is the same reference the body's own `copy ((_1 as Data).0)`
+/// already used.
+///
+/// `ret <= m.Data`: the guarded arm returns the payload (which is at most
+/// itself) and the fall-through arm returns `10`, which a payload of ten or more
+/// still dominates. The contract holds for every payload, so a model that read
+/// the guard's payload as an unconstrained input would refute it.
+/// requires: m == Msg::Data
+/// ensures: ret <= m.Data
+pub fn guarded_match_reads_its_payload(m: Msg) -> u8 {
+    match m {
+        Msg::Data(n) if n < 10 => n,
+        Msg::Data(_) => 10,
+        Msg::Ping => 0,
+        Msg::Stop => 0,
+    }
+}
+
+/// The tripwire for a guarded match: the guard's *other* arm, claimed to be the
+/// one taken.
+///
+/// The same body, but the contract claims the return is always `10` -- the value
+/// the arm taken when the guard *fails*. For a payload below ten the guard holds
+/// and the arm returns the payload, so the contract is false and must be refuted
+/// with a witness naming the payload. A model that dropped the guard's payload
+/// read (or read it as zero) would take the same arm on every path and prove it.
+/// requires: m == Msg::Data
+/// ensures: ret == 10
+pub fn guarded_match_tripwire(m: Msg) -> u8 {
+    match m {
+        Msg::Data(n) if n < 10 => n,
+        Msg::Data(_) => 10,
+        Msg::Ping => 0,
+        Msg::Stop => 0,
+    }
+}
+
 /// A *locally constructed* variant has a known tag, so its `match` is decided
 /// rather than symbolic.
 ///
