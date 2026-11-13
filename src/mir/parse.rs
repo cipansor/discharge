@@ -3068,7 +3068,7 @@ fn parse_fn_body(
         if let Some(rest) = t.strip_prefix("bb") {
             if let Some(colon) = rest.find(':') {
                 let header = &rest[..colon];
-                if let Ok(id) = header.trim().split_whitespace().next().unwrap_or("").parse::<usize>()
+                if let Ok(id) = header.split_whitespace().next().unwrap_or("").parse::<usize>()
                 {
                     if let Some(b) = cur_block.take() {
                         f.blocks.push(b);

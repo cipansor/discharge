@@ -1023,6 +1023,39 @@ fn verify_realistic(only: &[&str]) -> Option<verify::FileReport> {
     }
 }
 
+/// The independent corpus, scored, so the number in `ROADMAP.md` cannot drift.
+///
+/// `everyday.rs` is ordinary Rust written by an external reviewer, not shaped for
+/// the tool, so it is the honest measure of coverage (unlike `realistic.rs`, about
+/// a third of which is adversarial fixtures). Phase 1's exit criterion in
+/// `ROADMAP.md` is defined on it.
+///
+/// The assertion is a *floor*, not the exact score: adding a function that decides
+/// must not fail the test, but a change that makes the tool decide *fewer* of them
+/// -- a regression -- must. The exact score is printed by `mir_coverage`, which is
+/// what `ROADMAP.md` quotes.
+#[test]
+fn the_independent_corpus_does_not_regress() {
+    const EVERYDAY: &str = "examples/mir_targets/everyday.rs";
+    let Some(rustc) = rustc() else { return };
+    let report = match verify::verify_file_with(&rustc, std::path::Path::new(EVERYDAY), &[]) {
+        Ok(r) => r,
+        Err(e) => panic!("frontend failed: {e}"),
+    };
+    let decided = report
+        .outcomes
+        .iter()
+        .filter(|(_, o)| matches!(o, FnOutcome::Verified { .. } | FnOutcome::Failed { .. }))
+        .count();
+    assert!(
+        decided >= 9,
+        "everyday.rs decided {decided} of {} functions, down from 9 (43%); a regression \
+         dropped coverage of ordinary Rust. Run: cargo run --features std --example \
+         mir_coverage -- {EVERYDAY}",
+        report.outcomes.len()
+    );
+}
+
 /// A contract can name a struct field, and the field's *value* reaches the body.
 ///
 /// `pick_from`'s precondition is `c.lo <= c.hi` and its postcondition is

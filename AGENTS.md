@@ -22,8 +22,13 @@ Repository-level notes for agents working in this workspace.
   carry its own), `NOTICE` (third-party attribution — SPARK, z3, Kani, Verus,
   Lean, Coq, Ferrocene and the rest, each of which is an oracle or a comparison,
   never a dependency), `SECURITY.md` (soundness bugs are the vulnerability class
-  that matters in a verifier), `CONTRIBUTING.md`, `README.md` (the long-form
-  document, and the crate's page on crates.io), and `AGENTS.md` (this file).
+  that matters in a verifier), `CONTRIBUTING.md`, `ROADMAP.md` (the *single source
+  for open work* — one item per gap with a priority, a measurable exit criterion,
+  the competitor whose gap it closes, the closing move, and a status), `README.md`
+  (the long-form document, and the crate's page on crates.io), and `AGENTS.md`
+  (this file). This file records what was *learned*; `ROADMAP.md` records what is
+  *left*. When a "Stage N" or "Next stage" section below is finished, its remaining
+  work moves to `ROADMAP.md` rather than living here.
 
 ## Renaming the crate: `discharge` → `verif`
 
@@ -3639,6 +3644,11 @@ test that only checked the signed case would pass again the moment the rule went
 back to a single default.
 
 ## Next stage: the signedness work is a *rule*, so let the engine state it
+
+> The open work from every "Next stage" / "Stage N" section in this file is now
+> tracked in [`ROADMAP.md`](ROADMAP.md), which is the single source for what is
+> left. This section is kept as the *record* of the reasoning; check `ROADMAP.md`
+> for the current status of each item.
 
 Both false proofs fixed in this round were the same bug wearing different
 clothes. A value operation silently dropped the signedness of its operand:

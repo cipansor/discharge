@@ -107,6 +107,11 @@ all obligations discharged
 - [Documentation](#documentation)
 - [License](#license)
 
+**The open work** lives in [`ROADMAP.md`](ROADMAP.md) — one item per gap, each with
+a priority, a measurable exit criterion, the competitor whose gap it closes, the
+closing move (build / bridge / won't do), and a status. A PR that closes an item
+updates its status there.
+
 ---
 
 ## Installation
@@ -2279,6 +2284,7 @@ is instantaneous while a 12-bit multiplier equality is not.
 ├── Cargo.toml          the crate manifest (`no_std`, zero dependencies)
 ├── Cargo.lock          committed, and a single package: the dependency set is empty
 ├── README.md           this file
+├── ROADMAP.md          the open work: one item per gap, with exit criteria
 ├── AGENTS.md           notes for agents, including the traps that cost the most time
 ├── LICENSE             Apache-2.0
 ├── SECURITY.md         how to report a vulnerability (GitHub private advisories)
@@ -2353,7 +2359,10 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   ├── comparison/        the same three functions proved seven ways, plus
 │   │                      Ferrocene as the qualified compiler (see its README)
 │   └── mir_targets/
-│       └── actuator.rs    the Rust under verification; imports no `verif`
+│       ├── actuator.rs    the Rust under verification; imports no `verif`
+│       ├── realistic.rs   the large regression corpus (adversarial fixtures included)
+│       └── everyday.rs    the independent corpus: ordinary Rust, not shaped for
+│                          the tool; Phase 1 in `ROADMAP.md` is scored on it
 ├── tools/
 │   ├── mir-oracle/     the `rustc_public` oracle: checks the text-MIR frontend
 │   │                   against rustc's own typed MIR. Nightly + `rustc-dev`,
@@ -2789,6 +2798,9 @@ prover symbols.
   makes and the check that backs it. The [Contents](#contents) list at the top
   groups those sections.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the ground rules and the gates.
+- [`ROADMAP.md`](ROADMAP.md) is the single source for open work: each item carries
+  a priority, a measurable exit criterion, the competitor whose gap it closes, the
+  closing move (build / bridge / won't do), and a status.
 - [`SECURITY.md`](SECURITY.md) covers reporting a **soundness bug** — a false
   `Valid` — which is the vulnerability class that matters in a verifier.
 - [`AGENTS.md`](AGENTS.md) is the engineering log: why each decision was made,
