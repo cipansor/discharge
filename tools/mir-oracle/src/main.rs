@@ -229,28 +229,33 @@ fn main() {
 
     // The text side, exactly as the frontend reads it: `rustc --emit=mir` through
     // the crate's own emitter, so the oracle exercises the real code path rather
-    // than a re-implementation of it.
-    let text = match verif::mir::verify::emit_mir(target) {
+    // than a re-implementation of it. It returns the edition it resolved, and that
+    // same edition is handed to the typed side below -- one source for the edition,
+    // so the two compilations cannot drift apart again.
+    let (text, edition) = match verif::mir::verify::emit_mir_opts(
+        target,
+        &verif::mir::verify::MirOptions::default(),
+    ) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("mir-oracle: could not get text MIR: {e}");
-            eprintln!("mir-oracle: set VERIF_RUSTC to a nightly `rustc`");
             std::process::exit(2);
         }
     };
     let text_shapes = verif::mir::shape::of_text_mir(&text);
 
     // The typed side, through `rustc_public`. The argument list mirrors what the
-    // text emitter passes -- the same crate type *and* the same edition, so the
-    // two compile the same file the same way. Both sides used to disagree about
-    // the edition: the emitter passed none (rustc's default, 2015) while this side
-    // pinned 2021, and `panic!("literal")` lowers to one diverging call under 2015
-    // but to `Arguments::from_str` plus `std::rt::panic_fmt` under 2021 -- one
-    // extra basic block. Every shape with a `panic!` therefore disagreed for a
-    // reason that had nothing to do with the parser, and the oracle -- the one
-    // check that exists to catch a printer change -- failed on its own argument
-    // list instead. Both now name edition 2024 explicitly, so the only difference
-    // left between the two compilations is text versus typed IR.
+    // text emitter passes -- the same crate type *and* the *same edition*, taken
+    // from the emitter rather than repeated as a literal. Both sides used to
+    // disagree about the edition: the emitter passed none (rustc's default, 2015)
+    // while this side pinned 2021, and `panic!("literal")` lowers to one diverging
+    // call under 2015 but to `Arguments::from_str` plus `std::rt::panic_fmt` under
+    // 2021 -- one extra basic block. Every shape with a `panic!` therefore
+    // disagreed for a reason that had nothing to do with the parser, and the
+    // oracle -- the one check that exists to catch a printer change -- failed on
+    // its own argument list instead. Both sides now take the edition from
+    // `resolve_edition`, so the only difference left between the two compilations
+    // is text versus typed IR.
     //
     // `--out-dir` points the compiler's artifacts at a temp directory: without it
     // `rustc` drops `lib<name>.rlib` next to the source, which would litter the
@@ -260,7 +265,7 @@ fn main() {
     let mut typed_args = vec![
         target.to_string_lossy().into_owned(),
         "--edition".to_string(),
-        "2024".to_string(),
+        edition.as_str().to_string(),
         "--crate-type".to_string(),
         "lib".to_string(),
         "--out-dir".to_string(),

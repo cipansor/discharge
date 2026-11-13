@@ -9,10 +9,14 @@
 //! point — the earlier frontends in this crate proved things about expressions
 //! written next to the code, and a human had to keep the two in step.
 //!
-//! Set `VERIF_RUSTC` to a nightly `rustc`, since `--emit=mir` needs one:
+//! Set `VERIF_RUSTC` to name the compiler; `--emit=mir` is a *stable* flag, so any
+//! stable `rustc` works. The edition is resolved from the crate's `Cargo.toml`
+//! (2024 here), or from `VERIF_EDITION` when the file is not in a crate:
 //!
 //! ```text
-//! VERIF_RUSTC=$(rustup which --toolchain nightly rustc) \
+//! cargo run --features std --example mir_demo
+//! # a loose file with no Cargo.toml:
+//! VERIF_EDITION=2021 VERIF_RUSTC=$(rustup which rustc) \
 //!   cargo run --features std --example mir_demo
 //! ```
 

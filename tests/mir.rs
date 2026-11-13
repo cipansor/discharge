@@ -884,7 +884,7 @@ fn an_unreadable_ensures_is_reported_not_ignored() {
     )
     .expect("write source");
     let report =
-        verify::verify_file_with(&rustc, &src, &["f".to_string()]).expect("verify");
+        verify::verify_file_with_opts(&rustc, &src, &["f".to_string()], &probe_opts()).expect("verify");
     let (_, o) = report.outcomes.first().expect("one outcome");
     assert!(
         matches!(o, FnOutcome::Skipped { .. }),
@@ -4941,7 +4941,8 @@ fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("probe.rs");
     std::fs::write(&file, src).expect("write probe");
-    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &probe_opts())
+        .expect("frontend");
     let o = report
         .outcomes
         .into_iter()
@@ -4950,6 +4951,17 @@ fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
     let _ = std::fs::remove_dir_all(&dir);
     assert_not_dropped(name, src, o.is_some(), &report.missing);
     o
+}
+
+/// Options for a probe written to a loose temp file.
+///
+/// A probe has no `Cargo.toml` above it, so the edition cannot be resolved from a
+/// manifest -- and it is never guessed. The tests name the crate's own edition
+/// (2024) explicitly. The corpus files (`actuator.rs`, `realistic.rs`) do live
+/// under this repository's `Cargo.toml`, so those tests use the plain entry point
+/// and exercise the manifest resolution path instead.
+fn probe_opts() -> verify::MirOptions {
+    verify::MirOptions { edition: Some(verify::Edition::Rust2024) }
 }
 
 /// Every outcome and the `missing` list for one source, without the
@@ -4963,7 +4975,7 @@ fn verify_all_outcomes(src: &str) -> (Vec<(String, FnOutcome)>, Vec<String>) {
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("probe.rs");
     std::fs::write(&file, src).expect("write probe");
-    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &probe_opts()).expect("frontend");
     let _ = std::fs::remove_dir_all(&dir);
     (report.outcomes, report.missing)
 }
@@ -5216,7 +5228,7 @@ pub fn chain_must_be_read(a: [u8; 4], i: usize) -> u8 {
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("chain.rs");
     std::fs::write(&file, src).expect("write probe");
-    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &probe_opts()).expect("frontend");
     let o = outcome(&report, "chain_must_be_read");
     match o {
         FnOutcome::Failed { detail, .. } => assert!(
@@ -7669,7 +7681,7 @@ fn a_cfg_excluded_contract_does_not_steal_a_compiled_body() {
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("probe.rs");
     std::fs::write(&file, src).expect("write probe");
-    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &probe_opts()).expect("frontend");
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         report.outcomes.is_empty(),
@@ -8238,7 +8250,7 @@ fn verify_all_src(src: &str) -> Option<Vec<(String, FnOutcome)>> {
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("probe.rs");
     std::fs::write(&file, src).expect("write probe");
-    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &probe_opts()).expect("frontend");
     let _ = std::fs::remove_dir_all(&dir);
     Some(report.outcomes)
 }

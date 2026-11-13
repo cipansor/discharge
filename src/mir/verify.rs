@@ -25,6 +25,207 @@ pub use crate::mir::exec::{MirReport, Obligation, ObligationKind};
 use crate::mir::spec::{self, SpecError, Specs};
 use crate::smt::{self, Verdict};
 
+/// The Rust edition a file is compiled under.
+///
+/// The frontend has to compile *the program the user ships*, and that program's
+/// edition lives in its `Cargo.toml`. Pinning one edition unconditionally is the
+/// mistake this type exists to fix: `--edition=2024` refuses a valid 2021 crate
+/// (`extern "C" { … }` must be `unsafe` there) and lowers some code differently
+/// from the edition that ships, so a verdict could be about a program nobody
+/// built. The edition is therefore *resolved* (see [`resolve_edition`]), never
+/// assumed, and it is recorded on every report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Edition {
+    /// Rust 2015, `rustc`'s own default.
+    Rust2015,
+    /// Rust 2018.
+    Rust2018,
+    /// Rust 2021.
+    Rust2021,
+    /// Rust 2024, the crate's own edition.
+    Rust2024,
+}
+
+impl Edition {
+    /// The spelling `rustc --edition=` takes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Edition::Rust2015 => "2015",
+            Edition::Rust2018 => "2018",
+            Edition::Rust2021 => "2021",
+            Edition::Rust2024 => "2024",
+        }
+    }
+
+    /// Parse a manifest or override spelling.
+    ///
+    /// Only the four numeric forms are accepted, so a typo is an error rather
+    /// than a silent fallback to an edition the program does not use.
+    pub fn parse(s: &str) -> Option<Edition> {
+        match s.trim() {
+            "2015" => Some(Edition::Rust2015),
+            "2018" => Some(Edition::Rust2018),
+            "2021" => Some(Edition::Rust2021),
+            "2024" => Some(Edition::Rust2024),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Edition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "edition {}", self.as_str())
+    }
+}
+
+/// Options that shape a frontend run.
+#[derive(Clone, Debug, Default)]
+pub struct MirOptions {
+    /// The Rust edition to compile under.
+    ///
+    /// `None` resolves it: from the nearest `Cargo.toml`'s `package.edition`
+    /// first, then `VERIF_EDITION`. A file with neither is an *error*, never a
+    /// silent default -- see [`resolve_edition`].
+    pub edition: Option<Edition>,
+}
+
+/// Resolve the edition to compile `file` under: explicit first, then
+/// `VERIF_EDITION`, then the nearest `Cargo.toml`.
+///
+/// There is deliberately no silent default. A default would compile the program
+/// under an edition it does not use, which is the exact mismatch this resolution
+/// removes, and the mismatch would be invisible in the verdict.
+pub fn resolve_edition(file: &Path, explicit: Option<Edition>) -> Result<Edition, String> {
+    if let Some(e) = explicit {
+        return Ok(e);
+    }
+    if let Ok(v) = std::env::var("VERIF_EDITION") {
+        if !v.is_empty() {
+            return Edition::parse(&v).ok_or_else(|| {
+                format!(
+                    "VERIF_EDITION is `{v}`, which is not an edition; use 2015, 2018, 2021 or 2024"
+                )
+            });
+        }
+    }
+    if let Some(e) = edition_from_manifest(file) {
+        return Ok(e);
+    }
+    Err(format!(
+        "no Rust edition for {}: it has no `Cargo.toml` and `VERIF_EDITION` is unset. The \
+         edition is what the program is compiled under, so it is never guessed -- set \
+         `VERIF_EDITION` to 2015, 2018, 2021 or 2024",
+        file.display()
+    ))
+}
+
+/// The edition a file's crate declares, read from the nearest `Cargo.toml`.
+///
+/// `package.edition` is read directly; `edition.workspace = true` (or
+/// `edition = { workspace = true }`) is resolved against the workspace root's
+/// `[workspace.package]`. A manifest the reader cannot parse yields `None`, so the
+/// caller reports "no edition" rather than a wrong one.
+fn edition_from_manifest(file: &Path) -> Option<Edition> {
+    let manifest = nearest_manifest(file)?;
+    let text = std::fs::read_to_string(&manifest).ok()?;
+    match manifest_value(&text, "package", "edition")?.as_str() {
+        // `edition.workspace = true` / `edition = { workspace = true }`: the value
+        // lives in the workspace root.
+        "workspace" => {
+            let root = workspace_root(&manifest)?;
+            let root_text = std::fs::read_to_string(&root).ok()?;
+            Edition::parse(&manifest_value(&root_text, "workspace.package", "edition")?)
+        }
+        v => Edition::parse(v),
+    }
+}
+
+/// The nearest `Cargo.toml` at or above `file`, if any.
+fn nearest_manifest(file: &Path) -> Option<PathBuf> {
+    let abs = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+    let mut dir: Option<&Path> = abs.parent();
+    while let Some(d) = dir {
+        let candidate = d.join("Cargo.toml");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// The nearest `Cargo.toml` at or above `manifest` that declares a `[workspace]`.
+fn workspace_root(manifest: &Path) -> Option<PathBuf> {
+    let mut dir = manifest.parent()?;
+    loop {
+        let candidate = dir.join("Cargo.toml");
+        if candidate.is_file() {
+            let text = std::fs::read_to_string(&candidate).ok()?;
+            if text.lines().any(|l| l.trim().starts_with("[workspace")) {
+                return Some(candidate);
+            }
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// The value of a scalar key in a table of a TOML-ish manifest.
+///
+/// This is a focused reader, not a TOML parser: it handles the spellings a
+/// `Cargo.toml` uses for an edition (`edition = "2024"`, `edition.workspace =
+/// true`, `edition = { workspace = true }`) and returns `Some("workspace")` for
+/// the two inherited forms. Anything else it might read is something it could read
+/// *wrongly*, so it reads nothing else.
+fn manifest_value(text: &str, table: &str, key: &str) -> Option<String> {
+    let mut current = String::new();
+    for raw in text.lines() {
+        let line = strip_toml_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(inner) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            current = inner.trim().to_string();
+            continue;
+        }
+        if current != table {
+            continue;
+        }
+        let Some((lhs, rhs)) = line.split_once('=') else { continue };
+        let (lhs, rhs) = (lhs.trim(), rhs.trim());
+        if lhs == format!("{key}.workspace") {
+            return Some(if rhs == "true" { "workspace".into() } else { rhs.into() });
+        }
+        if lhs == key {
+            // `edition = { workspace = true }`
+            if rhs.starts_with('{') {
+                return Some(if rhs.contains("workspace") && rhs.contains("true") {
+                    "workspace".into()
+                } else {
+                    rhs.into()
+                });
+            }
+            return Some(rhs.trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+/// Drop a trailing `#` comment, respecting string literals so a `#` inside one is
+/// not mistaken for a comment.
+fn strip_toml_comment(line: &str) -> &str {
+    let mut in_str = false;
+    let mut prev = '\0';
+    for (i, c) in line.char_indices() {
+        match c {
+            '"' if prev != '\\' => in_str = !in_str,
+            '#' if !in_str => return &line[..i],
+            _ => {}
+        }
+        prev = c;
+    }
+    line
+}
+
 /// Where the MIR text came from, so failures can say so.
 #[derive(Clone, Debug)]
 pub enum MirSource {
@@ -49,15 +250,13 @@ pub enum MirSource {
 /// 1.85). The error is returned rather than papered over, because "the frontend
 /// could not run" and "the code is wrong" must never be reported the same way.
 ///
-/// The edition is pinned to 2024, the newest, rather than left to `rustc`'s
-/// default. The default is 2015 -- a decade behind the crate's own edition, and
-/// not the edition any of the targets are written in -- and it changes the
-/// lowering: `panic!("literal")` is one diverging call under 2015 but an
-/// `Arguments::from_str` plus `std::rt::panic_fmt` under 2024. Leaving it implicit
-/// meant the text dump and any tool that passed an edition explicitly (the
-/// `rustc_public` oracle did) compiled the same file differently and disagreed
-/// about the result. Pinning it here is what makes "the dump and the typed IR
-/// describe the same program" true by construction instead of by coincidence.
+/// The edition is *resolved*, never assumed: `VERIF_EDITION` first, then the
+/// nearest `Cargo.toml`'s `package.edition`. A file with neither is an error,
+/// because the edition changes the lowering -- `panic!("literal")` is one
+/// diverging call under 2015 but an `Arguments` chain plus `std::rt::panic_fmt`
+/// under 2024, and `extern "C" { … }` must be `unsafe` only from 2024 -- so a
+/// verdict under the wrong edition would be about a program nobody built. See
+/// [`resolve_edition`].
 ///
 /// The compiler is taken from `VERIF_RUSTC` when set, and otherwise from
 /// `rustc` on `PATH`. The dedicated variable exists so that pointing this tool at
@@ -65,8 +264,7 @@ pub enum MirSource {
 /// does not disturb the `rustc` that cargo is using to build the test suite;
 /// setting `RUSTC` would do exactly that.
 pub fn emit_mir(file: &Path) -> Result<String, String> {
-    let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
-    emit_mir_with(&rustc, file)
+    emit_mir_opts(file, &MirOptions::default()).map(|(text, _edition)| text)
 }
 
 /// [`emit_mir`] with the compiler named explicitly.
@@ -75,6 +273,29 @@ pub fn emit_mir(file: &Path) -> Result<String, String> {
 /// a nightly -- without mutating the process environment, which is a race when
 /// tests run in parallel.
 pub fn emit_mir_with(rustc: &str, file: &Path) -> Result<String, String> {
+    emit_mir_with_opts(rustc, file, &MirOptions::default()).map(|(text, _edition)| text)
+}
+
+/// [`emit_mir`] with the run's options, returning the resolved edition too.
+pub fn emit_mir_opts(
+    file: &Path,
+    opts: &MirOptions,
+) -> Result<(String, Edition), String> {
+    let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
+    emit_mir_with_opts(&rustc, file, opts)
+}
+
+/// [`emit_mir_with`] with the run's options, returning the resolved edition too.
+///
+/// The edition is resolved before `rustc` is invoked, so a file whose edition
+/// cannot be determined fails with "no edition" rather than with a compiler error
+/// about a program compiled under the wrong one.
+pub fn emit_mir_with_opts(
+    rustc: &str,
+    file: &Path,
+    opts: &MirOptions,
+) -> Result<(String, Edition), String> {
+    let edition = resolve_edition(file, opts.edition)?;
     // `rustc` writes its intermediate artifacts next to the output path, so the
     // output goes to a temp file rather than to `/dev/stdout` -- pointing it at
     // `/dev` makes rustc try to create a temp directory there and fail.
@@ -90,7 +311,7 @@ pub fn emit_mir_with(rustc: &str, file: &Path) -> Result<String, String> {
         file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
     ));
     let out = Command::new(rustc)
-        .arg("--edition=2024")
+        .arg(format!("--edition={}", edition.as_str()))
         .arg("--crate-type=lib")
         .arg("--emit=mir")
         .arg("-o")
@@ -100,27 +321,30 @@ pub fn emit_mir_with(rustc: &str, file: &Path) -> Result<String, String> {
         .map_err(|e| format!("could not run rustc: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "rustc failed on {}: {}",
+            "rustc failed on {} under {}: {}",
             file.display(),
+            edition,
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
     let text = std::fs::read_to_string(&out_path).map_err(|e| {
         format!(
-            "rustc produced no MIR for {} ({e}); `--emit=mir` is stable, so this is a \
+            "rustc produced no MIR for {} under {} ({e}); `--emit=mir` is stable, so this is a \
              missing output file rather than a toolchain problem",
-            file.display()
+            file.display(),
+            edition
         )
     })?;
     let _ = std::fs::remove_file(&out_path);
     if text.trim().is_empty() {
         return Err(format!(
-            "rustc produced empty MIR for {}; `--emit=mir` is stable, so check the \
+            "rustc produced empty MIR for {} under {}; `--emit=mir` is stable, so check the \
              file's crate type and that it defines an item with a body",
-            file.display()
+            file.display(),
+            edition
         ));
     }
-    Ok(text)
+    Ok((text, edition))
 }
 
 /// What happened to one function.
@@ -625,6 +849,13 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
 pub struct FileReport {
     /// The file these results are about.
     pub source: PathBuf,
+    /// The edition the file was compiled under.
+    ///
+    /// A `verified` that does not say which edition it holds under is only half a
+    /// claim: the edition changes the lowering, so the verdict is about *this*
+    /// edition's program. It is `None` only for a run whose MIR text was supplied
+    /// directly (tests), where no edition was involved.
+    pub edition: Option<Edition>,
     /// One outcome per verified function, in contract order.
     pub outcomes: Vec<(String, FnOutcome)>,
     /// Functions that carried a contract but were not found in the MIR. A
@@ -672,8 +903,17 @@ impl FileReport {
 /// contract test wants: verifying the whole file on every call would be slow and
 /// would report unrelated functions.
 pub fn verify_file(source: &Path, only: &[String]) -> Result<FileReport, String> {
+    verify_file_opts(source, only, &MirOptions::default())
+}
+
+/// [`verify_file`] with the run's options (currently the edition).
+pub fn verify_file_opts(
+    source: &Path,
+    only: &[String],
+    opts: &MirOptions,
+) -> Result<FileReport, String> {
     let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
-    verify_file_with(&rustc, source, only)
+    verify_file_with_opts(&rustc, source, only, opts)
 }
 
 /// [`verify_file`] with the compiler named explicitly. See [`emit_mir_with`].
@@ -682,15 +922,30 @@ pub fn verify_file_with(
     source: &Path,
     only: &[String],
 ) -> Result<FileReport, String> {
+    verify_file_with_opts(rustc, source, only, &MirOptions::default())
+}
+
+/// [`verify_file_with`] with the run's options.
+pub fn verify_file_with_opts(
+    rustc: &str,
+    source: &Path,
+    only: &[String],
+    opts: &MirOptions,
+) -> Result<FileReport, String> {
     let text = std::fs::read_to_string(source)
         .map_err(|e| format!("could not read {}: {e}", source.display()))?;
     let specs = spec::extract(&text);
-    let mir = emit_mir_with(rustc, source)?;
+    let (mir, edition) = emit_mir_with_opts(rustc, source, opts)?;
     let prog =
         parse::parse_program_scoped(&mir, &enum_layouts(&specs), &specs.crate_consts, &specs.const_generics, &specs.impl_owners, &specs.impl_traits, &specs.impl_trait_args, &specs.declared_traits);
 
     let (targets, missing) = resolve_targets(&prog, &specs);
-    let mut report = FileReport { source: source.to_path_buf(), missing, ..Default::default() };
+    let mut report = FileReport {
+        source: source.to_path_buf(),
+        edition: Some(edition),
+        missing,
+        ..Default::default()
+    };
     for (key, f) in select(&prog, &targets, only) {
         let outcome = smt::with_fresh(|| verify_function(&prog, f, &specs));
         report.outcomes.push((key, outcome));
